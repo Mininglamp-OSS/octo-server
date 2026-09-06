@@ -93,13 +93,11 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 			if res.Admitted {
 				p.audit(auditMemberAdd, actorUID, res.UID, row.ProjectID, row.SpaceID, "")
 			}
-		case errors.Is(res.Err, errNotSpaceMember):
-			observeRejected(entryMemberAdd, reasonNotSpaceMember)
-			outcomes = append(outcomes, memberOutcome{UID: res.UID, Reason: outcomeNotSpaceMember})
 		case errors.Is(res.Err, errQuotaMembers):
 			observeRejected(entryMemberAdd, reasonQuotaMembers)
 			outcomes = append(outcomes, memberOutcome{UID: res.UID, Reason: outcomeQuotaMembers})
-		case errors.Is(res.Err, errPermissionDenied), errors.Is(res.Err, errProjectGone):
+		case errors.Is(res.Err, errPermissionDenied), errors.Is(res.Err, errProjectGone),
+			errors.Is(res.Err, errActorNotSpaceMember):
 			// ACTOR-level or project-level: nothing after this point can succeed, so stop.
 			//
 			// But HOW we stop depends on whether anything already committed. Each target runs in
@@ -111,14 +109,27 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 			//
 			// With nothing committed yet, the single status code IS the honest answer.
 			reason := reasonPermissionDenied
-			if errors.Is(res.Err, errProjectGone) {
+			switch {
+			case errors.Is(res.Err, errProjectGone):
 				reason = reasonProjectDisbanded
+			case errors.Is(res.Err, errActorNotSpaceMember):
+				// Same reason string the TARGET-level refusal uses. Deliberate: it keeps the
+				// wire vocabulary closed, and the two are distinguishable anyway — an
+				// actor-level refusal is always the LAST outcome before a not_attempted tail,
+				// while a target-level one is followed by the rest of the batch.
+				reason = reasonNotSpaceMember
 			}
 			observeRejected(entryMemberAdd, reason)
 			if !anyApplied(outcomes) {
-				if errors.Is(res.Err, errProjectGone) {
+				switch {
+				case errors.Is(res.Err, errProjectGone):
 					respondProjectNotFound(c)
-				} else {
+				case errors.Is(res.Err, errActorNotSpaceMember):
+					// NOT permission_denied: the caller's project role is intact, their SPACE
+					// seat is not. Sending them to check their project role would point them
+					// at the wrong thing.
+					httperr.ResponseErrorL(c, errcode.ErrProjectMemberNotSpaceMember, nil, nil)
+				default:
 					httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 				}
 				return
@@ -131,6 +142,12 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 			outcomes = appendNotAttemptedUIDs(outcomes, uids[len(results):])
 			c.Response(outcomes)
 			return
+		case errors.Is(res.Err, errNotSpaceMember):
+			// TARGET-level, and it MUST stay below the actor arm above: errActorNotSpaceMember
+			// wraps errNotSpaceMember, so this arm would otherwise swallow the actor-level
+			// refusal and report it as one rejected uid while the batch carried on.
+			observeRejected(entryMemberAdd, reasonNotSpaceMember)
+			outcomes = append(outcomes, memberOutcome{UID: res.UID, Reason: outcomeNotSpaceMember})
 		default:
 			observeRejected(entryMemberAdd, outcomeStoreFailed)
 			p.Error("添加项目成员失败", zap.Error(res.Err),
@@ -186,17 +203,27 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 			if removed {
 				p.audit(auditMemberRemove, actorUID, uid, row.ProjectID, row.SpaceID, "kicked")
 			}
-		case errors.Is(err, errPermissionDenied):
+		case errors.Is(err, errPermissionDenied), errors.Is(err, errActorNotSpaceMember):
 			// ACTOR-level: the in-lock re-read says the caller no longer holds the role this
-			// endpoint needs. Nothing further can succeed, so stop — but report what already
-			// committed rather than collapsing a partially-applied batch into one 403. See the
-			// add path for why discarding the outcomes is the worse of the two answers.
-			observeRejected(entryMemberRemove, reasonPermissionDenied)
+			// endpoint needs, or no longer holds a seat in the Space at all. Nothing further
+			// can succeed, so stop — but report what already committed rather than collapsing
+			// a partially-applied batch into one 403. See the add path for why discarding the
+			// outcomes is the worse of the two answers.
+			actorSeatGone := errors.Is(err, errActorNotSpaceMember)
+			reason := reasonPermissionDenied
+			if actorSeatGone {
+				reason = reasonNotSpaceMember
+			}
+			observeRejected(entryMemberRemove, reason)
 			if !anyApplied(outcomes) {
-				httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
+				if actorSeatGone {
+					httperr.ResponseErrorL(c, errcode.ErrProjectMemberNotSpaceMember, nil, nil)
+				} else {
+					httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
+				}
 				return
 			}
-			outcomes = append(outcomes, memberOutcome{UID: uid, Reason: outcomeForbidden})
+			outcomes = append(outcomes, memberOutcome{UID: uid, Reason: reason})
 			outcomes = appendNotAttemptedUIDs(outcomes, uids[i+1:])
 			c.Response(outcomes)
 			return

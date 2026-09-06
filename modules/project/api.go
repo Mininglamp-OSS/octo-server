@@ -239,11 +239,33 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	offset, limit := pageParams(c)
 
-	spaceRole, _, err := spacepkg.MemberRole(p.ctx.DB(), spaceID, uid)
+	// `ok` is NOT discardable, and MemberRole's own doc comment says so: its role return is
+	// an int whose zero value is a VALID role, so a caller that ignores ok hands ordinary
+	// member rights to a non-member.
+	//
+	// This route's Space gate is spaceIDParamMiddleware, which answers from the shared
+	// space:member:{spaceID}:{uid} cache — and that cache can hold a stale POSITIVE two ways:
+	// the Space module's DEL and its negative-cache fallback both failing (a branch
+	// modules/space/member_removal.go logs explicitly), or cache-aside `Set` landing after a
+	// concurrent Space-side DEL and reinstating a positive entry for the full TTL. In either
+	// case this read is the authoritative answer and the only one left, so it decides. It is
+	// a live database read on every request, which is what makes the refusal immediate rather
+	// than eventual.
+	//
+	// The refusal shape is the middleware's own (respondForbidden), so a caller sees the same
+	// answer whether the cache was warm, cold, or stale — the alternative would make the
+	// cache's state observable from the wire.
+	spaceRole, isSpaceMember, err := spacepkg.MemberRole(p.ctx.DB(), spaceID, uid)
 	if err != nil {
 		p.Error("查询 Space 角色失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))
 		respondQueryFailed(c)
+		return
+	}
+	if !isSpaceMember {
+		p.Warn("Space 成员缓存给出了过期的正命中，列表端点按库内实况拒绝",
+			zap.String("spaceId", spaceID), zap.String("uid", uid))
+		respondForbidden(c)
 		return
 	}
 

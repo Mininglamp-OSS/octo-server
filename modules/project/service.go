@@ -14,7 +14,7 @@ import (
 
 // Lock order for every write path in this module, followed without exception:
 //
-//	space  ->  project  ->  group  ->  group_member  ->  octo_project_member
+//	space_member  ->  space  ->  project  ->  group  ->  group_member  ->  octo_project_member
 //
 // Concretely: a membership write locks the octo_project row (lockActiveProjectTx)
 // BEFORE it touches octo_project_member, and the Space-side facts it needs
@@ -22,6 +22,20 @@ import (
 // group table at all, so the two middle positions are reserved for P1's group
 // admission; recording them now is what keeps P1 from choosing a different order
 // and deadlocking against this code.
+//
+// space_member leads space, and that is NOT this module's choice — it is
+// modules/space's, recorded at modules/space/db.go:71-88 after an Error 1213 incident:
+// both Space-disband paths take `space_member ... FOR UPDATE` and then update `space`,
+// so any transaction taking those two in the opposite order closes a cycle with them.
+// createProject is the only path here that takes both, and it took them backwards until
+// PR #841 round 2 (yujiawei P1-3 / Jerry-Xin B-3); the deadlock was reproduced against
+// MySQL 8.0.33 with the OPERATOR'S DISBAND as InnoDB's victim.
+//
+// Scope of this claim, stated because the earlier version of this comment did not: the
+// order above has now been checked against modules/space's disband and member-removal
+// transactions, not just against this module's own. Anything new here that locks a
+// second table must be re-checked the same way — "no cycle within this module" is not
+// the property that matters.
 //
 // Every membership and role write follows the same three steps inside one
 // transaction:
@@ -39,13 +53,31 @@ import (
 // errors rather than responding from the service keeps the transaction boundary and
 // the wire contract in separate files.
 var (
-	errQuotaPerSpace         = errors.New("project: per-space project quota reached")
-	errQuotaPerCreator       = errors.New("project: per-creator project quota reached")
-	errQuotaDailyCreate      = errors.New("project: daily project creation quota reached")
-	errQuotaMembers          = errors.New("project: per-project member quota reached")
-	errNameDuplicated        = errors.New("project: active project name already used in this space")
-	errProjectGone           = errors.New("project: project is absent or disbanded")
-	errNotSpaceMember        = errors.New("project: target uid is not an active space member")
+	errQuotaPerSpace    = errors.New("project: per-space project quota reached")
+	errQuotaPerCreator  = errors.New("project: per-creator project quota reached")
+	errQuotaDailyCreate = errors.New("project: daily project creation quota reached")
+	errQuotaMembers     = errors.New("project: per-project member quota reached")
+	errNameDuplicated   = errors.New("project: active project name already used in this space")
+	errProjectGone      = errors.New("project: project is absent or disbanded")
+	errNotSpaceMember   = errors.New("project: target uid is not an active space member")
+	// errActorNotSpaceMember is the ACTOR-level counterpart of errNotSpaceMember: the CALLER
+	// no longer holds an active seat in the Space (removal, or the Space itself went
+	// inactive). It exists because the two are indistinguishable to a BATCH endpoint
+	// otherwise, and they demand opposite handling: a target without a Space seat is one
+	// rejected uid among many and the batch continues, while an ACTOR without one means no
+	// remaining target can succeed, so the batch must stop and the caller must be told it is
+	// their own standing that failed. Folding them, as the first version of the add path did,
+	// made an actor-level refusal look like a per-uid note and opened one doomed transaction
+	// per remaining uid (PR #841 round 2, Jerry-Xin N-1).
+	//
+	// It WRAPS errNotSpaceMember rather than standing beside it, so this is a refinement and
+	// not a reclassification: every existing errors.Is(err, errNotSpaceMember) keeps holding,
+	// including the acceptance guard that drives all six privileged writes. Only code that
+	// needs to tell actor from target asks the narrower question. The consequence for callers
+	// is a switch-order rule — a `case errors.Is(err, errNotSpaceMember)` arm would swallow
+	// this one, so the actor arm MUST come first (see addMembersHandler).
+	errActorNotSpaceMember = fmt.Errorf(
+		"project: actor uid is not an active space member: %w", errNotSpaceMember)
 	errMemberNotFound        = errors.New("project: target uid is not an active project member")
 	errLastOwnerMustTransfer = errors.New("project: the last owner must transfer ownership first")
 	// errPermissionDenied is ACTOR-level: the caller does not hold the role this operation
@@ -170,39 +202,63 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// Lock the Space row FIRST. Two things depend on it, and neither is optional:
+	// I1 for the owner seat, inside this transaction, holding a SHARED lock on the creator's
+	// space_member row — and BEFORE the exclusive lock on `space` below. The order of these
+	// two is load-bearing in both directions:
+	//
+	//   * Correctness: createProject writes a membership row like any other write path, so it
+	//     owes the same invariant. The middleware's check does not substitute — it ran before
+	//     this transaction, against a 60s Redis cache, so a Space removal committing in
+	//     between left a permanent owner seat with no Space seat, on the one project nobody
+	//     could then clean up (the cascade closes seats, and an ownerless project cannot be
+	//     disbanded).
+	//
+	//   * Deadlock: this used to come SECOND, and that is the exact reversed order
+	//     modules/space/db.go:71-88 records as a prior Error 1213 incident. Both Space-disband
+	//     paths (disbandSpace, forceDisbandSpace) take `space_member ... FOR UPDATE`
+	//     (lockActiveMemberUIDsTx) and THEN update `space`. Holding X(`space`) while waiting
+	//     for S(`space_member`) closes the cycle, and unlike the gap-lock case that comment
+	//     analyses these are record locks on rows that exist, so the cycle is real. It was
+	//     reproduced against MySQL 8.0.33: InnoDB chose the OPERATOR'S DISBAND as the victim
+	//     while this create committed — and disband is a step of the member-removal security
+	//     cascade, so that is the worse of the two outcomes the comment warns about
+	//     (TestCreateProjectDoesNotDeadlockAgainstTheSpaceDisbandLockOrder pins it).
+	//
+	//     Taking the shared lock first makes both transactions acquire `space_member` before
+	//     `space`, so there is no cycle: whichever arrives second simply waits.
+	//     lockSpaceSeatRowTx, not checkSpaceMembershipForWriteTx: the latter JOINs `space`,
+	//     and a table outside the `FOR SHARE OF` list is read as a CONSISTENT read, which
+	//     opens the transaction's read view. As the FIRST statement that would freeze the
+	//     snapshot before the `space` lock below, and every quota count after it would be
+	//     answered from it — six concurrent creates all passed MaxPerSpace=1 that way. The
+	//     Space's activeness is rechecked under the exclusive lock immediately below, so
+	//     nothing is lost. See lockSpaceSeatRowTx.
+	creatorIsMember, err := p.db.lockSpaceSeatRowTx(tx, in.SpaceID, in.Creator)
+	if err != nil {
+		return nil, err
+	}
+	if !creatorIsMember {
+		return nil, errNotSpaceMember
+	}
+
+	// NOW lock the Space row. Two things depend on it, and neither is optional:
 	//
 	//   1. It serialises every create in this Space, which is what makes the counts below
 	//      mean anything. A plain SELECT COUNT(*) is a non-locking consistent read even
 	//      inside a transaction, so without this lock two concurrent creates both read 999
 	//      and both insert. An earlier version of this function put the counts in a
-	//      transaction and claimed that was enough; it was not.
-	//   2. It confirms the Space is still active at write time, not just when the middleware
-	//      looked.
-	//
-	// It is also the first position in the module's lock order, so nothing else may be held yet.
+	//      transaction and claimed that was enough; it was not. Moving the membership check
+	//      ahead of this lock does not weaken that serialisation: both creates still queue on
+	//      the same `space` row, they just queue one statement later.
+	//   2. It confirms the Space is still active at write time. The membership check above
+	//      already joins on space.status = 1, but it read that under a shared lock on
+	//      space_member only, so a ban or disband could still commit in between — this is the
+	//      authoritative recheck, and it is why it stays.
 	spaceActive, err := p.db.lockSpaceRowTx(tx, in.SpaceID)
 	if err != nil {
 		return nil, err
 	}
 	if !spaceActive {
-		return nil, errNotSpaceMember
-	}
-
-	// I1 for the owner seat, inside this transaction and holding a shared lock on the
-	// creator's space_member row.
-	//
-	// createProject writes a membership row like any other write path, so it owes the same
-	// invariant — and it was the one path that did not check. The middleware's check does not
-	// substitute: it ran before this transaction, against a 60s Redis cache, so a Space
-	// removal committing in between left a permanent owner seat with no Space seat, on the one
-	// project nobody could then clean up (the cascade closes seats, and an ownerless project
-	// cannot be disbanded).
-	creatorIsMember, err := p.db.checkSpaceMembershipForWriteTx(tx, in.SpaceID, in.Creator)
-	if err != nil {
-		return nil, err
-	}
-	if !creatorIsMember {
 		return nil, errNotSpaceMember
 	}
 
@@ -466,7 +522,8 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 		// Stopping here makes the label honest: everything before it really ran, everything
 		// after it really did not. Continuing would also be pure waste — each remaining uid
 		// opens a transaction only to be refused by the same in-lock recheck.
-		if errors.Is(err, errPermissionDenied) || errors.Is(err, errProjectGone) {
+		if errors.Is(err, errPermissionDenied) || errors.Is(err, errProjectGone) ||
+			errors.Is(err, errActorNotSpaceMember) {
 			break
 		}
 	}
@@ -481,7 +538,24 @@ func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, 
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// I1 first, and INSIDE this transaction: it takes a shared lock on the target's
+	// The ACTOR's own Space seat, revalidated in-transaction like every other privileged
+	// write (see requireActorSpaceSeatTx). This path was the one omission, and its exposure
+	// is the widest of the six: addMembers runs ONE TRANSACTION PER TARGET and breaks the
+	// batch only on errPermissionDenied / errProjectGone, so an actor whose Space seat closes
+	// mid-batch would otherwise have every remaining uid of a 200-uid batch admitted and
+	// audited under them — the actor's project role stays active because the Space-removal
+	// cascade is asynchronous by design.
+	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+		// Re-tagged as ACTOR-level before it leaves this function: the batch layer and the
+		// wire contract must not confuse it with the target's own missing seat, checked
+		// immediately below and returned as the same sentinel.
+		if errors.Is(err, errNotSpaceMember) {
+			return false, errActorNotSpaceMember
+		}
+		return false, err
+	}
+
+	// I1 for the TARGET, INSIDE this transaction: it takes a shared lock on the target's
 	// space_member row, so a Space removal cannot commit between the check and the write.
 	// Before lockActiveProjectTx, so the declared lock order (space -> project) holds.
 	isSpaceMember, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceID, uid)
@@ -578,6 +652,14 @@ func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (
 	defer tx.RollbackUnlessCommitted()
 
 	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+		// ACTOR-level, re-tagged for the same reason as the add path: removal is the other
+		// batch-driven endpoint, and its handler drives the loop one target at a time — so
+		// without this it fell to the default branch, labelled the actor's own expired
+		// standing "store_failed" per uid, and kept opening one doomed transaction for every
+		// remaining target.
+		if errors.Is(err, errNotSpaceMember) {
+			return false, errActorNotSpaceMember
+		}
 		return false, err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)

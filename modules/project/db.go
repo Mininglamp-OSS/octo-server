@@ -341,10 +341,18 @@ func (d *DB) countActiveMembersTx(tx *dbr.Tx, projectID string) (int, error) {
 // shared lock on a row that Space disband updates, inventing a contention path this module
 // has no reason to create. Verified on MySQL 8.0.33 (the OF clause needs 8.0.1+).
 //
-// Lock order: callers MUST take this BEFORE locking octo_project, so the module's declared
-// order (space -> project -> ... -> octo_project_member) holds. The Space-removal path takes
-// FOR UPDATE on the same space_member row, so it blocks here until this transaction commits;
-// the cascade step reads space_member without a lock, so there is no cycle with it.
+// Lock order: callers MUST take this BEFORE locking octo_project AND before `space`, so the
+// module's declared order (space_member -> space -> project -> ... -> octo_project_member)
+// holds. Two separate claims, and the second one is the one that was missing:
+//
+//   - vs. Space MEMBER REMOVAL: it takes FOR UPDATE on the same space_member row, so it
+//     blocks here until this transaction commits; the cascade step reads space_member without
+//     a lock, so there is no cycle with it either.
+//   - vs. Space DISBAND: it takes `space_member ... FOR UPDATE` and THEN updates `space`
+//     (modules/space/db.go:71-88, an Error 1213 incident note). So a caller that holds
+//     X(`space`) and then asks for this shared lock closes a cycle. createProject was that
+//     caller until PR #841 round 2. "No cycle" holds only where this lock is taken FIRST —
+//     which is now every caller, and must stay that way.
 func (d *DB) checkSpaceMembershipForWriteTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
 	if spaceID == "" || uid == "" {
 		return false, nil
@@ -387,6 +395,42 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 	).Load(&found)
 	if err != nil {
 		return false, fmt.Errorf("project: lock space row: %w", err)
+	}
+	return len(found) > 0, nil
+}
+
+// lockSpaceSeatRowTx takes the shared lock on uid's space_member row and nothing else — no
+// JOIN onto `space`.
+//
+// It exists for createProject, and the missing JOIN is the entire point. `FOR SHARE OF sm`
+// locks sm, but a table NOT named in the OF list is read as a CONSISTENT read, and a
+// consistent read is what OPENS the transaction's read view. Put this statement first and
+// every later plain SELECT — including all three creation-quota counts — is answered from a
+// snapshot taken before the `space` row lock was acquired, so two concurrent creates both
+// count 0 and both insert. That is not a subtle degradation of the quota, it removes it:
+// reproduced as six concurrent creates all succeeding against MaxPerSpace=1.
+//
+// Verified directly on MySQL 8.0.33: `SELECT ... FROM sm JOIN sp ... FOR SHARE OF sm`
+// followed by `SELECT COUNT(*)` does NOT see a row another session committed in between,
+// while the same pair without the JOIN does.
+//
+// Dropping the JOIN loses nothing here. The caller takes `space ... FOR UPDATE` immediately
+// afterwards and refuses anything but status = 1, so Space activeness is checked more
+// strongly than the JOIN checked it — under an exclusive lock rather than in a snapshot.
+// Callers that do NOT lock the `space` row must keep using
+// checkSpaceMembershipForWriteTx, whose JOIN is their only activeness check.
+func (d *DB) lockSpaceSeatRowTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
+	if spaceID == "" || uid == "" {
+		return false, nil
+	}
+	var found []int
+	_, err := tx.SelectBySql(
+		"SELECT 1 FROM `space_member` WHERE uid = ? AND space_id = ? AND status = 1 "+
+			"LIMIT 1 FOR SHARE",
+		uid, spaceID,
+	).Load(&found)
+	if err != nil {
+		return false, fmt.Errorf("project: lock space seat row: %w", err)
 	}
 	return len(found) > 0, nil
 }

@@ -121,14 +121,20 @@ func TestCreateProjectDoesNotDeadlockAgainstTheSpaceDisbandLockOrder(t *testing.
 
 	_, updErr := txB.UpdateBySql("UPDATE `space` SET status=0 WHERE space_id=?", spaceA).Exec()
 
+	// Release the space_member locks BEFORE waiting on create. This ordering is not
+	// incidental: with the lock order fixed, create is parked on S(space_member) and can only
+	// proceed once this transaction ends, so waiting first would hang the test on its own
+	// orchestration rather than on the defect. With the order broken, the UPDATE above has already come
+	// back 1213 and the deferred rollback covers it.
+	if updErr == nil {
+		require.NoError(t, txB.Commit())
+	}
+
 	var got createOutcome
 	select {
 	case got = <-done:
 	case <-time.After(15 * time.Second):
 		t.Fatal("createProject 未在 15s 内返回：加锁顺序把它挂死了")
-	}
-	if updErr == nil {
-		require.NoError(t, txB.Commit())
 	}
 
 	assert.False(t, isDeadlockErr(updErr),
