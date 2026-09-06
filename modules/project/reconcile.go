@@ -235,10 +235,16 @@ func (p *Project) scanI1Violations() {
 	cursorProject, cursorUID, total := cursors.i1Resume()
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
-		rows, err := p.queryI1ViolationPage(cursorProject, cursorUID, p.cfg.ReconcileLimit)
+		rows, err := p.i1PageFn(cursorProject, cursorUID, p.cfg.ReconcileLimit)
 		if err != nil {
+			// BREAK, not return: the *Save call at the end of this function is the only place
+			// progress is persisted, so returning here threw away every page already walked in
+			// this tick. With a persistent failure at page N+1 that meant re-scanning 1..N
+			// forever — re-emitting the same Error lines for the prefix on every tick and never
+			// reaching a row past the failure. Breaking keeps the cursor and the running total,
+			// with completed=false so nothing is published from a partial rotation.
 			p.Warn("对账 I1 违约扫描失败", zap.Error(err))
-			return // keep the cursor and running total; the next tick retries from here
+			break
 		}
 		if len(rows) == 0 {
 			completed = true
@@ -365,8 +371,9 @@ func (p *Project) scanAbandonedCleanupLeak() {
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.queryAbandonedLeakPage(cursorProject, cursorUID, p.cfg.ReconcileLimit)
 		if err != nil {
+			// break, not return — see scanI1Violations for why the cursor save must be reached.
 			p.Warn("对账 abandoned 工单泄漏扫描失败", zap.Error(err))
-			return
+			break
 		}
 		if len(rows) == 0 {
 			completed = true
@@ -450,8 +457,9 @@ func (p *Project) scanOrphanProjects() {
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.queryInspectedProjectPage(cursor, p.cfg.ReconcileLimit)
 		if err != nil {
+			// break, not return — see scanI1Violations for why the cursor save must be reached.
 			p.Warn("对账孤儿项目扫描失败", zap.Error(err))
-			return
+			break
 		}
 		if len(rows) == 0 {
 			completed = true
@@ -571,8 +579,9 @@ func (p *Project) scanEpochSanity() {
 			cursor, p.cfg.ReconcileLimit,
 		).Load(&rows)
 		if err != nil {
+			// break, not return — see scanI1Violations for why the cursor save must be reached.
 			p.Warn("对账 member_epoch 扫描失败", zap.Error(err))
-			return
+			break
 		}
 		for _, row := range rows {
 			if row.MemberEpoch < 0 {

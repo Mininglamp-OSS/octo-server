@@ -369,3 +369,50 @@ func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
 		"the seat check must still be a LOCKING read, or a concurrent Space removal can "+
 			"commit between it and the insert")
 }
+
+// ---------- N-2: a broken payload must not be a destructive default ----------
+
+// TestRoleEndpointRejectsAMissingRoleInsteadOfDemoting pins the sibling of the round-1
+// leave-handler hardening ("a destructive action must not be the failure mode of a broken
+// payload"). roleReq.Role was a plain int, so `{}` and `{"role": null}` both decoded to
+// RoleCommon (0), passed IsValidRole, and silently demoted the target with a 200.
+func TestRoleEndpointRejectsAMissingRoleInsteadOfDemoting(t *testing.T) {
+	srv, _ := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv, "n2a")
+
+	// Promote n2a so a silent demotion is observable.
+	w := doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/members/n2a/role", ownerTok,
+		map[string]any{"role": RoleAdmin})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.Equal(t, RoleAdmin, roleOfMember(t, created.ProjectID, "n2a"))
+
+	for name, body := range map[string]any{
+		"empty object": map[string]any{},
+		"null role":    map[string]any{"role": nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := doJSON(t, srv, http.MethodPut,
+				"/v1/projects/"+created.ProjectID+"/members/n2a/role", ownerTok, body)
+			assertProjectErrorCode(t, w, "err.server.project.request_invalid")
+			assert.Equal(t, RoleAdmin, roleOfMember(t, created.ProjectID, "n2a"),
+				"a payload that names no role must not change the role")
+		})
+	}
+
+	// A role that IS named still works, including the zero value.
+	w = doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/members/n2a/role", ownerTok,
+		map[string]any{"role": RoleCommon})
+	require.Equal(t, http.StatusOK, w.Code, "an explicit demotion is legitimate: %s", w.Body.String())
+	assert.Equal(t, RoleCommon, roleOfMember(t, created.ProjectID, "n2a"))
+}
+
+// roleOfMember reads a member's current project role straight from the database.
+func roleOfMember(t *testing.T, projectID, uid string) int {
+	t.Helper()
+	m, err := testDB.queryMember(projectID, uid)
+	require.NoError(t, err)
+	require.NotNil(t, m, "member %s must exist", uid)
+	return m.Role
+}

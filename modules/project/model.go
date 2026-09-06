@@ -155,7 +155,13 @@ type leaveReq struct {
 }
 
 type roleReq struct {
-	Role int `json:"role"`
+	// Role is a POINTER so a payload that names no role is distinguishable from one
+	// naming RoleCommon. As a plain int, `{}` and `{"role": null}` both decoded to 0,
+	// passed IsValidRole, and silently DEMOTED the target with a 200 — a destructive
+	// action as the failure mode of a broken payload, which is the same thing the leave
+	// handler was hardened against in round 1. Matches updateReq, where every optional
+	// field is a pointer for the same reason.
+	Role *int `json:"role"`
 	// TransferTo is required when demoting the last owner, for the same reason as
 	// in leaveReq.
 	TransferTo string `json:"transfer_to"`

@@ -40,6 +40,16 @@ type Project struct {
 	// mountProject) and restores it, so nothing global is rewritable in production.
 	addOneFn    func(projectID, spaceID, actorUID, uid string) (bool, error)
 	removeOneFn func(projectID, spaceID, actorUID, targetUID string) (bool, error)
+
+	// i1PageFn is the page-query seam for the I1 reconcile scan, on the same terms as the
+	// two above.
+	//
+	// One seam, not four: all four scans share the identical page loop, and what needs a
+	// behavioural test is that a MID-SCAN page failure keeps the progress made so far —
+	// which cannot be provoked from the outside, because it needs page 1 to succeed and
+	// page 2 to fail. The other three scans are held to the same shape by a source guard
+	// (TestReconcileScansKeepProgressOnAPageError) rather than by three more fields.
+	i1PageFn func(cursorProject, cursorUID string, limit int) ([]*i1Row, error)
 }
 
 // New builds the Project API and registers the Space-removal cascade step.
@@ -68,6 +78,9 @@ func New(ctx *config.Context) *Project {
 	}
 	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		return p.removeMember(projectID, spaceID, actorUID, targetUID)
+	}
+	p.i1PageFn = func(cursorProject, cursorUID string, limit int) ([]*i1Row, error) {
+		return p.queryI1ViolationPage(cursorProject, cursorUID, limit)
 	}
 
 	p.registerSpaceMemberRemovalCleanup()

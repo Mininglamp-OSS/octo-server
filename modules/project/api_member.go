@@ -371,18 +371,25 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 		respondProjectRequestInvalid(c, "")
 		return
 	}
-	if !IsValidRole(req.Role) {
+	// Presence before validity: an ABSENT role is a malformed request, not a request for
+	// role 0. Without this, `{}` demoted the target and answered 200.
+	if req.Role == nil {
+		respondProjectRequestInvalid(c, "role")
+		return
+	}
+	if !IsValidRole(*req.Role) {
 		httperr.ResponseErrorL(c, errcode.ErrProjectRoleInvalid, nil, nil)
 		return
 	}
 
 	actorUID := c.GetLoginUID()
-	changed, successor, err := p.changeMemberRole(row.ProjectID, row.SpaceID, actorUID, targetUID, req.Role, req.TransferTo)
+	newRole := *req.Role
+	changed, successor, err := p.changeMemberRole(row.ProjectID, row.SpaceID, actorUID, targetUID, newRole, req.TransferTo)
 	switch {
 	case err == nil:
 		if changed {
 			p.audit(auditRoleChange, actorUID, targetUID, row.ProjectID, row.SpaceID, "",
-				zap.Int("new_role", req.Role))
+				zap.Int("new_role", newRole))
 		}
 		if successor != "" {
 			// Demoting the last owner promotes a successor in the same transaction. Auditing
