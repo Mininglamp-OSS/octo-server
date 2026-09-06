@@ -384,9 +384,12 @@ func (d *DB) checkSpaceMembershipForWriteTx(tx *dbr.Tx, spaceID, uid string) (bo
 // that both transactions must queue on, and the Space row is the only row that exists for
 // every create in that Space.
 //
-// Lock order: `space` is the FIRST position in the module's declared order
-// (space -> project -> ... -> octo_project_member), so taking it here — before any project
-// or member row — is exactly in order.
+// Lock order: `space` comes AFTER space_member and before project
+// (space_member -> space -> project -> ... -> octo_project_member). This comment used to
+// declare `space` the first position, which is the pre-B-3 order — on the very helper whose
+// old position caused that deadlock, so the stale wording could have argued it back in
+// (PR #841 round 3, Jerry-Xin P3). The creator's seat lock must already be held when this is
+// called; see createProjectOnce for why that direction and not the reverse.
 //
 // Returns false when the Space does not exist or is not active.
 func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {

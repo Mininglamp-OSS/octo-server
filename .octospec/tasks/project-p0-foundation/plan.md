@@ -592,12 +592,28 @@ SELECT project_id, space_id FROM `octo_project` p
 | `project_i1_violations` | Gauge | — |
 | `project_i1_abandoned_cleanup_leak` | Gauge | — |
 | `project_orphan_total` | Gauge | — |
+| `project_ownerless_total` | Gauge | — |
 | `project_reconcile_duration_seconds` | Histogram | `scan` |
 
 绝不放 `space_id` / `project_id` / `uid`（会撑爆 Prometheus）。
 `/metrics` 端点已在服务中（`pkg/metrics/http.go`，main.go 启动），落地即被抓取。
 **`entry` 标签从第一天就要有**——它是 P1 发现"漏了一条写路径"的唯一信号，
 单个不分维度的计数器不满足 acceptance。
+
+#### 三个"只升不降"的 gauge 的处置（告警前必读）
+
+`project_orphan_total`、`project_i1_abandoned_cleanup_leak`、`project_ownerless_total`
+在 P0 **没有自动修复路径**：它们计的是需要人处理的常驻状态，不是会自行清零的瞬时值。
+只能上升的告警一定会被静音，所以配告警时按下面的处置来，别配成"回到 0"的恢复条件。
+
+| gauge | 含义 | 人工处置 |
+|---|---|---|
+| `project_orphan_total` | 活跃项目的 Space 行已消失或已解散 | 决定这批项目是归档还是迁到别的 Space；P0 不解散它们（跨模块 teardown 不在范围） |
+| `project_i1_abandoned_cleanup_leak` | 席位背后有 abandoned 清理工单且当前无 Space 席位 | 重投那批工单，或手工关席位；查工单为何耗尽重试 |
+| `project_ownerless_total` | 活跃项目没有任何活跃 owner | 手工指定 owner（P0 无端点，直接改库）。并发路径已修（`countActiveOwnersTx` 为锁定读），剩下的来源是"唯一 owner 被移出 Space"，那条待产品决策 |
+
+判读方式与"错误率"类指标不同：**非零即代表有积压**，数值是积压量而非速率。
+建议告警用"数值上升"而非"数值非零"，并在处理完成后人工确认读数回落。
 
 ### 3.12 错误码（`pkg/errcode/project.go`）
 

@@ -912,3 +912,119 @@ B-3 的实测结果比 review 的预测更严重：受害者正是 `modules/spac
 
 顺带更正一处方法论：`timeout` 在 macOS 上不存在，第一次批量跑这三个包时命令静默失败、
 测试根本没执行（grep 无输出被误读成"无失败"）。已重跑。
+
+---
+
+# PR #841 第三轮 review 的 TDD 修复
+
+两位 reviewer 都在真 MySQL（8.0.33 / 8.0.46）上**执行**了并发断言并独立收敛到同一组问题：
+一个 P0、两个 P1。Jerry-Xin 明确记录自己曾把其中两条评为 P3、属于低估（"the third
+undercall on this arc"），并背书 yujiawei 的流程建议。三条经源码逐一核实全部成立。
+
+## 本轮的核心教训：范围，不是原因
+
+第二轮我把 read view 陷阱的**原因写对了**，甚至写进了 guard 的失败消息——然后把 guard
+指向了 `createProject` 一个调用点。另外五条写路径的首条语句仍是 JOIN 版 helper，于是同一个
+陷阱在那些路径上造成了更严重的后果。
+
+reviewer 的话很准："the source guard identifies the cause precisely and would have caught
+this if its scope had been 'every write path' instead of 'createProject'."
+
+所以本轮不再打点状补丁，而是把两个纪律做成**结构性**的。
+
+## P0：授权聚合读旧快照
+
+| 后果 | RED 实测 | 修复 |
+|---|---|---|
+| 两个 owner 并发退出 → 项目 **0 owner** | `activeOwnerCount = 0`；P0 无修复路径（改角色/解散都是 owner-only），四个对账扫描无一检测 | 三处授权聚合改锁定读 |
+| 成员配额可绕过 | cap=2 起始 1 人，两个并发 add → **3 人** | 同上 |
+| disband 漏失效并发新增成员的缓存 | `affectedUIDs = ["owner1"]` 漏掉 late1，该成员在**已解散项目**上保留 60s 正缓存 | 同上 |
+| `wasSoleOwner` 日志可能失真 | 走同一个 `countActiveOwnersTx` | 随之修好 |
+
+编排方式：手写事务持 project 行锁并提交，真实 service 方法在锁上真实排队（reviewer 测到
+1.26s / 719ms，我这里 ~700ms），拿到锁后 `queryMemberTx` 是 `FOR UPDATE` 读到**新**值、
+而授权聚合读**旧**快照。这就是它在 code review 里看不出来的原因：要写的那行是最新的。
+
+**guard 从单点换成结构性**：`TestNoWriteAuthorisingAggregateIsANonLockingRead` 解析每一条在
+`*dbr.Tx` 上执行的 `SelectBySql`，要求凡读 `octo_project_member` 的都是锁定读。新代码自动被
+覆盖，无需改测试。判据是"在 `*dbr.Tx` 上执行"而**不是**"出现在文件里"——列表端点的
+`member_count` 列和指标采集都是 session 上的裸 COUNT，它们不在写事务里也不授权任何东西；
+guard 初版对这两处误报，这个区分就是那样钉下来的。
+
+## P1-1：行级锁序
+
+B-3 修的是两张**表**的顺序，没有约束多**行**。RED 实测 **1213，受害者是 disband 扫描**；
+结构上 add/leave/role 分别取 2/2/3 个独立席位锁。
+
+修法不是排序——disband 扫描按 id 排、不按 uid 排，本模块选任何顺序都可能与它相反。改为
+**一条 `uid IN (...) FOR SHARE OF sm`**，让 InnoDB 用它自己的扫描顺序，于是不存在"持有第一
+行等第二行"的状态。所有席位锁统一走 `requireSpaceSeatsTx`，guard 按路径计数调用点。
+
+这次统一顺带**免费修好了 actor/target 分类**（reviewer 的 P2）：所有路径现在都返回 actor 级
+sentinel，update/disband 不再把授权拒绝渲染成 `store_failed`（Internal/500），leave/role 不再
+用"目标用户"的文案说调用者自己的席位。leave/role 的新 arm 必须放在 target arm **之上**，
+因为 actor sentinel 包装了它。
+
+## P1-2：有界 1213/1205 重试
+
+三轮 review 各自都发现了一个"推理没覆盖到"的锁序环，所以"我们推理过顺序"被证明不足以作为
+唯一防线。七个写入口全部委托给 `...Once` 实现并经 `retryOnLockConflict`；1062 与所有 service
+sentinel 首次尝试即原样返回，handler 的 switch 一个都不用改。
+
+## 新增对账扫描：无 owner 项目
+
+`project_ownerless_total`。两条到达路径：并发那条已修，剩下"唯一 owner 被移出 Space"是产品
+待决——这个 gauge 是让那个决策有数据可依。已解散项目同样无 owner，那是正确的，两个方向都
+钉住了。Q4 成本 guard 改为**从源码枚举**分页查询（这是第五个扫描），因为需要手工扩范围的
+guard 正是 read view guard 只覆盖 1/6 的成因。
+
+## 一个险情，与第二轮同一失败模式
+
+把七个写方法重命名为 `...Once` 后，**三个源码 guard 开始检查空的重试包装器**。一个响亮地
+失败了，另**两个变绿却什么都没检查**。现在 guard 经 `implBody()` 解析实现体，三个都用
+"在包装器背后改实现"重新做了变异验证。
+
+记下来是因为它说明了 guard 的一个通用弱点：能被一次重命名打败的 guard 不是 guard。
+
+## 处置一览
+
+| 项 | 处置 |
+|---|---|
+| P0 三处授权聚合 | 改 `FOR SHARE`（都已持 project 行排他锁，新增锁范围可忽略）+ 包级结构性 guard |
+| P1 行级锁序 | 单条 `uid IN (...)` + 结构 guard；顺带补齐 actor 分类 6/6 |
+| P1 1213 重试 | `retryOnLockConflict` + 七入口 guard；1062/sentinel 不重试 |
+| 无 owner 检测 | 新扫描 + gauge + 双向测试；Q4 guard 自动枚举 |
+| `lockSpaceRowTx` 注释仍称 `space` 为锁序第一位 | 更正（就在那个当初导致 B-3 的 helper 上） |
+| 模块头锁序注释 | 补上"表级顺序无法表达行级"，并说明行级不靠约定而靠单条语句 + 重试兜底 |
+| `createProject` 在 Space 不活跃时答 actor 文案 | 反枚举一致，注释说明是有意的 |
+| 三个"只升不降"gauge 的运维处置 | 写进 `plan.md` §3.11（告警按"上升"而非"非零"配，附人工处置表） |
+| collation | **未在任何具名部署上验证**——按指示本轮不做；PR 保留 `needs-human-review` |
+| 缓存 stale positive、对账随历史行增长 | 拆后续 PR（reviewer 建议，避免本分支继续膨胀） |
+
+## 最终验证（第三轮）
+
+| 项 | 结果 |
+|---|---|
+| `modules/project` | **129 PASS / 0 FAIL**（`-race -shuffle=on`） |
+| `modules/space` | ok 16.9s |
+| `modules/group` | ok 25.3s |
+| `modules/message` | ok 6.1s |
+| `modules/thread` | ok 14.1s（此前基线/HEAD 皆 1/3 flaky，本次通过） |
+| 单元 lane（`./pkg/...` + `./tools/...`） | 0 FAIL |
+| build / vet（全仓）/ golangci-lint | 全绿，0 issues |
+| i18n-extract-check / i18n-lint | 通过 / 通过 |
+| gofmt / `git diff --check` | clean |
+
+brief 点名的四个包本轮**全部通过**，非回归证据不再依赖基线对照。
+
+## 变异验证清单（本轮）
+
+| 变异 | 变红的测试 |
+|---|---|
+| 去掉 `countActiveOwnersTx` 的 `FOR SHARE` | 包级 guard + 0-owner 行为测试 |
+| 去掉 disband 席位读的 `FOR SHARE` | 包级 guard + 缓存失效行为测试 |
+| `createProjectOnce` 改回 JOIN helper | createProject 专项 guard（**穿透重试包装器**） |
+| `addOneMemberOnce` 拆成两次席位锁 | 单语句结构 guard（穿透包装器） |
+| 新扫描的 WHERE 塞回 `status` | Q4 成本 guard（未点名该扫描，靠枚举命中） |
+| 拿掉 update handler 的 actor arm | handler 分类 guard |
+| presence 检查换零值默认 | 静默降级测试 |

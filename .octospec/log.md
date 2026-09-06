@@ -2125,3 +2125,27 @@ Two reviewers converged on the same headline; all four verified against code bef
   context deadline），重启容器后 HEAD 整包全绿；`modules/thread` 两侧同构 flaky（迁移竞态）。
 - **方法论修正**：`timeout` 在 macOS 不存在，批量跑包时命令静默失败、测试根本没执行，而
   grep 无输出被读成"无失败"。凡是"没有输出即通过"的判断都要先确认命令真的跑了。
+
+## 2026-09-06 — project P0：PR #841 第三轮 review 修复（改为结构化而非点状补丁）
+
+两位 reviewer 都在真 MySQL 上执行并发断言，独立收敛到一个 P0 + 两个 P1，并都指出同一个
+模式：连续三轮，每轮的修复都在**上一轮修复没走到的路径**上留下同类问题。
+
+- **本轮的教训是范围而不是原因**。第二轮我把 read view 陷阱的原因写对了（甚至写进 guard 的
+  失败消息），却把 guard 指向了一个调用点。另外五条写路径的首条语句仍是 JOIN 版 helper，
+  后果比配额失效严重得多：**两个 owner 并发退出让项目变成 0 owner**，P0 无修复路径、四个
+  对账扫描无一检测。实测复现（service 方法在 project 行锁上真实排队 ~700ms，拿到锁后
+  `queryMemberTx` 是 FOR UPDATE 读新值、授权聚合读旧快照——所以 code review 看不出来）。
+- **两个纪律都做成结构性的**：读可见性 guard 改为解析每条在 `*dbr.Tx` 上执行的 SELECT
+  （新代码自动覆盖）；所有席位锁改为一条 `uid IN (...)` 语句让 InnoDB 定序（排序无效，
+  disband 扫描按 id 排不按 uid 排）；七个写入口统一经有界 1213/1205 重试。
+- **险情，与第二轮同一失败模式**：把写方法重命名为 `...Once` 后，三个源码 guard 开始检查空的
+  重试包装器——一个响亮失败，**两个变绿却什么都没检查**。能被一次重命名打败的 guard 不是
+  guard；现在统一经 `implBody()` 解析实现体，并在包装器背后改实现重做了变异验证。
+- **guard 的判据要精确到执行上下文**：读可见性 guard 初版用"文件里是否出现裸 COUNT"，误报了
+  列表端点的 `member_count` 列和指标采集——那两处在 session 上、不在写事务里、不授权任何
+  东西。改判据为"是否在 `*dbr.Tx` 上执行"。
+- **顺带发现统一 helper 能免费修好另一条 review 项**：所有路径都走同一个席位锁 helper 之后，
+  actor/target 分类自动补齐 6/6，update/disband 不再把授权拒绝渲染成 Internal 500。
+- **P2 拆后续 PR**（reviewer 建议）：缓存 cache-aside stale positive、对账随历史行增长。
+  collation 按指示本轮不查，PR 明确标注未在具名部署验证。

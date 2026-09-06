@@ -31,11 +31,17 @@ import (
 // PR #841 round 2 (yujiawei P1-3 / Jerry-Xin B-3); the deadlock was reproduced against
 // MySQL 8.0.33 with the OPERATOR'S DISBAND as InnoDB's victim.
 //
-// Scope of this claim, stated because the earlier version of this comment did not: the
-// order above has now been checked against modules/space's disband and member-removal
-// transactions, not just against this module's own. Anything new here that locks a
-// second table must be re-checked the same way — "no cycle within this module" is not
-// the property that matters.
+// Scope of this claim, stated because two earlier versions of this comment overstated it:
+//
+//   - it has been checked against modules/space's disband and member-removal transactions,
+//     not just this module's own. "No cycle within this module" is not the property that
+//     matters.
+//   - it is a TABLE order, and a table order cannot express ordering among the ROWS of one
+//     table. That is where round 3's remaining cycle lived: several paths locked two or three
+//     space_member rows in sequence while modules/space's disband scan locks them row by row
+//     in id order. Rows are therefore not ordered by convention at all — every path takes all
+//     of its space_member locks in ONE statement (requireSpaceSeatsTx) and lets InnoDB choose,
+//     and retryOnLockConflict is the backstop for whatever this reasoning still misses.
 //
 // Every membership and role write follows the same three steps inside one
 // transaction:
@@ -353,6 +359,12 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 		return nil, err
 	}
 	if !spaceActive {
+		// Deliberately the same answer as "you hold no seat here", which renders as
+		// actor_not_space_member — literally inaccurate when the SPACE was disbanded, and
+		// intentional: distinguishing the two tells a caller whether a Space id they cannot
+		// access exists. Same anti-enumeration reasoning as projectMiddleware folding three
+		// refusals into one 404 (PR #841 round 3, P2 — noted because the message reads like a
+		// bug otherwise).
 		return nil, errNotSpaceMember
 	}
 
