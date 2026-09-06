@@ -4695,8 +4695,61 @@ func (u *User) verifyTokenAegisRedirect(c *wkhttp.Context) {
 
 // ==================== Auth Verify API (for Gateway / Microservices) ====================
 
+// userSpacesLimit caps the spaces list in the context response.
+//
+// Package-level rather than a local const so a test can pin the real value
+// instead of a copy of it — a copy is how a cap and its test drift apart, and
+// this one is load-bearing: a consumer checking X-Space-Id membership against a
+// truncated list denies a legitimate member.
+const userSpacesLimit = 100
+
 type authVerifyTokenReq struct {
 	Token string `json:"token"`
+	// SpaceID + ProjectIDs drive the Project half of the context response.
+	//
+	// A POINT QUERY, not a list: the caller already knows which project it cares
+	// about, because the project_id is on the resource row it is serving. So the
+	// request names the projects and the response answers only those, which makes
+	// the response O(asked) instead of O(the user's projects) — and that is what
+	// keeps a truncation contract out of the design entirely. Returning every
+	// project a user belongs to would need `truncated` plus a cursor for a list
+	// bounded only by the 1000-per-Space quota, and truncation is a case that has
+	// to be designed correctly or it fails open.
+	//
+	// Callers that genuinely need a list use the paginated user-facing
+	// GET /v1/space/:space_id/projects. The judgment path never reads a roster.
+	SpaceID    string   `json:"space_id"`
+	ProjectIDs []string `json:"project_ids"`
+}
+
+// verifyProjectAnswer is one project's answer in the context response.
+//
+// A member:false item carries ONLY project_id and member. No role, no
+// capabilities, no epoch — so "not a member", "no such project" and "a project
+// in another Space" are one indistinguishable answer on the wire. Handing a
+// non-member the epoch would leak both that the project exists and how often its
+// membership changes.
+//
+// The omitempty on every optional field is what makes that true byte-for-byte,
+// so it is load-bearing rather than tidiness.
+type verifyProjectAnswer struct {
+	ProjectID string `json:"project_id"`
+	Member    bool   `json:"member"`
+	// Role is octo_project_member.role: 0 member, 1 admin, 2 owner.
+	//
+	// Note the collision with the RESPONSE-level Role, which is the platform role
+	// and a STRING. Same name, different type, different meaning, and a consumer
+	// that conflates them gets a silent authorization bug — pinned by a test.
+	Role *int `json:"role,omitempty"`
+	// Capabilities is emitted EXPLICITLY rather than left for the consumer to
+	// derive from Role. A consumer that maps role numbers to permissions
+	// re-implements this repository's permission matrix and drifts from it the
+	// first time the matrix changes — silently, and in the direction of granting
+	// too much. Transitive owner/admin protection, the system-bot exemption and
+	// "does removing = 1 count as a member" are answered here and never exported
+	// as rules.
+	Capabilities []string `json:"capabilities,omitempty"`
+	MemberEpoch  *int64   `json:"member_epoch,omitempty"`
 }
 
 type ownedBot struct {
@@ -4727,6 +4780,41 @@ type authVerifyTokenResp struct {
 	// (which lacks per-space grouping).
 	Spaces           []string            `json:"spaces,omitempty"`
 	OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space,omitempty"`
+
+	// ContextError says the context lookup FAILED, as distinct from returning a
+	// truthful empty result.
+	//
+	// A separate field rather than flipping ContextIncluded, and the difference
+	// is a security property rather than a style choice. ContextIncluded does not
+	// mean "the lookup succeeded"; it means "this server speaks the v2 contract".
+	// A consumer reading false falls back to PRE-V2 handling, which trusts the
+	// client-supplied X-Space-Id header — so reporting a transient database error
+	// by clearing that flag would downgrade every gateway to trusting its callers
+	// for the duration of the incident. modules/user's own
+	// TestAuthVerifyToken_IncludeContext_DBError_FailSecure pins that, and it is
+	// right to.
+	//
+	// The task brief listed "context_included stays true on failure" as a live
+	// defect to fix. It is not one: with the flag true and the lists empty, a
+	// consumer's membership check finds nothing and DENIES, which is fail-closed.
+	// What was genuinely missing is the ability to tell a failure from an honest
+	// empty answer — for retry decisions and for alerting, not for authorization
+	// — and this field supplies exactly that without touching the flag's meaning.
+	ContextError bool `json:"context_error,omitempty"`
+
+	// SpacesTruncated says the spaces list above was cut at the policy cap.
+	//
+	// The cap has always existed and the over-fetch has always computed this
+	// fact; it was written to a server-side Warn and then dropped. A consumer
+	// therefore could not tell "this user belongs to these 100 Spaces" from
+	// "these are 100 of the user's Spaces", and a middleware doing an X-Space-Id
+	// membership check against a silently truncated list fails CLOSED for a
+	// legitimate member — an outage that looks like a permissions bug.
+	SpacesTruncated bool `json:"spaces_truncated,omitempty"`
+
+	// Projects answers exactly the project_ids the request named, in that order.
+	// Empty when none were asked for.
+	Projects []verifyProjectAnswer `json:"projects,omitempty"`
 }
 
 // authVerifyToken validates a user token and returns identity + owned bots.
@@ -4801,16 +4889,53 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 	// reject downstream authz that depends on them, which is safer than
 	// masking the issue.
 	if c.Query("include") == "context" {
-		spaces, ownedByspace, ctxErr := u.queryUserSpaceContext(resp.UID)
+		spaces, ownedByspace, truncated, ctxErr := u.queryUserSpaceContext(resp.UID)
 		if ctxErr != nil {
+			// FAIL-SECURE, unchanged: context_included stays TRUE and the lists
+			// stay empty, so a consumer's membership check finds nothing and
+			// denies. Clearing the flag would downgrade the consumer to its
+			// pre-v2 path, which trusts the client-supplied X-Space-Id — see the
+			// ContextError field comment.
+			//
+			// What IS new is that the failure is now distinguishable from a
+			// truthful empty answer, which is what the brief actually wanted.
 			u.Warn("authVerifyToken include=context 查询失败",
 				zap.Error(ctxErr), zap.String("uid", resp.UID))
-			spaces = []string{}
-			ownedByspace = map[string][]string{}
+			resp.ContextIncluded = true
+			resp.ContextError = true
+			resp.Spaces = []string{}
+			resp.OwnedBotsBySpace = map[string][]string{}
+			c.Response(resp)
+			return
 		}
 		resp.ContextIncluded = true
 		resp.Spaces = spaces
 		resp.OwnedBotsBySpace = ownedByspace
+		resp.SpacesTruncated = truncated
+
+		if len(req.ProjectIDs) > 0 {
+			answers, projErr := u.answerProjectMembership(resp.UID, req.SpaceID, req.ProjectIDs)
+			if projErr != nil {
+				if errors.Is(projErr, errTooManyProjectIDs) {
+					respondUserRequestInvalid(c, "project_ids")
+					return
+				}
+				// Same reasoning as above: a failed lookup must not be reported as
+				// a truthful set of answers, and every answer here is an
+				// authorization fact.
+				// Same fail-secure shape as the Space half: keep the contract
+				// flag, empty the answers, and say that it failed. A consumer
+				// that treats an absent project answer as "not a member" then
+				// denies, which is the safe direction.
+				u.Warn("authVerifyToken project context 查询失败",
+					zap.Error(projErr), zap.String("uid", resp.UID))
+				resp.ContextError = true
+				resp.Projects = nil
+				c.Response(resp)
+				return
+			}
+			resp.Projects = answers
+		}
 	}
 
 	c.Response(resp)
@@ -4823,7 +4948,7 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 // Note: owned_bots are grouped by space_id via the bot's space_member row
 // (bot is itself a user; robot table has no space_id). Mirrors the join
 // pattern in botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
-func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, error) {
+func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, bool, error) {
 	// (1) spaces the user is an active member of.
 	//
 	// v3.3.1 §A.1 (Jerry-Xin Critical 三审): INNER JOIN space ON s.status=1
@@ -4845,7 +4970,6 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 	type spaceRow struct {
 		SpaceID string `db:"space_id"`
 	}
-	const userSpacesLimit = 100
 	var spaceRows []spaceRow
 	_, err := u.db.session.SelectBySql(
 		`SELECT sm.space_id FROM space_member sm
@@ -4856,13 +4980,14 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		uid,
 	).Load(&spaceRows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	spaces := make([]string, 0, len(spaceRows))
 	for _, r := range spaceRows {
 		spaces = append(spaces, r.SpaceID)
 	}
-	if len(spaces) > userSpacesLimit {
+	spacesTruncated := len(spaces) > userSpacesLimit
+	if spacesTruncated {
 		u.Warn("queryUserSpaceContext spaces truncated at policy limit",
 			zap.String("uid", uid),
 			zap.Int("limit", userSpacesLimit),
@@ -4913,7 +5038,7 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		uid,
 	).Load(&botRows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if len(botRows) > ownedBotsLimit {
 		// >1000 means we hit the cap. Truncate to the policy limit so
@@ -4954,7 +5079,7 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 			ownedByspace[b.SpaceID] = append(ownedByspace[b.SpaceID], b.RobotID)
 		}
 	}
-	return spaces, ownedByspace, nil
+	return spaces, ownedByspace, spacesTruncated, nil
 }
 
 type authVerifyBotReq struct {
