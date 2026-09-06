@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: space-cloud-agents-by-owner"
-description: 通讯录改版：新增 GET /v1/space/directory，返回 Space 内全部活跃真人及各自名下的云端 AI 分身（排除本地 self_hosted），不分页，每人最多返回 50 个分身明细并保留真实计数。
+description: 通讯录改版：新增 GET /v1/space/directory，返回 Space 内全部活跃真人及各自名下的云端 AI 分身（排除本地 self_hosted），支持按真人展示名或可展示分身名称检索；不分页，每人最多返回 50 个分身明细并保留真实计数。
 tags: ["space", "isolation", "wire-contract", "error-response", "rate-limit", "testing", "commit"]
 timestamp: 2026-09-06T00:00:00+08:00
 slug: space-cloud-agents-by-owner
@@ -34,7 +34,7 @@ source: user
 新增端点，一次给出通讯录页所需的全部数据：
 
 ```
-GET /v1/space/directory?space_id=<id>[&only_with_agents=true]
+GET /v1/space/directory?space_id=<id>[&only_with_agents=true][&keyword=<keyword>]
 ```
 
 ```json
@@ -65,6 +65,15 @@ GET /v1/space/directory?space_id=<id>[&only_with_agents=true]
 
 **默认包含调用者自己，即使其名下没有云端分身。** `only_with_agents=true` 时，调用者
 与其他真人使用同一过滤规则。服务端不额外按 viewer 排除自己；前端可按展示需要处理。
+
+**`keyword` 是可选的字面量包含检索。** 服务端先 `TrimSpace`，再匹配真人最终展示名
+（`user.name` → `real_name` → 占位符）或其可展示分身的 `user.name`。`%`、`_` 与反斜杠
+按字面字符处理，不是 SQL 通配符。命中真人名称时，该真人会出现在顶层，但 `agents` 只保留
+名称也命中 `keyword` 的分身，故可能为 `[]`；命中分身名称时，owner 与该命中的分身出现。
+有 `keyword` 时，`agent_count` / `agents_truncated` 针对**名称匹配后的分身集合**计算，仍受
+每 owner 50 条明细上限约束。`only_with_agents=true` 在此结果上再过滤 `agent_count>0`。
+缺省或空白 `keyword` 完全保持原有全量目录语义。除这一参数外，不支持名称之外的筛选、分页或
+服务端拼音排序。
 
 ## Background
 
@@ -144,14 +153,17 @@ Load-bearing 中的 collation 说明。
    真人过滤条件，系统账号不作为 owner 或分身返回。在这个候选集上使用 MySQL 8 窗口函数：
    `COUNT(*) OVER (PARTITION BY creator_uid)` 得到真实计数，
    `ROW_NUMBER() OVER (PARTITION BY creator_uid ORDER BY robot_id ASC)` 得到序号 `rn`，
-   外层查询限定 `rn <= 50` 后再返回明细。
+   外层查询限定 `rn <= 50` 后再返回明细。`keyword` 非空时，候选集在窗口计算前增加
+   Bot 名称的字面量 `LIKE` 谓词，确保计数、截断标记与明细使用同一匹配集合。
 
 窗口计算尽量只携带 owner UID、Bot UID 等必要列；分身名称、简介等明细在选出前 50 个后
 读取。好友关系以 `friend.uid=loginUID AND friend.to_uid=botUID AND is_deleted=0`
 LEFT JOIN 到选出的明细，得到 `is_friend`，不按人或 Bot 发起 N+1 查询。
 
 Go 侧按 `creator_uid` 挂到第一段的人身上。无分身的人使用 `agents: []`、`agent_count: 0`；
-`only_with_agents=true` 最后按计数过滤。owner 不在真人名单中的记录丢弃，不生成无主行。
+`only_with_agents=true` 最后按计数过滤。`keyword` 非空时，第一段还一次性派生名称命中
+可展示 Bot 的 owner 集合再关联真人；owner 自身名称命中但没有名称命中的 Bot 仍可保留为零分身行。owner
+不在真人名单中的记录丢弃，不生成无主行。
 两段读取不承诺跨查询快照；同一 owner 的计数和分身选取在第二条 SQL 内完成。
 
 沿用现有 handler 的 context 超时模式（参见 `modules/space/api_welcome.go`）：从
@@ -171,7 +183,8 @@ Go 侧按 `creator_uid` 挂到第一段的人身上。无分身的人使用 `age
   已挂 `SpaceMiddleware` + UID 限流）的口径一致，不是新开的枚举面。
 - **`wire-contract`** — 新端点是**新增**契约，不改任何既有响应形状。`agent_hosting` /
   `agent_reported_hosting_at` 从此有了第二个读面（第一个是 `GET /v1/user/bots`），
-  两处对空串三态的解释必须一致。
+  两处对空串三态的解释必须一致。`keyword` 是唯一的名称筛选参数，且会将 `agents`、
+  `agent_count` 与 `agents_truncated` 收窄到名称匹配的可展示分身集合。
 - **名字兜底链（issue #344）** — 顶层 `name` 必须与 `members` 的
   `MemberDetailModel.DisplayName()` 给出同样的结果（`u.name` → `user_verification.real_name`
   → 稳定占位符），否则同一个人在通讯录和其它成员列表里显示不同的名字。
@@ -193,8 +206,9 @@ Go 侧按 `creator_uid` 挂到第一段的人身上。无分身的人使用 `age
 - **孤儿分身会消失** — 分身要求 owner 是本 Space 的活跃真人。owner 已退出/已注销/
   `creator_uid` 为空的 bot 不出现。App Bot 天然不出现（`modules/app_bot/app_bot.go:1124`
   注释：App Bot 不进 `space_member`，也不在 `robot` 表）。既有 Bot 广场接口不改。
-- **响应体量** — 顶层仍随 Space 真人数增长，分身明细每人最多 50 个；不能以“替代
-  members”为由宣称响应体积或数据库开销不增加。不得全量加载分身后在 Go 截断。
+- **响应体量** — 无 `keyword` 时顶层仍随 Space 真人数增长，分身明细每人最多 50 个；不能以“替代
+  members”为由宣称响应体积或数据库开销不增加。不得全量加载分身后在 Go 截断。名称检索使用
+  前后通配符，现有索引无法承诺子串检索为常数成本。
 - **索引** — 复用 `spacemember_spaceid_status(space_id, status)`、
   `spacemember_spaceid_uid(space_id, uid)`、`robot_id_robot_index`、`user.uid` 的唯一索引
   和 `friend(uid, to_uid)` 的唯一索引。窗口计算可能需要排序或临时表，实现时用 `EXPLAIN`
@@ -234,6 +248,10 @@ Go 侧按 `creator_uid` 挂到第一段的人身上。无分身的人使用 `age
 - 给 `fileHelper` 建立活跃 Space 成员行，且其 `user.robot=0` / `status=1` /
   `is_destroy=0` → 仍不出现在顶层；共享系统清单中的账号也不能作为 owner 或分身返回。
 - `only_with_agents=true` → 只返回有云端分身的人；缺省或 `false` → 返回全部真人。
+- `keyword` 匹配真人最终展示名或可展示的非 `self_hosted` Bot 名称；名称只命中真人时该真人
+  仍返回，但其 `agents` / `agent_count` 只统计名称命中的 Bot，可能为空。名称命中 Bot 时返回
+  owner 与该 Bot；`self_hosted` Bot 的名称不得使 owner 命中。`%` / `_` / 反斜杠按字面量匹配。
+- `keyword` 与 `only_with_agents=true` 同时传入时，只返回至少有一个**名称命中**可展示 Bot 的 owner。
 - 顶层 `name` 与同一 Space 下 `GET /v1/space/:id/members` 对同一个 uid 给出的
   `name` 一致（含 `u.name` 为空时的 `real_name` / 占位符兜底）。
 - `agent_hosting = 'self_hosted'` 的 bot **不出现**。

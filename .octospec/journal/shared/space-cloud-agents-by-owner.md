@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: space-cloud-agents-by-owner"
-description: Adds a Space-scoped directory endpoint that returns active human members with each owner's visible cloud-agent summaries, preserving real per-owner counts while bounding detail rows.
+description: Adds a Space-scoped directory endpoint that returns active human members with each owner's visible cloud-agent summaries, supports literal human/Bot-name keyword filtering, and preserves real per-owner counts while bounding detail rows.
 tags: ["space", "isolation", "directory", "bot", "wire-contract", "rate-limit", "testing"]
 timestamp: 2026-09-06T00:00:00+08:00
 # --- octospec extension fields ---
@@ -14,7 +14,7 @@ source: user
 
 ## What was done
 
-Added `GET /v1/space/directory?space_id=<id>[&only_with_agents=true]` for the
+Added `GET /v1/space/directory?space_id=<id>[&only_with_agents=true][&keyword=<keyword>]` for the
 contacts directory. The route is ordered as `AuthMiddleware` →
 `SharedUIDRateLimiter` → `SpaceMiddleware`; the handler requires the query
 selector, then queries through the middleware-published verified Space ID.
@@ -34,6 +34,12 @@ filter: it is never an authorization signal.
   provides per-viewer `is_friend` without N+1 reads.
 - Both reads use one three-second request context. Either failed or canceled
   query returns `ErrSpaceQueryFailed`; no partial success envelope is emitted.
+- `keyword` is a trimmed literal contains match over the owner display name or
+  visible Bot name. The owner query retains either type of match; the agent
+  candidate query applies the Bot-name match before window counting, so the
+  returned details, `agent_count`, and `agents_truncated` describe the same
+  filtered Bot set. `%`, `_`, and backslash are escaped with the module's
+  explicit LIKE escape clause.
 
 No migration, cache, pagination, frontend change, hosting authority column, or
 new error code was introduced.
@@ -60,9 +66,11 @@ new error code was introduced.
   `go test ./modules/space -run TestSpaceNoLegacyResponseError -count=1`.
 - `EXPLAIN` for both production query shapes: the owner query used
   `spacemember_spaceid_status`, user and verification UID joins were `eq_ref`,
-  and the agent candidate CTE used the Space/member and UID indexes. The
-  window calculation and final stable order used temporary/filesort as expected;
-  the friend lookup used its `(uid, to_uid)` unique key.
+  and the keyword path first materialized matching Bot owners from the same
+  Space/status index before joining humans. The agent candidate CTE used the
+  Space/member and UID indexes. The window calculation and final stable order
+  used temporary/filesort as expected; the friend lookup used its `(uid, to_uid)`
+  unique key.
 
 ## Structural learnings / gotchas
 

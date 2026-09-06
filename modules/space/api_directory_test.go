@@ -271,15 +271,90 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	}
 }
 
+func TestSpaceDirectoryKeywordFiltersHumanAndVisibleBotNames(t *testing.T) {
+	srv, _, err := setup(t)
+	require.NoError(t, err)
+	spaceID := fmt.Sprintf("sp-directory-keyword-%d", time.Now().UnixNano())
+	seedDirectorySpace(t, spaceID)
+
+	seedDirectoryUser(t, "owner-human-match", "Alice Filter", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-human-match", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-human-match", "bot-human-other", "Ordinary Cloud Bot", "", "octo_hosted", nil, 1, 1)
+
+	seedDirectoryUser(t, "owner-bot-match", "Bob", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-bot-match", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-bot-match", "bot-keyword", "Needle Bot", "", "octo_hosted", nil, 1, 1)
+
+	seedDirectoryUser(t, "owner-local-only", "Carol", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-local-only", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-local-only", "bot-local-keyword", "Needle Local", "", "self_hosted", nil, 1, 1)
+
+	seedDirectoryUser(t, "owner-literal", "Literal Owner", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-literal", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-literal", "bot-literal", "A_100% Bot", "", "octo_hosted", nil, 1, 1)
+	seedDirectoryUser(t, "owner-wildcard-near", "Near Owner", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-wildcard-near", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-wildcard-near", "bot-wildcard-near", "Ax100suffix", "", "octo_hosted", nil, 1, 1)
+
+	humanName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"Alice"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, humanName.Code, humanName.Body.String())
+	humanResp := decodeDirectoryResponse(t, humanName)
+	require.Len(t, humanResp.Data, 1)
+	human := findDirectoryMember(t, humanResp.Data, "owner-human-match")
+	require.Zero(t, human.AgentCount, "only Bot-name matches are returned as agents for a keyword search")
+	require.Empty(t, human.Agents)
+
+	humanNameWithAgentsOnly := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id":         {spaceID},
+		"keyword":          {"Alice"},
+		"only_with_agents": {"true"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, humanNameWithAgentsOnly.Code, humanNameWithAgentsOnly.Body.String())
+	require.Empty(t, decodeDirectoryResponse(t, humanNameWithAgentsOnly).Data)
+
+	botName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"Needle Bot"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, botName.Code, botName.Body.String())
+	botResp := decodeDirectoryResponse(t, botName)
+	require.Len(t, botResp.Data, 1)
+	botOwner := findDirectoryMember(t, botResp.Data, "owner-bot-match")
+	require.Equal(t, int64(1), botOwner.AgentCount)
+	require.Len(t, botOwner.Agents, 1)
+	require.Equal(t, "bot-keyword", botOwner.Agents[0].UID)
+
+	localBotName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"Needle Local"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, localBotName.Code, localBotName.Body.String())
+	require.Empty(t, decodeDirectoryResponse(t, localBotName).Data, "self-hosted Bot names must not match")
+
+	literalName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"A_100%"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, literalName.Code, literalName.Body.String())
+	literalResp := decodeDirectoryResponse(t, literalName)
+	require.Len(t, literalResp.Data, 1, "LIKE wildcard characters in keyword must be literal")
+	literalOwner := findDirectoryMember(t, literalResp.Data, "owner-literal")
+	require.Equal(t, int64(1), literalOwner.AgentCount)
+	require.Equal(t, "bot-literal", literalOwner.Agents[0].UID)
+}
+
 func TestDirectoryQueriesHonorCanceledContext(t *testing.T) {
 	_, _, err := setup(t)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err = testSpaceDB.queryDirectoryOwners(ctx, "sp-canceled")
+	_, err = testSpaceDB.queryDirectoryOwners(ctx, "sp-canceled", "")
 	require.Error(t, err)
-	_, err = testSpaceDB.queryDirectoryAgents(ctx, "sp-canceled", testutil.UID)
+	_, err = testSpaceDB.queryDirectoryAgents(ctx, "sp-canceled", testutil.UID, "")
 	require.Error(t, err)
 }
 
@@ -321,9 +396,9 @@ func TestQueryDirectoryAgentsCapsEachOwnerAndKeepsTrueCounts(t *testing.T) {
 		}
 	}
 
-	first, err := testSpaceDB.queryDirectoryAgents(context.Background(), spaceID, testutil.UID)
+	first, err := testSpaceDB.queryDirectoryAgents(context.Background(), spaceID, testutil.UID, "")
 	require.NoError(t, err)
-	second, err := testSpaceDB.queryDirectoryAgents(context.Background(), spaceID, testutil.UID)
+	second, err := testSpaceDB.queryDirectoryAgents(context.Background(), spaceID, testutil.UID, "")
 	require.NoError(t, err)
 	require.Len(t, first, 100, "the SQL query must enforce the per-owner cap before data reaches Go")
 	require.Len(t, second, 100)

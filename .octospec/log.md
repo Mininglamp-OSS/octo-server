@@ -72,8 +72,8 @@ change-log convention (§7). Newest first.
   reads share one cancellation/timeout budget and never produce partial data.
   The test suite now covers zero / exactly 50 / 51 agents, hosting's two empty
   states, inactive/orphan/system exclusions, friendship, request cancellation,
-  and auth/isolation behavior. An adversarial `>= 50` mutation fails the
-  exact-50 assertion.
+  auth/isolation behavior, and literal owner/Bot-name `keyword` filtering. An
+  adversarial `>= 50` mutation fails the exact-50 assertion.
 - **Learned** — `CREATE TABLE IF NOT EXISTS` is an existence check, not a test
   fixture schema check. The manually provisioned robot fixture now recreates
   its required shape; the reusable guidance is staged in

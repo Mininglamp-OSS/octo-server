@@ -3,6 +3,7 @@ package space
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -69,19 +70,23 @@ func (s *Space) listDirectory(c *wkhttp.Context) {
 		}
 		onlyWithAgents = parsed
 	}
+	// keyword is a literal, case/collation-dependent contains search over a
+	// human display name or a visible Bot name. The DB layer escapes LIKE
+	// metacharacters, and returns only Bot-name matches as agent details.
+	keyword := strings.TrimSpace(c.Query("keyword"))
 
 	// Both reads share one request budget. A failure in either one is terminal:
 	// returning an owner list without a complete agent query misstates the
 	// directory and makes query failures look like zero owned agents.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), directoryDBTimeout)
 	defer cancel()
-	owners, err := s.db.queryDirectoryOwners(ctx, spaceID)
+	owners, err := s.db.queryDirectoryOwners(ctx, spaceID, keyword)
 	if err != nil {
 		s.Error("查询空间通讯录真人失败", zap.Error(err), zap.String("space_id", spaceID))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
-	agents, err := s.db.queryDirectoryAgents(ctx, spaceID, c.GetLoginUID())
+	agents, err := s.db.queryDirectoryAgents(ctx, spaceID, c.GetLoginUID(), keyword)
 	if err != nil {
 		s.Error("查询空间通讯录分身失败", zap.Error(err), zap.String("space_id", spaceID))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
