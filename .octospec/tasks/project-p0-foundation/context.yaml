@@ -88,10 +88,21 @@ assumptions:
 
 # Cannot be verified from here; must be checked before merge.
 open_verification:
-  - "Production collation of space / space_member / user: those tables were created
-     without COLLATE and inherit the server default. The new tables pin
-     utf8mb4_general_ci; if production defaults to utf8mb4_0900_ai_ci the reconcile
-     JOINs would hit MySQL error 1267."
+  - "MEASURED 2026-09-06, no longer open as a question: production collation of
+     space / space_member / user IS utf8mb4_0900_ai_ci on all four joining columns,
+     while this module pins utf8mb4_general_ci. Cause is the historical mysqldump
+     import (COLLATE omitted for tables whose collation equalled the source default,
+     so they inherited the MySQL 8 default on restore). What remains open is the
+     ACTION, not the fact: the whole-set conversion recorded in brief.md must run
+     before OCTO_PROJECT_RECONCILE_ENABLED or OCTO_PROJECT_CREATE_ENABLED is turned
+     on. Converting only those three tables is empirically harmful — verified by a
+     reviewer on a drift rig: it breaks live space-member-list and user/robot joins
+     in existing modules, because robot / group_member remain 0900_ai_ci."
+  - "Whether the deployment can tolerate a rolling restart to flip either flag in
+     both directions. Both are env vars, so the mitigation path for anything found
+     in production is a deploy, not a config change."
+  - "Product sign-off that a project whose only owner is removed from its Space stays
+     active and unmanageable. project_ownerless_total detects it; nothing resolves it."
 
 # Found while implementing, fixed here (details in verification.md):
 defects_found:

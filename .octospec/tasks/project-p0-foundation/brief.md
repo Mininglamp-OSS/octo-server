@@ -713,11 +713,28 @@ batches has a live-broken middle state** — already-converted tables stop match
 not-yet-converted ones — so either finish in one window or group by "tables that join
 each other" and keep each group atomic.
 
+### Known trade-off recorded here so it is a decision (round 5, P2-8)
+
+`err.server.project.name_duplicated` fires against `uk_octo_project_space_active_name`, which
+does not distinguish `unlisted` rows — while the list endpoint deliberately hides them. So any
+Space member can probe names and learn that an unlisted project by that name exists.
+
+This is consistent with the stated design (discoverability is not a security boundary, and
+Space membership is), but it is the one place that boundary leaks through a **write** path
+rather than a read, so it belongs in the recorded list rather than being rediscovered. The
+alternative — scoping the unique key to listed projects only — would let two projects share a
+name and break the "one active name per Space" rule the key exists to enforce.
+
 ### Acceptance for this item
 
 - [ ] Pre-check run, all queries returned 0 rows, output pasted into the PR
 - [ ] Conversion completed, and `TABLE_COLLATION <> 'utf8mb4_general_ci'` returns no rows
-- [ ] Only then flip `OCTO_PROJECT_CREATE_ENABLED` (which needs a rolling restart)
+- [ ] Only then flip the two switches (each needs a rolling restart):
+      `OCTO_PROJECT_RECONCILE_ENABLED` (the three scans that JOIN legacy Space tables) and
+      `OCTO_PROJECT_CREATE_ENABLED` (the HTTP write surface). The reconcile flag exists
+      because the worker previously started unconditionally, so the create flag alone did not
+      bound this item — see the migration header. Turning reconcile on FIRST is the safer
+      order: it verifies the conversion against live data before any writes depend on it.
 
 ## Rollback
 

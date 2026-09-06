@@ -1130,3 +1130,125 @@ uid」正是有意行为。判据改为**「switch 之后有代码时才要求�
 | 让 create 路径上报 add 的 entry | 指标拆分行为测试 |
 | successor 改回无条件 required / 中和其校验 | 双向各自变红 |
 | 绕过日志上限直接 `p.Error` | 日志上限 guard |
+
+---
+
+# PR #841 第五轮 review 的 TDD 修复
+
+三位 reviewer 全部收敛到同一组：两个 blocker + 一个记录不一致。两人各自在真 MySQL 上验证。
+
+## B-1：对账 worker 无条件启动——我自己写的安全声明不成立
+
+`startReconcileWorker()` 是 `Route()` 第一句，不看任何 flag。两人独立验证：**空表也失败**
+（collation 在语句**解析**时聚合，非数据依赖）。所以 flag 关、零项目、零流量，仍每 pod 每 5
+分钟跑三个必然 1267 的扫描。
+
+后果比我上一轮想的重：三个 gauge **只在完整轮转时 publish**，所以**永远不 publish** → 监控读
+起来是「健康、零违约」，而它从未跑过一次。偏偏这个模块的全部意义是当安全网。
+
+于是我上一轮亲手写进迁移注释的那句「`OCTO_PROJECT_CREATE_ENABLED` 默认 false 使这成为 pre-enable
+检查项而非故障」——对 HTTP 面成立，对后台任务不成立。
+
+### 我没有照搬 reviewer 的建议，两处不同
+
+reviewer 建议 `if p.cfg.CreateEnabled { startReconcileWorker() }` 或专用 flag。我选专用 flag 且
+**只门控三个跨表扫描**，理由是照搬会引入两个新问题：
+
+1. **不能复用 create flag**。Jerry-Xin 自己指出了这个 nuance：写开关关掉时（出问题止血）恰恰
+   **最需要**不变量监控，而耦合会在那一刻让它变瞎。两个 flag 回答的是不同问题。
+2. **不能门控整个 worker**。`scanOwnerlessProjects`、`scanEpochSanity`、分布指标只碰本模块自己
+   的表（已核实 `metrics_collect.go` 只有 `octo_project*`），漂移与它们无关。一刀切会白白丢掉
+   能工作的观测——而 ownerless 检测的正是 **P0 无法修复**的状态，最不该等运维窗口。测试**双向**
+   钉住范围：把 ownerless 挪进门里同样变红。
+
+### 另外两件让门控诚实而非遮盖问题的事
+
+- **flag 关时启动 Warn 点名 env 变量**。没人宣布的「监控缺失」比「监控坏了」更糟——gauge 停在 0
+  读起来就是「零违约」。这行日志让「我们从来没开」可被发现。
+- **新增 `project_reconcile_scan_failures_total{scan}`**。此前扫描失败只有一行 Warn 且 gauge 不动，
+  于是「从未跑」与「跑了、没发现」在看板上完全同形——这正是漂移会呈现的样子。计数器让它可告警。
+  这是治本的那一半：门控只管 merge 时刻，计数器管运行时。
+
+## B-2：I1 扫描的 banned Space 豁免过宽，而我的测试固定了它
+
+第 4 子句用 `space.status = 1`（**授权**语义）会把 banned Space 的成员判为违约，所以才有第 3 子句
+blanket 豁免整个 banned Space。两者叠加后比任何一个都宽：banned Space 里**席位已关、清理从未完成**
+的座位——cascade 本会处理的真泄漏——永久不可见。
+
+一个谓词替掉两个：cleanup 语义（`space.status <> 0`），与 `queryAbandonedLeakPage` 一致（它一直
+是对的）。两个扫描声称镜像同一个函数，必须一致。
+
+**我的测试固定了错误行为**：fixture 用 `removeSpaceMember`（status=0）再 ban，然后断言「不算违约」。
+但 cleanup 语义下 status=0 的人**不是成员**，cascade 不会跳过他 → 那恰是两者**不一致**的场景。
+fixture 已修正并记录错在哪；反向用例（banned + 已移除 = **必须**标记）也补上了。
+
+RED 里最有力的是第三个子测试：同一 fixture 下 abandoned 扫描数到 1、I1 数到 0，直接展示分歧。
+
+## B-3：公开记录与 spec 自相矛盾
+
+PR body 还写着「未在任何具名部署验证」，而 head commit 就叫 `record the measured collation`——我改了
+brief 忘了同步 body。更糟：body 还推荐「扩展 repair migration 到那三张表」，而 **Jerry-Xin 在 drift
+rig 上把这条推翻了**：只转那三张会让 `modules/space` 的成员列表和 `modules/user` 的 pinned join
+报 1267（robot/group_member 仍是 0900）。他明确撤回了自己第四轮的建议，并确认我的「不能逐表转」正确。
+
+已修：PR body、迁移注释（含「四个扫描」→「五个中三个」）、`context.yaml` 的 `open_verification`
+（从「待确认」改为「已实测，待执行的是转换动作」）。
+
+## P2：又是两个「读起来像覆盖、实际没有」的 guard
+
+| 项 | 问题 | 处置 |
+|---|---|---|
+| P2-1 | 两个 collation guard 断言 legacy 列是 `general_ci`，而 CI 建库就是 `general_ci`——**靠继承通过**，永远抓不到它们命名的生产形态 | 新增**故意制造漂移**的回归测试。用**独立库**（要动的是 `space`/`space_member`/`user`，共享表，`-shuffle=on` 下改它们会毁掉下一个用例）+ `CREATE TABLE ... LIKE` 从真实 schema 复制（零手写 DDL、零漂移，含生成列与全部索引）+ 调**产品查询方法**。断言三个跨表语句与 roster 报 1267、pinned-only 扫描正常，然后跑 brief 的转换、全部转正。**它同时就是转换步骤的验收证据** |
+| P2-2 | 日志上限测试只断言行计数器，而 `seen++` 在 cap 比较**之前**无条件执行——reviewer 的变异**存活** | 把 emitter 做成可注入，断言**真实 emit 次数** = cap+1。reviewer 那个存活的变异现在变红 |
+
+## 我在这一轮自己抓到的三个问题
+
+reviewer 没提，是我实施过程中发现的：
+
+1. **指标标签不一致**：我给失败计数器传 `abandoned_leak`，而 duration histogram 一直用
+   `abandoned`。两个指标描述同一个扫描却用两个名字，看板 join 不上。统一到既有值，并加 guard
+   钉住「一个扫描在所有指标里只能有一个名字」——变异（改回不一致）即红。
+2. **删掉的函数会让 guard 变 vacuous**：`checkSpaceMembershipForWriteTx` 删除后，那句
+   `assert.NotContains(fn, "checkSpaceMembershipForWriteTx")` 永远成立。改为点名**仍存在**的
+   JOIN 版 helper `lockSpaceSeatsTx`。同理，它的测试不是删掉而是**改指在用的函数**，并改成一条
+   语句查三个 uid（顺带钉住批量下每个判定独立）。
+3. **既有 helper `histogramSum` 名不副实**：它遍历时 `return` 第一个 series，取决于 registry
+   迭代顺序。我加第五个 scan 标签后，它在整包跑时失败、单独跑通过。改为真的求和。
+
+## 处置一览（第五轮）
+
+| 项 | 处置 |
+|---|---|
+| B-1 worker 门控 | 专用 flag（非复用 create flag）+ 只门控三个跨表扫描 + 启动 Warn + 失败计数器；范围双向钉住 |
+| B-2 I1 谓词 | 一个 cleanup 语义谓词替掉两个；旧 fixture 修正并记录；补反向用例与跨扫描一致性用例 |
+| B-3 记录 | PR body / 迁移注释 / context.yaml 三处对齐；撤回被证伪的逐表转换建议 |
+| P2-1 | 故意漂移的回归测试（独立库 + LIKE + 产品方法），三向变异验证 |
+| P2-2 | emitter 可注入，断言真实 emit 次数 |
+| P2-6 | leave/role 补上兄弟分支都有的 return（今天无害只因 switch 恰在函数末尾，那不该是承重的） |
+| P2-7 | 删两个无非测试调用者的函数；锁序推理搬到 `lockSpaceSeatsTx`；受影响 guard 与测试改指现存函数 |
+| P2-3 ban/disband 与写事务的窄窗口 | 保持（`space` 不加锁是有意的：锁它会造出与 disband 的争用面，正是 B-3 那轮要避免的）；已在 `lockSpaceSeatsTx` 注释记录 |
+| P2-8 重复名 409 是 unlisted 存在性 oracle | 记入 brief 的已知取舍（discoverability 非安全边界，但这是它唯一从**写**路径泄漏的地方） |
+
+## 最终验证（第五轮）
+
+| 项 | 结果 |
+|---|---|
+| `modules/project` | **140 PASS / 0 FAIL**（`-race -shuffle=on`，连跑两次） |
+| `modules/space` / `group` / `thread` / `message` | 全部 ok（brief 点名的四个包） |
+| 单元 lane（`./pkg/...` + `./tools/...`） | 0 FAIL |
+| build / vet（全仓）/ golangci-lint | 全绿，0 issues |
+| i18n-extract-check / i18n-lint | 通过 / 通过 |
+| gofmt（本次改动文件）/ `git diff --check` | clean |
+
+## 变异验证清单（第五轮）
+
+| 变异 | 变红 |
+|---|---|
+| 第 4 子句退回 auth 语义（`=`） | 新旧两个 banned-Space 测试 |
+| 加回 blanket 豁免子句 | 同上 |
+| 去掉 worker 门控 | 门控范围测试 |
+| 把 ownerless 也塞进门里（**过度**门控） | 同上（反向保护） |
+| 扫描标签改回不一致 | 标签一致性 guard |
+| 中和 cap 比较（reviewer 那个**存活**的变异） | 日志上限测试（现在红） |
+| 删掉汇总行 | 同上 |
+| 不制造漂移 / `converge` 空实现 / 给 roster 加显式 COLLATE 假修复 | collation 漂移测试三向 |

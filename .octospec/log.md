@@ -2178,3 +2178,32 @@ Two reviewers converged on the same headline; all four verified against code bef
   **不能逐表转**——那三张表还和 robot/group_member/group/app_bot/opanalytics 维表 JOIN，只转
   它们会打破现在兼容的那些。方案是把 dump 那批一次转完。顺带发现：默认 collation 的库上
   **迁移无法从零重放**（category 的 `group_setting ⋈ group_category` 1267），会咬到下个新环境。
+
+## 2026-09-06 — project P0：PR #841 第五轮 review 修复
+
+三位 reviewer 收敛到同一组：两个 blocker + 一处记录不一致。两人各自在真 MySQL 上验证。
+
+- **我上一轮亲手写的安全声明不成立**。迁移注释写着「create flag 默认 false 使这成为 pre-enable
+  检查项而非故障」——对 HTTP 面成立，对后台任务不成立：`startReconcileWorker()` 是 `Route()` 第
+  一句，不看任何 flag。两人独立确认**空表也失败**（collation 在语句**解析**时聚合）。而且三个
+  gauge 只在完整轮转时 publish → **永远不 publish** → 监控读起来是「健康、零违约」，实际从未跑过。
+- **没照搬 reviewer 的门控建议，两处故意不同**：① 不复用 create flag——写开关关掉时（止血）恰恰
+  最需要不变量监控，耦合会在那一刻让它变瞎；② 不门控整个 worker——ownerless/epoch/分布指标只碰
+  本模块自己的表，一刀切白丢能工作的观测，而 ownerless 检测的是 P0 无法修复的状态。测试**双向**
+  钉住范围（过度门控同样变红）。
+- **让门控诚实而非遮盖**：flag 关时启动 Warn 点名 env 变量（没人宣布的「监控缺失」比「监控坏了」
+  更糟）；新增 `reconcile_scan_failures_total`（此前「从未跑」与「跑了没发现」在看板上同形，
+  这正是漂移会呈现的样子）。
+- **又一次：我的测试固定了错误行为**。I1 扫描对 banned Space 豁免过宽，而那个测试的 fixture 用
+  `removeSpaceMember`(status=0) 再 ban——cleanup 语义下那人**不是成员**，cascade 不会跳过他，
+  所以测试恰好在两者**不一致**的场景上断言了「一致」。一个 cleanup 语义谓词替掉原来的两个。
+- **删函数会让 guard 变 vacuous**：删掉 `checkSpaceMembershipForWriteTx` 后，`assert.NotContains`
+  那句永远成立。改为点名**仍存在**的 JOIN 版 helper。它的测试不是删而是**改指在用的函数**。
+- **实施中自己抓到三个**：指标标签不一致（`abandoned_leak` vs histogram 的 `abandoned`，看板
+  join 不上，已加一致性 guard）；既有 helper `histogramSum` 只 return 第一个 series 而非求和
+  （加第五个标签后整包跑失败、单独跑通过）；leave/role 缺 return 今天无害只因 switch 恰在函数末尾。
+- **collation 的正确 guard 形态**：CI 建库就是 general_ci，所以断言 legacy 列是 general_ci 的
+  guard 靠继承通过、永不失败。改成**故意制造漂移**：独立库（共享表不能在 shuffle 下改）+
+  `CREATE TABLE ... LIKE` 从真实 schema 复制（零手写 DDL）+ 调产品查询方法。它同时是转换的验收证据。
+- **Jerry-Xin 撤回了他自己第四轮的建议**：只转 space/space_member/user 会让 `modules/space` 与
+  `modules/user` 的现网 join 报 1267（robot/group_member 仍 0900）。坐实「不能逐表转」。
