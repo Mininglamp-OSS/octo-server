@@ -2264,3 +2264,8 @@ Two reviewers converged on the same headline; all four verified against code bef
   passes under `-race`, including the ledger's decision table and a new
   concurrency case proving the Lua decision-and-write is one atomic round trip
   (8 concurrent redemptions of one token yield exactly one `admit_first`).
+- **Learnings** — `learnings/pending/a-sliding-window-is-not-a-record-ttl.md`
+  (absence cannot mean both "never seen" and "expired"; the record must outlive
+  the window) and
+  `learnings/pending/validate-in-the-representation-the-consumer-uses.md`
+  (a guard protects the value as its consumer sees it, not as its author wrote it).

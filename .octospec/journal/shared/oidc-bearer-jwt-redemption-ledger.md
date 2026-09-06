@@ -154,3 +154,12 @@ Two findings were not acted on, deliberately:
   out or its `exp` passes. Re-applying `F` to repeats would refuse exactly the
   long-lived reuse `T` exists to permit. Closing it means one-shot redemption
   (`N=1`), which needs a fact about the client that the repo does not record.
+
+## Learnings staged for promotion
+
+- `learnings/pending/a-sliding-window-is-not-a-record-ttl.md` — when absence of a
+  record already means "never seen", letting the record expire with the window
+  makes expiry readmit exactly what the window excluded.
+- `learnings/pending/validate-in-the-representation-the-consumer-uses.md` — a
+  bound checked as a `time.Duration` and consumed as whole seconds passed
+  validation and arrived as the value validation existed to forbid.
