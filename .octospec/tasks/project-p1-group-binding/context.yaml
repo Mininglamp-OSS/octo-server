@@ -118,6 +118,26 @@ scope_changes:
       survive as ordinary groups, and if the product later wants "take the
       groups away too" it should be an explicit opt-in named "archive", not the
       default, because "disband" does not clean up what its name implies.
+  - id: migration-placement-corrected
+    decision: |
+      group.project_id ships from modules/group/sql, NOT modules/project/sql as
+      brief D2 specifies. D2's reasoning was "the module that owns the concept
+      owns the column", citing modules/space adding group.space_id from its own
+      directory. That precedent does not transfer: modules/group IMPORTS
+      modules/space, so space's migrations are in every binary containing group,
+      including group's test binary. modules/project is not a dependency of
+      modules/group at all — the cascade is reverse-registered at runtime — so
+      its migrations are absent there.
+      Found empirically, not by reasoning: with the column in
+      modules/project/sql, every modules/group and modules/channel test that
+      inserts a group failed with "Error 1054: Unknown column 'project_id' in
+      'field list'", because Model carries ProjectID and the DAO builds its
+      column list by reflection.
+      The Project-owned schema (octo_project_member.removing, the cascade
+      outbox) stays in modules/project/sql, where only modules/project reads or
+      writes it. Rule left behind: a column belongs to the migration directory
+      of a module whose code reads or writes it.
+
   - id: collation-follows-repo
     decision: |
       P1 follows what the repo already does rather than waiting on the
@@ -132,6 +152,26 @@ scope_changes:
 
 # Assumptions taken where the brief left a choice; each reversible at one site.
 assumptions: []
+
+# Deferred by the requester until #841 (P0) merges — do NOT act on these here.
+deferred_until_p0_merges:
+  - id: reconcile-switch-consolidation
+    note: |
+      Whether the reconcile job needs its own enable switch separate from
+      OCTO_PROJECT_CREATE_ENABLED. The argument for two was that they guard
+      different risks that do not overlap in time — CREATE_ENABLED guards "the
+      feature is not ready" (a business risk, flipped repeatedly), a reconcile
+      switch guards "the database collation is not unified yet" (an
+      infrastructure risk, permanently on once converted) — and that sharing one
+      switch blinds the I1 monitoring at exactly the moment someone kills writes
+      to stop the bleeding, while the Space-side cascade keeps producing new
+      violations.
+      MEASURED AT e6a46cf (#841 head): no RECONCILE_ENABLED / ReconcileEnabled
+      exists in the tree. The reconcile job is unconditional; only its interval
+      and page limit are configurable (OCTO_PROJECT_RECONCILE_INTERVAL /
+      _LIMIT). So there is nothing to consolidate at HEAD, and P1 adds no second
+      switch of its own — its new scans ride the existing job.
+      The requester's call: revisit after #841 merges. P1 does not touch it.
 
 # Cannot be verified from here; must be checked before merge.
 open_verification:

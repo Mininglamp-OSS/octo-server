@@ -381,3 +381,42 @@ func (d *DB) admitOrRestoreMembersTx(
 func newMemberVercode() string {
 	return fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember)
 }
+
+// ---------------------------------------------------------------------------
+// D7 — the org-directory listeners are converged, not deleted
+// ---------------------------------------------------------------------------
+
+// Legacy org-directory listeners. AddEventListener exists for OrgOrDeptCreate,
+// OrgOrDeptEmployeeUpdate and OrgEmployeeExit, and no publisher for any of them
+// exists IN THIS REPOSITORY.
+//
+// The design brief said to delete them on those grounds. Two documents in the
+// same .octospec tree disagree about whether this code is dead: #797's inventory
+// classifies two of these handlers as 「HR / org-directory offboarding paths —
+// arguably the highest-stakes callers」. P1 should not settle that by deleting
+// them, for a concrete reason rather than caution: modules/base/event is a
+// DATABASE queue, so Wait rows can predate the deploy, and a deleted listener
+// drops them silently — an offboarding that never happens, with no error
+// anywhere.
+//
+// So they are routed through the admission funnel like every other path (which
+// is mechanical, since they already did the same work by hand), and this counter
+// answers the question deletion was supposed to answer. Zero over an observation
+// window in production is what makes deleting them a safe, separate change.
+const (
+	legacyListenerRegisterUser      = "register_user"
+	legacyListenerOrgCreate         = "org_or_dept_create"
+	legacyListenerOrgEmployeeUpdate = "org_or_dept_employee_update"
+	legacyListenerOrgEmployeeExit   = "org_employee_exit"
+)
+
+var legacyDirectoryListenerTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: admissionMetricNamespace,
+	Name:      "legacy_directory_listener_total",
+	Help: "Executions of the org-directory event listeners that have no publisher " +
+		"in this repository. Non-zero means they are live and must not be deleted.",
+}, []string{"listener"})
+
+func observeLegacyDirectoryListener(listener string) {
+	legacyDirectoryListenerTotal.WithLabelValues(listener).Inc()
+}

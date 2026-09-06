@@ -133,10 +133,53 @@ func TestNoProjectIDRewritesOutsideTheDetachStep(t *testing.T) {
 			"involved.")
 }
 
-// assertNoWritesOutsideAllowlist walks the module root and reports every
+// assertNoWritesOutsideAllowlist walks the WHOLE module root and reports every
 // non-test .go file that contains a forbidden needle it is not allowlisted for.
 func assertNoWritesOutsideAllowlist(
 	t *testing.T,
+	subject string,
+	needles []string,
+	allowlist map[string][]string,
+	why string,
+) {
+	t.Helper()
+	assertNeedlesAbsent(t, "", false, subject, needles, allowlist, why)
+}
+
+// assertNoWritesOutsideAllowlistIn restricts the walk to files UNDER prefix.
+// Used where a needle is ambiguous outside that subtree — modules/thread has its
+// own DAO with identically named methods on a different type, and string
+// matching cannot tell the two apart.
+func assertNoWritesOutsideAllowlistIn(
+	t *testing.T,
+	prefix string,
+	subject string,
+	needles []string,
+	allowlist map[string][]string,
+	why string,
+) {
+	t.Helper()
+	assertNeedlesAbsent(t, prefix, false, subject, needles, allowlist, why)
+}
+
+// assertNoWritesOutsideAllowlistExcluding restricts the walk to files NOT under
+// prefix — the cross-module half of the same question.
+func assertNoWritesOutsideAllowlistExcluding(
+	t *testing.T,
+	prefix string,
+	subject string,
+	needles []string,
+	allowlist map[string][]string,
+	why string,
+) {
+	t.Helper()
+	assertNeedlesAbsent(t, prefix, true, subject, needles, allowlist, why)
+}
+
+func assertNeedlesAbsent(
+	t *testing.T,
+	prefix string,
+	excludePrefix bool,
 	subject string,
 	needles []string,
 	allowlist map[string][]string,
@@ -182,6 +225,12 @@ func assertNoWritesOutsideAllowlist(
 			return rerr
 		}
 		rel = filepath.ToSlash(rel)
+		if prefix != "" {
+			under := strings.HasPrefix(rel, prefix)
+			if under == excludePrefix {
+				return nil
+			}
+		}
 
 		allowed := allowlist[rel]
 		body, rerr := os.ReadFile(path)
@@ -256,4 +305,76 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(digits)
+}
+
+// admissionPrimitiveNeedles are the DAO primitives that write an admission.
+//
+// Guarding the CALLERS is necessary on top of guarding the table, because the
+// primitives live in db.go, which the table guard allowlists. A new module doing
+//
+//	group.NewDB(ctx).InsertMember(&group.MemberModel{...})
+//
+// writes group_member without tripping the table guard at all. That is not a
+// hypothetical: IService.AddMember was exactly that shape — no transaction, no
+// Space check, no version, no vercode — exported on the service interface, and
+// this change deletes it.
+var admissionPrimitiveNeedles = []string{
+	"InsertMemberTx(",
+	"InsertMember(",
+	"recoverMemberTx(",
+}
+
+// admissionPrimitiveAllowlist — inside modules/group, only these files may call
+// the primitives.
+//
+// # Why the primitives stay EXPORTED
+//
+// The task brief's D3 says InsertMemberTx / InsertMember / recoverMemberTx
+// "become unexported and callable only from" the admission entry. Unexporting
+// them is not possible without breaking the brief's own non-regression
+// acceptance, which requires the suites of group, thread, space, message,
+// botfather and bot_api to pass with NO existing test file edited: 41 test files
+// in exactly those packages build their fixtures through InsertMember, e.g.
+// modules/message/api_message_get_test.go and
+// modules/botfather/api_bot_thread_test.go.
+//
+// The two requirements cannot both hold literally. This guard delivers D3's
+// INTENT — the primitives are callable only from the funnel — while leaving the
+// test fixtures alone, because "callable only from" is a property a guard can
+// assert and the compiler's export rules only approximate.
+var admissionPrimitiveAllowlist = map[string][]string{
+	"modules/group/db.go":        admissionPrimitiveNeedles, // the definitions
+	"modules/group/admission.go": admissionPrimitiveNeedles, // the single entry
+}
+
+func TestAdmissionPrimitivesAreCalledOnlyFromTheFunnel(t *testing.T) {
+	assertNoWritesOutsideAllowlistIn(t, "modules/group/",
+		"the group_member admission primitives",
+		admissionPrimitiveNeedles,
+		admissionPrimitiveAllowlist,
+		"InsertMember / InsertMemberTx / recoverMemberTx write a member row without "+
+			"consulting invariant I2. Admissions go through admitOrRestoreMembersTx, "+
+			"which enforces the composite gate on BOTH the insert and the restore "+
+			"branch. (The primitives stay exported only because 41 existing test "+
+			"files build fixtures with them; this guard is what makes 'callable only "+
+			"from the funnel' true.)")
+}
+
+func TestNoGroupMemberRowsBuiltOutsideModulesGroup(t *testing.T) {
+	// The cross-module half. Any non-test file outside modules/group that
+	// constructs a group.MemberModel is building a group membership row, which
+	// means it is admitting or removing someone without the funnel. Today there
+	// are none.
+	//
+	// This is a proxy rather than a proof — a caller could pass a variable of
+	// that type built elsewhere — but it catches the shape every historical
+	// bypass actually had, including the one deleted in this change.
+	assertNoWritesOutsideAllowlistExcluding(t, "modules/group/",
+		"cross-module group membership rows",
+		[]string{"group.MemberModel{"},
+		map[string][]string{},
+		"a group membership row built outside modules/group cannot have gone "+
+			"through the admission funnel. Route the operation through the group "+
+			"service instead, or reverse-register a step the way modules/space "+
+			"receives its preset-group admitter.")
 }

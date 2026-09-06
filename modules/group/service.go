@@ -2,7 +2,6 @@ package group
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -113,7 +112,6 @@ type IService interface {
 	// 获取用户所有超级群信息
 	GetUserSupers(uid string) ([]*InfoResp, error)
 	// 新增群成员
-	AddMember(model *AddMemberReq) error
 	// 获取指定一批群的指定成员信息
 	GetMembersWithUIDAndGroupIds(uid string, groupNos []string) ([]*MemberResp, error)
 	// 查询一批群的管理员及群主
@@ -376,13 +374,6 @@ func (s *Service) GetUserSupers(uid string) ([]*InfoResp, error) {
 	return infoResps, nil
 }
 
-func (s *Service) AddMember(model *AddMemberReq) error {
-	err := s.db.InsertMember(&MemberModel{
-		GroupNo: model.GroupNo,
-		UID:     model.MemberUID,
-	})
-	return err
-}
 func (s *Service) GetGroupMemberMaxVersion(groupNo string) (int64, error) {
 	version, err := s.db.queryGroupMemberMaxVersion(groupNo)
 	return version, err
@@ -722,12 +713,6 @@ func (s *Service) GetBotMemberUIDs(groupNo string) ([]string, error) {
 type AddGroupReq struct {
 	GroupNo string
 	Name    string
-}
-
-// AddMemberReq 添加群成员
-type AddMemberReq struct {
-	GroupNo   string
-	MemberUID string
 }
 
 // InfoResp 群信息
@@ -1238,6 +1223,11 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
 	// group_member 的 is_external_* 标记在同一事务内一致（与 ADD / DELETE
 	// 路径对称，bot-only 外部不会 flip 群标记）。
+	// 建群时的项目归属。P1 的排序约束要求级联先于创建参数存在，所以这里目前
+	// 恒为空串（直属 Space），闸门照常在位。
+	newGroupProjectID := ""
+	initialAdmissions := make([]MemberAdmission, 0, len(memberUsers))
+
 	isExternalGroup := 0
 	for _, memberUser := range memberUsers {
 		if memberUser.UID == req.Creator {
@@ -1300,27 +1290,32 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			isExt = 1
 			srcSpaceID = sourceSpaceMap[memberUser.UID]
 		}
-		err = s.db.InsertMemberTx(&MemberModel{
-			GroupNo:       groupNo,
+		initialAdmissions = append(initialAdmissions, MemberAdmission{
 			UID:           memberUser.UID,
-			Role:          role,
 			Version:       memberVersion,
+			Role:          role,
 			InviteUID:     req.Creator,
 			Robot:         memberUser.Robot,
-			Status:        int(common.GroupMemberStatusNormal),
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}, tx)
-		if err != nil {
-			s.Error("insert member failed", zap.Error(err), zap.String("uid", memberUser.UID))
-			return nil, errors.New("failed to insert group member")
-		}
+		})
 		realMemberUIDs = append(realMemberUIDs, memberUser.UID)
 		memberVos = append(memberVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
 	}
 	if len(realMemberUIDs) == 0 {
 		return nil, errors.New("no valid member to add")
+	}
+	// 收口到唯一准入口（A3）。newGroupProjectID 目前恒为空串——建群接口还不接受
+	// 客户端传入的 project_id，那个参数跟级联一起落地（brief 的排序约束：绝不能
+	// 出现「项目群已存在、级联还没有」的状态）。等它落地时这里改一行即可，闸门
+	// 已经在位并且有测试。
+	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID,
+		initialAdmissions, AdmissionEntryCreateGroup); err != nil {
+		s.Error("insert members failed", zap.Error(err), zap.String("groupNo", groupNo))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("failed to insert group member")
 	}
 
 	// Bot 加入群
@@ -1330,16 +1325,16 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			s.Error("generate bot member version failed", zap.Error(err))
 			return nil, err
 		}
-		err = s.db.InsertMemberTx(&MemberModel{
-			GroupNo:   groupNo,
+		// 收口到唯一准入口（A4）。Bot 走的是与人相同的闸门：只有 pkg/space 白名单
+		// 里的系统 bot 才对项目成员资格豁免，普通 bot 需要显式的项目席位，否则
+		// 「邀请一个 bot」就成了往项目群里塞监听者的旁路。
+		err = s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID, []MemberAdmission{{
 			UID:       req.BotUID,
-			Role:      MemberRoleCommon,
 			Version:   botMemberVersion,
+			Role:      MemberRoleCommon,
 			InviteUID: req.Creator,
 			Robot:     1,
-			Status:    int(common.GroupMemberStatusNormal),
-			Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
-		}, tx)
+		}}, AdmissionEntryCreateGroupBot)
 		if err != nil {
 			s.Error("insert bot member failed", zap.Error(err))
 			// Bot 加入失败不阻断建群
@@ -1556,6 +1551,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 
 	var addedUIDs []string
 	var addedVos []*config.UserBaseVo
+	admissions := make([]MemberAdmission, 0, len(memberUsers))
 	hasNewExternal := false
 	for _, memberUser := range memberUsers {
 		if memberUser.IsDestroy == user.IsDestroyDone {
@@ -1579,31 +1575,15 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			srcSpaceID = sourceSpaceMap[memberUser.UID]
 		}
 
-		// 检查是否之前被删除过（需要恢复）
-		insStart := time.Now()
-		existDelete, _ := s.db.ExistMemberDelete(memberUser.UID, req.GroupNo)
-		newMember := &MemberModel{
-			GroupNo:       req.GroupNo,
+		admissions = append(admissions, MemberAdmission{
 			UID:           memberUser.UID,
-			Role:          MemberRoleCommon,
 			Version:       memberVersion,
-			Status:        int(common.GroupMemberStatusNormal),
+			Role:          MemberRoleCommon,
 			InviteUID:     req.OperatorUID,
 			Robot:         memberUser.Robot,
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}
-		if existDelete {
-			err = s.db.recoverMemberTx(newMember, tx)
-		} else {
-			err = s.db.InsertMemberTx(newMember, tx)
-		}
-		insertMs += time.Since(insStart).Milliseconds()
-		if err != nil {
-			s.Error("add group member failed", zap.Error(err), zap.String("uid", memberUser.UID))
-			continue
-		}
+		})
 		addedUIDs = append(addedUIDs, memberUser.UID)
 		addedVos = append(addedVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
 		// is_external_group 语义只反映人类外部成员：bot 即便 is_external=1
@@ -1614,6 +1594,18 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			hasNewExternal = true
 		}
 	}
+
+	// 收口到唯一准入口（I2 / D3）。原先是每个 uid 一次 ExistMemberDelete 会话查询
+	// 加一次 insert/recover，且单个失败时 continue；现在整批一条 upsert，失败即整批
+	// 回滚。原子失败优于部分成功：部分成功会让下面的成员添加事件通告一批人，其中
+	// 有些并没有真的写进去。
+	insStart := time.Now()
+	if err := s.db.admitOrRestoreMembersTx(tx, req.GroupNo, groupModel.SpaceID, groupModel.ProjectID,
+		admissions, AdmissionEntryAddMembers); err != nil {
+		s.Error("add group members failed", zap.Error(err), zap.String("groupNo", req.GroupNo))
+		return nil, err
+	}
+	insertMs += time.Since(insStart).Milliseconds()
 
 	// 首次出现外部成员时，在事务内将群标记为外部群，确保成员/群标记一致提交
 	markedExternal := false
