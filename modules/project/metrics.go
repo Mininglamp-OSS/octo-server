@@ -159,3 +159,47 @@ var (
 func observeRejected(entry, reason string) {
 	writeRejected.WithLabelValues(entry, reason).Inc()
 }
+
+// ---------------------------------------------------------------------------
+// P1 — group-binding invariants
+// ---------------------------------------------------------------------------
+
+// i2Violations counts active group_member rows in a project group whose uid is
+// not an active member of that project.
+//
+// The one to alert on. I2 has NO read-path filter behind it: a violating row
+// means that person sees the group in sidebar/sync, receives its messages over
+// WuKongIM, and can post in it. Non-zero is a live access-control failure, not a
+// data-quality nit.
+var i2Violations = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "i2_violations_total",
+	Help:      "Active members of a project group who are not active members of that project.",
+})
+
+// i3Violations counts groups whose project_id points at a project that is
+// disbanded, in another Space, or absent.
+var i3Violations = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "i3_violations_total",
+	Help:      "Groups whose project attribution is disbanded, cross-Space or missing.",
+})
+
+// removingStalls counts seats stuck mid-removal past the stall threshold.
+//
+// A DISTINCT signal from i2_violations_total, with the opposite meaning: I2 says
+// the invariant broke, this says the cascade stopped. Alerting on them together
+// would make an operator treat a stuck worker as a security incident and a
+// security incident as a stuck worker.
+var removingStalls = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "removing_stalled_total",
+	Help:      "Project seats sitting at removing=1 past the stall threshold.",
+})
+
+// removalBacklog counts pending cascade jobs.
+var removalBacklog = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "removal_backlog_total",
+	Help:      "Pending project member-removal cascade jobs.",
+})

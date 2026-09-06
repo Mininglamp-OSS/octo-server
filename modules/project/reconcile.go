@@ -68,6 +68,12 @@ type reconcileCursors struct {
 	abandonedProject string
 	abandonedUID     string
 	abandonRun       int
+	// P1 scans. Both rotate over `group`.id, which is why they reuse the
+	// idResume/idSave pair rather than the composite cursor the member scans need.
+	i2Group int64
+	i2Run   int
+	i3Group int64
+	i3Run   int
 }
 
 var cursors reconcileCursors
@@ -147,6 +153,8 @@ func resetCursorsForTest() {
 	cursors.epoch = 0
 	cursors.ownerless, cursors.ownerlessRun = 0, 0
 	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
+	cursors.i2Group, cursors.i2Run = 0, 0
+	cursors.i3Group, cursors.i3Run = 0, 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly
@@ -220,6 +228,14 @@ func (p *Project) runReconcile() {
 	// state P0 cannot repair, which is precisely what should not be waiting on an ops window.
 	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
+	// P1: the group-binding invariants. I2 is the one with teeth — there is no
+	// read-path filter behind it, so a violation is a person seeing a project
+	// group they are not in. I3 catches attribution that survived a failed
+	// detach. The stall scan is deliberately separate from I2: it means the
+	// machinery stopped, not that the invariant broke.
+	p.scanI2Violations()
+	p.scanI3Violations()
+	p.scanRemovingStalls()
 }
 
 // reconcileLogCap bounds the per-row Error lines ONE scan emits in ONE tick.
