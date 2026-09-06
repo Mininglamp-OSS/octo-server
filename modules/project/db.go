@@ -175,9 +175,16 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 // no-op reruns — the step is re-executed on every job retry — and break the
 // "a no-op write does not change the epoch" rule that clients cache against.
 func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) error {
+	_ = now // the statement is clock-free now; the parameter stays for call-site stability
+	// updated_at is deliberately NOT written here: it is the field a client diffs to decide
+	// whether the project's PROFILE changed, and member_epoch already carries the roster
+	// signal — writing both made every roster edit churn the profile clock (yujiawei Q8,
+	// PR #841 round 1). The status predicate makes the method safe on its own terms instead
+	// of by caller convention: a disbanded project's epoch must not move.
 	_, err := tx.UpdateBySql(
-		"UPDATE octo_project SET member_epoch = member_epoch + 1, updated_at = ? WHERE project_id = ?",
-		now, projectID,
+		"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
+			"WHERE project_id = ? AND status = ?",
+		projectID, StatusNormal,
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("project: bump member epoch: %w", err)

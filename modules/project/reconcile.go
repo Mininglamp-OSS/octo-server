@@ -483,7 +483,12 @@ func (p *Project) queryInspectedProjectPage(cursor int64, limit int) ([]*orphanR
 	var rows []*orphanRow
 	_, err := p.db.session.SelectBySql(
 		"SELECT p.id, p.project_id, p.space_id, "+
-			"(NOT EXISTS (SELECT 1 FROM `space` s WHERE s.space_id = p.space_id)) AS violating "+
+			// Orphan = the Space is GONE (row absent) or DISBANDED (status=0). Both are
+		// unrecoverable states that leave the project permanently invisible. A BANNED Space
+		// (status=2) is deliberately not an orphan: a ban is recoverable, and flagging one
+		// would cry wolf every tick of every ban.
+		"(NOT EXISTS (SELECT 1 FROM `space` s "+
+		"             WHERE s.space_id = p.space_id AND s.status <> 0)) AS violating "+
 			"FROM `octo_project` p "+
 			"WHERE p.status = ? AND p.id > ? "+
 			"ORDER BY p.id LIMIT ?",

@@ -3,6 +3,7 @@ package project
 // Q8 smaller items, each with its reproducer.
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -55,19 +56,30 @@ func TestReconcileFlagsProjectsOfDisbandedSpace(t *testing.T) {
 // member_epoch already carries the roster signal.
 func TestMembershipWriteDoesNotTouchProjectUpdatedAt(t *testing.T) {
 	srv, _ := setup(t)
-	ownerTok, tokens, created := projectWithMembers(t, srv, "w1")
+	ownerTok, _, created := projectWithMembers(t, srv)
+	seedUser(t, "fresh1")
+	seedSpaceMember(t, spaceA, "fresh1", 0, 1)
 	before := updatedAtOf(t, created.ProjectID)
 
+	// A REAL add (fresh uid), not a no-op re-add: the epoch must move while updated_at must
+	// not — the two signals are now cleanly separated.
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"w1"}})
+		ownerTok, map[string]any{"uids": []string{"fresh1"}})
 	require.Equal(t, 200, w.Code, "body: %s", w.Body.String())
+	var outcomes []memberOutcome
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
+	require.Len(t, outcomes, 1)
+	require.True(t, outcomes[0].OK, "seeding add failed: %s", outcomes[0].Reason)
+	// committed itself is deliberately off the wire; its BEHAVIOR is pinned by
+	// TestNoOpBatchWithActorFailureStaysOneStatusCode in review4_blocker_test.go. Here the
+	// observable consequences are asserted below: the DB row exists, updated_at is unmoved,
+	// the epoch moved.
 
-	assert.Equal(t, before, updatedAtOf(t, created.ProjectID),
+	after := updatedAtOf(t, created.ProjectID)
+	assert.Equal(t, before.UpdatedAt, after.UpdatedAt,
 		"a membership write must not churn the project's updated_at")
-
-	// The epoch still moved — that is the roster signal.
-	assert.Equal(t, before.Epoch+1, epochOf(t, created.ProjectID))
-	_ = tokens
+	assert.Equal(t, before.Epoch+1, after.Epoch,
+		"the epoch is the roster signal and must still move")
 }
 
 // TestBumpMemberEpochSkipsDisbandedProjects pins the DAO's status predicate: the only

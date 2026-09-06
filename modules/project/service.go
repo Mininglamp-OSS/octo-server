@@ -409,10 +409,13 @@ func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string,
 		return nil, fmt.Errorf("project: read seats before disband: %w", err)
 	}
 
-	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
+	// Bump BEFORE the status flip: bumpMemberEpochTx guards on status=1 (the predicate that
+	// keeps a disbanded project's epoch frozen), and disband is exactly the write that must
+	// move the epoch — the brief lists it alongside add/remove/leave/role-change/cascade.
+	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
-	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

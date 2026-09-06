@@ -82,3 +82,37 @@ func TestRemoveBatchBare404WhenNothingCommitted(t *testing.T) {
 	assertProjectErrorCode(t, w, "err.server.project.not_found")
 	assert.Equal(t, 1, calls)
 }
+
+// TestNoOpBatchWithActorFailureStaysOneStatusCode pins Jerry-Xin's companion finding at the
+// BEHAVIOR level (committed is deliberately off the wire, so it cannot be asserted from a
+// response): a batch whose only "successes" are idempotent no-ops (re-adding existing
+// members, OK=true, nothing written) followed by an actor-level failure must still answer
+// with the single status code — "nothing committed yet" is TRUE for that batch.
+//
+// Mutated-check: with anyApplied keyed on OK instead of committed, this test returns 200
+// with a partial report and FAILS — verified before the fix landed.
+func TestNoOpBatchWithActorFailureStaysOneStatusCode(t *testing.T) {
+	srv, _ := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv, "already1")
+
+	// already1 holds a seat: re-adding is a no-op. The seam makes the SECOND target hit an
+	// actor-level failure after the no-op "succeeded".
+	calls := 0
+	orig := addOneMemberForTest
+	addOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, uid string) (bool, error) {
+		calls++
+		if uid == "blocked1" {
+			return false, errPermissionDenied
+		}
+		return orig(pr, projectID, spaceID, actorUID, uid)
+	}
+	t.Cleanup(func() { addOneMemberForTest = orig })
+
+	seedUser(t, "blocked1")
+	seedSpaceMember(t, spaceA, "blocked1", 0, 1)
+
+	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerTok, map[string]any{"uids": []string{"already1", "blocked1"}})
+	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
+	assert.Equal(t, 2, calls)
+}
