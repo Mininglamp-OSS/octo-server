@@ -470,9 +470,16 @@ func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string,
 	// Read the seats before closing them: after the UPDATE the status filter no
 	// longer matches, so the cache-invalidation list would come back empty and the
 	// removed members would keep their cached role for a full TTL.
+	// FOR SHARE, for the reason on countActiveOwnersTx: this transaction's read view opened at
+	// its first statement (the JOINing seat check), so a plain SELECT here answers from a
+	// snapshot older than the project row lock — while the UPDATE below is a CURRENT read and
+	// closes seats this list never saw. Reproduced: the list came back as ["owner1"] while the
+	// UPDATE closed ["owner1", "late1"], so nothing invalidated late1's cached role and they
+	// kept a positive entry on a DISBANDED project for the full TTL. That is exactly the leak
+	// the requirement below exists to prevent, so the read has to see what the UPDATE will.
 	var affectedUIDs []string
 	if _, err := tx.SelectBySql(
-		"SELECT uid FROM `octo_project_member` WHERE project_id = ? AND status = ?",
+		"SELECT uid FROM `octo_project_member` WHERE project_id = ? AND status = ? FOR SHARE",
 		projectID, MemberStatusActive,
 	).Load(&affectedUIDs); err != nil {
 		return nil, fmt.Errorf("project: read seats before disband: %w", err)

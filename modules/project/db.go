@@ -310,10 +310,13 @@ func (d *DB) countActiveMembers(projectID string) (int, error) {
 
 // countActiveMembersTx is countActiveMembers inside a write transaction, so the
 // member quota cannot be crossed by two concurrent adds.
+// countActiveMembersTx counts active seats as a LOCKING read, for the reason spelled out on
+// countActiveOwnersTx. Reproduced consequence: two concurrent adds against max_members=2 each
+// counted 1 and both were admitted, leaving 3 — at the 500 default, 501+.
 func (d *DB) countActiveMembersTx(tx *dbr.Tx, projectID string) (int, error) {
 	var count int
 	err := tx.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE project_id = ? AND status = ?",
+		"SELECT COUNT(*) FROM `octo_project_member` WHERE project_id = ? AND status = ? FOR SHARE",
 		projectID, MemberStatusActive,
 	).LoadOne(&count)
 	if err != nil {
@@ -595,11 +598,30 @@ func (d *DB) updateMemberRoleTx(tx *dbr.Tx, projectID, uid string, role int, now
 }
 
 // countActiveOwnersTx counts active owners, used by the last-owner guard.
+// countActiveOwnersTx counts the project's active owners as a LOCKING read.
+//
+// `FOR SHARE` is not optional here, and the reason is the same read-view trap
+// lockSpaceSeatRowTx exists for. Every caller's transaction opens with
+// checkSpaceMembershipForWriteTx, which JOINs `space` — a table outside the `FOR SHARE OF`
+// list, therefore a CONSISTENT read, therefore the statement that opens the read view. A plain
+// COUNT(*) after it is answered from a snapshot taken BEFORE lockActiveProjectTx, so the
+// project row lock does not protect this count at all.
+//
+// The consequence is not a soft one. Reproduced on MySQL 8.0.33: two owners leaving
+// concurrently each read 2, each pass "you are not the last owner", and the project ends with
+// ZERO owners — a state P0 cannot repair (role change and disband are owner-only) and no
+// reconcile scan detects. What made it invisible is that each transaction re-reads its OWN
+// membership row FOR UPDATE and so sees fresh data; only the aggregate authorising the write
+// was stale.
+//
+// A locking read is a current read, so it sees committed changes regardless of the read view.
+// The added lock scope is negligible: every caller already holds the project row's exclusive
+// lock, so the rows counted here cannot be written by anyone else anyway.
 func (d *DB) countActiveOwnersTx(tx *dbr.Tx, projectID string) (int, error) {
 	var count int
 	err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM `octo_project_member` "+
-			"WHERE project_id = ? AND status = ? AND role = ?",
+			"WHERE project_id = ? AND status = ? AND role = ? FOR SHARE",
 		projectID, MemberStatusActive, RoleOwner,
 	).LoadOne(&count)
 	if err != nil {

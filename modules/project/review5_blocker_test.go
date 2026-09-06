@@ -294,30 +294,118 @@ func TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch(t *testing.T) {
 
 // ---------- the read-view trap ----------
 
-// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin is a source guard for a defect that is
-// invisible at the call site and silent at runtime.
+// TestNoWriteAuthorisingAggregateIsANonLockingRead is the PACKAGE-WIDE read-visibility guard.
 //
-// checkSpaceMembershipForWriteTx JOINs `space`. A table outside a `FOR SHARE OF` list is read
-// as a CONSISTENT read, and a consistent read OPENS the transaction's read view — so using
-// that helper as createProject's first statement freezes the snapshot before the `space` row
-// lock, and all three creation quotas are then counted against it. Six concurrent creates
-// passed MaxPerSpace=1 that way, and nothing about the call site hints at it.
+// Round 2 introduced a guard for this exact cause and scoped it to createProject; round 3 then
+// found the same trap on the five paths it did not visit, with worse consequences (a project
+// left with zero owners, a bypassable member cap, a disband that skipped a member's cache).
+// The lesson is the scope, not the cause: the cause was already named correctly.
 //
-// The concurrency acceptance tests catch the consequence. This guard names the cause, because
-// the obvious future "cleanup" — collapsing the two helpers into one — reintroduces it.
+// The rule: inside a write transaction, any aggregate or seat-set read whose RESULT AUTHORISES
+// the write must be a LOCKING read. Every write transaction in this module opens with
+// checkSpaceMembershipForWriteTx, which JOINs `space`; a table outside a `FOR SHARE OF` list is
+// a consistent read, and a consistent read opens the read view. So every plain SELECT after it
+// is answered from a snapshot older than lockActiveProjectTx, and the project row lock protects
+// nothing about it.
+//
+// Enforced structurally rather than per call site: enumerate the tx-scoped reads of
+// octo_project_member and require each to carry FOR SHARE or FOR UPDATE.
+func TestNoWriteAuthorisingAggregateIsANonLockingRead(t *testing.T) {
+	// The judgement is "executed on a *dbr.Tx", not "appears in the file". A plain COUNT(*) on
+	// this table is perfectly fine on a *dbr.Session — the list endpoint's member_count column
+	// and the metrics collector both do it, neither is inside a write transaction and neither
+	// authorises anything.
+	found := 0
+	for _, f := range moduleSourceFiles(t) {
+		joined := stripComments(mustRead(t, f))
+		for _, stmt := range txSelectStatements(joined) {
+			if !strings.Contains(stmt, "octo_project_member") {
+				continue
+			}
+			found++
+			locking := strings.Contains(stmt, "FOR SHARE") || strings.Contains(stmt, "FOR UPDATE")
+			assert.True(t, locking,
+				"%s: this transaction-scoped read of octo_project_member is not a locking read.\n"+
+					"  %s\n"+
+					"Its read view opened at the transaction's FIRST statement — the JOINing seat "+
+					"check, before lockActiveProjectTx — so the project row lock protects nothing "+
+					"about it. Reproduced consequences of exactly this: a project left with ZERO "+
+					"owners (unrecoverable in P0, undetected by every reconcile scan), a bypassable "+
+					"member cap, and a disband that skipped a member's cache invalidation.",
+				f, strings.TrimSpace(stmt))
+		}
+	}
+	assert.GreaterOrEqual(t, found, 4,
+		"expected at least the four known transaction-scoped reads of octo_project_member "+
+			"(owner count, member count, member row, disband seat list); found %d — the parser "+
+			"probably stopped matching, which would make this guard vacuous", found)
+}
+
+// txSelectStatements returns the SQL text of every SelectBySql executed on a *dbr.Tx, from the
+// joined (comment-free, concatenation-glued) source. `tx.SelectBySql(` is the only way this
+// package issues a transaction-scoped read.
+func txSelectStatements(joined string) []string {
+	const marker = "tx.SelectBySql("
+	var out []string
+	for i := 0; ; {
+		j := strings.Index(joined[i:], marker)
+		if j < 0 {
+			return out
+		}
+		from := i + j + len(marker)
+		rest := joined[from:]
+		end := len(rest)
+		for _, term := range []string{").Load", ").Exec", ").ReturnInt", ").LoadOne"} {
+			if k := strings.Index(rest, term); k >= 0 && k < end {
+				end = k
+			}
+		}
+		out = append(out, rest[:end])
+		i = from
+	}
+}
+
+// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin keeps the narrower createProject-specific
+// half: that path must not merely take a LOCKING read, it must avoid opening a read view at all
+// before the `space` lock, because its quota counts run after it.
+func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
+	fn := funcBody(t, readLinesWithoutComments(t, "service.go"),
+		"func (p *Project) createProject(")
+	assert.Contains(t, fn, "lockSpaceSeatRowTx",
+		"createProject must take the JOIN-free seat lock")
+	assert.NotContains(t, fn, "checkSpaceMembershipForWriteTx",
+		"createProject must NOT use the JOINing helper: the JOIN opens the read view before "+
+			"the `space` lock and every creation quota is then counted from a stale snapshot")
+
+	// The JOIN-free helper must stay JOIN-free.
+	helper := funcBody(t, readLinesWithoutComments(t, "db.go"),
+		"func (d *DB) lockSpaceSeatRowTx(")
+	assert.NotContains(t, strings.ToUpper(helper), "JOIN",
+		"lockSpaceSeatRowTx must not grow a JOIN: that is exactly what opens the read view")
+	assert.Contains(t, helper, "FOR SHARE",
+		"the seat check must still be a LOCKING read, or a concurrent Space removal can "+
+			"commit between it and the insert")
+}
+
+// mustRead reads a source file in this package.
+func mustRead(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Clean(name))
+	require.NoError(t, err, "read %s", name)
+	return string(data)
+}
+
 // readLinesWithoutComments returns name's source with comment text removed but the LINE
 // structure intact.
 //
 // stripComments (api_i18n_test.go) collapses the whole file onto one line, which is right for
 // "does this token appear anywhere" guards and useless for slicing one function out. And the
-// comments must go: this file's own prose names the helper the guard forbids, so a raw read
+// comments must go: this file's own prose names the helpers the guards forbid, so a raw read
 // would match the warning rather than the code.
 func readLinesWithoutComments(t *testing.T, name string) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Clean(name))
-	require.NoError(t, err, "read %s", name)
 	var b strings.Builder
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(mustRead(t, name), "\n") {
 		if i := strings.Index(line, "//"); i >= 0 {
 			line = line[:i]
 		}
@@ -338,36 +426,6 @@ func funcBody(t *testing.T, src, sig string) string {
 		return src[start : start+len(sig)+end]
 	}
 	return src[start:]
-}
-
-// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin is a source guard for a defect that is
-// invisible at the call site and silent at runtime.
-//
-// checkSpaceMembershipForWriteTx JOINs `space`. A table outside a `FOR SHARE OF` list is read
-// as a CONSISTENT read, and a consistent read OPENS the transaction's read view — so using
-// that helper as createProject's first statement freezes the snapshot before the `space` row
-// lock, and all three creation quotas are then counted against it. Six concurrent creates
-// passed MaxPerSpace=1 that way, and nothing about the call site hints at it.
-//
-// The concurrency acceptance tests catch the consequence. This guard names the cause, because
-// the obvious future "cleanup" — collapsing the two helpers into one — reintroduces it.
-func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
-	fn := funcBody(t, readLinesWithoutComments(t, "service.go"),
-		"func (p *Project) createProject(")
-	assert.Contains(t, fn, "lockSpaceSeatRowTx",
-		"createProject must take the JOIN-free seat lock")
-	assert.NotContains(t, fn, "checkSpaceMembershipForWriteTx",
-		"createProject must NOT use the JOINing helper: the JOIN opens the read view before "+
-			"the `space` lock and every creation quota is then counted from a stale snapshot")
-
-	// The JOIN-free helper must stay JOIN-free.
-	helper := funcBody(t, readLinesWithoutComments(t, "db.go"),
-		"func (d *DB) lockSpaceSeatRowTx(")
-	assert.NotContains(t, strings.ToUpper(helper), "JOIN",
-		"lockSpaceSeatRowTx must not grow a JOIN: that is exactly what opens the read view")
-	assert.Contains(t, helper, "FOR SHARE",
-		"the seat check must still be a LOCKING read, or a concurrent Space removal can "+
-			"commit between it and the insert")
 }
 
 // ---------- N-2: a broken payload must not be a destructive default ----------
