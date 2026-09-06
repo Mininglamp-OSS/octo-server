@@ -180,6 +180,37 @@ deferred_until_p0_merges:
       switch of its own — its new scans ride the existing job.
       The requester's call: revisit after #841 merges. P1 does not touch it.
 
+# Scoped out during implementation, with the reason. NOT silently dropped.
+not_delivered:
+  - id: stale-subscriber-scan
+    what: |
+      The fourth reconcile scan from the brief: WuKongIM's subscriber set versus
+      group_member, per (channel, uid). It is the observable face of the
+      IM-unsubscribe leak P1 deliberately inherits (D6), and the brief calls it
+      "the only P1 answer" to that leak.
+    why_not: |
+      There is no way to ask the broker for a channel's subscribers that a
+      production reconcile job should depend on.
+      MEASURED, not assumed. octo-lib's shared client (config/msg.go) exposes
+      IMAddSubscriber / IMRemoveSubscriber and no listing call at all. The
+      pinned broker v2.2.4-20260313 answers 404 on every plausible data-plane
+      path; extracting its routes from the binary shows the only subscriber
+      listing is GET /cluster/channels/{id}/{type}/subscribers — the MANAGEMENT
+      plane, which requires manager credentials, is versioned with the admin UI,
+      and is not part of the integration surface this repo builds against.
+      Delivering it would therefore mean either adding a capability to octo-lib
+      (a different repository, outside this PR) or wiring a reconcile job in
+      modules/project to the broker's management plane. The second is the kind
+      of dependency that works until the admin UI changes.
+    consequence: |
+      The inherited leak stays UNMEASURED at project granularity. Nothing else
+      in P1 depends on this scan, and P1 asserts nothing about IM convergence
+      it cannot deliver — but the honest statement is that the leak is invisible
+      here, not that it is absent. Issue #797 and
+      .octospec/tasks/im-pending-outbox/brief.md own the fix; this scan should
+      land with whichever of them adds a subscriber-listing capability to
+      octo-lib.
+
 # Cannot be verified from here; must be checked before merge.
 open_verification:
   - "Index build time for (space_id, project_id) on production-scale `group` row
