@@ -44,7 +44,11 @@ type bearerJWTClaims struct {
 var (
 	// ErrBearerJWTNoUserID payload.userId 缺失或为 0(可能是未认证/默认值哨兵)。
 	ErrBearerJWTNoUserID = errors.New("bearer-jwt: userId is required and must be non-zero")
-	// ErrJWTTooOld token 的 iat 距今超过 bearerJWTMaxAge。
+	// ErrJWTTooOld token 的 iat 距今超过调用方传入的 maxAge。
+	//
+	// 生产路径当前两个调用方都传 0(不设上限)—— 新鲜度改由兑换台账按**兑换
+	// 行为**判定,见 redemption_ledger.go。这里保留能力与哨兵:它是纯函数的一个
+	// 通用参数,将来若要给某条路径重新加 iat 上限,不必再实现一遍。
 	ErrJWTTooOld = errors.New("bearer-jwt: token was issued too long ago")
 	// ErrJWTMissingIat payload 无 iat,无法判断新鲜度。
 	ErrJWTMissingIat = errors.New("bearer-jwt: iat claim is required")
@@ -62,17 +66,6 @@ const (
 	// **任意** userId 签一张能换会话的 token,而短密钥可被离线爆破 —— 攻击者
 	// 只要拿到一张合法 JWT 就能在本地穷举出密钥,此后可以伪造任何人的登录。
 	bearerJWTMinSecretBytes = 32
-
-	// bearerJWTMaxAge 从 iat 起算的最大可接受寿命。
-	//
-	// 上游那张 token 的 exp 是签发后约 15 天,但它的用途只是"登录那一刻兑换
-	// 一次会话"。15 天的可重放窗口与用途完全不匹配:抓到一张 assertion 就能
-	// 反复兑换新会话,**包括用户已登出之后** —— 而我方无法查询上游的吊销状态
-	// (黑名单在对方的存储里)。
-	//
-	// 10 分钟覆盖"登录完成 → 调我方端点"这段正常间隔(含用户在成功页停留),
-	// 同时把重放窗口从 15 天压到分钟级。纯我方措施,不需要上游改任何东西。
-	bearerJWTMaxAge = 10 * time.Minute
 
 	// bearerJWTClockSkew 容忍签发方与我方的时钟不同步。
 	//
@@ -121,12 +114,13 @@ func verifyBearerJWT(token string, secret []byte, now time.Time, maxAge time.Dur
 		return nil, fmt.Errorf("%w: iat is %s ahead of now",
 			ErrJWTIatInFuture, issued.Sub(now).Round(time.Second))
 	}
-	// maxAge 由调用方按用途给:
-	//   - 兑换一次会话(/exchange-jwt):给 bearerJWTMaxAge,把重放窗口压到分钟级;
-	//   - 常驻认证器(integration 端点):给 0,用 token 自己的 exp。
-	//
-	// 不能两处都用分钟级上限 —— 桌面客户端把这张 token 存下来长期复用、不重签,
-	// 套上分钟级上限等于登录十分钟后功能永久失效。
+	// maxAge 由调用方按用途给。**两个生产调用方现在都给 0**:
+	//   - 兑换一次会话(/exchange-jwt):新鲜度由兑换台账判定(首次兑换上限 F +
+	//     空闲窗口 T,见 redemption_ledger.go)。曾经这里给 10 分钟,锚点是 iat ——
+	//     上游签发的时刻,与"用户什么时候真的来兑换"无关,于是登录半小时后才
+	//     兑换的合法客户端被拒,而窗口内抓到 token 的攻击者照样能兑。
+	//   - 常驻认证器(integration 端点):用 token 自己的 exp。桌面客户端把这张
+	//     token 存下来长期复用、不重签,套上分钟级上限等于登录十分钟后功能永久失效。
 	if maxAge > 0 && now.Sub(issued) > maxAge {
 		return nil, fmt.Errorf("%w: issued %s ago, max %s",
 			ErrJWTTooOld, now.Sub(issued).Round(time.Second), maxAge)

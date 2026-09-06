@@ -115,6 +115,12 @@ func exchangeJWTResultLabels() []string {
 		"issue_fail",           // 401:IssueSession 失败
 		"identity_insert_fail", // 401:identity 行写入失败(非 duplicate)
 		"race_recovered",       // 200:并发首登竞态,已恢复
+
+		// 401:验签通过,但兑换台账拒绝(首次兑换超过 F / 距上次兑换超过 T)。
+		// 与 token_rejected 分开:前者是"这张凭据不成立",后者是"凭据成立但这次
+		// 兑换不该发生"。两条曲线混在一起,就没法回答"客户端是不是拿旧 token 在
+		// 反复兑换"这个问题。细分原因在 exchange_jwt_redemption_total 上。
+		"redeem_refused",
 	}
 }
 
@@ -169,6 +175,11 @@ func init() {
 	// /exchange-jwt 结果标签预热。
 	for _, l := range exchangeJWTResultLabels() {
 		metricBearerExchangeResult.WithLabelValues(l).Add(0)
+	}
+	// 兑换台账判定结果预热。degraded_* 两个尤其需要预热:它们平时为零,而运维
+	// 要能在 Redis 故障**之前**就把告警挂上去。
+	for _, l := range redemptionOutcomeLabels() {
+		metricBearerRedemptionTotal.WithLabelValues(l).Add(0)
 	}
 }
 
@@ -271,4 +282,17 @@ var (
 		Name:      "exchange_jwt_result_total",
 		Help:      "Total number of /exchange-jwt responses by terminal result.",
 	}, []string{"result"})
+
+	// metricBearerRedemptionTotal 兑换台账的判定分布(redemption_ledger.go)。
+	//
+	// 三条运维曲线都在这里:
+	//   - admit_repeat  客户端是否复用同一张 token 反复兑换。长期为零才谈得上把
+	//                   语义收紧成一次性消费;
+	//   - reject_*      两个边界各自拦下了多少,判断 F/T 配得是不是太紧;
+	//   - degraded_*    台账不可用(Redis 故障)期间的准入,应当告警。
+	metricBearerRedemptionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_jwt_redemption_total",
+		Help:      "Bearer-JWT redemption ledger decisions (admit_first|admit_repeat|reject_stale_first|reject_idle|degraded_admit|degraded_reject).",
+	}, []string{"outcome"})
 )

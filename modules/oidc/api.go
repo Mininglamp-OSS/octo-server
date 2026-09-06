@@ -133,6 +133,14 @@ type OIDC struct {
 	// bearerJWT 业务后端自签 HS256 JWT 的验签器;nil 表示该路径未启用。
 	bearerJWT *BearerJWTVerifier
 
+	// redeemLedger / redeemPolicy /exchange-jwt 的兑换台账及其两个边界。
+	//
+	// 台账为 nil(未启用 exchange 端点、或未配置验签器)时,准入退化为只用 F 判定
+	// ——见 admitRedemption。**不能**退化成无条件放行:那等于把重放窗口放大到
+	// token 自己的 exp(约 15 天),正是台账要收窄的东西。
+	redeemLedger redemptionLedger
+	redeemPolicy redemptionPolicy
+
 	// bearerJWTErr 验签器**构造失败**的原因(密钥太短 / issuer 派生失败)。
 	//
 	// 为什么不能只用 bearerJWT==nil 表示:nil 已经被"没配密钥,这条路径合法地
@@ -271,6 +279,19 @@ func New(ctx *config.Context) *OIDC {
 		o.bearerJWT = bv
 		o.Info("bearer JWT /exchange-jwt enabled",
 			zap.String("issuer", bv.Issuer()), zap.Int("secret_bytes", bv.SecretLen()))
+	}
+
+	// 兑换台账。只在 /exchange-jwt 真的会挂载时构造 —— 为一个不存在的端点开
+	// Redis 连接池没有意义(与 routeAt 里限流 client 的处理同一个理由)。
+	//
+	// 策略本身**总是**加载:台账没构造出来时,准入走 admitWithoutLedger,它要用
+	// 到 F。策略读取失败不存在(非法值回落默认值),所以这里没有错误分支。
+	o.redeemPolicy = loadRedemptionPolicy()
+	if cfg.ExchangeEnabled && o.bearerJWT != nil {
+		o.redeemLedger = newRedisRedemptionLedger(ctx, o.redeemPolicy)
+		o.Info("bearer JWT redemption ledger enabled",
+			zap.Duration("first_redeem_max_age", o.redeemPolicy.firstRedeemMaxAge),
+			zap.Duration("idle_window", o.redeemPolicy.idleWindow))
 	}
 
 	return o
@@ -931,6 +952,13 @@ func (o *OIDC) Close() error {
 			o.Error("关闭 OIDC id_token store 失败", zap.Error(err))
 		}
 		o.idTokens = nil
+	}
+	// redeemLedger 独立 redis.Client(/exchange-jwt 兑换台账),New() 在端点启用时创建。
+	if rrl, ok := o.redeemLedger.(*redisRedemptionLedger); ok {
+		if err := rrl.Close(); err != nil {
+			o.Error("关闭 OIDC 兑换台账 Redis client 失败", zap.Error(err))
+		}
+		o.redeemLedger = nil
 	}
 	if err := o.closeExchangeLimiterClients(); err != nil {
 		o.Error("关闭 OIDC exchange 限流 Redis client 失败", zap.Error(err))

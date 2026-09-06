@@ -2207,3 +2207,35 @@ Two reviewers converged on the same headline; all four verified against code bef
   `CREATE TABLE ... LIKE` 从真实 schema 复制（零手写 DDL）+ 调产品查询方法。它同时是转换的验收证据。
 - **Jerry-Xin 撤回了他自己第四轮的建议**：只转 space/space_member/user 会让 `modules/space` 与
   `modules/user` 的现网 join 报 1267（robot/group_member 仍 0900）。坐实「不能逐表转」。
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger
+
+- **The anchor, not the number** — `/exchange-jwt` judged a bearer JWT's freshness
+  by `now - iat <= 10min`. `iat` is when the upstream signed the token, which says
+  nothing about when the user came to redeem it, so the ceiling refused a client
+  that exchanged 36 minutes after login (a 401 indistinguishable from "invalid
+  credential") while still admitting anyone who captured the token inside the
+  window. Freshness now comes from the redemption itself: a Redis ledger keyed by
+  `sha256(token)`, bounding how late a **first** redemption may arrive (F, default
+  24h) and how long a token may sit unused **between** redemptions (T, default 7d).
+- **A sliding window is not a TTL** — the first design set `TTL = T` and read
+  expiry as "abandoned". Backwards: an expired key is indistinguishable from a
+  never-seen token, so the record's death would readmit the token as a first
+  redemption. The record must outlive the window (TTL = the token's own remaining
+  life) and idleness is computed from the stored `last_at`.
+- **A count cap was dropped before it shipped** — capping redemptions per token
+  stops nothing (an attacker needs one), and would refuse a client that restarts
+  often, with exactly the 401 this task removes. Kept as the `admit_repeat`
+  metric, which answers whether the client reuses one token instead of enforcing
+  an unfounded limit.
+- **Verification stayed side-effect-free** — `api_exchange.go` reuses the same
+  verify method to classify a credential posted to the wrong endpoint. A ledger
+  inside the verifier would have given that misdelivered token an idle window it
+  never earned; the side effect lives in the one caller that redeems.
+- **Degraded path keeps F** — with Redis down we cannot tell first from repeat, so
+  the fallback applies F alone: bounded, never "anything within exp", and not a
+  self-inflicted login outage. `degraded_*` labels are pre-warmed so the alert can
+  exist before the first outage.
+- **Deliberately not done** — true one-shot redemption. Whether the client redeems
+  once or on every launch is not recorded anywhere in the repo; making it one-shot
+  now would break the second case with the same indistinguishable 401. `T` is
+  configurable, so tightening later is a decision, not a redesign.
