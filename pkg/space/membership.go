@@ -23,6 +23,44 @@ func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, er
 	return count > 0, nil
 }
 
+// ActiveMembers is CheckMembership for a batch: it returns the subset of uids
+// that are active members of the given active Space.
+//
+// The predicate is byte-for-byte CheckMembership's (space_member.status = 1 AND
+// space.status = 1), and it must stay that way — this exists to stop a caller
+// with many uids from either issuing N round-trips or, worse, hand-rolling a
+// near-copy of the predicate that then drifts from this one.
+//
+// Callers get a set rather than a bool so they can name exactly which uids
+// failed. Absent from the map means "not an active member of that Space"; the
+// map is never nil on success.
+//
+// Like CheckMembership this takes a *dbr.Session, so it runs outside any caller
+// transaction and proves nothing about state at COMMIT time. That is the
+// long-standing shape of the Space half of every group admission check, and
+// changing it is a behaviour change on every group join in the product — see
+// modules/group/admission.go for why the project half does NOT copy it.
+func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[string]bool, error) {
+	active := make(map[string]bool, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return active, nil
+	}
+	var found []string
+	_, err := session.SelectBySql(
+		"SELECT sm.uid FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.space_id = ? AND sm.uid IN ? AND sm.status = 1",
+		spaceID, uids,
+	).Load(&found)
+	if err != nil {
+		return nil, err
+	}
+	for _, uid := range found {
+		active[uid] = true
+	}
+	return active, nil
+}
+
 // CheckMembershipForCleanup answers a different question from CheckMembership:
 // "does uid still hold their seat in this Space, so removal cleanup must SKIP?"
 //
