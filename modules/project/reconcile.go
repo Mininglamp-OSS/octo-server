@@ -207,6 +207,11 @@ type i1Row struct {
 	ProjectID string `db:"project_id"`
 	UID       string `db:"uid"`
 	SpaceID   string `db:"space_id"`
+	// violating is the per-row predicate flag. The base-row page is LIMIT-bounded and every
+	// predicate is evaluated as a SELECT-list flag over it, so the query's cost is bounded by
+	// rows EXAMINED; the scan filters on this flag in Go. A WHERE-clause predicate would bound
+	// rows returned instead, and a healthy table would be walked end to end every tick.
+	Violating bool `db:"violating"`
 }
 
 // scanI1Violations counts project seats with no active Space seat behind them,
@@ -235,18 +240,27 @@ func (p *Project) scanI1Violations() {
 			p.Warn("对账 I1 违约扫描失败", zap.Error(err))
 			return // keep the cursor and running total; the next tick retries from here
 		}
+		if len(rows) == 0 {
+			completed = true
+			break
+		}
 		for _, row := range rows {
+			if !row.Violating {
+				continue
+			}
 			p.Error("I1 违约：项目成员已无对应 Space 席位，且无在途清理工单",
 				zap.String("projectId", row.ProjectID), zap.String("uid", row.UID),
 				zap.String("spaceId", row.SpaceID))
+			total++
 		}
-		total += len(rows)
+		// The cursor advances over INSPECTED rows (every base row), not over flagged ones —
+		// that is what makes a short page mean "table end" even when nothing violated.
+		last := rows[len(rows)-1]
+		cursorProject, cursorUID = last.ProjectID, last.UID
 		if len(rows) < p.cfg.ReconcileLimit {
 			completed = true
 			break
 		}
-		last := rows[len(rows)-1]
-		cursorProject, cursorUID = last.ProjectID, last.UID
 	}
 
 	// Publish only a complete rotation. A truncated tick has counted part of the keyspace, and
@@ -257,39 +271,31 @@ func (p *Project) scanI1Violations() {
 	cursors.i1Save(cursorProject, cursorUID, total, completed)
 }
 
-// queryI1ViolationPage returns one bounded page of violations.
-//
-// Every clause is a NOT EXISTS rather than a LEFT JOIN. That matters for the cleanup
-// table specifically: (space_id, uid) is deliberately NOT unique there — remove →
-// rejoin → remove must enqueue a second job — so a LEFT JOIN would multiply rows and
-// inflate the count.
-//
-// The last NOT EXISTS is literally pkg/space.CheckMembership negated. Spelling it
-// that way, rather than as an equivalent-looking predicate, is what keeps the
-// synchronous gate and the asynchronous audit answering the same question; the two
-// drifting apart is how an invariant check starts certifying a bug.
-//
-// Bounded by LIMIT plus a (project_id, uid) row-value cursor on the primary key —
-// never an unbounded full-table join against space_member or user, which share
-// connections with the message paths.
+// queryI1ViolationPage returns one bounded page of INSPECTED member rows, each flagged with
+// whether it violates I1. The predicates are SELECT-list flags over the LIMIT-bounded base
+// row set, so the query's cost is bounded by rows examined (yujiawei Q4, PR #841 round 1):
+// in the healthy case — no violations at all — the old WHERE-clause shape walked the primary
+// key to the end of the table on every tick, because LIMIT only bounded what came back.
 func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit int) ([]*i1Row, error) {
 	var rows []*i1Row
 	_, err := p.db.session.SelectBySql(
-		"SELECT pm.project_id, pm.uid, pm.space_id "+
+		"SELECT pm.project_id, pm.uid, pm.space_id, "+
+			// The I1 flag: no in-flight cleanup job for the pair, not in a banned Space, and no
+			// active Space seat — the same three predicates the WHERE version had, evaluated
+			// per inspected row instead of filtering the result set.
+			"(NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
+			"             WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
+			" AND NOT EXISTS (SELECT 1 FROM `space` sb "+
+			"                  WHERE sb.space_id = pm.space_id AND sb.status = ?) "+
+			" AND NOT EXISTS (SELECT 1 FROM `space_member` sm "+
+			"                  INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = ? "+
+			"                  WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = ?) "+
+			") AS violating "+
 			"FROM `octo_project_member` pm "+
-			"WHERE pm.status = ? "+
-			"  AND (pm.project_id, pm.uid) > (?, ?) "+
-			"  AND NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
-			"                   WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
-			"  AND NOT EXISTS (SELECT 1 FROM `space` sb "+
-			"                   WHERE sb.space_id = pm.space_id AND sb.status = ?) "+
-			"  AND NOT EXISTS (SELECT 1 FROM `space_member` sm "+
-			"                   INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = ? "+
-			"                   WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = ?) "+
+			"WHERE pm.status = ? AND (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		MemberStatusActive, cursorProject, cursorUID,
 		cleanupStatusPending, spaceStatusBanned, spaceStatusNormal, spaceMemberStatusActive,
-		limit,
+		MemberStatusActive, cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: scan I1 violations: %w", err)
@@ -366,8 +372,11 @@ func (p *Project) scanAbandonedCleanupLeak() {
 			completed = true
 			break
 		}
-		leaked += int64(len(rows))
 		for _, r := range rows {
+			if !r.Violating {
+				continue
+			}
+			leaked++
 			p.Error("Space 成员移除工单已 abandoned，项目席位仍活跃：无自动重驱动，需人工介入",
 				zap.String("projectId", r.ProjectID), zap.String("spaceId", r.SpaceID),
 				zap.String("uid", r.UID))
@@ -385,36 +394,36 @@ func (p *Project) scanAbandonedCleanupLeak() {
 	cursors.abandonedSave(cursorProject, cursorUID, int(leaked), completed)
 }
 
-// queryAbandonedLeakPage returns one page of project seats that are still active behind an
-// ABANDONED Space-removal cleanup job, for members who no longer hold a Space seat.
-//
-// Bounded by LIMIT plus a (project_id, uid) row-value cursor on the primary key, so the walk
-// terminates and never revisits a row.
+// queryAbandonedLeakPage returns one bounded page of INSPECTED member rows, each flagged
+// with whether it is a real abandoned-cleanup leak: an exhausted job exists for the pair, no
+// NEWER pending job will clean the seat, and the member holds no Space seat. Same
+// flag-over-base-page shape as the I1 query — cost bounded by rows examined (Q4).
 func (p *Project) queryAbandonedLeakPage(cursorProject, cursorUID string, limit int) ([]*i1Row, error) {
 	var rows []*i1Row
 	_, err := p.db.session.SelectBySql(
-		"SELECT pm.project_id, pm.uid, pm.space_id "+
-			"FROM `octo_project_member` pm "+
-			"WHERE pm.status = ? "+
-			"  AND (pm.project_id, pm.uid) > (?, ?) "+
+		"SELECT pm.project_id, pm.uid, pm.space_id, "+
 			// An abandoned job exists for this pair: nothing will re-drive THAT job.
-			"  AND EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
-			"               WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
+			"(EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
+			"          WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
 			// ...but a NEWER job may already be queued for the same pair, and that one will
 			// clean the seat. remove -> rejoin -> remove enqueues a second job (the outbox is
 			// deliberately not unique on (space_id, uid)), so a pair can hold an old abandoned
 			// job AND a live pending one at once. Reporting that as "no automatic re-drive,
 			// needs manual intervention" is a false alarm about work that is already scheduled —
 			// and the in-flight exemption is exactly what the I1 scan already does.
-			"  AND NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` q "+
-			"                   WHERE q.space_id = pm.space_id AND q.uid = pm.uid AND q.status = ?) "+
+			" AND NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` q "+
+			"                  WHERE q.space_id = pm.space_id AND q.uid = pm.uid AND q.status = ?) "+
 			// And the member really has no Space seat right now — cleanup semantics, so a
 			// banned Space is not a leak, and a rejoined user is not one either.
-			"  AND NOT EXISTS (SELECT 1 FROM `space_member` sm "+
-			"                   INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status <> 0 "+
-			"                   WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = 1) "+
+			" AND NOT EXISTS (SELECT 1 FROM `space_member` sm "+
+			"                  INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status <> 0 "+
+			"                  WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = 1) "+
+			") AS violating "+
+			"FROM `octo_project_member` pm "+
+			"WHERE pm.status = ? AND (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		MemberStatusActive, cursorProject, cursorUID, cleanupStatusAbandoned, cleanupStatusPending, limit,
+		cleanupStatusAbandoned, cleanupStatusPending,
+		MemberStatusActive, cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: query abandoned leak page: %w", err)
@@ -428,6 +437,7 @@ type orphanRow struct {
 	ID        int64  `db:"id"`
 	ProjectID string `db:"project_id"`
 	SpaceID   string `db:"space_id"`
+	Violating bool   `db:"violating"`
 }
 
 // scanOrphanProjects counts active projects whose Space row no longer exists.
@@ -438,33 +448,51 @@ func (p *Project) scanOrphanProjects() {
 	cursor, total := cursors.idResume(&cursors.orphan, &cursors.orphanRun)
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
-		var rows []*orphanRow
-		_, err := p.db.session.SelectBySql(
-			"SELECT p.id, p.project_id, p.space_id FROM `octo_project` p "+
-				"WHERE p.status = ? AND p.id > ? "+
-				"  AND NOT EXISTS (SELECT 1 FROM `space` s WHERE s.space_id = p.space_id) "+
-				"ORDER BY p.id LIMIT ?",
-			StatusNormal, cursor, p.cfg.ReconcileLimit,
-		).Load(&rows)
+		rows, err := p.queryInspectedProjectPage(cursor, p.cfg.ReconcileLimit)
 		if err != nil {
 			p.Warn("对账孤儿项目扫描失败", zap.Error(err))
 			return
 		}
+		if len(rows) == 0 {
+			completed = true
+			break
+		}
 		for _, row := range rows {
+			if !row.Violating {
+				continue
+			}
 			p.Error("项目所属 Space 已不存在",
 				zap.String("projectId", row.ProjectID), zap.String("spaceId", row.SpaceID))
+			total++
 		}
-		total += len(rows)
+		cursor = rows[len(rows)-1].ID
 		if len(rows) < p.cfg.ReconcileLimit {
 			completed = true
 			break
 		}
-		cursor = rows[len(rows)-1].ID
 	}
 	if completed {
 		orphanProjects.Set(float64(total))
 	}
 	cursors.idSave(&cursors.orphan, &cursors.orphanRun, cursor, total, completed)
+}
+
+// queryInspectedProjectPage returns one bounded page of ACTIVE project rows, each flagged
+// with whether its Space is gone. Flag-over-base-page, like the member scans (Q4).
+func (p *Project) queryInspectedProjectPage(cursor int64, limit int) ([]*orphanRow, error) {
+	var rows []*orphanRow
+	_, err := p.db.session.SelectBySql(
+		"SELECT p.id, p.project_id, p.space_id, "+
+			"(NOT EXISTS (SELECT 1 FROM `space` s WHERE s.space_id = p.space_id)) AS violating "+
+			"FROM `octo_project` p "+
+			"WHERE p.status = ? AND p.id > ? "+
+			"ORDER BY p.id LIMIT ?",
+		StatusNormal, cursor, limit,
+	).Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("project: query inspected project page: %w", err)
+	}
+	return rows, nil
 }
 
 // ---------- scan 4: epoch sanity ----------

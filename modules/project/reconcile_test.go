@@ -45,7 +45,7 @@ func violationCount(t *testing.T, p *Project) int {
 	t.Helper()
 	rows, err := p.queryI1ViolationPage("", "", p.cfg.ReconcileLimit)
 	require.NoError(t, err)
-	return len(rows)
+	return len(violatingI1Rows(rows))
 }
 
 // TestReconcileFlagsInjectedI1Violation covers the base case: a seat with no active Space
@@ -59,6 +59,7 @@ func TestReconcileFlagsInjectedI1Violation(t *testing.T) {
 
 	rows, err := p.queryI1ViolationPage("", "", p.cfg.ReconcileLimit)
 	require.NoError(t, err)
+	rows = violatingI1Rows(rows)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "orphan", rows[0].UID)
 	assert.Equal(t, created.ProjectID, rows[0].ProjectID)
@@ -165,9 +166,9 @@ func TestReconcileCursorPagesWithoutRepeating(t *testing.T) {
 	for pages := 0; pages < 10; pages++ {
 		rows, err := p.queryI1ViolationPage(cursorProject, cursorUID, 2)
 		require.NoError(t, err)
-		for _, row := range rows {
+		for _, row := range violatingI1Rows(rows) {
 			key := row.ProjectID + "/" + row.UID
-			assert.False(t, seen[key], "cursor must not return %s twice", key)
+			assert.False(t, seen[key], "cursor must not flag %s twice", key)
 			seen[key] = true
 		}
 		if len(rows) < 2 {
@@ -187,17 +188,16 @@ func TestReconcileFlagsOrphanProjects(t *testing.T) {
 	_, err := testCtx.DB().DeleteFrom("space").Where("space_id = ?", spaceA).Exec()
 	require.NoError(t, err)
 
-	var rows []*orphanRow
-	_, err = p.db.session.SelectBySql(
-		"SELECT p.id, p.project_id, p.space_id FROM `octo_project` p "+
-			"WHERE p.status = ? AND p.id > ? "+
-			"  AND NOT EXISTS (SELECT 1 FROM `space` s WHERE s.space_id = p.space_id) "+
-			"ORDER BY p.id LIMIT ?",
-		StatusNormal, 0, p.cfg.ReconcileLimit,
-	).Load(&rows)
+	rows, err := p.queryInspectedProjectPage(0, p.cfg.ReconcileLimit)
 	require.NoError(t, err)
-	require.Len(t, rows, 1)
-	assert.Equal(t, created.ProjectID, rows[0].ProjectID)
+	orphans := make([]*orphanRow, 0, 1)
+	for _, r := range rows {
+		if r.Violating {
+			orphans = append(orphans, r)
+		}
+	}
+	require.Len(t, orphans, 1)
+	assert.Equal(t, created.ProjectID, orphans[0].ProjectID)
 }
 
 // TestRunReconcileIsReadOnly pins D7: the job may run on every pod because it mutates
@@ -376,4 +376,16 @@ func TestReconcileFileHasNoUnboundedAggregate(t *testing.T) {
 			"and allowing one here is what forced the aggregate exemption that hid an " +
 			"unbounded scan")
 	}
+}
+
+// violatingI1Rows filters an inspected page down to the rows the scan would flag — the
+// per-row predicate moved from WHERE into a SELECT flag (Q4), so tests assert on the flag.
+func violatingI1Rows(rows []*i1Row) []*i1Row {
+	out := make([]*i1Row, 0, len(rows))
+	for _, r := range rows {
+		if r.Violating {
+			out = append(out, r)
+		}
+	}
+	return out
 }

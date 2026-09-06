@@ -127,13 +127,13 @@ func TestAbandonedLeakIgnoresPairsWithANewerPendingJob(t *testing.T) {
 	insertCleanupJob(t, spaceA, "leaker1", cleanupStatusAbandoned)
 	rows, err := p.queryAbandonedLeakPage("", "", 50)
 	require.NoError(t, err)
-	assert.Len(t, rows, 1, "an abandoned job with no live successor is a genuine leak")
+	assert.Len(t, violatingI1Rows(rows), 1, "an abandoned job with no live successor is a genuine leak")
 
 	// Now a newer pending job for the same pair — that one will clean the seat.
 	insertCleanupJob(t, spaceA, "leaker1", cleanupStatusPending)
 	rows, err = p.queryAbandonedLeakPage("", "", 50)
 	require.NoError(t, err)
-	assert.Empty(t, rows,
+	assert.Empty(t, violatingI1Rows(rows),
 		"a pair with a live pending job must not be reported as needing manual intervention")
 	_ = created
 }
