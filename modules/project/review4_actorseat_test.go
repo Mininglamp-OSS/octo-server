@@ -14,10 +14,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestWritePathsRevalidateTheActorSpaceSeatInTx drives each privileged write directly at the
+// TestWritePathsRevalidateTheActorSpaceSeatInTx drives ALL SIX privileged writes directly at the
 // service layer with an actor who holds a PROJECT seat but no SPACE seat — the exact state a
 // Space removal leaves behind until its async cascade closes the project seat. Every path must
-// refuse; today they all succeed.
+// refuse; before the fixes they all succeeded.
+//
+// The count in the name of the guarantee matters: round 1 wired five of the six and the
+// omission was recorded nowhere, so keep this list exhaustive against the callers of
+// requireActorSpaceSeatTx.
 func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "admin9")
@@ -59,6 +63,22 @@ func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	_, _, cErr := p.changeMemberRole(created.ProjectID, spaceID, "admin9", "owner1", RoleCommon, "")
 	assert.ErrorIs(t, cErr, errNotSpaceMember,
 		"changeMemberRole must refuse an actor without a Space seat")
+
+	// addMember — the sixth path, and the one this guard used to skip while claiming to
+	// drive "each privileged write" (PR #841 round 2, yujiawei P1-1 / Jerry-Xin B-1). Its
+	// exposure is the widest of the six: addMembers runs one transaction per target and
+	// breaks the batch only on errPermissionDenied / errProjectGone, so an actor whose Space
+	// seat closes mid-batch would otherwise have every remaining uid of a 200-uid batch
+	// admitted and audited under them.
+	seedUser(t, "fresh1")
+	seedSpaceMember(t, spaceA, "fresh1", 0, 1)
+	admitted, aErr := p.addOneMember(created.ProjectID, spaceID, "admin9", "fresh1")
+	assert.ErrorIs(t, aErr, errNotSpaceMember,
+		"addOneMember must refuse an actor without a Space seat")
+	assert.False(t, admitted, "no seat may be admitted by an actor without a Space seat")
+	freshSeat, fErr := p.db.queryMember(created.ProjectID, "fresh1")
+	require.NoError(t, fErr)
+	assert.Nil(t, freshSeat, "the target must not have gained a project seat")
 
 	// Nothing may have changed.
 	row, err := p.db.queryByProjectID(created.ProjectID)
