@@ -37,26 +37,26 @@ func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 
 	// updateProject
 	desc := "should not land"
-	_, err = p.updateProject(created.ProjectID, "admin9", updateReq{Description: &desc})
+	_, err = p.updateProject(created.ProjectID, "admin9", spaceID, updateReq{Description: &desc})
 	assert.ErrorIs(t, err, errNotSpaceMember, "updateProject must refuse an actor without a Space seat")
 
 	// disbandProject
-	_, dErr := p.disbandProject(created.ProjectID, "admin9")
+	_, dErr := p.disbandProject(created.ProjectID, "admin9", spaceID)
 	assert.ErrorIs(t, dErr, errNotSpaceMember,
 		"disbandProject must refuse an actor without a Space seat")
 
 	// removeMember (acting on another member)
-	_, rErr := p.removeMember(created.ProjectID, "admin9", "owner1")
+	_, rErr := p.removeMember(created.ProjectID, spaceID, "admin9", "owner1")
 	assert.ErrorIs(t, rErr, errNotSpaceMember,
 		"removeMember must refuse an actor without a Space seat")
 
 	// leaveProject
-	_, lErr := p.leaveProject(created.ProjectID, "admin9", "")
+	_, lErr := p.leaveProject(created.ProjectID, spaceID, "admin9", "")
 	assert.ErrorIs(t, lErr, errNotSpaceMember,
 		"leaveProject must refuse an actor without a Space seat")
 
 	// changeMemberRole (demote someone)
-	_, _, cErr := p.changeMemberRole(created.ProjectID, "admin9", "owner1", RoleCommon, "")
+	_, _, cErr := p.changeMemberRole(created.ProjectID, spaceID, "admin9", "owner1", RoleCommon, "")
 	assert.ErrorIs(t, cErr, errNotSpaceMember,
 		"changeMemberRole must refuse an actor without a Space seat")
 
@@ -68,5 +68,4 @@ func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	after, qErr := p.db.queryByProjectID(created.ProjectID)
 	require.NoError(t, qErr)
 	assert.NotEqual(t, "should not land", after.Description, "no profile write may have landed")
-	_ = spaceID
 }

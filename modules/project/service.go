@@ -117,6 +117,27 @@ func canActOnTargetRole(actorRole, targetRole int) bool {
 	return false
 }
 
+// requireActorSpaceSeatTx revalidates the ACTOR's own Space seat inside the caller's
+// transaction, before the project row lock is taken.
+//
+// The middleware checks Space membership before the transaction, through the shared
+// space:member cache — which the Space module invalidates synchronously on removal, so the
+// window is normally closed. But that makes the guarantee depend on another module's cache
+// hygiene, and on a cache whose DEL-failure fallback is best-effort (yujiawei Q6, PR #841
+// round 1). The target's Space seat has been checked in-transaction since the first review;
+// the actor earns the same structural guarantee for one indexed shared lock the transaction
+// is well placed to take.
+func (p *Project) requireActorSpaceSeatTx(tx *dbr.Tx, spaceID, actorUID string) error {
+	ok, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceID, actorUID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errNotSpaceMember
+	}
+	return nil
+}
+
 // ---------- create ----------
 
 type createInput struct {
@@ -264,7 +285,7 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 // The allow-list is built here, not from the request payload: active_name and
 // is_official must never reach a SET clause, and an allow-list is the only form of
 // that guarantee which survives someone later adding a field to updateReq.
-func (p *Project) updateProject(projectID, actorUID string, req updateReq) (*Model, error) {
+func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -272,6 +293,9 @@ func (p *Project) updateProject(projectID, actorUID string, req updateReq) (*Mod
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+		return nil, err
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return nil, err
@@ -344,7 +368,7 @@ func (p *Project) updateProject(projectID, actorUID string, req updateReq) (*Mod
 //
 // Returns the uids whose seats were closed, so the caller can invalidate their
 // caches synchronously.
-func (p *Project) disbandProject(projectID, actorUID string) ([]string, error) {
+func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -352,6 +376,9 @@ func (p *Project) disbandProject(projectID, actorUID string) ([]string, error) {
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+		return nil, err
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return nil, err
@@ -533,7 +560,7 @@ func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, 
 // from an earlier unlocked read: the transitive-protection rule ("an admin may not
 // remove an admin or the owner") is only sound if the role it checks cannot change
 // between the check and the write.
-func (p *Project) removeMember(projectID, actorUID, targetUID string) (bool, error) {
+func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 	if targetUID == actorUID {
 		// Self-removal goes through leave, which carries the last-owner transfer rule.
 		// Allowing it here would let the last owner delete their own seat and leave an
@@ -547,6 +574,9 @@ func (p *Project) removeMember(projectID, actorUID, targetUID string) (bool, err
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+		return false, err
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return false, err
@@ -614,7 +644,7 @@ func (p *Project) removeMember(projectID, actorUID, targetUID string) (bool, err
 // The transfer and the departure are one transaction. Two transactions would leave
 // a window with two owners (if the transfer commits first) or none (if the departure
 // does), and the second of those is unrecoverable in P0.
-func (p *Project) leaveProject(projectID, uid, transferTo string) (string, error) {
+func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (string, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -622,6 +652,9 @@ func (p *Project) leaveProject(projectID, uid, transferTo string) (string, error
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	if err := p.requireActorSpaceSeatTx(tx, spaceID, uid); err != nil {
+		return "", err
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return "", err
@@ -675,7 +708,7 @@ func (p *Project) leaveProject(projectID, uid, transferTo string) (string, error
 
 // changeMemberRole sets one member's role, handling the last-owner demotion via the
 // same atomic transfer as leaveProject.
-func (p *Project) changeMemberRole(projectID, actorUID, targetUID string, role int, transferTo string) (bool, string, error) {
+func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID string, role int, transferTo string) (bool, string, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -683,6 +716,9 @@ func (p *Project) changeMemberRole(projectID, actorUID, targetUID string, role i
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+		return false, "", err
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return false, "", err

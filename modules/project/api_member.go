@@ -179,7 +179,7 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 	actorUID := c.GetLoginUID()
 	outcomes := make([]memberOutcome, 0, len(uids))
 	for i, uid := range uids {
-		removed, err := removeOneMemberForTest(p, row.ProjectID, actorUID, uid)
+		removed, err := removeOneMemberForTest(p, row.ProjectID, row.SpaceID, actorUID, uid)
 		switch {
 		case err == nil:
 			outcomes = append(outcomes, memberOutcome{UID: uid, OK: true, committed: removed})
@@ -274,7 +274,7 @@ func (p *Project) leaveProjectHandler(c *wkhttp.Context) {
 	}
 
 	uid := c.GetLoginUID()
-	successor, err := p.leaveProject(row.ProjectID, uid, req.TransferTo)
+	successor, err := p.leaveProject(row.ProjectID, row.SpaceID, uid, req.TransferTo)
 	switch {
 	case err == nil:
 		p.audit(auditLeave, uid, uid, row.ProjectID, row.SpaceID, "left")
@@ -349,7 +349,7 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 	}
 
 	actorUID := c.GetLoginUID()
-	changed, successor, err := p.changeMemberRole(row.ProjectID, actorUID, targetUID, req.Role, req.TransferTo)
+	changed, successor, err := p.changeMemberRole(row.ProjectID, row.SpaceID, actorUID, targetUID, req.Role, req.TransferTo)
 	switch {
 	case err == nil:
 		if changed {
@@ -425,6 +425,6 @@ var addOneMemberForTest = func(p *Project, projectID, spaceID, actorUID, uid str
 // A package var so a test can make the actor lose their rights PART WAY through a batch — the
 // only way to reach the partial-commit path, which needs one target to commit and a later one to
 // be refused. Not thread-safe; tests must restore it and must not run in parallel.
-var removeOneMemberForTest = func(p *Project, projectID, actorUID, targetUID string) (bool, error) {
-	return p.removeMember(projectID, actorUID, targetUID)
+var removeOneMemberForTest = func(p *Project, projectID, spaceID, actorUID, targetUID string) (bool, error) {
+	return p.removeMember(projectID, spaceID, actorUID, targetUID)
 }

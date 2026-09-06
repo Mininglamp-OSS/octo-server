@@ -216,12 +216,12 @@ func TestPartiallyAppliedBatchReportsWhatCommitted(t *testing.T) {
 	// Revoke the actor's rights after the first removal commits, by hooking the per-target call.
 	calls := 0
 	orig := removeOneMemberForTest
-	removeOneMemberForTest = func(pr *Project, projectID, actorUID, targetUID string) (bool, error) {
+	removeOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		calls++
 		if calls > 1 {
 			return false, errPermissionDenied
 		}
-		return orig(pr, projectID, actorUID, targetUID)
+		return orig(pr, projectID, spaceID, actorUID, targetUID)
 	}
 	t.Cleanup(func() { removeOneMemberForTest = orig })
 

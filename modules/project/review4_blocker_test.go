@@ -23,12 +23,12 @@ import (
 func withRemoveSeam(t *testing.T, failOn string, inject error, calls *int) {
 	t.Helper()
 	orig := removeOneMemberForTest
-	removeOneMemberForTest = func(pr *Project, projectID, actorUID, targetUID string) (bool, error) {
+	removeOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		*calls++
 		if targetUID == failOn {
 			return false, inject
 		}
-		return orig(pr, projectID, actorUID, targetUID)
+		return orig(pr, projectID, spaceID, actorUID, targetUID)
 	}
 	t.Cleanup(func() { removeOneMemberForTest = orig })
 }

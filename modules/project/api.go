@@ -335,7 +335,7 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	}
 
 	uid := c.GetLoginUID()
-	updated, err := p.updateProject(row.ProjectID, uid, req)
+	updated, err := p.updateProject(row.ProjectID, uid, row.SpaceID, req)
 	switch {
 	case err == nil:
 	case errors.Is(err, errProjectGone):
@@ -386,7 +386,7 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 		return
 	}
 	uid := c.GetLoginUID()
-	removed, err := p.disbandProject(row.ProjectID, uid)
+	removed, err := p.disbandProject(row.ProjectID, uid, row.SpaceID)
 	switch {
 	case err == nil:
 	case errors.Is(err, errProjectGone):
