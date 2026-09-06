@@ -129,7 +129,11 @@ func TestEachWritePathTakesItsSeatLocksInOneStatement(t *testing.T) {
 		// implBody, not funcBody: these all have a retry wrapper now, and inspecting the wrapper
 		// would make this guard vacuously green.
 		body := implBody(t, src, fn)
+		// Every way this module can take a space_member lock. requireSpaceSeatsTx delegates to
+		// lockSeatsTx, so a path using the former counts once — the guard reads one function
+		// body at a time and does not recurse.
 		n := countOccurrences(body, "requireSpaceSeatsTx(") +
+			countOccurrences(body, "lockSeatsTx(") +
 			countOccurrences(body, "lockSpaceSeatsTx(") +
 			countOccurrences(body, "checkSpaceMembershipForWriteTx(") +
 			countOccurrences(body, "lockSpaceSeatRowTx(")

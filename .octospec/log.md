@@ -2149,3 +2149,32 @@ Two reviewers converged on the same headline; all four verified against code bef
   actor/target 分类自动补齐 6/6，update/disband 不再把授权拒绝渲染成 Internal 500。
 - **P2 拆后续 PR**（reviewer 建议）：缓存 cache-aside stale positive、对账随历史行增长。
   collation 按指示本轮不查，PR 明确标注未在具名部署验证。
+
+## 2026-09-06 — project P0：PR #841 第四轮 review 修复
+
+第三轮那个"结构化"的修复 commit 自己引入了两个 blocker：给四个 handler 加 actor arm 时
+**全都忘了 `return`**。Go 的 case 不贯穿到下一个 case，但会掉出 switch，于是控制流走上成功
+路径——update **真的 panic**（nil model 进 toResp），disband 给一次**被拒绝的解散**写了审计并
+在错误信封上叠了第二个 JSON body。reviewer 只报了这两个；leave/role 也缺 return，无害纯粹
+因为它们的 switch 恰好是函数最后一句。
+
+- **单点变异不够，要变异"写错"而不只是"删掉"**。第三轮我给这个 arm 写了 guard，但只是
+  `assert.Contains(sentinel)`，且只变异验证了「删掉 arm」。substring 检查看不出 arm 是否终止。
+- **判据要精确到语境**。强化 guard 的第一版要求每个 arm 都 return，立刻标红三个——核对后是
+  要求错了：leave/role 以 switch 结尾（掉出去即函数结束），addMembers 的 switch 在逐目标循环
+  里、不终止正是"继续下一个 uid"。改为「switch 之后有代码时才要求终止」。
+- **guard 家族被系统性审了一遍，四条成立**：复现测试驱动重试包装器（P0 级复现变成抛硬币，
+  同类问题我自己还漏了 createProject 那个）；`LessOrEqual(n,1)` 允许 0；
+  `strings.Count("reconcileMaxPages")<4` 因函数名含同名子串而不可能失败；一个测试用自己手写的
+  SQL 当 oracle、从不调用产品代码，而那条 SQL 正是代码注释说明"错了三重"的废弃形态——测试把
+  删掉的 bug 编码成了断言。
+- **写新 guard 时当场又犯同一类错**：禁止 `p.Error(` 的检查被 `zap.Error(err)` 误报（za**p.Error(**）。
+  子串匹配的 guard 要用词边界。
+- **`cursors` 是包级全局，reset 从未在 setup 调用，而且漏了我自己第三轮加的两个字段**。CI 跑
+  `-shuffle=on`，所以"期望 0"的对账断言可能因为前一个用例留下的截断轮转而通过。已在 setup
+  调用 + 加字段覆盖 guard。
+- **collation 有实测答案了**：生产四列全是 `0900_ai_ci`。根因是 dump 导入（mysqldump 对
+  collation 等于源库默认的表省略 COLLATE），所以 `general_ci` 是意图、`0900` 是导入事故。
+  **不能逐表转**——那三张表还和 robot/group_member/group/app_bot/opanalytics 维表 JOIN，只转
+  它们会打破现在兼容的那些。方案是把 dump 那批一次转完。顺带发现：默认 collation 的库上
+  **迁移无法从零重放**（category 的 `group_setting ⋈ group_category` 1267），会咬到下个新环境。

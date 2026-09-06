@@ -234,29 +234,55 @@ func canActOnTargetRole(actorRole, targetRole int) bool {
 // strings in others are ignored, which is what lets the optional transfer_to be passed
 // unconditionally.
 func (p *Project) requireSpaceSeatsTx(tx *dbr.Tx, spaceID, actorUID string, others ...string) error {
-	uids := make([]string, 0, len(others)+1)
-	uids = append(uids, actorUID)
-	for _, uid := range others {
-		if uid != "" && uid != actorUID {
-			uids = append(uids, uid)
+	_, err := p.lockSeatsTx(tx, spaceID, actorUID, others, nil)
+	return err
+}
+
+// lockSeatsTx is requireSpaceSeatsTx plus CANDIDATE seats: locked in the same statement, but not
+// refused unless the caller establishes the seat is actually needed.
+//
+// The distinction exists because `transfer_to` is optional. Passing it as a required seat meant
+// an ordinary member — or an owner who is not the last one — was refused for naming a successor
+// who had left the Space, even though no transfer was going to happen (PR #841 round 4, P2-4).
+// Simply moving the check later is not available: the seat lock has to precede the project row
+// lock (see lockSpaceSeatsTx), while "is a transfer needed" is only knowable under that lock. So
+// the lock happens once, up front, and the REFUSAL happens where the need is established — the
+// returned map is how the caller asks later without taking a second lock.
+func (p *Project) lockSeatsTx(
+	tx *dbr.Tx, spaceID, actorUID string, required, candidates []string,
+) (map[string]bool, error) {
+	uids := make([]string, 0, len(required)+len(candidates)+1)
+	seen := map[string]bool{}
+	add := func(uid string) {
+		if uid == "" || seen[uid] {
+			return
 		}
+		seen[uid] = true
+		uids = append(uids, uid)
+	}
+	add(actorUID)
+	for _, uid := range required {
+		add(uid)
+	}
+	for _, uid := range candidates {
+		add(uid)
 	}
 	held, err := p.db.lockSpaceSeatsTx(tx, spaceID, uids)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The ACTOR is checked first, so a caller who has lost their own seat is told that rather
 	// than being told something about the target. Their project role may well still be active,
 	// because the Space-removal cascade is asynchronous by design.
 	if !held[actorUID] {
-		return errActorNotSpaceMember
+		return nil, errActorNotSpaceMember
 	}
-	for _, uid := range uids[1:] {
-		if !held[uid] {
-			return errNotSpaceMember
+	for _, uid := range required {
+		if uid != "" && uid != actorUID && !held[uid] {
+			return nil, errNotSpaceMember
 		}
 	}
-	return nil
+	return held, nil
 }
 
 // ---------- create ----------
@@ -904,7 +930,8 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 	// row. Together rather than in sequence: two row locks on space_member reopen the 1213 cycle
 	// with the disband scan (see lockSpaceSeatsTx). transferTo is passed unconditionally because
 	// the helper ignores the empty string.
-	if err := p.requireSpaceSeatsTx(tx, spaceID, uid, transferTo); err != nil {
+	heldSeats, err := p.lockSeatsTx(tx, spaceID, uid, nil, []string{transferTo})
+	if err != nil {
 		return "", err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -930,6 +957,13 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 			return "", err
 		}
 		if owners <= 1 {
+			// NOW the successor's Space seat matters, and not before: this is the point at which
+			// the transfer is established as necessary. The seat was already locked up front
+			// (one statement, ahead of the project row), so this is a map lookup rather than a
+			// second lock.
+			if transferTo != "" && !heldSeats[transferTo] {
+				return "", errNotSpaceMember
+			}
 			if err := p.promoteSuccessorTx(tx, projectID, transferTo, uid, now); err != nil {
 				return "", err
 			}
@@ -992,12 +1026,16 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 	//
 	// One statement rather than two or three: see lockSpaceSeatsTx for the 1213 cycle that
 	// sequential seat locks reopen against modules/space's disband scan.
-	seats := make([]string, 0, 2)
+	//
+	// The target is REQUIRED when the request grants (it is the subject of the grant); the
+	// successor is a CANDIDATE, refused only if the last-owner transfer turns out to be needed —
+	// see lockSeatsTx for why naming an irrelevant successor must not refuse the request.
+	var required []string
 	if role >= RoleAdmin {
-		seats = append(seats, targetUID)
+		required = append(required, targetUID)
 	}
-	seats = append(seats, transferTo) // ignored when empty
-	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seats...); err != nil {
+	heldSeats, err := p.lockSeatsTx(tx, spaceID, actorUID, required, []string{transferTo})
+	if err != nil {
 		return false, "", err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -1038,6 +1076,11 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 			return false, "", err
 		}
 		if owners <= 1 {
+			// The successor's Space seat becomes relevant exactly here — see leaveProjectOnce.
+			// Already locked in the single up-front statement, so this is a map lookup.
+			if transferTo != "" && !heldSeats[transferTo] {
+				return false, "", errNotSpaceMember
+			}
 			if err := p.promoteSuccessorTx(tx, projectID, transferTo, targetUID, now); err != nil {
 				return false, "", err
 			}

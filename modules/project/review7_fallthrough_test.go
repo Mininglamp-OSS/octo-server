@@ -22,8 +22,11 @@ package project
 
 import (
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
+
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -156,4 +159,143 @@ func TestResetCursorsForTestCoversEveryCursorField(t *testing.T) {
 	assert.GreaterOrEqual(t, fields, 8,
 		"expected to inspect at least 8 cursor fields, saw %d — the struct parse probably broke, "+
 			"which would make this guard vacuous", fields)
+}
+
+// ---------- acceptance #31: the metric's entry breakdown, behaviourally ----------
+
+// TestWriteRejectionsAreBrokenDownByEntryPoint is the behavioural evidence for the acceptance
+// criterion "admission metrics are split per entry point".
+//
+// It exists because verification.md cited two tests for that criterion which were never in the
+// tree (PR #841 round 4, S-2). The `entry` label did exist, and a source guard pinned the label
+// set — but nothing asserted that two different write paths actually land on DIFFERENT label
+// values, which is the whole property: the brief calls this breakdown "the signal that exposes a
+// write path that skipped invariant I1", and a single undifferentiated counter cannot expose it.
+func TestWriteRejectionsAreBrokenDownByEntryPoint(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv)
+	r := mountProject(t, p)
+
+	before := func(entry, reason string) float64 {
+		return promtestutil.ToFloat64(writeRejected.WithLabelValues(entry, reason))
+	}
+	addBefore := before(entryMemberAdd, reasonNotSpaceMember)
+	createBefore := before(entryCreateOwner, reasonNotSpaceMember)
+
+	// Path 1 — member add, target holds no Space seat.
+	seedUser(t, "e31a")
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerTok, map[string]any{"uids": []string{"e31a"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	assert.Equal(t, addBefore+1, before(entryMemberAdd, reasonNotSpaceMember),
+		"the add rejection must be counted under its own entry point")
+	assert.Equal(t, createBefore, before(entryCreateOwner, reasonNotSpaceMember),
+		"and must NOT be attributed to the create path — an undifferentiated counter cannot "+
+			"reveal which write path skipped I1, which is the reason this label exists")
+
+	// Path 2 — create, the creator's Space seat is gone by write time. Same reason, different
+	// entry: the two must move independently.
+	seedSpace(t, spaceB, 1)
+	tok := seedUser(t, "e31b")
+	seedSpaceMember(t, spaceB, "e31b", 0, 1)
+	wr := doOn(t, r, http.MethodGet, "/v1/space/"+spaceB+"/projects", tok, nil)
+	require.Equal(t, http.StatusOK, wr.Code, "warm the Space cache: %s", wr.Body.String())
+	removeSpaceMember(t, spaceB, "e31b")
+
+	createBefore2 := before(entryCreateOwner, reasonNotSpaceMember)
+	addBefore2 := before(entryMemberAdd, reasonNotSpaceMember)
+	w = doOn(t, r, http.MethodPost, "/v1/space/"+spaceB+"/projects", tok,
+		map[string]any{"name": "should-not-exist"})
+	assertProjectErrorCode(t, w, "err.server.project.actor_not_space_member")
+
+	assert.Equal(t, createBefore2+1, before(entryCreateOwner, reasonNotSpaceMember),
+		"the create-owner rejection must be counted under entryCreateOwner")
+	assert.Equal(t, addBefore2, before(entryMemberAdd, reasonNotSpaceMember),
+		"and must not disturb the add path's counter")
+}
+
+// ---------- P2-4: transfer_to is validated even when no transfer can happen ----------
+
+// TestLeaveIgnoresAnIrrelevantTransferTo pins that a successor is only required to hold a Space
+// seat when a transfer will actually happen.
+//
+// requireSpaceSeatsTx refuses any named uid without an active Space seat, and leave passed
+// transferTo unconditionally — before the code has established that a transfer is needed at all.
+// So an ordinary member, or an owner who is not the last one, sending
+// {"transfer_to": "<a colleague who left the Space last month>"} was refused for a successor
+// irrelevant to their departure (PR #841 round 4, P2-4).
+func TestLeaveIgnoresAnIrrelevantTransferTo(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, tokens, created := projectWithMembers(t, srv, "p24a", "p24b")
+	pid := created.ProjectID
+	_ = ownerTok
+
+	// p24b left the Space last month: a real project seat, no Space seat.
+	removeSpaceMember(t, spaceA, "p24b")
+
+	// p24a is an ordinary member. Their departure needs no transfer at all, so naming a
+	// seatless successor must not refuse it.
+	successor, err := p.leaveProject(pid, spaceA, "p24a", "p24b")
+	assert.NoError(t, err,
+		"an ordinary member's leave needs no transfer, so an irrelevant transfer_to must not "+
+			"block it")
+	assert.Empty(t, successor, "and nobody was promoted")
+
+	seat, qErr := p.db.queryMember(pid, "p24a")
+	require.NoError(t, qErr)
+	require.NotNil(t, seat)
+	assert.Equal(t, MemberStatusRemoved, seat.Status, "the leave must have taken effect")
+
+	// The last owner IS required to name a successor who still holds a Space seat — the
+	// protection must stay for the case it was written for.
+	_, lastErr := p.leaveProject(pid, spaceA, "owner1", "p24b")
+	assert.ErrorIs(t, lastErr, errNotSpaceMember,
+		"the LAST owner's transfer target must still be an active Space member, or the cascade "+
+			"closing that seat leaves the project ownerless")
+	_ = tokens
+}
+
+// ---------- P2-2: the per-row alert log must be capped ----------
+
+// TestReconcileAlertLogIsCappedPerTick pins the bound on per-row Error lines.
+//
+// Uncapped, each scan emits one line per violating row — up to
+// reconcileMaxPages * ReconcileLimit = 25,000 per tick per pod, every interval, on every replica.
+// Fine for a transient; wrong for the states this module documents as standing figures needing a
+// human. Nothing disbands the projects of a disbanded Space, so one legitimate operator action
+// produces N orphan lines per rotation forever (PR #841 round 4, P2-2).
+func TestReconcileAlertLogIsCappedPerTick(t *testing.T) {
+	// The cap is a property of the helper, so drive it directly: building 25k violating rows to
+	// observe the difference would be a slow test of the same one line.
+	_, p := setup(t)
+	emitted := 0
+	l := &logCapped{p: p, scan: "probe"}
+	for i := 0; i < reconcileLogCap*3; i++ {
+		before := l.emitted
+		l.errorf("probe")
+		if l.emitted != before+1 {
+			t.Fatalf("errorf must always count, even when suppressing: %d -> %d", before, l.emitted)
+		}
+		emitted++
+	}
+	assert.Equal(t, reconcileLogCap*3, l.emitted,
+		"every violating row must still be COUNTED — the cap is on the log, not on the gauge")
+
+	// And the source must route every per-row alert through the cap, not around it.
+	src := readLinesWithoutComments(t, "reconcile.go")
+	for _, scan := range scanFuncNames(src) {
+		body := scanFuncBody(src, scan)
+		if !strings.Contains(body, "log.errorf(") && !strings.Contains(body, "logCapped") {
+			continue // a scan with no per-row alert is fine
+		}
+		// A word boundary, NOT a substring: "zap.Error(err)" contains "p.Error(" — the exact
+		// class of false match the round-4 review criticised in this guard family, met here on
+		// the first try.
+		direct := regexp.MustCompile(`\bp\.Error\(`)
+		assert.NotRegexp(t, direct, body,
+			"%s emits a per-row alert with p.Error, bypassing the per-tick cap. At the "+
+				"1000-projects-per-Space quota one disbanded Space would log 1000 lines every "+
+				"five minutes, indefinitely, and an alert that only ratchets up gets muted.", scan)
+	}
 }

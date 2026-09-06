@@ -416,7 +416,7 @@ brief 共 42 条验收 checkbox。核对方式：逐条映射到具体测试函�
 | # | 验收项 | 状态 | 依据 |
 |---|---|---|---|
 | 21 | 每条路由无 header/query 时 401/403 | ✅ | `TestRoutesRejectWithoutSpaceHeaderOrQuery`，覆盖 **10/10** 条已注册路由 |
-| 22 | unlisted 对非成员与不存在同形；成员/Space admin 拿真实 payload | ✅ | `TestUnlistedProjectIsIndistinguishableFromNonexistent` + `TestCrossSpaceProjectLooksNonexistent` + `TestSpaceAdminSeesUnlistedProjectsInTheList` |
+| 22 | unlisted 对非成员与不存在同形；成员拿真实 payload，Space admin 仅在**详情**路由拿 | ✅ | `TestUnlistedProjectIsIndistinguishableFromNonexistent` + `TestCrossSpaceProjectLooksNonexistent`（**第四轮更正**：原先还引用了 `TestSpaceAdminSeesUnlistedProjectsInTheList`，该测试**从未存在**，且它描述的行为——Space admin 能在列表里发现 unlisted 项目——是被有意回退的。规则见 `canViewMembers` 的注释：可读"已能指名"的项目，不可"发现"项目） |
 | 23 | admin 不能移除/降级 admin/owner；最后 owner 须先转让；转让原子 | ✅ | `TestAdminCannotRemoveOrDemoteAdminOrOwner` + `TestLastOwnerMustTransferBeforeLeavingOrBeingDemoted` |
 | 24 | 被移除成员**下一次请求**即被拒（证明同步失效） | ✅ | `TestRemovedMemberIsDeniedOnTheVeryNextRequest` |
 | 25–28 | 邀请码限流／并发只准入一人／过期与 7 天默认／join_mode | 📦 | 按需求方指示移至 P2 |
@@ -427,7 +427,7 @@ brief 共 42 条验收 checkbox。核对方式：逐条映射到具体测试函�
 |---|---|---|---|
 | 29 | 四个配额各自 registered code，且从 config 读 | ✅ | `TestQuotasRejectAtTheirBoundary`；`config.go` 无字面量 |
 | 30 | 五个动作各写审计（actor/target/reason） | ✅ | `TestEveryWritePathEmitsAnAuditEntry` 覆盖 **7** 个动作（含 leave / cascade） |
-| 31 | admission 指标按 entry point 拆分 | ✅ | `TestAdmissionRejectionIsBrokenDownByEntryPoint` + `TestEpochBumpMetricIsPerEntryPoint` |
+| 31 | admission 指标按 entry point 拆分 | ✅ | `TestWriteRejectionsAreBrokenDownByEntryPoint`（**第四轮更正**：原先引用的两个测试名 `TestAdmissionRejectionIsBrokenDownByEntryPoint` / `TestEpochBumpMetricIsPerEntryPoint` **从未存在**。`entry` 标签本身是有的、也有源码 guard 钉标签集，但没有任何测试断言两条写路径真的落在**不同**标签值上——而那才是这条验收的实质。现补行为测试：两条路径同 reason、不同 entry，计数必须各自独立；变异（让 create 路径上报 add 的 entry）即变红） |
 | 32 | reconcile 也标记 space_id 不存在的项目 **与孤儿邀请** | ⚠️ | 孤儿项目 ✅ `TestReconcileFlagsOrphanProjects`；孤儿邀请随邀请表移 P2 |
 | 33 | `is_official` 永不被写 | ✅ | `TestIsOfficialHasNoWriter`（源码级双重）+ `TestIsOfficialStaysZeroThroughCRUD` |
 
@@ -1028,3 +1028,105 @@ brief 点名的四个包本轮**全部通过**，非回归证据不再依赖基�
 | 新扫描的 WHERE 塞回 `status` | Q4 成本 guard（未点名该扫描，靠枚举命中） |
 | 拿掉 update handler 的 actor arm | handler 分类 guard |
 | presence 检查换零值默认 | 静默降级测试 |
+
+---
+
+# PR #841 第四轮 review 的 TDD 修复
+
+## 两个 blocker，都是第三轮那个修复 commit 引入的
+
+给 update/disband 加 actor arm 时**四个 arm 全都忘了 `return`**。Go 的 case 不贯穿到下一个
+case，但会**掉出 switch**，于是控制流继续走成功路径：
+
+| handler | RED 实测 |
+|---|---|
+| update | **真的 panic**（`nil pointer dereference`，gin Recovery 捕获），且 panic 前已写审计 `{project.update owner1 …}`——记录一次被拒绝、从未落库的写 |
+| disband | 写 `project.disband` 审计（`seats_closed=0`）**给一次被拒绝的解散**，再 `c.ResponseOK()` 叠在已渲染的错误信封上——一个 400 里两个 JSON body |
+
+reviewer 只报了这两个（后果可见）。我自己查出 **leave 和 role 的 arm 也缺 return**，它们无害
+纯粹因为 switch 恰好是函数最后一个语句。
+
+为了能行为化测试，加了 `updateFn`/`disbandFn` 两个 seam：稳态下 `projectMiddleware` 用 live
+非缓存读会先以 404 拒绝，所以那些 arm 只在 middleware→事务的竞态窗口里可达。
+
+## 为什么第三轮的 guard 没抓到——这条比 bug 重要
+
+第三轮 guard 只有 `assert.Contains(body, "errActorNotSpaceMember")`。**substring 检查看不出
+arm 是否终止**，而我的变异验证只做了「删掉 arm」，没做「arm 写错」。
+
+修 guard 时的一个插曲值得记：第一版要求**每个** arm 都 return，立刻标红了 leave/role/add
+三个。逐个核对后发现是**要求错了**而不是代码错了——leave/role 以 switch 结尾（掉出去就是函数
+结束，那里每个 arm 都不 return）；addMembers 的 switch 在逐目标循环里，不终止表示「继续下一个
+uid」正是有意行为。判据改为**「switch 之后有代码时才要求终止」**，正好对准缺陷所在。
+
+## reviewer 系统性检查了我的 guard 家族，四条已验证
+
+| # | 缺陷 | 我的验证与修法 |
+|---|---|---|
+| a | 行级锁 1213 复现测试驱动**重试包装器**：InnoDB 若选 add 为受害者，重试在对侧已提交后重跑并成功→变绿。P0 级复现测试在修复它的同一 commit 里变成抛硬币 | 我这台机器上受害者恰好稳定（三次都红），但那是运气不是构造。改为直驱 `addOneMemberOnce`。**同类问题我自己还漏了一个**：createProject 的死锁测试也调包装器，一并修 |
+| b | `assert.LessOrEqual(n, 1)` 允许 `n == 0`——把三条路径的席位锁整个删掉照样绿 | 改 `assert.Equal(1, n)`；变异（删 updateProjectOnce 的席位锁）现在红 |
+| c | `strings.Count(src, "reconcileMaxPages") < 4` 不可能失败：函数名 `reconcileMaxPagesForTest` 里也含该子串，声明+两个 helper 就占 7 次。**删掉五个 scan 的页上限仍 ≥4** | 改为逐 scan 枚举 + scan 数下限；实测删掉全部 5 处后变红 |
+| d | `TestAbandonedCleanupLeakIsItsOwnSignal` 断言在测试自己写的 SQL 上，从不调用产品代码——整个 abandoned 扫描删掉也绿；而那条手写查询正是代码注释说明「错了三重」的**已废弃形态**，测试把删掉的 bug 当成了 oracle | 改为驱动产品扫描。修的过程暴露出旧 oracle 掩盖的真实语义差异：产品**有意豁免**「还有更新的 pending 工单会清理」的情况，手写查询没这个条件。现在三个状态都钉住 |
+
+### 他列出但未逐一确认的形态，我逐条查了
+
+- **`review6_retry_test.go` 用 `funcBody` 解析到包装器 → 不是缺陷**。那个 guard 的目的就是断言
+  包装器含 retry 且不自持事务，`funcBody` 正确。
+- **presence 检查不约束顺序 → 成立**。把两个锁交换回 B-3 顺序，`TestCreateDoesNotTake…` 仍绿。
+  已加位置比较断言（一次字符串比较，不需要 live MySQL 和 700ms 屏障）。
+- **枚举下限低于真实调用点 → 成立**。`≥4` 而恰好 4 个，加第五个就不再有保护；改为精确相等，
+  并写明 `scanEpochSanity` 为何有意在集合外（无跨表谓词可移出 WHERE；它的成本由逐 scan 页上限
+  检查覆盖）。
+- **路由 guard 数 group 而非 route → 成立**。直接注册在 `r` 上的路由不带任何中间件，既无鉴权也
+  对该 guard 不可见。已加禁止直接注册的断言，变异（加一条 `r.GET`）即红。
+- **`cursors` 包级全局 + `-shuffle=on` → 成立，且更糟**。`resetCursorsForTest` 从未在 `setup()`
+  里调用；而且它**漏了我第三轮加的 ownerless 两个字段**。已在 setup 调用，并加 guard 走
+  `reconcileCursors` 的每个字段要求出现在 reset 里。
+
+## 规范合规
+
+| 项 | 处置 |
+|---|---|
+| S-2 `verification.md` 引用三个不存在的测试 | 两处更正。`TestSpaceAdminSeesUnlisted…` 描述的行为是被有意回退的（规则见 `canViewMembers`）；指标拆分那条是真实覆盖缺口，**补了行为测试**（两条路径同 reason 不同 entry，计数各自独立；变异即红） |
+| S-3 超出允许文件清单 | 修订清单，写明 `pkg/authtree/authtree.go`（19 行纯注释，记录 project 路由不上 authtree 的决定）与 marker 文件（`make i18n-extract` 生成，非自选） |
+| S-4 kill switch 是 env-only | rollback 段改写：**两个方向都要滚动重启**，缓解手段是 deploy 而非改配置；顺带更正「三张表」→ 两张 |
+| S-5 P1 brief 混入 | 按指示移出本分支（内容留在磁盘与 git 历史，P1 分支可取回）；连同另一份本地工作笔记一起加入 exclude |
+| 42 框全空 | 加指针指向 verification.md 作为**单一事实来源**并附统计。不逐个勾选是有意的——双维护正是 S-2 那三个幻影引用的成因 |
+
+## P2
+
+| 项 | 处置 |
+|---|---|
+| P2-4 `transfer_to` 在不需要转让时也被校验 | 引入 candidate 席位：**一条语句锁全部**（锁序不变），但**拒绝时机推迟到确定需要转让**。双向变异都验证过——改回无条件 required 则新测试红；中和 successor 校验则 `TestOwnershipCannotTransferToExSpaceMember` 红 |
+| P2-2 逐行 Error 日志无上限 | 加 `logCapped`（每扫描每 tick 上限 20 + 一条汇总），五个扫描接入；计数仍然全量进 gauge。写 guard 时**当场犯了 reviewer 批评的同类错**：`zap.Error(err)` 含子串 `p.Error(` 导致误报，改用词边界正则 |
+| P2-1 读路由的缓存 stale positive | 拆后续 PR（与另一项一并，见 PR body） |
+| P1-3 collation | 已实测：生产四列全是 `0900_ai_ci`。根因是 dump 导入（`mysqldump` 对「collation 等于源库默认」的表省略 COLLATE）。**不是逐表转**——`user`/`space`/`space_member` 还和 robot/group_member/group/app_bot/opanalytics 维表 JOIN，只转这三张会打破那些。brief 写入预检/转换脚本与「一个窗口内转完 dump 那批」的方案 |
+
+顺带发现（不属本 PR）：在默认 collation 的库上**迁移无法从零重放**，
+`20260416000001_category_legacy01.sql` 在 `group_setting ⋈ group_category` 上 1267。现有实例
+能活是因为那些表早于分裂。会咬到下一个新环境，值得单独立 issue；上面的转换也顺带修它。
+
+## 最终验证（第四轮）
+
+| 项 | 结果 |
+|---|---|
+| `modules/project` | **135 PASS / 0 FAIL**（`-race -shuffle=on`） |
+| build / vet（全仓）/ golangci-lint | 全绿，0 issues |
+| i18n-extract-check / i18n-lint | 通过 / 通过 |
+| gofmt（我改动的文件）/ `git diff --check` | clean（仓库另有 104 个既有 gofmt 偏差，与本次改动交集为空） |
+
+## 变异验证清单（第四轮）
+
+| 变异 | 变红 |
+|---|---|
+| 去掉 update / disband 的 `return` | handler 终止 guard；disband 另有行为测试 |
+| 锁改回两条语句 | 单语句 guard + 行级 1213 复现（现在直驱 Once，不再靠受害者选择） |
+| 两个锁交换回 B-3 顺序 | 新增的位置比较断言 |
+| 删掉 `updateProjectOnce` 的席位锁 | `assert.Equal(1, n)` + actor 分类行为测试 |
+| 删掉五个 scan 的页上限 | 逐 scan 页上限检查 |
+| abandoned 扫描改空实现 | 该测试（改为驱动产品代码后） |
+| 从 reset 里删掉 ownerless 字段 | cursor 字段覆盖 guard |
+| 直接在 `r` 上注册一条路由 | `TestAuthChainOrder` |
+| 让 create 路径上报 add 的 entry | 指标拆分行为测试 |
+| successor 改回无条件 required / 中和其校验 | 双向各自变红 |
+| 绕过日志上限直接 `p.Error` | 日志上限 guard |

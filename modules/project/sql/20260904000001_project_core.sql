@@ -20,9 +20,41 @@
 -- column and read -28799 seconds under TZ=Asia/Shanghai
 -- (modules/space/member_removal_metrics.go). One clock, in Go, in UTC.
 --
--- Widths, charset and COLLATE are pinned to match space.space_id / user.uid /
--- space_member.uid. Those legacy tables declare no COLLATE and inherit the
--- database default; a mismatch makes every reconcile JOIN fail with MySQL 1267.
+-- Widths and charset are pinned to match space.space_id / user.uid /
+-- space_member.uid. COLLATE is pinned to utf8mb4_general_ci, which is what every
+-- migration in this repo declares explicitly.
+--
+-- MEASURED, not assumed (2026-09-06). The pin is correct as INTENT and currently
+-- WRONG against production, and that is a deployment gap rather than a schema bug:
+--
+--   * every table created by a migration here declares COLLATE=utf8mb4_general_ci
+--   * space / space_member / user declare none, and in the production database they
+--     are utf8mb4_0900_ai_ci — verified on the live instance, all four joining
+--     columns
+--   * the cause is the historical data import: mysqldump omits COLLATE for tables
+--     whose collation equalled the source database default, so those tables
+--     inherited the MySQL 8 default on restore while migration-created tables kept
+--     their explicit general_ci. So general_ci is the intent and 0900_ai_ci is an
+--     import artefact — not two competing conventions.
+--
+-- Consequence if this module is enabled before that is corrected: the listMembers
+-- query (LEFT JOIN user) fails with MySQL 1267 on EVERY request, so
+-- GET /v1/projects/:project_id/members is a 500 for every project, and all four
+-- reconcile scans go dark at once. CI cannot catch it — ci/run-e2e-shard.sh creates
+-- its database with an explicit COLLATE utf8mb4_general_ci, so a green suite is
+-- structurally not evidence.
+--
+-- The correction is NOT per-table: user / space / space_member also join robot,
+-- group_member, group, app_bot and the opanalytics dimension tables, so converting
+-- only these three would break whichever of those is still 0900_ai_ci. The whole
+-- set of TABLE_COLLATION other than utf8mb4_general_ci — i.e. exactly the
+-- dump-imported ones — has to be converted together, in one window, after checking
+-- each unique index on a character column for collisions under general_ci (its
+-- equivalence classes are coarser, so two rows that differ today can collide).
+-- See the task brief for the pre-check and conversion statements.
+--
+-- OCTO_PROJECT_CREATE_ENABLED defaults to false, which is what makes this a
+-- pre-enable checklist item rather than an outage.
 --
 -- No foreign keys: nothing in this schema uses them. Cross-table integrity is
 -- the cleanup outbox plus the reconcile job.

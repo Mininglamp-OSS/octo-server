@@ -204,6 +204,40 @@ func (p *Project) runReconcile() {
 	p.scanEpochSanity()
 }
 
+// reconcileLogCap bounds the per-row Error lines ONE scan emits in ONE tick.
+//
+// Without it each scan logs one line per violating row, up to
+// reconcileMaxPages * ReconcileLimit = 25,000 lines per tick per pod, every interval, on every
+// replica. That is tolerable for a transient and wrong for the states this module documents as
+// standing figures needing a human: nothing disbands the projects of a disbanded Space, so ONE
+// legitimate operator action produces N orphan lines per rotation forever — at the
+// 1000-projects-per-Space quota, 1000 lines every five minutes, indefinitely (PR #841 round 4,
+// P2-2).
+//
+// The gauge is the right channel for a standing figure; the log is for identifying WHICH rows,
+// and the first few are enough to start. The suppressed count is reported once so the line is
+// not silently lossy.
+const reconcileLogCap = 20
+
+// logCapped emits detail lines up to reconcileLogCap per scan per tick, then one summary.
+type logCapped struct {
+	p       *Project
+	scan    string
+	emitted int
+}
+
+func (l *logCapped) errorf(msg string, fields ...zap.Field) {
+	l.emitted++
+	if l.emitted <= reconcileLogCap {
+		l.p.Error(msg, fields...)
+		return
+	}
+	if l.emitted == reconcileLogCap+1 {
+		l.p.Error("对账告警条数已达单次上限，其余仅计入 gauge",
+			zap.String("scan", l.scan), zap.Int("cap", reconcileLogCap))
+	}
+}
+
 // ---------- scan 5: ownerless projects ----------
 
 // scanOwnerlessProjects counts ACTIVE projects with no active owner.
@@ -220,6 +254,7 @@ func (p *Project) scanOwnerlessProjects() {
 	defer func() { reconcileDuration.WithLabelValues("ownerless").Observe(time.Since(start).Seconds()) }()
 
 	cursor, total := cursors.idResume(&cursors.ownerless, &cursors.ownerlessRun)
+	log := &logCapped{p: p, scan: "ownerless"}
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.queryOwnerlessProjectPage(cursor, p.cfg.ReconcileLimit)
@@ -236,7 +271,7 @@ func (p *Project) scanOwnerlessProjects() {
 			if !row.Violating {
 				continue
 			}
-			p.Error("项目无活跃 owner，任何人都无法管理它（P0 无自动修复路径）",
+			log.errorf("项目无活跃 owner，任何人都无法管理它（P0 无自动修复路径）",
 				zap.String("projectId", row.ProjectID), zap.String("spaceId", row.SpaceID))
 			total++
 		}
@@ -309,6 +344,7 @@ func (p *Project) scanI1Violations() {
 	defer func() { reconcileDuration.WithLabelValues("i1_violations").Observe(time.Since(start).Seconds()) }()
 
 	cursorProject, cursorUID, total := cursors.i1Resume()
+	log := &logCapped{p: p, scan: "i1_violations"}
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.i1PageFn(cursorProject, cursorUID, p.cfg.ReconcileLimit)
@@ -330,7 +366,7 @@ func (p *Project) scanI1Violations() {
 			if !row.Violating {
 				continue
 			}
-			p.Error("I1 违约：项目成员已无对应 Space 席位，且无在途清理工单",
+			log.errorf("I1 违约：项目成员已无对应 Space 席位，且无在途清理工单",
 				zap.String("projectId", row.ProjectID), zap.String("uid", row.UID),
 				zap.String("spaceId", row.SpaceID))
 			total++
@@ -450,6 +486,7 @@ func (p *Project) scanAbandonedCleanupLeak() {
 	// Same cross-tick rotation as the other scans: the page cap must not mean "only ever look
 	// at the first window".
 	cursorProject, cursorUID, running := cursors.abandonedResume()
+	log := &logCapped{p: p, scan: "abandoned_leak"}
 	leaked := int64(running)
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
@@ -468,7 +505,7 @@ func (p *Project) scanAbandonedCleanupLeak() {
 				continue
 			}
 			leaked++
-			p.Error("Space 成员移除工单已 abandoned，项目席位仍活跃：无自动重驱动，需人工介入",
+			log.errorf("Space 成员移除工单已 abandoned，项目席位仍活跃：无自动重驱动，需人工介入",
 				zap.String("projectId", r.ProjectID), zap.String("spaceId", r.SpaceID),
 				zap.String("uid", r.UID))
 		}
@@ -541,6 +578,7 @@ func (p *Project) scanOrphanProjects() {
 	defer func() { reconcileDuration.WithLabelValues("orphan").Observe(time.Since(start).Seconds()) }()
 
 	cursor, total := cursors.idResume(&cursors.orphan, &cursors.orphanRun)
+	log := &logCapped{p: p, scan: "orphan"}
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.queryInspectedProjectPage(cursor, p.cfg.ReconcileLimit)
@@ -557,7 +595,7 @@ func (p *Project) scanOrphanProjects() {
 			if !row.Violating {
 				continue
 			}
-			p.Error("项目所属 Space 已不存在",
+			log.errorf("项目所属 Space 已不存在",
 				zap.String("projectId", row.ProjectID), zap.String("spaceId", row.SpaceID))
 			total++
 		}
@@ -671,6 +709,7 @@ func (p *Project) scanEpochSanity() {
 	defer func() { reconcileDuration.WithLabelValues("epoch").Observe(time.Since(start).Seconds()) }()
 
 	cursor, _ := cursors.idResume(&cursors.epoch, new(int))
+	log := &logCapped{p: p, scan: "epoch"}
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
 		var rows []*epochRow
@@ -687,13 +726,13 @@ func (p *Project) scanEpochSanity() {
 		for _, row := range rows {
 			if row.MemberEpoch < 0 {
 				epochAnomalies.Inc()
-				p.Error("member_epoch 为负值", zap.String("projectId", row.ProjectID),
+				log.errorf("member_epoch 为负值", zap.String("projectId", row.ProjectID),
 					zap.Int64("epoch", row.MemberEpoch))
 				continue
 			}
 			if regressed, previous := lastSeenEpoch.observe(row.ProjectID, row.MemberEpoch); regressed {
 				epochAnomalies.Inc()
-				p.Error("member_epoch 相比本副本上次观测出现回退（best-effort 检查）",
+				log.errorf("member_epoch 相比本副本上次观测出现回退（best-effort 检查）",
 					zap.String("projectId", row.ProjectID),
 					zap.Int64("previous", previous), zap.Int64("current", row.MemberEpoch))
 			}
