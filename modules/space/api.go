@@ -475,6 +475,34 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 			respondSpaceRequestInvalid(c, "preset_group_ids")
 			return
 		}
+		// A project group may not be a preset group.
+		//
+		// Preset means "everyone who joins this Space is added automatically",
+		// and a project group requires each member to hold a project seat. Put
+		// together, every new Space member would violate invariant I2 on the way
+		// in — so the two settings are not merely a bad combination, they are
+		// contradictory.
+		//
+		// Checked at CONFIGURATION time here, and again at execution time in
+		// joinPresetGroups. Both, deliberately: this one gives the admin an error
+		// at the moment they choose the group, which is the only moment they can
+		// act on it; the runtime one covers a group configured before this check
+		// existed, and the (currently impossible) case of a group acquiring an
+		// attribution afterwards. A check only at execution time fails silently
+		// into a log line nobody reads.
+		//
+		// validatePresetGroupIds itself stays a pure string validator with no
+		// database access — the semantic half belongs at a call site that has a
+		// session, not bolted onto a parser.
+		if bad, err := s.firstProjectGroupAmongPresets(*req.PresetGroupIds); err != nil {
+			s.Error("校验预设群组失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+			return
+		} else if bad != "" {
+			s.Warn("预设群组不能是项目群", zap.String("group_no", bad), zap.String("space_id", spaceId))
+			respondSpaceRequestInvalid(c, "preset_group_ids")
+			return
+		}
 	}
 
 	// allowBanned=false：用户端绝不能更新封禁空间。事务侧二次校验关闭了
@@ -2302,4 +2330,37 @@ func (s *Space) loadKnownSpaceIDs() {
 	}
 	spacepkg.RegisterSpaceIDs(ids)
 	s.Info("已注册 spaceId 到 ParseChannelID 缓存", zap.Int("count", len(ids)), zap.Strings("ids", ids))
+}
+
+// firstProjectGroupAmongPresets returns the first group_no in the preset list
+// that belongs to a project, or "" when none does.
+//
+// One query for the whole list rather than one per id: the list is admin-supplied
+// and bounded only by a byte cap, so a per-id loop would let a large payload turn
+// one settings save into an unbounded number of round-trips.
+func (s *Space) firstProjectGroupAmongPresets(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	var groupNos []string
+	if err := json.Unmarshal([]byte(raw), &groupNos); err != nil {
+		// Shape was already validated by validatePresetGroupIds; a failure here
+		// means the two disagree, which is worth surfacing rather than ignoring.
+		return "", err
+	}
+	if len(groupNos) == 0 {
+		return "", nil
+	}
+	var bad []string
+	_, err := s.ctx.DB().SelectBySql(
+		"SELECT group_no FROM `group` WHERE group_no IN ? AND project_id <> '' LIMIT 1",
+		groupNos,
+	).Load(&bad)
+	if err != nil {
+		return "", err
+	}
+	if len(bad) == 0 {
+		return "", nil
+	}
+	return bad[0], nil
 }
