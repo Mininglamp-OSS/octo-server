@@ -18,6 +18,11 @@ type memberOutcome struct {
 	UID    string `json:"uid"`
 	OK     bool   `json:"ok"`
 	Reason string `json:"reason,omitempty"`
+	// committed reports whether THIS target changed the database, as opposed to being an
+	// idempotent no-op that still succeeds. It is deliberately not on the wire: the client
+	// cares that the add succeeded (ok), while only the partial-batch decision cares whether
+	// anything was written.
+	committed bool `json:"-"`
 }
 
 // Rejection reasons surfaced per uid in a batch response. Low-cardinality enum,
@@ -84,7 +89,7 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 	for _, res := range results {
 		switch {
 		case res.Err == nil:
-			outcomes = append(outcomes, memberOutcome{UID: res.UID, OK: true})
+			outcomes = append(outcomes, memberOutcome{UID: res.UID, OK: true, committed: res.Admitted})
 			if res.Admitted {
 				p.audit(auditMemberAdd, actorUID, res.UID, row.ProjectID, row.SpaceID, "")
 			}
@@ -177,7 +182,7 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 		removed, err := removeOneMemberForTest(p, row.ProjectID, actorUID, uid)
 		switch {
 		case err == nil:
-			outcomes = append(outcomes, memberOutcome{UID: uid, OK: true})
+			outcomes = append(outcomes, memberOutcome{UID: uid, OK: true, committed: removed})
 			if removed {
 				p.audit(auditMemberRemove, actorUID, uid, row.ProjectID, row.SpaceID, "kicked")
 			}
@@ -206,8 +211,20 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 			observeRejected(entryMemberRemove, reasonLastOwner)
 			outcomes = append(outcomes, memberOutcome{UID: uid, Reason: outcomeLastOwner})
 		case errors.Is(err, errProjectGone):
+			// ACTOR-level or project-level: nothing after this point can succeed, so stop —
+			// but HOW depends on whether anything already committed. Mirrors the add path: a
+			// bare 404 here discarded the removals that had already committed and been
+			// audited, telling the caller "nothing happened" while the database disagreed.
+			// Jerry-Xin review, PR #841 round 1: the permission branch had the partial report;
+			// this branch did not.
 			observeRejected(entryMemberRemove, reasonProjectDisbanded)
-			respondProjectNotFound(c)
+			if !anyApplied(outcomes) {
+				respondProjectNotFound(c)
+				return
+			}
+			outcomes = append(outcomes, memberOutcome{UID: uid, Reason: reasonProjectDisbanded})
+			outcomes = appendNotAttemptedUIDs(outcomes, uids[i+1:])
+			c.Response(outcomes)
 			return
 		default:
 			observeRejected(entryMemberRemove, outcomeStoreFailed)
@@ -373,9 +390,15 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 // anyApplied reports whether any target in the batch actually changed the database. Only a
 // successful outcome counts: a rejected one committed nothing, so a batch of pure rejections can
 // still be answered with a single status code.
+// anyApplied reports whether any target in the batch CHANGED the database.
+//
+// The predicate is committed, not OK. A re-add of an existing member returns OK=true with
+// nothing written; counting it as applied would turn "nothing committed yet" into a false
+// positive and answer a fully no-op batch with a 200 partial report where the single status
+// code is still the honest answer. Jerry-Xin review, PR #841 round 1.
 func anyApplied(outcomes []memberOutcome) bool {
 	for _, o := range outcomes {
-		if o.OK {
+		if o.committed {
 			return true
 		}
 	}
