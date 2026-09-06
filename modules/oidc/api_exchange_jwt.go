@@ -119,10 +119,17 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	metricBearerRedemptionTotal.WithLabelValues(string(outcome)).Inc()
 	if !outcome.admitted() {
 		metricBearerExchangeResult.WithLabelValues("redeem_refused").Inc()
-		o.Warn("OIDC exchange-jwt: redemption refused by the ledger",
+		// token_age 只在 rj 非空时取:admitRedemption 对 rj==nil 有一条"按拒绝处理"
+		// 的防御分支,如果这里无条件解引用,那条分支就永远走不到 —— 它会先在这行
+		// panic,而且是在一个未认证端点上。
+		fields := []zap.Field{
 			zap.String("trace_id", traceID), zap.String("ip", clientIP),
 			zap.String("outcome", string(outcome)),
-			zap.Duration("token_age", now.Sub(rj.IssuedAt).Round(time.Second)))
+		}
+		if rj != nil {
+			fields = append(fields, zap.Duration("token_age", now.Sub(rj.IssuedAt).Round(time.Second)))
+		}
+		o.Warn("OIDC exchange-jwt: redemption refused by the ledger", fields...)
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
 		return
 	}

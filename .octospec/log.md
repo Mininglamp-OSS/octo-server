@@ -2239,3 +2239,28 @@ Two reviewers converged on the same headline; all four verified against code bef
   once or on every launch is not recorded anywhere in the repo; making it one-shot
   now would break the second case with the same indistinguishable 401. `T` is
   configurable, so tightening later is a decision, not a redesign.
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (review round)
+
+- **The same outage, through another door** — `normalized()` guarded against
+  `F <= 0` because `F=0` refuses every login, then let `F=500ms` through: the Lua
+  script compares whole seconds, so it arrived as `0`. A guard written against one
+  spelling of a value missed the other. Bounds are now truncated to whole seconds
+  with a 1s floor, which incidentally fixed a real divergence between the Go
+  degraded path (Durations) and the Lua path (seconds).
+- **A defensive branch that could never run** — `admitRedemption` refuses a nil
+  credential, but the caller dereferenced it one line earlier in a log field. The
+  guard read as safety and was decoration; on an unauthenticated endpoint it would
+  have been a panic.
+- **A cap that silently rewrote a configured value** — `T` longer than the
+  record's max TTL could not fire, and the resulting refusal was attributed to `F`,
+  which is the knob an operator would then tune. Capped where it is read so the
+  startup log prints what actually applies.
+- **Close() wrote a field the request path reads** — mirrored an existing pattern
+  without noticing the new field is read on the hot path. The closable client now
+  lives in its own field.
+- **Verified against real infrastructure** — MySQL 8.0.46 + Redis 7.0.15 brought
+  up locally (this environment has no docker): the whole `modules/oidc` package
+  passes under `-race`, including the ledger's decision table and a new
+  concurrency case proving the Lua decision-and-write is one atomic round trip
+  (8 concurrent redemptions of one token yield exactly one `admit_first`).

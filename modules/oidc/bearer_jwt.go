@@ -28,7 +28,9 @@ import (
 //     不做主键(可能改名/轮换,且未验证是否全局唯一)。
 //   - PayloadHash 是 客户端给"后续附加 userData"的完整性摘要,不是我们的 key,
 //     不影响鉴权,仅保留以便审计。
-//   - Iat 签发时间,未被消费,仅保留以便排障。
+//   - Iat 签发时间。**是准入判定的输入**,不是排障字段:兑换台账用它算首次兑换
+//     上限 F(redemption_ledger.go),降级路径也用它。下面那条 `Iat == 0` 的检查
+//     同样是安全检查而不是数据清洗 —— 去掉 iat 就绕过 F。
 type bearerJWTClaims struct {
 	UserID        int64  `json:"userId"`
 	DomainAccount string `json:"domainAccount"`

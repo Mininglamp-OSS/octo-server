@@ -87,8 +87,9 @@ Supporting changes:
   redemptions per token at N. An attacker needs one redemption, not twenty, so N
   stopped nothing, while a client restarting more than N times a day would hit
   the same indistinguishable 401 this task exists to remove. It survives as a
-  metric (`admit_repeat`), where it answers a question — is the client reusing
-  one token? — instead of enforcing one.
+  metric (`admit_repeat`) instead of a gate — though only as a negative signal:
+  the ledger stores `last_at` alone, so the curve cannot separate a client
+  reusing its token from someone replaying one.
 
 - **Verification and redemption had to stay separate.** `api_exchange.go` calls
   the same verify method to *classify* a credential ("is this a business JWT
@@ -102,3 +103,54 @@ Supporting changes:
   bounded, never "anything within `exp`", and not a self-inflicted login outage
   either. `degraded_admit`/`degraded_reject` are pre-warmed so the alert can be
   written before the first outage.
+
+## Review round
+
+A review pass found four defects in the first cut and three stale comments:
+
+- **Sub-second bounds truncated to zero.** `normalized()` accepted any positive
+  duration, but the Lua script compares whole seconds, so `F=500ms` reached it as
+  `0` and the script evaluated `now - iat > 0` — every redemption refused, which
+  is the `F=0` outage `normalized()` exists to prevent, entering by another door.
+  Bounds are now truncated to whole seconds with a 1s floor, which also removes a
+  real divergence: the degraded path compares Durations in Go, the ledger compares
+  seconds in Lua, and they now compare the same value.
+- **`T` could exceed the record's lifetime.** A record cannot outlive
+  `redemptionRecordMaxTTL`, so a longer idle window was unenforceable *and*
+  misreported: the late redemption came back as `reject_stale_first`, pointing an
+  operator at `F`. `T` is now capped where it is read, so the startup log prints
+  the value that actually applies.
+- **A defensive branch that could never run.** `admitRedemption` refuses a nil
+  credential, but the handler logged `rj.IssuedAt` unconditionally in the refusal
+  path — the nil would have panicked one line earlier, on an unauthenticated
+  endpoint. The log is now conditional.
+- **`Close()` wrote a field the request path reads.** Niling `redeemLedger`
+  during graceful shutdown races in-flight handlers on an interface value. The
+  closable client is now held in a separate field; `Close()` only touches that,
+  and a closed client simply makes `Admit` fail into the degraded path.
+- Stale comments: `bearerJWTClaims.Iat` still said "not consumed, kept for
+  debugging" while being the input to `F`; `modules/integration`'s test still
+  documented the deleted ten-minute ceiling as current; and the `admit_repeat`
+  comment overclaimed — the ledger stores only `last_at`, so that curve cannot
+  separate a client reusing its token from someone replaying one, and it is
+  honest only as a negative signal.
+- The Redis integration test salted its digests with a nanosecond timestamp,
+  which made its own `del()` calls dead code and left ~4 keys per CI run in the
+  shared test Redis for 15 days. Keys used are now registered and deleted in
+  `t.Cleanup`.
+
+Two findings were not acted on, deliberately:
+
+- **"Losing a ledger record is indistinguishable from never having redeemed."**
+  True, and the chosen direction: the ledger *is* this path's security state, and
+  requiring re-authentication after losing it is the safe side. The finding's
+  stated contrast — that the Redis *error* path admits the same token — does not
+  hold: `admitWithoutLedger` refuses anything past `F` too, so both paths agree.
+  The behaviour is now documented at the top of the file, together with the
+  operational signal (a sudden batch of `reject_stale_first` means Redis lost
+  data, not that clients changed).
+- **"A repeat redemption is never re-checked against `F`."** Correct, and it is
+  the trade this design makes: an actively-used token stays usable until it idles
+  out or its `exp` passes. Re-applying `F` to repeats would refuse exactly the
+  long-lived reuse `T` exists to permit. Closing it means one-shot redemption
+  (`N=1`), which needs a fact about the client that the repo does not record.

@@ -56,6 +56,52 @@ func TestLoadRedemptionPolicy_ReadsEnvAndFallsBackOnGarbage(t *testing.T) {
 	}
 }
 
+// 亚秒取值必须被收敛掉。判定在 Lua 里按整秒比较,`int64(500ms/time.Second)` 是 0,
+// 于是脚本比的是 `now - iat > 0` —— 任何一秒前签发的 token 都被拒。这与 F=0 是
+// 同一个全员登录失败,只是从另一扇门进来。
+func TestRedemptionPolicy_SubSecondBoundsCannotTruncateToZero(t *testing.T) {
+	for _, in := range []time.Duration{time.Millisecond, 500 * time.Millisecond, 999 * time.Millisecond} {
+		p := redemptionPolicy{firstRedeemMaxAge: in, idleWindow: in}.normalized()
+		if int64(p.firstRedeemMaxAge/time.Second) < 1 || int64(p.idleWindow/time.Second) < 1 {
+			t.Fatalf("policy %v normalized to %+v: it reaches the Lua script as whole "+
+				"seconds, and 0 there rejects every redemption", in, p)
+		}
+	}
+	// 非整秒取值也要截断,否则 Go 侧(降级路径,按 Duration 比)与 Lua 侧(按整秒比)
+	// 对同一张 token 可能给出不同结论。
+	p := redemptionPolicy{firstRedeemMaxAge: 90*time.Second + 400*time.Millisecond}.normalized()
+	if p.firstRedeemMaxAge != 90*time.Second {
+		t.Errorf("F = %v, want it truncated to whole seconds so both paths compare the "+
+			"same value", p.firstRedeemMaxAge)
+	}
+}
+
+// T 长过记录能存活的时间就是不可执行的:记录先没了,超时的兑换会以"首次兑换超过
+// F"的名义被拒 —— 拒得对,归因是错的,运维会去调 F。收敛到能执行的值,启动日志
+// 打印的也就是真正生效的值。
+func TestRedemptionPolicy_IdleWindowCannotExceedTheRecordLifetime(t *testing.T) {
+	p := redemptionPolicy{idleWindow: 60 * 24 * time.Hour}.normalized()
+	if p.idleWindow != redemptionRecordMaxTTL {
+		t.Errorf("T = %v, want it capped at %v — a record cannot outlive that, so a longer "+
+			"window can never fire", p.idleWindow, redemptionRecordMaxTTL)
+	}
+	if got := recordTTL(time.Now().Add(365*24*time.Hour), time.Now()); got < p.idleWindow {
+		t.Errorf("record ttl %v < T %v: the window would never be reachable", got, p.idleWindow)
+	}
+}
+
+// 台账拿到的必须是收敛后的取值 —— 否则配置里的亚秒值会绕过 normalized 直接进
+// 脚本。这条同时钉住"两处实现同一条规则"的接缝。
+func TestNewRedisRedemptionLedger_StoresTheNormalizedPolicy(t *testing.T) {
+	l := &redisRedemptionLedger{policy: redemptionPolicy{
+		firstRedeemMaxAge: 500 * time.Millisecond,
+		idleWindow:        60 * 24 * time.Hour,
+	}.normalized()}
+	if l.policy.firstRedeemMaxAge < time.Second || l.policy.idleWindow > redemptionRecordMaxTTL {
+		t.Fatalf("ledger policy = %+v, want the normalized bounds", l.policy)
+	}
+}
+
 // admitted() 是唯一的"放行"判据。新增一个 outcome 却忘了在这里归类,默认就是拒绝
 // —— 这个方向是对的(fail-closed),但要有用例把两边都钉住。
 func TestRedemptionOutcome_OnlyTheThreeAdmitOutcomesAdmit(t *testing.T) {
@@ -297,13 +343,29 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 
 	now := time.Now()
 	exp := now.Add(15 * 24 * time.Hour)
-	// 每个子用例一个独立摘要,避免同 binary 重跑时串扰。
-	digest := func(name string) string { return redemptionDigest(t.Name() + name + now.String()) }
-	del := func(d string) { _ = l.client.Del(redemptionKey(d)).Err() }
+
+	// 每个子用例一个独立摘要(带纳秒盐),避免同 binary 重跑时串扰。
+	//
+	// 盐意味着**清理不能靠"跑之前先删"** —— 那删的永远是一个不存在的 key。落账
+	// 的记录 TTL 是 token 的剩余寿命(这里 15 天),不清理就会在共享测试 Redis 里
+	// 堆两周,而 CleanAllTables 不碰 Redis。所以登记用过的 key,退出时删。
+	var used []string
+	digest := func(name string) string {
+		d := redemptionDigest(t.Name() + name + now.String())
+		used = append(used, redemptionKey(d))
+		return d
+	}
+	t.Cleanup(func() {
+		if len(used) == 0 {
+			return
+		}
+		if err := l.client.Del(used...).Err(); err != nil {
+			t.Logf("cleanup %d ledger keys: %v", len(used), err)
+		}
+	})
 
 	t.Run("first redemption inside F is admitted", func(t *testing.T) {
 		d := digest("first")
-		del(d)
 		got, err := l.Admit(context.Background(), d, now.Add(-30*time.Minute), exp, now)
 		if err != nil {
 			t.Fatalf("admit: %v", err)
@@ -324,7 +386,6 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 
 	t.Run("first redemption beyond F is refused and leaves no record", func(t *testing.T) {
 		d := digest("stale-first")
-		del(d)
 		got, err := l.Admit(context.Background(), d, now.Add(-10*time.Hour), exp, now)
 		if err != nil {
 			t.Fatalf("admit: %v", err)
@@ -340,7 +401,6 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 
 	t.Run("repeat redemption inside T is admitted and refreshes last_at", func(t *testing.T) {
 		d := digest("repeat")
-		del(d)
 		iat := now.Add(-30 * time.Minute)
 		if _, err := l.Admit(context.Background(), d, iat, exp, now); err != nil {
 			t.Fatalf("first admit: %v", err)
@@ -367,7 +427,6 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 
 	t.Run("repeat redemption beyond T is refused", func(t *testing.T) {
 		d := digest("idle")
-		del(d)
 		iat := now.Add(-10 * time.Minute)
 		if _, err := l.Admit(context.Background(), d, iat, exp, now); err != nil {
 			t.Fatalf("first admit: %v", err)
@@ -383,9 +442,52 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 		}
 	})
 
+	// 判定与落账必须在一次往返里完成。两步 GET+SET 的话,并发的首次兑换会各自读到
+	// "无记录"再各自写回,于是同一张 token 被当成多次首次兑换 —— 窗口判定失去意义。
+	t.Run("concurrent first redemptions produce exactly one admit_first", func(t *testing.T) {
+		d := digest("race")
+		const n = 8
+		res := make(chan redemptionOutcome, n)
+		for i := 0; i < n; i++ {
+			go func() {
+				out, err := l.Admit(context.Background(), d, now.Add(-time.Minute), exp, now)
+				if err != nil {
+					t.Errorf("admit: %v", err)
+				}
+				res <- out
+			}()
+		}
+		firsts := 0
+		for i := 0; i < n; i++ {
+			if <-res == redeemAdmitFirst {
+				firsts++
+			}
+		}
+		if firsts != 1 {
+			t.Errorf("%d concurrent redemptions produced %d admit_first, want exactly 1: "+
+				"the decision and the write must be one atomic round trip", n, firsts)
+		}
+	})
+
+	// F3 回归:亚秒配置经 normalized 收敛后,脚本拿到的是 >=1 的整秒。未收敛时
+	// ARGV 是 "0",脚本比的是 `now - iat > 0`,任何一秒前签发的 token 都被拒。
+	t.Run("a sub-second bound does not reject everything", func(t *testing.T) {
+		sub := &redisRedemptionLedger{client: l.client, policy: redemptionPolicy{
+			firstRedeemMaxAge: 500 * time.Millisecond,
+			idleWindow:        300 * time.Millisecond,
+		}.normalized()}
+		got, err := sub.Admit(context.Background(), digest("subsecond"),
+			now.Add(-100*time.Millisecond), exp, now)
+		if err != nil {
+			t.Fatalf("admit: %v", err)
+		}
+		if got != redeemAdmitFirst {
+			t.Errorf("got %s, want %s", got, redeemAdmitFirst)
+		}
+	})
+
 	t.Run("a corrupt record is treated as absent", func(t *testing.T) {
 		d := digest("corrupt")
-		del(d)
 		if err := l.client.Set(redemptionKey(d), "not-a-timestamp", time.Hour).Err(); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
@@ -398,4 +500,21 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 				"whoever can write one can also delete it", got, redeemAdmitFirst)
 		}
 	})
+}
+
+// Close 与在途请求可能并发。它只关连接池,不改 handler 在请求路径上读的接口字段
+// —— 后者是一次无同步的接口值写,轻则静默走降级,重则读到半个接口值。
+func TestOIDCClose_DoesNotMutateTheFieldTheRequestPathReads(t *testing.T) {
+	led := &fakeRedemptionLedger{outcome: redeemAdmitFirst}
+	o := &OIDC{Log: log.NewTLog("OIDC-test"), redeemLedger: led}
+	if err := o.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if o.redeemLedger != redemptionLedger(led) {
+		t.Error("Close() replaced redeemLedger; that field is read by in-flight handlers")
+	}
+	// 幂等:再关一次不应报错(New() 的失败路径会调一次,框架退出再调一次)。
+	if err := o.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
 }

@@ -21,6 +21,13 @@ package oidc
 // 合法客户端只要在持续使用,每次兑换都刷新 T,永远不会被拒;它是否复用同一张
 // token 兑换多次,本设计不需要预先知道。
 //
+// **记录丢失(Redis 重启无持久化 / maxmemory 淘汰)与"从未兑换过"不可区分。**
+// 后果是:一张仍在使用、但 iat 已超过 F 的 token 会以 reject_stale_first 被拒,
+// 客户端必须重走一次 SSO。这是**有意选择的方向** —— 台账就是这条路径的安全状态,
+// 状态丢失后要求重新认证是正确的一侧;反过来"记录没了就放行"等于让一次 Redis
+// 故障把 F 关掉。运维侧的信号是 reject_stale_first 突然成批出现(正常时它稀疏),
+// 该告警指向的是 Redis 数据丢失,不是客户端行为变化。
+//
 // **记录的 TTL 必须是 token 自己的剩余寿命,不是 T。** 若 TTL=T,记录过期后这张
 // token 在下次兑换时会被当成"首次兑换"重新走 F,而 F 是从 iat 起算的 —— 老 token
 // 会被 F 拒掉,看似也对;但只要 T > F,记录就会在 F 还没到期时先消失,重复兑换的
@@ -76,8 +83,11 @@ const (
 	redeemAdmitFirst redemptionOutcome = "admit_first"
 	// redeemAdmitRepeat 重复兑换,距上次在 T 之内,已刷新 last_at。
 	//
-	// 这条曲线是"客户端是否复用同一张 token 反复兑换"的唯一线上信号 —— 它长期
-	// 为零,才谈得上把语义收紧成一次性消费。
+	// 这条曲线回答的是**是否存在重复兑换**,不区分"客户端自己复用"与"有人在重放"
+	// —— 台账只存 last_at,两者产生的增量完全相同。所以它只能作否定判据:长期为
+	// 零,才谈得上把语义收紧成一次性消费;非零时它不构成"客户端在正常复用"的证据,
+	// 要判断是谁在兑换,得先有能区分调用方的记录(那会是另一个取舍:存 IP/uid
+	// 等于给凭据加一份用户行为记录)。
 	redeemAdmitRepeat redemptionOutcome = "admit_repeat"
 	// redeemRejectStaleFirst 首次兑换来得太晚(超过 F)。
 	redeemRejectStaleFirst redemptionOutcome = "reject_stale_first"
@@ -112,19 +122,41 @@ type redemptionPolicy struct {
 	idleWindow        time.Duration // T
 }
 
-// normalized 把非正值替换成默认值。
+// normalized 把两个边界收敛成**可执行的取值**:非正回落默认、截到整秒且不低于
+// 1 秒、T 不超过记录能存活的上限。
 //
 // 为什么必须有:这两个值参与的是**准入**判定,F=0 意味着"所有首次兑换都太晚",
 // 即全员登录失败。而零值来得很容易 —— 一个漏配的 env、一个测试里手工构造的
 // OIDC 结构体。让漏配表现为"用默认策略",而不是"登录全挂"。
+//
+// 整秒截断与 1 秒下限是同一类保护,针对的是**亚秒取值**:判定在 Lua 里以整秒
+// 比较,`int64(500ms/time.Second)` 是 0,于是脚本比的是 `now-iat > 0` —— 任何
+// 一秒前签发的 token 都被拒,就是 F=0 那个全员登录失败,只是绕了一圈。截断放在
+// 这里而不是转换处,是为了让**降级路径**(Go 里按 Duration 比较)与 Lua 用的是
+// 同一个值,两条路径不会对同一张 token 得出不同结论。
+//
+// T 的上限是 redemptionRecordMaxTTL:记录活不过它,配一个更长的 T 只会让超时的
+// 兑换以"首次兑换超过 F"的名义被拒 —— 拒得对,但归因是错的,运维会去调 F。
+// 收敛到能执行的值,启动日志打印的也就是真正生效的值。
 func (p redemptionPolicy) normalized() redemptionPolicy {
-	if p.firstRedeemMaxAge <= 0 {
-		p.firstRedeemMaxAge = defaultFirstRedeemMaxAge
-	}
-	if p.idleWindow <= 0 {
-		p.idleWindow = defaultRedeemIdleWindow
-	}
+	p.firstRedeemMaxAge = normalizeBound(p.firstRedeemMaxAge, defaultFirstRedeemMaxAge, 0)
+	p.idleWindow = normalizeBound(p.idleWindow, defaultRedeemIdleWindow, redemptionRecordMaxTTL)
 	return p
+}
+
+// normalizeBound 单个边界的收敛规则。max<=0 表示不设上限。
+func normalizeBound(v, def, max time.Duration) time.Duration {
+	if v <= 0 {
+		v = def
+	}
+	v = v.Truncate(time.Second)
+	if v < time.Second {
+		v = time.Second
+	}
+	if max > 0 && v > max {
+		v = max
+	}
+	return v
 }
 
 // loadRedemptionPolicy 从环境读取两个边界。
@@ -144,6 +176,8 @@ func loadRedemptionPolicy() redemptionPolicy {
 // 这段时间内重复兑换的客户端若 token 已超过 F,会被拒 —— 用一个独立的
 // metric label 暴露出来,而不是混进正常失败里。
 func (p redemptionPolicy) admitWithoutLedger(iat, now time.Time) redemptionOutcome {
+	// 这里仍收敛一次:调用方可能是一个零值 policy(直接构造的 OIDC),而这条路径
+	// 的 fail-open 后果是发会话。normalized 是幂等的,重复调用不改变结果。
 	if now.Sub(iat) > p.normalized().firstRedeemMaxAge {
 		return redeemDegradedReject
 	}
@@ -237,7 +271,8 @@ func (l *redisRedemptionLedger) Admit(_ context.Context, digest string, iat, exp
 		return "", errors.New("oidc: redemption digest is empty")
 	}
 	ttl := recordTTL(exp, now)
-	p := l.policy.normalized()
+	// policy 在构造时已收敛(newRedisRedemptionLedger),这里直接用。
+	p := l.policy
 	res, err := luaRedemptionAdmit.Run(l.client, []string{redemptionKey(digest)},
 		strconv.FormatInt(now.Unix(), 10),
 		strconv.FormatInt(iat.Unix(), 10),
@@ -294,20 +329,19 @@ func recordTTL(exp, now time.Time) time.Duration {
 // 未配置台账(o.redeemLedger == nil)与台账报错走同一条降级路径:两者对这次请求
 // 的意义相同 —— "拿不到历史",而准入不能因为拿不到历史就无条件放行。
 func (o *OIDC) admitRedemption(ctx context.Context, rawToken string, rj *RedeemedBearerJWT, now time.Time, traceID string) redemptionOutcome {
-	policy := o.redeemPolicy.normalized()
 	if rj == nil {
 		// 不可达(调用方在验签成功后才进来),但这里的 fail-open 是发一个会话,
 		// 所以按拒绝处理而不是按放行。
 		return redeemDegradedReject
 	}
 	if o.redeemLedger == nil {
-		return policy.admitWithoutLedger(rj.IssuedAt, now)
+		return o.redeemPolicy.admitWithoutLedger(rj.IssuedAt, now)
 	}
 	out, err := o.redeemLedger.Admit(ctx, redemptionDigest(rawToken), rj.IssuedAt, rj.ExpiresAt, now)
 	if err != nil {
 		o.Warn("OIDC exchange-jwt: redemption ledger unavailable, falling back to the first-redeem ceiling",
 			zap.String("trace_id", traceID), zap.Error(err))
-		return policy.admitWithoutLedger(rj.IssuedAt, now)
+		return o.redeemPolicy.admitWithoutLedger(rj.IssuedAt, now)
 	}
 	return out
 }

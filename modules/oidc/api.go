@@ -138,8 +138,13 @@ type OIDC struct {
 	// 台账为 nil(未启用 exchange 端点、或未配置验签器)时,准入退化为只用 F 判定
 	// ——见 admitRedemption。**不能**退化成无条件放行:那等于把重放窗口放大到
 	// token 自己的 exp(约 15 天),正是台账要收窄的东西。
-	redeemLedger redemptionLedger
-	redeemPolicy redemptionPolicy
+	//
+	// redeemLedger 只在 New() 里赋值,之后**只读** —— handler 在请求路径上读它,
+	// 而 Close() 与请求可能并发(优雅退出)。要关闭的连接池另存一份具体类型
+	// (redeemLedgerClient),Close 只动那一份,不写 handler 读的接口字段。
+	redeemLedger       redemptionLedger
+	redeemLedgerClient *redisRedemptionLedger
+	redeemPolicy       redemptionPolicy
 
 	// bearerJWTErr 验签器**构造失败**的原因(密钥太短 / issuer 派生失败)。
 	//
@@ -288,7 +293,9 @@ func New(ctx *config.Context) *OIDC {
 	// 到 F。策略读取失败不存在(非法值回落默认值),所以这里没有错误分支。
 	o.redeemPolicy = loadRedemptionPolicy()
 	if cfg.ExchangeEnabled && o.bearerJWT != nil {
-		o.redeemLedger = newRedisRedemptionLedger(ctx, o.redeemPolicy)
+		led := newRedisRedemptionLedger(ctx, o.redeemPolicy)
+		o.redeemLedger = led
+		o.redeemLedgerClient = led
 		o.Info("bearer JWT redemption ledger enabled",
 			zap.Duration("first_redeem_max_age", o.redeemPolicy.firstRedeemMaxAge),
 			zap.Duration("idle_window", o.redeemPolicy.idleWindow))
@@ -954,11 +961,15 @@ func (o *OIDC) Close() error {
 		o.idTokens = nil
 	}
 	// redeemLedger 独立 redis.Client(/exchange-jwt 兑换台账),New() 在端点启用时创建。
-	if rrl, ok := o.redeemLedger.(*redisRedemptionLedger); ok {
-		if err := rrl.Close(); err != nil {
+	//
+	// 只置空 redeemLedgerClient,**不动** redeemLedger:后者在请求路径上被读,而
+	// Close 可能与在途请求并发。关掉的 client 会让 Admit 返回 error,handler 因此
+	// 走降级判定(仍受 F 约束),这比与请求赛跑改一个接口字段安全。
+	if o.redeemLedgerClient != nil {
+		if err := o.redeemLedgerClient.Close(); err != nil {
 			o.Error("关闭 OIDC 兑换台账 Redis client 失败", zap.Error(err))
 		}
-		o.redeemLedger = nil
+		o.redeemLedgerClient = nil
 	}
 	if err := o.closeExchangeLimiterClients(); err != nil {
 		o.Error("关闭 OIDC exchange 限流 Redis client 失败", zap.Error(err))
