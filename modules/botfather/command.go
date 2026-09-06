@@ -626,42 +626,37 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	eventKey := botevent.QueueKey(botID)
 	h.ctx.GetRedisConn().Del(eventKey)
 
-	// Remove bot from all groups
+	// 把 Bot 从它所在的每个群里移除，走 modules/group 的移除漏斗。
+	//
+	// 原先这里是一段自己拼的清理：IMRemoveSubscriber + RemoveUserFromGroupThreads
+	// + 一条裸 `UPDATE group_member SET is_deleted=1`。裸 UPDATE 是源码守卫拦的写法，
+	// 而它漏掉的东西正是「重新实现移除」必然漏的那些 ——
+	// RemoveGroupMembers 还会发 CMDGroupMemberUpdate（客户端成员列表增量同步）、
+	// 清 thread_member / thread_setting、清 Space 维度的置顶与会话扩展、回收
+	// is_external_group 标记，并按 uid 排序取 LockRemovableMemberTx 保证锁序。
+	// IM 退订和子区退订它本来就做，所以这里删掉的两段不是丢功能，是去重。
+	//
+	// SuppressRemoveNotice=true 是为了**保持现状**：今天这条路径不发任何系统消息，
+	// 而漏斗默认会发「X 被 Y 移出群聊」。对一个被全局删除的 Bot 来说这句话是错的
+	// （没有人把它移出这个群，是它整个不存在了），而且让它在生产里冒出来，是
+	// 「收口顺带改了用户可见行为」的典型翻车方式。要不要给群里发一条「该 Bot 已被
+	// 删除」是产品问题，不是重构的副产品。
+	//
+	// 一个已知的行为差异：漏斗会静默跳过 role=creator 的成员。若某个 Bot 是某群的
+	// 创建者（正常流程产生不了），它的成员行会留下，由对账扫描报出来，而不是被
+	// 无声删掉。
 	groups, err := h.groupService.GetGroupsWithMemberUID(botID)
 	if err != nil {
 		h.Error("查询Bot所在群失败", zap.Error(err))
 	} else {
 		for _, g := range groups {
-			// Remove from IM channel
-			err = h.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-				ChannelID:   g.GroupNo,
-				ChannelType: uint8(common.ChannelTypeGroup),
-				Subscribers: []string{botID},
-			})
-			if err != nil {
-				h.Error("从IM频道移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(err))
-			}
-			// Issue #27：父群订阅之外，还要对齐摘除该 Bot 在群内所有非删除子区的 IM 订阅，
-			// 否则被删除的 Bot 仍会通过 WuKongIM 持续收到子区消息。
-			h.groupService.RemoveUserFromGroupThreads(g.GroupNo, botID, g.SpaceID)
-		}
-	}
-
-	// Remove bot from all group_member records with version for client sync
-	if groups != nil {
-		for _, g := range groups {
-			memberVersion, err := h.ctx.GenSeq(common.GroupMemberSeqKey)
-			if err != nil {
-				h.Error("GenSeq failed for group member", zap.String("groupNo", g.GroupNo), zap.Error(err))
-				continue
-			}
-			_, err = h.ctx.DB().Update("group_member").
-				Set("is_deleted", 1).
-				Set("version", memberVersion).
-				Where("group_no=? and uid=? and is_deleted=0", g.GroupNo, botID).
-				Exec()
-			if err != nil {
-				h.Error("删除Bot群成员记录失败", zap.String("groupNo", g.GroupNo), zap.Error(err))
+			if _, rmErr := h.groupService.RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
+				GroupNo:              g.GroupNo,
+				Members:              []string{botID},
+				OperatorUID:          botID,
+				SuppressRemoveNotice: true,
+			}); rmErr != nil {
+				h.Error("从群移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(rmErr))
 			}
 		}
 	}

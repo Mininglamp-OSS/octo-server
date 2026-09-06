@@ -1339,32 +1339,49 @@ func (s *Space) joinPresetGroups(uid string, spaceID string, presetGroupIdsJSON 
 		return
 	}
 
+	// 入群动作必须走 modules/group 的唯一准入口。本模块不能 import modules/group
+	// （group 已经 import space，反过来即成环），所以由 group 侧反向注册进来，
+	// 见 preset_group_admitter.go —— 那里也记着原来那条裸 INSERT 的四个缺陷。
+	admit := presetGroupAdmitter()
+	if admit == nil {
+		s.Error("预设群组准入口未注册，跳过自动入群",
+			zap.String("uid", uid), zap.String("space_id", spaceID))
+		return
+	}
+
 	session := s.ctx.DB()
 	for _, groupNo := range groupNos {
 		if groupNo == "" {
 			continue
 		}
-		// 检查群是否存在、未解散，且属于当前 Space
-		var groupStatus int
-		count, err := session.SelectBySql("SELECT status FROM `group` WHERE group_no=? AND space_id=?", groupNo, spaceID).Load(&groupStatus)
-		if err != nil || count == 0 || groupStatus != 1 {
+		// 检查群是否存在、未解散、属于当前 Space，且不是项目群。
+		//
+		// project_id 只是这条既有查询上多取一列，不是新依赖（modules/space 本来
+		// 就直接读 group 表）。项目群不能当预设群：预设群是「每个加入本 Space 的人
+		// 都自动进」，而项目群要求成员必须是该项目成员——把两者叠在一起，等于每来
+		// 一个新 Space 成员就批量破坏一次 I2。这里是执行期的兜底检查，配置期的检查
+		// 在 updateSpace 的入口。
+		var presetGroup struct {
+			Status    int    `db:"status"`
+			ProjectID string `db:"project_id"`
+		}
+		count, err := session.SelectBySql(
+			"SELECT status, project_id FROM `group` WHERE group_no=? AND space_id=?",
+			groupNo, spaceID).Load(&presetGroup)
+		if err != nil || count == 0 || presetGroup.Status != 1 {
 			s.Warn("预设群组不存在、已解散或不属于当前 Space，跳过", zap.String("group_no", groupNo), zap.String("space_id", spaceID))
 			continue
 		}
-		// 检查用户是否已在群中
-		var memberCount int
-		_, err = session.SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, uid).Load(&memberCount)
-		if err != nil {
-			s.Warn("检查群成员失败，跳过", zap.String("group_no", groupNo), zap.Error(err))
+		if presetGroup.ProjectID != "" {
+			s.Warn("预设群组属于某个项目，跳过自动入群（项目群要求显式的项目成员资格）",
+				zap.String("group_no", groupNo), zap.String("project_id", presetGroup.ProjectID),
+				zap.String("uid", uid))
 			continue
 		}
-		if memberCount > 0 {
-			s.Warn("用户已在群中，跳过", zap.String("group_no", groupNo), zap.String("uid", uid))
-			continue
-		}
-		// 添加成员
-		_, err = session.InsertBySql("INSERT INTO group_member (group_no, uid) VALUES (?, ?)", groupNo, uid).Exec()
-		if err != nil {
+		// 不再自己判断「是否已在群中」。原来那个检查过滤 is_deleted=0，于是曾经退过群
+		// 的人能通过检查、撞上唯一索引、拿到 1062、被记成一条 Warn，然后**永远**加不
+		// 回来。准入口内部用 upsert 决定插入还是恢复，已在群里则整条语句是空操作。
+		if err := admit(s.ctx, spaceID, groupNo, uid); err != nil {
 			s.Warn("自动加入预设群组失败", zap.String("group_no", groupNo), zap.String("uid", uid), zap.Error(err))
 			continue
 		}

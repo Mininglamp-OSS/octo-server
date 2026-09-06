@@ -32,9 +32,17 @@ package group
 // — a stored procedure, a generated query, an ORM introduced later. No such
 // writer exists today; one added later needs a matching needle here.
 //
-// Comments and strings are not stripped. A comment containing "UPDATE
-// group_member" is worth a review too: it usually means someone is describing a
-// write they are about to add.
+// Go comments ARE stripped before matching, and that is a deliberate reversal of
+// the model guard's choice. internal/msgextraseq keeps comments in scope because
+// the accepted place to document its key is that one file. Here the opposite is
+// true: converging a bypass means DELETING a write and explaining in a comment
+// what was deleted and why, and a guard that fires on that explanation pushes
+// authors to describe the removed SQL vaguely — which is worse for the next
+// reader than the guard is good. The three files that document the raw
+// `INSERT INTO group_member (group_no, uid)` this change removed are exactly the
+// files that should quote it.
+//
+// String literals are still in scope: that is where a real write lives.
 
 import (
 	"os"
@@ -237,7 +245,10 @@ func assertNeedlesAbsent(
 		if rerr != nil {
 			return rerr
 		}
-		for i, line := range strings.Split(string(body), "\n") {
+		inBlockComment := false
+		for i, raw := range strings.Split(string(body), "\n") {
+			var line string
+			line, inBlockComment = stripGoComments(raw, inBlockComment)
 			lower := strings.ToLower(line)
 			for _, needle := range needles {
 				hit := strings.Contains(line, needle)
@@ -254,7 +265,7 @@ func assertNeedlesAbsent(
 					file:   rel,
 					line:   i + 1,
 					needle: needle,
-					text:   strings.TrimSpace(line),
+					text:   strings.TrimSpace(raw),
 				})
 			}
 		}
@@ -377,4 +388,35 @@ func TestNoGroupMemberRowsBuiltOutsideModulesGroup(t *testing.T) {
 			"through the admission funnel. Route the operation through the group "+
 			"service instead, or reverse-register a step the way modules/space "+
 			"receives its preset-group admitter.")
+}
+
+// stripGoComments removes // line comments and /* */ block comment content from
+// one line, returning the code-only remainder and whether a block comment is
+// still open.
+//
+// Not a Go parser: a "//" inside a string literal is treated as a comment start.
+// The consequence is bounded — it can only shorten a line, so the worst case is
+// missing a needle that appears after "//" INSIDE a string, which no real write
+// looks like. Being a parser here would mean loading go/ast for a grep.
+func stripGoComments(line string, inBlock bool) (string, bool) {
+	var out strings.Builder
+	for i := 0; i < len(line); i++ {
+		if inBlock {
+			if i+1 < len(line) && line[i] == '*' && line[i+1] == '/' {
+				inBlock = false
+				i++
+			}
+			continue
+		}
+		if i+1 < len(line) && line[i] == '/' && line[i+1] == '/' {
+			break
+		}
+		if i+1 < len(line) && line[i] == '/' && line[i+1] == '*' {
+			inBlock = true
+			i++
+			continue
+		}
+		out.WriteByte(line[i])
+	}
+	return out.String(), inBlock
 }
