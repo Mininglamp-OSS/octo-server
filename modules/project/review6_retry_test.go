@@ -10,6 +10,7 @@ package project
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
@@ -80,18 +81,30 @@ func TestRetryOnLockConflictRetriesDeadlocksAndNothingElse(t *testing.T) {
 			"every service sentinel must survive the wrapper, or every handler switch breaks")
 	})
 
-	t.Run("wrapped deadlocks are recognised", func(t *testing.T) {
+	t.Run("a deadlock wrapped with %w is still recognised", func(t *testing.T) {
 		calls := 0
 		require.NoError(t, retryOnLockConflict(func() error {
 			calls++
 			if calls == 1 {
-				return errors.New("project: begin add member: " + deadlock.Error())
+				return fmt.Errorf("project: begin add member: %w", deadlock)
 			}
 			return nil
 		}))
-		// The plain-string form is NOT a MySQLError, so it must NOT be retried — this asserts
-		// the judgement is errors.As, not substring matching.
-		assert.Equal(t, 1, calls, "only a real *mysql.MySQLError counts as transient")
+		assert.Equal(t, 2, calls,
+			"the service wraps its DB errors, so the judgement must unwrap — every real "+
+				"deadlock arrives through a fmt.Errorf chain")
+	})
+
+	t.Run("a deadlock only DESCRIBED in a message is not retried", func(t *testing.T) {
+		calls := 0
+		err := retryOnLockConflict(func() error {
+			calls++
+			return errors.New("Deadlock found when trying to get lock")
+		})
+		require.Error(t, err)
+		assert.Equal(t, 1, calls,
+			"the judgement is errors.As, not substring matching: text that merely mentions a "+
+				"deadlock is not one")
 	})
 }
 

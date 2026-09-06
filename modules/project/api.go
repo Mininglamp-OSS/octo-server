@@ -409,6 +409,13 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		observeRejected(entryProjectUpdate, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 		return
+	case errors.Is(err, errActorNotSpaceMember):
+		// The caller's own Space seat closed between the middleware's live read and this
+		// transaction. An authorization refusal, so NOT store_failed: that renders Internal /
+		// HTTP 500, inflates the 5xx budget, and files the rejection under the wrong reason in
+		// write_rejected_total.
+		observeRejected(entryProjectUpdate, reasonNotSpaceMember)
+		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 	case errors.Is(err, errNoFieldsToUpdate):
 		respondProjectRequestInvalid(c, "name|description|logo|discoverability|max_members")
 		return
@@ -454,6 +461,10 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 	case errors.Is(err, errProjectGone):
 		respondProjectNotFound(c)
 		return
+	case errors.Is(err, errActorNotSpaceMember):
+		// See updateProjectHandler: an authorization refusal must not render as Internal 500.
+		observeRejected(entryProjectDisband, reasonNotSpaceMember)
+		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 	case errors.Is(err, errPermissionDenied):
 		observeRejected(entryProjectDisband, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)

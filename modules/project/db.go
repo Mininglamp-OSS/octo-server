@@ -2,6 +2,7 @@ package project
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -400,6 +401,58 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 		return false, fmt.Errorf("project: lock space row: %w", err)
 	}
 	return len(found) > 0, nil
+}
+
+// lockSpaceSeatsTx takes the shared lock on SEVERAL space_member rows in ONE statement and
+// reports which of the requested uids hold an active seat in an active Space.
+//
+// One statement is the whole point, and it is a lock-ORDER fix rather than a round-trip
+// optimisation. modules/space's disband takes `space_member WHERE space_id=? AND status=1
+// FOR UPDATE` (lockActiveMemberUIDsTx), a range lock acquired ROW BY ROW in index order —
+// clustered-key (id) order. A path that locks two seats in two statements holds the first while
+// waiting for the second, so whenever the second row precedes the first in id order the cycle
+// with that scan closes and InnoDB reports Error 1213. Reproduced on MySQL 8.0.33 against the
+// real addOneMember, with the DISBAND SCAN as the victim — and disband is a step of the
+// member-removal security cascade.
+//
+// Sorting the uids ascending does NOT fix this: the disband scan orders by id, not by uid, so
+// any order this module chooses can still oppose it. Handing InnoDB one `uid IN (...)` predicate
+// lets it acquire the rows in ITS scan order, which is the same order the disband scan uses —
+// there is then no "second row" being waited for while the first is held.
+//
+// The predicate is byte-for-byte checkSpaceMembershipForWriteTx's, and it keeps the JOIN onto
+// `space` for the same reason: callers here do not lock the `space` row, so the JOIN is their
+// only activeness check. The read view that JOIN opens is no longer load-bearing, because every
+// aggregate that authorises a write is now a locking read (see countActiveOwnersTx).
+//
+// Returns the set of uids that DO hold a seat. Callers decide which absence means what, since
+// actor and target absences carry different sentinels.
+func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+	held := make(map[string]bool, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return held, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(uids)), ",")
+	args := make([]interface{}, 0, len(uids)+1)
+	args = append(args, spaceID)
+	for _, uid := range uids {
+		args = append(args, uid)
+	}
+	var found []string
+	_, err := tx.SelectBySql(
+		"SELECT sm.uid FROM `space_member` sm "+
+			"INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.space_id = ? AND sm.uid IN ("+placeholders+") AND sm.status = 1 "+
+			"FOR SHARE OF sm",
+		args...,
+	).Load(&found)
+	if err != nil {
+		return nil, fmt.Errorf("project: lock space seats in tx: %w", err)
+	}
+	for _, uid := range found {
+		held[uid] = true
+	}
+	return held, nil
 }
 
 // lockSpaceSeatRowTx takes the shared lock on uid's space_member row and nothing else — no

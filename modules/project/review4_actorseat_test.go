@@ -21,7 +21,7 @@ import (
 //
 // The count in the name of the guarantee matters: round 1 wired five of the six and the
 // omission was recorded nowhere, so keep this list exhaustive against the callers of
-// requireActorSpaceSeatTx.
+// requireSpaceSeatsTx.
 func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "admin9")

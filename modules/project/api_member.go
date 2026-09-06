@@ -315,6 +315,12 @@ func (p *Project) leaveProjectHandler(c *wkhttp.Context) {
 				"ownership_transferred_on_leave", zap.Int("new_role", RoleOwner))
 		}
 		c.ResponseOK()
+	case errors.Is(err, errActorNotSpaceMember):
+		// ABOVE the target-level arm below, because errActorNotSpaceMember wraps
+		// errNotSpaceMember: placed after it, the caller's own closed seat would be reported
+		// with a message blaming the successor.
+		observeRejected(entryLeave, reasonNotSpaceMember)
+		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 	case errors.Is(err, errNotSpaceMember):
 		// The named successor is no longer an active Space member. Their project seat
 		// survives only because the Space-removal cascade has not run yet; promoting them
@@ -398,6 +404,10 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 				"ownership_transferred_on_demote", zap.Int("new_role", RoleOwner))
 		}
 		c.ResponseOK()
+	case errors.Is(err, errActorNotSpaceMember):
+		// Above the target-level arm, for the reason given in leaveProjectHandler.
+		observeRejected(entryRoleChange, reasonNotSpaceMember)
+		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 	case errors.Is(err, errNotSpaceMember):
 		// Same as in leave: a successor whose Space seat is already gone must not inherit
 		// ownership, or the cascade closing their seat leaves the project unmanageable.

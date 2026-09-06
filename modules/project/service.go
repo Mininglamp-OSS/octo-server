@@ -49,6 +49,48 @@ import (
 // on no-op reruns and break the "a no-op write does not change the epoch" rule that
 // clients cache against.
 
+// txRetryAttempts bounds the retry budget for transient lock conflicts. Three: enough for the
+// pathological interleaving to have passed, few enough that a genuine hot spot surfaces as an
+// error rather than as latency.
+const txRetryAttempts = 3
+
+// retryOnLockConflict re-runs fn while it fails with a TRANSIENT lock conflict.
+//
+// Why this exists even though the seat locks are now taken in one statement: three consecutive
+// review rounds each found a lock-order cycle that careful reasoning had missed — table order
+// vs. modules/space, then row order within space_member. "We reasoned about the order" is
+// demonstrably not sufficient on its own, and the cost of being wrong is not a retry, it is
+// store_failed (Internal, HTTP 500) — and when InnoDB picks the Space disband as its victim, a
+// failed step of the member-removal security cascade.
+//
+// Only 1213 (deadlock) and 1205 (lock wait timeout) are retried, matching
+// modules/common's isRetryableTxErr. Everything else — 1062, every service sentinel — is
+// returned verbatim on the first attempt, so callers' errors.Is checks are untouched. fn must
+// own its whole transaction: a retry re-runs it from BEGIN, which is only sound because a
+// deadlock has already rolled the failed attempt back.
+func retryOnLockConflict(fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < txRetryAttempts; attempt++ {
+		err := fn()
+		if err == nil || !isRetryableTxErr(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("project: transaction retries exhausted: %w", lastErr)
+}
+
+// isRetryableTxErr reports whether err is a transient InnoDB lock conflict. Spelled out here
+// rather than imported from modules/common, whose copy is unexported; the predicate is
+// deliberately identical.
+func isRetryableTxErr(err error) bool {
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number == 1213 || myErr.Number == 1205
+	}
+	return false
+}
+
 // Sentinel errors the API layer maps onto registered error codes. Returning typed
 // errors rather than responding from the service keeps the transaction boundary and
 // the wire contract in separate files.
@@ -162,23 +204,51 @@ func canActOnTargetRole(actorRole, targetRole int) bool {
 	return false
 }
 
-// requireActorSpaceSeatTx revalidates the ACTOR's own Space seat inside the caller's
-// transaction, before the project row lock is taken.
+// requireSpaceSeatsTx takes every space_member seat lock a write path needs in ONE statement,
+// and maps each absence onto the sentinel its subject deserves.
 //
-// The middleware checks Space membership before the transaction, through the shared
-// space:member cache — which the Space module invalidates synchronously on removal, so the
-// window is normally closed. But that makes the guarantee depend on another module's cache
-// hygiene, and on a cache whose DEL-failure fallback is best-effort (yujiawei Q6, PR #841
-// round 1). The target's Space seat has been checked in-transaction since the first review;
-// the actor earns the same structural guarantee for one indexed shared lock the transaction
-// is well placed to take.
-func (p *Project) requireActorSpaceSeatTx(tx *dbr.Tx, spaceID, actorUID string) error {
-	ok, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceID, actorUID)
+// It is the ONLY way this module takes a space_member lock on a write path, which is what lets
+// the guard test count call sites per function. Two reasons it revalidates seats at all, both
+// established by earlier review rounds:
+//
+//   - the ACTOR earns the same structural guarantee as the target. The middleware checks Space
+//     membership before the transaction, through the shared space:member cache, so that
+//     guarantee otherwise depends on another module's cache hygiene — and on a cache whose
+//     DEL-failure fallback is best-effort.
+//   - the TARGET's absence must be observable inside the transaction, or a Space removal can
+//     commit between the check and the write.
+//
+// One statement, because two sequential row locks on space_member reopen the Error 1213 cycle
+// with modules/space's disband scan — see lockSpaceSeatsTx for the mechanism and the
+// reproduction. Paths that need only their own seat still go through here, so there is exactly
+// one way to take these locks and the guard test can count call sites.
+//
+// actorUID is always first and always required. others are the target / successor, and their
+// absence is TARGET-level: the caller is fine, the subject of the operation is not. Empty
+// strings in others are ignored, which is what lets the optional transfer_to be passed
+// unconditionally.
+func (p *Project) requireSpaceSeatsTx(tx *dbr.Tx, spaceID, actorUID string, others ...string) error {
+	uids := make([]string, 0, len(others)+1)
+	uids = append(uids, actorUID)
+	for _, uid := range others {
+		if uid != "" && uid != actorUID {
+			uids = append(uids, uid)
+		}
+	}
+	held, err := p.db.lockSpaceSeatsTx(tx, spaceID, uids)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return errNotSpaceMember
+	// The ACTOR is checked first, so a caller who has lost their own seat is told that rather
+	// than being told something about the target. Their project role may well still be active,
+	// because the Space-removal cascade is asynchronous by design.
+	if !held[actorUID] {
+		return errActorNotSpaceMember
+	}
+	for _, uid := range uids[1:] {
+		if !held[uid] {
+			return errNotSpaceMember
+		}
 	}
 	return nil
 }
@@ -195,6 +265,17 @@ type createInput struct {
 	MaxMembers      int
 }
 
+// createProject runs createProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+func (p *Project) createProject(in createInput) (*Model, error) {
+	var model *Model
+	err := retryOnLockConflict(func() error {
+		var e error
+		model, e = p.createProjectOnce(in)
+		return e
+	})
+	return model, err
+}
+
 // createProject inserts a project and its owner seat in ONE transaction.
 //
 // All three creation quotas are counted inside that transaction. Counting them
@@ -205,7 +286,7 @@ type createInput struct {
 // increases" covers add / remove / leave / role change / Space cascade / disband —
 // creation is where the roster comes into existence rather than changing, so 0 is
 // its initial value and the first real membership change makes it 1.
-func (p *Project) createProject(in createInput) (*Model, error) {
+func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	now := time.Now().UTC()
 	dayFrom, dayTo := p.cfg.dayWindow(now)
 
@@ -349,12 +430,23 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 
 // ---------- update / disband ----------
 
+// updateProject runs updateProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+	var model *Model
+	err := retryOnLockConflict(func() error {
+		var e error
+		model, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
+		return e
+	})
+	return model, err
+}
+
 // updateProject applies a partial profile update under the project row lock.
 //
 // The allow-list is built here, not from the request payload: active_name and
 // is_official must never reach a SET clause, and an allow-list is the only form of
 // that guarantee which survives someone later adding a field to updateReq.
-func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -362,7 +454,7 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID); err != nil {
 		return nil, err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -427,6 +519,17 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 	return row, nil
 }
 
+// disbandProject runs disbandProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string, error) {
+	var uids []string
+	err := retryOnLockConflict(func() error {
+		var e error
+		uids, e = p.disbandProjectOnce(projectID, actorUID, spaceID)
+		return e
+	})
+	return uids, err
+}
+
 // disbandProject marks the project disbanded, closes every seat and bumps the epoch
 // in one transaction.
 //
@@ -437,7 +540,7 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 //
 // Returns the uids whose seats were closed, so the caller can invalidate their
 // caches synchronously.
-func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string, error) {
+func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]string, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -445,7 +548,7 @@ func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string,
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID); err != nil {
 		return nil, err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -557,7 +660,18 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 	return results, nil
 }
 
+// addOneMember runs addOneMemberOnce through the bounded lock-conflict retry; see retryOnLockConflict.
 func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, error) {
+	var admitted bool
+	err := retryOnLockConflict(func() error {
+		var e error
+		admitted, e = p.addOneMemberOnce(projectID, spaceID, actorUID, uid)
+		return e
+	})
+	return admitted, err
+}
+
+func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bool, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -566,31 +680,19 @@ func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, 
 	defer tx.RollbackUnlessCommitted()
 
 	// The ACTOR's own Space seat, revalidated in-transaction like every other privileged
-	// write (see requireActorSpaceSeatTx). This path was the one omission, and its exposure
+	// write (see requireSpaceSeatsTx). This path was the one omission, and its exposure
 	// is the widest of the six: addMembers runs ONE TRANSACTION PER TARGET and breaks the
 	// batch only on errPermissionDenied / errProjectGone, so an actor whose Space seat closes
 	// mid-batch would otherwise have every remaining uid of a 200-uid batch admitted and
 	// audited under them — the actor's project role stays active because the Space-removal
 	// cascade is asynchronous by design.
-	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
-		// Re-tagged as ACTOR-level before it leaves this function: the batch layer and the
-		// wire contract must not confuse it with the target's own missing seat, checked
-		// immediately below and returned as the same sentinel.
-		if errors.Is(err, errNotSpaceMember) {
-			return false, errActorNotSpaceMember
-		}
+	// Both seats — the actor's and the target's — in ONE statement, before lockActiveProjectTx.
+	// I1 for the target is enforced here rather than before the transaction so a Space removal
+	// cannot commit between the check and the write; the actor gets the same guarantee (see
+	// requireSpaceSeatsTx), and taking them together is what keeps this path out of the
+	// row-level 1213 cycle with the disband scan.
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, uid); err != nil {
 		return false, err
-	}
-
-	// I1 for the TARGET, INSIDE this transaction: it takes a shared lock on the target's
-	// space_member row, so a Space removal cannot commit between the check and the write.
-	// Before lockActiveProjectTx, so the declared lock order (space -> project) holds.
-	isSpaceMember, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceID, uid)
-	if err != nil {
-		return false, err
-	}
-	if !isSpaceMember {
-		return false, errNotSpaceMember
 	}
 
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -658,13 +760,24 @@ func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, 
 	return changed, nil
 }
 
+// removeMember runs removeMemberOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (bool, error) {
+	var removed bool
+	err := retryOnLockConflict(func() error {
+		var e error
+		removed, e = p.removeMemberOnce(projectID, spaceID, actorUID, targetUID)
+		return e
+	})
+	return removed, err
+}
+
 // removeMember closes one seat.
 //
 // The target's role is re-read under a row lock inside the transaction, not taken
 // from an earlier unlocked read: the transitive-protection rule ("an admin may not
 // remove an admin or the owner") is only sound if the role it checks cannot change
 // between the check and the write.
-func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (bool, error) {
+func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 	if targetUID == actorUID {
 		// Self-removal goes through leave, which carries the last-owner transfer rule.
 		// Allowing it here would let the last owner delete their own seat and leave an
@@ -678,7 +791,7 @@ func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID); err != nil {
 		// ACTOR-level, re-tagged for the same reason as the add path: removal is the other
 		// batch-driven endpoint, and its handler drives the loop one target at a time — so
 		// without this it fell to the default branch, labelled the actor's own expired
@@ -750,13 +863,24 @@ func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (
 	return changed, nil
 }
 
+// leaveProject runs leaveProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (string, error) {
+	var successor string
+	err := retryOnLockConflict(func() error {
+		var e error
+		successor, e = p.leaveProjectOnce(projectID, spaceID, uid, transferTo)
+		return e
+	})
+	return successor, err
+}
+
 // leaveProject closes the caller's own seat, transferring ownership first when the
 // caller is the last owner.
 //
 // The transfer and the departure are one transaction. Two transactions would leave
 // a window with two owners (if the transfer commits first) or none (if the departure
 // does), and the second of those is unrecoverable in P0.
-func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (string, error) {
+func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (string, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -764,15 +888,12 @@ func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (stri
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireActorSpaceSeatTx(tx, spaceID, uid); err != nil {
+	// The leaver's seat and, when named, the successor's — in ONE statement, before the project
+	// row. Together rather than in sequence: two row locks on space_member reopen the 1213 cycle
+	// with the disband scan (see lockSpaceSeatsTx). transferTo is passed unconditionally because
+	// the helper ignores the empty string.
+	if err := p.requireSpaceSeatsTx(tx, spaceID, uid, transferTo); err != nil {
 		return "", err
-	}
-	// The successor's Space seat is locked and verified HERE, before the project row, so the
-	// transfer path follows the declared space -> project order too (Q2).
-	if transferTo != "" {
-		if err := p.requireActorSpaceSeatTx(tx, spaceID, transferTo); err != nil {
-			return "", err
-		}
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
@@ -825,9 +946,21 @@ func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (stri
 	return successorPromoted, nil
 }
 
+// changeMemberRole runs changeMemberRoleOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID string, role int, transferTo string) (bool, string, error) {
+	var changed bool
+	var successor string
+	err := retryOnLockConflict(func() error {
+		var e error
+		changed, successor, e = p.changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID, role, transferTo)
+		return e
+	})
+	return changed, successor, err
+}
+
 // changeMemberRole sets one member's role, handling the last-owner demotion via the
 // same atomic transfer as leaveProject.
-func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID string, role int, transferTo string) (bool, string, error) {
+func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID string, role int, transferTo string) (bool, string, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -835,34 +968,25 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
-		return false, "", err
-	}
-	// The target's Space seat is locked and verified HERE, before the project row (Q2),
-	// whenever the REQUESTED role is admin or owner.
+	// Every seat this operation depends on, in ONE statement, before the project row.
 	//
-	// Stated precisely, because the earlier version of this comment said "a demotion skips the
-	// check" and the gate does not: it keys on the requested role, so an owner -> admin
-	// DEMOTION is checked too. Only a demotion to RoleCommon skips it. That is the intended
-	// shape rather than a gap — RoleCommon is the operator's escape hatch for a member already
-	// on their way out of the Space, and every role at or above admin is a privilege worth the
-	// in-transaction predicate whichever direction the change moves.
-	//
-	// The requested role is what the gate can use: it is known before any lock, whereas
-	// whether the change is really a promotion (role > target.Role) is only knowable under the
+	// Which seats those are depends on the REQUESTED role, and that condition is the same one
+	// the sequential version used: a request that would raise the target to admin or owner is a
+	// GRANT, and a grant needs the authorization predicate in-transaction. Only a demotion to
+	// RoleCommon skips the target's seat — the operator's escape hatch for a member already on
+	// their way out of the Space. The requested role is knowable before any lock; whether the
+	// change is really a promotion is not, since that needs the target's current role under the
 	// project lock. Pinned by TestPromotionRequiresTargetStillInSpace.
+	//
+	// One statement rather than two or three: see lockSpaceSeatsTx for the 1213 cycle that
+	// sequential seat locks reopen against modules/space's disband scan.
+	seats := make([]string, 0, 2)
 	if role >= RoleAdmin {
-		if err := p.requireActorSpaceSeatTx(tx, spaceID, targetUID); err != nil {
-			return false, "", err
-		}
+		seats = append(seats, targetUID)
 	}
-	// The named successor (last-owner demotion) gets the same pre-lock treatment as in
-	// leaveProject: their seat is about to receive ownership, so the authorization predicate
-	// must hold and the shared lock must precede the project row.
-	if transferTo != "" {
-		if err := p.requireActorSpaceSeatTx(tx, spaceID, transferTo); err != nil {
-			return false, "", err
-		}
+	seats = append(seats, transferTo) // ignored when empty
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seats...); err != nil {
+		return false, "", err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
@@ -934,7 +1058,7 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 }
 
 // promoteSuccessorTx promotes a successor whose Space seat was ALREADY verified and locked
-// by the caller (lockSpaceSeatBeforeProjectTx, before lockActiveProjectTx) to owner.
+// by the caller (requireSpaceSeatsTx, before lockActiveProjectTx) to owner.
 //
 // The Space-seat check is the point. Checking only for an active PROJECT seat is not enough:
 // the Space-removal cascade is asynchronous, so a user removed from the Space keeps their
@@ -944,7 +1068,7 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 // has read access only). The predicate is the authorization one, so a banned Space does not
 // qualify a successor either.
 //
-// The check itself lives in lockSpaceSeatBeforeProjectTx so the shared space_member lock is
+// The check itself lives in requireSpaceSeatsTx so the shared space_member lock is
 // taken BEFORE the project row — restoring the declared space -> project order on every path
 // that needs it. The earlier placement (shared lock taken while holding the project row, with
 // a no-cycle argument relying on the removal path taking its project lock only in a LATER
@@ -967,17 +1091,6 @@ func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, successorUID, depart
 		return err
 	}
 	return nil
-}
-
-// lockSpaceSeatBeforeProjectTx takes the SHARED lock on uid's space_member row — the
-// authorization predicate (active member of an active Space) — before the caller locks the
-// project row. Callers pass every uid whose Space seat the transaction will later rely on:
-// the actor (always), the role-change target, and the named successor.
-//
-// Reported as "not a Space member" rather than "not found": the caller named a real project
-// member, and telling them the seat is missing would send them looking in the wrong place.
-func (p *Project) lockSpaceSeatBeforeProjectTx(tx *dbr.Tx, spaceID, uid string) error {
-	return p.requireActorSpaceSeatTx(tx, spaceID, uid)
 }
 
 // ---------- helpers ----------

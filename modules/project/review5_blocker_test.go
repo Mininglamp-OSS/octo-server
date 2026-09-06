@@ -4,7 +4,7 @@ package project
 // B-1..B-3). Three guarantees this PR itself introduced were each applied at all-but-one
 // of their call sites, and the omission was unrecorded in every case:
 //
-//	B-1  requireActorSpaceSeatTx reached five privileged writes; addOneMember was not one.
+//	B-1  the actor Space-seat check reached five privileged writes; addOneMember was not one.
 //	B-2  MemberRole's `ok` is honoured by projectMiddleware and discarded by the list route.
 //	B-3  createProject locks `space` before `space_member`, the reverse of the order
 //	     modules/space/db.go records as a known Error 1213 incident.
@@ -369,8 +369,8 @@ func txSelectStatements(joined string) []string {
 // half: that path must not merely take a LOCKING read, it must avoid opening a read view at all
 // before the `space` lock, because its quota counts run after it.
 func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
-	fn := funcBody(t, readLinesWithoutComments(t, "service.go"),
-		"func (p *Project) createProject(")
+	fn := implBody(t, readLinesWithoutComments(t, "service.go"),
+		"func (p *Project) createProject")
 	assert.Contains(t, fn, "lockSpaceSeatRowTx",
 		"createProject must take the JOIN-free seat lock")
 	assert.NotContains(t, fn, "checkSpaceMembershipForWriteTx",
@@ -413,6 +413,22 @@ func readLinesWithoutComments(t *testing.T, name string) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// implBody returns the body of a write path's IMPLEMENTATION, preferring the `...Once` form
+// over its retry wrapper.
+//
+// This indirection is load-bearing, and it exists because of a near-miss: wrapping the seven
+// write entry points in retryOnLockConflict renamed every implementation to `...Once`, and three
+// source guards silently began inspecting the empty wrapper instead. One failed loudly; two
+// went GREEN while checking nothing. A guard that can be defeated by a rename is not a guard, so
+// resolution happens here, once, for all of them.
+func implBody(t *testing.T, src, receiverAndName string) string {
+	t.Helper()
+	if i := strings.Index(src, receiverAndName+"Once("); i >= 0 {
+		return funcBody(t, src, receiverAndName+"Once(")
+	}
+	return funcBody(t, src, receiverAndName+"(")
 }
 
 // funcBody returns the source of the function whose signature starts with sig, up to the next

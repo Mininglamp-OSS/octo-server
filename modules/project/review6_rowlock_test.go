@@ -112,15 +112,18 @@ func TestAddDoesNotDeadlockWhenSeatRowsAreLockedAgainstTheDisbandScanOrder(t *te
 func TestEachWritePathTakesItsSeatLocksInOneStatement(t *testing.T) {
 	src := readLinesWithoutComments(t, "service.go")
 	for _, fn := range []string{
-		"func (p *Project) addOneMember(",
-		"func (p *Project) leaveProject(",
-		"func (p *Project) changeMemberRole(",
-		"func (p *Project) removeMember(",
-		"func (p *Project) updateProject(",
-		"func (p *Project) disbandProject(",
+		"func (p *Project) addOneMember",
+		"func (p *Project) leaveProject",
+		"func (p *Project) changeMemberRole",
+		"func (p *Project) removeMember",
+		"func (p *Project) updateProject",
+		"func (p *Project) disbandProject",
 	} {
-		body := funcBody(t, src, fn)
-		n := countOccurrences(body, "requireActorSpaceSeatTx(") +
+		// implBody, not funcBody: these all have a retry wrapper now, and inspecting the wrapper
+		// would make this guard vacuously green.
+		body := implBody(t, src, fn)
+		n := countOccurrences(body, "requireSpaceSeatsTx(") +
+			countOccurrences(body, "lockSpaceSeatsTx(") +
 			countOccurrences(body, "checkSpaceMembershipForWriteTx(") +
 			countOccurrences(body, "lockSpaceSeatRowTx(")
 		assert.LessOrEqual(t, n, 1,
