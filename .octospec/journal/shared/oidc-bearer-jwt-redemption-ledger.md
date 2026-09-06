@@ -72,8 +72,13 @@ Supporting changes:
 - **A ceiling's anchor matters more than its value.** Every proposal that only
   argued about the number (10 minutes → 30 → an hour) kept the same defect,
   because `iat` cannot express "this redemption is suspicious". Moving the anchor
-  to the redemption made both the false refusals and the real replay window
-  smaller at once — the two goals stopped competing.
+  to the redemption ended the false refusals outright and narrowed two of the
+  three capture windows — before first use (`exp` → `F`) and after abandonment
+  (`exp` → `T`). It did not narrow all three: a token captured while its owner
+  is still redeeming stays usable for the rest of its `exp`, where the old
+  ceiling would have refused it after ten minutes. That widening is the trade
+  this design makes knowingly, and the honest claim is "the goals stopped
+  competing on two of the three", not on all of them.
 
 - **A sliding window cannot be expressed by the record's TTL.** The first design
   set `TTL = T` and let expiry mean "abandoned". It is backwards: an expired key
@@ -163,3 +168,42 @@ Two findings were not acted on, deliberately:
 - `learnings/pending/validate-in-the-representation-the-consumer-uses.md` — a
   bound checked as a `time.Duration` and consumed as whole seconds passed
   validation and arrived as the value validation existed to forbid.
+
+## Second review round (PR #843)
+
+Approved, with five P2s. Four are folded in; the fifth is answered rather than changed.
+
+- **`F` was uncapped while `T` was capped, and the asymmetry defeats `T`.** A
+  record cannot outlive `redemptionRecordMaxTTL`, so with `F` longer than that,
+  every post-eviction redemption looks like a first one and passes `F` — a 60-day
+  `F` silently waves through a 7-day idle window. Both bounds are now capped by
+  the record's lifetime. The cap on `T` was argued for in the file already; the
+  same argument applied to `F` and nobody had turned it around.
+- **The degraded bound is now `min(F, T)`.** `T < F` is a legitimate
+  configuration ("first use may be late, reuse must be frequent"), and applying
+  `F` alone made a Redis outage *looser* than normal operation — the one thing
+  the degraded path is not allowed to be. On the defaults (`F=24h`, `T=7d`)
+  nothing changes.
+- **"Ledger not configured" is no longer reported as "Redis is flapping".** Both
+  states fell into the same `degraded_*` labels, so a wiring regression — a
+  permanent, non-self-healing downgrade where `T` never applies — would read on a
+  dashboard as transient Redis trouble. New `unconfigured_*` labels plus a log
+  line separate them, and a `New()`-level test now asserts the ledger is wired
+  whenever `/exchange-jwt` is mounted. Every handler test injects a double, so
+  without that test the constructor could be dropped with the suite still green —
+  the exact failure `new_wiring_integration_test.go` was written for.
+- **The headline regression was not pinned numerically.** The 36-minute test
+  stubs the ledger, so it proves the handler applies no `iat` ceiling — not that
+  the shipped default admits a 36-minute-old token. Reverting `defaultFirstRedeemMaxAge`
+  to ten minutes would have reinstated the production bug with a green suite.
+  There is now a floor assertion on the default.
+- **`Admit` normalises its own policy.** It trusted its constructor; the
+  sub-second defect fixed one round earlier was exactly a value reaching the
+  script un-normalised.
+
+Two claims were softened rather than defended: the two paths use the same
+*bound* but not the same comparison resolution (whole seconds in Lua,
+`time.Duration` in Go), and the anti-enumeration test pins the response, not the
+timing — a refusal by the ledger costs a Redis round trip that a bad signature
+does not. Neither is worth code; both were worth saying plainly where the test
+name would otherwise overstate.

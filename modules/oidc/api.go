@@ -289,8 +289,11 @@ func New(ctx *config.Context) *OIDC {
 	// 兑换台账。只在 /exchange-jwt 真的会挂载时构造 —— 为一个不存在的端点开
 	// Redis 连接池没有意义(与 routeAt 里限流 client 的处理同一个理由)。
 	//
-	// 策略本身**总是**加载:台账没构造出来时,准入走 admitWithoutLedger,它要用
-	// 到 F。策略读取失败不存在(非法值回落默认值),所以这里没有错误分支。
+	// 策略本身**总是**加载:台账没构造出来时,准入走降级判定,它要用到 F。
+	// 策略读取失败不存在(非法值回落默认值),所以这里没有错误分支。
+	//
+	// 打印的是**收敛之后**的取值,也就是真正生效的那两个数 —— 运维配了
+	// 一个超上限或亚秒的值时,日志里不该还显示他配的那个。
 	o.redeemPolicy = loadRedemptionPolicy()
 	if cfg.ExchangeEnabled && o.bearerJWT != nil {
 		led := newRedisRedemptionLedger(ctx, o.redeemPolicy)
@@ -300,6 +303,11 @@ func New(ctx *config.Context) *OIDC {
 			zap.Duration("first_redeem_max_age", o.redeemPolicy.firstRedeemMaxAge),
 			zap.Duration("idle_window", o.redeemPolicy.idleWindow))
 	}
+	// 这里没有"装不上就报错"的运行期分支:构造条件与上面那一行是同一个,写出来
+	// 必然是死代码。真正能挡住接线回归的是从 New() 出发的用例 ——
+	// TestNew_WiresRedemptionLedgerWhenExchangeEnabled_Integration,理由与
+	// new_wiring_integration_test.go 顶部记的那次 id_token 缓存被整块删掉一样:
+	// handler 测试全都手工注入 double,接线消失它们照样绿。
 
 	return o
 }

@@ -289,10 +289,12 @@ var (
 	//   - admit_repeat  客户端是否复用同一张 token 反复兑换。长期为零才谈得上把
 	//                   语义收紧成一次性消费;
 	//   - reject_*      两个边界各自拦下了多少,判断 F/T 配得是不是太紧;
-	//   - degraded_*    台账不可用(Redis 故障)期间的准入,应当告警。
+	//   - degraded_*    Redis 故障期间的准入,应当告警(会自愈);
+	//   - unconfigured_* 台账根本没装上 —— T 永远不生效,且不会自愈。与 degraded_*
+	//                   分开正是为了让一次接线回归不被读成"Redis 在抖"。
 	metricBearerRedemptionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "exchange_jwt_redemption_total",
-		Help:      "Bearer-JWT redemption ledger decisions (admit_first|admit_repeat|reject_stale_first|reject_idle|degraded_admit|degraded_reject).",
+		Help:      "Bearer-JWT redemption ledger decisions (admit_first|admit_repeat|reject_stale_first|reject_idle|degraded_admit|degraded_reject|unconfigured_admit|unconfigured_reject).",
 	}, []string{"outcome"})
 )

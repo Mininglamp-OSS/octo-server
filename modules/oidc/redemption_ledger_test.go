@@ -67,26 +67,58 @@ func TestRedemptionPolicy_SubSecondBoundsCannotTruncateToZero(t *testing.T) {
 				"seconds, and 0 there rejects every redemption", in, p)
 		}
 	}
-	// 非整秒取值也要截断,否则 Go 侧(降级路径,按 Duration 比)与 Lua 侧(按整秒比)
-	// 对同一张 token 可能给出不同结论。
+	// 非整秒取值也要截断,让两条路径至少**用同一个边界**。
+	//
+	// 说清楚它没解决什么:两边比较的精度仍不同 —— Lua 比整秒,降级路径比
+	// time.Duration,所以在 F 附近一秒内的 token 两条路可能给出不同结论。在 24
+	// 小时量级的边界上这没有意义,但"完全一致"是句过头的话。
 	p := redemptionPolicy{firstRedeemMaxAge: 90*time.Second + 400*time.Millisecond}.normalized()
 	if p.firstRedeemMaxAge != 90*time.Second {
-		t.Errorf("F = %v, want it truncated to whole seconds so both paths compare the "+
-			"same value", p.firstRedeemMaxAge)
+		t.Errorf("F = %v, want it truncated to whole seconds so both paths use the same "+
+			"bound", p.firstRedeemMaxAge)
 	}
 }
 
 // T 长过记录能存活的时间就是不可执行的:记录先没了,超时的兑换会以"首次兑换超过
 // F"的名义被拒 —— 拒得对,归因是错的,运维会去调 F。收敛到能执行的值,启动日志
 // 打印的也就是真正生效的值。
-func TestRedemptionPolicy_IdleWindowCannotExceedTheRecordLifetime(t *testing.T) {
-	p := redemptionPolicy{idleWindow: 60 * 24 * time.Hour}.normalized()
+func TestRedemptionPolicy_NeitherBoundCanExceedTheRecordLifetime(t *testing.T) {
+	p := redemptionPolicy{
+		firstRedeemMaxAge: 60 * 24 * time.Hour,
+		idleWindow:        60 * 24 * time.Hour,
+	}.normalized()
+
 	if p.idleWindow != redemptionRecordMaxTTL {
 		t.Errorf("T = %v, want it capped at %v — a record cannot outlive that, so a longer "+
 			"window can never fire", p.idleWindow, redemptionRecordMaxTTL)
 	}
+	// F 长过记录寿命会**反过来废掉 T**:记录在 maxTTL 被截掉,之后的兑换找不到
+	// 记录、被当成首次,而它仍在 F 之内于是放行 —— 空闲窗口就这样被绕过去了。
+	if p.firstRedeemMaxAge != redemptionRecordMaxTTL {
+		t.Errorf("F = %v, want it capped at %v — an F longer than we remember the token "+
+			"turns every post-eviction redemption into an admitted 'first' one, which "+
+			"defeats T entirely", p.firstRedeemMaxAge, redemptionRecordMaxTTL)
+	}
 	if got := recordTTL(time.Now().Add(365*24*time.Hour), time.Now()); got < p.idleWindow {
 		t.Errorf("record ttl %v < T %v: the window would never be reachable", got, p.idleWindow)
+	}
+}
+
+// 默认 F 必须够宽,能覆盖"登录后过一会儿才兑换"。
+//
+// 这条钉的是**数值本身**,不是接线:线上那个 401 就是 F=10min 造成的,而所有
+// handler 级用例都把台账 stub 掉了 —— 把默认值改回 10 分钟,它们全都照样绿。
+func TestDefaultFirstRedeemMaxAge_IsWideEnoughForALateClient(t *testing.T) {
+	if defaultFirstRedeemMaxAge < time.Hour {
+		t.Fatalf("default F = %v; the production failure this task exists to fix was a "+
+			"36-minute-old token being refused, so anything at that scale reinstates it",
+			defaultFirstRedeemMaxAge)
+	}
+	// 同时确认默认组合下降级路径的上限就是 F(min(F,T) 取到 F)。
+	if defaultRedeemIdleWindow < defaultFirstRedeemMaxAge {
+		t.Errorf("default T (%v) < default F (%v): the fallback bound would drop to T, "+
+			"which is not what the defaults are documented to do",
+			defaultRedeemIdleWindow, defaultFirstRedeemMaxAge)
 	}
 }
 
@@ -104,11 +136,12 @@ func TestNewRedisRedemptionLedger_StoresTheNormalizedPolicy(t *testing.T) {
 
 // admitted() 是唯一的"放行"判据。新增一个 outcome 却忘了在这里归类,默认就是拒绝
 // —— 这个方向是对的(fail-closed),但要有用例把两边都钉住。
-func TestRedemptionOutcome_OnlyTheThreeAdmitOutcomesAdmit(t *testing.T) {
+func TestRedemptionOutcome_OnlyTheAdmitOutcomesAdmit(t *testing.T) {
 	admit := map[redemptionOutcome]bool{
-		redeemAdmitFirst:    true,
-		redeemAdmitRepeat:   true,
-		redeemDegradedAdmit: true,
+		redeemAdmitFirst:        true,
+		redeemAdmitRepeat:       true,
+		redeemDegradedAdmit:     true,
+		redeemUnconfiguredAdmit: true,
 	}
 	for _, l := range redemptionOutcomeLabels() {
 		out := redemptionOutcome(l)
@@ -123,19 +156,36 @@ func TestRedemptionOutcome_OnlyTheThreeAdmitOutcomesAdmit(t *testing.T) {
 
 // ---- 降级判定 ---------------------------------------------------------------
 
-// 台账不可用时只用 F,而且必须比"只看 exp"紧:Redis 故障不能顺带把重放窗口
-// 放大到 token 自己的 15 天。
-func TestAdmitWithoutLedger_KeepsTheFirstRedeemCeiling(t *testing.T) {
+// 拿不到台账时按 iat 判一个上限,而且必须比"只看 exp"紧:Redis 故障不能顺带把
+// 重放窗口放大到 token 自己的 15 天。
+func TestFallbackAdmits_KeepsACeiling(t *testing.T) {
 	now := time.Now()
 	p := redemptionPolicy{firstRedeemMaxAge: time.Hour, idleWindow: 7 * 24 * time.Hour}
 
-	if got := p.admitWithoutLedger(now.Add(-30*time.Minute), now); got != redeemDegradedAdmit {
-		t.Errorf("a token issued 30m ago = %s, want %s", got, redeemDegradedAdmit)
+	if !p.fallbackAdmits(now.Add(-30*time.Minute), now) {
+		t.Error("a token issued 30m ago must be admitted; a Redis blip is not a reason to " +
+			"refuse someone who just authenticated")
 	}
 	// exp 还有 5 天,但 iat 已是 10 天前 —— 降级路径也必须拒。
-	if got := p.admitWithoutLedger(now.Add(-10*24*time.Hour), now); got != redeemDegradedReject {
-		t.Errorf("a 10-day-old token = %s, want %s; degrading must not widen the window "+
-			"to the token's own exp", got, redeemDegradedReject)
+	if p.fallbackAdmits(now.Add(-10*24*time.Hour), now) {
+		t.Error("a 10-day-old token was admitted; degrading must not widen the window to " +
+			"the token's own exp")
+	}
+}
+
+// 降级上限取 min(F, T)。T 配得比 F 短是合法配置("首次可以来得晚,复用必须频繁"),
+// 而只用 F 会让 Redis 故障期间**比正常时更好过** —— 两小时前用过的 token 正常是
+// reject_idle,降级却放行。降级路径的正当性全靠"绝不比正常路径松"。
+func TestFallbackAdmits_NeverLooserThanTheIdleWindow(t *testing.T) {
+	now := time.Now()
+	p := redemptionPolicy{firstRedeemMaxAge: 24 * time.Hour, idleWindow: time.Hour}
+
+	if p.fallbackAdmits(now.Add(-2*time.Hour), now) {
+		t.Errorf("a token 2h old was admitted with F=24h, T=1h; the ledger would have "+
+			"refused it as idle, so the fallback bound must be min(F,T)=%v", time.Hour)
+	}
+	if !p.fallbackAdmits(now.Add(-30*time.Minute), now) {
+		t.Error("30m is inside both bounds and must still be admitted")
 	}
 }
 
@@ -198,9 +248,16 @@ func TestAdmitRedemption_NilLedgerDoesNotFailOpen(t *testing.T) {
 	now := time.Now()
 	o := newRedeemTestOIDC(nil, redemptionPolicy{})
 	stale := &RedeemedBearerJWT{IssuedAt: now.Add(-30 * 24 * time.Hour), ExpiresAt: now.Add(24 * time.Hour)}
-	if got := o.admitRedemption(context.Background(), "tok", stale, now, "trace"); got.admitted() {
+	got := o.admitRedemption(context.Background(), "tok", stale, now, "trace")
+	if got.admitted() {
 		t.Errorf("outcome = %s; without a ledger the default must still be the ceiling, "+
 			"not 'anything within exp'", got)
+	}
+	// 未配置与 Redis 故障必须能分开:前者不会自愈,T 永远不生效;后者会。共用一组
+	// label 的话,一次接线回归在看板上只会显示成"Redis 在抖"。
+	if got != redeemUnconfiguredReject {
+		t.Errorf("outcome = %s, want %s: a missing ledger is not a Redis outage",
+			got, redeemUnconfiguredReject)
 	}
 }
 
@@ -271,9 +328,14 @@ func TestExchangeJWT_FirstRedemptionLongAfterIssuanceSucceeds(t *testing.T) {
 	}
 }
 
-// 台账拒绝时,客户端看到的必须与验签失败**完全一样**:区分两者等于告诉调用方
-// "这张 token 曾经是有效的"。
-func TestExchangeJWT_LedgerRefusalIsIndistinguishableFromABadToken(t *testing.T) {
+// 台账拒绝与验签失败,**响应内容**必须一模一样:区分两者等于告诉调用方"这张
+// token 曾经是有效的"。
+//
+// 只钉响应,不钉时序:验签失败在碰 Redis 之前就返回了,而验签通过但被台账拒的
+// 那条要多走一次 Redis 往返,两者理论上可由重复测量区分开。没有去抹平它 ——
+// 代价是给每个坏签名都加一次 Redis 调用,而能利用这个信道的人本来就已经握着
+// 这张 token 了。这里如实写下来,免得用例名被读成"时序也一致"。
+func TestExchangeJWT_LedgerRefusalReturnsTheSameResponseAsABadToken(t *testing.T) {
 	issuer := "https://idp-test.example.com#bearer-jwt"
 	now := time.Now()
 	good := signJWT(t, "s", map[string]any{

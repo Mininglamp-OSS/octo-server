@@ -2269,3 +2269,23 @@ Two reviewers converged on the same headline; all four verified against code bef
   the window) and
   `learnings/pending/validate-in-the-representation-the-consumer-uses.md`
   (a guard protects the value as its consumer sees it, not as its author wrote it).
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (PR #843 review)
+
+- **An argument written for one bound and not turned around on its twin** — the
+  file argued at length why `T` cannot exceed the record's lifetime, then left `F`
+  uncapped, where the same overflow silently defeats `T` entirely. Both are capped
+  now. Worth looking for whenever a rule is written next to its sibling.
+- **A degraded path is only justified while it is never looser** — applying `F`
+  alone made a Redis outage more permissive than normal operation for any
+  deployment configuring `T < F`. The fallback bound is `min(F, T)`; on the
+  defaults it is unchanged, which is why nothing caught it.
+- **Two failure states sharing one metric label hide the worse one** — "ledger
+  never configured" and "Redis is down" both reported `degraded_*`. The first does
+  not self-heal and disables `T` outright; on a dashboard it read as flapping
+  Redis. Separate labels, plus a `New()` wiring test, since every handler test
+  injects a double and would stay green if the constructor were dropped.
+- **A regression test that stubs the mechanism does not pin the fix** — the
+  36-minute case proved the handler no longer applies a ceiling, not that the
+  shipped default admits it. The default could have been reverted to ten minutes
+  with the suite green.

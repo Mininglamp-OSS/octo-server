@@ -93,15 +93,25 @@ const (
 	redeemRejectStaleFirst redemptionOutcome = "reject_stale_first"
 	// redeemRejectIdle 距上次兑换超过 T,视为已被弃用。
 	redeemRejectIdle redemptionOutcome = "reject_idle"
-	// redeemDegradedAdmit 台账不可用,按 F 单独判定后放行。
+	// redeemDegradedAdmit 台账**报错**(Redis 不可用),降级判定后放行。
 	redeemDegradedAdmit redemptionOutcome = "degraded_admit"
-	// redeemDegradedReject 台账不可用,按 F 单独判定后拒绝。
+	// redeemDegradedReject 台账**报错**,降级判定后拒绝。
 	redeemDegradedReject redemptionOutcome = "degraded_reject"
+
+	// redeemUnconfiguredAdmit / redeemUnconfiguredReject 台账**根本没装上**,
+	// 降级判定后的结果。
+	//
+	// 与 degraded_* 分开,是因为两者对运维意味着完全不同的事:degraded 是"Redis
+	// 现在不好",会自己恢复;unconfigured 是"这个部署压根没有台账",T 永远不生效,
+	// 且不会自愈。共用一组 label 的话,一次接线回归看起来就只是 Redis 在抖。
+	redeemUnconfiguredAdmit  redemptionOutcome = "unconfigured_admit"
+	redeemUnconfiguredReject redemptionOutcome = "unconfigured_reject"
 )
 
 // admitted 该结果是否放行。判定散在调用方就会漂,集中在这里。
 func (o redemptionOutcome) admitted() bool {
-	return o == redeemAdmitFirst || o == redeemAdmitRepeat || o == redeemDegradedAdmit
+	return o == redeemAdmitFirst || o == redeemAdmitRepeat ||
+		o == redeemDegradedAdmit || o == redeemUnconfiguredAdmit
 }
 
 // redemptionOutcomeLabels metric 预热用的全部取值。
@@ -113,6 +123,8 @@ func redemptionOutcomeLabels() []string {
 		string(redeemRejectIdle),
 		string(redeemDegradedAdmit),
 		string(redeemDegradedReject),
+		string(redeemUnconfiguredAdmit),
+		string(redeemUnconfiguredReject),
 	}
 }
 
@@ -135,11 +147,17 @@ type redemptionPolicy struct {
 // 这里而不是转换处,是为了让**降级路径**(Go 里按 Duration 比较)与 Lua 用的是
 // 同一个值,两条路径不会对同一张 token 得出不同结论。
 //
-// T 的上限是 redemptionRecordMaxTTL:记录活不过它,配一个更长的 T 只会让超时的
-// 兑换以"首次兑换超过 F"的名义被拒 —— 拒得对,但归因是错的,运维会去调 F。
+// **两个边界都以 redemptionRecordMaxTTL 为上限**,理由同源但方向不同:
+//
+//   - T 长过它就不可执行:记录先没了,超时的兑换会以"首次兑换超过 F"的名义被拒
+//     —— 拒得对,但归因是错的,运维会去调 F。
+//   - F 长过它会**反过来废掉 T**:记录在第 30 天被 TTL 截掉,第 31 天的兑换找不到
+//     记录、被当成首次,而 `31d <= F` 于是放行 —— 一个 7 天的空闲窗口就这样被
+//     一个 60 天的 F 绕过去了。F 不该比"我们还记得这张 token"更长。
+//
 // 收敛到能执行的值,启动日志打印的也就是真正生效的值。
 func (p redemptionPolicy) normalized() redemptionPolicy {
-	p.firstRedeemMaxAge = normalizeBound(p.firstRedeemMaxAge, defaultFirstRedeemMaxAge, 0)
+	p.firstRedeemMaxAge = normalizeBound(p.firstRedeemMaxAge, defaultFirstRedeemMaxAge, redemptionRecordMaxTTL)
 	p.idleWindow = normalizeBound(p.idleWindow, defaultRedeemIdleWindow, redemptionRecordMaxTTL)
 	return p
 }
@@ -170,18 +188,26 @@ func loadRedemptionPolicy() redemptionPolicy {
 	}.normalized()
 }
 
-// admitWithoutLedger 台账不可用时的降级判定:只用 F,不看历史。
+// fallbackAdmits 拿不到台账时的降级判定:不看历史,只按 iat 判一个上限。
 //
-// 方向必须比"只看 exp"紧:Redis 故障不能顺带把重放窗口放大到 15 天。代价是
-// 这段时间内重复兑换的客户端若 token 已超过 F,会被拒 —— 用一个独立的
-// metric label 暴露出来,而不是混进正常失败里。
-func (p redemptionPolicy) admitWithoutLedger(iat, now time.Time) redemptionOutcome {
+// 上限取 **min(F, T)**,而不是单独的 F。降级路径的全部正当性在于"它绝不比正常
+// 路径松",而正常路径对一张有记录的 token 用的是 T:若运维把 T 配得比 F 短
+// (合法配置:首次可以来得晚,复用必须频繁),只用 F 就会出现"Redis 挂了反而更
+// 好过"——两小时前用过的 token 正常时是 reject_idle,降级时却放行。取两者较小值
+// 让这个方向不可能发生;默认值下 F=24h < T=7d,min 就是 F,行为不变。
+//
+// 方向也必须比"只看 exp"紧:Redis 故障不能顺带把重放窗口放大到 15 天。代价是
+// 这段时间内 token 已超过该上限的客户端会被拒 —— 用独立的 metric label 暴露,
+// 不混进正常失败里。
+func (p redemptionPolicy) fallbackAdmits(iat, now time.Time) bool {
 	// 这里仍收敛一次:调用方可能是一个零值 policy(直接构造的 OIDC),而这条路径
 	// 的 fail-open 后果是发会话。normalized 是幂等的,重复调用不改变结果。
-	if now.Sub(iat) > p.normalized().firstRedeemMaxAge {
-		return redeemDegradedReject
+	n := p.normalized()
+	bound := n.firstRedeemMaxAge
+	if n.idleWindow < bound {
+		bound = n.idleWindow
 	}
-	return redeemDegradedAdmit
+	return now.Sub(iat) <= bound
 }
 
 // redemptionLedger 兑换台账。
@@ -271,8 +297,10 @@ func (l *redisRedemptionLedger) Admit(_ context.Context, digest string, iat, exp
 		return "", errors.New("oidc: redemption digest is empty")
 	}
 	ttl := recordTTL(exp, now)
-	// policy 在构造时已收敛(newRedisRedemptionLedger),这里直接用。
-	p := l.policy
+	// 自己再收敛一次,不依赖构造方。**这次改动修的那个亚秒 bug 就是这种形态**:
+	// 一个"看起来合法"的值绕过收敛直接进了脚本,而这里没收敛的后果是 ARGV 里出现
+	// 0,脚本比的是 `now-iat > 0`,每一次登录都被拒。normalized 幂等,代价为零。
+	p := l.policy.normalized()
 	res, err := luaRedemptionAdmit.Run(l.client, []string{redemptionKey(digest)},
 		strconv.FormatInt(now.Unix(), 10),
 		strconv.FormatInt(iat.Unix(), 10),
@@ -335,13 +363,25 @@ func (o *OIDC) admitRedemption(ctx context.Context, rawToken string, rj *Redeeme
 		return redeemDegradedReject
 	}
 	if o.redeemLedger == nil {
-		return o.redeemPolicy.admitWithoutLedger(rj.IssuedAt, now)
+		// 不是"Redis 现在不好",是这个部署没有台账 —— T 永远不生效,且不会自愈。
+		// 生产上不可达(New() 在端点会挂载时必装),所以这条日志的读者是接线回归,
+		// 该吵就吵;metric 也用独立的 unconfigured_* 与 Redis 故障区分开。
+		o.Warn("OIDC exchange-jwt: no redemption ledger configured; admission falls back to "+
+			"the iat ceiling and the idle window is not enforced at all",
+			zap.String("trace_id", traceID))
+		if o.redeemPolicy.fallbackAdmits(rj.IssuedAt, now) {
+			return redeemUnconfiguredAdmit
+		}
+		return redeemUnconfiguredReject
 	}
 	out, err := o.redeemLedger.Admit(ctx, redemptionDigest(rawToken), rj.IssuedAt, rj.ExpiresAt, now)
 	if err != nil {
-		o.Warn("OIDC exchange-jwt: redemption ledger unavailable, falling back to the first-redeem ceiling",
+		o.Warn("OIDC exchange-jwt: redemption ledger unavailable, falling back to the iat ceiling",
 			zap.String("trace_id", traceID), zap.Error(err))
-		return o.redeemPolicy.admitWithoutLedger(rj.IssuedAt, now)
+		if o.redeemPolicy.fallbackAdmits(rj.IssuedAt, now) {
+			return redeemDegradedAdmit
+		}
+		return redeemDegradedReject
 	}
 	return out
 }
