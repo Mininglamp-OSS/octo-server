@@ -84,7 +84,13 @@ source: self
   `RedeemedBearerJWT{Claims, IssuedAt, ExpiresAt}` —— 台账要用 iat/exp，而让调用方
   再解一次 payload 就是第二处 JWT 解析，两处对同一张 token 得出不同 iat 则判定失效。
 - 新增台账：key `oidc:bjwt:redeem:{sha256(token) hex}`，值含 `last_at`，
-  TTL = `exp - now`（记录与 token 同寿）。
+  TTL = `min(exp - now, redemptionRecordMaxTTL)`，下限 1 秒 —— 记录与 token 同寿，
+  但不让一张 `exp` 离谱的 token 在 Redis 里占一条近乎永久的记录。
+- 两个边界都收敛到**可执行取值**：非正回落默认、截到整秒且不低于 1 秒、
+  都不超过记录寿命，且 **`F` 不超过 `T`**。最后一条是安全前提而非整洁：记录丢失
+  之后判定只剩 `F`，`F > T` 会把一张本该 `reject_idle` 的 token 当成首次兑换放行
+  （fail-open，且信号从 `reject_stale_first` 变成 `admit_first`）。因此 `T < F`
+  不是受支持的配置，配了会被收敛成 `F = T` 并在启动日志里说明。
 - 判定表（全部有测试）：
   | 台账状态 | 条件 | 结果 |
   |---|---|---|
@@ -92,8 +98,11 @@ source: self
   | 无记录 | `now - iat > F` | 拒 401 |
   | 有记录 | `now - last_at ≤ T` | 放行，刷新 `last_at` |
   | 有记录 | `now - last_at > T` | 拒 401 |
-- Redis 不可用时降级为"只用 `F`"（不查台账，直接按 `now - iat ≤ F` 判），并计
-  独立 metric label + `Warn` 日志。降级方向必须比"只用 exp"紧。
+- 拿不到台账时按 `min(F, T)` 判一个上限（不查历史，直接按 `iat` 算），并计独立
+  metric label + `Warn` 日志。方向必须比"只用 exp"紧，且**绝不比正常路径松**。
+  收敛后 `F ≤ T`，所以这个 `min` 恒等于 `F`；保留它表达的是不变量本身。
+  台账**未配置**与台账**报错**用两组不同的 label（`unconfigured_*` / `degraded_*`）：
+  前者不会自愈且 `T` 永远不生效，共用一组会被看板读成"Redis 在抖"。
 - 客户端可见行为不变：所有拒绝仍是 `ErrOIDCExchangeTokenRejected`（401），
   不新增错误码，不在响应里区分原因。
 - 新增 metric label 进 `exchangeJWTResultLabels()`，`metrics_label_coverage_test.go`

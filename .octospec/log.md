@@ -2289,3 +2289,26 @@ Two reviewers converged on the same headline; all four verified against code bef
   36-minute case proved the handler no longer applies a ceiling, not that the
   shipped default admits it. The default could have been reverted to ten minutes
   with the suite green.
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (PR #843, round 3 — blocking)
+
+- **The same lesson, second door** — round two fixed the *degraded* path to
+  `min(F, T)` and left the *authoritative* one on `F` alone. The Lua no-record
+  branch has two triggers: never-written (where `F` is right) and **lost**
+  (evicted / un-persisted restart, where the bound should be `T`). Under `T < F`
+  a lost record admits as a "first redemption" what an intact one refuses as
+  idle — fail-open, with the documented loss signal (`reject_stale_first`)
+  replaced by `admit_first`, and Redis-down left stricter than Redis-evicted.
+- **The decision, not the clamp, is the content** — `T < F` was defended one
+  round earlier as a coherent configuration. It is now unsupported: `F` is capped
+  at `T` and the startup log reports the reduction. Nobody had asked for the
+  config, and its price was a fail-open on an unauthenticated session-minting
+  endpoint under an ordinary eviction policy.
+- **"Equivalent to deletion" was nearly true** — a numeric `last_at` in the
+  future made the elapsed time negative and admitted unconditionally, where
+  deleting the key would have refused. Clamped, so the comment is literally true.
+- **A spec artifact that misstates its own implementation** — the brief still
+  described two rounds ago; `guard-matrix.md` still listed the deleted ceiling as
+  live. Both corrected in the same commit as the code they describe.
+- **Assertions one level weaker than their own comments** — four of them, all
+  cheap to strengthen, all on the path where the next regression would land.

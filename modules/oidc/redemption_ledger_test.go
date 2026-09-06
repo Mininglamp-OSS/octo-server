@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -108,17 +109,53 @@ func TestRedemptionPolicy_NeitherBoundCanExceedTheRecordLifetime(t *testing.T) {
 //
 // 这条钉的是**数值本身**,不是接线:线上那个 401 就是 F=10min 造成的,而所有
 // handler 级用例都把台账 stub 掉了 —— 把默认值改回 10 分钟,它们全都照样绿。
-func TestDefaultFirstRedeemMaxAge_IsWideEnoughForALateClient(t *testing.T) {
+func TestDefaultBounds_AreTheDocumentedValues(t *testing.T) {
+	// 钉确切值而不是下限:只写 `F >= 1h` 的话,把两个默认值都改成 30 天照样绿 ——
+	// 那等于对一张 15 天的 token 不设防,而用例名还说着"够宽"。
+	if defaultFirstRedeemMaxAge != 24*time.Hour {
+		t.Errorf("default F = %v, want 24h — the value documented in the brief, the journal "+
+			"and the startup log", defaultFirstRedeemMaxAge)
+	}
+	if defaultRedeemIdleWindow != 7*24*time.Hour {
+		t.Errorf("default T = %v, want 7d", defaultRedeemIdleWindow)
+	}
+	// 两条派生性质,写出来是因为它们才是这两个数要满足的东西:
+	//   - F 必须宽到覆盖"登录后过一会儿才兑换"(线上那次是 36 分钟);
+	//   - F <= T,否则记录丢失会从 fail-closed 变成 fail-open(见 normalized)。
 	if defaultFirstRedeemMaxAge < time.Hour {
-		t.Fatalf("default F = %v; the production failure this task exists to fix was a "+
-			"36-minute-old token being refused, so anything at that scale reinstates it",
+		t.Errorf("default F = %v is at the scale of the production failure this task fixes",
 			defaultFirstRedeemMaxAge)
 	}
-	// 同时确认默认组合下降级路径的上限就是 F(min(F,T) 取到 F)。
-	if defaultRedeemIdleWindow < defaultFirstRedeemMaxAge {
-		t.Errorf("default T (%v) < default F (%v): the fallback bound would drop to T, "+
-			"which is not what the defaults are documented to do",
-			defaultRedeemIdleWindow, defaultFirstRedeemMaxAge)
+	if defaultFirstRedeemMaxAge > defaultRedeemIdleWindow {
+		t.Errorf("default F (%v) > default T (%v)", defaultFirstRedeemMaxAge, defaultRedeemIdleWindow)
+	}
+}
+
+// F 必须服从 T。记录丢失(maxmemory 淘汰 / 无持久化重启)之后判定只剩 F:F > T 时
+// 一张本该 reject_idle 的 token 会以"首次兑换"的名义在 F 之内被放行 —— fail-open,
+// 而且信号也没了(该出现 reject_stale_first,实际出现 admit_first)。
+//
+// 还会造成方向倒挂:Redis **挂了**(降级路径按 min(F,T))反而比 Redis **活着但
+// 记录被淘汰**(只按 F)更严。
+func TestRedemptionPolicy_FirstRedeemCeilingCannotExceedTheIdleWindow(t *testing.T) {
+	p := redemptionPolicy{firstRedeemMaxAge: 24 * time.Hour, idleWindow: time.Hour}.normalized()
+	if p.firstRedeemMaxAge != time.Hour {
+		t.Errorf("F = %v with T=1h, want F capped at T; otherwise a lost record admits as "+
+			"a first redemption what an intact one refuses as idle", p.firstRedeemMaxAge)
+	}
+	if p.idleWindow != time.Hour {
+		t.Errorf("T = %v, want it untouched at 1h", p.idleWindow)
+	}
+	// 收敛之后这条不变量对任何输入都成立。
+	for _, in := range []redemptionPolicy{
+		{firstRedeemMaxAge: 30 * 24 * time.Hour, idleWindow: time.Second},
+		{firstRedeemMaxAge: 90 * 24 * time.Hour, idleWindow: 2 * time.Hour},
+		{},
+	} {
+		got := in.normalized()
+		if got.firstRedeemMaxAge > got.idleWindow {
+			t.Errorf("normalized(%+v) = %+v: F must never exceed T", in, got)
+		}
 	}
 }
 
@@ -173,9 +210,10 @@ func TestFallbackAdmits_KeepsACeiling(t *testing.T) {
 	}
 }
 
-// 降级上限取 min(F, T)。T 配得比 F 短是合法配置("首次可以来得晚,复用必须频繁"),
-// 而只用 F 会让 Redis 故障期间**比正常时更好过** —— 两小时前用过的 token 正常是
-// reject_idle,降级却放行。降级路径的正当性全靠"绝不比正常路径松"。
+// 降级上限取 min(F, T)。收敛之后 F <= T 恒成立,所以这个 min 现在恒等于 F ——
+// 用例仍然存在,是因为它钉的是"降级绝不比正常路径松"这条不变量本身:传进来的
+// policy 可能未收敛(零值 / 直接构造的 OIDC),而这条路径的 fail-open 后果是发
+// 一个会话。
 func TestFallbackAdmits_NeverLooserThanTheIdleWindow(t *testing.T) {
 	now := time.Now()
 	p := redemptionPolicy{firstRedeemMaxAge: 24 * time.Hour, idleWindow: time.Hour}
@@ -196,11 +234,16 @@ type fakeRedemptionLedger struct {
 	err        error
 	calls      int
 	lastDigest string
+	// 收下三个时间戳。丢掉它们的话,admitRedemption 把 now 当成 iat 传下去
+	// (等于关掉 F)、或者传错 exp(记录寿命错)都不会有任何用例变红:直连台账的
+	// 用例自己造时间戳,根本不经过这段接线。
+	lastIat, lastExp, lastNow time.Time
 }
 
-func (f *fakeRedemptionLedger) Admit(_ context.Context, digest string, _, _, _ time.Time) (redemptionOutcome, error) {
+func (f *fakeRedemptionLedger) Admit(_ context.Context, digest string, iat, exp, now time.Time) (redemptionOutcome, error) {
 	f.calls++
 	f.lastDigest = digest
+	f.lastIat, f.lastExp, f.lastNow = iat, exp, now
 	return f.outcome, f.err
 }
 
@@ -222,6 +265,19 @@ func TestAdmitRedemption_UsesTheLedgerVerdict(t *testing.T) {
 	}
 	if led.lastDigest == "tok" || len(led.lastDigest) != 64 {
 		t.Errorf("digest = %q, want the token's sha256 hex, never the token itself", led.lastDigest)
+	}
+	// 台账的两个边界全靠这两个值:iat 算 F,exp 定记录寿命。传错任何一个,判定
+	// 都还在跑、还返回 outcome,只是判的东西不对了。
+	if !led.lastIat.Equal(rj.IssuedAt) {
+		t.Errorf("iat forwarded = %v, want the token's own %v; passing now here would "+
+			"disable F outright", led.lastIat, rj.IssuedAt)
+	}
+	if !led.lastExp.Equal(rj.ExpiresAt) {
+		t.Errorf("exp forwarded = %v, want the token's own %v; it sets the record's lifetime",
+			led.lastExp, rj.ExpiresAt)
+	}
+	if !led.lastNow.Equal(now) {
+		t.Errorf("now forwarded = %v, want %v", led.lastNow, now)
 	}
 }
 
@@ -435,14 +491,17 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 		if got != redeemAdmitFirst {
 			t.Fatalf("got %s, want %s", got, redeemAdmitFirst)
 		}
-		// 记录必须活到 token 的 exp,不是活到 T。
+		// 记录必须活到 token 的 exp,不是活到 T。对着 exp-now 比而不是"大于 T":
+		// 后者在 T=2h 时被一条 3h 的 TTL 满足,而注释说的是 15 天。
 		ttl, err := l.client.TTL(redemptionKey(d)).Result()
 		if err != nil {
 			t.Fatalf("ttl: %v", err)
 		}
-		if ttl <= p.idleWindow {
-			t.Errorf("record ttl = %v, want the token's remaining life; a record that dies "+
-				"before the token makes a repeat redemption look like a first one", ttl)
+		want := exp.Sub(now)
+		if ttl < want-time.Minute || ttl > want+time.Minute {
+			t.Errorf("record ttl = %v, want the token's remaining life %v (±1m); a record "+
+				"that dies before the token makes a repeat redemption look like a first one",
+				ttl, want)
 		}
 	})
 
@@ -519,15 +578,24 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 				res <- out
 			}()
 		}
-		firsts := 0
+		var firsts, repeats int
 		for i := 0; i < n; i++ {
-			if <-res == redeemAdmitFirst {
+			switch <-res {
+			case redeemAdmitFirst:
 				firsts++
+			case redeemAdmitRepeat:
+				repeats++
 			}
 		}
 		if firsts != 1 {
 			t.Errorf("%d concurrent redemptions produced %d admit_first, want exactly 1: "+
 				"the decision and the write must be one atomic round trip", n, firsts)
+		}
+		// 另外七个也要检查:只数 admit_first 的话,"其余七个全被拒"同样是 1,而那
+		// 是八次并发启动里七次登录失败 —— 客户端看到的行为完全坏掉,用例却绿着。
+		if repeats != n-1 {
+			t.Errorf("the other %d concurrent redemptions produced %d admit_repeat; every "+
+				"one of them must be admitted, not refused", n-1, repeats)
 		}
 	})
 
@@ -545,6 +613,67 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 		}
 		if got != redeemAdmitFirst {
 			t.Errorf("got %s, want %s", got, redeemAdmitFirst)
+		}
+	})
+
+	// P1 回归:记录被淘汰之后,判定只剩 F。F 若能大于 T,一张本该 reject_idle 的
+	// token 会以"首次兑换"的名义放行 —— 这正是 normalized 把 F 卡在 T 以下的原因。
+	// 这里走完整构造(newRedisRedemptionLedger 会收敛),模拟淘汰后再兑换。
+	t.Run("an evicted record cannot be admitted as a first redemption", func(t *testing.T) {
+		strict := newRedisRedemptionLedger(ctx, redemptionPolicy{
+			firstRedeemMaxAge: 24 * time.Hour, // 配得比 T 长
+			idleWindow:        time.Hour,
+		})
+		t.Cleanup(func() { _ = strict.Close() })
+
+		d := digest("evicted")
+		iat := now.Add(-10 * time.Minute)
+		if got, err := strict.Admit(context.Background(), d, iat, exp, now); err != nil || got != redeemAdmitFirst {
+			t.Fatalf("seed: got=%v err=%v", got, err)
+		}
+		// 记录被 maxmemory 淘汰 / 随重启丢失。
+		if err := strict.client.Del(redemptionKey(d)).Err(); err != nil {
+			t.Fatalf("evict: %v", err)
+		}
+		// 距首次兑换 3 小时:记录还在的话是 reject_idle(T=1h)。
+		got, err := strict.Admit(context.Background(), d, iat, exp, now.Add(3*time.Hour))
+		if err != nil {
+			t.Fatalf("admit: %v", err)
+		}
+		if got == redeemAdmitFirst {
+			t.Fatalf("an evicted record was admitted as a first redemption; losing state must "+
+				"not be more permissive than keeping it — with F capped at T this must be %s",
+				redeemRejectStaleFirst)
+		}
+		if got != redeemRejectStaleFirst {
+			t.Errorf("got %s, want %s", got, redeemRejectStaleFirst)
+		}
+	})
+
+	// 数字但落在未来的 last_at(写坏 / 跨节点时钟偏移)会让 now-last 变成负数,
+	// 从而无条件走 admit_repeat —— 一张同时超出 F 和 T 的 token 被放行,而**删掉**
+	// 这个 key 反而会拒。损坏不能比删除更宽松。
+	t.Run("a future last_at is clamped instead of admitting forever", func(t *testing.T) {
+		d := digest("future")
+		if err := l.client.Set(redemptionKey(d),
+			strconv.FormatInt(now.Add(90*24*time.Hour).Unix(), 10), time.Hour).Err(); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		// iat 远早于 F,last_at 又在未来:夹回 now 之后按 T 判,应当放行为 repeat
+		// (刚"兑换过"),而不是因为负数差值被无条件放行 —— 两者结果同为放行,
+		// 区别在下一步:再过 T 之后必须能拒。
+		if got, err := l.Admit(context.Background(), d, now.Add(-10*24*time.Hour), exp, now); err != nil {
+			t.Fatalf("admit: %v", err)
+		} else if got != redeemAdmitRepeat {
+			t.Fatalf("got %s, want %s", got, redeemAdmitRepeat)
+		}
+		got, err := l.Admit(context.Background(), d, now.Add(-10*24*time.Hour), exp, now.Add(3*time.Hour))
+		if err != nil {
+			t.Fatalf("admit: %v", err)
+		}
+		if got != redeemRejectIdle {
+			t.Errorf("got %s, want %s: a corrupt (future) last_at must not buy the token "+
+				"an unbounded idle window", got, redeemRejectIdle)
 		}
 	})
 

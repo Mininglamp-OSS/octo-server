@@ -28,6 +28,17 @@ package oidc
 // 故障把 F 关掉。运维侧的信号是 reject_stale_first 突然成批出现(正常时它稀疏),
 // 该告警指向的是 Redis 数据丢失,不是客户端行为变化。
 //
+// **这条性质只在 F <= T 时成立,所以 F 被强制卡在 T 以下(见 normalized)。**
+// 记录没了之后,判定只剩 F 一个尺子;若 F 比 T 长,一张本该被 reject_idle 的
+// token 会以"首次兑换"的名义在 F 之内被放行 —— 记录丢失从 fail-closed 变成
+// fail-open,而且信号也一起消失了(该出现的是 reject_stale_first,实际出现的是
+// admit_first)。更刺眼的是它会造成方向倒挂:Redis **挂了**(降级路径,按
+// min(F,T) 判)反而比 Redis **活着但记录被淘汰**更严。
+//
+// 因此 "T < F" 不是一个受支持的配置:配了也会被收敛成 F = T,并在启动日志里说明。
+// 代价是"首次可以来得晚、复用必须频繁"这种组合表达不出来 —— 没有人要过它,而它
+// 的代价是一个未认证的发会话端点在 Redis 淘汰时失守。
+//
 // **记录的 TTL 必须是 token 自己的剩余寿命,不是 T。** 若 TTL=T,记录过期后这张
 // token 在下次兑换时会被当成"首次兑换"重新走 F,而 F 是从 iat 起算的 —— 老 token
 // 会被 F 拒掉,看似也对;但只要 T > F,记录就会在 F 还没到期时先消失,重复兑换的
@@ -155,10 +166,19 @@ type redemptionPolicy struct {
 //     记录、被当成首次,而 `31d <= F` 于是放行 —— 一个 7 天的空闲窗口就这样被
 //     一个 60 天的 F 绕过去了。F 不该比"我们还记得这张 token"更长。
 //
+// **F 另外还要卡在 T 以下。** 上一条说的是"记录被 TTL 截掉",这一条说的是
+// "记录被 maxmemory 淘汰或随重启丢失"—— 触发方式不同,失守方式一样:判定退回
+// 只剩 F,而 F > T 时它比 T 松。文件头写着"记录丢失是 fail-closed",那句话只在
+// F <= T 时为真,所以把它变成强制的,而不是留一句注释。
+//
 // 收敛到能执行的值,启动日志打印的也就是真正生效的值。
 func (p redemptionPolicy) normalized() redemptionPolicy {
 	p.firstRedeemMaxAge = normalizeBound(p.firstRedeemMaxAge, defaultFirstRedeemMaxAge, redemptionRecordMaxTTL)
 	p.idleWindow = normalizeBound(p.idleWindow, defaultRedeemIdleWindow, redemptionRecordMaxTTL)
+	// 顺序有意:先各自收敛到可执行区间,再让 F 服从 T。
+	if p.firstRedeemMaxAge > p.idleWindow {
+		p.firstRedeemMaxAge = p.idleWindow
+	}
 	return p
 }
 
@@ -177,24 +197,32 @@ func normalizeBound(v, def, max time.Duration) time.Duration {
 	return v
 }
 
-// loadRedemptionPolicy 从环境读取两个边界。
+// rawRedemptionPolicyFromEnv 环境里配的原值,**未收敛**。
+//
+// 单独留一个入口是为了让启动期能比对"配的"与"生效的":收敛会悄悄改值(F 被 T
+// 或记录寿命压下来、亚秒被抬到 1 秒),而运维只有看到那句差异才知道自己配的没
+// 完全生效。
+func rawRedemptionPolicyFromEnv() redemptionPolicy {
+	return redemptionPolicy{
+		firstRedeemMaxAge: getDurationWithAlias("OCTO_OIDC_BEARER_JWT_FIRST_REDEEM_MAX_AGE", "", defaultFirstRedeemMaxAge),
+		idleWindow:        getDurationWithAlias("OCTO_OIDC_BEARER_JWT_REDEEM_IDLE_WINDOW", "", defaultRedeemIdleWindow),
+	}
+}
+
+// loadRedemptionPolicy 从环境读取两个边界并收敛成可执行取值。
 //
 // 解析失败或非正值一律回落默认值(getDurationWithAlias 已处理解析失败,
 // normalized 处理非正值)—— 见 normalized 的说明:这里的"严格"会变成登录故障。
 func loadRedemptionPolicy() redemptionPolicy {
-	return redemptionPolicy{
-		firstRedeemMaxAge: getDurationWithAlias("OCTO_OIDC_BEARER_JWT_FIRST_REDEEM_MAX_AGE", "", defaultFirstRedeemMaxAge),
-		idleWindow:        getDurationWithAlias("OCTO_OIDC_BEARER_JWT_REDEEM_IDLE_WINDOW", "", defaultRedeemIdleWindow),
-	}.normalized()
+	return rawRedemptionPolicyFromEnv().normalized()
 }
 
 // fallbackAdmits 拿不到台账时的降级判定:不看历史,只按 iat 判一个上限。
 //
-// 上限取 **min(F, T)**,而不是单独的 F。降级路径的全部正当性在于"它绝不比正常
-// 路径松",而正常路径对一张有记录的 token 用的是 T:若运维把 T 配得比 F 短
-// (合法配置:首次可以来得晚,复用必须频繁),只用 F 就会出现"Redis 挂了反而更
-// 好过"——两小时前用过的 token 正常时是 reject_idle,降级时却放行。取两者较小值
-// 让这个方向不可能发生;默认值下 F=24h < T=7d,min 就是 F,行为不变。
+// 上限取 **min(F, T)**。收敛之后 F <= T 恒成立(见 normalized),所以这个 min
+// 现在恒等于 F —— 保留它是因为它表达的是"降级绝不比正常路径松"这条不变量,
+// 而不是当前哪个值更小:调用方可能拿着一个未收敛的零值 policy,而这条路径的
+// fail-open 后果是发一个会话。
 //
 // 方向也必须比"只看 exp"紧:Redis 故障不能顺带把重放窗口放大到 15 天。代价是
 // 这段时间内 token 已超过该上限的客户端会被拒 —— 用独立的 metric label 暴露,
@@ -246,11 +274,18 @@ func redemptionKey(digest string) string { return redemptionKeyPrefix + digest }
 // 会误伤移动网络换 IP 的正常客户端 —— 存了却不据以判定的字段,只是一份多余的
 // 用户行为记录。
 //
-// 记录损坏(tonumber 得 nil)按"不存在"处理:它与 key 被删等价,而能删 key 的人
-// 也能写坏它,所以这不是一条新的降级路径。
+// 记录损坏分两种,都不能比"key 被删"更宽松:
+//   - 非数字(tonumber 得 nil)按"不存在"处理,走 F 的判定;
+//   - **数字但在未来**(写坏、或跨节点时钟偏移)会让 now-last 变成负数,从而
+//     无条件落进 admit_repeat —— 一张同时超出 F 和 T 的 token 会被放行,而删掉
+//     这个 key 反而会拒。所以先把 last 夹回 now:损坏至多等价于"刚刚兑换过",
+//     不会好过删除。写权限本身已经等于绕过一切,这条只是让上面那句话字面为真。
 var luaRedemptionAdmit = rd.NewScript(`
 local now = tonumber(ARGV[1])
 local last = tonumber(redis.call("GET", KEYS[1]))
+if last ~= nil and last > now then
+  last = now
+end
 if last == nil then
   if now - tonumber(ARGV[2]) > tonumber(ARGV[3]) then
     return "reject_stale_first"

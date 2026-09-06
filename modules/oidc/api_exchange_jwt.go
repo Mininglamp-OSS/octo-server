@@ -43,7 +43,8 @@ type exchangeJWTRequest struct {
 // 出: 200 {status:"ok", uid, login_resp}
 //
 //	| 400 请求格式错/空 token
-//	| 401 验签失败/过期/claims 非法(反枚举:统一返同一个码)
+//	| 401 验签失败/过期/claims 非法,**或兑换台账拒绝**(首次兑换超过 F /
+//	|     距上次兑换超过 T,见 redemption_ledger.go)——反枚举:统一返同一个码
 //	| 500 密钥未配置(启动期配置错误,不给攻击者探测面)
 //
 // 反枚举与 /exchange 保持一致:任何无法确立身份的失败都返 401 同一个错误码,

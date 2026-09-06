@@ -207,3 +207,60 @@ Two claims were softened rather than defended: the two paths use the same
 timing — a refusal by the ledger costs a Redis round trip that a bad signature
 does not. Neither is worth code; both were worth saying plainly where the test
 name would otherwise overstate.
+
+## Third review round (PR #843) — a blocking one
+
+Changes requested, on a defect I introduced in the previous round.
+
+**`F` must not exceed `T`, and now cannot.** Round two changed the *degraded*
+path to `min(F, T)` — reasoning that a Redis outage must never be more
+permissive than normal operation — and left the *authoritative* path comparing
+against `F` alone. The Lua no-record branch is reached by two different
+triggers, and only one of them had been thought through:
+
+- the record was never written (a genuine first redemption), where `F` is right;
+- the record was **lost** — evicted under `maxmemory`, or gone with an
+  un-persisted restart — where the correct bound is `T` since the last
+  redemption, and `F` is right only if `F ≤ T`.
+
+With `T < F` the second case admits, as a "first redemption", a token an intact
+record would have refused as idle. Worse, the failure signal inverts too: the
+file documents a burst of `reject_stale_first` as the sign of ledger data loss,
+and in this configuration the loss produces `admit_first` instead — no signal at
+all. And it left Redis *down* (bounded by `min(F,T)`) stricter than Redis *up
+but evicted* (bounded by `F`).
+
+The fix is one clamp in `normalized()`, but the decision behind it is the real
+content: **`T < F` is no longer a supported configuration.** Round two defended
+it as coherent ("first use may be late, reuse must be frequent"); nobody has
+asked for it, and its price turned out to be a fail-open on an unauthenticated
+session-minting endpoint under an ordinary Redis eviction policy. A configured
+`F` above `T` is now reduced to `T`, and the startup log says so rather than
+silently applying a different number than the operator set.
+
+This is the same lesson the previous round wrote into `log.md` — an argument
+made for one bound and not turned around on its twin — arriving a second time
+through a different door. The first instance was `F` uncapped against the
+record's TTL; this one is `F` uncapped against `T`. Both are "the no-record
+branch is reachable in more ways than the branch's author had in mind".
+
+Also folded in from the same review:
+
+- A numeric `last_at` **in the future** (a corrupt write, or cross-node clock
+  skew) made `now - last` negative and fell into `admit_repeat` unconditionally —
+  so a token past both bounds was admitted where deleting the key would have
+  refused it. The file claimed corruption was equivalent to deletion; it is now
+  clamped to `now`, which makes the claim true rather than nearly true.
+- The brief still described the behaviour of two rounds ago (`F`-only fallback,
+  `TTL = exp - now`). A spec artifact that misstates its own implementation is
+  the next person's wrong premise, so it is corrected in the same commit.
+- `guard-matrix.md`'s `G8` rows still listed the deleted ten-minute ceiling as
+  the live control — staleness this PR created, in the one consolidated
+  statement of which guard covers which OIDC path.
+- Three assertions were each one level weaker than the sentence above them: the
+  handler↔ledger seam never checked that `iat`/`exp` were forwarded (passing
+  `now` as `iat` would disable `F` with a green suite), the default-bounds test
+  asserted a floor rather than the documented values, the TTL assertion compared
+  against `T` rather than `exp - now`, and the concurrency case counted the one
+  `admit_first` without checking the other seven were admitted rather than
+  refused.

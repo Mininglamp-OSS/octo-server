@@ -135,9 +135,9 @@ type OIDC struct {
 
 	// redeemLedger / redeemPolicy /exchange-jwt 的兑换台账及其两个边界。
 	//
-	// 台账为 nil(未启用 exchange 端点、或未配置验签器)时,准入退化为只用 F 判定
-	// ——见 admitRedemption。**不能**退化成无条件放行:那等于把重放窗口放大到
-	// token 自己的 exp(约 15 天),正是台账要收窄的东西。
+	// 台账为 nil(未启用 exchange 端点、或未配置验签器)时,准入退化为按 min(F,T)
+	// 判一个上限 ——见 admitRedemption。**不能**退化成无条件放行:那等于把重放
+	// 窗口放大到 token 自己的 exp(约 15 天),正是台账要收窄的东西。
 	//
 	// redeemLedger 只在 New() 里赋值,之后**只读** —— handler 在请求路径上读它,
 	// 而 Close() 与请求可能并发(优雅退出)。要关闭的连接池另存一份具体类型
@@ -294,7 +294,24 @@ func New(ctx *config.Context) *OIDC {
 	//
 	// 打印的是**收敛之后**的取值,也就是真正生效的那两个数 —— 运维配了
 	// 一个超上限或亚秒的值时,日志里不该还显示他配的那个。
-	o.redeemPolicy = loadRedemptionPolicy()
+	raw := rawRedemptionPolicyFromEnv()
+	o.redeemPolicy = raw.normalized()
+	// 收敛会悄悄改值(F 被 T 或记录寿命压下来、亚秒被抬到 1 秒)。运维只有看到这
+	// 一句才知道自己配的没完全生效 —— 尤其是 T < F:那个组合表达不出来,会被收敛
+	// 成 F = T,而不说的话下一个人只会以为自己配错了地方。
+	if raw.firstRedeemMaxAge > 0 && o.redeemPolicy.firstRedeemMaxAge != raw.firstRedeemMaxAge {
+		o.Warn("bearer JWT redemption: configured first-redeem max age was reduced to an enforceable value",
+			zap.Duration("configured", raw.firstRedeemMaxAge),
+			zap.Duration("effective", o.redeemPolicy.firstRedeemMaxAge),
+			zap.Duration("idle_window", o.redeemPolicy.idleWindow),
+			zap.String("reason", "F must not exceed T, nor the record's own lifetime; "+
+				"otherwise a lost record turns an idle token into an admitted first redemption"))
+	}
+	if raw.idleWindow > 0 && o.redeemPolicy.idleWindow != raw.idleWindow {
+		o.Warn("bearer JWT redemption: configured idle window was reduced to an enforceable value",
+			zap.Duration("configured", raw.idleWindow),
+			zap.Duration("effective", o.redeemPolicy.idleWindow))
+	}
 	if cfg.ExchangeEnabled && o.bearerJWT != nil {
 		led := newRedisRedemptionLedger(ctx, o.redeemPolicy)
 		o.redeemLedger = led
