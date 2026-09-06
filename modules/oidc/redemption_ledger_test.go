@@ -616,6 +616,30 @@ func TestRedisRedemptionLedger_DecisionTable_Integration(t *testing.T) {
 		}
 	})
 
+	// 上一条先 normalize 再交给台账,所以它证明的是 normalized 有效,**不是**
+	// Admit 自己会兜底 —— 把 Admit 里那次 normalize 删掉,上一条照样绿。
+	//
+	// 这条故意交一个**未收敛**的策略。token 的年龄必须**正好 1 秒**才能区分两者:
+	// 脚本按整秒比,收敛后 F=1s 时比的是 `1 > 1`(放行),没收敛时 F=0 比的是
+	// `1 > 0`(拒绝)。年龄取 100ms 是分不出来的 —— 整秒粒度下它是 0 秒,两种
+	// 情况都放行,用例会假绿。now 是显式传进去的,所以这 1 秒是精确的。
+	t.Run("Admit normalises a raw policy instead of trusting its constructor", func(t *testing.T) {
+		raw := &redisRedemptionLedger{client: l.client, policy: redemptionPolicy{
+			firstRedeemMaxAge: 500 * time.Millisecond,
+			idleWindow:        300 * time.Millisecond,
+		}} // 注意:没有 .normalized()
+		got, err := raw.Admit(context.Background(), digest("raw-policy"),
+			now.Add(-time.Second), exp, now)
+		if err != nil {
+			t.Fatalf("admit: %v", err)
+		}
+		if got != redeemAdmitFirst {
+			t.Errorf("got %s, want %s: an un-normalised sub-second bound reaches Lua as 0, "+
+				"and `now - iat > 0` then refuses every token at least a second old",
+				got, redeemAdmitFirst)
+		}
+	})
+
 	// P1 回归:记录被淘汰之后,判定只剩 F。F 若能大于 T,一张本该 reject_idle 的
 	// token 会以"首次兑换"的名义放行 —— 这正是 normalized 把 F 卡在 T 以下的原因。
 	// 这里走完整构造(newRedisRedemptionLedger 会收敛),模拟淘汰后再兑换。
