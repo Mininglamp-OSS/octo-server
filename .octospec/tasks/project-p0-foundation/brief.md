@@ -553,9 +553,13 @@ via `SetErrorRenderer` or assertions on `error.code` will not see a code.
 **Quotas, audit, observability**
 
 - [ ] Each quota rejects at its boundary with its own registered code: projects
-      per creator per Space (100), projects per Space (1000), members per project
-      (500), projects created per day per user. Each limit is read from config,
-      not a literal.
+      per creator per Space (100), projects per Space (1000), projects created
+      per day per user. Each limit is read from config, not a literal. The
+      members-per-project cap (500) is the one exception, and it is deliberate:
+      it rejects inside a batch endpoint whose contract is per-target outcomes, so
+      it surfaces as a per-uid reason in a 200 response (other targets in the batch
+      may have succeeded) rather than as a batch-level error code; the metric carries
+      the same reason string.
 - [ ] Create, disband, member add, member remove and role change each write an
       audit entry carrying the actor, the target and the reason.
 - [ ] The admission-rejection metric is broken down by entry point — that

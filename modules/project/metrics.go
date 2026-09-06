@@ -45,12 +45,15 @@ const (
 )
 
 var (
-	// admissionRejected counts refused membership / project writes, split by the
-	// entry point that refused and why.
-	admissionRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+	// writeRejected counts refused project writes, split by the entry point that refused
+	// and why. Named write_rejected rather than admission_rejected: the entry set covers
+	// every refused write (create/update/disband/leave/remove too, per S-3 in the round-1
+	// review), and "admission" described only the member-admission slice of what it counts.
+	// The entry breakdown is still what exposes a write path that skipped invariant I1.
+	writeRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
-		Name:      "admission_rejected_total",
-		Help: "Refused project membership or project writes, labeled by entry point and reason. " +
+		Name:      "write_rejected_total",
+		Help: "Refused project writes, labeled by entry point and reason. " +
 			"The entry breakdown is what exposes a write path that skipped invariant I1.",
 	}, []string{"entry", "reason"})
 
@@ -122,5 +125,5 @@ var (
 
 // observeRejected records one refused write.
 func observeRejected(entry, reason string) {
-	admissionRejected.WithLabelValues(entry, reason).Inc()
+	writeRejected.WithLabelValues(entry, reason).Inc()
 }

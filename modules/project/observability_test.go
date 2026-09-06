@@ -126,28 +126,28 @@ func TestCascadeEmitsAnAuditEntry(t *testing.T) {
 	assert.Equal(t, "kicked", entries[0].Reason)
 }
 
-// TestAdmissionRejectionIsBrokenDownByEntryPoint pins the metric SHAPE, not a number.
+// TestWriteRejectionIsBrokenDownByEntryPoint pins the metric SHAPE, not a number.
 //
 // The breakdown is the whole point: P1 adds several more membership write paths, and a
 // single undifferentiated counter cannot tell you that one of them skipped invariant I1.
 // A test that only checked "the counter went up" would pass against exactly the metric the
 // acceptance criterion rules out.
-func TestAdmissionRejectionIsBrokenDownByEntryPoint(t *testing.T) {
+func TestWriteRejectionIsBrokenDownByEntryPoint(t *testing.T) {
 	srv, _ := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv)
 	seedUser(t, "outsider")
 
-	before := testutil.ToFloat64(admissionRejected.WithLabelValues(entryMemberAdd, reasonNotSpaceMember))
-	otherBefore := testutil.ToFloat64(admissionRejected.WithLabelValues(entryRoleChange, reasonNotSpaceMember))
+	before := testutil.ToFloat64(writeRejected.WithLabelValues(entryMemberAdd, reasonNotSpaceMember))
+	otherBefore := testutil.ToFloat64(writeRejected.WithLabelValues(entryRoleChange, reasonNotSpaceMember))
 
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
 		ownerTok, map[string]any{"uids": []string{"outsider"}})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
-	after := testutil.ToFloat64(admissionRejected.WithLabelValues(entryMemberAdd, reasonNotSpaceMember))
+	after := testutil.ToFloat64(writeRejected.WithLabelValues(entryMemberAdd, reasonNotSpaceMember))
 	assert.Equal(t, before+1, after, "the rejection must be counted against member_add")
 	assert.Equal(t, otherBefore,
-		testutil.ToFloat64(admissionRejected.WithLabelValues(entryRoleChange, reasonNotSpaceMember)),
+		testutil.ToFloat64(writeRejected.WithLabelValues(entryRoleChange, reasonNotSpaceMember)),
 		"and must NOT be counted against another entry point")
 }
 
