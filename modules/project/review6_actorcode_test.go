@@ -14,6 +14,7 @@ package project
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,10 +90,65 @@ func TestEveryWriteHandlerClassifiesTheActorSeatSentinel(t *testing.T) {
 		"func (p *Project) removeMembersHandler(",
 	} {
 		body := funcBody(t, src, handler)
-		assert.Contains(t, body, "errActorNotSpaceMember",
+		require.Contains(t, body, "errActorNotSpaceMember",
 			"%s has no arm for errActorNotSpaceMember. Every write path now returns it (one "+
 				"helper takes all the seat locks), so without an arm an authorization refusal "+
 				"falls to default and renders as store_failed — Internal, HTTP 500 — which "+
 				"inflates the 5xx budget and mislabels write_rejected_total.", handler)
+
+		// Existence is not enough, and this is the round-4 lesson: BOTH single-shot handlers
+		// had the arm and neither terminated it, so control fell out of the switch onto the
+		// success path — one panicked on a nil model, the other audited a refused disband.
+		// A substring check for the sentinel cannot see that.
+		assertArmDoesNotReachTheSuccessPath(t, handler, body, "errActorNotSpaceMember")
 	}
+}
+
+// assertArmDoesNotReachTheSuccessPath requires the switch arm matching sentinel to terminate
+// WHEN the switch has code after it.
+//
+// The judgement is deliberately conditional, because "every arm must return" is not this
+// module's style and would be a false alarm: leaveProjectHandler and updateMemberRoleHandler
+// end WITH their switch, so an arm falling out of it just ends the function — every arm there
+// omits the return. The defect is specific to a switch that is followed by the handler's
+// SUCCESS path, which is exactly where round 4 found it:
+//
+//	update:  toResp(nil) -> panic, after auditing a write that never happened
+//	disband: audits a REFUSED disband, then ResponseOK on top of the error envelope
+//
+// Batch handlers are excluded for the opposite reason: their switch sits inside the per-target
+// loop, where NOT terminating means "carry on to the next uid" and is the intended behaviour.
+// Their actor-level arms are covered behaviourally instead (review5_blocker_test.go).
+func assertArmDoesNotReachTheSuccessPath(t *testing.T, where, body, sentinel string) {
+	t.Helper()
+	if strings.Contains(body[:strings.Index(body, "switch")], "for ") {
+		return // batch handler: the switch is inside the per-target loop
+	}
+	// Does the switch have code after it? The switch closes at the first "\n\t}" line.
+	swStart := strings.Index(body, "\tswitch ")
+	require.GreaterOrEqual(t, swStart, 0, "%s: expected a switch", where)
+	swEnd := strings.Index(body[swStart:], "\n\t}")
+	require.GreaterOrEqual(t, swEnd, 0, "%s: could not find the end of the switch", where)
+	after := strings.TrimSpace(body[swStart+swEnd+len("\n\t}"):])
+	if after == "" || after == "}" {
+		return // the switch ends the function; falling out of it is harmless and idiomatic here
+	}
+
+	// It does have a success path after it, so the arm MUST terminate.
+	i := strings.Index(body, sentinel)
+	require.GreaterOrEqual(t, i, 0, "%s: no arm for %s", where, sentinel)
+	rest := body[i:]
+	end := len(rest)
+	for _, term := range []string{"\n\tcase ", "\n\tdefault:"} {
+		if k := strings.Index(rest, term); k >= 0 && k < end {
+			end = k
+		}
+	}
+	arm := rest[:end]
+	assert.Contains(t, arm, "return",
+		"%s: the %s arm does not terminate, and this switch is followed by the handler's "+
+			"SUCCESS path. Go switch cases do not fall through to the next case, but they DO "+
+			"fall out of the switch — round 4 found exactly this: one handler panicked on a nil "+
+			"model, the other audited a REFUSED disband and then called ResponseOK on top of the "+
+			"rendered error envelope. Arm:\n%s", where, sentinel, arm)
 }

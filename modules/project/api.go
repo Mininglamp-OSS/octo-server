@@ -437,6 +437,7 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		// write_rejected_total.
 		observeRejected(entryProjectUpdate, reasonNotSpaceMember)
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
+		return
 	case errors.Is(err, errNoFieldsToUpdate):
 		respondProjectRequestInvalid(c, "name|description|logo|discoverability|max_members")
 		return
@@ -486,6 +487,7 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 		// See updateProjectHandler: an authorization refusal must not render as Internal 500.
 		observeRejected(entryProjectDisband, reasonNotSpaceMember)
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
+		return
 	case errors.Is(err, errPermissionDenied):
 		observeRejected(entryProjectDisband, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
