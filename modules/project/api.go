@@ -40,12 +40,18 @@ type Project struct {
 // to already exist by then.
 func New(ctx *config.Context) *Project {
 	p := &Project{
-		ctx:        ctx,
-		Log:        log.NewTLog("Project"),
-		db:         NewDB(ctx),
-		cfg:        loadConfig(),
-		spaceCache: spacepkg.NewRedisMembershipCache(ctx.GetRedisConn()),
+		ctx: ctx,
+		Log: log.NewTLog("Project"),
+		db:  NewDB(ctx),
+		cfg: loadConfig(),
 	}
+	// nil-conn deployments (Redis-less mode) leave spaceCache nil so the middleware degrades
+	// to the database instead of dereferencing a nil redis.Conn. The other Redis paths already
+	// check GetRedisConn() per call.
+	if ctx.GetRedisConn() != nil {
+		p.spaceCache = spacepkg.NewRedisMembershipCache(ctx.GetRedisConn())
+	}
+
 	p.registerSpaceMemberRemovalCleanup()
 	return p
 }

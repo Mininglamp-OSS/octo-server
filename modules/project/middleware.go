@@ -158,6 +158,12 @@ func (p *Project) cachedProjectRole(projectID, uid string) (int, error) {
 // spaceMembershipCache is the Space-gate cache. Constructed from pkg/space so it
 // shares the key format and therefore the Space module's synchronous invalidation.
 func (p *Project) checkSpaceMembership(spaceID, uid string) (bool, error) {
+	// Without Redis the cache cannot answer — and would panic if asked. Degrade to the
+	// database, which is the safe direction (same reasoning as invalidateProjectMemberCache).
+	// spaceCache is nil exactly when the process has no Redis connection at all; see New.
+	if p.spaceCache == nil {
+		return spacepkg.CheckMembership(p.ctx.DB(), spaceID, uid)
+	}
 	if isMember, found := p.spaceCache.Get(spaceID, uid); found {
 		return isMember, nil
 	}
@@ -266,11 +272,17 @@ func (p *Project) projectMiddleware() wkhttp.HandlerFunc {
 			return
 		}
 
-		// Publish the project's Space as the request's verified Space only after the
-		// membership check below passes — SetSpaceID means "this Space is verified
-		// for this caller", and writing it before verification would hand any
-		// handler reading GetSpaceID a Space the caller has no seat in.
-		isMember, err := p.checkSpaceMembership(row.SpaceID, uid)
+		// Space membership and Space role answer the SAME predicate
+		// (space_member.status=1 AND space.status=1), so they are ONE read, not two: MemberRole
+		// returns ok=false exactly when CheckMembership would return false. The earlier version
+		// ran the cached membership check here and then an uncached MemberRole — the cache saved
+		// nothing on this route, because the role query hit the same tables anyway
+		// (yujiawei Q8, PR #841 round 1).
+		//
+		// The role is deliberately NOT cached: it widens what the caller may see, so a demotion
+		// has to take effect at once, and a second cached authorization fact with no
+		// invalidation path is the bug this module avoids everywhere else.
+		spaceRole, isMember, err := spacepkg.MemberRole(p.ctx.DB(), row.SpaceID, uid)
 		if err != nil {
 			p.Error("校验 Space 成员身份失败", zap.Error(err),
 				zap.String("spaceId", row.SpaceID), zap.String("uid", uid))
@@ -286,25 +298,15 @@ func (p *Project) projectMiddleware() wkhttp.HandlerFunc {
 			c.Abort()
 			return
 		}
+		// Only NOW is this Space verified for this caller: SetSpaceID means "verified", and
+		// writing it before the check would hand any handler reading GetSpaceID a Space the
+		// caller has no seat in.
 		spacepkg.SetSpaceID(c, row.SpaceID)
 
 		projectRole, err := p.cachedProjectRole(projectID, uid)
 		if err != nil {
 			p.Error("查询项目成员角色失败", zap.Error(err),
 				zap.String("projectId", projectID), zap.String("uid", uid))
-			respondQueryFailed(c)
-			c.Abort()
-			return
-		}
-
-		// The Space role is read from the database on every request, never cached.
-		// It widens what the caller may see, so a demotion has to take effect at
-		// once; a second cached authorization fact with no invalidation path is the
-		// bug this module already avoids for Space membership.
-		spaceRole, _, err := spacepkg.MemberRole(p.ctx.DB(), row.SpaceID, uid)
-		if err != nil {
-			p.Error("查询 Space 角色失败", zap.Error(err),
-				zap.String("spaceId", row.SpaceID), zap.String("uid", uid))
 			respondQueryFailed(c)
 			c.Abort()
 			return

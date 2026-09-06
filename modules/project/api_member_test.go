@@ -87,53 +87,50 @@ func TestAddRejectsMemberOfAnotherSpace(t *testing.T) {
 
 // TestAddRejectsWhenSpaceIsBanned covers the authorization side of the banned-Space
 // axis. CheckMembership requires space.status=1, so admission into a banned Space's
-// project is impossible — and it is impossible at BOTH layers, which is what this pins,
-// because the two layers fail on different schedules:
+// project is impossible — and it is impossible at BOTH layers:
 //
-//   - the transactional I1 check in the handler refuses immediately, even while the
-//     caller's own Space membership is still cached as valid;
-//   - the middleware's Space gate refuses once its cache entry is cold.
+//   - the middleware's Space gate refuses the request outright. Since the round-1 review
+//     merge (Q3), the gate on /v1/projects/* reads the database on every request (space
+//     membership and role answer the same predicate, so they are one read), so a ban takes
+//     effect on the next request with no TTL window at all. The folded not-found response
+//     is what that gate answers with.
+//   - the transactional I1 check in the service layer refuses the TARGET regardless of any
+//     cache state — pinned by TestI1CheckRunsInsideTheWriteTransaction, which asserts the
+//     predicate fails for space.status=2, and by TestAddRejectsMemberOfAnotherSpace for the
+//     errNotSpaceMember mapping.
 //
-// The middleware's staleness window is pre-existing and not introduced here: banning a
-// Space does not invalidate space:member:*, so pkg/space's own SpaceMiddleware admits a
-// member of a freshly banned Space for up to the same TTL. What P0 must guarantee is
-// that no new project seat can be created in a banned Space, and the transactional check
-// is what guarantees it regardless of cache state.
+// The middleware window this test used to exercise (a warm cache admitting the caller for
+// up to one TTL while the transactional check refused the target) is gone by design: the
+// gate got stricter, not looser. What P0 must guarantee is that no new project seat can be
+// created in a banned Space, and both layers now guarantee it.
 //
 // Note this is the OPPOSITE of what cleanup does with a banned Space: cleanup uses
 // CheckMembershipForCleanup and SKIPS, because the seat is still real. Authorization and
 // cleanup deliberately answer differently here, and confusing the two would tear every
 // project membership apart the moment a Space is banned.
 func TestAddRejectsWhenSpaceIsBanned(t *testing.T) {
-	srv, _ := setup(t)
+	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv)
 	seedUser(t, "later")
 	seedSpaceMember(t, spaceA, "later", 0, 1)
 	setSpaceStatus(t, spaceA, 2)
 
-	// Warm cache: the caller still gets through the gate, but the transactional I1 check
-	// refuses the admission.
+	// The middleware gate reads the database every request since the Q3 merge, so a ban
+	// refuses the NEXT request outright with the folded not-found envelope.
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
 		ownerTok, map[string]any{"uids": []string{"later"}})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	var outcomes []memberOutcome
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
-	require.Len(t, outcomes, 1)
-	assert.False(t, outcomes[0].OK)
-	assert.Equal(t, reasonNotSpaceMember, outcomes[0].Reason,
-		"a banned Space must not admit anyone, whatever the caller's cache says")
+	assertProjectErrorCode(t, w, "err.server.project.not_found")
 
-	// Cold cache: the gate itself refuses, so the handler is never reached.
-	flushProjectCache(t, testCtx)
-	resetUIDRateLimit(t, testCtx)
-	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"later"}})
-	require.NotEqual(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-
-	// No seat was created either way.
-	member, err := testDB.queryMember(created.ProjectID, "later")
+	// The transactional layer independently refuses the TARGET — exercised directly, because
+	// the middleware gate above now stops the request before the handler runs. This is the
+	// guarantee that holds even if a future change reintroduces a cached caller gate.
+	tx, txErr := p.db.session.Begin()
+	require.NoError(t, txErr)
+	isSpaceMember, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "later")
 	require.NoError(t, err)
-	assert.Nil(t, member)
+	assert.False(t, isSpaceMember,
+		"the authorization predicate must fail for a banned Space, cache or no cache")
+	require.NoError(t, tx.Rollback())
 }
 
 // ---------- member_epoch ----------
