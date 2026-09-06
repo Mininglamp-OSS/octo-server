@@ -94,7 +94,7 @@ func TestConcurrentCreatesCannotExceedPerSpaceQuota(t *testing.T) {
 			defer wg.Done()
 			_, errs[i] = p.createProject(createInput{
 				SpaceID: spaceA, Creator: uid, Name: "race-" + string(rune('a'+i)),
-				Discoverability: DiscoverabilitySpaceListed, JoinMode: JoinModeInviteOnly,
+				Discoverability: DiscoverabilitySpaceListed,
 			})
 		}(i, uid)
 	}
@@ -134,7 +134,7 @@ func TestConcurrentCreatesCannotExceedPerCreatorQuota(t *testing.T) {
 			defer wg.Done()
 			_, _ = p.createProject(createInput{
 				SpaceID: spaceA, Creator: "solo", Name: "mine-" + string(rune('a'+i)),
-				Discoverability: DiscoverabilitySpaceListed, JoinMode: JoinModeInviteOnly,
+				Discoverability: DiscoverabilitySpaceListed,
 			})
 		}(i)
 	}

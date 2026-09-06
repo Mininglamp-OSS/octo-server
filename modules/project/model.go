@@ -65,10 +65,12 @@ func IsValidDiscoverability(d int) bool {
 
 // Join modes (octo_project.join_mode).
 //
-// P0 has NO self-service join path — the invite surface is P2 — so this column
-// has no consumer yet. It ships now for the same reason is_official does: it is a
-// column on octo_project, and adding it later means a second migration against a
-// table that by then carries production traffic.
+// P0 has NO self-service join path — the invite surface is P2 — so the column exists with
+// its DDL default and NOTHING above the storage layer reads or writes it. Same treatment as
+// is_official: no model field, no request field, no response field. A client-visible
+// join_mode with no enforcement point would let deployments persist join_mode=0 today and
+// hand every such row open-join semantics the day the P2 path lands, with nobody
+// re-consenting (yujiawei S-2, PR #841).
 const (
 	// JoinModeOpen — any Space member may join without an invite (P2).
 	JoinModeOpen = 0
@@ -97,7 +99,6 @@ type Model struct {
 	Logo            string    `db:"logo"`
 	Creator         string    `db:"creator"`
 	Discoverability int       `db:"discoverability"`
-	JoinMode        int       `db:"join_mode"`
 	MaxMembers      int       `db:"max_members"`
 	MemberEpoch     int64     `db:"member_epoch"`
 	Status          int       `db:"status"`
@@ -132,7 +133,6 @@ type createReq struct {
 	Description     string `json:"description"`
 	Logo            string `json:"logo"`
 	Discoverability *int   `json:"discoverability"`
-	JoinMode        *int   `json:"join_mode"`
 	MaxMembers      *int   `json:"max_members"`
 }
 
@@ -141,7 +141,6 @@ type updateReq struct {
 	Description     *string `json:"description"`
 	Logo            *string `json:"logo"`
 	Discoverability *int    `json:"discoverability"`
-	JoinMode        *int    `json:"join_mode"`
 	MaxMembers      *int    `json:"max_members"`
 }
 
@@ -184,7 +183,6 @@ type Resp struct {
 	Logo            string `json:"logo"`
 	Creator         string `json:"creator"`
 	Discoverability int    `json:"discoverability"`
-	JoinMode        int    `json:"join_mode"`
 	MaxMembers      int    `json:"max_members"`
 	MemberCount     int    `json:"member_count"`
 	MemberEpoch     int64  `json:"member_epoch"`

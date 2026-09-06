@@ -148,7 +148,6 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 		Description:     req.Description,
 		Logo:            req.Logo,
 		Discoverability: DiscoverabilitySpaceListed,
-		JoinMode:        JoinModeInviteOnly,
 	}
 	if req.Discoverability != nil {
 		if !IsValidDiscoverability(*req.Discoverability) {
@@ -156,13 +155,6 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 			return
 		}
 		in.Discoverability = *req.Discoverability
-	}
-	if req.JoinMode != nil {
-		if *req.JoinMode != JoinModeOpen && *req.JoinMode != JoinModeInviteOnly {
-			respondProjectRequestInvalid(c, "join_mode")
-			return
-		}
-		in.JoinMode = *req.JoinMode
 	}
 	if req.MaxMembers != nil {
 		if *req.MaxMembers < 0 || *req.MaxMembers > p.cfg.MaxMembers {
@@ -337,10 +329,6 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		respondProjectRequestInvalid(c, "discoverability")
 		return
 	}
-	if req.JoinMode != nil && *req.JoinMode != JoinModeOpen && *req.JoinMode != JoinModeInviteOnly {
-		respondProjectRequestInvalid(c, "join_mode")
-		return
-	}
 	if req.MaxMembers != nil && (*req.MaxMembers < 0 || *req.MaxMembers > p.cfg.MaxMembers) {
 		respondProjectRequestInvalid(c, "max_members")
 		return
@@ -360,7 +348,7 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 		return
 	case errors.Is(err, errNoFieldsToUpdate):
-		respondProjectRequestInvalid(c, "name|description|logo|discoverability|join_mode|max_members")
+		respondProjectRequestInvalid(c, "name|description|logo|discoverability|max_members")
 		return
 	case errors.Is(err, errNameDuplicated):
 		observeRejected(entryProjectUpdate, reasonNameDuplicated)
@@ -429,7 +417,6 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount int) *Resp {
 		Logo:            m.Logo,
 		Creator:         m.Creator,
 		Discoverability: m.Discoverability,
-		JoinMode:        m.JoinMode,
 		MaxMembers:      p.cfg.effectiveMaxMembers(m.MaxMembers),
 		MemberCount:     memberCount,
 		MemberEpoch:     m.MemberEpoch,

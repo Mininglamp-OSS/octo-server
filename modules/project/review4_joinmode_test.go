@@ -32,11 +32,13 @@ func TestJoinModeHasNoClientSurfaceInP0(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "join_mode",
 		"the P0 response must not carry join_mode")
 
-	// Update carrying join_mode=0: the field must be inert.
+	// Update carrying ONLY join_mode=0: the field is not a known column, so the request has
+	// no recognizable fields and the empty-update guard rejects it explicitly — a client
+	// sending a field this API no longer has gets an error, not a silent success.
 	created := decodeResp(t, w)
 	w = doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID, ownerTok,
 		map[string]any{"join_mode": 0})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assertProjectErrorCode(t, w, "err.server.project.request_invalid")
 	assert.NotContains(t, w.Body.String(), "join_mode")
 
 	// The detail view must not surface it either.

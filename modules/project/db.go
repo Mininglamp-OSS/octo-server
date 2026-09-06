@@ -42,8 +42,11 @@ func NewDB(ctx *config.Context) *DB {
 // type comment for why active_name / is_official / member_epoch are absent.
 var projectInsertColumns = []string{
 	"project_id", "space_id", "name", "description", "logo", "creator",
-	"discoverability", "join_mode", "max_members", "status",
+	"discoverability", "max_members", "status",
 	"created_at", "updated_at",
+	// join_mode is deliberately absent: the column exists with its DDL default (1) and
+	// nothing above the storage layer touches it until the P2 join path lands. See the
+	// JoinMode constants in model.go.
 }
 
 // ---------- project ----------
@@ -57,7 +60,7 @@ func (d *DB) insertProjectTx(tx *dbr.Tx, m *Model) error {
 	_, err := tx.InsertInto("octo_project").
 		Columns(projectInsertColumns...).
 		Values(m.ProjectID, m.SpaceID, m.Name, m.Description, m.Logo, m.Creator,
-			m.Discoverability, m.JoinMode, m.MaxMembers, m.Status,
+			m.Discoverability, m.MaxMembers, m.Status,
 			m.CreatedAt, m.UpdatedAt).
 		Exec()
 	if err != nil {
@@ -78,7 +81,7 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	var models []*Model
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, join_mode, max_members, member_epoch, status, created_at, updated_at "+
+			"discoverability, max_members, member_epoch, status, created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
 	if err != nil {
@@ -100,7 +103,7 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	var models []*Model
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, join_mode, max_members, member_epoch, status, created_at, updated_at "+
+			"discoverability, max_members, member_epoch, status, created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
 	).Load(&models)
@@ -259,7 +262,7 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	var rows []*listRow
 	_, err := d.session.SelectBySql(
 		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, "+
-			"p.discoverability, p.join_mode, p.max_members, p.member_epoch, p.status, "+
+			"p.discoverability, p.max_members, p.member_epoch, p.status, "+
 			"p.created_at, p.updated_at, "+
 			"IFNULL(pm.role, ?) AS my_role, "+
 			"(SELECT COUNT(*) FROM `octo_project_member` mc "+

@@ -126,7 +126,6 @@ type createInput struct {
 	Description     string
 	Logo            string
 	Discoverability int
-	JoinMode        int
 	MaxMembers      int
 }
 
@@ -227,7 +226,6 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 		Logo:            in.Logo,
 		Creator:         in.Creator,
 		Discoverability: in.Discoverability,
-		JoinMode:        in.JoinMode,
 		MaxMembers:      in.MaxMembers,
 		Status:          StatusNormal,
 		CreatedAt:       now,
@@ -310,10 +308,6 @@ func (p *Project) updateProject(projectID, actorUID string, req updateReq) (*Mod
 	if req.Discoverability != nil {
 		set["discoverability"] = *req.Discoverability
 		row.Discoverability = *req.Discoverability
-	}
-	if req.JoinMode != nil {
-		set["join_mode"] = *req.JoinMode
-		row.JoinMode = *req.JoinMode
 	}
 	if req.MaxMembers != nil {
 		set["max_members"] = *req.MaxMembers
