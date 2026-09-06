@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -22,6 +23,13 @@ type Project struct {
 	log.Log
 	db  *DB
 	cfg Config
+	// settings resolves the feature switch at REQUEST time rather than at
+	// construction. cfg carries the quota/cadence knobs, which are genuinely
+	// process-scoped; the on/off switch is not — see requireWriteEnabled.
+	//
+	// Nil only in tests that build a bare struct; requireWriteEnabled falls back
+	// to cfg.CreateEnabled in that case so no test has to know about this field.
+	settings *common.SystemSettings
 	// spaceCache is pkg/space's own membership cache, deliberately reused rather
 	// than reimplemented — see projectMemberCacheKey for why a second copy of that
 	// fact under a project: key would be an isolation hole.
@@ -79,6 +87,10 @@ func New(ctx *config.Context) *Project {
 		Log: log.NewTLog("Project"),
 		db:  NewDB(ctx),
 		cfg: loadConfig(),
+		// EnsureSystemSettings returns the process-wide instance with its
+		// auto-reload goroutine already running, so an admin-console flip
+		// converges here within the reload interval without a restart.
+		settings: common.EnsureSystemSettings(ctx),
 	}
 	// nil-conn deployments (Redis-less mode) leave spaceCache nil so the middleware degrades
 	// to the database instead of dereferencing a nil redis.Conn. The other Redis paths already
@@ -163,12 +175,41 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 // off freezes the feature while leaving existing data observable — which is what
 // makes it a usable rollback rather than a blackout.
 func (p *Project) requireWriteEnabled(c *wkhttp.Context, entry string) bool {
-	if p.cfg.CreateEnabled {
+	if p.writeEnabled() {
 		return true
 	}
 	observeRejected(entry, reasonFlagOff)
 	httperr.ResponseErrorL(c, errcode.ErrProjectDisabled, nil, nil)
 	return false
+}
+
+// writeEnabled resolves the feature switch, DB → env → false.
+//
+// P0 read this once at construction from OCTO_PROJECT_CREATE_ENABLED, which
+// meant flipping it in EITHER direction needed a rolling restart, and the value
+// was not visible to clients at all — the frontend had no way to know whether to
+// show the Project entry. Both are fixed by resolving through
+// SystemSettings.ProjectEnabled(), which is the SAME value
+// GET /v1/common/appconfig ships as project_on.
+//
+// One switch, two consumers. Two switches could disagree, and the disagreement
+// has a worst case: the client shows the entry and every write behind it 403s.
+//
+// The env var still decides when no system_setting row exists, so an existing
+// deployment's behaviour is byte-identical until someone writes the row.
+//
+// The system_setting row is an OVERRIDE, not a replacement: with no row,
+// cfg.CreateEnabled — the env value resolved at construction, exactly as P0 did
+// it — decides. That keeps the resolution order DB → env → false while leaving
+// the env half where it was, and it is why an existing deployment behaves
+// identically until someone actually writes the row.
+func (p *Project) writeEnabled() bool {
+	if p.settings != nil {
+		if v, ok := p.settings.ProjectEnabledOverride(); ok {
+			return v
+		}
+	}
+	return p.cfg.CreateEnabled
 }
 
 // ---------- create ----------
