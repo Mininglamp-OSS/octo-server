@@ -2100,3 +2100,28 @@ Two reviewers converged on the same headline; all four verified against code bef
 - **Learning** — `learnings/pending/batch-write-validate-what-lands.md`: reduce a
   batch to the state it will actually produce before validating it; a validator
   that stops at the first match for a key approves one value and persists another.
+
+## 2026-09-06 — project P0：PR #841 第二轮 review 修复
+
+两位 reviewer 对新 head 重审，独立收敛到同一组三个 blocker。三条均为"本 PR 自己引入的
+保证，在除一处以外的全部调用点生效，而遗漏未被记录"：`addOneMember` 漏了 actor 的 Space
+席位复核、list 路由丢弃 `MemberRole` 的 `ok`、`createProject` 的锁序与 `modules/space` 记录
+的死锁事故顺序相反。
+
+- **B-3 的实测比预测更糟**：复现出 Error 1213，InnoDB 选中的受害者是**解散事务**而非
+  create —— 正是 `modules/space/db.go:71-88` 那条注释担心的一侧，而解散是成员移除安全
+  级联的一步。
+- **修 B-3 时引入的第二个缺陷，被既有验收测试当场抓住**：锁序交换让六个并发 create 全部
+  通过 `MaxPerSpace=1`。根因不在锁，在 read view —— `FOR SHARE OF sm` 里**不在 OF 列表中
+  的 JOIN 表按一致性读处理，而一致性读会打开事务的 read view**，于是快照冻结在 `space`
+  行锁之前，三个创建配额全按旧快照计数。在 MySQL 8.0.33 上做了有/无 JOIN 的对照实验坐实。
+  修法是给 create 单独一个无 JOIN 的席位锁；丢掉的 JOIN 不损失保证，Space 活性由紧随其后
+  的排他锁更强地复核。为此加了源码 guard，因为把两个 helper "统一"回去会静默重现它。
+- **一个 code 的文案也是分类的一部分**：actor 级失败复用 target 级 code，文案会说"目标用户
+  不是该空间的有效成员"——对调用者自己而言仍指错方向。新注册 actor 级 code；create 端点
+  本来就无 target，那处是既有误标。
+- **非回归证据从推理升级为实测**：建基线 worktree 对照 brief 点名的四个包。`modules/group`
+  初次 5 个 FAIL 定位为 WuKongIM 容器老化（同一份基线代码两次跑失败集 3 → 39，全是 IM
+  context deadline），重启容器后 HEAD 整包全绿；`modules/thread` 两侧同构 flaky（迁移竞态）。
+- **方法论修正**：`timeout` 在 macOS 不存在，批量跑包时命令静默失败、测试根本没执行，而
+  grep 无输出被读成"无失败"。凡是"没有输出即通过"的判断都要先确认命令真的跑了。

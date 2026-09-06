@@ -784,7 +784,7 @@ PUT 只带 join_mode 会命中空更新守卫得到显式 400（比静默忽略�
 |---|---|
 | Q2 锁序倒置（三方死锁环可达） | successor/target 的 S 锁前置到 `lockActiveProjectTx` 之前（`lockSpaceSeatBeforeProjectTx`），删除"仅此处安全"的例外论证；授权门以**请求目标角色**（`role >= RoleAdmin`）为键，降级不取 Space 锁，保住"对已离开成员仍可降级"的既有契约（测试钉着） |
 | Q3+Q8 双查合并 | projectMiddleware 用一次 `MemberRole` 同时得到成员资格（ok）与角色，删掉缓存化的成员查询——同谓词两查，缓存本来就没省往返；banned/移除在**下一次请求即生效**（`TestAddRejectsWhenSpaceIsBanned` 更新为更严契约）；`spaceCache` nil 部署降级查库不 panic |
-| Q6 actor 的 Space 席位事务内复核 | 新增 `requireActorSpaceSeatTx`，五条特权写路径统一在 project 锁前执行（与 Q2 锁序一致）；actor 与 target 拿到同构保证，不再依赖另一模块的缓存纪律 |
+| Q6 actor 的 Space 席位事务内复核 | 新增 `requireActorSpaceSeatTx`，五条特权写路径统一在 project 锁前执行（与 Q2 锁序一致）；actor 与 target 拿到同构保证，不再依赖另一模块的缓存纪律。**第二轮更正：当时是五条，第六条 `addOneMember` 漏了且此处未记录 —— 正是 B-1。现为六条，guard 测试同步补齐；覆盖数写进测试名与本表，避免再次出现"声称覆盖 > 实际覆盖"** |
 | Q4 LIMIT 限"返回行"而非"检查行" | 三个分页查询改为 base 行 LIMIT + 每行 `AS violating` 标记，Go 侧过滤；cursor 按**检查过**的行推进，短页才真正意味着表尾；guard `TestReconcilePageQueriesExamineBoundedRows` 钉形态 |
 | Q7 ForTest 全局函数指针 | `addOneFn`/`removeOneFn` 改为 `*Project` 字段，New 装配真实现，测试在自己的实例上替换；auth 路径不再有可写全局 |
 | Q8 | orphan 谓词含解散 Space（banned 仍不算，可恢复）；`bumpMemberEpochTx` 不再写 `updated_at` 且加 `status=1` 谓词——**并抓到一个由该谓词引入的真回归**：disband 先翻 status 再 bump，谓词吞掉了 disband 的 epoch bump，已修正为同事务内先 bump 后翻转（验收项要求 disband 移动 epoch）；删除无调用者的 `countActiveInSpace` |
@@ -812,3 +812,103 @@ PUT 只带 join_mode 会命中空更新守卫得到显式 400（比静默忽略�
 | build / vet / golangci-lint | 全绿，0 issues |
 | i18n-extract-check / i18n-lint | 通过 / 2/2 |
 | `git diff --check` | clean |
+
+---
+
+# PR #841 第二轮 review 的 TDD 修复
+
+两位 reviewer（yujiawei、Jerry-Xin）均对 head `4682767b` 重新提交审查，独立收敛到同一组
+三个 blocker（yujiawei P1-1..P1-3 = Jerry-Xin B-1..B-3），Jerry-Xin 在真实 MySQL 8.0.46 上
+probe 复现了其中一条。三条经源码逐一核实全部成立。mochashanyao 未对新 head 重审。
+
+## 三个 blocker：RED 实证 → 修复 → 变异验证
+
+| # | 问题 | RED 实测（失败原因即目标缺陷） | 修复 |
+|---|---|---|---|
+| B-1 | `addOneMember` 是唯一不复核 actor 自身 Space 席位的特权写 | `addOneMember` 返回 `(true, nil)`，`fresh1` 真实落座（`InviteUID=admin9`，status=1），actor 无 Space 席位 | 补 `requireActorSpaceSeatTx`；guard 测试从五条补到六条 |
+| B-2 | `listProjectsHandler` 丢弃 `MemberRole` 的 `ok` | 返回 **200 + 完整项目列表**（含 project_id / member_epoch / 成员数）给已无 Space 席位的用户 | 尊重 `ok`，按该路由自身中间件的形状（403 forbidden）拒绝 |
+| B-3 | `createProject` 先锁 `space` 后锁 `space_member`，与 `modules/space/db.go:71-88` 记录的死锁事故顺序相反 | 实测 **Error 1213**，且 InnoDB 选中的受害者是**解散事务**，createProject 反而提交成功 | 席位共享锁前置于 `space` 排他锁 |
+
+B-3 的实测结果比 review 的预测更严重：受害者正是 `modules/space` 注释里担心的那一侧
+（"滚回去的可能是管理员那条解散事务"），而解散是成员移除安全级联的一步。变异验证：把锁序
+还原即复现 1213，受害者仍是解散。
+
+## 修 B-3 时引入的第二个缺陷（既有验收测试当场抓住）
+
+锁序交换让 `TestConcurrentCreatesCannotExceedPerSpaceQuota` 立刻变红：`MaxPerSpace=1` 下
+**六个并发 create 全部成功**。
+
+根因不是锁，是 read view。`checkSpaceMembershipForWriteTx` 里 `INNER JOIN space s`——**不在
+`FOR SHARE OF sm` 列表中的表按一致性读处理，而一致性读会打开事务的 read view**。它一旦成为
+事务首条语句，快照就冻结在 `space` 行锁之前，三个创建配额全部按那个快照计数。
+
+直接在 MySQL 8.0.33 上做了对照实验坐实机制：
+
+- `SELECT ... FOR SHARE`（无 JOIN）后再 `COUNT(*)` → 看得见并发提交（count=1）
+- `SELECT ... FROM sm JOIN sp ... FOR SHARE OF sm` 后再 `COUNT(*)` → **看不见**（count=0）
+
+修法：create 改用新增的 `lockSpaceSeatRowTx`（无 JOIN，纯当前读）。丢掉的 JOIN 不损失任何
+保证——Space 活性由紧随其后的 `space ... FOR UPDATE` 权威复核，比快照里的 JOIN 更强。
+
+## 顺带修的非阻塞项
+
+| 项 | 处置 |
+|---|---|
+| N-1 actor 级 `errNotSpaceMember` 的 wire 分类（B-1 让它在 add 上可达） | 新增 `errActorNotSpaceMember`，**包装** `errNotSpaceMember`（既有 `errors.Is` 全部继续成立，只有批量层问更窄的问题）；两个批量端点均停批并返回新注册的 `err.server.project.actor_not_space_member` |
+| 复用 target 级 code 的文案误导 | 旧文案"目标用户不是该空间的有效成员"用在 actor 级身上仍指错方向；新 code 文案"你已不是该空间的有效成员"。create 端点无 target，也改用它——那是一处既有误标 |
+| N-2 `{}` 静默降级 | `roleReq.Role` 改 `*int` + presence 检查；`{"role":0}` 显式降级仍有效 |
+| reconcile 页错误丢弃本 tick 进度（两轮均提，且注释声称相反） | 四个扫描的错误分支改 `break`，让末尾的 `*Save` 一定被执行 |
+| Q4 属性不完整（`status` 仍在 WHERE） | 三个查询的 `status` 移入 `violating` 标记；Q4 guard 加强为"WHERE 除游标外不得有任何谓词" |
+| N-3 `changeMemberRole` 注释与门不一致 | 门按请求角色，owner→admin 降级**也**校验，只有降到 common 跳过；注释改为准确表述 |
+| `ErrProjectQuotaMembers` 无生产消费者 | 按 D3 删除（code + zh-CN + marker），到有调用方时再注册 |
+| Q5 grant 路径的负缓存兜底 | 保持 fail-safe，把取舍写进代码：正向兜底要写"相信的"角色而非锁内读到的角色 |
+| `project_orphan_total` 解散 Space 后不归零 | 文档化为需人工处置的常驻读数（同 `i1_abandoned_cleanup_leak`） |
+| Space admin 读放宽 list vs roster | 写成一条规则：可读"已能指名"的项目，不可"发现"项目 |
+| disband 逐成员串行 Redis DEL | 记录约束：同步是规则（授权边界），串行不是；pipeline 需 octo-lib 暴露能力，不在此处另开连接 |
+| `internal/modules.go` import 分组 | 归回单一字母序块 |
+
+## 测试先行的收益
+
+本轮全部三个 blocker 修复都由测试先证伪，且**修 B-3 引入的配额缺陷是既有验收测试当场抓住的**
+——那正是 read view 这一层从代码上完全看不出来的问题。新增/加强的 guard 均做过变异验证：
+
+- 锁序还原 → 死锁测试变红（1213 复现）
+- switch 分支顺序还原 → actor 级分类测试变红（wrap 被吞）
+- sentinel 去掉 wrap → 六路径 guard 变红
+- create 改回 JOIN 版席位检查 → 并发配额测试 + read view guard 双双变红
+- `break` 改回 `return` → cursor 行为测试 + 四扫描源码 guard 双双变红
+- presence 检查换成零值默认 → 静默降级测试变红
+- `status` 放回 WHERE → Q4 guard 变红
+
+## 最终验证（第二轮）
+
+| 项 | 结果 |
+|---|---|
+| `modules/project` | **117 PASS / 0 FAIL**（`-race -shuffle=on`） |
+| `modules/space` | ok 11.7s |
+| `modules/group` | **ok 25.7s（全绿）** |
+| `modules/message` | ok 6.6s |
+| `modules/thread` | flaky，基线与 HEAD 同样表现（见下） |
+| 单元 lane（`./pkg/...` + `./tools/...`） | 全绿，0 FAIL |
+| build / vet（全仓）/ golangci-lint | 全绿，0 issues |
+| i18n-extract-check / i18n-lint | 通过 / 通过 |
+| `git diff --check` | clean |
+| 改动范围 | 18 文件；未触碰 `modules/group/`、`modules/thread/`、`modules/message/`、`pkg/space/channel.go`、任何既有 migration |
+
+### 非回归证据（reviewer 明确要求把"在纯净 worktree 上同样失败"升级为实测）
+
+在 `4682767b`（上一次推送的 head）建了基线 worktree 做对照，brief 点名的四个包逐一实跑：
+
+- **`modules/group`** — 初次跑报 5 个 FAIL，耗时 111s。定位为 **WuKongIM 容器老化**而非代码：
+  `/health` 200/0.1ms 正常，但内部 `propose batch until applied timeout` +
+  `store message failed: context deadline exceeded`，容器已运行 2 天、BLOCK I/O 32.5GB。
+  决定性证据是**基线同一份代码两次跑的失败集从 3 个变成 39 个**（同代码、不同跑次），
+  失败原因全是 `IM服务失败 -> context deadline exceeded`。重启 IM 容器后，
+  HEAD 上整包 **ok 25.7s**（此前 111s 几乎全耗在超时等待）。
+- **`modules/thread`** — flaky，两侧同构：HEAD 三次 = FAIL / ok / FAIL，
+  基线三次 = FAIL / ok / ok。报错在迁移阶段并且两种交替出现
+  （`Table 'group' already exists` 与 `Unknown database 'test'`），是既有的并发迁移竞态。
+- **`modules/message`**、**`modules/space`** — HEAD 直接通过。
+
+顺带更正一处方法论：`timeout` 在 macOS 上不存在，第一次批量跑这三个包时命令静默失败、
+测试根本没执行（grep 无输出被误读成"无失败"）。已重跑。

@@ -473,6 +473,10 @@ compete with message paths for the same connections.
       `modules/thread/`, `modules/message/`, `pkg/space/channel.go`, or any
       existing `sql/` migration. New files plus `internal/modules.go` plus
       `pkg/errcode/project.go` plus the i18n locale file only.
+      **Amended (round 2):** plus `modules/space/member_removal_registry.go`, a new
+      read-only accessor (`MemberRemovalCleanupStepNames`) added so a downstream test
+      can assert the cleanup step is actually registered — a round-1 finding was that
+      nothing verified it. New file, read-only, no behaviour change in that module.
 - [ ] Every reconcile query is bounded by `LIMIT` and cursor; none is an
       unbounded full-table `JOIN` on `space_member` or `user` (C3).
 - [ ] Project cache keys are namespaced `project:*` and collide with no existing
@@ -542,6 +546,13 @@ via `SetErrorRenderer` or assertions on `error.code` will not see a code.
       cannot leave or be demoted without a transfer; transfer is atomic.
 - [ ] A member removed from a project is denied on the very next request, not
       after the cache TTL (proves synchronous invalidation).
+      **Scoped (round 2):** this holds for the non-racing interleaving, which is what
+      synchronous invalidation buys. It does NOT hold against a cache-aside race — a
+      request that missed and read an active role can reinstate a positive entry for a
+      full TTL after a concurrent removal DELs the key. Impact is read-only: every
+      write path re-reads the role in-transaction under the project lock, so the stale
+      positive can gate a read but cannot authorize a write. Closing it properly means
+      versioning the key on `member_epoch`, which is P1 work.
 - [ ] Invite-code brute force is throttled by `StrictIPRateLimitMiddleware`; an
       invalid, expired, revoked and exhausted code all return the *same* generic
       code.
