@@ -67,7 +67,6 @@ func TestProjectQuotaCodesSurfaceTheirLimit(t *testing.T) {
 	for _, c := range []codes.Code{
 		ErrProjectQuotaPerSpace,
 		ErrProjectQuotaPerCreator,
-		ErrProjectQuotaMembers,
 		ErrProjectQuotaDailyCreate,
 	} {
 		registered, ok := codes.Lookup(c.ID)

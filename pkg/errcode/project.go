@@ -128,13 +128,13 @@ var (
 		DefaultMessage: "You have reached your project limit in this space.",
 		SafeDetailKeys: []string{"max"},
 	})
-	// ErrProjectQuotaMembers covers the per-project member cap.
-	ErrProjectQuotaMembers = register(codes.Code{
-		ID:             "err.server.project.quota_members",
-		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "This project has reached its member limit.",
-		SafeDetailKeys: []string{"max"},
-	})
+	// There is deliberately NO code for the per-project member cap. It is reached only
+	// inside a batch add, where the brief's own exception applies: the cap surfaces as a
+	// per-uid "quota_members" reason in a 200 partial report, because the other uids in the
+	// batch may well be admissible. A registered code with no producer costs a zh-CN entry
+	// and an en-US marker maintained forever, which is the "register it and wait for a
+	// consumer" shape D3 argues against — so it is registered when a caller needs it, not
+	// before (PR #841 round 2, P2).
 	// ErrProjectQuotaDailyCreate covers the per-user per-day creation cap.
 	ErrProjectQuotaDailyCreate = register(codes.Code{
 		ID:             "err.server.project.quota_daily_create",

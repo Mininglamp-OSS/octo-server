@@ -795,9 +795,6 @@ other = "Failed to query project data."
 ["err.server.project.quota_daily_create"]
 other = "You have created too many projects today."
 
-["err.server.project.quota_members"]
-other = "This project has reached its member limit."
-
 ["err.server.project.quota_per_creator"]
 other = "You have reached your project limit in this space."
 

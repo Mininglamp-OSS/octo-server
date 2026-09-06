@@ -40,7 +40,38 @@ func TestReconcilePageQueriesExamineBoundedRows(t *testing.T) {
 			"%s must evaluate its predicates as a per-row SELECT flag over the LIMIT-bounded "+
 				"base rows; a WHERE-clause predicate bounds rows returned, not rows examined, "+
 				"so a healthy table would be walked end to end every tick", fn)
+
+		// The WHERE clause must carry NOTHING but the keyset cursor. round 2 found `status`
+		// still in there: rows are never deleted in either table (removal and disband flip a
+		// status column), and no index leads with status, so as closed rows accumulate that one
+		// predicate put LIMIT back to bounding rows RETURNED — the property this whole shape
+		// exists to provide. It belongs in the flag with the others.
+		where := whereClause(t, body)
+		require.NotEmpty(t, where, "%s must have a WHERE clause", fn)
+		assert.NotContains(t, where, "status",
+			"%s must not filter on status in its WHERE clause — put it in the violating flag: %s",
+			fn, where)
 	}
+}
+
+// whereClause returns the text of the query's WHERE clause up to ORDER BY, with the Go string
+// concatenation glue removed so a clause split across source lines reads as one.
+func whereClause(t *testing.T, body string) string {
+	t.Helper()
+	i := strings.Index(body, "\"WHERE ")
+	if i < 0 {
+		return ""
+	}
+	rest := body[i:]
+	end := strings.Index(rest, "ORDER BY")
+	if end < 0 {
+		end = len(rest)
+	}
+	clause := rest[:end]
+	for _, glue := range []string{"\" + \"", "\"+\"", "\" +\"", "\"+ \""} {
+		clause = strings.ReplaceAll(clause, glue, "")
+	}
+	return strings.ReplaceAll(clause, "\n", " ")
 }
 
 // src / fnBody are small helpers over the file text.

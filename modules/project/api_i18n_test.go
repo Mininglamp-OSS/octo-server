@@ -330,8 +330,8 @@ func TestRespondProjectHelpers(t *testing.T) {
 		},
 		{
 			name:          "quota surfaces the configured max",
-			probe:         func(c *wkhttp.Context) { respondProjectQuota(c, errcode.ErrProjectQuotaMembers, 500) },
-			wantCodeID:    "err.server.project.quota_members",
+			probe:         func(c *wkhttp.Context) { respondProjectQuota(c, errcode.ErrProjectQuotaPerSpace, 500) },
+			wantCodeID:    "err.server.project.quota_per_space",
 			wantSemStatus: http.StatusForbidden,
 			wantDetails:   map[string]any{"max": float64(500)},
 		},

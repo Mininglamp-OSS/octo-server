@@ -286,10 +286,18 @@ func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit in
 	var rows []*i1Row
 	_, err := p.db.session.SelectBySql(
 		"SELECT pm.project_id, pm.uid, pm.space_id, "+
-			// The I1 flag: no in-flight cleanup job for the pair, not in a banned Space, and no
-			// active Space seat — the same three predicates the WHERE version had, evaluated
-			// per inspected row instead of filtering the result set.
-			"(NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
+			// The I1 flag: the seat is ACTIVE, has no in-flight cleanup job, is not in a banned
+			// Space, and has no active Space seat behind it — the same predicates the WHERE
+			// version had, evaluated per inspected row instead of filtering the result set.
+			//
+			// pm.status belongs in here with the others, and it was the one left behind. Member
+			// rows are never deleted (removal flips status), so as closed seats accumulate a
+			// WHERE on status again bounds rows RETURNED rather than rows EXAMINED — the exact
+			// property Q4 was about — and no index leads with status (the PK is
+			// (project_id, uid), and the three secondary indexes lead with space_id/uid/
+			// project_id).
+			"(pm.status = ? "+
+			" AND NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
 			"             WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
 			" AND NOT EXISTS (SELECT 1 FROM `space` sb "+
 			"                  WHERE sb.space_id = pm.space_id AND sb.status = ?) "+
@@ -298,10 +306,10 @@ func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit in
 			"                  WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = ?) "+
 			") AS violating "+
 			"FROM `octo_project_member` pm "+
-			"WHERE pm.status = ? AND (pm.project_id, pm.uid) > (?, ?) "+
+			"WHERE (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		cleanupStatusPending, spaceStatusBanned, spaceStatusNormal, spaceMemberStatusActive,
-		MemberStatusActive, cursorProject, cursorUID, limit,
+		MemberStatusActive, cleanupStatusPending, spaceStatusBanned, spaceStatusNormal,
+		spaceMemberStatusActive, cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: scan I1 violations: %w", err)
@@ -409,8 +417,12 @@ func (p *Project) queryAbandonedLeakPage(cursorProject, cursorUID string, limit 
 	var rows []*i1Row
 	_, err := p.db.session.SelectBySql(
 		"SELECT pm.project_id, pm.uid, pm.space_id, "+
+			// The seat is still ACTIVE. In the flag rather than the WHERE clause for the same
+			// reason as the I1 scan: member rows are never deleted, so filtering on status
+			// there would bound rows returned instead of rows examined.
+			"(pm.status = ? "+
 			// An abandoned job exists for this pair: nothing will re-drive THAT job.
-			"(EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
+			" AND EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
 			"          WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
 			// ...but a NEWER job may already be queued for the same pair, and that one will
 			// clean the seat. remove -> rejoin -> remove enqueues a second job (the outbox is
@@ -427,10 +439,10 @@ func (p *Project) queryAbandonedLeakPage(cursorProject, cursorUID string, limit 
 			"                  WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = 1) "+
 			") AS violating "+
 			"FROM `octo_project_member` pm "+
-			"WHERE pm.status = ? AND (pm.project_id, pm.uid) > (?, ?) "+
+			"WHERE (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		cleanupStatusAbandoned, cleanupStatusPending,
-		MemberStatusActive, cursorProject, cursorUID, limit,
+		MemberStatusActive, cleanupStatusAbandoned, cleanupStatusPending,
+		cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: query abandoned leak page: %w", err)
@@ -495,10 +507,23 @@ func (p *Project) queryInspectedProjectPage(cursor int64, limit int) ([]*orphanR
 			// unrecoverable states that leave the project permanently invisible. A BANNED Space
 			// (status=2) is deliberately not an orphan: a ban is recoverable, and flagging one
 			// would cry wolf every tick of every ban.
-			"(NOT EXISTS (SELECT 1 FROM `space` s "+
+			// NOTE — this gauge does not return to zero on its own. A legitimately disbanded
+			// Space leaves its projects behind (nothing disbands them, by design: P0 owns no
+			// cross-module teardown), so every project in a disbanded Space is counted on every
+			// completed rotation with no repair path in P0. Read it the same way as
+			// i1_abandoned_cleanup_leak: a standing figure needing a human, not a transient
+			// that clears. The brief asks for "a project whose space_id no longer exists";
+			// status=0 is included because it is equally unrecoverable and equally invisible,
+			// and excluding it would have hidden the disband case the round-1 review asked for.
+			//
+			// p.status is part of the flag, not the WHERE clause: disbanded projects are kept
+			// as rows, and no index leads with status (the PK is id, and the secondary indexes
+			// lead with space_id or creator), so filtering here would bound rows returned
+			// rather than rows examined as the count of disbanded projects grows.
+			"(p.status = ? AND NOT EXISTS (SELECT 1 FROM `space` s "+
 			"             WHERE s.space_id = p.space_id AND s.status <> 0)) AS violating "+
 			"FROM `octo_project` p "+
-			"WHERE p.status = ? AND p.id > ? "+
+			"WHERE p.id > ? "+
 			"ORDER BY p.id LIMIT ?",
 		StatusNormal, cursor, limit,
 	).Load(&rows)

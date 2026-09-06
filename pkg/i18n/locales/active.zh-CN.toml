@@ -1464,9 +1464,6 @@ other = "该空间的项目数量已达上限。"
 ["err.server.project.quota_per_creator"]
 other = "你在该空间创建的项目数量已达上限。"
 
-["err.server.project.quota_members"]
-other = "该项目的成员数量已达上限。"
-
 ["err.server.project.quota_daily_create"]
 other = "你今天创建的项目数量已达上限。"
 

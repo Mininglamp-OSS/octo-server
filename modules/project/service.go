@@ -115,6 +115,19 @@ func canDisbandProject(projectRole int) bool   { return projectRole == RoleOwner
 func canManageMembers(projectRole int) bool    { return projectRole >= RoleAdmin }
 func canChangeMemberRole(projectRole int) bool { return projectRole == RoleOwner }
 func isProjectMember(projectRole int) bool     { return projectRole >= RoleCommon }
+
+// canViewMembers is the one place the Space-admin read widening applies, and the split
+// between this and listVisibleInSpace (which grants Space admins nothing) is deliberate
+// rather than an inconsistency.
+//
+// The rule the module follows: a Space admin may read a project they can already NAME, and
+// may not DISCOVER one. The brief grants them the detail route; the roster hangs off a
+// project id they must already hold, so it travels with the detail route. The list route is
+// discovery, so it stays closed — widening it would make "unlisted" stop meaning what it says
+// on the one route where users read it, and would ship a slice of the P2 admin surface early.
+//
+// Project membership is not derivable from Space membership either way, which is why this is
+// written down once instead of being re-derived per endpoint (PR #841 round 2, P2).
 func canViewMembers(projectRole, spaceRole int) bool {
 	return isProjectMember(projectRole) || spaceRole >= spacepkg.MemberRoleAdmin
 }
@@ -477,6 +490,13 @@ func (p *Project) disbandProject(projectID, actorUID, spaceID string) ([]string,
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit disband: %w", err)
 	}
+	// One Redis round-trip per member, on the request path: at the 500-member default that is
+	// 500 sequential DELs. They are synchronous by rule — this is an authorization boundary, so
+	// handing invalidation to a worker would leave every member of a disbanded project
+	// authorized for up to a full TTL — but sequential is not required by that rule, only by
+	// the client: octo-lib's redis.Conn exposes single-key Del and neither a variadic form nor
+	// the underlying client, so pipelining them needs a capability added there rather than a
+	// second connection opened here. Recorded rather than worked around (PR #841 round 2, P2).
 	for _, uid := range affectedUIDs {
 		p.invalidateProjectMemberCache(projectID, uid)
 	}
@@ -811,14 +831,19 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
 		return false, "", err
 	}
-	// The target's Space seat is locked and verified HERE, before the project row (Q2), when
-	// the request would raise the target to admin or owner: that is a grant, and the grant
-	// needs the authorization predicate in-transaction. A DEMOTION narrows privilege, so it
-	// deliberately skips the check — refusing to demote a member who is already on their way
-	// out would block the operator from doing the safe thing (pinned by
-	// TestPromotionRequiresTargetStillInSpace). The gate keys on the REQUESTED role, which is
-	// known before any lock; whether the change is actually a promotion (role > target.Role)
-	// is only knowable under the project lock, but a demotion request can never grant.
+	// The target's Space seat is locked and verified HERE, before the project row (Q2),
+	// whenever the REQUESTED role is admin or owner.
+	//
+	// Stated precisely, because the earlier version of this comment said "a demotion skips the
+	// check" and the gate does not: it keys on the requested role, so an owner -> admin
+	// DEMOTION is checked too. Only a demotion to RoleCommon skips it. That is the intended
+	// shape rather than a gap — RoleCommon is the operator's escape hatch for a member already
+	// on their way out of the Space, and every role at or above admin is a privilege worth the
+	// in-transaction predicate whichever direction the change moves.
+	//
+	// The requested role is what the gate can use: it is known before any lock, whereas
+	// whether the change is really a promotion (role > target.Role) is only knowable under the
+	// project lock. Pinned by TestPromotionRequiresTargetStillInSpace.
 	if role >= RoleAdmin {
 		if err := p.requireActorSpaceSeatTx(tx, spaceID, targetUID); err != nil {
 			return false, "", err

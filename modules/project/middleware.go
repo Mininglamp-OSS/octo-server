@@ -76,6 +76,14 @@ type projectCacheStore interface {
 // its full TTL while the handler has already committed and returned 200. So when
 // DEL fails, overwrite instead of merely logging: a shorter-lived negative entry
 // makes the middleware refuse on the next request.
+// The fallback direction is right for REMOVALS and wrong for GRANTS, and this helper runs on
+// both. On a DEL failure after an add or a promotion, the negative entry denies a member whose
+// seat has just committed, for up to projectNegativeCacheTTL (30s). That is the fail-SAFE
+// direction — a false denial for 30s, versus a removed member keeping authority for a full
+// positive TTL — and it is kept deliberately, with the same reasoning modules/space applies to
+// its own membership cache. A positive fallback for grant paths would have to write a role it
+// believes rather than one it read under the lock, which is how a stale positive gets minted.
+// Raised in both review rounds of PR #841; the answer is "yes, and on purpose".
 func invalidateProjectMemberCacheIn(store projectCacheStore, projectID, uid string) error {
 	key := projectMemberCacheKey(projectID, uid)
 	delErr := store.Del(key)
