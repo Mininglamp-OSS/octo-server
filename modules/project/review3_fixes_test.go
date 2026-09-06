@@ -209,23 +209,26 @@ func TestPartiallyAppliedBatchReportsWhatCommitted(t *testing.T) {
 		seedUser(t, uid)
 		seedSpaceMember(t, spaceA, uid, 0, 1)
 	}
-	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+	// The seam is a field on the instance, so the requests must hit a router mounted on THAT
+	// instance — the shared testSrv routes a different one.
+	r := mountProject(t, p)
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
 		ownerTok, map[string]any{"uids": []string{"t1", "t2", "t3"}})
 	require.Equal(t, http.StatusOK, w.Code)
 
 	// Revoke the actor's rights after the first removal commits, by hooking the per-target call.
 	calls := 0
-	orig := removeOneMemberForTest
-	removeOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, targetUID string) (bool, error) {
+	orig := p.removeOneFn
+	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		calls++
 		if calls > 1 {
 			return false, errPermissionDenied
 		}
-		return orig(pr, projectID, spaceID, actorUID, targetUID)
+		return orig(projectID, spaceID, actorUID, targetUID)
 	}
-	t.Cleanup(func() { removeOneMemberForTest = orig })
+	t.Cleanup(func() { p.removeOneFn = orig })
 
-	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
 		ownerTok, map[string]any{"uids": []string{"t1", "t2", "t3"}})
 	require.Equal(t, http.StatusOK, w.Code,
 		"a partially-applied batch must report per-target results, not one status code: %s",
@@ -246,7 +249,7 @@ func TestPartiallyAppliedBatchReportsWhatCommitted(t *testing.T) {
 
 	// With NOTHING committed, a single status code is still the honest answer.
 	calls = 1000
-	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
 		ownerTok, map[string]any{"uids": []string{"t2"}})
 	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
 }
@@ -332,16 +335,16 @@ func TestAddBatchStopsAtActorLevelFailureAndLabelsOnlyTheTail(t *testing.T) {
 	r := mountProject(t, p)
 
 	calls := 0
-	orig := addOneMemberForTest
-	addOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, uid string) (bool, error) {
+	orig := p.addOneFn
+	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
 		calls++
 		if uid == "a2" {
 			// Simulate the actor's rights expiring while the batch is in flight.
 			return false, errPermissionDenied
 		}
-		return orig(pr, projectID, spaceID, actorUID, uid)
+		return orig(projectID, spaceID, actorUID, uid)
 	}
-	t.Cleanup(func() { addOneMemberForTest = orig })
+	t.Cleanup(func() { p.addOneFn = orig })
 
 	var w *httptest.ResponseRecorder
 	entries := captureAuditOn(t, p, func() {

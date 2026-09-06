@@ -179,7 +179,7 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 	actorUID := c.GetLoginUID()
 	outcomes := make([]memberOutcome, 0, len(uids))
 	for i, uid := range uids {
-		removed, err := removeOneMemberForTest(p, row.ProjectID, row.SpaceID, actorUID, uid)
+		removed, err := p.removeOneFn(row.ProjectID, row.SpaceID, actorUID, uid)
 		switch {
 		case err == nil:
 			outcomes = append(outcomes, memberOutcome{UID: uid, OK: true, committed: removed})
@@ -411,20 +411,4 @@ func appendNotAttemptedUIDs(outcomes []memberOutcome, rest []string) []memberOut
 		outcomes = append(outcomes, memberOutcome{UID: uid, Reason: outcomeNotAttempted})
 	}
 	return outcomes
-}
-
-// addOneMemberForTest is the per-target seam for the add batch. See removeOneMemberForTest
-// for why a package var: a test must be able to make the actor's rights expire PART WAY
-// through a batch. Not thread-safe; tests must restore it and must not run in parallel.
-var addOneMemberForTest = func(p *Project, projectID, spaceID, actorUID, uid string) (bool, error) {
-	return p.addOneMember(projectID, spaceID, actorUID, uid)
-}
-
-// removeOneMemberForTest is the per-target seam for the remove batch.
-//
-// A package var so a test can make the actor lose their rights PART WAY through a batch — the
-// only way to reach the partial-commit path, which needs one target to commit and a later one to
-// be refused. Not thread-safe; tests must restore it and must not run in parallel.
-var removeOneMemberForTest = func(p *Project, projectID, spaceID, actorUID, targetUID string) (bool, error) {
-	return p.removeMember(projectID, spaceID, actorUID, targetUID)
 }

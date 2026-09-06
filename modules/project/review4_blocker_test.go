@@ -18,19 +18,19 @@ import (
 // errProjectGone branch responds unconditionally.
 // ---------------------------------------------------------------------------
 
-// withRemoveSeam drives removeOneMemberForTest so every target before failOn commits for
-// real and failOn itself is told inject happened.
-func withRemoveSeam(t *testing.T, failOn string, inject error, calls *int) {
+// withRemoveSeam swaps the remove seam on p's instance so every target before failOn
+// commits for real and failOn itself is told inject happened.
+func withRemoveSeam(t *testing.T, p *Project, failOn string, inject error, calls *int) {
 	t.Helper()
-	orig := removeOneMemberForTest
-	removeOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, targetUID string) (bool, error) {
+	orig := p.removeOneFn
+	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		*calls++
 		if targetUID == failOn {
 			return false, inject
 		}
-		return orig(pr, projectID, spaceID, actorUID, targetUID)
+		return orig(projectID, spaceID, actorUID, targetUID)
 	}
-	t.Cleanup(func() { removeOneMemberForTest = orig })
+	t.Cleanup(func() { p.removeOneFn = orig })
 }
 
 // TestRemoveBatchReportsPartialWhenProjectDisbandsMidBatch is the RED reproducer.
@@ -45,7 +45,7 @@ func TestRemoveBatchReportsPartialWhenProjectDisbandsMidBatch(t *testing.T) {
 	r := mountProject(t, p)
 
 	calls := 0
-	withRemoveSeam(t, "r2", errProjectGone, &calls)
+	withRemoveSeam(t, p, "r2", errProjectGone, &calls)
 
 	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
 		ownerTok, map[string]any{"uids": []string{"r1", "r2", "r3"}})
@@ -70,12 +70,12 @@ func TestRemoveBatchReportsPartialWhenProjectDisbandsMidBatch(t *testing.T) {
 // TestRemoveBatchBare404WhenNothingCommitted pins the other half of the contract: with
 // nothing committed, the single status code IS the honest answer.
 func TestRemoveBatchBare404WhenNothingCommitted(t *testing.T) {
-	srv, _ := setup(t)
+	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv, "x1")
-	r := mountProject(t, New(testCtx))
+	r := mountProject(t, p)
 
 	calls := 0
-	withRemoveSeam(t, "x1", errProjectGone, &calls)
+	withRemoveSeam(t, p, "x1", errProjectGone, &calls)
 
 	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
 		ownerTok, map[string]any{"uids": []string{"x1"}})
@@ -92,26 +92,27 @@ func TestRemoveBatchBare404WhenNothingCommitted(t *testing.T) {
 // Mutated-check: with anyApplied keyed on OK instead of committed, this test returns 200
 // with a partial report and FAILS — verified before the fix landed.
 func TestNoOpBatchWithActorFailureStaysOneStatusCode(t *testing.T) {
-	srv, _ := setup(t)
+	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv, "already1")
 
 	// already1 holds a seat: re-adding is a no-op. The seam makes the SECOND target hit an
 	// actor-level failure after the no-op "succeeded".
 	calls := 0
-	orig := addOneMemberForTest
-	addOneMemberForTest = func(pr *Project, projectID, spaceID, actorUID, uid string) (bool, error) {
+	orig := p.addOneFn
+	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
 		calls++
 		if uid == "blocked1" {
 			return false, errPermissionDenied
 		}
-		return orig(pr, projectID, spaceID, actorUID, uid)
+		return orig(projectID, spaceID, actorUID, uid)
 	}
-	t.Cleanup(func() { addOneMemberForTest = orig })
+	t.Cleanup(func() { p.addOneFn = orig })
 
 	seedUser(t, "blocked1")
 	seedSpaceMember(t, spaceA, "blocked1", 0, 1)
 
-	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+	r := mountProject(t, p)
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
 		ownerTok, map[string]any{"uids": []string{"already1", "blocked1"}})
 	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
 	assert.Equal(t, 2, calls)

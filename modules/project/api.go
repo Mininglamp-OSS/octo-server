@@ -30,6 +30,16 @@ type Project struct {
 	// the "every write path audits" contract is assertable without capturing the
 	// process-wide logger.
 	auditSink auditSink
+
+	// addOneFn / removeOneFn are the per-target execution seams for the batch endpoints.
+	//
+	// Fields on the instance, not package-level vars: the earlier form put a mutable,
+	// not-thread-safe function pointer named ForTest on the production authorization path
+	// (yujiawei Q7, PR #841 round 1). New installs the real implementations; a test that
+	// needs mid-batch behavior swaps the field on ITS OWN instance (mounted via
+	// mountProject) and restores it, so nothing global is rewritable in production.
+	addOneFn    func(projectID, spaceID, actorUID, uid string) (bool, error)
+	removeOneFn func(projectID, spaceID, actorUID, targetUID string) (bool, error)
 }
 
 // New builds the Project API and registers the Space-removal cascade step.
@@ -50,6 +60,14 @@ func New(ctx *config.Context) *Project {
 	// check GetRedisConn() per call.
 	if ctx.GetRedisConn() != nil {
 		p.spaceCache = spacepkg.NewRedisMembershipCache(ctx.GetRedisConn())
+	}
+	// The batch seams are instance fields (see the struct comment): production gets the real
+	// implementations here, and tests swap them on their own instance.
+	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
+		return p.addOneMember(projectID, spaceID, actorUID, uid)
+	}
+	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
+		return p.removeMember(projectID, spaceID, actorUID, targetUID)
 	}
 
 	p.registerSpaceMemberRemovalCleanup()

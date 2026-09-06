@@ -451,7 +451,7 @@ type addMemberResult struct {
 func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string) ([]addMemberResult, error) {
 	results := make([]addMemberResult, 0, len(uids))
 	for _, uid := range uids {
-		admitted, err := addOneMemberForTest(p, projectID, spaceID, actorUID, uid)
+		admitted, err := p.addOneFn(projectID, spaceID, actorUID, uid)
 		results = append(results, addMemberResult{UID: uid, Admitted: admitted, Err: err})
 		// An ACTOR-level or project-level failure ends the batch HERE, not in the handler.
 		//
