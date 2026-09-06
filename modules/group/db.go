@@ -62,9 +62,27 @@ func (d *DB) InsertMember(m *MemberModel) error {
 	return err
 }
 
-// DeleteMemberTx 删除群成员
+// DeleteMemberTx 删除群成员（软删）。
+//
+// forbidden_expir_time is cleared here for two reasons, and both matter.
+//
+// The bug: CheckForbiddenLoop polls every row with a non-zero, expired
+// forbidden_expir_time and rewrites it. Its source query did not filter
+// is_deleted, and removal did not clear the column, so a member who was muted
+// and then removed was rewritten forever, outside any transaction, on every
+// tick. Filtering the query stops the reads; clearing here stops the rows.
+//
+// The semantics: a mute is a permission the GROUP granted, and group-granted
+// state must not survive leave-and-rejoin. The restore branch of the admission
+// funnel deliberately does not touch this column (recoverMemberTx did not
+// either), so clearing it on the way OUT is what makes a rejoining member come
+// back unmuted — the same rule as the bot_admin reset.
 func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.Tx) error {
-	_, err := tx.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
+	_, err := tx.Update("group_member").
+		Set("is_deleted", 1).
+		Set("version", version).
+		Set("forbidden_expir_time", 0).
+		Where("group_no=? and uid=?", groupNo, uid).Exec()
 	return err
 }
 
@@ -682,9 +700,20 @@ func (d *DB) queryGroupsWithMemberUID(memberUID string) ([]*Model, error) {
 }
 
 // 查询禁言时长到期成员
+// queryForbiddenExpirationTimeMembers feeds CheckForbiddenLoop, the unmute-expiry
+// poller (which, despite its name, is not loop detection).
+//
+// `is_deleted = 0` is a FIX, not a tightening. Without it the poller selected
+// removed members whose forbidden_expir_time was never cleared, and rewrote them
+// forever with a full-row UpdateMember outside any transaction — every tick, for
+// the life of the row. The other half of the same defect is fixed in
+// DeleteMemberTx, which now clears the column on removal, so rows already in
+// that state stop being produced as well as stopping being read.
 func (d *DB) queryForbiddenExpirationTimeMembers(limit int64) ([]*MemberModel, error) {
 	var models []*MemberModel
-	_, err := d.session.Select("*").From("group_member").Where("forbidden_expir_time <>0 and unix_timestamp(now())-forbidden_expir_time>0").Limit(uint64(limit)).Load(&models)
+	_, err := d.session.Select("*").From("group_member").
+		Where("is_deleted=0 and forbidden_expir_time <>0 and unix_timestamp(now())-forbidden_expir_time>0").
+		Limit(uint64(limit)).Load(&models)
 	return models, err
 }
 

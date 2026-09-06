@@ -120,23 +120,30 @@ scope_changes:
       default, because "disband" does not clean up what its name implies.
   - id: migration-placement-corrected
     decision: |
-      group.project_id ships from modules/group/sql, NOT modules/project/sql as
-      brief D2 specifies. D2's reasoning was "the module that owns the concept
-      owns the column", citing modules/space adding group.space_id from its own
-      directory. That precedent does not transfer: modules/group IMPORTS
-      modules/space, so space's migrations are in every binary containing group,
-      including group's test binary. modules/project is not a dependency of
-      modules/group at all — the cascade is reverse-registered at runtime — so
-      its migrations are absent there.
-      Found empirically, not by reasoning: with the column in
-      modules/project/sql, every modules/group and modules/channel test that
-      inserts a group failed with "Error 1054: Unknown column 'project_id' in
-      'field list'", because Model carries ProjectID and the DAO builds its
-      column list by reflection.
+      group.project_id ships from modules/space/sql, not modules/project/sql as
+      brief D2 specifies.
+      The rule is about DEPENDENCY DIRECTION, not ownership: a column must ship
+      from a migration directory present in every binary that reads it. Measured
+      with `go list -deps`, three modules read this column — modules/group (the
+      admission gate, the detach step), modules/space (joinPresetGroups skips
+      project groups; the Space settings endpoint refuses one as a preset group)
+      and modules/project (the I2/I3 reconcile scans) — and modules/space/sql is
+      the only directory present in all three binaries. modules/space's binary
+      contains no group migrations, and modules/project's contains neither.
+      Both wrong placements were found the same way, by a whole test package
+      failing with "Error 1054: Unknown column", not by reasoning:
+        * modules/project/sql — modules/group's binary has no project
+          migrations, so every group and channel test that inserted a group
+          failed (82 of them);
+        * modules/group/sql   — modules/space's binary has no group migrations,
+          so the Space settings endpoint failed the moment it read the column.
+      This is also the real reason group.space_id was added from modules/space's
+      own directory in 20260307000004_space_legacy03.sql. D2 cited that as a
+      precedent for "the module that owns the concept owns the column"; the
+      precedent is real but the explanation was not.
       The Project-owned schema (octo_project_member.removing, the cascade
-      outbox) stays in modules/project/sql, where only modules/project reads or
-      writes it. Rule left behind: a column belongs to the migration directory
-      of a module whose code reads or writes it.
+      outbox) correctly stays in modules/project/sql, because only
+      modules/project reads or writes it.
 
   - id: collation-follows-repo
     decision: |
