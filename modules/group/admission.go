@@ -180,20 +180,38 @@ func (d *DB) assertAdmissibleTx(tx *dbr.Tx, spaceID, projectID string, uids []st
 		return nil
 	}
 
+	// System bots are exempt from the WHOLE gate, not just its project half.
+	//
+	// The narrower reading — exempt from the project check, still subject to the
+	// Space check — was tried and is wrong for a concrete reason: platform bots
+	// (botfather, fileHelper, u_10000) have no space_member row at all. They are
+	// global infrastructure the platform adds to groups itself, not members of
+	// any Space. Subjecting them to the Space half therefore refuses them from
+	// every project group, which is the opposite of an exemption.
+	//
+	// Filtering them out HERE rather than inside each half also means the two
+	// halves cannot disagree about who is exempt.
+	gated := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		if uid == "" || spacepkg.IsSystemBot(uid) {
+			continue
+		}
+		gated = append(gated, uid)
+	}
+	if len(gated) == 0 {
+		return nil
+	}
+
 	// Space half. Only project groups reach it, so this adds no cost to the
 	// paths that carry the product's traffic today.
 	if spaceID != "" {
-		active, err := spacepkg.ActiveMembers(d.ctx.DB(), spaceID, uids)
+		active, err := spacepkg.ActiveMembers(d.ctx.DB(), spaceID, gated)
 		if err != nil {
 			return fmt.Errorf("group: admission space check: %w", err)
 		}
 		missing := make([]string, 0)
-		for _, uid := range uids {
-			// System bots are exempt from the PROJECT half by whitelist, but not
-			// from the Space half: a bot in a Space group is a Space member.
-			// Keeping them subject to it means the exemption widens exactly one
-			// gate, not two.
-			if uid != "" && !active[uid] {
+		for _, uid := range gated {
+			if !active[uid] {
 				missing = append(missing, uid)
 			}
 		}
@@ -208,8 +226,10 @@ func (d *DB) assertAdmissibleTx(tx *dbr.Tx, spaceID, projectID string, uids []st
 		}
 	}
 
-	// Project half — in-transaction, locked.
-	missing, err := projectpkg.AssertMembersInProjectTx(tx, projectID, uids)
+	// Project half — in-transaction, locked. pkg/project applies the same
+	// system-bot exemption internally; passing the already-filtered list keeps
+	// the two from having to agree by coincidence.
+	missing, err := projectpkg.AssertMembersInProjectTx(tx, projectID, gated)
 	if err != nil {
 		return fmt.Errorf("group: admission project check: %w", err)
 	}

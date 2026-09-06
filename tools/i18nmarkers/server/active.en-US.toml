@@ -468,6 +468,9 @@ other = "Failed to send group notification."
 ["err.server.group.project_member_required"]
 other = "Only members of this project can be added to the group."
 
+["err.server.group.project_unavailable"]
+other = "This project is unavailable."
+
 ["err.server.group.qrcode_member_only"]
 other = "Only group members can generate a QR code."
 

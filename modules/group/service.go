@@ -990,14 +990,17 @@ func GetGroupMdMaxSize() int {
 
 // CreateGroupServiceReq 创建群请求
 type CreateGroupServiceReq struct {
-	Creator     string   // 创建者 UID
-	Members     []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
-	Name        string   // 群名称（可为空，Service 会自动生成）
-	SpaceID     string   // Space ID（可为空）
-	BotUID      string   // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
-	CategoryID  string   // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText  string   // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int     // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
+	Creator string   // 创建者 UID
+	Members []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
+	Name    string   // 群名称（可为空，Service 会自动生成）
+	SpaceID string   // Space ID（可为空）
+	// ProjectID 群的项目归属（可为空=直属 Space）。非空时群成员受 I2 约束，
+	// 包括创建者自己——他不是该项目成员的话，建群会在准入闸门处被拒。
+	ProjectID   string // 所属项目 ID（可为空）
+	BotUID      string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
+	CategoryID  string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
+	AvatarText  string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
 // CreateGroupServiceResp 创建群响应
@@ -1223,9 +1226,10 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
 	// group_member 的 is_external_* 标记在同一事务内一致（与 ADD / DELETE
 	// 路径对称，bot-only 外部不会 flip 群标记）。
-	// 建群时的项目归属。P1 的排序约束要求级联先于创建参数存在，所以这里目前
-	// 恒为空串（直属 Space），闸门照常在位。
-	newGroupProjectID := ""
+	// 建群时的项目归属。空串=直属 Space。handler 已校验过它属于同一个 Space
+	// 且项目处于活跃状态；「创建者本人是不是该项目成员」由下面的准入闸门在事务
+	// 内判定，那才是不会过期的判定点。
+	newGroupProjectID := req.ProjectID
 	initialAdmissions := make([]MemberAdmission, 0, len(memberUsers))
 
 	isExternalGroup := 0
@@ -1250,6 +1254,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Version:             version,
 		AllowViewHistoryMsg: int(common.GroupAllowViewHistoryMsgEnabled),
 		SpaceID:             req.SpaceID,
+		ProjectID:           req.ProjectID,
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
 		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,

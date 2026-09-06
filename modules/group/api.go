@@ -34,6 +34,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -1004,6 +1005,48 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	// 零宽/格式字符撑爆 avatar_text VARCHAR(16) 导致 MySQL 截断。
 	req.AvatarText = avatarrender.GroupText(req.AvatarText)
 
+	// 校验 project_id。
+	//
+	// 三道门，顺序有意如此：
+	//
+	//  1. 必须同时给 space_id —— 项目本身就活在某个 Space 里，没有 Space 的项目群
+	//     无从谈起。
+	//  2. 功能开关必须打开。这是 brief D1 说的唯一回滚手段：关掉它只是「不再产生
+	//     新的项目群」，已有项目群的成员约束照常强制——设计文档明确不允许放松
+	//     已有约束。开关与 appconfig 的 project_on 是同一个值。
+	//  3. 项目必须存在、活跃、且属于同一个 Space。三种失败回同一个错误码，不区分
+	//     ——区分开就等于把建群变成一个探测器：拿着一个自己看不见的 project_id，
+	//     用一个自己有权限的 Space 就能问出「它存不存在、在哪个 Space」。
+	//
+	// 「创建者本人是不是这个项目的成员」不在这里查。那是准入闸门的事，发生在建群
+	// 事务内、持锁状态下；放在这里查是一次会过期的读。
+	if req.ProjectID != "" {
+		if req.SpaceID == "" {
+			respondGroupRequestInvalid(c, "space_id")
+			return
+		}
+		if !common2.EnsureSystemSettings(g.ctx).ProjectEnabled() {
+			g.Warn("项目功能未开启，拒绝创建项目群",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+		ok, err := projectpkg.ResolveForGroup(g.ctx.DB(), req.SpaceID, req.ProjectID)
+		if err != nil {
+			g.Error("查询项目失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !ok {
+			// The distinguishing reason (absent / disbanded / other Space) stays
+			// in the log, never on the wire.
+			g.Warn("项目不可用：不存在、已解散，或不属于该 Space",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+	}
+
 	// 校验 category_id
 	if req.CategoryID != "" {
 		if req.SpaceID == "" {
@@ -1104,6 +1147,7 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 		Members:     realUids,
 		Name:        req.Name,
 		SpaceID:     req.SpaceID,
+		ProjectID:   req.ProjectID,
 		CategoryID:  req.CategoryID,
 		AvatarText:  req.AvatarText,
 		AvatarColor: req.AvatarColor,
@@ -4775,12 +4819,19 @@ func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []mem
 }
 
 type groupReq struct {
-	Name        string   `json:"name"`         // 群名
-	Members     []string `json:"members"`      // 成员uid
-	SpaceID     string   `json:"space_id"`     // Space ID（可选）
-	CategoryID  string   `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
-	AvatarText  string   `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int     `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
+	Name    string   `json:"name"`     // 群名
+	Members []string `json:"members"`  // 成员uid
+	SpaceID string   `json:"space_id"` // Space ID（可选）
+	// ProjectID 把新群挂到某个项目下（可选，必须与 space_id 同时传）。
+	//
+	// 一旦设置就不可更改（不变量 I3）：没有任何接口能改群的项目归属，源码守卫
+	// 也禁止在创建路径和 detach 步骤之外写这一列。要换项目只能新建群。
+	//
+	// 非空时，群的成员集合从此受不变量 I2 约束——加人时必须是该项目的活跃成员。
+	ProjectID   string `json:"project_id"`   // 所属项目 ID（可选，需配合 space_id）
+	CategoryID  string `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
+	AvatarText  string `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
 }
 
 func (g groupReq) Check() error {
