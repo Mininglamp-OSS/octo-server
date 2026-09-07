@@ -14,14 +14,10 @@ source: user
 
 > One task = one `.octospec/tasks/<slug>/` directory. This brief is the spec for
 > the work. AI may draft it from existing code; a human confirms it.
->
-> 本文是**产品视角的第一版**：每条决策都给了建议默认值，但都标着"待确认"。
-> 确认前不进入 Implement。
->
-> 自审一轮（2026-09-07）后的修订：补了 D13（分身跟人走）、D14（bot 删除要走 Space
-> 移除工单）、D15（谁能把分身带进项目）、D16（名册怎么区分人和分身），改掉了 D4 里
-> "项目行锁保证只建一个"这句与"钩子在提交后运行"自相矛盾的说法，删掉了验收里一条
-> 不成立的断言（provisioner 并不重跑建群 handler 的四道门）。
+
+**确认记录（2026-09-07）**：D1–D16 全部由需求方确认，取本文档给出的默认值。D6 / D7 / D8
+的"可裁剪"标记随之取消——三者都在本期范围内。仅剩三项无法在本仓库内核实的事项，列在末尾的
+「上线前须核对」，它们不阻塞实现。
 
 ## Goal
 
@@ -122,40 +118,41 @@ bot 在本 Space 有活跃 `space_member` 行、不在 `pkg/space.SystemBots` �
   （`modules/group/preset_group_admission.go`）：**自带事务、自取版本号、走准入口、提交后
   IM 订阅、失败返回错误由调用方记日志**。这就是"加入项目 → 进全员群"要抄的模板。
 
-所以本期至少新增两个注册点，都在 `modules/project` 定义、由 `modules/group` 实现：
+本期新增**四个**注册点，都在 `modules/project` 定义、由 `modules/group` 实现：
 
 1. **全员群创建器**：`RegisterAllMemberGroupProvisioner(fn)`，输入项目 id / Space / 创建者 /
    初始成员，输出 `group_no`。群侧用 `Service.CreateGroup` 实现，走标准建群（IM 频道、群创建
    通知、准入闸门 A3/A4），不重新实现建群。
 2. **全员群准入器**：`RegisterAllMemberGroupAdmitter(fn)`，输入 Space / group_no / uid，
    群侧照 `admitToPresetGroup` 实现。
+3. **群主同步器**：`RegisterAllMemberGroupOwnerTransfer(fn)`（D6）。
+4. **群名同步器**：`RegisterAllMemberGroupRename(fn)`（D8）。
 
-D6（群主同步）和 D8（群名同步）各再加一个注册点，两者都可裁剪。所有钩子都在项目事务
-**提交之后**调用，原因和 `runDisbandSteps` 的注释一样：钩子在另一个模块的表上做事务，锁在
-项目行上跨模块等待会把建项目串行化到该项目的每一次群写入上。**因此项目侧不能靠项目行锁
-给钩子做互斥**，D4 的补建用租约认领。
+四个钩子都在项目事务**提交之后**调用，原因和 `runDisbandSteps` 的注释一样：钩子在另一个模块
+的表上做事务，锁在项目行上跨模块等待会把建项目串行化到该项目的每一次群写入上。**因此项目侧
+不能靠项目行锁给钩子做互斥**，D4 的补建用租约认领。
 
-### 原型里还没说清、代码也回答不了的事
+### 原型里没说、但"全员"二字要求的持续义务
 
-弹窗只覆盖"创建"这一瞬间。"全员"这个词隐含的持续义务（后加入的人要进、群主不能把群解散掉、
-人走了分身怎么办）弹窗上没有字，但不做的话产品承诺就只成立一秒钟。本 brief 把这些义务显式
-列成决策，交产品拍板。
+弹窗只覆盖"创建"这一瞬间。后加入的人要进群、群主不能把群解散掉、人走了分身怎么办——弹窗上
+没有字，但不做的话产品承诺只成立一秒钟。这些义务在下面全部写成已定决策。
 
-## 产品决策（建议默认值，全部待确认）
+## Decisions
 
-每条给出建议、理由、被拒绝的替代方案。确认后改成 P1 brief 那种 "D-n — 已定" 的口吻。
+每条记录决定、理由，以及被否决的替代方案。全部于 2026-09-07 由需求方确认。
 
 **D1 — "共同目标"复用 `octo_project.description`，不加新列。** 500 字上限已够；前端文案叫
-"共同目标"只是展示层的事。替代方案是新增 `goal` 列，被拒绝：两个语义相近的文本字段会让
-后续每个表单都要回答"填哪个"。
+"共同目标"只是展示层的事。被否决：新增 `goal` 列——两个语义相近的文本字段会让后续每个表单都
+要回答"填哪个"。
 
 **D2 — 分身的资格口径与通讯录一致，服务端复核，不信任前端。** 建项目请求新增可选
 `agent_uids []string`。服务端逐个校验：`robot.creator_uid = 调用方`、`robot.status = 1`、
 `user.robot = 1`、在本 Space 有活跃 `space_member` 行（I1，事务内锁定，与人类成员同一条
-路径 `requireSpaceSeatsTx`）、不在系统 bot 白名单。**是否排除 `self_hosted`：建议排除**，与
-通讯录选择器同口径——否则用户在选择器里看不到的分身可以从接口带进来。但 `agent_hosting`
-是自报值，排除它是产品一致性，不是安全边界，写进注释。上限沿用 `MemberBatchMax`（默认 200）。
-资格谓词放在 `modules/project`（它要读 `robot` 表），不放 `pkg/project`。
+路径 `requireSpaceSeatsTx`）、不在系统 bot 白名单、`agent_hosting <> 'self_hosted'`。
+**排除本地分身**与通讯录选择器同口径——否则用户在选择器里看不到的分身可以从接口带进来。但
+`agent_hosting` 是自报值，排除它是产品一致性，不是安全边界，这句话要写进代码注释。上限沿用
+`MemberBatchMax`（默认 200）。资格谓词放在 `modules/project`（它要读 `robot` 表），
+不放 `pkg/project`。
 
 **D3 — 任一分身不合格，整单拒绝，不做部分成功。** 建项目是一次性动作，"项目建了但有两个
 分身没进来"比"请修正后重试"更难解释，而且部分成功会让 D4 的失败语义再多一种。错误码新增
@@ -179,7 +176,7 @@ D6（群主同步）和 D8（群名同步）各再加一个注册点，两者都
   `space_member_removal_cleanup` / `octo_project_member_removal_cleanup` 的 lease 是同一个
   形状，过期租约自然可重试。
 
-被拒绝的替代方案：回滚项目——见上；同步建在项目事务内——违反锁序，把项目行锁跨到 IM 调用上；
+被否决：回滚项目——见上；同步建在项目事务内——违反锁序，把项目行锁跨到 IM 调用上；
 对账驱动补建——对账只报不修是仓库纪律，且补建会写群表，对账 worker 不该持有写路径。
 
 **D5 — 全员群身份记录在项目侧：`octo_project.all_member_group_no VARCHAR(40) NOT NULL
@@ -190,18 +187,16 @@ DEFAULT ''`，加普通索引。** 一个项目一个值，"有且仅有一个"�
 时才查**，Space 直属群零成本（延续 P1 的 C1 纪律）。谓词必须同时要求
 `group.project_id = 该项目`：P1 的 detach 在群主无继任者时会把群回退成 Space 直属而
 `all_member_group_no` 还指着它，这时它已经不是全员群，保护和补建都要按"没有全员群"处理。
-被拒绝的替代方案：在 `group` 表加 `project_role` 列——迁移得放 `modules/space/sql`
-（P1 踩过的坑），且"每个项目至多一个"要靠应用层保证。
+被否决：在 `group` 表加 `project_role` 列——迁移得放 `modules/space/sql`（P1 踩过的坑），
+且"每个项目至多一个"要靠应用层保证。
 
 **D6 — 全员群群主始终是项目 owner。** 建群时群主 = 创建者 = owner，这部分免费。项目 owner
 转让（`changeMemberRole` 的 transfer 分支、`leaveProject` 带 `transfer_to`）时**同步转让群主**，
-通过群侧注册的第三个钩子 `RegisterAllMemberGroupOwnerTransfer` 实现；群侧要把
-`transferGrouper` handler 里的转让逻辑抽成服务层函数供钩子调用，钩子路径**不经过** D7 的
-handler 层保护。理由：P1 只在群主**离开项目**时移交群主；owner 转让后原 owner 仍在项目里，
-群主就会停在一个普通项目成员身上，而这个人又不能解散/退出全员群（D7），形成一个没人能操作
-的群主。钩子失败时不回滚项目侧转让；原 owner 之后一旦离开项目，P1 的 detach 会按"群主离开"
-路径把群主移交给资深项目成员，是现成的兜底。**可裁剪**：不做的话把 D7 里对群主的限制也一并
-放宽，两者要一起决定。
+通过注册点 3 实现；群侧要把 `transferGrouper` handler 里的转让逻辑抽成服务层函数供钩子调用，
+钩子路径**不经过** D7 的 handler 层保护。理由：P1 只在群主**离开项目**时移交群主；owner 转让后
+原 owner 仍在项目里，群主就会停在一个普通项目成员身上，而这个人又不能解散/退出全员群（D7），
+形成一个没人能操作的群主。钩子失败时不回滚项目侧转让；原 owner 之后一旦离开项目，P1 的
+detach 会按"群主离开"路径把群主移交给资深项目成员，是现成的兜底。
 
 **D7 — 全员群受保护：群主不能解散、任何人不能退群、群内不能踢人、不能手动转让群主。**
 "全员"的含义就是这四件事都由项目侧驱动：退出走项目退出，踢人走项目移除，转让走项目 owner
@@ -211,15 +206,13 @@ handler 层保护。理由：P1 只在群主**离开项目**时移交群主；ow
 区分动作）。**保护只加在 HTTP handler 层，不加在 `RemoveGroupMembers` 等服务层函数上**：
 P1 的 detach、Space 级联、botfather 删 bot、本期的四个钩子都走服务层，加在那里等于把 I2 的
 级联一起挡掉。**手动加人不禁止**：加项目成员会被幂等吸收，加非项目成员会被 I2 拒绝，无需
-新规则。这是本期最大的一块新增限制，建议**单独一个 PR**，产品可以决定先不做——但先不做意味着
-"全员群"在第一个群主点了解散之后就不存在了，I4 对账会立刻报告。
+新规则。这是本期最大的一块新增限制，单独一个 PR（PR-C）。
 
 **D8 — 项目改名同步全员群群名；项目 logo 不同步群头像。** 群名 = 项目名是用户识别全员群的
 心智，改了不同步等于让全员群"失联"；群名上限 50 字（`MaxGroupNameLen`）短于项目名 64 字，
 截断规则与 `CreateGroup` 一致（取前 50 rune）。头像不同步：群头像有自己的一套自定义规则
-（`avatar_text` / `avatar_color`），项目 logo 是一个 URL，两者不是一回事。通过第四个钩子
-`RegisterAllMemberGroupRename` 实现，best-effort，钩子路径绕过群侧改名的角色校验（项目侧
-已经按 `canUpdateProject` 校验过）。
+（`avatar_text` / `avatar_color`），项目 logo 是一个 URL，两者不是一回事。通过注册点 4 实现，
+best-effort，钩子路径绕过群侧改名的角色校验（项目侧已经按 `canUpdateProject` 校验过）。
 
 **D9 — 自动建群不占用创建者的个人每日建群配额，但受项目每日创建配额约束。** 服务层调用天然
 绕过 handler 的 `SameDayCreateMaxCount`，这里把它写成有意为之：用户点一次"创建项目"消耗一次
@@ -246,30 +239,39 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 不跟上，I4 在第一个成员离开时就被打破，而且没有任何路径修复（分身的席位活着，群侧不会再把
 它加回来）。"分身"的产品含义也是如此——它以主人的身份运作（`modules/bot_api/obo_fanout.go`），
 主人不在了它不该继续读项目群。判定用 `robot.creator_uid`，与群侧同源；分身席位关闭的
-`operator_uid` 记为触发者，`reason` 沿用触发者的。被拒绝的替代方案：分身独立留在项目里——
-等于让一个已离开的人的代理留在项目群里，且立刻违反 I4。
+`operator_uid` 记为触发者，`reason` 沿用触发者的。被否决：分身独立留在项目里——等于让一个
+已离开的人的代理留在项目群里，且立刻违反 I4。
 
 **D14 — botfather 删除 bot 必须走 Space 成员移除的事务性工单，而不是裸 UPDATE。**
 `modules/space` 导出一个"关闭 uid 在所有 Space 的席位并入队清理"的入口（内部就是
 `enqueueMemberRemovalCleanupTx`，理由 `MemberRemoveReasonForceRemoved` 或新增一个
 `bot_deleted`），botfather 改调它。这样 P0 的级联关闭项目席位、P1 的级联从项目群移除，
-一条链全部复用。这是本任务的**前置修复**，改动在 `modules/botfather` 与 `modules/space`，
-很小；不做的话 I1 对账会在第一个被删的分身上永久报警。
+一条链全部复用。这是本任务的**前置修复**（PR-0），改动在 `modules/botfather` 与
+`modules/space`，很小；不做的话 I1 对账会在第一个被删的分身上永久报警。
 
-**D15 — 分身进项目的资格规则，以及谁能操作。** 今天 `members/add` 对 bot 零规则。建议：
-(a) bot 只能由**它的主人**加进项目，且主人必须是该项目的活跃成员；管理员不能替别人带分身，
-也不能带非成员的分身——这是弹窗"仅可带入自己的分身"在创建之后的延伸。(b) 因此需要一个
-**普通成员也有**的窄能力 `can_manage_own_agents`：任何活跃项目成员可以把自己的分身加进
-项目、把自己的分身移出项目，不需要 `can_manage_member`；管理员对分身的移除权与对人一致。
-(c) 入口不新增路由：`members/add` / `members/remove` 对 bot 目标改按这套规则判定。
-被拒绝的替代方案：沿用今天"管理员想加谁加谁"——和创建弹窗的承诺矛盾，也让 D13 的
-"分身跟人走"没有对应的"分身跟人来"。
+**D15 — 分身进项目的资格规则，以及谁能操作。** 今天 `members/add` 对 bot 零规则，改为：
+
+- (a) bot 只能由**它的主人**加进项目，且主人必须是该项目的活跃成员；管理员不能替别人带分身，
+  也不能带非成员的分身——这是弹窗"仅可带入自己的分身"在创建之后的延伸。
+- (b) 因此新增一个**普通成员也有**的窄能力 `can_manage_own_agents`：任何活跃项目成员可以把
+  自己的分身加进项目、把自己的分身移出项目，不需要 `can_manage_member`；管理员对分身的移除
+  权与对人一致。
+- (c) 入口不新增路由：`members/add` / `members/remove` 对 bot 目标改按这套规则判定。
+
+被否决：沿用今天"管理员想加谁加谁"——和创建弹窗的承诺矛盾，也让 D13 的"分身跟人走"没有对应的
+"分身跟人来"。
 
 **D16 — 名册透出 `robot` 与 `owner_uid`；`member_count` 只数人。** `MemberResp` 增加
 `robot int` 和 `owner_uid string`（bot 才有），客户端才能像通讯录那样把分身挂到人下面；
 项目 `Resp.member_count` 改为只数 `user.robot = 0` 的活跃成员，另加 `agent_count`。
 配额 `max_members` 仍按全部席位计（分身占席位是有意的：它是一个会读消息的成员）。
-被拒绝的替代方案：`member_count` 混数——弹窗和列表页显示"3 人"里有两个是分身，用户会问。
+**这是既有字段的语义变更**，PR 描述里要单独说明，并按「上线前须核对」第 1 条确认客户端影响面。
+被否决：`member_count` 混数——弹窗和列表页显示"3 人"里有两个是分身，用户会问。
+
+**D17 — 产品文案不得承诺外部成员。** P0 / P1 两次记录的未决项：原型的「客户联合交付」叙事与
+v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本期把"项目就是一个群"的心智推到用户
+面前，这个期待会更早出现。技术上不做任何外部成员支持（见 Out of scope），文案侧由产品保证不
+出现相关承诺。记在这里是为了让它有归属，而不是继续挂在"未决"里。
 
 ## Load-bearing list
 
@@ -335,10 +337,10 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 - **反探测。** 分身校验失败一个码；`IsAllMemberGroup` 对非项目成员不暴露项目是否存在
   （群侧四个接口在拒绝之前已经要求调用方是群成员，所以不新增探测面）。touches: `isolation`
 - **响应契约。** 项目 `Resp` 新增 `all_member_group_no`（空串表示尚未建成）、`agent_count`，
-  `member_count` 语义改为只数人（D16，**这是既有字段的语义变更**，要在 PR 里单独说明）；
-  `MemberResp` 新增 `robot`、`owner_uid`；`Capabilities` 新增 `can_manage_own_agents`；
-  `GroupResp` 及群详情新增 `project_id`（空串 = Space 直属）。
-  `POST /v1/auth/verify?include=context` 的 `projects[]` **不变**。touches: `wire-contract`
+  `member_count` 语义改为只数人（D16，**既有字段语义变更**）；`MemberResp` 新增 `robot`、
+  `owner_uid`；`Capabilities` 新增 `can_manage_own_agents`；`GroupResp` 及群详情新增
+  `project_id`（空串 = Space 直属）。`POST /v1/auth/verify?include=context` 的 `projects[]`
+  **不变**。touches: `wire-contract`
 - **测试纪律。** 不改既有测试文件的断言；命中 UID 限流路由的测试在 setup 里重置
   `ratelimit:uid:*`。touches: `testing`
 
@@ -354,7 +356,7 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 - **IM 订阅 / 退订泄漏**（#797、`im-pending-outbox`）：准入器和级联继承同一个泄漏，本期不解。
 - **全员群欢迎语**：走既有 `group-welcome-message` 的群级配置，不做项目级默认。
 - **项目 logo 同步群头像**（D8 已说明）。
-- **外部成员、跨 Space 项目、项目作为读边界**：与 P0/P1 同样不做。
+- **外部成员、跨 Space 项目、项目作为读边界**：与 P0/P1 同样不做（D17 是文案侧的对应约束）。
 - **对账自动修复**：I4 只报不修；D4 的补建只在写路径上，不由对账触发。
 - **P1 遗留的未决项**（`(space_id, project_id)` 索引构建时长、`queryI2Page` 游标计划、
   org-directory 监听器是否存活、A1/A2/A4-A8 的路径级覆盖）：不在本期顺手解决。
@@ -418,7 +420,7 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
       移人期间报 0，直接 SQL 造出违规时报 1。扫描 B 的豁免：`octo_project_member.updated_at`
       在可配置的宽限期内的行（准入尚未完成的窗口）、系统 bot、被封禁 Space 的项目。
 
-**全员群保护（D7，可独立 PR）**
+**全员群保护（D7，PR-C）**
 
 - [ ] 对全员群：群主 `disband` 被拒、任何成员 `exit` 被拒、`members` 删除被拒、
       `transfer` 被拒，码为 `err.server.group.all_member_group_protected`，
@@ -433,7 +435,7 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 - [ ] 一个已被 P1 detach 成 Space 直属、但 `all_member_group_no` 仍指向它的群，四个接口
       **不再**被拒（谓词要求 `group.project_id = 项目 id`）。
 
-**owner 与名称同步（D6 / D8，可裁剪）**
+**owner 与名称同步（D6 / D8）**
 
 - [ ] 项目 owner 转让（角色变更或退出带 `transfer_to`）后，全员群 `creator` = 新 owner，
       原 owner 降为普通群成员；钩子失败不回滚项目侧转让，记日志 + 指标；钩子路径不被 D7 拒绝。
@@ -459,10 +461,10 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
       `pkg/space/channel.go`、既有迁移文件。
 - [ ] 锁序守卫 `TestNoExclusiveProjectMemberLockUnderAGroupMemberLock` 仍通过。
 
-## 建议切分
+## 实现切分
 
-不是硬性要求，但顺序是有意的：**没有任何一个 PR 会留下"全员群存在但没人维护它"的状态**，
-也没有一个 PR 会让分身成为项目成员而没有 D13 / D14 兜底。
+顺序是载重的：**没有任何一个 PR 会留下"全员群存在但没人维护它"的状态**，也没有一个 PR 会让
+分身成为项目成员而没有 D13 / D14 兜底。
 
 0. **PR-0 前置修复（D14）**：botfather 删 bot 走 Space 移除工单。独立可合，今天就是缺陷。
 1. **PR-A 创建**：`agent_uids` + D13 分身跟人走 + D15 资格规则 + D16 名册字段 + 全员群
@@ -471,23 +473,19 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 2. **PR-B 加入同步**：准入器 + `members/add` 后同步 + I4 扫描 B。合并后：I4 在没有人为破坏时
    成立。
 3. **PR-C 保护与同步**：D7 四个接口的拒绝 + D6 群主同步 + D8 改名同步。合并后：I4 在有人为
-   操作时也成立。产品可以决定 PR-C 延后，代价见 D7 末尾。
+   操作时也成立。
 4. **PR-D 透出**：群详情 / 群列表 `project_id`。与前三者无依赖，可并行。
 
-## Open questions（需要产品拍板）
+## 上线前须核对
 
-1. **共同目标**：接受 D1（复用 `description`）？
-2. **分身范围**：是否排除 `self_hosted`（D2）？截图文案只说"自己的分身"。
-3. **分身校验失败**：整单拒绝（D3）还是跳过不合格的？
-4. **全员群建失败**：项目照常创建 + 写路径补建（D4），还是整单失败？
-5. **分身跟人走**（D13）：人离开项目，他的分身是否一并离开？建议是。不做的话 I4 在第一个
-   成员离开时就不成立，需要另想办法。
-6. **谁能带分身、谁能移分身**（D15）：普通成员能否自己带自己的分身进项目？管理员能否替别人
-   带？建议"只有主人能带，管理员和主人都能移"。
-7. **全员群保护**（D7）：本期做、延后、还是不做？不做则"全员群"只是一个初始状态。
-8. **owner 转让与改名是否同步群主 / 群名**（D6 / D8）？两者可以只做其一，但 D6 与 D7 要
-   一起决定。
-9. **名册与计数**（D16）：`member_count` 改成只数人，是否接受这个既有字段的语义变更？
-10. **解散项目时全员群的去向**：接受 D10（沿用 P1 规则，回退为普通群）？
-11. **原型的"客户联合交付"叙事**：P0/P1 两次记录的未决项，本期全员群把"项目就是一个群"的
-    心智推到用户面前，外部成员的期待会更早出现；仍需产品在文案上先说清 v1 没有外部成员。
+无法在本仓库内核实，不阻塞实现，合并前要有答案。
+
+1. **`member_count` 语义变更的客户端影响面（D16）。** 服务端可以改，但哪些端已经在用这个
+   字段、是否有把它当"含 bot 的席位数"使用的地方，只能问客户端。若影响面大，退路是保留
+   `member_count` 原语义并新增 `human_member_count`，那是一次纯加字段的变更。
+2. **前端分身选择器是否已排除 `self_hosted`（D2）。** 服务端按通讯录口径排除；如果选择器
+   没排除，用户会看到一个选了就被拒的分身。两侧口径必须一致，以服务端为准。
+3. **botfather 删 bot 改走工单后，是否有调用方依赖旧裸 UPDATE 的同步性（D14）。**
+   工单是异步的，Space 席位关闭与后续清理之间会出现一个窗口。删除接口本身的响应语义
+   （"已删除"）不变，但若有测试或调用方在删除返回后立即断言 `space_member.status = 0`，
+   需要同步调整——席位关闭本身仍是同步的，异步的只有级联清理。
