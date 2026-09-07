@@ -34,6 +34,19 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "The File Helper cannot be added to a group.",
 	})
+	// ErrGroupProjectUnavailable refuses a group creation naming a project that
+	// cannot own it: absent, disbanded, or belonging to a different Space.
+	//
+	// ONE code for all three, and the reason never reaches the wire. Splitting
+	// them would turn group creation into an oracle: a caller holding a project
+	// id they cannot otherwise see could learn whether it exists and which Space
+	// it lives in, using only a Space they DO have access to. The distinguishing
+	// reason goes to the log.
+	ErrGroupProjectUnavailable = register(codes.Code{
+		ID:             "err.server.group.project_unavailable",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This project is unavailable.",
+	})
 	// ErrGroupProjectMemberRequired refuses an admission into a group that
 	// belongs to a Project when the target is not an active member of that
 	// Project (invariant I2).
@@ -50,19 +63,6 @@ var (
 	// The refused uids are NOT in Details for the same reason: the caller
 	// already knows which uids they sent, and echoing a subset back tells them
 	// which of those are project members.
-	// ErrGroupProjectUnavailable refuses a group creation naming a project that
-	// cannot own it: absent, disbanded, or belonging to a different Space.
-	//
-	// ONE code for all three, and the reason never reaches the wire. Splitting
-	// them would turn group creation into an oracle: a caller holding a project
-	// id they cannot otherwise see could learn whether it exists and which Space
-	// it lives in, using only a Space they DO have access to. The distinguishing
-	// reason goes to the log.
-	ErrGroupProjectUnavailable = register(codes.Code{
-		ID:             "err.server.group.project_unavailable",
-		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "This project is unavailable.",
-	})
 	ErrGroupProjectMemberRequired = register(codes.Code{
 		ID:             "err.server.group.project_member_required",
 		HTTPStatus:     http.StatusBadRequest,

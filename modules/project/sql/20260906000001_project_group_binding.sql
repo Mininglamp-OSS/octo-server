@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS `octo_project_member_removal_cleanup` (
   `uid`             VARCHAR(40)      NOT NULL DEFAULT ''  COMMENT '被移除的成员（对齐 octo_project_member.uid）',
   `space_id`        VARCHAR(40)      NOT NULL DEFAULT ''  COMMENT '冗余 Space；避免 worker 每行回表查 octo_project',
   `operator_uid`    VARCHAR(40)      NOT NULL DEFAULT ''  COMMENT '操作者；自助退出时等于 uid',
-  `reason`          VARCHAR(32)      NOT NULL DEFAULT ''  COMMENT 'kicked / left / space_removed / project_disbanded',
+  `reason`          VARCHAR(32)      NOT NULL DEFAULT ''  COMMENT 'kicked / left（仅此两种；解散不入队，Space 级联直接关席位）',
   `status`          TINYINT UNSIGNED NOT NULL DEFAULT 0   COMMENT '0=pending 1=done 2=abandoned 3=cancelled（D4 重新加入）',
   `attempts`        INT UNSIGNED     NOT NULL DEFAULT 0,
   `next_attempt_at` DATETIME(3)      NOT NULL             COMMENT 'UTC；应用侧写入，禁 CURRENT_TIMESTAMP',
