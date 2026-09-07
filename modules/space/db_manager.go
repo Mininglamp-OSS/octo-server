@@ -624,20 +624,28 @@ func (d *managerDB) disableInvitation(spaceId, code string) (int64, error) {
 	return result.RowsAffected()
 }
 
-// updateInvitationAdmin 管理端可修改 max_uses / expires_at / status，nil 字段不变更。
-// 返回 affected rows，0 表示记录不存在。
+// updateInvitationAdmin 管理端更新邀请码字段。返回 affected rows，0 表示记录不存在。
 //
-// 有意设计：WHERE 不限制 status，管理员可以对已禁用（status=0）的邀请码执行 PUT，
-// 包括通过 {"status": 1} 重新启用——这是管理操作的必要能力（如误禁恢复）。
+// expires_at 三态行为：
+//   - clearExpiresAt=true               → SET expires_at = NULL（永久），优先级最高
+//   - clearExpiresAt=false, expiresAt!=nil → 写入具体时间
+//   - clearExpiresAt=false, expiresAt==nil → 列保持不变
+//
+// 有意设计：WHERE 不限制 status，管理员可对已禁用（status=0）的邀请码执行 PUT，
+// 包括通过 {"status": 1} 重新启用——管理操作的必要能力（如误禁恢复）。
 // 若要禁止重新启用，应在 API 层决策，不在此函数加 AND status=1。
-func (d *managerDB) updateInvitationAdmin(spaceId, code string, maxUses *int, expiresAt *time.Time, status *int) (int64, error) {
+func (d *managerDB) updateInvitationAdmin(spaceId, code string, maxUses *int, expiresAt *time.Time, clearExpiresAt bool, status *int) (int64, error) {
 	builder := d.session.Update("space_invitation")
 	changed := false
 	if maxUses != nil {
 		builder = builder.Set("max_uses", *maxUses)
 		changed = true
 	}
-	if expiresAt != nil {
+	if clearExpiresAt {
+		// 显式永久：写 NULL
+		builder = builder.Set("expires_at", nil)
+		changed = true
+	} else if expiresAt != nil {
 		builder = builder.Set("expires_at", *expiresAt)
 		changed = true
 	}
