@@ -105,7 +105,8 @@ func signBearerTesting(t *testing.T, secret []byte, userId int64, domainAccount 
 	t.Helper()
 	// iat 是**签发时刻**,不是从 exp 倒推的。上游的 exp 约为签发后 15 天,
 	// 早先这里用 exp-15d 反推 iat,等于造出一张"15 天前签发"的 token ——
-	// 那是被 bearerJWTMaxAge 正确拒绝的重放形态,不是新登录的形态。
+	// 那是"抓包后长期复用"的重放形态,不是新登录的形态 —— 兑换台账的首次兑换
+	// 上限 F 正是拒绝它的那道(见 redemption_ledger.go)。
 	claims := map[string]any{
 		"userId":        userId,
 		"domainAccount": domainAccount,

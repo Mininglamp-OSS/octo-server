@@ -2207,3 +2207,108 @@ Two reviewers converged on the same headline; all four verified against code bef
   `CREATE TABLE ... LIKE` 从真实 schema 复制（零手写 DDL）+ 调产品查询方法。它同时是转换的验收证据。
 - **Jerry-Xin 撤回了他自己第四轮的建议**：只转 space/space_member/user 会让 `modules/space` 与
   `modules/user` 的现网 join 报 1267（robot/group_member 仍 0900）。坐实「不能逐表转」。
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger
+
+- **The anchor, not the number** — `/exchange-jwt` judged a bearer JWT's freshness
+  by `now - iat <= 10min`. `iat` is when the upstream signed the token, which says
+  nothing about when the user came to redeem it, so the ceiling refused a client
+  that exchanged 36 minutes after login (a 401 indistinguishable from "invalid
+  credential") while still admitting anyone who captured the token inside the
+  window. Freshness now comes from the redemption itself: a Redis ledger keyed by
+  `sha256(token)`, bounding how late a **first** redemption may arrive (F, default
+  24h) and how long a token may sit unused **between** redemptions (T, default 7d).
+- **A sliding window is not a TTL** — the first design set `TTL = T` and read
+  expiry as "abandoned". Backwards: an expired key is indistinguishable from a
+  never-seen token, so the record's death would readmit the token as a first
+  redemption. The record must outlive the window (TTL = the token's own remaining
+  life) and idleness is computed from the stored `last_at`.
+- **A count cap was dropped before it shipped** — capping redemptions per token
+  stops nothing (an attacker needs one), and would refuse a client that restarts
+  often, with exactly the 401 this task removes. Kept as the `admit_repeat`
+  metric, which answers whether the client reuses one token instead of enforcing
+  an unfounded limit.
+- **Verification stayed side-effect-free** — `api_exchange.go` reuses the same
+  verify method to classify a credential posted to the wrong endpoint. A ledger
+  inside the verifier would have given that misdelivered token an idle window it
+  never earned; the side effect lives in the one caller that redeems.
+- **Degraded path keeps F** — with Redis down we cannot tell first from repeat, so
+  the fallback applies F alone: bounded, never "anything within exp", and not a
+  self-inflicted login outage. `degraded_*` labels are pre-warmed so the alert can
+  exist before the first outage.
+- **Deliberately not done** — true one-shot redemption. Whether the client redeems
+  once or on every launch is not recorded anywhere in the repo; making it one-shot
+  now would break the second case with the same indistinguishable 401. `T` is
+  configurable, so tightening later is a decision, not a redesign.
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (review round)
+
+- **The same outage, through another door** — `normalized()` guarded against
+  `F <= 0` because `F=0` refuses every login, then let `F=500ms` through: the Lua
+  script compares whole seconds, so it arrived as `0`. A guard written against one
+  spelling of a value missed the other. Bounds are now truncated to whole seconds
+  with a 1s floor, which incidentally fixed a real divergence between the Go
+  degraded path (Durations) and the Lua path (seconds).
+- **A defensive branch that could never run** — `admitRedemption` refuses a nil
+  credential, but the caller dereferenced it one line earlier in a log field. The
+  guard read as safety and was decoration; on an unauthenticated endpoint it would
+  have been a panic.
+- **A cap that silently rewrote a configured value** — `T` longer than the
+  record's max TTL could not fire, and the resulting refusal was attributed to `F`,
+  which is the knob an operator would then tune. Capped where it is read so the
+  startup log prints what actually applies.
+- **Close() wrote a field the request path reads** — mirrored an existing pattern
+  without noticing the new field is read on the hot path. The closable client now
+  lives in its own field.
+- **Verified against real infrastructure** — MySQL 8.0.46 + Redis 7.0.15 brought
+  up locally (this environment has no docker): the whole `modules/oidc` package
+  passes under `-race`, including the ledger's decision table and a new
+  concurrency case proving the Lua decision-and-write is one atomic round trip
+  (8 concurrent redemptions of one token yield exactly one `admit_first`).
+- **Learnings** — `learnings/pending/a-sliding-window-is-not-a-record-ttl.md`
+  (absence cannot mean both "never seen" and "expired"; the record must outlive
+  the window) and
+  `learnings/pending/validate-in-the-representation-the-consumer-uses.md`
+  (a guard protects the value as its consumer sees it, not as its author wrote it).
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (PR #843 review)
+
+- **An argument written for one bound and not turned around on its twin** — the
+  file argued at length why `T` cannot exceed the record's lifetime, then left `F`
+  uncapped, where the same overflow silently defeats `T` entirely. Both are capped
+  now. Worth looking for whenever a rule is written next to its sibling.
+- **A degraded path is only justified while it is never looser** — applying `F`
+  alone made a Redis outage more permissive than normal operation for any
+  deployment configuring `T < F`. The fallback bound is `min(F, T)`; on the
+  defaults it is unchanged, which is why nothing caught it.
+- **Two failure states sharing one metric label hide the worse one** — "ledger
+  never configured" and "Redis is down" both reported `degraded_*`. The first does
+  not self-heal and disables `T` outright; on a dashboard it read as flapping
+  Redis. Separate labels, plus a `New()` wiring test, since every handler test
+  injects a double and would stay green if the constructor were dropped.
+- **A regression test that stubs the mechanism does not pin the fix** — the
+  36-minute case proved the handler no longer applies a ceiling, not that the
+  shipped default admits it. The default could have been reverted to ten minutes
+  with the suite green.
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (PR #843, round 3 — blocking)
+
+- **The same lesson, second door** — round two fixed the *degraded* path to
+  `min(F, T)` and left the *authoritative* one on `F` alone. The Lua no-record
+  branch has two triggers: never-written (where `F` is right) and **lost**
+  (evicted / un-persisted restart, where the bound should be `T`). Under `T < F`
+  a lost record admits as a "first redemption" what an intact one refuses as
+  idle — fail-open, with the documented loss signal (`reject_stale_first`)
+  replaced by `admit_first`, and Redis-down left stricter than Redis-evicted.
+- **The decision, not the clamp, is the content** — `T < F` was defended one
+  round earlier as a coherent configuration. It is now unsupported: `F` is capped
+  at `T` and the startup log reports the reduction. Nobody had asked for the
+  config, and its price was a fail-open on an unauthenticated session-minting
+  endpoint under an ordinary eviction policy.
+- **"Equivalent to deletion" was nearly true** — a numeric `last_at` in the
+  future made the elapsed time negative and admitted unconditionally, where
+  deleting the key would have refused. Clamped, so the comment is literally true.
+- **A spec artifact that misstates its own implementation** — the brief still
+  described two rounds ago; `guard-matrix.md` still listed the deleted ceiling as
+  live. Both corrected in the same commit as the code they describe.
+- **Assertions one level weaker than their own comments** — four of them, all
+  cheap to strengthen, all on the path where the next regression would land.

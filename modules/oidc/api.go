@@ -133,6 +133,19 @@ type OIDC struct {
 	// bearerJWT 业务后端自签 HS256 JWT 的验签器;nil 表示该路径未启用。
 	bearerJWT *BearerJWTVerifier
 
+	// redeemLedger / redeemPolicy /exchange-jwt 的兑换台账及其两个边界。
+	//
+	// 台账为 nil(未启用 exchange 端点、或未配置验签器)时,准入退化为按 min(F,T)
+	// 判一个上限 ——见 admitRedemption。**不能**退化成无条件放行:那等于把重放
+	// 窗口放大到 token 自己的 exp(约 15 天),正是台账要收窄的东西。
+	//
+	// redeemLedger 只在 New() 里赋值,之后**只读** —— handler 在请求路径上读它,
+	// 而 Close() 与请求可能并发(优雅退出)。要关闭的连接池另存一份具体类型
+	// (redeemLedgerClient),Close 只动那一份,不写 handler 读的接口字段。
+	redeemLedger       redemptionLedger
+	redeemLedgerClient *redisRedemptionLedger
+	redeemPolicy       redemptionPolicy
+
 	// bearerJWTErr 验签器**构造失败**的原因(密钥太短 / issuer 派生失败)。
 	//
 	// 为什么不能只用 bearerJWT==nil 表示:nil 已经被"没配密钥,这条路径合法地
@@ -272,6 +285,46 @@ func New(ctx *config.Context) *OIDC {
 		o.Info("bearer JWT /exchange-jwt enabled",
 			zap.String("issuer", bv.Issuer()), zap.Int("secret_bytes", bv.SecretLen()))
 	}
+
+	// 兑换台账。只在 /exchange-jwt 真的会挂载时构造 —— 为一个不存在的端点开
+	// Redis 连接池没有意义(与 routeAt 里限流 client 的处理同一个理由)。
+	//
+	// 策略本身**总是**加载:台账没构造出来时,准入走降级判定,它要用到 F。
+	// 策略读取失败不存在(非法值回落默认值),所以这里没有错误分支。
+	//
+	// 打印的是**收敛之后**的取值,也就是真正生效的那两个数 —— 运维配了
+	// 一个超上限或亚秒的值时,日志里不该还显示他配的那个。
+	raw := rawRedemptionPolicyFromEnv()
+	o.redeemPolicy = raw.normalized()
+	// 收敛会悄悄改值(F 被 T 或记录寿命压下来、亚秒被抬到 1 秒)。运维只有看到这
+	// 一句才知道自己配的没完全生效 —— 尤其是 T < F:那个组合表达不出来,会被收敛
+	// 成 F = T,而不说的话下一个人只会以为自己配错了地方。
+	if raw.firstRedeemMaxAge > 0 && o.redeemPolicy.firstRedeemMaxAge != raw.firstRedeemMaxAge {
+		o.Warn("bearer JWT redemption: configured first-redeem max age was reduced to an enforceable value",
+			zap.Duration("configured", raw.firstRedeemMaxAge),
+			zap.Duration("effective", o.redeemPolicy.firstRedeemMaxAge),
+			zap.Duration("idle_window", o.redeemPolicy.idleWindow),
+			zap.String("reason", "F must not exceed T, nor the record's own lifetime; "+
+				"otherwise a lost record turns an idle token into an admitted first redemption"))
+	}
+	if raw.idleWindow > 0 && o.redeemPolicy.idleWindow != raw.idleWindow {
+		o.Warn("bearer JWT redemption: configured idle window was reduced to an enforceable value",
+			zap.Duration("configured", raw.idleWindow),
+			zap.Duration("effective", o.redeemPolicy.idleWindow))
+	}
+	if cfg.ExchangeEnabled && o.bearerJWT != nil {
+		led := newRedisRedemptionLedger(ctx, o.redeemPolicy)
+		o.redeemLedger = led
+		o.redeemLedgerClient = led
+		o.Info("bearer JWT redemption ledger enabled",
+			zap.Duration("first_redeem_max_age", o.redeemPolicy.firstRedeemMaxAge),
+			zap.Duration("idle_window", o.redeemPolicy.idleWindow))
+	}
+	// 这里没有"装不上就报错"的运行期分支:构造条件与上面那一行是同一个,写出来
+	// 必然是死代码。真正能挡住接线回归的是从 New() 出发的用例 ——
+	// TestNew_WiresRedemptionLedgerWhenExchangeEnabled_Integration,理由与
+	// new_wiring_integration_test.go 顶部记的那次 id_token 缓存被整块删掉一样:
+	// handler 测试全都手工注入 double,接线消失它们照样绿。
 
 	return o
 }
@@ -931,6 +984,17 @@ func (o *OIDC) Close() error {
 			o.Error("关闭 OIDC id_token store 失败", zap.Error(err))
 		}
 		o.idTokens = nil
+	}
+	// redeemLedger 独立 redis.Client(/exchange-jwt 兑换台账),New() 在端点启用时创建。
+	//
+	// 只置空 redeemLedgerClient,**不动** redeemLedger:后者在请求路径上被读,而
+	// Close 可能与在途请求并发。关掉的 client 会让 Admit 返回 error,handler 因此
+	// 走降级判定(仍受 F 约束),这比与请求赛跑改一个接口字段安全。
+	if o.redeemLedgerClient != nil {
+		if err := o.redeemLedgerClient.Close(); err != nil {
+			o.Error("关闭 OIDC 兑换台账 Redis client 失败", zap.Error(err))
+		}
+		o.redeemLedgerClient = nil
 	}
 	if err := o.closeExchangeLimiterClients(); err != nil {
 		o.Error("关闭 OIDC exchange 限流 Redis client 失败", zap.Error(err))

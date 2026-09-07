@@ -43,7 +43,8 @@ type exchangeJWTRequest struct {
 // 出: 200 {status:"ok", uid, login_resp}
 //
 //	| 400 请求格式错/空 token
-//	| 401 验签失败/过期/claims 非法(反枚举:统一返同一个码)
+//	| 401 验签失败/过期/claims 非法,**或兑换台账拒绝**(首次兑换超过 F /
+//	|     距上次兑换超过 T,见 redemption_ledger.go)——反枚举:统一返同一个码
 //	| 500 密钥未配置(启动期配置错误,不给攻击者探测面)
 //
 // 反枚举与 /exchange 保持一致:任何无法确立身份的失败都返 401 同一个错误码,
@@ -98,7 +99,8 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	//
 	// 失败原因(签名/过期/格式 vs userId 缺失)由 err 携带,进日志区分;
 	// 对客户端一律回同一个 401 码,不做失败原因枚举(anti-enumeration)。
-	ic, err := o.bearerJWT.VerifyForRedemption(req.AccessToken, time.Now())
+	now := time.Now()
+	rj, err := o.bearerJWT.VerifyForRedemption(req.AccessToken, now)
 	if err != nil {
 		metricBearerExchangeResult.WithLabelValues("token_rejected").Inc()
 		o.Warn("OIDC exchange-jwt: token rejected",
@@ -107,15 +109,41 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 		return
 	}
 
+	// 新鲜度判定。验签只回答"这张 token 是不是我们签的、有没有过期",能不能**用它
+	// 换一个新会话**是另一个问题 —— 由兑换台账按兑换行为回答(首次兑换上限 F +
+	// 空闲窗口 T,见 redemption_ledger.go)。
+	//
+	// 拒绝时对客户端仍是与验签失败**同一个** 401 码:两者都意味着"重新走一遍 SSO",
+	// 而区分它们只会告诉调用方"这张 token 曾经是有效的",那正是反枚举要挡的信息。
+	// 真实原因进 metric 与日志。
+	outcome := o.admitRedemption(c.Request.Context(), req.AccessToken, rj, now, traceID)
+	metricBearerRedemptionTotal.WithLabelValues(string(outcome)).Inc()
+	if !outcome.admitted() {
+		metricBearerExchangeResult.WithLabelValues("redeem_refused").Inc()
+		// token_age 只在 rj 非空时取:admitRedemption 对 rj==nil 有一条"按拒绝处理"
+		// 的防御分支,如果这里无条件解引用,那条分支就永远走不到 —— 它会先在这行
+		// panic,而且是在一个未认证端点上。
+		fields := []zap.Field{
+			zap.String("trace_id", traceID), zap.String("ip", clientIP),
+			zap.String("outcome", string(outcome)),
+		}
+		if rj != nil {
+			fields = append(fields, zap.Duration("token_age", now.Sub(rj.IssuedAt).Round(time.Second)))
+		}
+		o.Warn("OIDC exchange-jwt: redemption refused by the ledger", fields...)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
+	}
+
 	o.completeExchange(c, verifiedIdentity{
-		claims:     ic,
+		claims:     rj.Claims,
 		deviceFlag: deviceFlag,
 		clientIP:   clientIP,
 		traceID:    traceID,
 		state:      sd,
 		// domainAccount 人类可读,便于与上游对账;userId 是数字串,对账时无用。
 		// toIdentityClaims 把它映射到 Name(不是主键,仅作显示与审计)。
-		auditDetail: ic.Name,
+		auditDetail: rj.Claims.Name,
 	}, exchangeFlavour{
 		logName:   "exchange-jwt",
 		result:    metricBearerExchangeResult,

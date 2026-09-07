@@ -215,10 +215,14 @@ func TestBearerJWT_WrongSecretIsRejected(t *testing.T) {
 // 桌面客户端把这张 JWT 存下来长期复用(exp 约 15 天),每次调这两个端点都出示
 // 同一张 —— 它**不会**每次重签。
 //
-// 所以 /exchange-jwt 那条"iat 起 10 分钟"的上限不能套在这里:那个上限的论证是
-// "用途只是登录那一刻兑换一次会话",对**每请求都验同一张 assertion 的常驻认证器**
-// 不成立。套上去的后果是桌面端登录 10 分钟后这两个端点永久 401,而且错误与
-// "凭据无效"不可区分。
+// 所以任何"从 iat 起算的固定上限"都不能套在这里:那种上限的论证是"用途只是登录
+// 那一刻兑换一次会话",对**每请求都验同一张 assertion 的常驻认证器**不成立。套上
+// 去的后果是桌面端登录若干分钟后这两个端点永久 401,而且错误与"凭据无效"不可区分。
+//
+// /exchange-jwt 曾经有过这样一条上限(10 分钟),它同样因为锚点选在 iat 而误伤了
+// 合法客户端,现已删除:那条路的新鲜度改由兑换台账按**兑换行为**判定
+// (modules/oidc/redemption_ledger.go)。这条常驻认证路径不进台账 —— 它不产生新
+// 绑定,判定的是"这张凭据现在有没有效",答案只能来自凭据自己的 exp。
 //
 // 认证器用凭据自己的 exp —— 那是上游对生命周期的声明。至于"15 天的 bearer 窗口
 // 偏长",那是已经记在 Pending 的同一个问题(需要上游给 aud/jti),不该用一个会把
@@ -238,7 +242,7 @@ func TestBearerJWT_LongLivedTokenStillAuthenticatesOnIntegrationPath(t *testing.
 		"/v1/integrations/oidc/spaces", tok, nil))
 	require.Equal(t, http.StatusOK, w.Code,
 		"a token the desktop client legitimately reuses within its exp must authenticate; "+
-			"applying the one-shot redemption ceiling here breaks the client 10 minutes "+
+			"applying a redemption-shaped iat ceiling here breaks the client minutes "+
 			"after login. body=%s", w.Body.String())
 	var resp struct {
 		UID string `json:"uid"`

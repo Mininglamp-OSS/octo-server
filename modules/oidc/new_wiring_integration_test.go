@@ -125,3 +125,55 @@ func TestNew_IDTokenStoreConstructorIsReachableFromProduction_Integration(t *tes
 			"test double; got %T", o.idTokens)
 	assert.NotNil(t, store)
 }
+
+// 兑换台账的接线,理由与上面的 id_token 缓存完全一样。
+//
+// /exchange-jwt 的所有 handler 级用例都手工 `o.redeemLedger = ...` 注入 double
+// (redemption_ledger_test.go),所以 New() 哪天不再构造台账,它们照样全绿 ——
+// 而生产上的后果是这条路径**永久**降级成"只按 iat 判一个上限":空闲窗口 T 完全
+// 不生效,且不会自愈。degraded/unconfigured 两组 metric label 能在事后区分出这种
+// 状态,这条用例是在它发生**之前**挡住。
+func TestNew_WiresRedemptionLedgerWhenExchangeEnabled_Integration(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	mp := NewMockProvider(t)
+	setNewWiringEnv(t, mp)
+	// 端点是显式选择的(见 Config.ExchangeEnabled),且需要一把够长的验签密钥。
+	t.Setenv("OCTO_OIDC_EXCHANGE_ENABLED", "true")
+	t.Setenv("OCTO_OIDC_BEARER_JWT_SECRET", "wiring-test-secret-not-real-0123456789")
+
+	o := New(ctx)
+	t.Cleanup(func() { _ = o.Close() })
+
+	require.NotNil(t, o.bearerJWT, "the bearer verifier must be wired for this scenario")
+	led, ok := o.redeemLedger.(*redisRedemptionLedger)
+	require.True(t, ok,
+		"production must wire the real redis-backed ledger whenever /exchange-jwt is "+
+			"mounted; got %T — without it the endpoint silently runs on the iat ceiling "+
+			"alone and T is never enforced", o.redeemLedger)
+	assert.NotNil(t, led.client, "the ledger must hold a live Redis client")
+	// 策略必须是收敛后的取值 —— 启动日志打印的也是这两个数。
+	assert.Equal(t, o.redeemPolicy.normalized(), o.redeemPolicy,
+		"New() must store the normalized policy, so the startup log reports what actually applies")
+}
+
+// 端点没开 → 不构造台账(不给一组不存在的路由开 Redis 连接池)。
+func TestNew_NoRedemptionLedgerWhenExchangeDisabled_Integration(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	mp := NewMockProvider(t)
+	setNewWiringEnv(t, mp)
+	t.Setenv("OCTO_OIDC_EXCHANGE_ENABLED", "false")
+	t.Setenv("OCTO_OIDC_BEARER_JWT_SECRET", "wiring-test-secret-not-real-0123456789")
+
+	o := New(ctx)
+	t.Cleanup(func() { _ = o.Close() })
+
+	assert.Nil(t, o.redeemLedger,
+		"opening a connection pool for routes that are not mounted is waste; the handler "+
+			"is served by o.disabled and never reaches admission")
+	// 策略仍然加载:降级判定要用到它,而它不依赖端点是否挂载。
+	assert.Positive(t, o.redeemPolicy.firstRedeemMaxAge, "the policy must load regardless")
+}

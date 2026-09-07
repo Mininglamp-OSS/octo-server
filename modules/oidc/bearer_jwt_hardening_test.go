@@ -63,8 +63,12 @@ func TestBearerJWTSecret_ErrorDoesNotLeakSecret(t *testing.T) {
 // 15 天的可重放窗口与用途完全不匹配,而我们无法验证上游的吊销状态(黑名单在
 // 对方 Redis 里,我方连不上;而且据现状那条黑名单写入本身是坏的)。
 //
-// 所以我方自己设一个最大寿命上限:只接受 iat 距今在窗口内的 token。
-// 这不需要上游改任何东西。
+// 我方因此需要一道自己的新鲜度判定,不需要上游改任何东西。
+//
+// **本用例验的是 verifyBearerJWT 这个纯函数的 maxAge 参数**,不是生产策略:生产
+// 上兑换的新鲜度已改由兑换台账按兑换行为判定(redemption_ledger.go 的 F/T),
+// 两个生产调用方都给 maxAge=0。参数与哨兵留着,是为了将来要给某条路径重新加
+// iat 上限时不必再实现一遍;它一旦被接回某条路径,这里就是它的行为基线。
 func TestVerifyBearerJWT_RejectsTokenOlderThanMaxLifetime(t *testing.T) {
 	secret := strings.Repeat("k", 32)
 	now := time.Now()
@@ -81,10 +85,10 @@ func TestVerifyBearerJWT_RejectsTokenOlderThanMaxLifetime(t *testing.T) {
 		"exp": now.Add(5 * 24 * time.Hour).Unix(),
 	})
 
-	if _, err := verifyBearerJWT(fresh, []byte(secret), now, bearerJWTMaxAge); err != nil {
+	if _, err := verifyBearerJWT(fresh, []byte(secret), now, testBearerJWTMaxAge); err != nil {
 		t.Fatalf("a freshly issued token must be accepted: %v", err)
 	}
-	_, err := verifyBearerJWT(stale, []byte(secret), now, bearerJWTMaxAge)
+	_, err := verifyBearerJWT(stale, []byte(secret), now, testBearerJWTMaxAge)
 	if err == nil {
 		t.Fatal("a token issued 10 days ago was accepted; exp alone lets a captured " +
 			"assertion mint fresh sessions for its whole lifetime, including after logout")
@@ -104,7 +108,7 @@ func TestVerifyBearerJWT_MissingIatIsRefused(t *testing.T) {
 		"userId": 1,
 		"exp":    now.Add(time.Hour).Unix(),
 	})
-	if _, err := verifyBearerJWT(noIat, []byte(secret), now, bearerJWTMaxAge); err == nil {
+	if _, err := verifyBearerJWT(noIat, []byte(secret), now, testBearerJWTMaxAge); err == nil {
 		t.Fatal("a token without iat was accepted; freshness cannot be checked without " +
 			"it, so dropping iat would bypass the max-lifetime ceiling")
 	}
@@ -121,7 +125,7 @@ func TestVerifyBearerJWT_TolerateSmallClockSkewButRejectFarFutureIat(t *testing.
 		"iat":    now.Add(30 * time.Second).Unix(), // 我方时钟慢了半分钟
 		"exp":    now.Add(time.Hour).Unix(),
 	})
-	if _, err := verifyBearerJWT(skewed, []byte(secret), now, bearerJWTMaxAge); err != nil {
+	if _, err := verifyBearerJWT(skewed, []byte(secret), now, testBearerJWTMaxAge); err != nil {
 		t.Errorf("a 30s clock skew must be tolerated, got %v", err)
 	}
 
@@ -130,21 +134,22 @@ func TestVerifyBearerJWT_TolerateSmallClockSkewButRejectFarFutureIat(t *testing.
 		"iat":    now.Add(24 * time.Hour).Unix(),
 		"exp":    now.Add(48 * time.Hour).Unix(),
 	})
-	if _, err := verifyBearerJWT(farFuture, []byte(secret), now, bearerJWTMaxAge); err == nil {
+	if _, err := verifyBearerJWT(farFuture, []byte(secret), now, testBearerJWTMaxAge); err == nil {
 		t.Error("an iat a day in the future was accepted; that shifts the token's usable " +
 			"window forward and defeats the ceiling")
 	}
 }
 
-// 同一张 token,两种用途,两种结果 —— 这是把新鲜度策略按用途分开的全部意义。
+// 验签器不再按用途区分新鲜度 —— 两种用途都只验签名与 exp,兑换那条路的新鲜度
+// 由兑换台账按**兑换行为**判定(redemption_ledger.go)。
 //
-// 桌面客户端登录后把 JWT 存下来长期复用(exp 约 15 天),不会每次重签。所以:
-//   - 兑换一次会话(/exchange-jwt):套分钟级上限,压住可重放窗口;
-//   - 常驻认证器(integration 两个端点):用 token 自己的 exp,否则登录十分钟后
-//     端点永久 401,而且与"凭据无效"不可区分。
+// 曾经这里是"兑换套 10 分钟 iat 上限、认证用 exp"。那个上限的锚点是 iat,即上游
+// 签发的时刻,与"用户什么时候真的来兑换"无关:登录后隔半小时才兑换的合法客户端
+// 被拒(返回的 401 与"凭据无效"不可区分),而窗口内抓到 token 的攻击者照样能兑。
 //
-// 一个上限套两种用途,必然牺牲其中一个:要么功能坏掉,要么窗口敞开。
-func TestBearerJWTVerifier_FreshnessPolicyDiffersByPurpose(t *testing.T) {
+// 这个测试现在钉的是**验签器一侧的不变量**:两种用途对同一张 token 给出相同答案,
+// 且 exp 在两边都仍然强制。兑换准入的两个边界由 redemption_ledger_test.go 覆盖。
+func TestBearerJWTVerifier_VerificationIsFreshnessAgnostic(t *testing.T) {
 	secret := strings.Repeat("k", 32)
 	v := newBearerJWTVerifierForTest([]byte(secret), "https://idp.example.com#bearer-jwt")
 	now := time.Now()
@@ -157,11 +162,21 @@ func TestBearerJWTVerifier_FreshnessPolicyDiffersByPurpose(t *testing.T) {
 		"exp":           now.Add(5 * 24 * time.Hour).Unix(),
 	})
 
-	if _, err := v.VerifyForRedemption(longLived, now); err == nil {
-		t.Error("redemption must refuse a 10-day-old assertion: that path only needs the " +
-			"moment just after login, and a wider window is replayable")
-	} else if !errors.Is(err, ErrJWTTooOld) {
-		t.Errorf("redemption err = %v, want ErrJWTTooOld", err)
+	rj, err := v.VerifyForRedemption(longLived, now)
+	if err != nil {
+		t.Fatalf("verification must not judge freshness: a 10-day-old assertion still "+
+			"verifies; whether it may mint a session is the ledger's call: %v", err)
+	}
+	// 台账需要这两个时间戳,而它们必须来自这一次解析 —— 让调用方自己再解一遍
+	// payload,两处对同一张 token 得出不同的 iat,判定就无从谈起。
+	if got := rj.IssuedAt.Unix(); got != now.Add(-10*24*time.Hour).Unix() {
+		t.Errorf("IssuedAt = %d, want the token's own iat", got)
+	}
+	if got := rj.ExpiresAt.Unix(); got != now.Add(5*24*time.Hour).Unix() {
+		t.Errorf("ExpiresAt = %d, want the token's own exp", got)
+	}
+	if rj.Claims == nil || rj.Claims.Subject != "1" {
+		t.Errorf("Claims = %+v, want the mapped identity", rj.Claims)
 	}
 
 	if _, err := v.VerifyForAuthentication(longLived, now); err != nil {
@@ -169,7 +184,7 @@ func TestBearerJWTVerifier_FreshnessPolicyDiffersByPurpose(t *testing.T) {
 			"refusing it breaks the desktop client ten minutes after login", err)
 	}
 
-	// 但真正过了 exp,两种用途都必须拒。
+	// 但真正过了 exp,两种用途都必须拒 —— 去掉 iat 上限不等于去掉过期校验。
 	expired := signJWT(t, secret, map[string]any{
 		"userId": 1,
 		"iat":    now.Add(-20 * 24 * time.Hour).Unix(),

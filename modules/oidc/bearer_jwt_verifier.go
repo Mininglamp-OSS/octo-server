@@ -76,20 +76,48 @@ func (v *BearerJWTVerifier) verify(raw string, now time.Time, maxAge time.Durati
 	return claims.toIdentityClaims(v.issuer), nil
 }
 
+// RedeemedBearerJWT 一张通过验签的兑换凭据:身份,加上判定新鲜度所需的两个时间戳。
+//
+// 为什么要把 iat/exp 一起带出来:新鲜度不再由验签器判定(见 VerifyForRedemption),
+// 判定方是 redemption_ledger.go,它需要 iat 算首次兑换上限、需要 exp 定台账记录的
+// 寿命。让调用方为此再解一次 payload,等于第二处 JWT 解析 —— 两处对同一张 token
+// 得出不同的 iat,判定就无从谈起。
+type RedeemedBearerJWT struct {
+	Claims    *IdentityClaims
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+}
+
 // VerifyForRedemption 用于"出示一次、换成我方会话"的场景(/exchange-jwt)。
 //
-// 除签名与 exp 之外另加一道 bearerJWTMaxAge 的新鲜度上限:上游给的 exp 约 15 天,
-// 而这个用途只需要"刚登录完"那一小段,把可重放窗口压到分钟级。
-func (v *BearerJWTVerifier) VerifyForRedemption(raw string, now time.Time) (*IdentityClaims, error) {
-	return v.verify(raw, now, bearerJWTMaxAge)
+// **这里不再套 iat 起算的新鲜度上限。** 曾经套的是一个 10 分钟的常量,
+// 锚点是上游签发时刻 —— 与"用户什么时候真的来兑换"无关,于是登录后隔半小时才
+// 兑换的合法客户端被拒,而 10 分钟内抓到 token 的攻击者照样能兑。新鲜度改由
+// redemption_ledger.go 按兑换行为判定(首次兑换上限 F + 空闲窗口 T)。
+//
+// 本方法因此只回答"这张 token 是不是我们签的、有没有过期、claims 合不合法",
+// 且**无副作用** —— api_exchange.go 用它做凭据归属分类(判断一张 token 是不是
+// 发错端点的业务 JWT),那条路径不是兑换,不能在台账上留下痕迹。
+func (v *BearerJWTVerifier) VerifyForRedemption(raw string, now time.Time) (*RedeemedBearerJWT, error) {
+	claims, err := verifyBearerJWT(strings.TrimSpace(raw), v.secret, now, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &RedeemedBearerJWT{
+		Claims:    claims.toIdentityClaims(v.issuer),
+		IssuedAt:  time.Unix(claims.Iat, 0),
+		ExpiresAt: time.Unix(claims.Exp, 0),
+	}, nil
 }
 
 // VerifyForAuthentication 用于**每次请求都出示同一张 token** 的常驻认证器
 // (modules/integration 的两个端点)。
 //
-// 生命周期用 token 自己的 exp,不套 VerifyForRedemption 那道分钟级上限:桌面客户端
-// 登录后把这张 JWT 存进本地并长期复用,并不会每次重签。把一次性兑换的上限套在
-// 认证器上,结果是登录十分钟后端点永久返回 401,而且与"凭据无效"不可区分。
+// 生命周期用 token 自己的 exp,**不进兑换台账**:桌面客户端登录后把这张 JWT 存进
+// 本地并长期复用,并不会每次重签,而这条路径每次请求都要验它。台账判的是"这次
+// 兑换该不该发生",一次只读请求去刷新兑换窗口没有意义;反过来,把兑换那侧的上限
+// (曾经是 iat 起算的 10 分钟,已删除;现在是 F/T)套到认证器上,结果是登录若干
+// 分钟后端点永久返回 401,而且与"凭据无效"不可区分。
 //
 // 换来的代价是这条路径的可重放窗口等于 exp(约 15 天)。这不是本方法引入的问题,
 // 而是"上游 JWT 没有 aud/jti"这条已记在 Pending 的约束的直接后果;用一个会弄坏
