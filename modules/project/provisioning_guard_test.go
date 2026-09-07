@@ -222,6 +222,82 @@ func TestContainerIDHasOneProducerAndItIgnoresTheProjectID(t *testing.T) {
 	}
 }
 
+// TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID is the repo-wide half of
+// the disclosure rule, and it is what actually discharges the acceptance item's
+// "appconfig and verify responses" clause.
+//
+// A behavioural assertion can only cover the response shapes a test thought to call.
+// This covers every response every module produces, by attacking the prerequisite
+// instead: a container id can only reach a response if some code READS one, and the only
+// place one is stored is octo_project_provisioning. So if no package outside this slice
+// names that table — and no package outside it can mint an id, since the two prefixes
+// live with the single producer — then no other module's response can carry one.
+//
+// Whole-repo walk rather than a listed set of packages: the point is that a NEW consumer
+// has to come here and think about it, and a listed set would not notice one.
+func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
+	root := repoRootForGuard(t)
+	// The slice's own files, by path suffix. internal/projectprovision never names the
+	// table (it takes the id as an argument), but it is listed so the guard does not
+	// depend on that staying true.
+	allowed := map[string]bool{
+		filepath.Join("modules", "project", "db_provisioning.go"): true,
+		filepath.Join("modules", "project", "provisioning.go"):    true,
+	}
+	needles := []string{"octo_project_provisioning", `"octows-`, `"octods-`}
+	scanned := 0
+	var offenders []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", ".octospec", ".context", ".claude":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		if allowed[rel] || strings.HasPrefix(rel, filepath.Join("internal", "projectprovision")) {
+			return nil
+		}
+		scanned++
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		src := stripComments(string(raw))
+		for _, needle := range needles {
+			if strings.Contains(src, needle) {
+				offenders = append(offenders, rel+" ("+needle+")")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk repo: %v", err)
+	}
+	if scanned < 100 {
+		t.Fatalf("only %d files scanned; the walk is not reaching the repository and this guard "+
+			"would pass vacuously", scanned)
+	}
+	sort.Strings(offenders)
+	for _, o := range offenders {
+		t.Errorf("%s reads the provisioning table or mints a container id outside the provisioning "+
+			"slice. A container id must not be readable by any code that can put it in a response — "+
+			"until the target narrows authorization by Project, knowing the id is close enough to "+
+			"holding access to the container.", o)
+	}
+}
+
 // TestNoLogFieldCarriesTheContainerID is the log-and-error-detail half of the
 // disclosure rule.
 //

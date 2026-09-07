@@ -109,7 +109,7 @@ import 守卫拿 `"internal/projectprovision"`（带前引号）去匹配，而�
 
 | 验收项 | 覆盖 |
 |---|---|
-| 任何客户端响应都不含容器 id | `TestNoClientResponseCarriesAContainerID`（create/detail/list/members 四个响应，且在 worker 跑到 ready **之后**再查一遍） |
+| 任何客户端响应都不含容器 id（验收点名 detail / list / appconfig / verify） | `TestNoClientResponseCarriesAContainerID`：create / detail / list / members / **verify** 五个响应，且在 worker 跑到 ready **之后**再查一遍。**appconfig 没有行为断言**，理由与替代见下方 2.3 |
 | 日志与 error details 不含容器 id | `TestNoLogFieldCarriesTheContainerID` + `TestEnsureErrorNeverCarriesTheContainerID`（含 `last_error` 的两条断言） |
 | 容器 id 不是 project_id 的函数 | 行为面 `TestContainerIDIsNotAFunctionOfProjectID` + 源码面 `TestContainerIDHasOneProducer...` |
 | 回滚不留行 / 提交后每目标恰好一行且 container_id 已就位 | `TestProvisioningEnqueueFailureRollsBackTheWholeCreate` + `TestCreateEnqueuesExactlyOneRowPerEnabledTarget` |
@@ -119,6 +119,22 @@ import 守卫拿 `"internal/projectprovision"`（带前引号）去匹配，而�
 | 解散移到 `disband_pending` 且不发出网请求 | `TestDisbandMovesRowsToDisbandPendingAndSendsNothing`（解散后再跑一轮 worker，断言假目标计数不变） |
 | 出网客户端只在 worker 包，`modules/project` / `modules/user` 的 handler 都到不了 | `TestProvisioningClientIsConfinedToTheWorker` |
 | 未收窄容器数量有 gauge | `TestUnnarrowedContainerGaugeCountsReadyRowsOnUnnarrowedTargets`（含「条件消失后回落到 0」） |
+
+### 2.3 appconfig：为什么用结构性守卫替代行为断言
+
+验收点名了四个响应，其中 `appconfig` 没有做行为断言，这是一次有意的替换而不是漏做：
+`CleanAllTables` 会删掉 `app_config` 行，而重建一条合法的行需要生成 RSA 密钥对并用
+master key 加密 —— 等于在测试里重写一遍 `modules/common.insertAppConfigIfNeed`。
+不重建就只能对着它的 400 响应断言，那是一条「因为响应里什么都没有所以通过」的测试。
+
+替代的是 `TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID`，而它**比原验收更强**：
+行为断言只能覆盖测试想到要调的响应形状，这条走的是前提 —— 容器 id 只有被**读出来**
+才可能进响应，而它只存在 `octo_project_provisioning` 一张表里；于是全仓遍历断言
+「本切片以外没有任何包点名这张表，也没有任何包能造出容器 id（两个前缀只和唯一生产者
+同文件）」。结论覆盖的是**其它模块产出的每一个响应**，不只是 appconfig。
+
+变异验证：往 `modules/user/api.go` 里塞一条读该表的 SQL 常量，守卫 FAIL 并点名该文件；
+恢复后 PASS。守卫还带扫描文件数下限（<100 即 Fatal），所以遍历失效不会静默变绿。
 
 ---
 

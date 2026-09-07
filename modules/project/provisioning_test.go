@@ -337,6 +337,29 @@ func TestNoClientResponseCarriesAContainerID(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	bodies["members"] = w.Body.String()
 
+	// verify is named explicitly by the acceptance item, and it is the response this
+	// module does not own — which is why it is asserted rather than reasoned about. It is
+	// served by the SHARED test router (module.Setup mounted every module into this test
+	// binary), not the private one; the row it must not disclose lives in the same
+	// database either way.
+	//
+	// It is also where a container id would most plausibly appear by accident: verify is
+	// the endpoint every subsystem fronts, so "tell me which containers this user's
+	// projects have" is a natural-sounding thing for someone to add to it.
+	//
+	// appconfig is the fourth response the acceptance item names and it is NOT asserted
+	// here, deliberately: CleanAllTables removes the app_config row and recreating a valid
+	// one means generating an RSA keypair and encrypting it with the master key, i.e.
+	// reimplementing modules/common.insertAppConfigIfNeed inside this test. Asserting
+	// against its 400 body instead would be a test that passes because there is nothing in
+	// the response at all. It is covered STRUCTURALLY instead, and more strongly, by
+	// TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID — which covers every
+	// response every other module produces rather than the one shape a test happened to
+	// hit.
+	w = doJSON(t, testSrv, http.MethodPost, "/v1/auth/verify", token, map[string]any{"token": token})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	bodies["verify"] = w.Body.String()
+
 	for name, body := range bodies {
 		for _, row := range readProvisioningRows(t, created.ProjectID) {
 			assert.NotContains(t, body, row.ContainerID, "%s response discloses a container id", name)
