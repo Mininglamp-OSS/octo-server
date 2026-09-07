@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"go.uber.org/zap"
 )
 
@@ -82,6 +83,21 @@ func (g *Group) detachMemberFromProjectGroups(ctx *config.Context, removal proje
 	if removal.ProjectID == "" || removal.UID == "" {
 		return nil
 	}
+	// An empty SpaceID must FAIL, not report success.
+	//
+	// queryProjectGroupNosWithActiveMember returns (nil, nil) for an empty
+	// spaceID, so without this the step would report done having detached
+	// nothing — and the worker would then close the seat with every group row
+	// intact, which is the I2 violation the two-phase close exists to avoid.
+	// Not reachable through the API (projectMiddleware sets it and the enqueue
+	// carries it), which is exactly why it needs to be loud rather than absent:
+	// a job that got here with no Space is a bug upstream, and reporting success
+	// is how it would stay one.
+	if removal.SpaceID == "" {
+		return fmt.Errorf(
+			"group: project removal cascade for %s/%s carries no space_id",
+			removal.ProjectID, removal.UID)
+	}
 	groupNos, err := g.db.queryProjectGroupNosWithActiveMember(removal.SpaceID, removal.ProjectID, removal.UID)
 	if err != nil {
 		return fmt.Errorf("group: list project groups for cascade: %w", err)
@@ -92,6 +108,47 @@ func (g *Group) detachMemberFromProjectGroups(ctx *config.Context, removal proje
 
 	var firstErr error
 	for _, groupNo := range groupNos {
+		// Re-check the seat BEFORE every group, not once per job.
+		//
+		// D4 says re-admission cancels the cascade, and three comments in
+		// modules/project claim the worker enforces that "before every batch".
+		// There is one batch per job, so the worker's single check happens before
+		// this loop — and the fan-out is the loop. Without this, an admin who
+		// removes a member from a five-group project and immediately re-adds them
+		// gets a 200 while the worker goes on to strip them from the remaining
+		// groups: active in the project, member of none of its groups, repairable
+		// only by re-adding each group by hand.
+		//
+		// CheckMembership already answers `removing = 1` as "not a member", so
+		// true here means exactly one thing: the seat was re-opened while this
+		// cascade was running. Stop and let the job retire; the groups already
+		// detached stay detached, which is the subset relation holding, not a
+		// violation.
+		//
+		// One indexed session read per group, on a background path. It is
+		// deliberately NOT the Tx variant: there is no transaction spanning the
+		// loop, and a lock taken here would be held across RemoveGroupMembers'
+		// own transaction and its IM calls.
+		readmitted, err := projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
+		if err != nil {
+			g.Error("项目级联：复查项目席位失败",
+				zap.String("group_no", groupNo),
+				zap.String("project_id", removal.ProjectID),
+				zap.String("uid", removal.UID),
+				zap.Error(err))
+			if firstErr == nil {
+				firstErr = fmt.Errorf("group: recheck project seat: %w", err)
+			}
+			break
+		}
+		if readmitted {
+			g.Info("项目级联：成员在级联进行中被重新加入，停止摘除剩余群",
+				zap.String("project_id", removal.ProjectID),
+				zap.String("uid", removal.UID),
+				zap.String("next_group_no", groupNo))
+			projectCascadeCancelledTotal.Inc()
+			return firstErr
+		}
 		if err := g.detachMemberFromOneProjectGroup(groupNo, removal); err != nil {
 			// One group failing must not abandon the rest: partial progress is
 			// durable (a group already left does not come back in the next

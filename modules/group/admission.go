@@ -465,6 +465,21 @@ var projectGroupDetachedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Groups reverted from a Project to Space-direct, by reason.",
 }, []string{"reason"})
 
+// projectCascadeCancelledTotal counts fan-outs stopped because the member was
+// re-admitted to the project while the cascade was running.
+//
+// Its own counter because it is the only externally visible sign that D4's
+// cancellation reached the fan-out rather than only the queue. A cascade that
+// stopped mid-way leaves a member in some of the project's groups and not
+// others — legitimate, and confusing enough to look up. If this counter is
+// always zero while support tickets say "I re-added them and they still lost
+// their groups", the per-group re-check has regressed.
+var projectCascadeCancelledTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: admissionMetricNamespace,
+	Name:      "project_cascade_cancelled_total",
+	Help:      "Project-removal cascades stopped mid fan-out because the member was re-admitted.",
+})
+
 // projectGroupHandoverTotal counts ownership handovers performed by the cascade.
 //
 // Worth its own counter rather than a log line: it is the one place the system
