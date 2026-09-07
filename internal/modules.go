@@ -30,6 +30,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 
 	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_mention"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_task"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 
 	_ "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"

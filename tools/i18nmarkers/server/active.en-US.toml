@@ -222,6 +222,18 @@ other = "Invalid request."
 ["err.server.bot_provision.space_forbidden"]
 other = "You are not a member of this space."
 
+["err.server.bot_task.forbidden"]
+other = "This source cannot deliver tasks to the requested bot."
+
+["err.server.bot_task.idempotency_conflict"]
+other = "This idempotency key was already used with a different task."
+
+["err.server.bot_task.in_progress"]
+other = "A task with this idempotency key is still being accepted."
+
+["err.server.bot_task.store_failed"]
+other = "Failed to accept the bot task."
+
 ["err.server.botfather.already_friends"]
 other = "You are already friends."
 
