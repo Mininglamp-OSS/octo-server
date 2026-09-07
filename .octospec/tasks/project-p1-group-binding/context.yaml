@@ -335,6 +335,23 @@ open_verification:
   - "Whether the three org-directory event listeners are live in production
      (brief D7): P1 converges them and adds a metric rather than deleting them.
      Deleting becomes a separate change once production shows zero rows."
+  - "Path-level coverage for most of the eleven admission entry points. Raised
+     by PR #846's review as S1. Verified state of the suite: A3 (create group)
+     is driven over HTTP by admission_refusal_status_test.go, A11
+     (un-blacklist) by admission_a11_path_test.go, and A10 (preset-group
+     auto-join) by admission_a10_path_test.go, added in round 4. The rest — A1
+     (invite confirm), A2 (Service.AddGroupMembers), A4 (create-group bot), A5
+     (scan-join), A6 (register-user event), A7 (org create), A8 (org employee
+     update) — are exercised only by calling admitOrRestoreMembersTx directly,
+     plus the per-entry label guard in project_cascade_guard_test.go.
+     Funnel-direct tests prove the FUNNEL refuses; they do not prove the path
+     reaches the funnel carrying the group's real attribution, which is where a
+     fail-open lives — an empty project_id argument reads as 'not a project
+     group', which is exactly the defect round 4 fixed at
+     addMembersTxWithSpace (A1). A6/A7/A8 are event listeners with no HTTP
+     surface, so covering them means driving the event system, and the org
+     listeners may be dead in production anyway (see the item above, which
+     would delete three of them). Deferred, not dismissed."
 
 defects_found:
   - id: brief-605-context-included-is-fail-open
