@@ -33,6 +33,28 @@ error, so there is no 408 and no error envelope.
 The server always **reads before waiting**: a caller with a backlog is answered
 immediately, whatever `wait` it sent.
 
+### Generic Bot Task events
+
+Trusted business systems create tasks through `POST /v1/internal/bot-tasks`.
+Consumers receive one fixed event type, `bot_task`, whose `event_data` contains:
+
+| Field | Meaning |
+|---|---|
+| `source` | Opaque source identifier configured by the producer. |
+| `task_type` | Opaque business task type. |
+| `idempotency_key` | Producer-supplied key, scoped by source and target Bot. |
+| `bot_uid` | Target User Bot. |
+| `actor_uid` | User who initiated the task. |
+| `session_key` | Stable business-thread session key. |
+| `prompt` | Complete execution prompt supplied by the business system. |
+| `context` | Opaque JSON object used by the prompt. |
+| `metadata` | Optional opaque JSON object. |
+| `enqueued_at` | Server enqueue time in Unix seconds. |
+
+The transport does not interpret profiles, capabilities, execution steps, or
+business-specific fields. Consumers ACK the event only after it reaches their
+terminal processing state.
+
 ## How the wake-up works
 
 Every producer that ZADDs into `robotEvent:{robotID}` also rings a per-bot
