@@ -1,6 +1,9 @@
 package space
 
-import "github.com/Mininglamp-OSS/octo-server/pkg/db"
+import (
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
+	"github.com/gocraft/dbr/v2"
+)
 
 // ---------- DB Models ----------
 
@@ -279,6 +282,29 @@ func (m *MemberDetailModel) DisplayName() string {
 		return m.RealName
 	}
 	return memberDisplayNamePlaceholderPrefix + m.UID
+}
+
+// directoryOwnerModel is the first, human-only query result for the Space
+// directory. It intentionally carries just the data needed before agents are
+// attached, avoiding a repeated human row for every agent in the second query.
+type directoryOwnerModel struct {
+	UID      string
+	Name     string
+	RealName string
+	Role     int
+}
+
+// directoryAgentModel is one capped row returned by the second directory
+// query. AgentCount is the untruncated per-owner count from the SQL window.
+type directoryAgentModel struct {
+	CreatorUID        string
+	UID               string
+	Name              string
+	Description       string
+	IsFriend          int
+	Hosting           string
+	HostingReportedAt dbr.NullTime
+	AgentCount        int64
 }
 
 // SpaceDetailModel 带成员数和角色的空间详情（MaxUsers 从 SpaceModel 继承）
