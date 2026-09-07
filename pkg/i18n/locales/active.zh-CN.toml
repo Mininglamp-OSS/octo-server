@@ -1418,6 +1418,18 @@ other = "该幂等键已用于不同的请求。"
 ["err.server.bot_mention.store_failed"]
 other = "文档评论机器人事件处理失败。"
 
+["err.server.bot_task.forbidden"]
+other = "该来源无权向指定机器人投递任务。"
+
+["err.server.bot_task.in_progress"]
+other = "使用此幂等键的任务仍在接收中。"
+
+["err.server.bot_task.idempotency_conflict"]
+other = "此幂等键已用于其他任务。"
+
+["err.server.bot_task.store_failed"]
+other = "接收机器人任务失败。"
+
 # ---- modules/notification：账号级快捷静音 ----
 
 ["err.server.notification.pause.invalid_time"]
