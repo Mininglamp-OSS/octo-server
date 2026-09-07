@@ -379,6 +379,60 @@ func (d *DB) rescheduleRemovalJob(id int64, owner string, nextAttempt time.Time,
 	return affected == 1, nil
 }
 
+// removalJobOwnership is the pair the seat close is fenced on.
+type removalJobOwnership struct {
+	Status     int    `db:"status"`
+	LeaseOwner string `db:"lease_owner"`
+}
+
+// jobStillOwnsRemovalTx reports whether the outbox row is STILL this worker's
+// pending job, read under lock inside the caller's transaction.
+//
+// # Why the seat close needs this at all
+//
+// The seat carries no removal generation: `removing = 1` says a removal is in
+// progress, not WHICH one. So a worker that has been running a fan-out while
+// the member was re-admitted and then removed AGAIN comes back to a seat that
+// reads `removing = 1` — cycle 2's flag — and, without this, closes it. The
+// second cycle's job then finds `removing = 0`, concludes it has no work, and
+// retires without running a step: the groups the member joined between the two
+// cycles keep their rows, the seat says not-a-member, and because I2 has no
+// read-path filter that uid keeps full access to those groups. The I2 scan
+// reports it and nothing repairs it — both jobs are terminal and there is no
+// endpoint that re-drives a cascade.
+//
+// Fencing on the job turns "a removal is in progress" into "MY removal is still
+// in progress", which is the fact the close actually depends on. In the
+// interleaving above the first job reads `cancelled` here, declines, leaves
+// `removing = 1` alone, and the second job — claimed next tick — re-snapshots
+// the group list and does the right thing.
+//
+// # Lock order
+//
+// FOR UPDATE, and it is taken while the caller holds the seat lock: seat then
+// outbox row. That is the same order the re-admission path takes (the seat
+// upsert in addOneMemberOnce, then cancelPendingRemovalJobsTx), so the two
+// cannot close a cycle. It is a locking read rather than a plain one because a
+// plain SELECT after a locking read establishes its own consistent snapshot,
+// and "which version did that snapshot see" is not a question this decision
+// should rest on.
+func (d *DB) jobStillOwnsRemovalTx(tx *dbr.Tx, id int64, owner string) (bool, error) {
+	var rows []removalJobOwnership
+	_, err := tx.SelectBySql(
+		"SELECT status, lease_owner FROM `octo_project_member_removal_cleanup` "+
+			"WHERE id = ? FOR UPDATE", id,
+	).Load(&rows)
+	if err != nil {
+		return false, fmt.Errorf("project: re-read removal job under seat lock: %w", err)
+	}
+	if len(rows) == 0 {
+		// Purged out from under us. Not ours any more, by the only definition
+		// that matters here.
+		return false, nil
+	}
+	return rows[0].Status == removalJobPending && rows[0].LeaseOwner == owner, nil
+}
+
 // removalJobStatus reads one job's current status.
 //
 // Only used on the path where a fenced write was refused, to say WHY: a job

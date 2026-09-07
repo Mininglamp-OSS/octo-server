@@ -174,7 +174,7 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 	// A member re-admitted in that window has removing = 0, and tearing their
 	// groups down now would destroy a membership that is legitimate again. Same
 	// shape as P0's checkSpaceSeatForCleanupTx re-check.
-	cancelled, err := p.removalCancelled(job)
+	cancelled, err := p.removalCancelled(job, owner)
 	if err != nil {
 		p.rescheduleAfterFailure(job, owner, err)
 		return
@@ -238,9 +238,19 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 	// re-admission can land while they run. finishMemberRemovalTx is guarded on
 	// removing = 1, so a cancelled removal affects zero rows and the job is
 	// retired as cancelled rather than closing a seat somebody just restored.
-	if err := p.finishRemoval(job); err != nil {
+	closed, err := p.finishRemoval(job, owner)
+	if err != nil {
 		p.rescheduleAfterFailure(job, owner, err)
 		return
+	}
+	if !closed {
+		// The seat was not ours to close. Retiring the job is still right — its
+		// own work is done — but say so, because "cascade finished and the seat
+		// is still open" is the one shape that used to be invisible.
+		p.Info("项目移除工单：席位不归本工单关闭，保持 removing 由后续工单接手",
+			zap.Int64("job_id", job.ID),
+			zap.String("project_id", job.ProjectID),
+			zap.String("uid", job.UID))
 	}
 	p.retireRemovalJob(job, owner, removalJobDone, "")
 }
@@ -289,9 +299,15 @@ func (p *Project) retireRemovalJob(job RemovalJob, owner string, status int, las
 	return false
 }
 
-// removalCancelled reports whether the member was re-admitted since the job was
-// enqueued.
-func (p *Project) removalCancelled(job RemovalJob) (bool, error) {
+// removalCancelled reports whether this job still has work: the member is
+// mid-removal AND the removal in progress is the one this job was enqueued for.
+//
+// The second half is not redundant. `removing = 1` says a removal is in
+// progress, not WHICH one, and the outbox deliberately allows several jobs per
+// (project, uid) because remove → re-add → remove must enqueue a second one. A
+// job that answers "there is a removal in flight, so it must be mine" is the
+// same mistake the seat close made — see jobStillOwnsRemovalTx.
+func (p *Project) removalCancelled(job RemovalJob, owner string) (bool, error) {
 	tx, err := p.ctx.DB().Begin()
 	if err != nil {
 		return false, fmt.Errorf("project: begin cascade recheck: %w", err)
@@ -302,31 +318,48 @@ func (p *Project) removalCancelled(job RemovalJob) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("project: commit cascade recheck: %w", err)
-	}
 	if member == nil {
 		// No row at all: nothing to cascade and nothing to close. Treat as
 		// cancelled so the job retires instead of retrying forever.
-		return true, nil
+		return true, tx.Commit()
 	}
-	// removing == 0 means either re-admitted (status 1) or already finished
-	// (status 0). Both mean this job has no work left.
-	return member.Removing == 0, nil
+	if member.Removing == 0 {
+		// Either re-admitted (status 1) or already finished (status 0). Both
+		// mean this job has no work left.
+		return true, tx.Commit()
+	}
+
+	mine, err := p.db.jobStillOwnsRemovalTx(tx, job.ID, owner)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("project: commit cascade recheck: %w", err)
+	}
+	// Not reachable today — the claim only picks up pending rows and
+	// cancelPendingRemovalJobsTx retires claimed ones too, so a job that got
+	// this far is ours. It is here because the alternative reading ("removing =
+	// 1, therefore my work") is exactly what has to stop being assumed.
+	return !mine, nil
 }
 
 // finishRemoval flips status to 0 and clears removing, under the row lock.
-func (p *Project) finishRemoval(job RemovalJob) error {
+//
+// Reports whether it actually closed the seat. `false` with no error is not a
+// failure: it means the seat is not this job's to close — either the removal
+// was cancelled while the steps ran, or the `removing = 1` now on the row
+// belongs to a LATER removal cycle whose own job has not run yet.
+func (p *Project) finishRemoval(job RemovalJob, owner string) (bool, error) {
 	now := time.Now().UTC()
 	tx, err := p.ctx.DB().Begin()
 	if err != nil {
-		return fmt.Errorf("project: begin finish removal: %w", err)
+		return false, fmt.Errorf("project: begin finish removal: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
 	member, err := p.db.lockMemberForCascadeTx(tx, job.ProjectID, job.UID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if member == nil || member.Removing == 0 {
 		// Cancelled while the steps ran. Commit the (empty) transaction and let
@@ -336,12 +369,32 @@ func (p *Project) finishRemoval(job RemovalJob) error {
 		// member lists, and an admin can re-add. Do not "fix" this by re-adding
 		// them to those groups: that would race the very admission the
 		// cancellation represents.
-		return tx.Commit()
+		return false, tx.Commit()
+	}
+
+	// The seat says A removal is in flight. Whose?
+	//
+	// Without this the answer was assumed to be "mine", and the assumption is
+	// wrong exactly once per remove → re-add → join → re-remove sequence: this
+	// job would close cycle 2's seat, cycle 2's job would then find removing = 0
+	// and retire without running a step, and the group joined between the cycles
+	// would keep an active member row for a uid the project says is gone. I2 has
+	// no read-path filter, so that uid keeps full access to it — the leak the
+	// whole change exists to prevent, produced by the close itself.
+	mine, err := p.db.jobStillOwnsRemovalTx(tx, job.ID, owner)
+	if err != nil {
+		return false, err
+	}
+	if !mine {
+		// Leave `removing = 1` alone. The job that owns it is claimed on a later
+		// tick and re-snapshots the group list, which is what picks up the group
+		// joined in between.
+		return false, tx.Commit()
 	}
 
 	changed, err := p.db.finishMemberRemovalTx(tx, job.ProjectID, job.UID, now)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if changed {
 		// The epoch was already bumped when `removing` was set — that is when
@@ -350,7 +403,7 @@ func (p *Project) finishRemoval(job RemovalJob) error {
 		// acceptance requires it to move by exactly +1 per membership change.
 		p.invalidateProjectMemberCache(job.ProjectID, job.UID)
 	}
-	return tx.Commit()
+	return changed, tx.Commit()
 }
 
 // rescheduleAfterFailure applies backoff, or abandons a job that has run out of
