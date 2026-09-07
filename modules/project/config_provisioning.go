@@ -73,6 +73,22 @@ const (
 	envProvisionFleetNarrowed = "OCTO_PROJECT_PROVISION_FLEET_NARROWED"
 	envProvisionDriveNarrowed = "OCTO_PROJECT_PROVISION_DRIVE_NARROWED"
 
+	// envProvisionReclaimConsumerLive states that a consumer is actually polling the D9
+	// status endpoint, and it GATES THE PURGE.
+	//
+	// The retention window is justified as a reclaim window — the subsystem learns about a
+	// disband by polling POST /v1/internal/projects/status — and that endpoint does not
+	// exist in this repository yet (it is PR-2, which stacks on this slice). Without a gate
+	// the clock starts the day a target is enabled while nothing can poll, and once a
+	// disband_pending row is purged the answer to "was this project disbanded" is
+	// permanently `unknown` — which D9 makes indistinguishable from "outside your grant",
+	// so the consumer can never reclaim that container. Deleting the row is the one
+	// irreversible operation in this slice, so it is the one thing that must not run on an
+	// assumption.
+	//
+	// Default OFF: retained rows cost storage, an un-reclaimable container is a leak.
+	envProvisionReclaimConsumerLive = "OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE"
+
 	envProvisionInterval    = "OCTO_PROJECT_PROVISION_INTERVAL"
 	envProvisionTimeout     = "OCTO_PROJECT_PROVISION_TIMEOUT"
 	envProvisionMaxAttempts = "OCTO_PROJECT_PROVISION_MAX_ATTEMPTS"
@@ -176,6 +192,10 @@ type ProvisioningConfig struct {
 	Timeout     time.Duration
 	MaxAttempts uint32
 	BatchSize   int
+	// ReclaimConsumerLive gates the retention purge. See envProvisionReclaimConsumerLive —
+	// with no consumer polling, purging a disband_pending row makes its container
+	// permanently un-reclaimable.
+	ReclaimConsumerLive bool
 }
 
 // Enabled reports whether any target is live. When false, createProjectOnce
@@ -230,6 +250,9 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		Timeout:     timeout,
 		MaxAttempts: maxAttempts,
 		BatchSize:   envPositiveIntFrom(getenv, envProvisionBatch, defaultProvisionBatch),
+		// Read unconditionally: the purge is scheduled independently of which targets are
+		// enabled, so this has to resolve even with an empty target list.
+		ReclaimConsumerLive: envBoolFrom(getenv, envProvisionReclaimConsumerLive, false),
 	}
 	requested := parseTargetList(getenv(envProvisionTargets))
 	if len(requested) == 0 {

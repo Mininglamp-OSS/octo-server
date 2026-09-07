@@ -20,9 +20,9 @@ func testTarget(url string) Target {
 	return Target{Name: "fleet", EnsureURL: url, Secret: testSecret, Timeout: 2 * time.Second}
 }
 
-// TestEnsureSignsTheCanonicalRequest pins the wire contract a receiver has to
-// implement: the same v1 HMAC over the same canonical string as a card-action
-// callback, with the container id in the eventID slot.
+// TestEnsureSignsTheCanonicalRequest pins the wire contract a receiver has to implement:
+// the same v1 HMAC over the same canonical string as a card-action callback, with
+// sha256(container_id) — not the id — in the event-id slot.
 //
 // Verified with octosign.Verify rather than by re-deriving the hex here,
 // because the point of reusing that package is that a receiver can verify with the

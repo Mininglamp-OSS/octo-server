@@ -168,6 +168,9 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 	p.startRemovalWorker()
 	// Inert unless a target is enabled; see startProvisioningWorker.
 	p.startProvisioningWorker()
+	// The census runs regardless, so a rollback that clears the target list does not take
+	// the gauges with it — see startProvisioningMetrics.
+	p.startProvisioningMetrics()
 
 	spaceScoped := r.Group("/v1/space",
 		p.ctx.AuthMiddleware(r),

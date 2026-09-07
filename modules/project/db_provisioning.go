@@ -332,12 +332,23 @@ func (d *DB) abandonExhaustedProvisioningJobs(maxAttempts uint32, now time.Time,
 	// and starts the outbound call; the old UPDATE then matches on id + status alone,
 	// clears the fresh lease and writes `abandoned` while the call is in flight.
 	// Re-checking is one clause and removes the whole class.
+	// last_error is APPENDED to, not overwritten.
+	//
+	// Overwriting it with a constant destroyed the only durable per-row evidence of why
+	// provisioning failed — and it did so exactly on the path this sweep exists for, where
+	// the executing pod was killed and there is no log line to fall back on either. The
+	// sweep's own note matters (it says "nobody released this row", which is different from
+	// a normal give-up), so both are kept: the row keeps whatever the last release recorded
+	// and gains the sweep marker. CONCAT is bounded by LEFT(...) at the column width, so a
+	// long history cannot make the UPDATE fail on a strict-mode length error — which would
+	// leave the row pending and unsweepable, reintroducing the zombie one layer up.
 	result, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_provisioning` "+
-			"SET status = ?, finished_at = ?, lease_owner = '', lease_until = NULL, last_error = ? "+
+			"SET status = ?, finished_at = ?, lease_owner = '', lease_until = NULL, "+
+			"    last_error = LEFT(CONCAT(IF(last_error = '', '', CONCAT(last_error, ' | ')), ?), 255) "+
 			"WHERE id IN ? AND status = ? AND attempts >= ? "+
 			"AND (lease_until IS NULL OR lease_until <= ?)",
-		provisionStatusAbandoned, now, "sweep: retries exhausted", ids, provisionStatusPending,
+		provisionStatusAbandoned, now, "sweep: no executor released this row", ids, provisionStatusPending,
 		maxAttempts, now.Add(-provisioningLease),
 	).Exec()
 	if err != nil {

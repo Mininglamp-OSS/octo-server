@@ -92,6 +92,23 @@ var (
 	}, []string{"target"})
 )
 
+// provisioningTargetLabel keeps the `target` label a closed enum.
+//
+// Every other label value in this file comes from a constant, but the misconfiguration
+// gauge is fed from OCTO_PROJECT_PROVISION_TARGETS — operator-supplied text, which can be
+// anything. An unrecognised name is reported as "unknown" rather than passed through:
+// Prometheus retains every label value it has ever seen, so a typo'd list would leave a
+// permanent series behind on every deploy. The operator still gets the actual name in the
+// Error log written at construction.
+func provisioningTargetLabel(name string) string {
+	switch name {
+	case TargetFleet, TargetDrive:
+		return name
+	default:
+		return "unknown"
+	}
+}
+
 // provisioningStatusLabel maps a status to its metric label. A switch rather than
 // a number so a dashboard query does not have to encode the enum.
 func provisioningStatusLabel(status uint8) string {

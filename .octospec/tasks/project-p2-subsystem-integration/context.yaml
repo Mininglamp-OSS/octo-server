@@ -207,6 +207,24 @@ deviations:
       zombie exactly where the code claims to prevent one. The UPDATE re-check closes a
       rolling-restart race where replicas disagree about max. The bounds exist because an
       unbounded int cast to uint32 made every claim predicate false.
+  - id: purge-drains-and-is-gated
+    what: |
+      the retention purge drains (loop until a short batch, bounded per tick) AND is gated
+      on OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE, default off. The sweep appends to
+      last_error rather than overwriting it. The row census is scheduled independently of
+      whether any target is enabled.
+    why: |
+      Three separate findings with one root: the retention path was built as if its
+      consumer already existed. A fixed DELETE per tick is not a slower purge but no purge
+      once churn exceeds it (#797's own argument, and #846 implements the drain). Deleting
+      a disband_pending row before the D9 endpoint ships makes the status answer
+      permanently `unknown`, which D9 makes indistinguishable from "outside your grant" —
+      so the container can never be reclaimed; that is the only irreversible operation in
+      this slice, so it must not run on an assumption. Overwriting last_error destroyed the
+      only durable failure evidence exactly on the pod-killed path where there is no log
+      line either. And scheduling the census inside startProvisioningWorker meant the
+      documented rollback took every gauge with it, including the backlog the runbook
+      promises is preserved.
   - id: conformance-vectors
     what: |
       internal/projectprovision ships four fixed request/verdict vectors (valid /

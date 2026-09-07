@@ -208,6 +208,36 @@ UTC 时钟两侧一致；`attempts` 恰好一次自增；`truncateProvisioningEr
 
 ---
 
+### 2.6 第二 / 第三份 review 追加修掉的 6 项
+
+同一个 head（`4587b788`）上另外来了两份 review，其中 Jerry-Xin 跑了**真引擎**（MySQL 8.0.46
+生产 collation 形状、8 线程锁交错探针、六项守卫变异、对 #846 活头做 merge-tree）。它确认了
+第一份的所有阻塞项，并且**抓出我上一轮漏掉的东西**：
+
+| | 问题 | 处置 | 变异验证 |
+|---|---|---|---|
+| **P1-A(2)** | 「P1 的三处修正」里我只修了 heartbeat 那一条声称，**漏了 purge 不 drain** —— 代码是每小时一条固定 `DELETE ... LIMIT 1000`，正是 #797 标记过的形状；#846 的 `purgeRemovalJobs` 有现成 drain 循环 | 改成 drain（循环到短批为止）+ 每 tick 总量上限，撞上限打 Warn（那才是「保留策略跑不过 churn」的信号，固定上限会把它藏起来） | 退回单批 → 新测试 FAIL |
+| **retention × PR-2** | 90 天 retention 的理由是「子系统靠轮询 D9 端点得知解散」，而**那个端点在本仓不存在**（就是 PR-2）。开启后时钟就开始走，一旦 purge 掉 `disband_pending`，状态答案永久变 `unknown` —— 而 D9 让它与「不在你的 grant 内」不可区分，容器**永远无法回收** | 新增 `OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE`（默认 off）**门住 purge**。删行是本片唯一不可逆操作，不能跑在假设上；留行只花存储，漏容器是泄漏 | 门控测试双向 |
+| **census 随 rollback 消失** | `refreshProvisioningMetrics` 原本在 `startProvisioningWorker` 里调度，共享同一个 early return —— 于是 runbook 的 rollback（清空 `TARGETS`）会在下次部署把**所有** provisioning gauge 一起带走，包括 runbook 承诺「保留」的 `pending` 积压 | 拆出 `startProvisioningMetrics`，**无条件调度**。rollback 恰恰是有人在盯这些数字的时候，而消失的 series 读起来就是 0 | gauge 测试加 rollback 后 census 断言 |
+| **sweep 覆盖 last_error** | sweep 用常量覆写 `last_error`，毁掉唯一的按行失败证据 —— 而且恰好在这条路径上（pod 被打死）连日志都没有，`plan.md §3.4` 还让人照着这个字段去判断要不要重排 | 改成**追加**（`LEFT(CONCAT(...), 255)` 防列宽超限 —— 超限会让 UPDATE 挂掉、行回到不可 sweep 状态，等于把僵尸换个层次复现） | 断言 sweep 后仍含 release 期的原因 |
+| **两个测试空洞** | reviewer 变异发现：删掉 `finishProvisioningJob` 的 `AND lease_owner = ?` **整包仍绿**（没有任何测试驱动过租约易主）；撤掉 sweep 的整租约宽限**也仍绿**（两个 fixture 都在窗口外，一个远过期一个未来） | 两个新测试：租约易主后陈旧执行者的终态写入必须落空；租约刚过期 30s（宽限窗口**内**）必须不被 sweep | 两个变异 → 两条 FAIL |
+| **gauge label 基数** | `provisioning_target_misconfigured` 把 `TARGETS` 里的**任意 operator 文本**当 label 值，违反本文件自己「label 全是闭集」的声明；Prometheus 永不遗忘 label 值，打错一次留一条永久 series | 未识别的名字折叠成 `unknown`；真实名字仍在构造期的 Error 日志里 | — |
+
+另外修掉两处陈旧注释（`main.go` 指向不存在的守卫文件 —— **三份 review 都提了**；
+`TestEnsureSignsTheCanonicalRequest` 的注释还写着「container id 在 eventID 槽」而测试
+断言的已是 sha256）。
+
+**引擎侧被确认正确的**（照录要点，免得复审重跑）：8 线程 ~500 事务的
+create/disband/claim/sweep/purge 交错**零 1213/1205**；`(project_id,target)` 并发插入恰好
+一个赢家 + 一个 1062；两个并发 `SKIP LOCKED` 认领取到不同行且 `attempts` 各自 +1；
+迁移在**生产形状**（默认 collation `utf8mb4_0900_ai_ci`）的服务器上干净应用，且本片每条
+语句都是单表、不存在跨表表达式面（#842 判定过的 1267/1270 类根本不会出现）；
+EXPLAIN 实测 claim/sweep 走 `idx_..._pending`、purge 走 `idx_..._finished`、disband 标记走
+`uk_..._target`；对 #846 活头 merge-tree **恰好两处文本冲突**（与 PR body 声称一致）、
+迁移 id 不撞、两种合并顺序都无锁环。
+
+---
+
 ## 3. 运维手册
 
 ### 3.1 默认状态：完全惰性
@@ -237,6 +267,12 @@ env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关�
    wrong_secret）。这不是形式主义 —— 三条 MUST 里，canonical string 写错会 fail closed
    会自己暴露，而**时间戳校验写松了 fail open 且完全静默**，本仓没有任何东西能发现它。
    向量就是把「已评审」变成一个可执行动作。
+
+**`OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE`（默认 off）门住 retention purge。**
+只有当某个子系统**确实在轮询** `POST /v1/internal/projects/status`（= PR-2 已上线且有消费方）
+之后才置 true。在那之前 `disband_pending` 行只增不删 —— 这是有意的：删行之后状态答案永久
+变 `unknown`，D9 让它与「不在你的 grant 内」不可区分，那个容器就永远回收不了。留行只花
+存储，漏容器是泄漏。
 
 **两个 knob 有硬边界，越界会被拒绝并回落默认值**（配置加载期报 Error 日志）：
 

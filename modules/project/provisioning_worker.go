@@ -33,9 +33,13 @@ const (
 	// longer than the whole retry budget exhausts every pending row at once.
 	provisioningSweepInterval = time.Minute
 	provisioningSweepLimit    = 500
-	// provisioningPurgeInterval / provisioningPurgeLimit pace retention cleanup.
-	provisioningPurgeInterval = time.Hour
-	provisioningPurgeLimit    = 1000
+	// provisioningPurgeInterval paces retention cleanup; provisioningPurgeLimit bounds one
+	// DELETE and provisioningPurgeMaxPerTick bounds one tick's total. The purge drains
+	// within that bound — see purgeProvisioningJobs for why a fixed per-tick cap is no
+	// purge at all.
+	provisioningPurgeInterval   = time.Hour
+	provisioningPurgeLimit      = 1000
+	provisioningPurgeMaxPerTick = 100_000
 )
 
 // provisionEnsurer is the one-method surface the worker needs from
@@ -119,6 +123,10 @@ func newProvisioningClaimOwner() string {
 // has the same guard for the same measured reason.
 var provisioningWorkerOnce sync.Once
 
+// provisioningMetricsOnce keeps the census timer to one per process, on the same terms and
+// for the same measured reason as provisioningWorkerOnce.
+var provisioningMetricsOnce sync.Once
+
 // provisioningRunning is the in-process reentrancy guard.
 //
 // The interval tick schedules the next firing before running the current one, so a
@@ -140,8 +148,23 @@ func (p *Project) startProvisioningWorker() {
 		p.ctx.Schedule(p.cfg.Provisioning.Interval, p.processProvisioningJobs)
 		p.ctx.Schedule(provisioningSweepInterval, p.sweepExhaustedProvisioningJobs)
 		p.ctx.Schedule(provisioningPurgeInterval, p.purgeProvisioningJobs)
-		// Metrics on the module's sparse tick: countProvisioningByTargetStatus is a
-		// whole-table GROUP BY, and these gauges serve trend questions.
+	})
+}
+
+// startProvisioningMetrics schedules the row census, INDEPENDENTLY of whether any target is
+// enabled.
+//
+// Separate from startProvisioningWorker on purpose. The census used to be scheduled inside
+// it, behind the same early return — so the documented rollback (clear
+// OCTO_PROJECT_PROVISION_TARGETS) made every provisioning gauge disappear on the next
+// deploy, including the `pending` backlog the runbook promises is preserved and the
+// unnarrowed-surface figure. Rollback is exactly when someone is watching those numbers,
+// and a vanished series reads like a zero.
+//
+// Cheap to run unconditionally: one bounded GROUP BY on the module's sparse metrics tick,
+// over a table that is empty in the default state.
+func (p *Project) startProvisioningMetrics() {
+	provisioningMetricsOnce.Do(func() {
 		p.ctx.Schedule(p.cfg.MetricsInterval, p.refreshProvisioningMetrics)
 	})
 }
@@ -154,7 +177,11 @@ func (p *Project) publishProvisioningConfigMetrics() {
 		provisioningTargetMisconfigured.WithLabelValues(t.Name).Set(0)
 	}
 	for _, name := range p.cfg.Provisioning.Misconfigured {
-		provisioningTargetMisconfigured.WithLabelValues(name).Set(1)
+		// Fold an unrecognised name into a fixed label. OCTO_PROJECT_PROVISION_TARGETS is
+		// operator text, so passing it through verbatim broke this file's own "every label
+		// value is a closed enum" rule — a typo'd list would mint a new time series per
+		// deploy, and Prometheus never forgets a label value.
+		provisioningTargetMisconfigured.WithLabelValues(provisioningTargetLabel(name)).Set(1)
 	}
 	for _, err := range p.cfg.Provisioning.Problems {
 		// Error, not Warn: an operator asked for this target and it will not
@@ -435,15 +462,49 @@ func (p *Project) sweepExhaustedProvisioningJobs() {
 
 // purgeProvisioningJobs deletes disband_pending rows past the retention window.
 // ready and abandoned rows are never purged — see provisioningRetention.
+//
+// It DRAINS: loop until a batch comes back short, rather than one fixed DELETE per tick.
+// The distinction is not cosmetic, and P1's own purge (#846's purgeRemovalJobs) makes the
+// same argument — a fixed cap below the arrival rate is not a slower purge, it is NO
+// purge: the table grows without bound and every scan over it gets slower forever. The
+// per-batch cap stays, so no single DELETE locks a large range; what changes is that a
+// tick keeps going while there is work.
+//
+// A total bound per tick is still required. Without one, a first enablement that
+// disbanded a very large number of projects could keep this loop deleting for a long time
+// on a scheduler goroutine, and the whole point of the batch cap is to stay out of the
+// way. Reaching the bound logs at Warn — that is the signal that the retention policy is
+// losing against churn, which is the state a fixed cap would have hidden.
 func (p *Project) purgeProvisioningJobs() {
-	deleted, err := p.db.purgeFinishedProvisioningJobs(
-		time.Now().UTC().Add(-provisioningRetention), provisioningPurgeLimit)
-	if err != nil {
-		p.Warn("purge project provisioning jobs failed", zap.Error(err))
+	// Gated on a consumer actually polling the D9 status endpoint, which does not exist in
+	// this repository yet (PR-2 stacks on this slice). Deleting a disband_pending row is the
+	// only irreversible operation here: afterwards the status answer is permanently
+	// `unknown`, which D9 makes indistinguishable from "outside your grant", so the consumer
+	// can never reclaim that container. Retained rows cost storage; an un-reclaimable
+	// container is a leak.
+	if !p.cfg.Provisioning.ReclaimConsumerLive {
 		return
 	}
-	if deleted > 0 {
-		p.Info("purged disband-pending project provisioning rows", zap.Int64("deleted", deleted))
+	before := time.Now().UTC().Add(-provisioningRetention)
+	var total int64
+	for total < provisioningPurgeMaxPerTick {
+		deleted, err := p.db.purgeFinishedProvisioningJobs(before, provisioningPurgeLimit)
+		if err != nil {
+			p.Warn("purge project provisioning jobs failed",
+				zap.Int64("deletedBeforeError", total), zap.Error(err))
+			return
+		}
+		total += deleted
+		// A short batch means the eligible set is exhausted.
+		if deleted < int64(provisioningPurgeLimit) {
+			break
+		}
+	}
+	if total >= provisioningPurgeMaxPerTick {
+		p.Warn("project provisioning purge hit its per-tick bound; retention is losing against churn",
+			zap.Int64("deleted", total), zap.Int64("boundPerTick", provisioningPurgeMaxPerTick))
+	} else if total > 0 {
+		p.Info("purged disband-pending project provisioning rows", zap.Int64("deleted", total))
 	}
 }
 

@@ -804,6 +804,173 @@ func TestSweepSparesAJobStillInsideItsLease(t *testing.T) {
 
 // ---------- disband ----------
 
+// TestTerminalWriteRequiresTheLease covers a hole a reviewer found by mutation: deleting
+// `AND lease_owner = ?` from finishProvisioningJob left the whole suite GREEN, because no
+// test ever drove an owner hand-over.
+//
+// That clause is what makes a stale executor's terminal write land on nothing after its
+// lease expired and another replica took over. Without it, a slow worker finishing late
+// would overwrite the state of whoever is running now.
+func TestTerminalWriteRequiresTheLease(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "P")
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+
+	// Two claims of the same row: the second only becomes possible after the first lease
+	// expires, so force that state directly rather than waiting two minutes.
+	firstOwner := newProvisioningClaimOwner()
+	job, err := p.db.claimProvisioningJob(firstOwner, []string{TargetFleet}, p.cfg.Provisioning.MaxAttempts, time.Now().UTC())
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	expireProvisioningLease(t, job.ID)
+	secondOwner := newProvisioningClaimOwner()
+	takenOver, err := p.db.claimProvisioningJob(secondOwner, []string{TargetFleet}, p.cfg.Provisioning.MaxAttempts, time.Now().UTC())
+	require.NoError(t, err)
+	require.NotNil(t, takenOver, "the expired lease should have been re-claimable")
+	require.Equal(t, job.ID, takenOver.ID)
+
+	// The FIRST owner now finishes, late. It must not land.
+	ok, err := p.db.finishProvisioningJob(job.ID, firstOwner, provisionStatusReady, "", time.Now().UTC())
+	require.NoError(t, err)
+	assert.False(t, ok, "a stale owner's terminal write must not land: the lease changed hands")
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusPending, rows[0].Status,
+		"the stale write set a terminal status underneath the current executor")
+	assert.Equal(t, secondOwner, rows[0].LeaseOwner, "the stale write cleared the live lease")
+
+	// The current owner's write does land.
+	ok, err = p.db.finishProvisioningJob(job.ID, secondOwner, provisionStatusReady, "", time.Now().UTC())
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	// Release is fenced the same way, and reports it rather than failing silently.
+	err = p.db.releaseProvisioningJob(job.ID, firstOwner, 1, "late", time.Now().UTC())
+	assert.ErrorIs(t, err, errProvisioningLeaseLost)
+}
+
+// expireProvisioningLease pushes a held lease into the past so the row is re-claimable
+// without waiting out provisioningLease.
+func expireProvisioningLease(t *testing.T, id uint64) {
+	t.Helper()
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project_provisioning` SET lease_until = ? WHERE id = ?",
+		time.Now().UTC().Add(-time.Minute), id,
+	).Exec()
+	require.NoError(t, err)
+}
+
+// TestSweepSparesALeaseExpiredWithinTheGracePeriod is the second hole the same mutation
+// pass found: reverting the grace from `now - lease` to `now` also left the suite GREEN,
+// because both existing sweep fixtures sit OUTSIDE the window (one long-expired, one in
+// the future). Nothing covered the middle, which is the only region the grace exists for.
+//
+// A job on its final attempt legitimately runs past its lease — the grace is what stops
+// the sweep writing `abandoned` under it and leaving its own finish to land on nothing.
+func TestSweepSparesALeaseExpiredWithinTheGracePeriod(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	p.cfg.Provisioning.MaxAttempts = 1
+	created := createVia(t, r, token, "P")
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+
+	// Budget spent, lease expired 30s ago — i.e. inside the one-lease grace. A running
+	// final attempt looks exactly like this.
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project_provisioning` SET attempts = ?, lease_owner = 'running', lease_until = ? WHERE id = ?",
+		p.cfg.Provisioning.MaxAttempts, time.Now().UTC().Add(-30*time.Second), rows[0].ID,
+	).Exec()
+	require.NoError(t, err)
+
+	p.sweepExhaustedProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusPending, rows[0].Status,
+		"a lease expired only 30s ago is inside the grace period: the executor is probably still running")
+
+	// Past a full lease it is swept — otherwise this test would pass with no grace at all.
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project_provisioning` SET lease_until = ? WHERE id = ?",
+		time.Now().UTC().Add(-2*provisioningLease), rows[0].ID,
+	).Exec()
+	require.NoError(t, err)
+	p.sweepExhaustedProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusAbandoned, rows[0].Status)
+	// And the release-path evidence survives the sweep: overwriting last_error with a
+	// constant destroyed the only durable record of WHY, on the very path where there is
+	// no log line either.
+	assert.Contains(t, rows[0].LastError, "no executor released this row")
+}
+
+// TestPurgeDrainsRatherThanDeletingOneBatchPerTick pins the drain loop.
+//
+// A fixed cap per tick that is below the arrival rate is not a slower purge, it is no
+// purge — the table grows without bound and every scan over it gets slower. The brief
+// listed the drain as one of "P1's three corrections" while the code did one bounded
+// DELETE per hourly tick.
+func TestPurgeDrainsRatherThanDeletingOneBatchPerTick(t *testing.T) {
+	_, p := setup(t)
+	old := time.Now().UTC().Add(-2 * provisioningRetention)
+	// More rows than one batch, so a single DELETE cannot finish the job.
+	const rows = provisioningPurgeLimit + 250
+	for i := 0; i < rows; i++ {
+		containerID, err := newContainerID(TargetFleet)
+		require.NoError(t, err)
+		_, err = testCtx.DB().InsertBySql(
+			"INSERT INTO `octo_project_provisioning` "+
+				"(project_id, space_id, target, container_id, status, next_attempt_at, created_at, finished_at) "+
+				"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			fmt.Sprintf("purge-%d", i), spaceA, TargetFleet, containerID,
+			provisionStatusDisbandPending, old, old, old,
+		).Exec()
+		require.NoError(t, err)
+	}
+	require.Equal(t, rows, countAllProvisioningRows(t))
+
+	// The purge is gated on a declared reclaim consumer (see
+	// TestPurgeIsGatedOnAReclaimConsumer); this test is about the drain loop, not the gate.
+	p.cfg.Provisioning.ReclaimConsumerLive = true
+	p.purgeProvisioningJobs()
+	assert.Zero(t, countAllProvisioningRows(t),
+		"one tick must drain the eligible set, not delete a single batch and leave the rest")
+}
+
+// TestPurgeIsGatedOnAReclaimConsumer pins the one irreversible operation in this slice
+// against an assumption.
+//
+// The retention window is justified as a reclaim window, but the endpoint a consumer would
+// poll does not exist in this repository yet. Purge before it ships and the status answer
+// becomes permanently `unknown`, which D9 makes indistinguishable from "outside your
+// grant" — so the container can never be reclaimed. Retained rows cost storage; that costs
+// a leak.
+func TestPurgeIsGatedOnAReclaimConsumer(t *testing.T) {
+	_, p := setup(t)
+	old := time.Now().UTC().Add(-2 * provisioningRetention)
+	containerID, err := newContainerID(TargetFleet)
+	require.NoError(t, err)
+	_, err = testCtx.DB().InsertBySql(
+		"INSERT INTO `octo_project_provisioning` "+
+			"(project_id, space_id, target, container_id, status, next_attempt_at, created_at, finished_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		"p-gated", spaceA, TargetFleet, containerID,
+		provisionStatusDisbandPending, old, old, old,
+	).Exec()
+	require.NoError(t, err)
+
+	// Default: no consumer declared, so nothing is deleted however old the row is.
+	require.False(t, p.cfg.Provisioning.ReclaimConsumerLive)
+	p.purgeProvisioningJobs()
+	assert.Equal(t, 1, countAllProvisioningRows(t),
+		"a purge ran with no reclaim consumer: the container becomes permanently un-reclaimable")
+
+	// Declared: the purge proceeds.
+	p.cfg.Provisioning.ReclaimConsumerLive = true
+	p.purgeProvisioningJobs()
+	assert.Zero(t, countAllProvisioningRows(t))
+}
+
 // TestDisbandMovesRowsToDisbandPendingAndSendsNothing pins D9's pull-based teardown.
 func TestDisbandMovesRowsToDisbandPendingAndSendsNothing(t *testing.T) {
 	fleet, drive := newFakeTarget(t), newFakeTarget(t)
@@ -927,6 +1094,12 @@ func TestUnnarrowedContainerGaugeCountsReadyRowsOnUnnarrowedTargets(t *testing.T
 	p.refreshProvisioningMetrics()
 	assert.Equal(t, 3.0, testutil.ToFloat64(provisioningUnnarrowedContainers.WithLabelValues(TargetDrive)),
 		"clearing the target list made the exposed surface read 0 while the containers still exist")
+	// The whole census must survive a rollback too. It used to be scheduled inside
+	// startProvisioningWorker, behind the same early return, so clearing the target list
+	// took every gauge with it on the next deploy — including the `pending` backlog the
+	// runbook promises is preserved. Rollback is exactly when someone is reading these.
+	assert.Equal(t, 1.0, testutil.ToFloat64(provisioningRows.WithLabelValues(TargetDrive, "pending")),
+		"the row census vanished for a target that is no longer enabled")
 
 	// It does fall to 0 once the rows are actually gone — a gauge that holds a stale
 	// reading after the condition clears reads as an unresolved alert.
