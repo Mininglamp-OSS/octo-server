@@ -2401,3 +2401,36 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   live. Both corrected in the same commit as the code they describe.
 - **Assertions one level weaker than their own comments** — four of them, all
   cheap to strengthen, all on the path where the next regression would land.
+
+## 2026-09-07 — project-p2-subsystem-integration（PR #850 第七轮 review：两个阻塞项）
+
+- **权限的作用域比它能代表的状态更宽** —— 两个阻塞项是同一个形状。一个进程级布尔门住
+  一条不带 `target` 谓词的 DELETE：本片其它所有「关于某个子系统」的事实都是 per-target
+  的（启用、URL、secret、收窄声明），理由就是 fleet 与 drive 排期不同 —— 而回收消费方
+  也是分开落地的。于是先交付消费方的那个子系统，顺带授权了删掉另一个的回收账。删行是
+  本片唯一不可逆的操作。改成 per-target 集合直接作为 `target IN ?` 穿进 DELETE，并且
+  **按已知 target 而非已启用 target 解析**：启用管「造什么」，这个管「可以忘掉什么」。
+- **回滚手册的步骤 2 会打坏一条与被回滚功能无关的路径** —— 解散事务里对本表的写入是
+  **无条件**的，而那个位置是对的（加 `Enabled()` 门会让「启用过又关掉」的 target 不再
+  标记可回收，那是真泄漏）。代价是清空开关并不会停掉这次写，手工 `DROP TABLE` 之后
+  每次解散都是 1146 → 500；而且 sql-migrate 的账本行还在，重启不会重建表。手册现在写明
+  顺序（先退二进制再退表）并指定走 `sql-migrate down`。
+- **七轮 review 没找到的那个缺陷是一个 flaky 测试找到的** —— 认领/清扫/清理三条语句都带
+  `target IN (...)`，但索引首列是 `status`，于是每个目标的扫描会先锁住并检出另一个目标的
+  行，`FOR UPDATE SKIP LOCKED` 又让兄弟扫描把这些被锁的行整个跳过。实测（MySQL 8.0.46）：
+  两目标同 tick 时，落后的那个**一行都认领不到**，静默等下一个 tick。这正是「每目标一个
+  goroutine」要消除的互相拖累，所以修的是索引不是并发模型。附带收益：`(target, status)`
+  的行数普查从全表扫变成覆盖索引读。
+- **一个概率性的 guard 不是 guard** —— 单 tick 对重新注入的索引缺陷只有 7/8 检出，也就是
+  缺陷在场时有八分之一的机会报绿。改成五轮独立 tick 后 8/8。要的是「多轮」而不是「一个
+  tick 里更多行」：同 tick 的行是相关的。
+- **用代码读的那个常量去构造 fixture 是自证的** —— reclaim env 的测试两边都用同一个常量，
+  把常量打错会同时改掉两边，测试照样绿，而失败方向是静默的（purge 永久关闭，恰好是操作者
+  最可能误以为已经打开的状态）。env 名是部署契约不是 Go 标识符，断言必须用字面量。
+- **基数不等于身份** —— purge 的测试断言「删了 1 行、剩 2 行」，而一个删掉 `ready` 行的
+  purge 给出完全相同的两个数字。改成回读**哪些** status 存活。
+- **发布出去的示例凭据能通过长度下限** —— 一致性向量在公开仓的非测试文件里带了两个可用
+  secret，都是 33 字节、都过了 32 字节的门槛；抄进生产 env 会启动干净地握着一把公开的
+  HMAC 密钥，而向量里那条 tampered_body 就是这把钥匙授权的伪造。`ValidateTarget` 现在按值
+  拒绝它们，检查函数放在字面量旁边，这样加第五条向量时不会把它落下。
+

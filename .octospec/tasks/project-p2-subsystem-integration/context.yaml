@@ -210,9 +210,10 @@ deviations:
   - id: purge-drains-and-is-gated
     what: |
       the retention purge drains (loop until a short batch, bounded per tick) AND is gated
-      on OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE, default off. The sweep appends to
-      last_error rather than overwriting it. The row census is scheduled independently of
-      whether any target is enabled.
+      PER TARGET on OCTO_PROJECT_PROVISION_{FLEET,DRIVE}_RECLAIM_CONSUMER_LIVE, both
+      default off, with that set threaded into the DELETE as `target IN ?`. The sweep
+      appends to last_error rather than overwriting it. The row census is scheduled
+      independently of whether any target is enabled.
     why: |
       Three separate findings with one root: the retention path was built as if its
       consumer already existed. A fixed DELETE per tick is not a slower purge but no purge
@@ -225,6 +226,54 @@ deviations:
       line either. And scheduling the census inside startProvisioningWorker meant the
       documented rollback took every gauge with it, including the backlog the runbook
       promises is preserved.
+  - id: reclaim-gate-is-per-target
+    what: |
+      the reclaim gate is a per-target set (ProvisioningConfig.ReclaimTargets, resolved for
+      every KNOWN target rather than every enabled one) and it is threaded into the purge
+      DELETE as `target IN ?`; the retired process-global
+      OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE is refused at config load rather than
+      ignored. The exhausted-row sweep gained the same `target IN ?` filter the claim path
+      already had.
+    why: |
+      A live reclaim consumer is a per-subsystem deliverable — fleet and drive ship on
+      different teams' schedules, which is why every other per-subsystem fact here is
+      already per target. A process-global boolean guarding a DELETE with no target
+      predicate meant the FIRST subsystem to ship a consumer silently authorized deleting
+      the OTHER one's reclaim records, on the rollout order the runbook prescribes; those
+      containers reach exactly the end state the gate exists to prevent, irreversibly and
+      with no gauge for it. Read for every known target, not every enabled one, because a
+      target disabled after use still has containers its live consumer must finish
+      reclaiming: enablement governs what we create, this governs what we may forget. The
+      sweep filter is the same non-destructiveness the claim filter documents — without it,
+      narrowing TARGETS drove the disabled target's exhausted rows to terminal `abandoned`,
+      from which there is no automatic re-drive, so flipping the switch back would not
+      resume them.
+  - id: scan-indexes-lead-with-target
+    what: |
+      both scan indexes on octo_project_provisioning lead with `target`:
+      idx_..._pending (target, status, next_attempt_at, lease_until) and
+      idx_..._finished (target, status, finished_at).
+    why: |
+      Found by a flaky test, not by review. Every claim/sweep/purge statement filters
+      `target IN (...)`, but while the indexes led with `status`, each per-target scan
+      walked an index range containing the other target's rows, locked them, and only then
+      filtered them out at the server layer — and FOR UPDATE SKIP LOCKED makes the sibling
+      scan skip a row a peer transaction holds. Measured on MySQL 8.0.46: with two targets
+      due in the same tick, the loser claimed nothing and waited silently for the next 15s
+      tick. That is the mutual starvation the one-goroutine-per-target fan-out exists to
+      remove, so the fix belongs in the index. Also makes the (target, status) census a
+      covering-index read (EXPLAIN: Using index) rather than a whole-table scan, which was
+      a separate review finding.
+  - id: published-conformance-secrets-refused
+    what: |
+      ValidateTarget rejects the two secrets conformance.go publishes, next to the 32-byte
+      length floor.
+    why: |
+      Both published values are 33 bytes, so they cleared the floor: an operator copying one
+      into OCTO_PROJECT_PROVISION_*_SECRET to try the endpoint booted clean holding a
+      published HMAC key, and conformanceTamperedBody is literally the forgery that key
+      authorises — a valid signature over an attacker-chosen project_id. The MAC is the
+      load-bearing layer precisely because ValidateTarget declines to require TLS.
   - id: conformance-vectors
     what: |
       internal/projectprovision ships four fixed request/verdict vectors (valid /

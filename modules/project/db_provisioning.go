@@ -305,17 +305,24 @@ func (d *DB) releaseProvisioningJob(id uint64, owner string, attempts uint32, la
 // attempts < max and this requires attempts >= max, so the two predicates cannot select
 // the same row. Across replicas mid-rollout they can disagree about max, which is why the
 // UPDATE below re-checks the predicates instead of trusting the SELECT.
-func (d *DB) abandonExhaustedProvisioningJobs(maxAttempts uint32, now time.Time, limit int) (int64, error) {
-	if limit <= 0 {
+//
+// targets carries the SAME `target IN ?` filter as claimProvisioningJob, for the same
+// reason: turning a target off has to be non-destructive. Without it, narrowing
+// OCTO_PROJECT_PROVISION_TARGETS to fleet still let this sweep drive drive's parked rows
+// to terminal `abandoned` — from which there is no automatic re-drive — so flipping the
+// switch back would NOT resume them, contradicting the promise the rollback runbook makes.
+// Parked rows stay `pending` and stay visible in provisioning_rows instead.
+func (d *DB) abandonExhaustedProvisioningJobs(targets []string, maxAttempts uint32, now time.Time, limit int) (int64, error) {
+	if limit <= 0 || len(targets) == 0 {
 		return 0, nil
 	}
 	var ids []uint64
 	if _, err := d.session.SelectBySql(
 		"SELECT id FROM `octo_project_provisioning` "+
-			"WHERE status = ? AND attempts >= ? "+
+			"WHERE target IN ? AND status = ? AND attempts >= ? "+
 			"AND (lease_until IS NULL OR lease_until <= ?) "+
 			"LIMIT ?",
-		provisionStatusPending, maxAttempts, now.Add(-provisioningLease), limit,
+		targets, provisionStatusPending, maxAttempts, now.Add(-provisioningLease), limit,
 	).Load(&ids); err != nil {
 		return 0, fmt.Errorf("project: select exhausted provisioning jobs: %w", err)
 	}
@@ -346,10 +353,10 @@ func (d *DB) abandonExhaustedProvisioningJobs(maxAttempts uint32, now time.Time,
 		"UPDATE `octo_project_provisioning` "+
 			"SET status = ?, finished_at = ?, lease_owner = '', lease_until = NULL, "+
 			"    last_error = LEFT(CONCAT(IF(last_error = '', '', CONCAT(last_error, ' | ')), ?), 255) "+
-			"WHERE id IN ? AND status = ? AND attempts >= ? "+
+			"WHERE id IN ? AND target IN ? AND status = ? AND attempts >= ? "+
 			"AND (lease_until IS NULL OR lease_until <= ?)",
-		provisionStatusAbandoned, now, "sweep: no executor released this row", ids, provisionStatusPending,
-		maxAttempts, now.Add(-provisioningLease),
+		provisionStatusAbandoned, now, "sweep: no executor released this row", ids, targets,
+		provisionStatusPending, maxAttempts, now.Add(-provisioningLease),
 	).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("project: sweep exhausted provisioning jobs: %w", err)
@@ -376,8 +383,23 @@ const provisioningRetention = 90 * 24 * time.Hour
 
 // purgeFinishedProvisioningJobs deletes disband_pending rows past the retention
 // window, bounded per call so one DELETE cannot lock a large range.
-func (d *DB) purgeFinishedProvisioningJobs(before time.Time, limit int) (int64, error) {
-	if limit <= 0 {
+//
+// targets is the set whose reclaim consumer the operator has DECLARED LIVE
+// (ProvisioningConfig.ReclaimTargets), and the `target IN ?` predicate is load-bearing,
+// not a filter for tidiness. This is the only irreversible statement in the slice, and
+// deletion authority is per subsystem: fleet's consumer shipping says nothing about
+// drive's, and without this clause the first subsystem to ship one would silently license
+// deleting the other's reclaim records — after which its containers can never be reclaimed
+// (the D9 answer becomes permanently `unknown`, indistinguishable from "outside your
+// grant"). Empty set means delete nothing, which is the default state.
+//
+// idx_octo_project_provisioning_finished leads with (target, status) so this DELETE is an
+// index range and not a scan that examines the other target's rows. That column order is
+// not for this statement's speed — the eligible set is tiny — but because the same missing
+// leading `target` made the CLAIM path starve one target: see the index's own comment in
+// the migration, and TestBothTargetsAdvanceInTheSameTick.
+func (d *DB) purgeFinishedProvisioningJobs(targets []string, before time.Time, limit int) (int64, error) {
+	if limit <= 0 || len(targets) == 0 {
 		return 0, nil
 	}
 	// DeleteBySql, not UpdateBySql. modules/space's equivalent sends its DELETE through
@@ -386,8 +408,8 @@ func (d *DB) purgeFinishedProvisioningJobs(before time.Time, limit int) (int64, 
 	// future reader has to stop and re-read.
 	result, err := d.session.DeleteBySql(
 		"DELETE FROM `octo_project_provisioning` "+
-			"WHERE status = ? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
-		provisionStatusDisbandPending, before, limit,
+			"WHERE target IN ? AND status = ? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
+		targets, provisionStatusDisbandPending, before, limit,
 	).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("project: purge provisioning jobs: %w", err)
@@ -404,9 +426,10 @@ type provisioningCount struct {
 
 // countProvisioningByTargetStatus aggregates the table for the gauges.
 //
-// A whole-table GROUP BY, which is why it runs on the sparse metrics tick rather
-// than the claim tick. Cardinality is bounded by design: two targets times four
-// statuses.
+// A whole-table GROUP BY, which is why it runs on the sparse metrics tick rather than the
+// claim tick. What is bounded by design is the OUTPUT — two targets times four statuses,
+// so at most eight rows and eight label combinations — and not the rows examined: only
+// disband_pending is ever purged, so the table grows with every project ever created.
 func (d *DB) countProvisioningByTargetStatus() ([]provisioningCount, error) {
 	var rows []provisioningCount
 	if _, err := d.session.SelectBySql(

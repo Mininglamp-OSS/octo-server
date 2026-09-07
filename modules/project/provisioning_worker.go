@@ -140,6 +140,15 @@ var provisioningRunning atomic.Bool
 //
 // A no-op when no target is enabled, which is the default: nothing is enqueued in
 // that state either, so the whole slice is inert rather than idling.
+//
+// The PURGE timer sits inside this gate deliberately, and that is the one asymmetry with
+// ReclaimTargets, which is resolved for every known target regardless of enablement. With
+// at least one target enabled the purge is mounted and prunes exactly the declared set —
+// including a target switched off after use, which is the case the per-target gate exists
+// for. With NOTHING enabled (the documented rollback) it is not mounted at all, so rows
+// accumulate: retained rows cost storage and the reclaim window merely stays open longer,
+// whereas deleting rows on a deployment where the feature is switched off is the surprising
+// direction. The census is NOT in this gate — see startProvisioningMetrics.
 func (p *Project) startProvisioningWorker() {
 	if !p.cfg.Provisioning.Enabled() {
 		return
@@ -448,8 +457,12 @@ func (p *Project) finishProvisioning(job *provisioningJob, owner string, status 
 
 // sweepExhaustedProvisioningJobs pushes hard-killed rows to abandoned.
 func (p *Project) sweepExhaustedProvisioningJobs() {
+	// Same target filter as the claim path. A row parked on a disabled target must stay
+	// pending, not go terminal `abandoned` behind the operator's back — see
+	// abandonExhaustedProvisioningJobs.
 	abandoned, err := p.db.abandonExhaustedProvisioningJobs(
-		p.cfg.Provisioning.MaxAttempts, time.Now().UTC(), provisioningSweepLimit)
+		p.enabledProvisioningTargetNames(), p.cfg.Provisioning.MaxAttempts,
+		time.Now().UTC(), provisioningSweepLimit)
 	if err != nil {
 		p.Warn("sweep exhausted project provisioning jobs failed", zap.Error(err))
 		return
@@ -476,19 +489,28 @@ func (p *Project) sweepExhaustedProvisioningJobs() {
 // way. Reaching the bound logs at Warn — that is the signal that the retention policy is
 // losing against churn, which is the state a fixed cap would have hidden.
 func (p *Project) purgeProvisioningJobs() {
-	// Gated on a consumer actually polling the D9 status endpoint, which does not exist in
-	// this repository yet (PR-2 stacks on this slice). Deleting a disband_pending row is the
-	// only irreversible operation here: afterwards the status answer is permanently
-	// `unknown`, which D9 makes indistinguishable from "outside your grant", so the consumer
-	// can never reclaim that container. Retained rows cost storage; an un-reclaimable
-	// container is a leak.
-	if !p.cfg.Provisioning.ReclaimConsumerLive {
+	// Gated PER TARGET on a consumer actually polling the D9 status endpoint, which does not
+	// exist in this repository yet (PR-2 stacks on this slice). Deleting a disband_pending
+	// row is the only irreversible operation here: afterwards the status answer is
+	// permanently `unknown`, which D9 makes indistinguishable from "outside your grant", so
+	// the consumer can never reclaim that container. Retained rows cost storage; an
+	// un-reclaimable container is a leak.
+	//
+	// The set is threaded into the DELETE rather than merely checked here, because "may we
+	// purge at all" and "whose rows may we purge" are different questions and only the
+	// second one is safe to answer with a boolean per subsystem. ReclaimTargets is
+	// intentionally not filtered by enablement — a target switched off after use still has
+	// containers its live consumer must be able to finish reclaiming. (This tick only fires
+	// while SOME target is enabled; see startProvisioningWorker for why that boundary sits
+	// there and not here.)
+	reclaimable := p.cfg.Provisioning.ReclaimTargets
+	if len(reclaimable) == 0 {
 		return
 	}
 	before := time.Now().UTC().Add(-provisioningRetention)
 	var total int64
 	for total < provisioningPurgeMaxPerTick {
-		deleted, err := p.db.purgeFinishedProvisioningJobs(before, provisioningPurgeLimit)
+		deleted, err := p.db.purgeFinishedProvisioningJobs(reclaimable, before, provisioningPurgeLimit)
 		if err != nil {
 			p.Warn("purge project provisioning jobs failed",
 				zap.Int64("deletedBeforeError", total), zap.Error(err))
@@ -502,9 +524,11 @@ func (p *Project) purgeProvisioningJobs() {
 	}
 	if total >= provisioningPurgeMaxPerTick {
 		p.Warn("project provisioning purge hit its per-tick bound; retention is losing against churn",
-			zap.Int64("deleted", total), zap.Int64("boundPerTick", provisioningPurgeMaxPerTick))
+			zap.Int64("deleted", total), zap.Int64("boundPerTick", provisioningPurgeMaxPerTick),
+			zap.Strings("targets", reclaimable))
 	} else if total > 0 {
-		p.Info("purged disband-pending project provisioning rows", zap.Int64("deleted", total))
+		p.Info("purged disband-pending project provisioning rows",
+			zap.Int64("deleted", total), zap.Strings("targets", reclaimable))
 	}
 }
 

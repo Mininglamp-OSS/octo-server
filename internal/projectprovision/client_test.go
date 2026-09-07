@@ -428,3 +428,41 @@ func TestConformanceVectorsExerciseEveryEnforceableClause(t *testing.T) {
 		t.Errorf("the baseline vector is %ds old, outside the %ds window", valid.NowUnix-ts, MaxSkewSeconds)
 	}
 }
+
+// TestValidateTargetRejectsThePublishedConformanceSecrets closes the gap between "long
+// enough" and "secret".
+//
+// conformance.go ships two real, working secrets in a non-test source file of a public
+// repository, and both are 33 bytes — comfortably past minSecretBytes. So the obvious
+// operator move, copying one into OCTO_PROJECT_PROVISION_FLEET_SECRET to try the endpoint,
+// booted clean while holding a published HMAC key; conformanceTamperedBody is literally the
+// forgery that key authorises, a valid signature over an attacker-chosen project_id. The
+// MAC is load-bearing here because ValidateTarget deliberately does not require TLS.
+func TestValidateTargetRejectsThePublishedConformanceSecrets(t *testing.T) {
+	const ensureURL = "https://fleet.internal/api/internal/workspaces/ensure"
+	for _, secret := range []string{conformanceSecret, conformanceOtherSecret} {
+		// Non-vacuity: the length floor must not be what rejects these, or this test would
+		// still pass with the published-value check deleted.
+		if len(secret) < minSecretBytes {
+			t.Fatalf("this test only means something while the published secret clears the length floor: %d", len(secret))
+		}
+		err := ValidateTarget(Target{Name: "fleet", EnsureURL: ensureURL, Secret: secret})
+		if err == nil {
+			t.Fatal("a published conformance secret was accepted as a production credential")
+		}
+		if !strings.Contains(err.Error(), "conformance") {
+			t.Fatalf("rejection does not say why: %v", err)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatal("the rejection echoed the secret it rejected")
+		}
+	}
+
+	// A real secret of the same length still passes, so what is rejected is the published
+	// VALUE — not the length, and not a substring of it.
+	if err := ValidateTarget(Target{
+		Name: "fleet", EnsureURL: ensureURL, Secret: strings.Repeat("z", len(conformanceSecret)),
+	}); err != nil {
+		t.Fatalf("a real secret of the same length was rejected: %v", err)
+	}
+}

@@ -64,10 +64,19 @@ CREATE TABLE `octo_project_provisioning` (
   -- container_id 全局唯一。它是接收方的幂等键（drive 的 drive_space 主键 / fleet 的
   -- slug 唯一索引），本侧重复生成属于生成器缺陷，宁可让 INSERT 失败也不要静默复用。
   UNIQUE KEY `uk_octo_project_provisioning_container` (`container_id`),
-  KEY `idx_octo_project_provisioning_pending` (`status`, `next_attempt_at`, `lease_until`),
-  -- 终态清理按 (status, finished_at) 扫。pending 索引首列虽然也是 status，但第二列是
-  -- next_attempt_at，帮不上 finished_at 的范围条件。
-  KEY `idx_octo_project_provisioning_finished` (`status`, `finished_at`)
+  -- 两个扫描索引都以 target 开头，这一列是必需的而不是顺手加的。
+  --
+  -- 认领、清扫、清理三条语句全都带 `target IN (...)`（认领的 target 过滤是「关掉一个目标
+  -- 不破坏已入队的行」的实现方式）。若 target 不在索引里，每个目标的扫描会在索引区间内
+  -- 先锁住并检出另一个目标的行、再在 server 层按 target 过滤掉——而 FOR UPDATE SKIP
+  -- LOCKED 会让兄弟扫描把这些已被锁住的行整个跳过。实测（本地 MySQL 8.0，两目标同 tick）：
+  -- 被抢先的那个目标本 tick 一行都认领不到，静默等到下一个 tick。这正是「每目标一个
+  -- goroutine」要消除的互相拖累，所以索引必须让每个目标的扫描只落在自己的行上。
+  KEY `idx_octo_project_provisioning_pending` (`target`, `status`, `next_attempt_at`, `lease_until`),
+  -- 终态清理按 (target, status, finished_at) 扫。pending 索引前两列虽然相同，但第三列是
+  -- next_attempt_at，帮不上 finished_at 的范围条件。首列 target 同时让按 (target, status)
+  -- 的行数普查（provisioning_rows 计量）走索引而不是全表。
+  KEY `idx_octo_project_provisioning_finished` (`target`, `status`, `finished_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='项目子系统容器预置工单（兼映射表）';
 
 -- +migrate Down

@@ -1,5 +1,7 @@
 package projectprovision
 
+import "crypto/subtle"
+
 // Conformance vectors for a subsystem's `ensure` endpoint.
 //
 // # Why these exist
@@ -167,4 +169,18 @@ func ConformanceVectors() []ConformanceVector {
 			Why:        "authentication: a signature from any other key must be refused",
 		},
 	}
+}
+
+// isPublishedConformanceSecret reports whether s is one of the secrets this file publishes.
+//
+// Kept next to the literals it guards rather than in client.go, so adding a fifth vector
+// with a new secret cannot leave the check behind: whoever adds the constant is editing
+// this file.
+func isPublishedConformanceSecret(s string) bool {
+	for _, published := range []string{conformanceSecret, conformanceOtherSecret} {
+		if subtle.ConstantTimeCompare([]byte(s), []byte(published)) == 1 {
+			return true
+		}
+	}
+	return false
 }

@@ -712,6 +712,104 @@ func assertLeaseUntilIsNull(t *testing.T, id uint64) {
 	require.Equal(t, 1, nullCount, "a released row must have lease_until = NULL")
 }
 
+// TestBothTargetsAdvanceInTheSameTick pins the index property that makes the per-target
+// goroutines actually independent.
+//
+// Found by a flaky sibling test, not by review. Every claim/sweep/purge statement filters
+// `target IN (...)`, but while the scan indexes led with `status` and not `target`, each
+// per-target scan walked an index range containing the OTHER target's rows, locked them,
+// and only then filtered them out at the server layer — and FOR UPDATE SKIP LOCKED makes
+// the sibling scan skip a row a peer transaction is holding. Measured locally on MySQL
+// 8.0.46: with two targets due in the same tick, the loser claimed NOTHING and waited
+// silently for the next 15s tick. That is precisely the mutual starvation the one-goroutine-
+// per-target fan-out exists to remove, so the fix is the index, not the fan-out.
+//
+// Both scan indexes now lead with (target, status), so this holds whichever one the
+// optimizer picks.
+//
+// The property is inherently concurrent, so ONE tick is a probabilistic detector: measured
+// against the defect reintroduced (both indexes led with `status`), a single tick caught it
+// in 7 of 8 runs. That is a guard that reports green one time in eight while the defect is
+// present, which is not a guard. Rounds is what makes it one: at ~0.875 per round, five
+// independent rounds miss with probability ~3e-5. Rounds, not rows in one tick — a single
+// wider tick correlates, five separate ticks do not.
+func TestBothTargetsAdvanceInTheSameTick(t *testing.T) {
+	fleet, drive := newFakeTarget(t), newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet, drive)
+	// Both unhealthy, so the observable is `attempts`, which is written AT CLAIM: a row
+	// still at 0 was never claimed, which is the starvation being pinned. A healthy target
+	// would end at `ready` and hide whether the claim happened this tick or the next.
+	fleet.setStatus(http.StatusInternalServerError)
+	drive.setStatus(http.StatusInternalServerError)
+
+	const rounds = 5
+	for round := 0; round < rounds; round++ {
+		created := createVia(t, r, token, fmt.Sprintf("P%d", round))
+		// Exactly one tick per round. The round's two rows share status, next_attempt_at and
+		// a NULL lease_until — one statement in one transaction enqueues them — so they sit
+		// adjacent in the pending index range, which is what made the interleaving
+		// reproducible. Earlier rounds' rows carry a backoff, so they are not due and this
+		// tick sees only the pair just enqueued.
+		p.processProvisioningJobs()
+
+		attempts := map[string]uint32{}
+		for _, row := range readProvisioningRows(t, created.ProjectID) {
+			attempts[row.Target] = row.Attempts
+		}
+		require.Equal(t, uint32(1), attempts[TargetFleet],
+			"round %d: fleet was not claimed in the tick that claimed drive — "+
+				"one target's scan is locking the other target's rows", round)
+		require.Equal(t, uint32(1), attempts[TargetDrive],
+			"round %d: drive was not claimed in the tick that claimed fleet — "+
+				"one target's scan is locking the other target's rows", round)
+	}
+}
+
+// TestSweepSparesRowsParkedOnADisabledTarget pins the sweep's target filter, which has to
+// match the claim path's.
+//
+// Turning a target off must be non-destructive: claimProvisioningJob filters `target IN ?`
+// precisely so parked rows stop burning their retry budget against a destination nobody
+// listens on and survive the switch being flipped back. Without the same filter on the
+// sweep, the subset with attempts >= MaxAttempts went terminal `abandoned` anyway — a state
+// with no automatic re-drive — so flipping the switch back would NOT resume them, which is
+// the opposite of what the rollback runbook promises. Reachable by combining the documented
+// rollback with the documented remedy of lowering OCTO_PROJECT_PROVISION_MAX_ATTEMPTS.
+func TestSweepSparesRowsParkedOnADisabledTarget(t *testing.T) {
+	fleet, drive := newFakeTarget(t), newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet, drive)
+	p.cfg.Provisioning.MaxAttempts = 8
+	fleet.setStatus(http.StatusInternalServerError)
+	drive.setStatus(http.StatusInternalServerError)
+
+	created := createVia(t, r, token, "P")
+	// One real failed attempt each, so both rows rest the way production rests them:
+	// pending, attempts advanced, lease_until NULL.
+	p.processProvisioningJobs()
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 2)
+	for _, row := range rows {
+		require.Equal(t, provisionStatusPending, row.Status)
+		require.Equal(t, uint32(1), row.Attempts)
+	}
+
+	// The operator narrows to fleet and lowers the budget below what both rows have spent —
+	// the two documented moves, combined.
+	p.cfg.Provisioning.Targets = []provisionTarget{fleetTargetOn(fleet)}
+	p.cfg.Provisioning.MaxAttempts = 1
+	p.sweepExhaustedProvisioningJobs()
+
+	byTarget := map[string]uint8{}
+	for _, row := range readProvisioningRows(t, created.ProjectID) {
+		byTarget[row.Target] = row.Status
+	}
+	assert.Equal(t, provisionStatusAbandoned, byTarget[TargetFleet],
+		"an exhausted row on an ENABLED target must still reach a terminal state")
+	assert.Equal(t, provisionStatusPending, byTarget[TargetDrive],
+		"the sweep drove a row on a DISABLED target to terminal abandoned: "+
+			"flipping the target back on can no longer resume it")
+}
+
 // TestSweepLeavesANeverClaimedRowAlone is the other side of relaxing that predicate.
 //
 // The NULL arm is only safe because max >= 1 is guaranteed at config load: a never-claimed
@@ -931,7 +1029,7 @@ func TestPurgeDrainsRatherThanDeletingOneBatchPerTick(t *testing.T) {
 
 	// The purge is gated on a declared reclaim consumer (see
 	// TestPurgeIsGatedOnAReclaimConsumer); this test is about the drain loop, not the gate.
-	p.cfg.Provisioning.ReclaimConsumerLive = true
+	p.cfg.Provisioning.ReclaimTargets = []string{TargetFleet}
 	p.purgeProvisioningJobs()
 	assert.Zero(t, countAllProvisioningRows(t),
 		"one tick must drain the eligible set, not delete a single batch and leave the rest")
@@ -959,14 +1057,22 @@ func TestPurgeIsGatedOnAReclaimConsumer(t *testing.T) {
 	).Exec()
 	require.NoError(t, err)
 
-	// Default: no consumer declared, so nothing is deleted however old the row is.
-	require.False(t, p.cfg.Provisioning.ReclaimConsumerLive)
+	// Default: no consumer declared for any target, so nothing is deleted however old the
+	// row is.
+	require.Empty(t, p.cfg.Provisioning.ReclaimTargets)
 	p.purgeProvisioningJobs()
 	assert.Equal(t, 1, countAllProvisioningRows(t),
 		"a purge ran with no reclaim consumer: the container becomes permanently un-reclaimable")
 
-	// Declared: the purge proceeds.
-	p.cfg.Provisioning.ReclaimConsumerLive = true
+	// Declared for the OTHER target only: still nothing, because deletion authority is per
+	// subsystem. This is the assertion the single-target fixtures could not make.
+	p.cfg.Provisioning.ReclaimTargets = []string{TargetDrive}
+	p.purgeProvisioningJobs()
+	assert.Equal(t, 1, countAllProvisioningRows(t),
+		"drive declaring a consumer deleted a fleet row: one subsystem authorized forgetting another's")
+
+	// Declared for this target: the purge proceeds.
+	p.cfg.Provisioning.ReclaimTargets = []string{TargetFleet}
 	p.purgeProvisioningJobs()
 	assert.Zero(t, countAllProvisioningRows(t))
 }
@@ -1041,10 +1147,77 @@ func TestPurgeOnlyDeletesDisbandPendingRows(t *testing.T) {
 		).Exec()
 		require.NoError(t, err)
 	}
-	deleted, err := testDB.purgeFinishedProvisioningJobs(time.Now().UTC().Add(-provisioningRetention), 100)
+	deleted, err := testDB.purgeFinishedProvisioningJobs(
+		[]string{TargetFleet}, time.Now().UTC().Add(-provisioningRetention), 100)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), deleted)
-	assert.Equal(t, 2, countAllProvisioningRows(t))
+	// Cardinality alone is vacuous here: a purge that deleted the `ready` row instead also
+	// leaves 1 deleted and 2 survivors. Assert WHICH statuses survived.
+	assert.ElementsMatch(t,
+		[]int{int(provisionStatusReady), int(provisionStatusAbandoned)},
+		survivingProvisioningStatuses(t),
+		"the purge deleted a status it must never touch")
+}
+
+// survivingProvisioningStatuses reads back the statuses still in the table, so a purge
+// assertion can name the rows rather than count them.
+//
+// []int, not []uint8: dbr scans a *[]uint8 as a byte slice, so the statuses came back as
+// their ASCII codes and the comparison silently compared the wrong thing.
+func survivingProvisioningStatuses(t *testing.T) []int {
+	t.Helper()
+	var statuses []int
+	_, err := testCtx.DB().SelectBySql("SELECT status FROM `octo_project_provisioning`").Load(&statuses)
+	require.NoError(t, err)
+	return statuses
+}
+
+// TestPurgeSparesRowsOfTargetsWithNoDeclaredReclaimConsumer is the mixed-target case the
+// single-target fixtures could not express.
+//
+// A live consumer is a PER-SUBSYSTEM deliverable — fleet and drive ship on different
+// teams' schedules, which is why everything else about a target here is per target. With a
+// process-global gate and a DELETE carrying no target predicate, fleet shipping its
+// consumer first silently authorized deleting drive's reclaim records too, 90 days later
+// and with no gauge for it: the D9 answer for those containers becomes permanently
+// `unknown`, which is indistinguishable from "outside your grant", so they can never be
+// reclaimed. Deletion is the only irreversible operation in this slice.
+func TestPurgeSparesRowsOfTargetsWithNoDeclaredReclaimConsumer(t *testing.T) {
+	_, p := setup(t)
+	old := time.Now().UTC().Add(-2 * provisioningRetention)
+	for i, target := range []string{TargetFleet, TargetDrive} {
+		containerID, err := newContainerID(target)
+		require.NoError(t, err)
+		_, err = testCtx.DB().InsertBySql(
+			"INSERT INTO `octo_project_provisioning` "+
+				"(project_id, space_id, target, container_id, status, next_attempt_at, created_at, finished_at) "+
+				"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			fmt.Sprintf("mixed-%d", i), spaceA, target, containerID,
+			provisionStatusDisbandPending, old, old, old,
+		).Exec()
+		require.NoError(t, err)
+	}
+	require.Equal(t, 2, countAllProvisioningRows(t))
+
+	// Only fleet has a consumer. Drive's row is equally old and equally eligible by every
+	// other predicate, so it isolates the target clause.
+	p.cfg.Provisioning.ReclaimTargets = []string{TargetFleet}
+	p.purgeProvisioningJobs()
+
+	remaining := readProvisioningTargets(t)
+	assert.Equal(t, []string{TargetDrive}, remaining,
+		"the purge deleted reclaim records for a target whose consumer nobody declared live")
+}
+
+// readProvisioningTargets lists the targets still present, so a purge assertion can name
+// whose rows survived rather than count them.
+func readProvisioningTargets(t *testing.T) []string {
+	t.Helper()
+	var targets []string
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT target FROM `octo_project_provisioning` ORDER BY target").Load(&targets)
+	require.NoError(t, err)
+	return targets
 }
 
 // ---------- metrics ----------
@@ -1161,6 +1334,56 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		drive, ok := cfg.TargetByName(TargetDrive)
 		require.True(t, ok)
 		assert.False(t, drive.Narrowed)
+	})
+
+	// The reclaim switches are the gate on the one irreversible statement in the slice, and
+	// every other assertion about them sets the struct field directly — so nothing pinned
+	// that the env NAMES are read at all. A typo in either constant fails safe (the purge
+	// stays off) but silently, and silently-off is exactly the state an operator would
+	// believe they had left.
+	//
+	// The env names are spelled out as LITERALS here, not referenced through the constants.
+	// Keying the fixture with the same constant the code reads is a tautology: renaming or
+	// mistyping the constant renames it on both sides and the test stays green — measured,
+	// by mutating the drive constant to a name ending in _LIV and watching this pass. These
+	// literals are the deployed contract (a configmap key, not a Go identifier), so a
+	// literal is what the assertion has to be made of.
+	t.Run("reclaim consumers resolve per target from their own envs", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			"OCTO_PROJECT_PROVISION_DRIVE_RECLAIM_CONSUMER_LIVE": "true",
+		}))
+		require.Empty(t, problems)
+		assert.Equal(t, []string{TargetDrive}, cfg.ReclaimTargets,
+			"the per-target reclaim env did not resolve, or resolved for the wrong target")
+
+		both, problems := loadProvisioningConfig(env(map[string]string{
+			"OCTO_PROJECT_PROVISION_FLEET_RECLAIM_CONSUMER_LIVE": "true",
+			"OCTO_PROJECT_PROVISION_DRIVE_RECLAIM_CONSUMER_LIVE": "true",
+		}))
+		require.Empty(t, problems)
+		assert.Equal(t, []string{TargetFleet, TargetDrive}, both.ReclaimTargets)
+	})
+
+	// Read WITHOUT any target enabled on purpose: a target switched off after use still has
+	// containers whose reclaim accounting its live consumer must be able to finish, so this
+	// has to resolve past the empty-target-list early return.
+	t.Run("reclaim consumers resolve with no target enabled", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			"OCTO_PROJECT_PROVISION_FLEET_RECLAIM_CONSUMER_LIVE": "true",
+		}))
+		require.Empty(t, problems)
+		require.False(t, cfg.Enabled())
+		assert.Equal(t, []string{TargetFleet}, cfg.ReclaimTargets)
+	})
+
+	t.Run("the retired process-global reclaim env is refused, not ignored", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			"OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE": "true",
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE")
+		assert.Empty(t, cfg.ReclaimTargets,
+			"the retired global switch must not authorize purging any target")
 	})
 
 	t.Run("a bad target is dropped, not fatal", func(t *testing.T) {

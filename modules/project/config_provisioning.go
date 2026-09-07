@@ -73,8 +73,8 @@ const (
 	envProvisionFleetNarrowed = "OCTO_PROJECT_PROVISION_FLEET_NARROWED"
 	envProvisionDriveNarrowed = "OCTO_PROJECT_PROVISION_DRIVE_NARROWED"
 
-	// envProvisionReclaimConsumerLive states that a consumer is actually polling the D9
-	// status endpoint, and it GATES THE PURGE.
+	// envProvision*ReclaimConsumerLive states, PER TARGET, that a consumer is actually
+	// polling the D9 status endpoint, and it GATES THE PURGE OF THAT TARGET'S ROWS.
 	//
 	// The retention window is justified as a reclaim window — the subsystem learns about a
 	// disband by polling POST /v1/internal/projects/status — and that endpoint does not
@@ -86,8 +86,30 @@ const (
 	// irreversible operation in this slice, so it is the one thing that must not run on an
 	// assumption.
 	//
+	// PER TARGET, and not one process-global switch, because a consumer is a per-subsystem
+	// deliverable: fleet and drive land on different teams' schedules, which is why every
+	// other subsystem fact here (enablement, URL, secret, narrowing) is already per target.
+	// A global switch means the FIRST subsystem to ship a consumer authorizes deletion of
+	// the OTHER one's reclaim records — an irreversible loss, for a target whose consumer
+	// nobody claimed was live, on the rollout order the runbook actually prescribes.
+	//
+	// Read for every KNOWN target rather than every ENABLED one, deliberately: a target
+	// that was enabled, produced rows and was then disabled still has reclaimable
+	// containers on the other side, and its live consumer must still be able to finish
+	// sweeping them. Enablement governs what we CREATE; this governs what we may FORGET.
+	//
 	// Default OFF: retained rows cost storage, an un-reclaimable container is a leak.
-	envProvisionReclaimConsumerLive = "OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE"
+	envProvisionFleetReclaimConsumerLive = "OCTO_PROJECT_PROVISION_FLEET_RECLAIM_CONSUMER_LIVE"
+	envProvisionDriveReclaimConsumerLive = "OCTO_PROJECT_PROVISION_DRIVE_RECLAIM_CONSUMER_LIVE"
+
+	// envProvisionRetiredReclaimConsumerLive is the process-global predecessor of the two
+	// switches above. It is READ ONLY TO REFUSE IT.
+	//
+	// Silently ignoring it would fail in the safe direction (the purge stays off, rows are
+	// retained) but silently: an operator who had followed an earlier revision of the
+	// runbook would believe reclaim accounting was being pruned when it was not. Cheaper to
+	// name it once at boot than to explain a growing table later.
+	envProvisionRetiredReclaimConsumerLive = "OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE"
 
 	envProvisionInterval    = "OCTO_PROJECT_PROVISION_INTERVAL"
 	envProvisionTimeout     = "OCTO_PROJECT_PROVISION_TIMEOUT"
@@ -192,10 +214,14 @@ type ProvisioningConfig struct {
 	Timeout     time.Duration
 	MaxAttempts uint32
 	BatchSize   int
-	// ReclaimConsumerLive gates the retention purge. See envProvisionReclaimConsumerLive —
-	// with no consumer polling, purging a disband_pending row makes its container
-	// permanently un-reclaimable.
-	ReclaimConsumerLive bool
+	// ReclaimTargets is the set of target names whose reclaim consumer the operator has
+	// declared live, and it is the ONLY set whose disband_pending rows the purge may
+	// delete. See envProvision*ReclaimConsumerLive — with no consumer polling, purging a
+	// disband_pending row makes its container permanently un-reclaimable.
+	//
+	// Deliberately NOT a subset of Targets: enablement governs what we create, this governs
+	// what we may forget, and a target disabled after use still has containers to reclaim.
+	ReclaimTargets []string
 }
 
 // Enabled reports whether any target is live. When false, createProjectOnce
@@ -250,10 +276,18 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		Timeout:     timeout,
 		MaxAttempts: maxAttempts,
 		BatchSize:   envPositiveIntFrom(getenv, envProvisionBatch, defaultProvisionBatch),
-		// Read unconditionally: the purge is scheduled independently of which targets are
-		// enabled, so this has to resolve even with an empty target list.
-		ReclaimConsumerLive: envBoolFrom(getenv, envProvisionReclaimConsumerLive, false),
 	}
+	// Resolved BEFORE the empty-target-list early return, and over every known target
+	// rather than the enabled ones, because the purge must still be able to finish the
+	// reclaim accounting for a target that has since been switched off while another is
+	// still enabled. Enablement decides what gets created; this decides what may be deleted.
+	// (With NOTHING enabled the purge tick is not scheduled at all — startProvisioningWorker
+	// records why that boundary is there. This value still has to resolve, so that the
+	// retired-env refusal below is reported on a rolled-back deployment too.)
+	reclaimTargets, reclaimProblems := resolveReclaimTargets(getenv)
+	cfg.ReclaimTargets = reclaimTargets
+	problems = append(problems, reclaimProblems...)
+
 	requested := parseTargetList(getenv(envProvisionTargets))
 	if len(requested) == 0 {
 		cfg.Problems = problems
@@ -262,21 +296,21 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 
 	secrets := map[string]string{}
 	for _, name := range requested {
-		urlEnv, secretEnv, narrowedEnv, ok := targetEnvNames(name)
+		envs, ok := targetEnvNames(name)
 		if !ok {
 			problems = append(problems, fmt.Errorf("project provisioning: unknown target %q in %s", name, envProvisionTargets))
 			cfg.Misconfigured = append(cfg.Misconfigured, name)
 			continue
 		}
-		secret := getenv(secretEnv)
+		secret := getenv(envs.secret)
 		target := provisionTarget{
 			Target: projectprovision.Target{
 				Name:      name,
-				EnsureURL: strings.TrimSpace(getenv(urlEnv)),
+				EnsureURL: strings.TrimSpace(getenv(envs.url)),
 				Secret:    secret,
 				Timeout:   cfg.Timeout,
 			},
-			Narrowed: envBoolFrom(getenv, narrowedEnv, false),
+			Narrowed: envBoolFrom(getenv, envs.narrowed, false),
 		}
 		if err := projectprovision.ValidateTarget(target.Target); err != nil {
 			problems = append(problems, err)
@@ -360,18 +394,72 @@ func checkSecretExclusivity(getenv func(string) string, name, secret string, alr
 	return nil
 }
 
-// targetEnvNames maps a target name to its three envs. A switch rather than
-// string concatenation so an unknown name is rejected instead of silently
-// resolving to three envs nobody sets.
-func targetEnvNames(name string) (urlEnv, secretEnv, narrowedEnv string, ok bool) {
+// provisionTargetEnvs is the env set that belongs to one target. A struct rather than
+// four return values: the group only grows, and positional returns of the same type are
+// exactly how a url ends up read out of a secret env.
+type provisionTargetEnvs struct {
+	url                 string
+	secret              string
+	narrowed            string
+	reclaimConsumerLive string
+}
+
+// allProvisionTargetNames is every target this build knows about, enabled or not.
+//
+// The purge and the misconfiguration census both need to reason about a target that is
+// absent from OCTO_PROJECT_PROVISION_TARGETS, so the known set cannot be derived from the
+// enabled set.
+func allProvisionTargetNames() []string { return []string{TargetFleet, TargetDrive} }
+
+// targetEnvNames maps a target name to its envs. A switch rather than string
+// concatenation so an unknown name is rejected instead of silently resolving to a set of
+// envs nobody sets.
+func targetEnvNames(name string) (provisionTargetEnvs, bool) {
 	switch name {
 	case TargetFleet:
-		return envProvisionFleetURL, ProvisionFleetSecretEnv, envProvisionFleetNarrowed, true
+		return provisionTargetEnvs{
+			url:                 envProvisionFleetURL,
+			secret:              ProvisionFleetSecretEnv,
+			narrowed:            envProvisionFleetNarrowed,
+			reclaimConsumerLive: envProvisionFleetReclaimConsumerLive,
+		}, true
 	case TargetDrive:
-		return envProvisionDriveURL, ProvisionDriveSecretEnv, envProvisionDriveNarrowed, true
+		return provisionTargetEnvs{
+			url:                 envProvisionDriveURL,
+			secret:              ProvisionDriveSecretEnv,
+			narrowed:            envProvisionDriveNarrowed,
+			reclaimConsumerLive: envProvisionDriveReclaimConsumerLive,
+		}, true
 	default:
-		return "", "", "", false
+		return provisionTargetEnvs{}, false
 	}
+}
+
+// resolveReclaimTargets reads the per-target reclaim switches and refuses the retired
+// process-global one.
+//
+// Iterates allProvisionTargetNames, NOT the enabled list: see
+// envProvision*ReclaimConsumerLive. Order is the fixed order of that list, so the
+// resulting IN () predicate is stable across processes.
+func resolveReclaimTargets(getenv func(string) string) (targets []string, problems []error) {
+	for _, name := range allProvisionTargetNames() {
+		envs, ok := targetEnvNames(name)
+		if !ok {
+			continue
+		}
+		if envBoolFrom(getenv, envs.reclaimConsumerLive, false) {
+			targets = append(targets, name)
+		}
+	}
+	if strings.TrimSpace(getenv(envProvisionRetiredReclaimConsumerLive)) != "" {
+		problems = append(problems, fmt.Errorf(
+			"project provisioning: %s is retired and IGNORED; it was replaced by the per-target %s / %s "+
+				"because one subsystem declaring a live consumer must not authorize deleting the other's "+
+				"reclaim records. The retention purge stays OFF for any target without its own switch",
+			envProvisionRetiredReclaimConsumerLive,
+			envProvisionFleetReclaimConsumerLive, envProvisionDriveReclaimConsumerLive))
+	}
+	return targets, problems
 }
 
 // parseTargetList splits and normalizes the target list, dropping blanks and

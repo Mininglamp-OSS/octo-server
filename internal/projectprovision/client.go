@@ -49,7 +49,7 @@
 // and the first two clauses have no enforcement on this side at all:
 //
 //  1. **Verify the signature** over the canonical string
-//     (internal/octosign.CanonicalRequest), using the shared per-target
+//     (pkg/octosign.CanonicalRequest), using the shared per-target
 //     secret. An unsigned or wrongly-signed request must be refused.
 //  2. **Reject a stale timestamp.** X-Octo-Timestamp is inside the signed string,
 //     so it cannot be tampered with, but nothing stops a captured request from
@@ -239,6 +239,19 @@ func ValidateTarget(t Target) error {
 		// that reports the observed length is a (small) oracle in a log.
 		return fmt.Errorf("projectprovision: %s secret must be at least %d bytes", t.Name, minSecretBytes)
 	}
+	if isPublishedConformanceSecret(t.Secret) {
+		// The conformance vectors ship real, working secrets in a source file of a public
+		// repository, and both are long enough to clear the floor above — so an operator who
+		// copies one into OCTO_PROJECT_PROVISION_*_SECRET to "try it out" boots clean holding
+		// a published HMAC key. conformanceTamperedBody is literally the forgery that key
+		// authorises: a valid signature over an attacker-chosen project_id. The MAC is the
+		// load-bearing layer here precisely because ValidateTarget declines to require TLS.
+		//
+		// Compared with subtle.ConstantTimeCompare for consistency with how the rest of this
+		// package treats secret material, not because a timing signal would matter: the
+		// values being compared against are already public.
+		return fmt.Errorf("projectprovision: %s secret is a published conformance vector secret; generate a real one", t.Name)
+	}
 	parsed, err := url.Parse(t.EnsureURL)
 	if err != nil {
 		return fmt.Errorf("projectprovision: %s ensure url is not parseable", t.Name)
@@ -286,7 +299,7 @@ type Client struct {
 // it without a network, which is the only reason they are parameters.
 //
 // Proxy is cleared and redirects are refused, for the same two reasons
-// pkg/octosign/http.go clears them: the destinations are exact,
+// internal/cardactiondispatch/http.go clears them: the destinations are exact,
 // operator-registered URLs, so honouring HTTP(S)_PROXY would let a
 // deployment-level setting redirect provisioning traffic, and following a
 // redirect would re-send the signed body to a host the signature was not

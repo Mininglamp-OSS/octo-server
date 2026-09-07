@@ -217,7 +217,7 @@ UTC 时钟两侧一致；`attempts` 恰好一次自增；`truncateProvisioningEr
 | | 问题 | 处置 | 变异验证 |
 |---|---|---|---|
 | **P1-A(2)** | 「P1 的三处修正」里我只修了 heartbeat 那一条声称，**漏了 purge 不 drain** —— 代码是每小时一条固定 `DELETE ... LIMIT 1000`，正是 #797 标记过的形状；#846 的 `purgeRemovalJobs` 有现成 drain 循环 | 改成 drain（循环到短批为止）+ 每 tick 总量上限，撞上限打 Warn（那才是「保留策略跑不过 churn」的信号，固定上限会把它藏起来） | 退回单批 → 新测试 FAIL |
-| **retention × PR-2** | 90 天 retention 的理由是「子系统靠轮询 D9 端点得知解散」，而**那个端点在本仓不存在**（就是 PR-2）。开启后时钟就开始走，一旦 purge 掉 `disband_pending`，状态答案永久变 `unknown` —— 而 D9 让它与「不在你的 grant 内」不可区分，容器**永远无法回收** | 新增 `OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE`（默认 off）**门住 purge**。删行是本片唯一不可逆操作，不能跑在假设上；留行只花存储，漏容器是泄漏 | 门控测试双向 |
+| **retention × PR-2** | 90 天 retention 的理由是「子系统靠轮询 D9 端点得知解散」，而**那个端点在本仓不存在**（就是 PR-2）。开启后时钟就开始走，一旦 purge 掉 `disband_pending`，状态答案永久变 `unknown` —— 而 D9 让它与「不在你的 grant 内」不可区分，容器**永远无法回收** | 新增 **per-target** 的 `OCTO_PROJECT_PROVISION_{FLEET,DRIVE}_RECLAIM_CONSUMER_LIVE`（均默认 off）**门住 purge**，且开关集合作为 `target IN (...)` 谓词穿进 DELETE。删行是本片唯一不可逆操作，不能跑在假设上；留行只花存储，漏容器是泄漏。**曾经是进程级布尔**，那样先交付消费方的子系统会顺带授权删掉另一个的回收账（上游复审判为阻塞项） | 门控测试双向 + fleet/drive 混合断言未声明 target 的行存活 |
 | **census 随 rollback 消失** | `refreshProvisioningMetrics` 原本在 `startProvisioningWorker` 里调度，共享同一个 early return —— 于是 runbook 的 rollback（清空 `TARGETS`）会在下次部署把**所有** provisioning gauge 一起带走，包括 runbook 承诺「保留」的 `pending` 积压 | 拆出 `startProvisioningMetrics`，**无条件调度**。rollback 恰恰是有人在盯这些数字的时候，而消失的 series 读起来就是 0 | gauge 测试加 rollback 后 census 断言 |
 | **sweep 覆盖 last_error** | sweep 用常量覆写 `last_error`，毁掉唯一的按行失败证据 —— 而且恰好在这条路径上（pod 被打死）连日志都没有，`plan.md §3.4` 还让人照着这个字段去判断要不要重排 | 改成**追加**（`LEFT(CONCAT(...), 255)` 防列宽超限 —— 超限会让 UPDATE 挂掉、行回到不可 sweep 状态，等于把僵尸换个层次复现） | 断言 sweep 后仍含 release 期的原因 |
 | **两个测试空洞** | reviewer 变异发现：删掉 `finishProvisioningJob` 的 `AND lease_owner = ?` **整包仍绿**（没有任何测试驱动过租约易主）；撤掉 sweep 的整租约宽限**也仍绿**（两个 fixture 都在窗口外，一个远过期一个未来） | 两个新测试：租约易主后陈旧执行者的终态写入必须落空；租约刚过期 30s（宽限窗口**内**）必须不被 sweep | 两个变异 → 两条 FAIL |
@@ -268,11 +268,33 @@ env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关�
    会自己暴露，而**时间戳校验写松了 fail open 且完全静默**，本仓没有任何东西能发现它。
    向量就是把「已评审」变成一个可执行动作。
 
-**`OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE`（默认 off）门住 retention purge。**
-只有当某个子系统**确实在轮询** `POST /v1/internal/projects/status`（= PR-2 已上线且有消费方）
-之后才置 true。在那之前 `disband_pending` 行只增不删 —— 这是有意的：删行之后状态答案永久
-变 `unknown`，D9 让它与「不在你的 grant 内」不可区分，那个容器就永远回收不了。留行只花
-存储，漏容器是泄漏。
+**retention purge 由 per-target 开关门住，两个都默认 off：**
+
+```bash
+OCTO_PROJECT_PROVISION_FLEET_RECLAIM_CONSUMER_LIVE=false
+OCTO_PROJECT_PROVISION_DRIVE_RECLAIM_CONSUMER_LIVE=false
+```
+
+**每个开关只授权删除它自己那个 target 的行** —— 开关集合是直接作为 `target IN (...)` 谓词
+穿进 DELETE 的，不是只在调用点做一次布尔判断。**只有当该子系统自己确实在轮询**
+`POST /v1/internal/projects/status`（= PR-2 已上线，且**这个** target 有消费方）之后，才置
+它自己那一个为 true。
+
+> **为什么必须 per-target。** 消费方是**按子系统**交付的：fleet 与 drive 归不同团队、排期
+> 不同，本切片里关于一个 target 的其它一切（启用、URL、secret、收窄声明）本来就都是
+> per-target 的。早期版本这里是一个进程级布尔，配一条不带 target 谓词的 DELETE ——
+> 于是**先交付消费方的那个子系统会顺带授权删掉另一个子系统的回收账**：90 天后那些行消失，
+> 状态答案永久变 `unknown`，D9 让它与「不在你的 grant 内」不可区分，容器永远回收不了；
+> 而删行是本切片**唯一不可逆**的操作，也没有「被删掉但未回收」的计量。上游复审把这条判为
+> 阻塞项，已改成 per-target（回归测试：`TestPurgeSparesRowsOfTargetsWithNoDeclaredReclaimConsumer`
+> 用 fleet/drive 混合行断言「未声明的那个 target 的行必须存活」）。
+
+在开关置 true 之前，该 target 的 `disband_pending` 行只增不删 —— 这是有意的：留行只花存储，
+漏容器是泄漏。
+
+> 旧的进程级 `OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE` **已退役**。它没有被静默忽略：
+> 配置加载期检测到它被设置就记一条 Error 级 problem（`resolveReclaimTargets`），因为
+> 「静默 off」正是操作者最可能误以为自己已经打开的状态。
 
 **两个 knob 有硬边界，越界会被拒绝并回落默认值**（配置加载期报 Error 日志）：
 
@@ -353,11 +375,52 @@ SELECT p.project_id, p.space_id, 'fleet',
 
 ### 3.5 回滚
 
-1. `OCTO_PROJECT_PROVISION_TARGETS=`（清空）+ 滚动重启 → 立刻停止入队与出网；已入队的
-   `pending` 行**保留**（认领带 target 过滤），重新打开就继续。
-2. 需要连表一起回退时：`DROP TABLE octo_project_provisioning`（migration 的 Down 段）。
-   此时必须先确认没有已创建的容器需要回收 —— 表被删掉之后本地就再也答不出
-   「哪些项目曾被预置进 drive」。
+**顺序是强制的：先退代码，再退表。** 中间那一步不能跳，理由见步骤 2 的方框。
+
+1. **停功能（不动表）**：`OCTO_PROJECT_PROVISION_TARGETS=`（清空）+ 滚动重启 → 立刻停止
+   入队与出网。已入队的 `pending` 行**保留**：认领和清扫都带 target 过滤，所以这些行既
+   不会被认领、也不会被清扫成终态 `abandoned`，重新打开开关就从原处继续。
+   `provisioning_rows` 计量与本表无关地继续发布，回滚期间照样能看到积压。
+
+   > 绝大多数回滚**到这里就该停**。这一步完全可逆、不丢任何回收账，也不需要任何 DBA 操作。
+
+2. **只有确实要连表一起回退时，才继续；而且必须按下面三步走。**
+
+   > ⚠️ **不要手工 `DROP TABLE`，也不要在旧二进制还在服务时动表。**
+   >
+   > 两个原因，都实测于本切片的代码：
+   >
+   > - **步骤 1 并不会停掉解散路径对本表的写入。** `disbandProjectTx` 里
+   >   `markProvisioningDisbandPendingTx` 是**无条件**调用的，而这个位置是**设计上正确
+   >   的、不该改**：若给它加 `Enabled()` 门，一个「曾启用 → 产出过行 → 后来关掉」的
+   >   target 就再也不会把自己的容器标成可回收，那是真泄漏。代价是：只要还有一个旧二进制
+   >   在服务，表一旦不存在，**每一次项目解散**都会拿到 `Error 1146` →
+   >   `disbandProjectOnce` 报错 → **500**，而且是在一条与被回滚功能毫无关系的路径上。
+   > - **手工 drop 不会自愈。** 迁移在启动时由 `pkg/db/mysql.go` 的
+   >   `migrate.Exec(..., migrate.Up)` 应用，手工 drop 会把 `gorp_migrations` 里
+   >   `20260907000001` 那条账本行留在原地 —— sql-migrate 认为它已应用，**重启不会重建
+   >   表**。解散会一直坏着，直到有人再手工删账本行。
+   >
+   > 三步：
+   >
+   > 1. **先把二进制回退**到不含本迁移的版本（或至少不含 `modules/project` 本切片的版本），
+   >    滚动重启完成、确认没有旧 Pod 还在服务。此时已经没有任何代码路径引用本表。
+   > 2. 再退表，**走 migration 的 Down 段，不要手工 DDL**：
+   >    ```bash
+   >    sql-migrate down -limit=1 -env=<env>   # 对应 20260907000001_project_provisioning.sql
+   >    ```
+   >    Down 段是 `DROP TABLE IF EXISTS octo_project_provisioning`，且 sql-migrate 会
+   >    **同时**删掉 `gorp_migrations` 里的账本行 —— 这正是手工 drop 缺的那一半，也是
+   >    「以后再上线时能重建」的前提。
+   > 3. 退表**之前**必须确认没有已创建的容器还需要回收：表一旦删掉，本地就再也答不出
+   >    「哪些项目曾被预置进 fleet/drive」。若还有，先按 §3.4.2 的口径把
+   >    `container_id` 导出留档。
+
+3. **回收账的时序约束**（与上面同一件事的另一面）：`disband_pending` 行的 90 天保留期是
+   一个**回收窗口**，而消费它的 `POST /v1/internal/projects/status` 在 PR-2 才落地。所以
+   在 PR-2 上线前就启用某个 target 的话，这些行会在 90 天后被删（如果那时该 target 的
+   per-target reclaim 开关已置 true），而中间从未有任何消费方能读到它们。参见 §3.3 的
+   per-target 开关说明 —— 默认 off 就是为了让这条时序约束**不需要靠人记住**。
 
 ---
 
