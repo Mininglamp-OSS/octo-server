@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 const (
@@ -18,11 +20,19 @@ const (
 	maxTextBytes        = 10 * 1024
 	maxURLBytes         = 2048
 
-	featureEnabledEnv          = "OCTO_DOCS_BOT_MENTION_ENABLED"
-	spaceAllowlistEnv          = "OCTO_DOCS_BOT_MENTION_SPACE_ALLOWLIST"
-	documentAllowlistEnv       = "OCTO_DOCS_BOT_MENTION_DOC_ALLOWLIST"
-	internalTokenEnv           = "OCTO_DOCS_BOT_MENTION_TOKEN"
-	internalTokenHeader        = "X-Internal-Token"
+	featureEnabledEnv    = "OCTO_DOCS_BOT_MENTION_ENABLED"
+	spaceAllowlistEnv    = "OCTO_DOCS_BOT_MENTION_SPACE_ALLOWLIST"
+	documentAllowlistEnv = "OCTO_DOCS_BOT_MENTION_DOC_ALLOWLIST"
+	// internalTokenEnv gates the doc-comment bot-mention ingress. Sourced
+	// from the shared registry so the name cannot drift from the entry that
+	// the cross-capability check compares against.
+	internalTokenEnv = internaltoken.BotMentionTokenEnv
+	// marketplaceInternalTokenEnv is modules/space.MarketplaceInternalTokenEnv;
+	// a local literal only until that env joins the registry (PR #853 follow-up).
+	marketplaceInternalTokenEnv = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
+	// internalTokenHeader is owned by pkg/internaltoken so the credential
+	// family has one spelling across every internal ingress.
+	internalTokenHeader        = internaltoken.Header
 	docCommentMentionEventType = "doc_comment_mention"
 
 	// docKindHTML 标记 doc_id 是 octo-doc 的 slug(HTML 文档),而不是 docs-backend 的 docId。
@@ -39,14 +49,14 @@ type mentionRequest struct {
 	// 「文档真的不存在」无法区分,靠试错回退会把后者误判成 HTML 再失败一次。
 	//
 	// 空 = 默认 docs-backend 文档(doc/sheet/board),与加这个字段之前的行为一致。
-	DocKind        string `json:"doc_kind,omitempty"`
-	CommentID      string `json:"comment_id"`
-	ParentID       string `json:"parent_id,omitempty"`
-	FromUID        string `json:"from_uid"`
-	BotUID         string `json:"bot_uid"`
-	Text           string `json:"text"`
-	URL            string `json:"url,omitempty"`
-	SpaceID        string `json:"space_id,omitempty"`
+	DocKind   string `json:"doc_kind,omitempty"`
+	CommentID string `json:"comment_id"`
+	ParentID  string `json:"parent_id,omitempty"`
+	FromUID   string `json:"from_uid"`
+	BotUID    string `json:"bot_uid"`
+	Text      string `json:"text"`
+	URL       string `json:"url,omitempty"`
+	SpaceID   string `json:"space_id,omitempty"`
 }
 
 type normalizedMention struct {
@@ -152,40 +162,28 @@ func mentionClaimLogHash(claimKey string) string {
 	return hex.EncodeToString(sum[:6])
 }
 
-// resolveBotMentionInternalToken loads OCTO_DOCS_BOT_MENTION_TOKEN and refuses
-// to enable the capability when it is unset or collides with a sibling *fixed*
-// internal-token env, so one leaked value can never grant two capabilities.
+// resolveBotMentionInternalToken loads OCTO_DOCS_BOT_MENTION_TOKEN through the
+// shared registry in pkg/internaltoken, which refuses the value when it is
+// unset or equal to the value of any env registered BEFORE it. That is more
+// than the two siblings this function used to know about by hand, and it grows
+// on its own; it is not symmetric, though — a capability registered after this
+// one is normally the side that yields.
 //
-// OCTO_MARKETPLACE_INTERNAL_TOKEN is the newest member of that set
-// (modules/space.MarketplaceInternalTokenEnv). modules/space rejects a value
-// shared with this module's token, so the branch below is the mirror-image
-// half: a deployment that sets one value for both fails BOTH capabilities
-// closed instead of picking an arbitrary winner. The other, pre-existing pairs
-// are left exactly as they were.
+// OCTO_MARKETPLACE_INTERNAL_TOKEN (#827) is the exception: it is registered
+// after this env, but that pair was deliberately made symmetric, so the
+// mirror-image branch below stays until the env is absorbed into the registry.
 //
-// The env names are duplicated as literals rather than imported from their
-// owning packages, matching modules/internal_resolve/config.go: no module
-// should take a production dependency on another just to learn a string.
-// config_test.go pins the spellings.
-//
-// Returned error messages are logger-safe (they never contain token values).
+// Refusal returns the empty string, which fails the ingress closed. Error
+// messages are logger-safe: env names only, never a token value.
 func resolveBotMentionInternalToken(getenv func(string) string) (string, error) {
-	if getenv == nil {
-		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN lookup unavailable; bot mention capability disabled")
+	token, err := internaltoken.Resolve(internalTokenEnv, getenv)
+	if err != nil {
+		return "", err
 	}
-	token := getenv(internalTokenEnv)
-	switch {
-	case token == "":
-		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN not set; internal bot mention API will reject all requests")
-	case token == getenv("NOTIFY_INTERNAL_TOKEN"):
-		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; bot mention capability disabled")
-	case token == getenv("OCTO_DOCS_NOTIFY_TOKEN"):
-		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; bot mention capability disabled")
-	case token == getenv("OCTO_MARKETPLACE_INTERNAL_TOKEN"):
+	if getenv(marketplaceInternalTokenEnv) == token {
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_MARKETPLACE_INTERNAL_TOKEN; bot mention capability disabled")
-	default:
-		return token, nil
 	}
+	return token, nil
 }
 
 type featureGate struct {

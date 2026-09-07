@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 // testInternalToken is 32 bytes so it clears the minInternalTokenBytes floor
@@ -410,32 +411,97 @@ func TestResolveDriveInternalTokenRejectsShortValue(t *testing.T) {
 }
 
 func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
-	// Use a 32-byte shared value so the length gate passes and we exercise
-	// the collision cases individually.
+	// Enumerate the shared registry rather than a hand-written sibling list.
+	//
+	// The registry guard is directional: the drive token yields to every env
+	// registered BEFORE it, and an env registered after it is covered from the
+	// other direction, by that junior capability disabling itself. Branching on
+	// the precedence index rather than asserting refusal against every sibling
+	// is what makes this test survive an appended Spec.
+	//
+	// OCTO_MARKETPLACE_INTERNAL_TOKEN is checked separately below: it is not in
+	// the registry yet, and #827 made that pair symmetric rather than
+	// precedence-ordered.
+	//
+	// Use a 32-byte shared value so the length gate passes and we exercise the
+	// collision path.
 	sharedSecret := strings.Repeat("s", minInternalTokenBytes)
-	cases := []struct {
-		name    string
-		sibling string
-	}{
-		{"notify", notifyInternalTokenEnv},
-		{"docs-notify", docsNotifyInternalToken},
-		{"bot-mention", botMentionInternalToken},
-		{"marketplace", marketplaceInternalToken},
+	envs := internaltoken.Envs()
+	subjectIndex := -1
+	for i, env := range envs {
+		if env == DriveInternalTokenEnv {
+			subjectIndex = i
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			getenv := func(k string) string {
-				if k == DriveInternalTokenEnv || k == tc.sibling {
-					return sharedSecret
-				}
-				return ""
+	if subjectIndex < 0 {
+		t.Fatalf("%s missing from internaltoken.Envs() = %v", DriveInternalTokenEnv, envs)
+	}
+	if subjectIndex == 0 {
+		t.Fatalf("%s is first in the registry, so it yields to nothing; this test would be vacuous",
+			DriveInternalTokenEnv)
+	}
+
+	seniors := 0
+	for siblingIndex, sibling := range envs {
+		if sibling == DriveInternalTokenEnv {
+			continue
+		}
+		getenv := func(k string) string {
+			if k == DriveInternalTokenEnv || k == sibling {
+				return sharedSecret
 			}
-			_, err := resolveDriveInternalToken(getenv)
-			if err == nil {
-				t.Fatalf("expected error when %s == %s", DriveInternalTokenEnv, tc.sibling)
+			return ""
+		}
+		if siblingIndex < subjectIndex {
+			seniors++
+			t.Run("yields_to_"+sibling, func(t *testing.T) {
+				token, err := resolveDriveInternalToken(getenv)
+				if err == nil {
+					t.Fatalf("expected a refusal when %s == the senior env %s", DriveInternalTokenEnv, sibling)
+				}
+				if token != "" {
+					t.Fatalf("token = %q on collision; must be empty so the auth middleware fails closed", token)
+				}
+				if !strings.Contains(err.Error(), sibling) {
+					t.Fatalf("reason %q must name the colliding env", err.Error())
+				}
+				if strings.Contains(err.Error(), sharedSecret) {
+					t.Fatalf("reason leaked the token value: %q", err.Error())
+				}
+			})
+			continue
+		}
+		t.Run("outranks_"+sibling, func(t *testing.T) {
+			token, err := resolveDriveInternalToken(getenv)
+			if err != nil {
+				t.Fatalf("unexpected refusal when the junior env %s duplicates this token: %v", sibling, err)
+			}
+			if token != sharedSecret {
+				t.Fatalf("token = %q, want the configured value", token)
 			}
 		})
 	}
+	if seniors == 0 {
+		t.Fatal("registry exposed no senior envs; the cross-capability guard would be vacuous")
+	}
+
+	// The marketplace pair is symmetric by #827's design, so it is asserted
+	// explicitly rather than through the precedence branches above.
+	t.Run("symmetric_"+marketplaceInternalToken, func(t *testing.T) {
+		getenv := func(k string) string {
+			if k == DriveInternalTokenEnv || k == marketplaceInternalToken {
+				return sharedSecret
+			}
+			return ""
+		}
+		token, err := resolveDriveInternalToken(getenv)
+		if err == nil {
+			t.Fatalf("expected a refusal when %s == %s", DriveInternalTokenEnv, marketplaceInternalToken)
+		}
+		if token != "" {
+			t.Fatalf("token = %q on collision; must be empty", token)
+		}
+	})
 }
 
 // TestMarketplaceInternalTokenLiteralMatchesSpaceConstant pins the duplicated

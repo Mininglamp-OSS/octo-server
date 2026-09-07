@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"go.uber.org/zap"
 )
 
@@ -51,7 +52,16 @@ func New(ctx *config.Context) *BotMention {
 	logger := log.NewTLog("BotMention")
 	token, tokenErr := resolveBotMentionInternalToken(os.Getenv)
 	if tokenErr != nil {
-		logger.Error(tokenErr.Error())
+		// An unset env is a normal deployment shape (the capability is simply
+		// not in use); a collision or an undersized value is an operator
+		// mistake that silently turns an ingress off. Logging both at ERROR
+		// teaches operators to ignore the level that carries the real ones.
+		var resolveErr *internaltoken.Error
+		if errors.As(tokenErr, &resolveErr) && resolveErr.Reason == internaltoken.ReasonUnset {
+			logger.Warn(tokenErr.Error())
+		} else {
+			logger.Error(tokenErr.Error())
+		}
 	}
 	return &BotMention{
 		robots:        robot.NewService(ctx),

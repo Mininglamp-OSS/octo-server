@@ -9,17 +9,25 @@ package internal_resolve_test
 // immediately (the review that produced this file, CHANGES_REQUESTED P1 on
 // PR #711, showed exactly that gap and this test pins it closed).
 //
+// These tests build the exclusion argument list the way main.go does — from
+// internaltoken.Values over the test's OWN getenv — rather than spelling out
+// the fixed envs by hand. Two reasons: a hand-written list would be the last
+// copy of the very thing pkg/internaltoken exists to own, and it silently
+// pinned a call shape main.go no longer uses. Feeding the test's getenv also
+// keeps the assertions off the ambient process environment, which the previous
+// os.Getenv("NOTIFY_INTERNAL_TOKEN") arguments were coupled to.
+//
 // External-package test (_test) so we consume only exported identifiers —
 // DriveInternalTokenEnv is exported for this reason.
 
 import (
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 // testValidRouteSpec is a locally-owned copy of the cardactiondispatch package
@@ -73,12 +81,7 @@ func TestDriveInternalTokenCollidesWithRouteNotifyToken(t *testing.T) {
 	// this argument list, the collision goes undetected and Registry
 	// silently authorizes a token holder to mint route notifications AND
 	// call resolve-bot-owner — the exact P1 hazard.
-	err = registry.ValidateNotifyTokenExclusions(
-		os.Getenv("NOTIFY_INTERNAL_TOKEN"),
-		os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"),
-		os.Getenv("OCTO_DOCS_BOT_MENTION_TOKEN"),
-		getenv(internal_resolve.DriveInternalTokenEnv),
-	)
+	err = registry.ValidateNotifyTokenExclusions(internaltoken.Values(getenv)...)
 	if err == nil {
 		t.Fatal("ValidateNotifyTokenExclusions() = nil; expected collision rejection " +
 			"when OCTO_DRIVE_INTERNAL_TOKEN == a route's notify_token_env value")
@@ -94,7 +97,10 @@ func TestDriveInternalTokenCollidesWithRouteNotifyToken(t *testing.T) {
 func TestDriveInternalTokenCollidesWithCallbackSecret(t *testing.T) {
 	spec := testValidRouteSpec()
 	spec.SecretEnv = "MY_ROUTE_SECRET"
-	// notify_token_env may point anywhere; we're testing the OTHER slot.
+	// notify_token_env may point anywhere; we're testing the OTHER slot. It is
+	// deliberately a registered fixed env here: Values now feeds every fixed
+	// env in, so this also covers the route-token slot being satisfied by a
+	// fixed env without masking the callback-secret collision below.
 	spec.NotifyTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
 
 	// Drive token equals the ROUTE'S CALLBACK SECRET.
@@ -114,10 +120,7 @@ func TestDriveInternalTokenCollidesWithCallbackSecret(t *testing.T) {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
 
-	err = registry.ValidateNotifyTokenExclusions(
-		"", "", "",
-		getenv(internal_resolve.DriveInternalTokenEnv),
-	)
+	err = registry.ValidateNotifyTokenExclusions(internaltoken.Values(getenv)...)
 	if err == nil {
 		t.Fatal("ValidateNotifyTokenExclusions() = nil; expected collision rejection " +
 			"when OCTO_DRIVE_INTERNAL_TOKEN == a route's callback secret env value")
@@ -147,10 +150,7 @@ func TestDriveInternalTokenPassesWhenUniqueAcrossDynamicRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
-	err = registry.ValidateNotifyTokenExclusions(
-		"", "", "",
-		getenv(internal_resolve.DriveInternalTokenEnv),
-	)
+	err = registry.ValidateNotifyTokenExclusions(internaltoken.Values(getenv)...)
 	if err != nil {
 		t.Fatalf("ValidateNotifyTokenExclusions() = %v; expected nil for a unique drive token", err)
 	}
