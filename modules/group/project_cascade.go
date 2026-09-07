@@ -240,8 +240,18 @@ func (g *Group) handOverProjectGroupIfCreator(groupNo string, removal projectmod
 	if err != nil {
 		return false, false, fmt.Errorf("group: GenSeq for successor: %w", err)
 	}
-	if err := g.db.UpdateMemberRoleTx(groupNo, successor, MemberRoleCreator, successorVersion, tx); err != nil {
+	promoted, err := g.db.updateMemberRoleIfLiveTx(tx, groupNo, successor, MemberRoleCreator, successorVersion)
+	if err != nil {
 		return false, false, fmt.Errorf("group: promote successor: %w", err)
+	}
+	if !promoted {
+		// The successor row was picked under FOR UPDATE, so reaching this is a
+		// bug rather than a race — but it MUST NOT fall through to the demote.
+		// A demote on top of a promotion that landed nowhere is how a group ends
+		// up with no creator at all, silently, with the cascade logging success.
+		// Returning an error rolls the transaction back and re-drives the job.
+		return false, false, fmt.Errorf(
+			"group: promote successor %s in %s affected no live member row", successor, groupNo)
 	}
 	departingVersion, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {
