@@ -16,6 +16,7 @@ package project
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -95,6 +96,32 @@ func TestP1ReconcileQueriesAreBounded(t *testing.T) {
 // accumulate it put LIMIT back to bounding rows RETURNED rather than examined.
 var whereMustNotFilterOn = []string{"status"}
 
+// innerJoinOnExemptions declares, per predicate, why it is allowed to sit in an
+// INNER JOIN's ON clause.
+//
+// The WHERE check above was, on its own, a claim the guard did not check: for
+// cost purposes an INNER JOIN's ON clause filters base rows exactly as WHERE
+// does, so moving a predicate from one to the other satisfies the rule while
+// changing nothing. Raised by PR #846's review as P2-3.
+//
+// LEFT JOINs are a different matter and are deliberately not inspected: a LEFT
+// JOIN's ON clause cannot eliminate a base row, only decide whether the right
+// side is NULL. That is why `jobp.status = 0` / `jobs.status = 0` are fine where
+// they are, and why the rule has to distinguish the two join kinds rather than
+// banning a needle everywhere it appears.
+// goStringGlue matches the `" +` … `"` (optionally with a // comment line in
+// between) that separates adjacent fragments of one SQL string in the source.
+var goStringGlue = regexp.MustCompile(`"\s*\+\s*(?://[^\n]*\n\s*)*"`)
+
+var innerJoinOnExemptions = map[string]string{
+	"gm.is_deleted = 0": "moving it into the flag makes every soft-deleted member row a " +
+		"base row — the whole tombstone history walked each tick, which is worse than " +
+		"what the rule is protecting against",
+	"gm.status = 1": "rides the same group_member.group_no index lookup as the join key " +
+		"itself, so it costs nothing where it is; in the flag it would widen the base " +
+		"page by every blacklisted member",
+}
+
 // TestP1PagedQueriesUseTheFlagOverBasePageShape is the cost guard's rule,
 // applied to reconcile_p1.go.
 func TestP1PagedQueriesUseTheFlagOverBasePageShape(t *testing.T) {
@@ -130,5 +157,55 @@ func TestP1PagedQueriesUseTheFlagOverBasePageShape(t *testing.T) {
 				"%s must not filter on %q in its WHERE clause — put it in the violating "+
 					"flag: %s", fn, banned, where)
 		}
+
+		for _, on := range innerJoinOnClauses(body) {
+			stripped := on
+			for exempt := range innerJoinOnExemptions {
+				stripped = strings.ReplaceAll(stripped, exempt, "")
+			}
+			for _, banned := range whereMustNotFilterOn {
+				assert.NotContains(t, stripped, banned,
+					"%s filters on %q in an INNER JOIN's ON clause, which bounds base rows "+
+						"exactly as WHERE does — put it in the violating flag, or add it to "+
+						"innerJoinOnExemptions with the reason: %s", fn, banned, on)
+			}
+		}
+	}
+}
+
+// innerJoinOnClauses returns the ON clause of each INNER JOIN in the body, with
+// the Go concatenation glue removed so a clause split across source lines reads
+// as one.
+//
+// A clause ends at the next JOIN, WHERE, ORDER BY or the end of the statement.
+// LEFT JOINs are skipped for the reason innerJoinOnExemptions gives.
+func innerJoinOnClauses(body string) []string {
+	// Collapse the Go string concatenation glue (and the comments that sit
+	// between the fragments) so a clause split across source lines reads as one —
+	// otherwise an exemption that happens to straddle a line break would not
+	// match and the guard would report it as a violation.
+	flat := goStringGlue.ReplaceAllString(body, "")
+	flat = strings.ReplaceAll(flat, "\n", " ")
+
+	var out []string
+	rest := flat
+	for {
+		i := strings.Index(rest, "INNER JOIN ")
+		if i < 0 {
+			return out
+		}
+		rest = rest[i+len("INNER JOIN "):]
+		on := strings.Index(rest, " ON ")
+		if on < 0 {
+			return out
+		}
+		clause := rest[on:]
+		end := len(clause)
+		for _, stop := range []string{"INNER JOIN ", "LEFT JOIN ", "RIGHT JOIN ", "WHERE ", "ORDER BY "} {
+			if j := strings.Index(clause, stop); j >= 0 && j < end {
+				end = j
+			}
+		}
+		out = append(out, clause[:end])
 	}
 }
