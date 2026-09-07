@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
+	"github.com/Mininglamp-OSS/octo-server/pkg/octosign"
 )
 
 const testSecret = "0123456789abcdef0123456789abcdef" // 32 bytes, the configured minimum
@@ -23,7 +23,7 @@ func testTarget(url string) Target {
 // implement: the same v1 HMAC over the same canonical string as a card-action
 // callback, with the container id in the eventID slot.
 //
-// Verified with cardactiondispatch.Verify rather than by re-deriving the hex here,
+// Verified with octosign.Verify rather than by re-deriving the hex here,
 // because the point of reusing that package is that a receiver can verify with the
 // code it already has — a hand-rolled expectation in this test could agree with
 // itself while disagreeing with Verify.
@@ -59,19 +59,51 @@ func TestEnsureSignsTheCanonicalRequest(t *testing.T) {
 	if resp.ContainerID != "octows-deadbeef" {
 		t.Fatalf("container id = %q", resp.ContainerID)
 	}
-	if gotEventID != "octows-deadbeef" {
-		t.Errorf("%s = %q; the container id is the idempotency key and must ride in the eventID slot", HeaderEventID, gotEventID)
+	// The header must carry the HASH, never the container id itself: headers get
+	// picked up by reverse-proxy log formats and APM agents in a way request bodies do
+	// not, and until R2/R3 land the id is a capability. This is the regression guard for
+	// that — the body still carries the real id, which is where the receiver reads it.
+	if gotEventID == "octows-deadbeef" {
+		t.Errorf("%s carries the raw container id; a capability must not travel in a header", HeaderEventID)
 	}
-	if !cardactiondispatch.Verify(testSecret, gotSignature, http.MethodPost, gotPath, gotTimestamp, gotEventID, gotBody) {
+	if want := containerEventID("octows-deadbeef"); gotEventID != want {
+		t.Errorf("%s = %q, want sha256(container_id) = %q — the receiver recomputes this to verify",
+			HeaderEventID, gotEventID, want)
+	}
+	if !strings.Contains(string(gotBody), "octows-deadbeef") {
+		t.Error("the body no longer carries the real container id; the receiver has nothing to key on")
+	}
+	if !octosign.Verify(testSecret, gotSignature, http.MethodPost, gotPath, gotTimestamp, gotEventID, gotBody) {
 		t.Errorf("signature %q does not verify against the canonical request", gotSignature)
 	}
-	if !cardactiondispatch.Verify(testSecret, gotSignature, http.MethodPost, gotPath, gotTimestamp, gotEventID, gotBody) {
+	if !octosign.Verify(testSecret, gotSignature, http.MethodPost, gotPath, gotTimestamp, gotEventID, gotBody) {
 		return
 	}
 	// A different secret must not verify — otherwise the assertion above would pass
 	// for a client that signed with an empty key.
-	if cardactiondispatch.Verify(testSecret+"x", gotSignature, http.MethodPost, gotPath, gotTimestamp, gotEventID, gotBody) {
+	if octosign.Verify(testSecret+"x", gotSignature, http.MethodPost, gotPath, gotTimestamp, gotEventID, gotBody) {
 		t.Error("signature verified under the wrong secret; the guard above is vacuous")
+	}
+}
+
+// TestContainerEventIDIsAOneWayStableDerivation pins the two properties the receiver
+// and the outbox each depend on: stable across replays of the same job (so the
+// canonical string does not change), and one-way (so a proxy log holding the value
+// does not hold the capability).
+func TestContainerEventIDIsAOneWayStableDerivation(t *testing.T) {
+	const id = "octows-cafebabecafebabecafebabecafebabe"
+	first, second := containerEventID(id), containerEventID(id)
+	if first != second {
+		t.Fatalf("not deterministic: %q vs %q", first, second)
+	}
+	if strings.Contains(first, id) || strings.Contains(id, first) {
+		t.Errorf("the derived event id %q still contains the container id", first)
+	}
+	if first == containerEventID(id+"x") {
+		t.Error("two different container ids derived the same event id")
+	}
+	if len(first) != 64 {
+		t.Errorf("event id length = %d, want 64 hex chars", len(first))
 	}
 }
 

@@ -72,9 +72,23 @@ func (d *DB) enqueueProvisioningTx(tx *dbr.Tx, projectID, spaceID string, target
 		"(project_id, space_id, target, container_id, status, next_attempt_at, created_at) VALUES " +
 		strings.Join(placeholders, ",")
 	if _, err := tx.InsertBySql(sql, args...).Exec(); err != nil {
+		// A duplicate key on uk_octo_project_provisioning_container is the one failure
+		// whose MySQL message embeds the container id verbatim
+		// ("Duplicate entry 'octows-...' for key ..."), and the caller logs this chain
+		// with zap.Error — so passing it through would put a capability in a log line.
+		// It needs a 128-bit collision to happen at all (every attempt mints a fresh id,
+		// so a retry never reuses one), but "essentially unreachable" is not the same as
+		// "cannot happen", and the zap-field guard cannot see a leak that arrives through
+		// an error string. Replaced with a fixed summary; the row is identifiable from
+		// project_id, which the caller already logs.
+		if isDuplicateKeyErr(err) {
+			return errors.Join(errProvisioningEnqueueFailed,
+				errors.New("project: provisioning row already exists for this project and target"))
+		}
 		// errors.Join, not fmt.Errorf: the caller classifies on
 		// errProvisioningEnqueueFailed for the metric label while the underlying cause
-		// stays in the chain for the log line.
+		// stays in the chain for the log line. errors.As still reaches the
+		// *mysql.MySQLError underneath, so retryOnLockConflict keeps retrying 1205/1213.
 		return errors.Join(errProvisioningEnqueueFailed, err)
 	}
 	return nil
@@ -316,7 +330,11 @@ func (d *DB) purgeFinishedProvisioningJobs(before time.Time, limit int) (int64, 
 	if limit <= 0 {
 		return 0, nil
 	}
-	result, err := d.session.UpdateBySql(
+	// DeleteBySql, not UpdateBySql. modules/space's equivalent sends its DELETE through
+	// UpdateBySql and it works, but dbr has the right builder and this repo already uses
+	// it (modules/conversation_ext) — a DELETE spelled as an update is a thing every
+	// future reader has to stop and re-read.
+	result, err := d.session.DeleteBySql(
 		"DELETE FROM `octo_project_provisioning` "+
 			"WHERE status = ? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
 		provisionStatusDisbandPending, before, limit,

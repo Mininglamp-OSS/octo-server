@@ -136,6 +136,28 @@ master key 加密 —— 等于在测试里重写一遍 `modules/common.insertAp
 变异验证：往 `modules/user/api.go` 里塞一条读该表的 SQL 常量，守卫 FAIL 并点名该文件；
 恢复后 PASS。守卫还带扫描文件数下限（<100 即 Fatal），所以遍历失效不会静默变绿。
 
+### 2.4 自审（/code-review）后修掉的 9 项
+
+复审在自己的代码上找出 2 个 HIGH、3 个 MEDIUM、4 个 LOW，全部已修并各自补了变异验证。
+两个 HIGH 都是「文档/指标说的和代码做的不一致」这一类 —— 不是崩溃，但会把运维引向错误结论：
+
+| 编号 | 问题 | 修法 | 变异验证 |
+|---|---|---|---|
+| **H-1** | `provisioning_attempts_total` 同时漏计与重复计：`panic` / `target_disabled` 两条路径 0 次增量，而耗尽预算的那次增量记两次（真实 outcome + `"abandoned"`）。后果是 `sum by(outcome)` ≠ 尝试次数，且一个每次都 panic 的 job 在这个 counter 里直到放弃前完全不可见 | 增量点收敛到 `releaseOrAbandon` 唯一一处，label 用真实 outcome；删掉 `"abandoned"` outcome（该问题由 `provisioning_rows{status="abandoned"}` gauge 回答） | 退回旧形态 → 三条测试 FAIL |
+| **H-2** | 退避窗口文档写「约 1 小时」，实际 **23.5 分钟**（代码注释 + context.yaml + plan.md 三处） | 三处改成实算值，并把算式写进注释 | 算术已实算复核 |
+| **M-1** | 容器 id 走在 `X-Octo-Event-ID` header 里。body 几乎不会被记录，header 经常会（反代日志格式、APM 默认抓 header），而在 R2/R3 前它是 capability | event-id 槽改成 `sha256(container_id)`；保留重放稳定性与资源绑定，接收方从 body 读真 id | 退回原始 id → 签名测试 FAIL |
+| **M-2** | 接收方契约只写了「怎么签」，没写「验什么」。缺时间戳新鲜度窗口 → 抓到的 ensure 请求可无限重放，**把子系统已回收的容器复活** | 包注释 + brief D2 补三条 MUST（验签 / 拒绝过期时间戳 / 以 `container_id` 为幂等键） | 契约文档，无代码可变异 |
+| **M-3** | `target_disabled` 与 `panic` 两条路径既无测试也无指标 —— 正是 H-1 漏计的那两条 | 两个用例，同时断言行状态、租约已释放与指标增量；panic 用例通过 `provisionEnsurer` 注入 | 见 H-1 |
+| **L-1** | `uk_..._container` 撞键的 MySQL 消息形如 `Duplicate entry 'octows-...' for key ...`，经 `errors.Join` → `zap.Error` **把容器 id 带进日志**；zap 字段守卫看不见从错误串来的泄漏 | 入队的 duplicate-key 分支换成固定文案 | 删掉分支 → 新测试 FAIL |
+| **L-2** | `ValidateTarget` 不挡私网/link-local（元数据端点） | **保持不挡**，但把「已接受」的理由写进注释：目标是部署期 operator 值而非用户输入，两个真实目标都在集群内私网上，私网黑名单会拒掉所有合法配置；与 cardactiondispatch 同姿态 | n/a |
+| **L-3** | DELETE 走 `UpdateBySql` | 改 `DeleteBySql`（仓内 `modules/conversation_ext` 已在用） | 既有 purge 测试覆盖 |
+| **L-4** | 所有容器在子系统侧显示名都是同一个 `octo-project`，fleet UI 里会一片同名 | 契约里写明「接收方拿 `project_id` 自建标签」，并说清这是 D3 的后果而不是 bug | 契约文档 |
+
+另有若干项复审确认**不是**问题，理由记在报告里，其中最值得留档的一条：
+`errors.Join` 不会打断 `retryOnLockConflict` 的 `errors.As(*mysql.MySQLError)` 识别，
+也不打断 `respondCreateError` 的 sentinel 分支 —— 用一个独立最小测试实测过，
+不是靠读文档推断。
+
 ---
 
 ## 3. 运维手册
@@ -159,7 +181,12 @@ OCTO_PROJECT_PROVISION_FLEET_NARROWED=false
 env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关同一性质）。
 
 **打开之前必须确认 P-2（子系统侧服务身份）已经就绪。** 否则每个新项目都会产出一条
-在 ~1 小时后走到 `abandoned` 的行，而 `abandoned` 没有任何自动重驱动。
+在 **~23.5 分钟**后走到 `abandoned` 的行，而 `abandoned` 没有任何自动重驱动。
+
+> 这个数字是算出来的，不是估的：`provisioningRetryDelay` 是 `min(2^attempt, 300s)`，
+> `release` 收到的 attempts 是 1..11（第 12 次放弃），
+> 即 `2+4+8+16+32+64+128+256+300+300+300 = 1410s`。改 `MaxAttempts` 或改封顶值时重算。
+> 本文件早期版本写的「约 1 小时」是错的（复审 H-2 抓到）。
 
 ### 3.3 需要盯的指标
 
@@ -168,7 +195,7 @@ env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关�
 | `project_provisioning_rows{target,status}` | 行普查。`pending` 持续上涨 = 目标不响应；`abandoned` 非零 = 需要人 |
 | `project_provisioning_unnarrowed_containers{target}` | **暴露面大小**：该目标尚未声明按 Project 收窄，这些容器只靠 id 不可推导来保护 |
 | `project_provisioning_target_misconfigured{target}` | 1 = 这个 target 被要求了但配置被拒（坏 URL / 短 secret / 凭据撞车），它不会预置任何东西 |
-| `project_provisioning_attempts_total{target,outcome}` | `target_no_ensure_endpoint`（= 404，P-2 还没到）与 `target_5xx`（= 真故障）在**第一次尝试**就能分开 |
+| `project_provisioning_attempts_total{target,outcome}` | **一次尝试恰好一个增量**，所以 `sum by(outcome)` 就是尝试次数。`target_no_ensure_endpoint`（= 404，P-2 还没到）与 `target_5xx`（= 真故障）在**第一次尝试**就能分开；`panic` / `target_disabled` 也各有自己的 outcome。刻意**没有** `abandoned` 这个 outcome —— 「多少行放弃了」由上面那个 gauge 回答 |
 | `write_rejected_total{reason="provisioning_enqueue"}` | 建项目因为 outbox 写失败而失败。非零说明是本切片让 create 挂的 |
 
 ### 3.4 P-2 落地后重驱动已放弃的行

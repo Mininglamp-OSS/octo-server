@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -131,6 +132,7 @@ type provRow struct {
 	ContainerID string     `db:"container_id"`
 	Status      uint8      `db:"status"`
 	Attempts    uint32     `db:"attempts"`
+	LeaseOwner  string     `db:"lease_owner"`
 	LastError   string     `db:"last_error"`
 	FinishedAt  *time.Time `db:"finished_at"`
 }
@@ -141,7 +143,7 @@ func readProvisioningRows(t *testing.T, projectID string) []provRow {
 	t.Helper()
 	var rows []provRow
 	_, err := testCtx.DB().SelectBySql(
-		"SELECT id, project_id, space_id, target, container_id, status, attempts, last_error, finished_at "+
+		"SELECT id, project_id, space_id, target, container_id, status, attempts, lease_owner, last_error, finished_at "+
 			"FROM `octo_project_provisioning` WHERE project_id = ? ORDER BY target",
 		projectID,
 	).Load(&rows)
@@ -277,6 +279,40 @@ func TestProvisioningIsInertWithNoTargetEnabled(t *testing.T) {
 	// And the worker refuses to run at all, so a stray tick cannot claim anything.
 	p.processProvisioningJobs()
 	assert.Zero(t, countAllProvisioningRows(t))
+}
+
+// TestEnqueueDuplicateKeyErrorCarriesNoDatabaseText covers the one enqueue failure whose
+// MySQL message embeds a value verbatim.
+//
+// "Duplicate entry '<value>' for key '<index>'" is how 1062 reads, and on
+// uk_octo_project_provisioning_container that value IS a container id — which then
+// reaches a log line through errors.Join and zap.Error. Reaching that specific key needs
+// a 128-bit collision, so the collision this test can actually force is the sibling one
+// on (project_id, target); both go through the same branch, and what the branch has to
+// guarantee is that no database text survives it.
+//
+// The zap-field guard cannot cover this: it inspects zap arguments, and a leak arriving
+// inside an error string is invisible to it.
+func TestEnqueueDuplicateKeyErrorCarriesNoDatabaseText(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "P")
+
+	tx, err := testCtx.DB().Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	// Same (project_id, target) as the row the create already wrote.
+	err = p.db.enqueueProvisioningTx(tx, created.ProjectID, spaceA,
+		[]provisionTarget{fleetTargetOn(fleet)}, time.Now().UTC())
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, errProvisioningEnqueueFailed,
+		"the caller classifies on this sentinel to pick its metric reason")
+	for _, banned := range []string{"Duplicate entry", "1062", "uk_octo_project_provisioning", "octows-"} {
+		assert.NotContains(t, err.Error(), banned,
+			"the duplicate-key error still carries database text; on the container-id key that "+
+				"text is a capability and this chain is logged with zap.Error")
+	}
 }
 
 // ---------- container id opacity ----------
@@ -444,10 +480,26 @@ func TestWorkerRetriesThenAbandons(t *testing.T) {
 	assert.Contains(t, rows[0].LastError, "target_5xx")
 	assert.NotContains(t, rows[0].LastError, containerID, "last_error leaks the container id")
 
+	attemptsBefore := testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "target_5xx"))
 	makeProvisioningRowDue(t, id)
 	p.processProvisioningJobs()
 	rows = readProvisioningRows(t, created.ProjectID)
 	assert.Equal(t, provisionStatusAbandoned, rows[0].Status)
+	// The attempt that EXHAUSTS the budget is counted once, under its real reason.
+	// Previously it was counted twice — once as target_5xx and again as "abandoned" —
+	// which made sum by(outcome) exceed the attempt count and hid the reason a row gave
+	// up behind a label that only said that it did.
+	assert.Equal(t, attemptsBefore+1,
+		testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "target_5xx")),
+		"the exhausting attempt must be counted exactly once, with its real outcome")
+	// And the second increment is gone. Asserting the real outcome alone cannot see the
+	// double count — target_5xx went up by one either way — so the property has to be
+	// stated as "the abandoned label does not exist", which is what makes
+	// sum by(outcome) equal the attempt count.
+	assert.Equal(t, 0.0, testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "abandoned")),
+		`provisioning_attempts_total must have no "abandoned" outcome: it double-counted the `+
+			`exhausting attempt and competed with the real reason. Use `+
+			`provisioning_rows{status="abandoned"} for "how many rows gave up".`)
 	assert.Equal(t, uint32(2), rows[0].Attempts)
 	require.NotNil(t, rows[0].FinishedAt)
 	assert.Contains(t, rows[0].LastError, "retries exhausted")
@@ -460,6 +512,86 @@ func TestWorkerRetriesThenAbandons(t *testing.T) {
 	p.processProvisioningJobs()
 	callsAfter, _ := fleet.snapshot()
 	assert.Equal(t, callsBefore, callsAfter)
+}
+
+// panickingEnsurer is a provisionEnsurer that always panics.
+//
+// It exists because the panic path had no test at all, which is exactly why nobody
+// noticed it recorded no metric: the recovery, the release and the backoff were all
+// asserted only by the comment above them. provisionEnsurer is the seam that makes
+// this injectable — that is the second thing the interface buys beyond keeping the
+// outbound package out of api.go.
+type panickingEnsurer struct{ calls int }
+
+func (e *panickingEnsurer) Ensure(context.Context, projectprovision.Target, projectprovision.EnsureRequest) (projectprovision.EnsureResponse, error) {
+	e.calls++
+	panic("provisioning boom")
+}
+
+// TestWorkerRecoversFromAPanicAndCountsIt covers a path that previously had neither a
+// test nor a metric.
+//
+// A panic caught only at the batch level would skip the release, leaving the row
+// claimed with no last_error and no backoff — it would sit until the lease expired, be
+// re-claimed, and panic again, burning a full lease period AND a batch slot on every
+// cycle. attempts advances at claim time so it would still converge to abandoned, but
+// slowly and invisibly.
+func TestWorkerRecoversFromAPanicAndCountsIt(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	panicker := &panickingEnsurer{}
+	p.provisionClient = panicker
+
+	before := testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "panic"))
+	created := createVia(t, r, token, "P")
+
+	// Must not propagate: one poisoned row cannot be allowed to kill the batch.
+	require.NotPanics(t, p.processProvisioningJobs)
+	require.Equal(t, 1, panicker.calls)
+
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	assert.Equal(t, provisionStatusPending, rows[0].Status, "a panic must schedule a retry, not strand the row")
+	assert.Equal(t, uint32(1), rows[0].Attempts, "attempts must advance so a poisoned row converges to abandoned")
+	assert.Empty(t, rows[0].LeaseOwner, "the lease must be released, not held until it expires")
+	assert.Contains(t, rows[0].LastError, "panic")
+	// The metric half. Without it a job that panics on every attempt is invisible in
+	// provisioning_attempts_total until it abandons.
+	assert.Equal(t, before+1, testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "panic")))
+}
+
+// TestWorkerRetriesAJobWhoseTargetWentAway covers the other path that had no test and
+// no metric: configuration changed between the claim and the run.
+//
+// Retry rather than abandon, because the operator may be mid-rollout — and if the
+// target stays off, the claim-side filter simply stops picking the row up, so nothing
+// spins.
+func TestWorkerRetriesAJobWhoseTargetWentAway(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "P")
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+
+	// Claim with the target enabled, then disable it before running — the window the
+	// claim-side filter cannot cover.
+	owner := newProvisioningClaimOwner()
+	job, err := p.db.claimProvisioningJob(owner, []string{TargetFleet}, p.cfg.Provisioning.MaxAttempts, time.Now().UTC())
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	p.cfg.Provisioning.Targets = nil
+
+	before := testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "target_disabled"))
+	p.runProvisioningJob(job, owner)
+
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusPending, rows[0].Status)
+	assert.Empty(t, rows[0].LeaseOwner)
+	assert.Contains(t, rows[0].LastError, "target_disabled")
+	calls, _ := fleet.snapshot()
+	assert.Zero(t, calls, "a disabled target must not be contacted")
+	assert.Equal(t, before+1,
+		testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "target_disabled")))
 }
 
 // TestWorkerLeavesRowsAloneForADisabledTarget pins the claim-side target filter:

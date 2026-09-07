@@ -148,6 +148,21 @@ deviations:
       collaboration integration was misconfigured is a worse outcome than that
       integration being off. The failure is therefore loud in two channels that survive
       a restart loop instead of one that does not.
+  - id: receiver-contract-is-specified-here
+    what: |
+      the client's package comment and brief D2 now state three MUST clauses for the
+      receiver (verify the signature, reject a stale timestamp, treat container_id as the
+      idempotency key), and document that `name` is a fixed label the receiver should not
+      display.
+    why: |
+      The original sketch specified how the request is SIGNED and nothing about what
+      verifying it requires, and the first two clauses have no enforcement on this side.
+      The gap that matters is freshness: the timestamp is inside the signed string so it
+      cannot be edited, but a captured request can still be REPLAYED, and because ensure
+      is idempotent a replay resurrects a container the subsystem had already reclaimed.
+      cardactiondispatch.Verify checks only the MAC. Written down now because neither
+      subsystem has started its ensure endpoint — after they ship it is a cross-repo
+      rework.
   - id: provision-ensurer-interface
     what: |
       Project.provisionClient is typed on a local one-method interface declared in
@@ -161,11 +176,14 @@ deviations:
 
 # Taken where the brief left a choice; each is reversible at one site.
 assumptions:
-  - "Retry budget: 12 attempts with backoff capped at 5 minutes (~1 hour). Deliberately
-     not stretched to days: because a row only exists for a target an operator turned
-     on, exhaustion means 'a target I asked for is not answering' — a real alert — and
-     hiding that behind a week of retries would delay the only signal there is.
-     Tunable via OCTO_PROJECT_PROVISION_MAX_ATTEMPTS."
+  - "Retry budget: 12 attempts with backoff capped at 5 minutes, which is
+     2+4+8+16+32+64+128+256+300+300+300 = 1410s = ~23.5 MINUTES. An earlier revision of
+     this line and of the code comment said '~1 hour', which was simply wrong — the sum
+     was never taken. Deliberately not stretched to days either way: because a row only
+     exists for a target an operator turned on, exhaustion means 'a target I asked for is
+     not answering' — a real alert — and hiding that behind a week of retries would delay
+     the only signal there is. Tunable via OCTO_PROJECT_PROVISION_MAX_ATTEMPTS; re-do the
+     sum if you change it or the cap."
   - "Lease is 2 minutes, ~10x one job's bounded cost (a single 10s-timeout call plus
      two short statements). modules/space needs 10 minutes because its job walks every
      group; this one does not."
@@ -175,10 +193,11 @@ assumptions:
      that provisioning gave up. 90 days rather than modules/space's 14 because this is
      a RECLAIM window: consumers learn about a disband by polling, so deleting the row
      early drops local accounting for a container that still exists elsewhere."
-  - "The signature's eventID slot carries the container id. Natural for an
-     idempotency-keyed call (the receiver can bind the signature to the exact resource)
-     and replay-stable. Not a confidentiality problem: the id is already the body's
-     first field and travels on the same connection."
+  - "The signature's event-id slot carries sha256(container_id), not the id. Replay-stable
+     and still bound to one resource, while keeping a capability out of a header —
+     bodies are almost never logged, headers routinely are. An earlier revision put the
+     raw id there and justified it with 'the body already carries it', which ignored that
+     asymmetry."
   - "A successful create nudges the worker in one goroutine so 'eager' means seconds
      rather than up to a full interval. Bounded by the project creation rate, which the
      per-day and per-Space quotas already cap — unlike modules/space's original per-uid

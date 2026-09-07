@@ -31,11 +31,49 @@
 // or an error `details` map. Every error string this package produces is built
 // from a fixed low-cardinality category plus an HTTP status, never from the
 // request body — see EnsureError.Error.
+//
+// It also does not travel in a HEADER. The signature's event-id slot carries
+// sha256(container_id), not the id itself, and the reason is asymmetric exposure
+// rather than principle: request bodies are almost never logged, while headers
+// routinely are — a reverse proxy's custom log format, an APM agent's default
+// header capture. Putting a capability where the id would be picked up by
+// infrastructure nobody in this repository controls is a measurable widening for
+// no gain, since the receiver reads the real id out of the body anyway. The hash
+// keeps everything the slot is for: it is stable across replays of the same job,
+// and it still binds the signature to one specific resource.
+//
+// # What the receiver must do
+//
+// Stated here because it is NOT optional and because neither subsystem has
+// implemented its ensure endpoint yet — this is the contract being handed over,
+// and the first two clauses have no enforcement on this side at all:
+//
+//  1. **Verify the signature** over the canonical string
+//     (internal/octosign.CanonicalRequest), using the shared per-target
+//     secret. An unsigned or wrongly-signed request must be refused.
+//  2. **Reject a stale timestamp.** X-Octo-Timestamp is inside the signed string,
+//     so it cannot be tampered with, but nothing stops a captured request from
+//     being REPLAYED — and this operation is idempotent, so a replay would
+//     resurrect a container the subsystem had already reclaimed. A bounded skew
+//     window (a few minutes) is what closes that; octosign.Verify
+//     deliberately does not check freshness, so the receiver owns it.
+//  3. **Treat container_id as the idempotency key**: get-first, create,
+//     duplicate-key downgrade. Delivery is at-least-once by construction, so an
+//     ensure that creates a second container on the second call is a defect on
+//     the receiving side.
+//
+// And one thing the receiver should NOT expect: `name` is a fixed, low-information
+// label, not the project's name (see the field comment on EnsureRequest). A
+// receiver that wants a human-readable label should build one from `project_id`,
+// which is in every request — octo-server deliberately does not egress
+// user-supplied text here.
 package projectprovision
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +134,16 @@ type Target struct {
 // project_id travels alongside container_id and is NOT the id: the receiver needs
 // it to answer "which project is this container for" when it later reclaims
 // (D9), and must not derive an id from it.
+//
+// Name is a fixed, low-information label — NOT the project's name. octo-server holds
+// the name authoritatively and never syncs it outbound (brief D3), and a project name
+// is user-supplied free text, so egressing it would make provisioning a content path
+// with its own escaping and disclosure questions. The consequence for the receiver is
+// real and worth stating rather than discovering: every container arrives with the
+// SAME name, so a receiver that shows this string in its own UI will show one label
+// for every project. Build a display label from project_id instead, or read the real
+// name from GET /v1/projects/:project_id, which is what D3 already tells fleet to do
+// for `context`.
 type EnsureRequest struct {
 	ContainerID string `json:"container_id"`
 	ProjectID   string `json:"project_id"`
@@ -160,6 +208,16 @@ func Category(err error) string {
 // operator-supplied configuration, and a `https://user:pass@host/` form would put
 // a credential into every log line that prints the URL. A path is required
 // because a bare origin almost always means a truncated env value.
+//
+// What it deliberately does NOT do is reject private, loopback or link-local hosts
+// (169.254.169.254 and friends). Recorded as an ACCEPTED posture rather than left as
+// an omission a reader has to guess about: the destination is a deploy-time operator
+// value, not user input, so there is no untrusted party choosing it, and both real
+// targets are in-cluster services on private addresses — a private-range denylist
+// would reject every legitimate configuration. This is the same posture as
+// pkg/octosign, whose route URLs are operator-registered for the same
+// reason. It would have to change if an ensure URL ever became something a tenant
+// could influence.
 func ValidateTarget(t Target) error {
 	if strings.TrimSpace(t.Name) == "" {
 		return errors.New("projectprovision: target name required")
@@ -227,13 +285,12 @@ func NewClient(transport http.RoundTripper, clock func() time.Time) *Client {
 //
 // The receiver's contract is get-first / create / duplicate-key downgrade, keyed
 // on the supplied container_id (brief P-1), so this is safe to replay: at-least-once
-// delivery converges instead of manufacturing a second container.
+// delivery converges instead of manufacturing a second container. The receiver owes
+// two more things that this side cannot enforce — see "What the receiver must do".
 //
-// The signature's eventID slot carries the container id. That is the natural
-// choice for an idempotency-keyed call — the receiver can bind the signature to
-// the exact resource being created, and replays of the same job produce the same
-// canonical string. It is not a confidentiality problem: the id is already the
-// body's first field, and the signature travels on the same connection.
+// The signature's event-id slot carries containerEventID(container_id), i.e. the
+// hash, not the id. See the package comment for why a capability does not go in a
+// header.
 func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (EnsureResponse, error) {
 	if ctx == nil {
 		return EnsureResponse{}, &EnsureError{Category: "invalid_request"}
@@ -258,6 +315,7 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		timeout = defaultTimeout
 	}
 	timestamp := strconv.FormatInt(c.clock().Unix(), 10)
+	eventID := containerEventID(req.ContainerID)
 
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -268,9 +326,9 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("User-Agent", "octo-server/project-provisioning-v1")
 	httpReq.Header.Set(HeaderTimestamp, timestamp)
-	httpReq.Header.Set(HeaderEventID, req.ContainerID)
+	httpReq.Header.Set(HeaderEventID, eventID)
 	httpReq.Header.Set(HeaderSignature, octosign.Sign(
-		target.Secret, http.MethodPost, path, timestamp, req.ContainerID, body))
+		target.Secret, http.MethodPost, path, timestamp, eventID, body))
 
 	response, err := c.client.Do(httpReq)
 	if err != nil {
@@ -307,6 +365,18 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		return EnsureResponse{}, &EnsureError{Category: "container_id_mismatch", Status: response.StatusCode}
 	}
 	return out, nil
+}
+
+// containerEventID derives the wire event id from a container id.
+//
+// sha256 hex, and exported behaviour rather than an implementation detail: the
+// receiver has to compute the same value to verify the signature, so this is part
+// of the contract. It is deterministic, so a replay of the same job produces the
+// same canonical string; and it is one-way, so the value sitting in a proxy log
+// is not the capability.
+func containerEventID(containerID string) string {
+	sum := sha256.Sum256([]byte(containerID))
+	return hex.EncodeToString(sum[:])
 }
 
 // statusCategory maps a status to a fixed metric label.

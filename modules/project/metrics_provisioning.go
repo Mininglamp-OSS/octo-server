@@ -57,16 +57,28 @@ var (
 
 	// provisioningAttempts counts finished attempts by target and outcome.
 	//
+	// **Exactly one increment per attempt**, and the invariant is worth stating because
+	// the first version broke it in both directions: two failure paths incremented zero
+	// times, and the attempt that exhausted the budget incremented twice under two
+	// different labels. So `sum by(outcome)` IS the attempt count, and a rate on any one
+	// outcome is a real fraction of traffic. See releaseOrAbandon, which is the single
+	// increment site for every failure.
+	//
 	// `outcome` is the low-cardinality classification from
-	// internal/projectprovision.Category plus this module's own terminal labels, so
-	// a permanent contract break (target_no_ensure_endpoint,
-	// container_id_mismatch) is distinguishable from a transient one
-	// (target_5xx, transport_failed) on the FIRST attempt rather than at
-	// attempt-exhaustion an hour later.
+	// internal/projectprovision.Category, plus "ready" for success and this module's own
+	// "panic" / "target_disabled" / "unclassified". A permanent contract break
+	// (target_no_ensure_endpoint, container_id_mismatch) is therefore distinguishable
+	// from a transient one (target_5xx, transport_failed) on the FIRST attempt rather
+	// than only once the row abandons ~23 minutes later.
+	//
+	// There is deliberately no "abandoned" outcome: "how many rows gave up" is a
+	// different question, already answered by provisioning_rows{status="abandoned"}, and
+	// as a counter label it competed with the real reason for the same increment.
 	provisioningAttempts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "provisioning_attempts_total",
-		Help:      "Provisioning ensure attempts, by target and outcome.",
+		Help: "Provisioning ensure attempts, by target and outcome. Exactly one increment per " +
+			"attempt, so sum by(outcome) is the attempt count.",
 	}, []string{"target", "outcome"})
 
 	// provisioningDuration times one ensure call.

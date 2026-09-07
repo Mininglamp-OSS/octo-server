@@ -241,7 +241,6 @@ func (p *Project) runProvisioningJob(job *provisioningJob, owner string) {
 		if outcome == "" {
 			outcome = "unclassified"
 		}
-		observeProvisioningAttempt(job.Target, outcome)
 		p.releaseOrAbandon(job, owner, outcome, err)
 		return
 	}
@@ -276,8 +275,24 @@ const provisioningContainerName = "octo-project"
 
 // releaseOrAbandon schedules the retry, or writes the terminal abandoned state when
 // the budget is gone.
+//
+// It is also the ONE place a failed attempt is counted, and that placement is the fix
+// for a metric that was wrong in two directions at once. Counting at the call site
+// meant the panic and target-disabled paths — which reach here but not the ensure
+// call — recorded nothing at all, so a job that panicked on every attempt was
+// invisible in provisioning_attempts_total until it abandoned. And the abandon branch
+// then added a SECOND increment labelled "abandoned", so the last failing attempt of
+// any job was counted twice under two different outcomes and
+// sum by(outcome)(provisioning_attempts_total) did not equal the number of attempts.
+//
+// Now: exactly one increment per attempt, labelled with the real reason — including
+// the attempt that exhausts the budget, whose reason is the interesting part. "How
+// many rows have given up" is a different question and is already answered by the
+// provisioning_rows{status="abandoned"} gauge, so it does not need a counter label
+// competing with the outcomes.
 func (p *Project) releaseOrAbandon(job *provisioningJob, owner, outcome string, cause error) {
 	now := time.Now().UTC()
+	observeProvisioningAttempt(job.Target, outcome)
 	if job.Attempts >= p.cfg.Provisioning.MaxAttempts {
 		// Error, and on purpose it fires once per row rather than once per tick:
 		// abandoned has NO automatic re-drive. Once the target's precondition (brief
@@ -286,7 +301,6 @@ func (p *Project) releaseOrAbandon(job *provisioningJob, owner, outcome string, 
 			zap.Uint64("jobId", job.ID), zap.String("target", job.Target),
 			zap.String("projectId", job.ProjectID), zap.String("outcome", outcome),
 			zap.Uint32("attempts", job.Attempts), zap.Error(cause))
-		observeProvisioningAttempt(job.Target, "abandoned")
 		p.finishProvisioning(job, owner, provisionStatusAbandoned, outcome+": retries exhausted")
 		return
 	}

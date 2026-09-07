@@ -96,8 +96,15 @@ const (
 	defaultProvisionInterval = 15 * time.Second
 	// defaultProvisionTimeout bounds one ensure call.
 	defaultProvisionTimeout = 10 * time.Second
-	// defaultProvisionMaxAttempts, together with the capped exponential backoff,
-	// gives roughly a one-hour window before a row is abandoned.
+	// defaultProvisionMaxAttempts, together with the capped exponential backoff, gives a
+	// ~23.5 minute window before a row is abandoned.
+	//
+	// The arithmetic is written out because the first version of this comment claimed
+	// "roughly one hour" and that was simply wrong — the kind of slip that survives review
+	// precisely because nobody adds up the series. provisioningRetryDelay is
+	// min(2^attempt, 300s) and release() is called with attempts 1..11 (the 12th
+	// abandons), so the schedule is 2+4+8+16+32+64+128+256+300+300+300 = 1410s. Re-do this
+	// sum if you change either the cap or the attempt count.
 	//
 	// A row is only ever enqueued for a target an operator has explicitly turned
 	// on (see envProvisionTargets), so exhaustion means "a target I asked for is

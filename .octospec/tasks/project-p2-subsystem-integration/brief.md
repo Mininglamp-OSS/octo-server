@@ -296,7 +296,41 @@ POST /api/internal/workspaces/ensure
   { "container_id": "...", "project_id": "...", "octo_space_id": "...",
     "name": "...", "issue_prefix": "..." }
   → 200 { "container_id": "...", "slug": "..." }
+
+Headers on both:
+  X-Octo-Timestamp   unix seconds
+  X-Octo-Event-ID    sha256(container_id), hex  ← NOT the container id
+  X-Octo-Signature   v1=<hmac-sha256 over CanonicalRequest(POST, path, ts, event-id, body)>
 ```
+
+**Three things the receiver MUST do**, added 2026-09-07 because the original sketch
+specified how the request is signed and not what verifying it requires — and the first
+two have no enforcement on octo-server's side at all:
+
+1. **Verify the signature** against the shared per-target secret. Refuse anything
+   unsigned or wrongly signed.
+2. **Reject a stale `X-Octo-Timestamp`** (a few minutes of skew). The timestamp is
+   inside the signed string so it cannot be edited, but nothing stops a captured
+   request from being *replayed* — and because ensure is idempotent, a replay would
+   **resurrect a container the subsystem had already reclaimed**.
+   `cardactiondispatch.Verify` deliberately checks only the MAC, so freshness is the
+   receiver's.
+3. **Treat `container_id` as the idempotency key** (get-first / create /
+   duplicate-key downgrade). Delivery is at-least-once by construction.
+
+**`X-Octo-Event-ID` carries sha256(container_id), not the id.** Bodies are almost never
+logged; headers routinely are (a proxy's custom log format, an APM agent's default
+header capture). Until R2/R3 land the container id is a capability, so putting it where
+infrastructure nobody here controls will pick it up is a measurable widening for no
+gain — the receiver reads the real id from the body. The hash keeps both properties the
+slot needs: stable across replays of one job, and bound to one specific resource.
+
+**`name` is a fixed low-information label, not the project's name** (D3, and see PR-5's
+deviation note). The consequence on the receiving side is real: every container arrives
+with the same name, so a receiver that displays this string shows one label for every
+project. Build a display label from `project_id` — it is in every request — or read the
+real name from `GET /v1/projects/:project_id`, which is what D3 already tells fleet to
+do for `context`.
 
 **What Shape S costs**, recorded so the choice stays reviewable: a table, a worker,
 an egress, a secret per target; project creation gains a durable side effect in two
