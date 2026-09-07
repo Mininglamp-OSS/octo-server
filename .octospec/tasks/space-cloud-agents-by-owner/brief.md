@@ -191,9 +191,12 @@ Go 侧按 `creator_uid` 挂到第一段的人身上。无分身的人使用 `age
   **禁止**用 `short_no` / `username` 兜底（privacy-gated）。
 - **真人判定** — `robot=0` 之外还须排除 `spacepkg.SystemBotList()`；系统账号即使有
   活跃的 `space_member` 行，也不出现在顶层，不作为分身 owner。
-- **collation** — 名字兜底需要 LEFT JOIN `user_verification`（强制 `utf8mb4_general_ci`），
-  而 `space_member` 建表未显式 COLLATE，8.0 库上有 `1267` 隐患。等同于既有
-  `queryMembers` 的风险面，非新增，但跑测试时要留意。
+- **collation** — 名字兜底需要 LEFT JOIN `user_verification`（`utf8mb4_general_ci`），
+  而 `space_member` / `user` 的历史表可能继承另一种 collation。directory 的 keyword
+  路径还把三路展示名放进 `COALESCE` 再作 `LIKE`，这是独立于既有 `queryMembers` 的
+  比较表达式，必须将完成后的展示名表达式 pin 到 `utf8mb4_general_ci`。JOIN 只能转换
+  驱动侧 `sm.uid`，不得给 `uv.user_id`（PRIMARY KEY）套 `COLLATE`，否则可能退化为
+  扫描或 hash join。回归测试必须在隔离的混合-collation schema 上执行真实 keyword 查询。
 - **`robot.agent_hosting` 的语义依赖** — 本端点的过滤直接建立在这个**自报**字段上。
   若将来引入权威的 provision 来源列，过滤条件要一起改。
 - **`error-response` / i18n** — 复用现成码 `ErrSpaceRequestInvalid` / `ErrSpaceNotMember` /
@@ -295,6 +298,9 @@ Go 侧按 `creator_uid` 挂到第一段的人身上。无分身的人使用 `age
   请求仍可响应时走 `ErrSpaceQueryFailed`。确认两段查询共用超时 context。
 - 对实际两段 SQL 执行 `EXPLAIN`，记录索引使用与窗口计算情况；本任务不要求单独建设
   压测或监控系统。
+- 在隔离的混合-collation schema（legacy `space_member` / `user` / `robot` 为
+  `utf8mb4_0900_ai_ci`，`user_verification` 为 `utf8mb4_general_ci`）上，带 keyword 的
+  `queryDirectoryOwners` 必须对 `name`、`real_name`、占位符三条展示名链都可执行。
 - 新 handler 文件已加入 `TestSpaceNoLegacyResponseError` 清单，该测试通过。
 - `make i18n-lint` 通过（无新增 raw error response；本任务不新增错误码，
   `make i18n-extract-check` 应无变化）。
