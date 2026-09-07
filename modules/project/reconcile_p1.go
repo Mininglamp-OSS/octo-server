@@ -175,7 +175,16 @@ func (p *Project) queryI2Page(cursorGroupID int64, cursorUID string, limit int) 
 			"  ((pm.uid IS NULL OR pm.status <> 1 OR pm.removing = 1) "+
 			"   AND jobp.id IS NULL "+ // exemption 1: a pending project cascade job
 			"   AND jobs.id IS NULL "+ // exemption 2: a pending Space cleanup job
-			"   AND (sp.status IS NULL OR sp.status <> 2)) "+ // exemption 3: banned Space
+			"   AND (sp.status IS NULL OR sp.status <> 2) "+ // exemption 3: banned Space
+			// exemption 4: a disbanded group (see the doc comment above). This
+			// belongs in the flag rather than the WHERE for the reason the cost
+			// guard states: `group`.status leads no index, so as disbanded groups
+			// accumulate a WHERE predicate on it turns LIMIT back into a bound on
+			// rows RETURNED. `IS NOT NULL AND` keeps it exactly equivalent to the
+			// WHERE clause it replaces — the column is nullable, and `NULL <> 2`
+			// is NULL, which the WHERE dropped and a bare AND here would load
+			// into a Go bool.
+			"   AND (g.status IS NOT NULL AND g.status <> 2)) "+
 			"  AS violating "+
 			"FROM `group` g "+
 			// group ⋈ group_member: both legacy, so no COLLATE — forcing one here
@@ -201,7 +210,11 @@ func (p *Project) queryI2Page(cursorGroupID int64, cursorUID string, limit int) 
 			" AND jobs.uid = gm.uid COLLATE utf8mb4_general_ci AND jobs.status = 0 "+
 			// `space` IS legacy, so this one needs nothing.
 			"LEFT JOIN `space` sp ON sp.space_id = g.space_id "+
-			"WHERE (g.id, gm.uid) > (?, ?) AND g.project_id <> '' AND g.status <> 2 "+
+			// project_id STAYS here, and it is the one predicate that must: moving
+			// it into the flag would make every Space-direct group's members base
+			// rows, i.e. a walk of the whole group_member table every tick. It is
+			// also the selective one — the population it keeps out is the product.
+			"WHERE (g.id, gm.uid) > (?, ?) AND g.project_id <> '' "+
 			"  AND gm.uid NOT IN ? "+
 			"ORDER BY g.id ASC, gm.uid ASC LIMIT ?",
 		cursorGroupID, cursorUID, systemBotUIDsForScan(), limit,
