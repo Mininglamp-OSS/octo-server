@@ -7,9 +7,11 @@
 --   2. `octo_project_member_removal_cleanup` — the project-side cascade outbox (D5)
 --
 -- `group.project_id` deliberately does NOT live here. It is in
--- modules/group/sql/20260906000001_group_project_binding.sql, and that file
--- explains why: modules/group's test binary does not register modules/project,
--- so a column modules/group reads and writes cannot ship from this directory.
+-- modules/space/sql/20260906000001_group_project_binding.sql, and that file
+-- explains why: a column ships from a migration directory present in EVERY
+-- binary that reads it. Three modules read this one (group, space, project) and
+-- modules/space/sql is the only directory in all three -- which is also why
+-- group.space_id was added from there.
 
 -- ---------------------------------------------------------------------------
 -- 1. octo_project_member.removing
@@ -19,7 +21,7 @@
 --
 -- `removing` is set to 1 in the same transaction that begins removal, while
 -- `status` stays 1. Every authorization read — the project member list, the
--- group admission gate, the middleware's role resolution — treats removing = 1
+-- group admission gate, the role resolution in the middleware — treats removing = 1
 -- as a non-member. Keeping status = 1 until the detach finishes is what makes
 -- I2 never LITERALLY violated by the removal itself: the group_member rows that
 -- have not been cleaned up yet still belong to a member of record. The worker
@@ -76,7 +78,7 @@ CREATE INDEX `idx_octo_project_member_removing` ON `octo_project_member` (`remov
 -- Structurally copied from space_member_removal_cleanup
 -- (modules/space/sql/20260821000001_*.sql) — lease owner + lease_until,
 -- attempts, next_attempt_at, backoff, a terminal abandoned state, the same two
--- index shapes, retention purge — with the corrections that table's own history
+-- index shapes, retention purge — with the corrections that the history of that table
 -- earned:
 --
 --   * TIME IS APPLICATION-WRITTEN UTC, with no DEFAULT and no ON UPDATE. The
@@ -86,7 +88,7 @@ CREATE INDEX `idx_octo_project_member_removing` ON `octo_project_member` (`remov
 --     session-timezone column and read -28799 seconds under TZ=Asia/Shanghai
 --     (modules/space/member_removal_metrics.go). One clock, in Go, in UTC.
 --   * status carries a CANCELLED terminal state (3), which the space table has
---     no equivalent of. D4's re-admission path needs to retire an in-flight job
+--     no equivalent of. The re-admission path in D4 needs to retire an in-flight job
 --     without it looking like either success or exhaustion, and without deleting
 --     the row — a deleted job leaves no evidence that a cascade was cancelled.
 --
@@ -126,10 +128,17 @@ CREATE TABLE IF NOT EXISTS `octo_project_member_removal_cleanup` (
 -- A discarded job means a member whose project seat is closed keeps their rows
 -- in that project group set, which the I2 reconcile scan will then report.
 --
--- No apostrophes and no semicolons in this comment on purpose: the module's
--- migration test splits statements naively and treats a quote as a string
--- delimiter, so a possessive apostrophe here makes it read the next semicolon
--- as being inside a literal. It asserts that, and it caught this.
+-- No apostrophes anywhere in this file, in ANY comment, on purpose. The
+-- migration test in this module splits statements naively and treats a quote as
+-- a string delimiter, so a possessive apostrophe makes it read the next
+-- semicolon as being inside a literal.
+--
+-- Note the shape of the failure: apostrophes PAIR UP, so a file with an even
+-- number of them can pass while a file with an odd number fails, and the test
+-- then points at whichever statement happens to sit between the last pair. It
+-- has now caught this twice, the second time because an unrelated edit removed
+-- one apostrophe from a comment forty lines away and flipped the parity. Do not
+-- add one back and rely on counting.
 DROP TABLE IF EXISTS `octo_project_member_removal_cleanup`;
 DROP INDEX `idx_octo_project_member_removing` ON `octo_project_member`;
 ALTER TABLE `octo_project_member` DROP COLUMN `removing`;

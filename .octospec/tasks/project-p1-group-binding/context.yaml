@@ -165,20 +165,29 @@ deferred_until_p0_merges:
   - id: reconcile-switch-consolidation
     note: |
       Whether the reconcile job needs its own enable switch separate from
-      OCTO_PROJECT_CREATE_ENABLED. The argument for two was that they guard
-      different risks that do not overlap in time — CREATE_ENABLED guards "the
-      feature is not ready" (a business risk, flipped repeatedly), a reconcile
-      switch guards "the database collation is not unified yet" (an
-      infrastructure risk, permanently on once converted) — and that sharing one
-      switch blinds the I1 monitoring at exactly the moment someone kills writes
-      to stop the bleeding, while the Space-side cascade keeps producing new
-      violations.
-      MEASURED AT e6a46cf (#841 head): no RECONCILE_ENABLED / ReconcileEnabled
-      exists in the tree. The reconcile job is unconditional; only its interval
-      and page limit are configurable (OCTO_PROJECT_RECONCILE_INTERVAL /
-      _LIMIT). So there is nothing to consolidate at HEAD, and P1 adds no second
-      switch of its own — its new scans ride the existing job.
-      The requester's call: revisit after #841 merges. P1 does not touch it.
+      OCTO_PROJECT_CREATE_ENABLED.
+      RESOLVED BY P0, not by P1. Measured at e6a46cf there was no such switch;
+      P0's round-5 fix (cfbfa77, now in the base branch at b38d59c) adds
+      OCTO_PROJECT_RECONCILE_ENABLED, default false, gating exactly the three
+      scans that JOIN legacy Space tables with no COLLATE — for the reason the
+      argument for two switches predicted: turning writes off to contain a
+      problem is when the invariant monitor is most wanted, so coupling them
+      would blind it at that moment. There is nothing left to consolidate.
+      P1's position, decided here after the rebase and asserted rather than
+      argued: its three scans run OUTSIDE that gate.
+        * I2 and I3 do JOIN legacy tables, but every comparison crossing into
+          the pinned schema carries an explicit COLLATE, so they survive the
+          drift the gate exists for. TestP1ScansSurviveCollationDrift proves it
+          on a deliberately drifted database, and TestP1ScansRunWithTheReconcileGateOff
+          pins the scope in both directions, as P0's own gate test does.
+        * Gating them would default the invariant WITH TEETH to "no monitoring".
+          I2 has no read-path filter behind it, so it is the last of the five
+          that should be dark by default — the same failure P0 round 5 fixed,
+          reached from the other side.
+      Writing that test found two real COLLATE gaps the reasoning had missed
+      (space_member_removal_cleanup is pinned, not legacy; a comparison in the
+      SELECT list raises 1267 just as one in an ON clause does), which is the
+      case for having it rather than the comment.
 
 # Scoped out during implementation, with the reason. NOT silently dropped.
 not_delivered:

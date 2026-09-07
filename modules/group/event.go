@@ -88,6 +88,16 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 
 // handleRegisterUserEvent 用户注册时加入系统群
 func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) {
+	// Counted once per EXECUTION, at the top, before any branch can return.
+	//
+	// The counter answers one question — "is this listener live in production?" —
+	// and deletion of these handlers is gated on it reading zero over an
+	// observation window (D7). Counting deeper in meant a listener that fired and
+	// then bailed out on a config flag or an empty payload registered as zero, so
+	// "no publisher exists" and "the publisher exists and every event was skipped"
+	// looked identical. It also meant the two loop-nested call sites counted
+	// MEMBERS rather than executions, which the Help text does not say.
+	observeLegacyDirectoryListener(legacyListenerRegisterUser)
 	appconfig, _ := g.commonService.GetAppConfig()
 	if appconfig != nil && appconfig.NewUserJoinSystemGroup == 0 {
 		commit(nil)
@@ -168,7 +178,6 @@ func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) 
 		}
 		// 收口到唯一准入口（A6）。系统群不属于任何 Space 或项目，闸门在
 		// project_id 为空串时直接短路，一次查询都不发。
-		observeLegacyDirectoryListener(legacyListenerRegisterUser)
 		err = g.db.admitOrRestoreMembersTx(tx,
 			g.ctx.GetConfig().Account.SystemGroupID, "", "",
 			[]MemberAdmission{{
@@ -245,6 +254,8 @@ func (g *Group) handleGroupMemberAddEvent(data []byte, commit config.EventCommit
 
 // 处理创建组织或部门事件
 func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommit) {
+	// Once per execution — see handleRegisterUserEvent.
+	observeLegacyDirectoryListener(legacyListenerOrgCreate)
 	var req config.MsgOrgOrDeptCreateReq
 	err := util.ReadJsonByByte(data, &req)
 	if err != nil {
@@ -317,7 +328,6 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 			return
 		}
 		// 收口到唯一准入口（A7 创建者）。组织架构建的群不带 Space/项目归属。
-		observeLegacyDirectoryListener(legacyListenerOrgCreate)
 		err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo, "", "",
 			[]MemberAdmission{{
 				UID:     req.Operator,
@@ -404,6 +414,10 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 
 // 批量处理组织或部门成员改变部门事件
 func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCommit) {
+	// Once per execution — see handleRegisterUserEvent. The previous call site was
+	// inside the per-member loop's "add" branch, so it counted members, and an
+	// event carrying only removals counted nothing at all.
+	observeLegacyDirectoryListener(legacyListenerOrgEmployeeUpdate)
 	var req config.MsgOrgOrDeptEmployeeUpdateReq
 	err := util.ReadJsonByByte(data, &req)
 	if err != nil {
@@ -519,7 +533,6 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 				// 收口到唯一准入口（A8）。这条路径原先自己查 ExistMemberDelete
 				// 再分支，现在由 upsert 内部决定插入还是恢复。
 				//
-				observeLegacyDirectoryListener(legacyListenerOrgEmployeeUpdate)
 				err = g.db.admitOrRestoreMembersTx(tx, groupNo, groupSpaceID, groupProjectID,
 					[]MemberAdmission{{
 						UID:       member.EmployeeUid,
@@ -745,6 +758,11 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 
 // 处理组织成员退出
 func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
+	// This one had NO call site at all, so its label never appeared in the metric
+	// family — and an absent series reads exactly like a zero one on a dashboard.
+	// It is also the listener #797 calls the highest-stakes of the four (HR
+	// offboarding), i.e. the one whose deletion the counter most needs to gate.
+	observeLegacyDirectoryListener(legacyListenerOrgEmployeeExit)
 	var req config.OrgEmployeeExitReq
 	err := util.ReadJsonByByte(data, &req)
 	if err != nil {

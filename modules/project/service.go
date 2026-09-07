@@ -947,7 +947,9 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	if err != nil {
 		return false, err
 	}
-	if target == nil || target.Status != MemberStatusActive {
+	// removing = 1 reads as "not a member" here too. Acting on a closing seat is
+	// not a partial success to report, it is a target that no longer exists.
+	if target == nil || target.Status != MemberStatusActive || target.Removing != 0 {
 		return false, errMemberNotFound
 	}
 	if !canActOnTargetRole(actorRole, target.Role) {
@@ -1033,7 +1035,9 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 	if err != nil {
 		return "", err
 	}
-	if self == nil || self.Status != MemberStatusActive {
+	// A member already on their way out cannot leave a second time; the first
+	// removal owns the seat and its cascade.
+	if self == nil || self.Status != MemberStatusActive || self.Removing != 0 {
 		return "", errMemberNotFound
 	}
 
@@ -1147,7 +1151,9 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 	if err != nil {
 		return false, "", err
 	}
-	if target == nil || target.Status != MemberStatusActive {
+	// See actorRoleTx: a closing seat is not a member, so it cannot be granted or
+	// stripped of a role either.
+	if target == nil || target.Status != MemberStatusActive || target.Removing != 0 {
 		return false, "", errMemberNotFound
 	}
 	if !canActOnTargetRole(actorRole, target.Role) {
@@ -1224,7 +1230,14 @@ func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, successorUID, depart
 	if err != nil {
 		return err
 	}
-	if successor == nil || successor.Status != MemberStatusActive {
+	// The successor must not be a seat that is CLOSING, and this is the sharpest
+	// case of the rule rather than another instance of it. countActiveOwnersTx
+	// already excludes removing = 1, so promoting one satisfies the last-owner
+	// guard while leaving the project with zero owners the moment the cascade
+	// finishes — the exact outcome that guard exists to prevent, reached through
+	// the guard itself. Nothing in P0 or P1 can promote a member without an owner,
+	// so the project would be unmanageable with no path back.
+	if successor == nil || successor.Status != MemberStatusActive || successor.Removing != 0 {
 		return errMemberNotFound
 	}
 	if _, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now); err != nil {
@@ -1252,7 +1265,14 @@ func (p *Project) actorRoleTx(tx *dbr.Tx, projectID, actorUID string) (int, erro
 	if err != nil {
 		return roleNonMember, err
 	}
-	if actor == nil || actor.Status != MemberStatusActive {
+	// A seat at removing = 1 is NOT a member for any authorization purpose — that
+	// is the whole contract of the two-phase close, and every other authorization
+	// read in the module already carries it (pkg/project's three predicates,
+	// countActiveOwnersTx, listMembers). This one deciding otherwise would leave a
+	// departing owner holding disband and role-change for the entire cascade
+	// window, on the re-read whose only job is to catch a role the middleware's
+	// cache got wrong.
+	if actor == nil || actor.Status != MemberStatusActive || actor.Removing != 0 {
 		return roleNonMember, nil
 	}
 	return actor.Role, nil

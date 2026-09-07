@@ -50,13 +50,20 @@ func (d *DB) UpdateGroupType(groupNo string, groupType GroupType) error {
 	return err
 }
 
-// InsertMemberTx 插入群成员信息(带事务)
+// InsertMemberTx 插入群成员信息(带事务)。
+//
+// **测试夹具专用，生产代码不得调用。** 全部准入已收口到
+// admitOrRestoreMembersTx；这条原语不带闸门，直接用它就是绕过 I2。
+// TestNoGroupMemberWritesOutsideTheAdmissionFunnel 会在 CI 里拦下任何非测试调用点。
+//
+// 之所以留着而不删：146 个受保护的测试文件用它建夹具，删掉等于改动这些既有测试，
+// 而「只能从漏斗调用」这件事守卫断言得比编译器的导出规则更准。
 func (d *DB) InsertMemberTx(m *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
-// InsertMember 插入群成员信息
+// InsertMember 插入群成员信息。测试夹具专用，理由同 InsertMemberTx。
 func (d *DB) InsertMember(m *MemberModel) error {
 	_, err := d.session.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
@@ -282,6 +289,10 @@ func (d *DB) ExistMemberDelete(uid string, groupNo string) (bool, error) {
 //
 // 注意：解除拉黑走的是 updateMembersStatus，不经过这里，因此不受影响。
 // 回归见 TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd。
+//
+// 生产路径已不再调用它：恢复分支被 admitOrRestoreMembersTx 的 upsert 原样复刻
+// （包括这里的 bot_admin=0）。留作测试夹具与这段说明的载体——它记录的是那个
+// upsert 为什么要重置 bot_admin。
 func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
 		"remark":          member.Remark,
@@ -313,11 +324,11 @@ func (d *DB) UpdateMember(member *MemberModel) error {
 // updateMembersStatusTx 是 updateMembersStatus 的事务版。
 //
 // 解除拉黑（status 回到 Normal）是一条**准入路径**：它把 uid 放回活跃成员集合、
-// 重新订阅 IM 频道、重新挂回群内子区，却既不经过 InsertMemberTx 也不经过
-// recoverMemberTx。只装在那两个原语里的闸门会被它整条绕过。
+// 重新订阅 IM 频道、重新挂回群内子区，但它并不插入或恢复成员行，所以任何只挂在
+// 「插入/恢复」上的闸门都拦不到它。
 //
-// 所以这条路径必须能在事务内先过闸门再翻状态——闸门的共享锁只有在同一个事务里
-// 才有意义。会话版保留给拉黑方向（那是收回权限，不需要闸门）。
+// 所以这条路径必须能在事务内先过 admitOrRestoreMembersTx 再翻状态——闸门的共享锁
+// 只有在同一个事务里才有意义。会话版保留给拉黑方向（那是收回权限，不需要闸门）。
 func (d *DB) updateMembersStatusTx(tx *dbr.Tx, version int64, groupNo string, status int, uids []string) error {
 	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
 		"status":  status,
@@ -1195,19 +1206,34 @@ func (d *DB) queryProjectGroupNos(spaceID, projectID string) ([]string, error) {
 	return groupNos, err
 }
 
-// queryProjectGroupNosWithActiveMember returns the project's groups that uid is
-// an active member of.
+// queryProjectGroupNosWithActiveMember returns the project's LIVE groups that uid
+// is an active member of.
 //
-// The COLLATE on the join column is NOT optional and NOT cosmetic. `group` was
-// created in 2019 with no explicit CHARSET/COLLATE and inherits the server
-// default; `octo_project*` pin utf8mb4_general_ci. P0's round-4 verification
-// MEASURED production and found user / space / space_member at
-// utf8mb4_0900_ai_ci — an artefact of a mysqldump import, since mysqldump omits
-// COLLATE for tables whose collation equalled the source default. So an implicit
-// join here is MySQL error 1267 in production while passing in CI, because CI
-// creates its database with an explicit utf8mb4_general_ci. Two other places in
-// this tree already carry the same workaround
-// (modules/message/db_reminders.go:113, modules/bot_api/resolve_targets.go:148).
+// # Disbanded groups are excluded, and that filter is load-bearing
+//
+// RemoveGroupMembers refuses a disbanded group outright ("group not found or
+// disbanded"), so handing it one is not a wasted call — it is a permanent
+// failure. The cascade returns that error, the job backs off, and after eight
+// attempts it is marked abandoned, which is terminal: the departing member's seat
+// then sits at removing = 1 forever. One disbanded group anywhere in a project
+// was enough to break removal for every member still in it.
+//
+// Skipping is also the right answer on its own terms. Group disband only flips
+// group.status and deliberately leaves group_member rows in place, a disbanded
+// group grants no access, and there is no endpoint that would clean those rows
+// up — so the rows are expected, not a leak. The I2 scan carries the same filter
+// for the same reason; if it did not, it would report rows this path is now
+// correct to leave alone.
+//
+// # No COLLATE on this join
+//
+// `group` and `group_member` are BOTH legacy tables, so they share whatever
+// collation the server default gave them and compare cleanly without help.
+// Forcing one side to utf8mb4_general_ci would make the expression
+// non-sargable — the index on group_member.group_no could no longer serve the
+// join — to solve a mismatch that does not exist here. The COLLATE belongs
+// exactly where a legacy column meets an `octo_project*` one, which this query
+// does not do.
 func (d *DB) queryProjectGroupNosWithActiveMember(spaceID, projectID, uid string) ([]string, error) {
 	if spaceID == "" || projectID == "" || uid == "" {
 		return nil, nil
@@ -1215,9 +1241,10 @@ func (d *DB) queryProjectGroupNosWithActiveMember(spaceID, projectID, uid string
 	var groupNos []string
 	_, err := d.session.SelectBySql(
 		"SELECT g.group_no FROM `group` g "+
-			"INNER JOIN group_member gm ON gm.group_no = g.group_no COLLATE utf8mb4_general_ci "+
-			"WHERE g.space_id = ? AND g.project_id = ? AND gm.uid = ? AND gm.is_deleted = 0",
-		spaceID, projectID, uid,
+			"INNER JOIN group_member gm ON gm.group_no = g.group_no "+
+			"WHERE g.space_id = ? AND g.project_id = ? AND g.status <> ? "+
+			"  AND gm.uid = ? AND gm.is_deleted = 0",
+		spaceID, projectID, GroupStatusDisband, uid,
 	).Load(&groupNos)
 	return groupNos, err
 }

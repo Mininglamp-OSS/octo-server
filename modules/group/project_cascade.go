@@ -120,9 +120,23 @@ func (g *Group) detachMemberFromOneProjectGroup(groupNo string, removal projectm
 	if detached {
 		// The group left the project entirely; its members, including the
 		// departing uid, stay. Nothing further to do for this group.
+		g.Info("项目级联：群无可继任的项目成员，已改为 Space 直属",
+			zap.String("group_no", groupNo),
+			zap.String("project_id", removal.ProjectID),
+			zap.String("uid", removal.UID))
 		return nil
 	}
-	_ = handedOver
+	if handedOver {
+		// An ownership change nobody asked for, performed by a background job.
+		// It is the right outcome (see handOverProjectGroupIfCreator) but it is
+		// not a thing to do silently: this line is the only record of WHY a group
+		// changed hands, and it is what an operator will look for when the new
+		// owner asks.
+		g.Info("项目级联：群主随项目席位关闭而交接",
+			zap.String("group_no", groupNo),
+			zap.String("project_id", removal.ProjectID),
+			zap.String("former_creator", removal.UID))
+	}
 
 	resp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:              groupNo,
@@ -148,21 +162,24 @@ func (g *Group) detachMemberFromOneProjectGroup(groupNo string, removal projectm
 }
 
 // creatorOf reads a group's creator outside a transaction, for diagnostics only.
+//
+// One statement. The first version listed the managers and creator and then asked
+// "is this one the creator?" per uid — an N+1 on the error path of a background
+// job, i.e. exactly where nobody would notice it.
 func (g *Group) creatorOf(groupNo string) (string, error) {
-	uids, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
+	var uids []string
+	_, err := g.db.session.SelectBySql(
+		"SELECT uid FROM group_member "+
+			"WHERE group_no = ? AND role = ? AND is_deleted = 0 LIMIT 1",
+		groupNo, MemberRoleCreator,
+	).Load(&uids)
 	if err != nil {
 		return "", err
 	}
-	for _, uid := range uids {
-		isCreator, err := g.db.QueryIsGroupCreator(groupNo, uid)
-		if err != nil {
-			return "", err
-		}
-		if isCreator {
-			return uid, nil
-		}
+	if len(uids) == 0 {
+		return "", nil
 	}
-	return "", nil
+	return uids[0], nil
 }
 
 // handOverProjectGroupIfCreator transfers ownership away from the departing

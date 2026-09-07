@@ -80,29 +80,49 @@ func (p *Project) runRemovalCascade() {
 		p.Error("认领项目移除工单失败", zap.Error(err))
 		return
 	}
+
+	// Publish the backlog. It is read here rather than on its own timer because
+	// this is the only place that already knows the queue is being looked at, and
+	// a COUNT on an indexed status column every 10s is cheaper than a second
+	// scheduled job. Without a writer the gauge sat at zero forever, which reads
+	// as "the queue is empty" — the same failure shape P0's round 5 found on the
+	// reconcile gauges.
+	if pending, cErr := p.db.countPendingRemovalJobs(); cErr != nil {
+		p.Warn("采集项目移除工单积压失败", zap.Error(cErr))
+	} else {
+		removalBacklog.Set(float64(pending))
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	// Heartbeat the WHOLE claimed batch for as long as this tick runs.
+	//
+	// One claim leases up to removalBatch jobs and they are then worked in
+	// sequence, so the last one can wait for all the others. Renewing only the job
+	// currently in flight — which is what the first version did — leaves the queued
+	// remainder on the lease they were claimed with, and the tail of a slow batch
+	// expires while this worker still intends to work it. Another pod then claims
+	// those rows and runs the same cascade concurrently, and the two take group
+	// locks in whatever order their group lists happen to produce.
+	//
+	// Renewing a job that has already finished is harmless: the statement is
+	// guarded on status = pending, so a terminal row is not touched.
+	ids := make([]int64, 0, len(jobs))
 	for _, job := range jobs {
-		p.workRemovalJob(job, owner)
+		ids = append(ids, job.ID)
+	}
+	stop := p.startLeaseHeartbeat(ids, owner)
+	defer stop()
+
+	for _, job := range jobs {
+		p.workRemovalJob(job)
 	}
 }
 
-// workRemovalJob runs one job to a terminal state, or reschedules it.
-func (p *Project) workRemovalJob(job RemovalJob, owner string) {
-	defer func() {
-		if r := recover(); r != nil {
-			p.Error("项目移除工单 panic",
-				zap.Int64("job_id", job.ID),
-				zap.String("project_id", job.ProjectID),
-				zap.Any("recover", r))
-		}
-	}()
-
-	// Heartbeat the lease for as long as this job runs.
-	//
-	// #797's open P1 on the Space outbox is the absence of exactly this: without
-	// a heartbeat the abandon sweep marks a still-running FINAL attempt as
-	// abandoned, and because abandoned is terminal the work is then never
-	// retried. A project removal fans out over every group in the project, so it
-	// is more likely to outrun a lease than the Space job that already does.
+// startLeaseHeartbeat renews `ids` every removalHeartbeatEvery until the returned
+// function is called, which blocks until the goroutine has stopped.
+func (p *Project) startLeaseHeartbeat(ids []int64, owner string) func() {
 	stop := make(chan struct{})
 	var beat sync.WaitGroup
 	beat.Add(1)
@@ -115,16 +135,32 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				if err := p.db.heartbeatRemovalLease(job.ID, owner, time.Now().UTC().Add(removalLease)); err != nil {
-					p.Warn("续租项目移除工单失败", zap.Int64("job_id", job.ID), zap.Error(err))
+				until := time.Now().UTC().Add(removalLease)
+				if err := p.db.heartbeatRemovalLeases(ids, owner, until); err != nil {
+					p.Warn("续租项目移除工单失败", zap.Int("jobs", len(ids)), zap.Error(err))
 				}
 			}
 		}
 	}()
-	defer func() {
+	return func() {
 		close(stop)
 		beat.Wait()
+	}
+}
+
+// workRemovalJob runs one job to a terminal state, or reschedules it.
+func (p *Project) workRemovalJob(job RemovalJob) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.Error("项目移除工单 panic",
+				zap.Int64("job_id", job.ID),
+				zap.String("project_id", job.ProjectID),
+				zap.Any("recover", r))
+		}
 	}()
+
+	// The lease is heartbeaten by runRemovalCascade for the whole claimed batch,
+	// not per job — see startLeaseHeartbeat for why the batch is the right unit.
 
 	// Re-read the member row UNDER LOCK before doing anything (D4).
 	//

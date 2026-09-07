@@ -15,7 +15,7 @@ import (
 // the keyspace, and Set-ing that partial number publishes a value smaller than
 // reality, under which an alert threshold never fires.
 //
-// # Every JOIN here carries an explicit COLLATE, and that is not cosmetic
+// # Every join that CROSSES the two schemas carries an explicit COLLATE
 //
 // `group` and `group_member` were created in 2019 with no explicit
 // CHARSET/COLLATE and inherit the server default. octo_project* pin
@@ -27,6 +27,22 @@ import (
 // passing in CI, because CI creates its database with an explicit
 // utf8mb4_general_ci. A scan that 500s in production and is green in CI is worse
 // than no scan: it reports zero violations and nobody looks again.
+//
+// The converse matters just as much, and the first version of this file got it
+// wrong in BOTH directions. A join between two LEGACY tables (`group` ⋈
+// `group_member`, `group` ⋈ `space`) needs no COLLATE, because both sides
+// already agree; adding one there makes the predicate non-sargable — the index
+// on the joined column stops being usable — so the "safety" measure costs a full
+// scan on the largest tables. But `space_member_removal_cleanup` is NOT legacy
+// (modules/space created it with an explicit general_ci), and a comparison in the
+// SELECT list crosses the schemas exactly as one in an ON clause does; both were
+// missed. The rule is about which SIDE a column is on, not which module wrote the
+// query, and it applies wherever two columns meet.
+//
+// That claim is CI evidence rather than an assertion: TestP1ScansSurviveCollationDrift
+// runs these statements against a deliberately drifted database. It is also why
+// these scans sit OUTSIDE p.cfg.ReconcileEnabled — the gate exists for statements
+// that cannot survive the drift, and these can.
 
 // i2Threshold values.
 const (
@@ -40,6 +56,9 @@ const (
 // i2Row is one active member of a project group, flagged with whether they are a
 // violation and, if exempt, why.
 type i2Row struct {
+	// ID and UID are the composite cursor. The page cuts on (group id, uid)
+	// pairs, not on groups, so both halves have to come back with the row.
+	ID        int64  `db:"id"`
 	GroupNo   string `db:"group_no"`
 	ProjectID string `db:"project_id"`
 	UID       string `db:"uid"`
@@ -77,15 +96,16 @@ func (p *Project) scanI2Violations() {
 	start := time.Now()
 	defer func() { reconcileDuration.WithLabelValues("i2").Observe(time.Since(start).Seconds()) }()
 
-	cursor, total := cursors.idResume(&cursors.i2Group, &cursors.i2Run)
+	cursorGroup, cursorUID, total := cursors.i2Resume()
 	log := &logCapped{p: p, scan: "i2"}
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
-		rows, lastID, err := p.queryI2Page(cursor, p.cfg.ReconcileLimit)
+		rows, err := p.queryI2Page(cursorGroup, cursorUID, p.cfg.ReconcileLimit)
 		if err != nil {
 			// break, not return: the cursor save below must be reached, or a
 			// failing page resets the rotation to the start every tick and the
 			// tail of the keyspace is never examined.
+			noteScanFailure("i2")
 			p.Warn("对账 I2 扫描失败", zap.Error(err))
 			break
 		}
@@ -104,7 +124,8 @@ func (p *Project) scanI2Violations() {
 				zap.String("spaceId", row.SpaceID))
 			total++
 		}
-		cursor = lastID
+		last := rows[len(rows)-1]
+		cursorGroup, cursorUID = last.ID, last.UID
 		if len(rows) < p.cfg.ReconcileLimit {
 			completed = true
 			break
@@ -113,20 +134,40 @@ func (p *Project) scanI2Violations() {
 	if completed {
 		i2Violations.Set(float64(total))
 	}
-	cursors.idSave(&cursors.i2Group, &cursors.i2Run, cursor, total, completed)
+	cursors.i2Save(cursorGroup, cursorUID, total, completed)
 }
 
 // queryI2Page returns one bounded page of (project group, active member) pairs,
-// each flagged with whether it violates I2, plus the last group id examined.
+// each flagged with whether it violates I2.
 //
-// The LIMIT is on group_member rows, not on groups, so the page size bounds rows
-// EXAMINED rather than groups visited — which is what the bounded-rows guard
-// actually asks for. A single very large group therefore costs one page, not an
-// unbounded read.
-func (p *Project) queryI2Page(cursorGroupID int64, limit int) ([]*i2Row, int64, error) {
+// # The cursor is composite, and it has to be
+//
+// The LIMIT is on group_member rows, so the page bounds rows EXAMINED rather
+// than groups visited — a single very large group costs one page, not an
+// unbounded read. But that means a page can cut a group in half, and an earlier
+// version advanced the cursor to the page's last GROUP ID with `WHERE g.id > ?`.
+// The next page then started strictly after that group, so every member of it
+// past the boundary was skipped. The comment called this self-correcting; it is
+// not, and that was the defect: the pages fall on the same boundary on every
+// rotation, so the same members are skipped forever. A group whose one
+// non-member sorts last was invisible to the scan permanently.
+//
+// `(g.id, gm.uid) > (?, ?)` resumes at the exact pair the last page ended on,
+// which is the same shape P0's queryI1ViolationPage uses over
+// (project_id, uid). It also removes the second query the old cursor needed —
+// which was differently filtered (no bot exclusion), so it could report a
+// different last group than the page it was supposed to describe.
+//
+// # Disbanded groups are excluded
+//
+// Group disband only flips group.status and leaves every group_member row in
+// place, by design, and no endpoint cleans them up. Those rows grant nothing, so
+// they are not a leak — and the cascade skips disbanded groups for the same
+// reason, so flagging them here would report a state nothing is allowed to fix.
+func (p *Project) queryI2Page(cursorGroupID int64, cursorUID string, limit int) ([]*i2Row, error) {
 	var rows []*i2Row
 	_, err := p.db.session.SelectBySql(
-		"SELECT g.group_no, g.project_id, gm.uid, g.space_id, "+
+		"SELECT g.id, g.group_no, g.project_id, gm.uid, g.space_id, "+
 			// violating = "not an active project member" AND "no exemption
 			// applies". Computed in SQL rather than filtered by a WHERE so the
 			// page stays a fixed size: with a WHERE, a burst of exempt rows would
@@ -137,58 +178,38 @@ func (p *Project) queryI2Page(cursorGroupID int64, limit int) ([]*i2Row, int64, 
 			"   AND (sp.status IS NULL OR sp.status <> 2)) "+ // exemption 3: banned Space
 			"  AS violating "+
 			"FROM `group` g "+
+			// group ⋈ group_member: both legacy, so no COLLATE — forcing one here
+			// would cost the index on group_member.group_no for nothing.
 			"INNER JOIN group_member gm "+
-			"  ON gm.group_no = g.group_no COLLATE utf8mb4_general_ci "+
+			"  ON gm.group_no = g.group_no "+
 			" AND gm.is_deleted = 0 AND gm.status = 1 "+
+			// These two cross into the pinned schema, so the legacy side is
+			// coerced. This is where COLLATE actually belongs.
 			"LEFT JOIN `octo_project_member` pm "+
 			"  ON pm.project_id = g.project_id COLLATE utf8mb4_general_ci "+
 			" AND pm.uid = gm.uid COLLATE utf8mb4_general_ci "+
 			"LEFT JOIN `octo_project_member_removal_cleanup` jobp "+
 			"  ON jobp.project_id = g.project_id COLLATE utf8mb4_general_ci "+
 			" AND jobp.uid = gm.uid COLLATE utf8mb4_general_ci AND jobp.status = 0 "+
+			// space_member_removal_cleanup is NOT legacy: modules/space created it
+			// with an explicit general_ci, so it sits on the pinned side and its
+			// comparisons against `group` / group_member cross the schemas. This
+			// one was miscategorised in the first pass at the COLLATE cleanup and
+			// the drift test caught it — which is the point of having the test.
 			"LEFT JOIN space_member_removal_cleanup jobs "+
 			"  ON jobs.space_id = g.space_id COLLATE utf8mb4_general_ci "+
 			" AND jobs.uid = gm.uid COLLATE utf8mb4_general_ci AND jobs.status = 0 "+
-			"LEFT JOIN `space` sp ON sp.space_id = g.space_id COLLATE utf8mb4_general_ci "+
-			"WHERE g.id > ? AND g.project_id <> '' AND gm.uid NOT IN ? "+
+			// `space` IS legacy, so this one needs nothing.
+			"LEFT JOIN `space` sp ON sp.space_id = g.space_id "+
+			"WHERE (g.id, gm.uid) > (?, ?) AND g.project_id <> '' AND g.status <> 2 "+
+			"  AND gm.uid NOT IN ? "+
 			"ORDER BY g.id ASC, gm.uid ASC LIMIT ?",
-		cursorGroupID, systemBotUIDsForScan(), limit,
+		cursorGroupID, cursorUID, systemBotUIDsForScan(), limit,
 	).Load(&rows)
 	if err != nil {
-		return nil, cursorGroupID, err
+		return nil, err
 	}
-	if len(rows) == 0 {
-		return nil, cursorGroupID, nil
-	}
-	// The page's last group id is the next cursor. Rows for that group may be
-	// split across the page boundary; the next page starts AFTER it, so a few of
-	// its members can be skipped for one rotation. Acceptable for an alerting
-	// scan and self-correcting — the next rotation sees them — and the
-	// alternative (a composite (group_id, uid) cursor) buys exactness the alert
-	// does not need.
-	last, err := p.lastGroupIDOfI2Page(cursorGroupID, limit)
-	if err != nil {
-		return rows, cursorGroupID, err
-	}
-	return rows, last, nil
-}
-
-// lastGroupIDOfI2Page returns the highest group id the matching page covered.
-func (p *Project) lastGroupIDOfI2Page(cursorGroupID int64, limit int) (int64, error) {
-	var ids []int64
-	_, err := p.db.session.SelectBySql(
-		"SELECT g.id FROM `group` g "+
-			"INNER JOIN group_member gm "+
-			"  ON gm.group_no = g.group_no COLLATE utf8mb4_general_ci "+
-			" AND gm.is_deleted = 0 AND gm.status = 1 "+
-			"WHERE g.id > ? AND g.project_id <> '' "+
-			"ORDER BY g.id ASC, gm.uid ASC LIMIT ?",
-		cursorGroupID, limit,
-	).Load(&ids)
-	if err != nil || len(ids) == 0 {
-		return cursorGroupID, err
-	}
-	return ids[len(ids)-1], nil
+	return rows, nil
 }
 
 // i3Row is one group whose project attribution is broken.
@@ -218,6 +239,7 @@ func (p *Project) scanI3Violations() {
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.queryI3Page(cursor, p.cfg.ReconcileLimit)
 		if err != nil {
+			noteScanFailure("i3")
 			p.Warn("对账 I3 扫描失败", zap.Error(err))
 			break
 		}
@@ -251,11 +273,16 @@ func (p *Project) scanI3Violations() {
 func (p *Project) queryI3Page(cursor int64, limit int) ([]*i3Row, error) {
 	var rows []*i3Row
 	_, err := p.db.session.SelectBySql(
+		// pr.space_id (pinned) against g.space_id (legacy) crosses the schemas just
+		// as the JOIN does, so it carries the same COLLATE. A comparison in the
+		// SELECT list is as capable of raising 1267 as one in the ON clause, and
+		// this pair was missed until the drift test ran.
 		"SELECT g.id, g.group_no, g.project_id, g.space_id, "+
-			"  (pr.project_id IS NULL OR pr.status <> 1 OR pr.space_id <> g.space_id) AS violating, "+
+			"  (pr.project_id IS NULL OR pr.status <> 1 "+
+			"     OR pr.space_id <> g.space_id COLLATE utf8mb4_general_ci) AS violating, "+
 			"  CASE WHEN pr.project_id IS NULL THEN 'missing' "+
 			"       WHEN pr.status <> 1 THEN 'disbanded' "+
-			"       WHEN pr.space_id <> g.space_id THEN 'other_space' "+
+			"       WHEN pr.space_id <> g.space_id COLLATE utf8mb4_general_ci THEN 'other_space' "+
 			"       ELSE '' END AS reason "+
 			"FROM `group` g "+
 			"LEFT JOIN `octo_project` pr "+
@@ -303,6 +330,7 @@ func (p *Project) scanRemovingStalls() {
 		before, p.cfg.ReconcileLimit,
 	).Load(&rows)
 	if err != nil {
+		noteScanFailure("removing_stall")
 		p.Warn("对账 removing 滞留扫描失败", zap.Error(err))
 		return
 	}

@@ -4965,8 +4965,15 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 	// spaces cap was missed in the same function. spaces feeds the same
 	// derived authz cache (owned_bots_by_space is whitelisted through this
 	// list), so truncation at the spaces side cascades into bots silently.
-	// Over-fetch to LIMIT 101, slice + warn when len > 100. ORDER BY makes
+	// Over-fetch by one, slice + warn when the extra row came back. ORDER BY makes
 	// LIMIT deterministic across calls (was random per MySQL engine choice).
+	//
+	// The over-fetch is userSpacesLimit+1 as a BOUND PARAMETER rather than a
+	// literal 101. The literal and the constant beneath it drifted apart the
+	// moment userSpacesLimit was hoisted to package scope: raising the constant to
+	// 200 would have left the query at 101, so the truncation warning would stop
+	// firing while the list was still being cut — silent truncation, which is the
+	// exact defect the over-fetch was added to prevent.
 	type spaceRow struct {
 		SpaceID string `db:"space_id"`
 	}
@@ -4976,8 +4983,8 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
 		 WHERE sm.uid=? AND sm.status=1
 		 ORDER BY sm.space_id
-		 LIMIT 101`,
-		uid,
+		 LIMIT ?`,
+		uid, userSpacesLimit+1,
 	).Load(&spaceRows)
 	if err != nil {
 		return nil, nil, false, err

@@ -1007,14 +1007,16 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 
 	// 校验 project_id。
 	//
-	// 三道门，顺序有意如此：
+	// 四道门，顺序有意如此：
 	//
 	//  1. 必须同时给 space_id —— 项目本身就活在某个 Space 里，没有 Space 的项目群
 	//     无从谈起。
 	//  2. 功能开关必须打开。这是 brief D1 说的唯一回滚手段：关掉它只是「不再产生
 	//     新的项目群」，已有项目群的成员约束照常强制——设计文档明确不允许放松
 	//     已有约束。开关与 appconfig 的 project_on 是同一个值。
-	//  3. 项目必须存在、活跃、且属于同一个 Space。三种失败回同一个错误码，不区分
+	//  3. 调用方本人必须在这个 Space 里。见下面那段：Space 成员校验在 Service 里，
+	//     也就是在这之后，所以不先问这一句，第 4 道门就成了一个人人可用的探测器。
+	//  4. 项目必须存在、活跃、且属于同一个 Space。三种失败回同一个错误码，不区分
 	//     ——区分开就等于把建群变成一个探测器：拿着一个自己看不见的 project_id，
 	//     用一个自己有权限的 Space 就能问出「它存不存在、在哪个 Space」。
 	//
@@ -1028,6 +1030,29 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 		if !common2.EnsureSystemSettings(g.ctx).ProjectEnabled() {
 			g.Warn("项目功能未开启，拒绝创建项目群",
 				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+		// 先确认调用方自己在这个 Space 里，再去问项目存不存在。
+		//
+		// 顺序不是风格问题。Space 成员校验被放在 Service 里（见下方 CreateGroup），
+		// 也就是**在这段之后**；于是先查项目就把建群接口变成了一个探测器：任何
+		// 持有效 token 的人都能拿 space_id + project_id 组合去问「这个项目在不在
+		// 这个 Space」，而这正是上一条注释说要避免的事——只不过它防住了「三种失败
+		// 回同一个码」，没防住「根本不该被回答」。
+		//
+		// 失败回同一个 ErrGroupProjectUnavailable，而不是一个「你不在这个 Space」
+		// 的专属错误：区分开来同样是在回答问题。真正的原因进日志。
+		creatorInSpace, err := spacepkg.CheckMembership(g.ctx.DB(), req.SpaceID, creator)
+		if err != nil {
+			g.Error("查询 Space 成员失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !creatorInSpace {
+			g.Warn("建项目群：调用方不在该 Space，不回答项目是否存在",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID),
+				zap.String("creator", creator))
 			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
 			return
 		}
@@ -1154,6 +1179,15 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
+		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
+		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
+		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
+		// 变成 5xx，把本功能最常见的一次拒绝变成一条 on-call 告警；而 P1 专为
+		// 这次拒绝注册的错误码从此不可达，本地化文案永远不会出现。
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1652,6 +1686,11 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			return
 		}
 		g.Error("添加群成员失败", zap.Error(err))
+		// 与建群同理：准入被拒是 400，不是 500。见 groupCreate 处的说明。
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}

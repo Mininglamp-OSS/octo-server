@@ -44,10 +44,15 @@ const (
 )
 
 // removalReason values. Low-cardinality; they end up in a metric label.
+//
+// There is deliberately NO "project_disbanded" reason. Disband does not enqueue
+// per-member jobs at all — it closes every seat in one statement and runs the
+// registered disband steps, which revert the project's groups to Space-direct
+// with their members intact. An unused constant here would suggest a code path
+// that does not exist.
 const (
-	removalReasonKicked           = "kicked"
-	removalReasonLeft             = "left"
-	removalReasonProjectDisbanded = "project_disbanded"
+	removalReasonKicked = "kicked"
+	removalReasonLeft   = "left"
 )
 
 // RemovalJob is one unit of project-side cleanup.
@@ -182,6 +187,30 @@ func (d *DB) cancelPendingRemovalJobsTx(tx *dbr.Tx, projectID, uid string, now t
 	return affected, nil
 }
 
+// cancelPendingRemovalJobsForProjectTx retires every outstanding job of one
+// project, for the disband path.
+//
+// Disband closes every seat in a single UPDATE, so the per-uid variant would need
+// the list of seats it just closed and one statement each. One statement over the
+// project is both cheaper and impossible to get out of step with the UPDATE it
+// accompanies.
+func (d *DB) cancelPendingRemovalJobsForProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int64, error) {
+	res, err := tx.UpdateBySql(
+		"UPDATE `octo_project_member_removal_cleanup` "+
+			"SET status = ?, finished_at = ?, lease_owner = '', lease_until = NULL "+
+			"WHERE project_id = ? AND status = ?",
+		removalJobCancelled, now, projectID, removalJobPending,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: cancel removal jobs for project: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: cancel removal jobs for project affected rows: %w", err)
+	}
+	return affected, nil
+}
+
 // claimRemovalJobs leases up to limit pending jobs for owner.
 //
 // Two statements rather than one because MySQL cannot UPDATE a table it selects
@@ -248,21 +277,32 @@ func (d *DB) claimRemovalJobs(owner string, limit int, now time.Time, lease time
 	return jobs, nil
 }
 
-// heartbeatRemovalLease extends the lease of a job that is still being worked.
+// heartbeatRemovalLeases extends the leases of every job in one claimed batch.
 //
-// #797's open P1 on the Space outbox is the absence of exactly this: without a
-// heartbeat, the abandon sweep marks a still-running FINAL attempt as abandoned,
-// and the work is then never retried because the row is terminal. A project
-// removal fans out over every group in the project, so it is more likely to
-// outrun a lease than the Space job that already does.
-func (d *DB) heartbeatRemovalLease(id int64, owner string, until time.Time) error {
+// #797's open P1 on the Space outbox is the absence of a heartbeat at all:
+// without one, the abandon sweep marks a still-running FINAL attempt as
+// abandoned, and the work is then never retried because the row is terminal. A
+// project removal fans out over every group in the project, so it is more likely
+// to outrun a lease than the Space job that already does.
+//
+// It takes the WHOLE BATCH rather than one id, because one claim leases up to
+// removalBatch jobs at once and the worker then processes them in sequence.
+// Heartbeating only the in-flight one leaves the queued remainder on the lease
+// they were claimed with, so the tail of a slow batch expires while this worker
+// still intends to work it — and another pod picks those rows up and runs the
+// same cascade concurrently. The two then take group locks in whatever order
+// their group lists happen to produce.
+func (d *DB) heartbeatRemovalLeases(ids []int64, owner string, until time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	_, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_member_removal_cleanup` SET lease_until = ? "+
-			"WHERE id = ? AND lease_owner = ? AND status = ?",
-		until, id, owner, removalJobPending,
+			"WHERE id IN ? AND lease_owner = ? AND status = ?",
+		until, ids, owner, removalJobPending,
 	).Exec()
 	if err != nil {
-		return fmt.Errorf("project: heartbeat removal lease: %w", err)
+		return fmt.Errorf("project: heartbeat removal leases: %w", err)
 	}
 	return nil
 }
@@ -310,9 +350,14 @@ func (d *DB) rescheduleRemovalJob(id int64, nextAttempt time.Time, lastErr strin
 // forever and the purge itself gets slower as it does.
 func (d *DB) purgeFinishedRemovalJobs(before time.Time, batch int) (int64, error) {
 	res, err := d.session.DeleteBySql(
+		// `status IN (terminal...)` rather than `status <> pending`: the index is
+		// (status, finished_at), and a negated equality cannot use it — MySQL
+		// falls back to scanning the whole table on every purge tick, which is the
+		// opposite of what a retention job that runs forever should do. Listing the
+		// three terminal values keeps it an index range scan.
 		"DELETE FROM `octo_project_member_removal_cleanup` "+
-			"WHERE status <> ? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
-		removalJobPending, before, batch,
+			"WHERE status IN (?, ?, ?) AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
+		removalJobDone, removalJobAbandoned, removalJobCancelled, before, batch,
 	).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("project: purge removal jobs: %w", err)

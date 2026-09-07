@@ -1310,10 +1310,10 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	if len(realMemberUIDs) == 0 {
 		return nil, errors.New("no valid member to add")
 	}
-	// 收口到唯一准入口（A3）。newGroupProjectID 目前恒为空串——建群接口还不接受
-	// 客户端传入的 project_id，那个参数跟级联一起落地（brief 的排序约束：绝不能
-	// 出现「项目群已存在、级联还没有」的状态）。等它落地时这里改一行即可，闸门
-	// 已经在位并且有测试。
+	// 收口到唯一准入口（A3）。newGroupProjectID 来自建群请求的 project_id：
+	// handler 已经校验过它存在、活跃、属于同一个 Space，且调用方在这个 Space 里；
+	// 「调用方是不是这个项目的成员」故意不在那里查，而是由下面这道闸门在**建群
+	// 事务内、持锁状态下**判定——放在 handler 里查是一次会过期的读。
 	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID,
 		initialAdmissions, AdmissionEntryCreateGroup); err != nil {
 		s.Error("insert members failed", zap.Error(err), zap.String("groupNo", groupNo))
