@@ -2179,6 +2179,38 @@ Two reviewers converged on the same headline; all four verified against code bef
   它们会打破现在兼容的那些。方案是把 dump 那批一次转完。顺带发现：默认 collation 的库上
   **迁移无法从零重放**（category 的 `group_setting ⋈ group_category` 1267），会咬到下个新环境。
 
+## 2026-09-07 — project-p1-group-binding（第一轮 review 修复 + rebase 到 P0 新门控）
+
+**两阶段状态机会把每一处既有的 `status == active` 变成一道必须重答的题**——这次六个高优
+里有四个是同一形状，而且都朝「看起来安全」的方向静默失败：Space 级联和项目解散把
+`status` 翻成 0 却不清 `removing`，落进 schema 自己写着「不允许存在」的那格，而
+`finishMemberRemovalTx` 的 `status=1 AND removing=1` 谓词从此永远匹配不上，滞留告警每
+tick 报一次、没人能修；`actorRoleTx` 把正在关闭的席位当活跃成员，于是即将离开的 owner
+在整个级联窗口里握着解散权；`promoteSuccessorTx` 允许把最后一个 owner 交给一个正在关闭
+的席位——而 `countActiveOwnersTx` 已经排除了它，于是「最后一个 owner 必须先转让」这道闸
+门自己把项目变成了零 owner。
+
+**「自我修正」是个需要证明的说法。** I2 扫描的游标停在整页最后一个**群 id** 上，
+`WHERE g.id > ?` 于是跳过那个群边界之后的所有成员；注释写着「下一轮就看到了」，但分页每
+轮都落在同一个边界，所以被跳过的是**永远**被跳过。改成 `(g.id, gm.uid)` 复合游标（P0 的
+I1 早就是这个形状），顺带删掉旧游标要的第二条查询——那条的过滤条件还和主查询不一致。
+
+**一个被解散的群足以让整个项目的成员都移除不掉。** 级联的群列表没有 status 过滤，而
+`RemoveGroupMembers` 对解散群直接报错，于是八次尝试全部同样失败、工单终态 abandoned、席位
+永远停在 removing=1。
+
+**COLLATE 的规则是「列在哪一侧」，不是「查询是谁写的」。** 我按「legacy ⋈ legacy 不需要」
+清理了一轮，然后写了一个**故意制造漂移**的库去跑真查询——当场抓到两处判断错误：
+`space_member_removal_cleanup` 是迁移建的、显式 general_ci，属于 pinned 侧不是 legacy 侧；
+而 SELECT 列表里的比较和 ON 子句里的一样会 1267。这也是 P1 三个扫描**不进** P0 新增的
+`OCTO_PROJECT_RECONCILE_ENABLED` 门控的依据：门是为「撑不住漂移的语句」设的，这三条撑得住
+（有测试为证），而 I2 背后没有任何读路径过滤，把最有牙齿的那个不变量监控默认关掉，正是
+P0 第五轮修的那个失败从另一侧再来一次。
+
+**撇号会配对。** 迁移测试的朴素分割把引号当字符串定界符，所以文件里撇号数为偶数时可能
+碰巧通过、奇数时才炸。这次是一处四十行外的无关编辑删掉了一个撇号、翻转了奇偶，测试便指向
+了完全无辜的语句。修法不是数撇号，是全文件不用撇号。
+
 ## 2026-09-06 — project-p1-group-binding（群绑定项目 / 不变量 I2）
 
 把群的成员集合收进项目边界。11 条准入路径收口到**唯一入口**，4 条源码守卫钉住它，
