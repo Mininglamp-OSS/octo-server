@@ -89,6 +89,8 @@ type IService interface {
 
 	// 获取设备在线状态
 	GetDeviceOnline(uid string, deviceFlag config.DeviceFlag) (*config.OnlinestatusResp, error)
+	// 批量获取指定设备的在线状态（仅返回 online=1 的记录），单次查询避免 per-uid N+1
+	GetDeviceOnlines(uids []string, deviceFlags []config.DeviceFlag) ([]*config.OnlinestatusResp, error)
 	// 查询在线用户总数量
 	GetOnlineCount() (int64, error)
 	// 存在黑明单
@@ -1290,6 +1292,33 @@ func (s *Service) GetDeviceOnline(uid string, deviceFlag config.DeviceFlag) (*co
 	}, nil
 }
 
+// GetDeviceOnlines 批量查询给定 uid 集合中指定设备的在线记录（仅 online=1），单次 DB 往返。
+// 用于离线 Push 前的批量在线判定，替代 GetDeviceOnline 的 per-uid 循环查询。
+func (s *Service) GetDeviceOnlines(uids []string, deviceFlags []config.DeviceFlag) ([]*config.OnlinestatusResp, error) {
+	if len(uids) == 0 || len(deviceFlags) == 0 {
+		return nil, nil
+	}
+	// 用 uint16 而非 uint8：dbr 会把 []uint8([]byte) 当二进制字面量，IN 列表无法展开（详见 queryOnlineDevices）。
+	flags := make([]uint16, 0, len(deviceFlags))
+	for _, f := range deviceFlags {
+		flags = append(flags, uint16(f.Uint8()))
+	}
+	models, err := s.onlineDB.queryOnlineDevices(uids, flags)
+	if err != nil {
+		return nil, err
+	}
+	resps := make([]*config.OnlinestatusResp, 0, len(models))
+	for _, m := range models {
+		resps = append(resps, &config.OnlinestatusResp{
+			UID:         m.UID,
+			DeviceFlag:  m.DeviceFlag,
+			LastOffline: m.LastOffline,
+			Online:      m.Online,
+		})
+	}
+	return resps, nil
+}
+
 // 查询在线总数量
 func (s *Service) GetOnlineCount() (int64, error) {
 	count, err := s.onlineService.GetOnlineCount()
@@ -1357,6 +1386,7 @@ type Resp struct {
 	CreatedAt       int64 // 注册时间 10位时间戳
 	IsDestroy       int   // 是否注销
 	Robot           int   // 机器人0.否1.是
+	MuteOfApp       int   // 手机静音：Web/PC 在线时抑制 App 离线 Push
 }
 
 func newResp(m *Model) *Resp {
@@ -1374,6 +1404,7 @@ func newResp(m *Model) *Resp {
 		IsDestroy:       m.IsDestroy,
 		CreatedAt:       time.Time(m.CreatedAt).Unix(),
 		Robot:           m.Robot,
+		MuteOfApp:       m.MuteOfApp,
 	}
 }
 

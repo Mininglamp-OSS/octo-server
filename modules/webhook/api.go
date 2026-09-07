@@ -606,6 +606,29 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 		w.Error("查询推送用户信息错误", zap.Error(err))
 		return nil
 	}
+	// OCT-61: 账号级「手机静音」(mute_of_app)——Web/PC(从设备) 在线时抑制 App(主设备) 离线 Push。
+	// 仅普通消息生效(isVideoCall 已在上方分流，RTC/来电不受影响)。进入 PushPool 前一次性批量
+	// 查询候选收件人的从设备在线态，避免 per-uid N+1；批量查询失败 fail-open(不抑制)，避免一次
+	// DB 抖动静默吞掉整批离线通知（与相邻账号级快捷静音的 best-effort 语义一致）。
+	if !isVideoCall {
+		candidates := make([]string, 0)
+		for _, u := range users {
+			if u != nil && u.MuteOfApp == 1 {
+				candidates = append(candidates, u.UID)
+			}
+		}
+		if len(candidates) > 0 {
+			onlineRows, err := w.userService.GetDeviceOnlines(candidates, []config.DeviceFlag{config.Web, config.PC})
+			if err != nil {
+				w.Error("批量查询设备在线状态失败，mute_of_app 不抑制", zap.Error(err), zap.Int("candidateCount", len(candidates)))
+			} else {
+				toUids = filterMutedAppUIDs(toUids, mutedUIDsFromOnline(candidates, onlineRows))
+				if len(toUids) == 0 {
+					return nil
+				}
+			}
+		}
+	}
 	fromUID := ""
 	if !isVideoCall { // 音视频消息不检查设置，直接推送
 		// 查询免打扰
