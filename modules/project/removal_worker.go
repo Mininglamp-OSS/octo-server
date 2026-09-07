@@ -2,6 +2,7 @@ package project
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,7 +117,7 @@ func (p *Project) runRemovalCascade() {
 	defer stop()
 
 	for _, job := range jobs {
-		p.workRemovalJob(job)
+		p.workRemovalJob(job, owner)
 	}
 }
 
@@ -149,7 +150,12 @@ func (p *Project) startLeaseHeartbeat(ids []int64, owner string) func() {
 }
 
 // workRemovalJob runs one job to a terminal state, or reschedules it.
-func (p *Project) workRemovalJob(job RemovalJob) {
+//
+// `owner` is the lease this job was claimed under. Every write that retires or
+// releases the job is fenced on it (see db_removal.go): a worker that lost its
+// lease mid-job abandons the write rather than landing it on top of the worker
+// that took over.
+func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.Error("项目移除工单 panic",
@@ -170,13 +176,11 @@ func (p *Project) workRemovalJob(job RemovalJob) {
 	// shape as P0's checkSpaceSeatForCleanupTx re-check.
 	cancelled, err := p.removalCancelled(job)
 	if err != nil {
-		p.rescheduleAfterFailure(job, err)
+		p.rescheduleAfterFailure(job, owner, err)
 		return
 	}
 	if cancelled {
-		if err := p.db.completeRemovalJob(job.ID, removalJobCancelled, "re-admitted", time.Now().UTC()); err != nil {
-			p.Error("标记项目移除工单为已取消失败", zap.Int64("job_id", job.ID), zap.Error(err))
-		}
+		p.retireRemovalJob(job, owner, removalJobCancelled, "re-admitted")
 		return
 	}
 
@@ -190,8 +194,27 @@ func (p *Project) workRemovalJob(job RemovalJob) {
 		OperatorUID: job.OperatorUID,
 		Reason:      job.Reason,
 	}
+	steps := snapshotMemberRemovalSteps()
+	if len(steps) == 0 {
+		// An empty registry must NOT read as "every step succeeded".
+		//
+		// Falling through would call finishRemoval and close the seat with the
+		// member's group_member rows never detached — the exact I2 violation the
+		// two-phase close exists to avoid, produced silently, with the job marked
+		// done. The mirror-image registry in modules/space fails closed for the
+		// same reason (preset_group_admitter.go: joinPresetGroups SKIPS and does
+		// not fall back).
+		//
+		// Failing here instead leaves the seat at removing = 1 — a state in which
+		// the member is already a non-member for every authorization read — and
+		// surfaces as backlog plus the stall alert. Stuck and visible beats closed
+		// and wrong.
+		p.rescheduleAfterFailure(job, owner,
+			fmt.Errorf("project: no member-removal cascade step is registered"))
+		return
+	}
 	var firstErr error
-	for _, step := range snapshotMemberRemovalSteps() {
+	for _, step := range steps {
 		if err := step.fn(p.ctx, removal); err != nil {
 			p.Error("项目移除级联步骤失败",
 				zap.String("step", step.name),
@@ -205,7 +228,7 @@ func (p *Project) workRemovalJob(job RemovalJob) {
 		}
 	}
 	if firstErr != nil {
-		p.rescheduleAfterFailure(job, firstErr)
+		p.rescheduleAfterFailure(job, owner, firstErr)
 		return
 	}
 
@@ -216,12 +239,32 @@ func (p *Project) workRemovalJob(job RemovalJob) {
 	// removing = 1, so a cancelled removal affects zero rows and the job is
 	// retired as cancelled rather than closing a seat somebody just restored.
 	if err := p.finishRemoval(job); err != nil {
-		p.rescheduleAfterFailure(job, err)
+		p.rescheduleAfterFailure(job, owner, err)
 		return
 	}
-	if err := p.db.completeRemovalJob(job.ID, removalJobDone, "", time.Now().UTC()); err != nil {
-		p.Error("标记项目移除工单完成失败", zap.Int64("job_id", job.ID), zap.Error(err))
+	p.retireRemovalJob(job, owner, removalJobDone, "")
+}
+
+// retireRemovalJob writes one terminal state and reports whether it landed.
+//
+// A lost lease is a WARN, not an error: the job is not lost, another worker owns
+// it and will retire it. What must not happen silently is this worker believing
+// it retired a job it did not — hence the return value, which the abandon path
+// uses so its breadcrumb log describes what actually happened.
+func (p *Project) retireRemovalJob(job RemovalJob, owner string, status int, lastErr string) bool {
+	held, err := p.db.completeRemovalJob(job.ID, owner, status, lastErr, time.Now().UTC())
+	if err != nil {
+		p.Error("标记项目移除工单终态失败",
+			zap.Int64("job_id", job.ID), zap.Int("status", status), zap.Error(err))
+		return false
 	}
+	if !held {
+		p.Warn("项目移除工单租约已易主，放弃写入终态",
+			zap.Int64("job_id", job.ID),
+			zap.Int("status", status),
+			zap.String("lease_owner", owner))
+	}
+	return held
 }
 
 // removalCancelled reports whether the member was re-admitted since the job was
@@ -290,11 +333,15 @@ func (p *Project) finishRemoval(job RemovalJob) error {
 
 // rescheduleAfterFailure applies backoff, or abandons a job that has run out of
 // attempts.
-func (p *Project) rescheduleAfterFailure(job RemovalJob, cause error) {
+func (p *Project) rescheduleAfterFailure(job RemovalJob, owner string, cause error) {
 	now := time.Now().UTC()
 	if job.Attempts >= removalMaxAttempts {
-		if err := p.db.completeRemovalJob(job.ID, removalJobAbandoned, cause.Error(), now); err != nil {
-			p.Error("标记项目移除工单为 abandoned 失败", zap.Int64("job_id", job.ID), zap.Error(err))
+		if !p.retireRemovalJob(job, owner, removalJobAbandoned, cause.Error()) {
+			// The write did not land, so this job is not abandoned — either it
+			// errored or another worker owns it now. retireRemovalJob has already
+			// said which; claiming an abandon on top of that would be a false
+			// breadcrumb in the one log an operator reads after the stall alert.
+			return
 		}
 		// Abandoned is terminal and means a member's project seat is stuck at
 		// removing = 1 with group rows still in place. The reconcile scan's
@@ -311,8 +358,14 @@ func (p *Project) rescheduleAfterFailure(job RemovalJob, cause error) {
 	if backoff > 5*time.Minute {
 		backoff = 5 * time.Minute
 	}
-	if err := p.db.rescheduleRemovalJob(job.ID, now.Add(backoff), cause.Error()); err != nil {
+	held, err := p.db.rescheduleRemovalJob(job.ID, owner, now.Add(backoff), cause.Error())
+	if err != nil {
 		p.Error("重排项目移除工单失败", zap.Int64("job_id", job.ID), zap.Error(err))
+		return
+	}
+	if !held {
+		p.Warn("项目移除工单租约已易主，放弃重排",
+			zap.Int64("job_id", job.ID), zap.String("lease_owner", owner))
 	}
 }
 
@@ -345,8 +398,37 @@ func (p *Project) purgeRemovalJobs() {
 	}
 }
 
-// workerIdentity labels a lease. Not a security boundary — it exists so an
-// operator can tell which pod is holding a job.
+// workerIdentity labels a lease.
+//
+// Process-stable, not per-tick. Two things depend on that. An operator reading
+// lease_owner has to be able to answer "which pod is holding this job", which a
+// fresh timestamp per tick cannot; and the fence on the terminal writes is only
+// as meaningful as the identity it compares. A hostname+pid pair distinguishes
+// pods, survives every tick of one process, and changes on restart — which is
+// exactly when a lease SHOULD stop being recognised as ours.
+//
+// Two ticks of the same process cannot collide on a job: runRemovalCascade
+// skips while a batch is still in flight (removalRunning).
+//
+// The column is 64 chars (see the migration); a long hostname is truncated from
+// the left, keeping the pid and the distinguishing tail of the name.
+var workerIdentityOnce sync.Once
+var workerIdentityValue string
+
 func (p *Project) workerIdentity() string {
-	return fmt.Sprintf("project-removal-%d", time.Now().UnixNano())
+	workerIdentityOnce.Do(func() {
+		host, err := os.Hostname()
+		if err != nil || host == "" {
+			// No hostname is not a reason to fall back to something unstable:
+			// the pid still distinguishes this process from another on the same
+			// node, and an unstable owner would silently disable the fence.
+			host = "unknown"
+		}
+		id := fmt.Sprintf("project-removal-%s-%d", host, os.Getpid())
+		if len(id) > 64 {
+			id = id[len(id)-64:]
+		}
+		workerIdentityValue = id
+	})
+	return workerIdentityValue
 }

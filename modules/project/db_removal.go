@@ -307,38 +307,76 @@ func (d *DB) heartbeatRemovalLeases(ids []int64, owner string, until time.Time) 
 	return nil
 }
 
-// completeRemovalJob marks a job terminal with the given status.
-func (d *DB) completeRemovalJob(id int64, status int, lastErr string, now time.Time) error {
+// Terminal and release writes are FENCED on (status, lease_owner).
+//
+// This table's doc says it was "structurally copied from
+// space_member_removal_cleanup ... with the corrections that the history of that
+// table earned". The fence is one of those corrections and it did not come
+// across: finishMemberRemovalCleanup and releaseMemberRemovalCleanup
+// (modules/space/db_member_removal.go) both write
+// `WHERE id=? AND status=? AND lease_owner=?` and check RowsAffected, so a
+// worker whose lease has expired abandons its write instead of landing it on top
+// of the worker that took over.
+//
+// Without the fence, a stalled worker A (pod eviction, a DB failover with failing
+// heartbeats, a long GC — the window the heartbeat narrows but cannot close) can,
+// after worker B has claimed the same job:
+//
+//   - mark the job done while B is still running the cascade, so the row reads
+//     terminal for work that is still in flight;
+//   - reschedule a row B is working, exposing it to a third claimer;
+//   - overwrite the CANCELLED state that re-admission wrote, destroying the
+//     evidence that terminal state exists to keep.
+//
+// The heartbeat is deliberately NOT given the same treatment. It renews the whole
+// claimed batch, and rows of that batch legitimately go terminal while the batch
+// is still being worked — the statement is guarded on `status = pending` for
+// exactly that reason. So a renewed-count below the batch size is the normal case,
+// not a lease loss, and alerting on it would be noise rather than a signal.
+
+// completeRemovalJob marks a job terminal with the given status, provided this
+// worker still holds the lease. Reports false when it no longer does; the caller
+// abandons the write because another worker has taken the job over.
+func (d *DB) completeRemovalJob(id int64, owner string, status int, lastErr string, now time.Time) (bool, error) {
 	if len(lastErr) > 255 {
 		lastErr = lastErr[:255]
 	}
-	_, err := d.session.UpdateBySql(
+	res, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_member_removal_cleanup` "+
 			"SET status = ?, finished_at = ?, last_error = ?, lease_owner = '', lease_until = NULL "+
-			"WHERE id = ?",
-		status, now, lastErr, id,
+			"WHERE id = ? AND status = ? AND lease_owner = ?",
+		status, now, lastErr, id, removalJobPending, owner,
 	).Exec()
 	if err != nil {
-		return fmt.Errorf("project: complete removal job: %w", err)
+		return false, fmt.Errorf("project: complete removal job: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("project: read complete removal job result: %w", err)
+	}
+	return affected == 1, nil
 }
 
-// rescheduleRemovalJob puts a failed job back with backoff and releases the lease.
-func (d *DB) rescheduleRemovalJob(id int64, nextAttempt time.Time, lastErr string) error {
+// rescheduleRemovalJob puts a failed job back with backoff and releases the
+// lease, provided this worker still holds it. Reports false when it does not.
+func (d *DB) rescheduleRemovalJob(id int64, owner string, nextAttempt time.Time, lastErr string) (bool, error) {
 	if len(lastErr) > 255 {
 		lastErr = lastErr[:255]
 	}
-	_, err := d.session.UpdateBySql(
+	res, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_member_removal_cleanup` "+
 			"SET next_attempt_at = ?, last_error = ?, lease_owner = '', lease_until = NULL "+
-			"WHERE id = ?",
-		nextAttempt, lastErr, id,
+			"WHERE id = ? AND status = ? AND lease_owner = ?",
+		nextAttempt, lastErr, id, removalJobPending, owner,
 	).Exec()
 	if err != nil {
-		return fmt.Errorf("project: reschedule removal job: %w", err)
+		return false, fmt.Errorf("project: reschedule removal job: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("project: read reschedule removal job result: %w", err)
+	}
+	return affected == 1, nil
 }
 
 // purgeFinishedRemovalJobs deletes terminal rows older than the retention
