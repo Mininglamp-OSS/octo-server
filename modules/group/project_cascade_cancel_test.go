@@ -239,3 +239,81 @@ func TestTheCascadeRefusesAJobWithNoSpace(t *testing.T) {
 			"and it must not have detached anything")
 	}
 }
+
+// TestTheCascadeSkipsAGroupThatLeftTheProjectMidFanOut is P2-5 from PR #846's
+// review.
+//
+// The group list is snapshotted once. Between the snapshot and a given group's
+// removal that group can LEAVE the project — a project disband, or another
+// group's no-successor detach earlier in the same fan-out, both set
+// project_id = ”. Removing the member from it then contradicts the contract
+// that disband and detach preserve their members: they lose a group for a reason
+// that no longer applies to it.
+//
+// The interleaving is mandatory, not decoration: queryProjectGroupNosWithActiveMember
+// filters on project_id itself, so a group cleared BEFORE the cascade starts is
+// simply not in the list and the test would pass with the guard deleted. It has
+// to be cleared while the fan-out is parked. Both member rows are locked so the
+// cascade blocks inside the first group's removal regardless of the order the
+// snapshot returned, exactly as the seat-reopen case above does.
+//
+// Not an I2 violation (a Space-direct group has no project gate), which is why
+// this is a P2 and why the fix is a re-read rather than a lock. The window is
+// narrowed, not closed; the call site says so.
+func TestTheCascadeSkipsAGroupThatLeftTheProjectMidFanOut(t *testing.T) {
+	_, ctx := newTestServer(t)
+	f := New(ctx)
+
+	spaceID, projectID, groups := cascadeFixture(t, ctx, "cas_left", 1)
+
+	blocker, err := ctx.DB().Begin()
+	require.NoError(t, err)
+	defer blocker.RollbackUnlessCommitted()
+	var locked []string
+	_, err = blocker.SelectBySql(
+		"SELECT uid FROM group_member WHERE group_no IN ? AND uid = ? FOR UPDATE",
+		[]string{groups[0], groups[1]}, "cas_left").Load(&locked)
+	require.NoError(t, err)
+	require.Len(t, locked, 2, "both member rows must be held before the cascade starts")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.detachMemberFromProjectGroups(ctx, projectmod.MemberRemoval{
+			ProjectID:   projectID,
+			UID:         "cas_left",
+			SpaceID:     spaceID,
+			OperatorUID: "cas_owner",
+			Reason:      "kicked",
+		})
+	}()
+
+	waitForCascadeToPark(t, ctx, done)
+	// Both groups leave the project the way a detach or a disband leaves them:
+	// project_id cleared, everyone still in them. Both, so the assertion does not
+	// depend on which one the cascade happened to start with.
+	_, err = ctx.DB().UpdateBySql(
+		"UPDATE `group` SET project_id = '' WHERE group_no IN ?",
+		[]string{groups[0], groups[1]}).Exec()
+	require.NoError(t, err)
+	require.NoError(t, blocker.Commit())
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("the cascade did not finish after the lock was released")
+	}
+
+	// Both survive: the cascade parks in queryGroupCreatorTx, which runs BEFORE
+	// each group's attribution re-read, so both re-reads see the cleared
+	// project_id. Without the re-read both are removed from.
+	//
+	// That the guard is not a blanket skip is pinned separately by
+	// TestTheCascadeDetachesEveryGroupWhileTheSeatIsClosing, which runs the same
+	// fan-out with the groups left in the project.
+	for _, g := range groups {
+		require.True(t, activeMemberExists(t, ctx, g, "cas_left"),
+			"group %s left the project mid fan-out and must keep its members: that is "+
+				"exactly what detach and disband promise", g)
+	}
+}

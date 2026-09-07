@@ -195,6 +195,41 @@ func (g *Group) detachMemberFromOneProjectGroup(groupNo string, removal projectm
 			zap.String("former_creator", removal.UID))
 	}
 
+	// Re-read the attribution before removing anyone.
+	//
+	// The group list was snapshotted at the top of the fan-out. Between then and
+	// now the group can have LEFT the project: a project disband, or another
+	// group's no-successor detach above, both set project_id = ''. Removing the
+	// member then takes them out of a group that is now Space-direct — against
+	// the contract that disband and detach preserve their members, and for a
+	// reason no longer connected to anything the member did.
+	//
+	// The creator case was already covered: querySuccessorForProjectGroupTx
+	// filters on project_id, so a departed group yields no successor, the detach
+	// is a zero-row update and the step returns early. This is the other branch —
+	// the departing member is an ordinary member, so the handover returns at the
+	// creator check and nothing looks at project_id again.
+	//
+	// This narrows the window rather than closing it: RemoveGroupMembers opens
+	// and commits its own transaction, so the read cannot be held under the same
+	// lock, and a detach landing in between still loses a member. Closing it
+	// would mean threading a transaction through the group service's removal
+	// path, which is a much larger change than the outcome justifies — a member
+	// dropped from a group that is leaving the project anyway, recoverable by
+	// re-adding.
+	stillOurs, err := g.db.groupStillBelongsToProject(groupNo, removal.ProjectID)
+	if err != nil {
+		return fmt.Errorf("group: re-read group attribution before removal: %w", err)
+	}
+	if !stillOurs {
+		g.Info("项目级联：群在级联进行中已离开本项目，跳过摘除",
+			zap.String("group_no", groupNo),
+			zap.String("project_id", removal.ProjectID),
+			zap.String("uid", removal.UID))
+		projectCascadeGroupLeftTotal.Inc()
+		return nil
+	}
+
 	resp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:              groupNo,
 		Members:              []string{removal.UID},

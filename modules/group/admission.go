@@ -480,6 +480,19 @@ var projectCascadeCancelledTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help:      "Project-removal cascades stopped mid fan-out because the member was re-admitted.",
 })
 
+// projectCascadeGroupLeftTotal counts groups skipped because they left the
+// project between the cascade's snapshot and the removal.
+//
+// Separate from the cancellation counter: that one means the MEMBER came back,
+// this one means the GROUP did not stay. Both leave a member in some of the
+// project's groups and not others, and only the pair of counters tells an
+// operator which explanation applies to a given ticket.
+var projectCascadeGroupLeftTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: admissionMetricNamespace,
+	Name:      "project_cascade_group_left_total",
+	Help:      "Groups skipped by a removal cascade because they left the project mid fan-out.",
+})
+
 // projectGroupHandoverTotal counts ownership handovers performed by the cascade.
 //
 // Worth its own counter rather than a log line: it is the one place the system

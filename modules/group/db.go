@@ -1302,6 +1302,28 @@ func (d *DB) queryProjectGroupNosWithActiveMember(spaceID, projectID, uid string
 	return groupNos, err
 }
 
+// groupStillBelongsToProject answers whether the group is, right now, an active
+// group of that project.
+//
+// Used by the cascade between its snapshot and the removal. It is a plain read,
+// not a locking one, and so does not close the window it narrows — see the call
+// site in project_cascade.go, which explains why a lock is not available there
+// and what the residual window costs.
+func (d *DB) groupStillBelongsToProject(groupNo, projectID string) (bool, error) {
+	if groupNo == "" || projectID == "" {
+		return false, nil
+	}
+	var n int
+	err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM `group` WHERE group_no = ? AND project_id = ? AND status <> ?",
+		groupNo, projectID, GroupStatusDisband,
+	).LoadOne(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // queryGroupCreatorTx reads a group's creator role holder under the caller's
 // transaction. Empty string means the group currently has no creator row, which
 // happens after a creator was removed by some path that did not transfer first.
