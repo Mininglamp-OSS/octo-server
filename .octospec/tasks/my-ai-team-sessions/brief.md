@@ -5,7 +5,7 @@ description: 为“我的 AI 团队”提供按 Space、用户与 User Bot 隔�
 tags: ["space", "isolation", "auth", "acl", "bot-api", "thread", "wire-contract", "error-response", "i18n", "rate-limit", "adapter", "trust-boundary", "test", "commit"]
 timestamp: 2026-09-07T11:43:14+08:00
 slug: my-ai-team-sessions
-upstream: null
+upstream: Mininglamp-OSS/octo-server#849
 source: user
 ---
 
