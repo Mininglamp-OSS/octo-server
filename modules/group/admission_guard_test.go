@@ -49,6 +49,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // groupMemberWriteNeedles are the ways this repository writes group_member.
@@ -384,6 +386,78 @@ func TestAdmissionPrimitivesAreCalledOnlyFromTheFunnel(t *testing.T) {
 			"branch. (The primitives stay exported only because 41 existing test "+
 			"files build fixtures with them; this guard is what makes 'callable only "+
 			"from the funnel' true.)")
+}
+
+// groupDBHolders — the non-test files outside modules/group that legitimately
+// obtain a *group.DB, and why.
+//
+// group.NewDB is the ONLY constructor for that type (db.go:22), so this list is
+// the complete set of places outside the module that could reach a membership
+// primitive. Each is checked below for primitive calls, so being on this list
+// buys read access, not write access.
+var groupDBHolders = map[string]string{
+	"modules/incomingwebhook/api.go":           "resolving a webhook's target channel",
+	"modules/report/api_manager.go":            "rendering the manager report",
+	"modules/base/elastic/service.go":          "group metadata for the index documents",
+	"modules/message/1module.go":               "group lookups on the message path",
+	"modules/message/api.go":                   "group lookups on the message path",
+	"modules/message/api_conversation.go":      "group lookups when building conversations",
+	"modules/message/api_sidebar.go":           "group lookups when building the sidebar",
+	"modules/message/space_filter.go":          "QueryExternalGroupNosForUser, for cross-Space filtering",
+	"modules/messages_search/search_global.go": "QueryExternalGroupNosForUser, for cross-Space filtering",
+	"modules/qrcode/api.go":                    "group lookups behind the QR-code join screen",
+	"modules/search/api.go":                    "QueryExternalGroupNosForUser, for cross-Space filtering",
+}
+
+// TestOnlyDeclaredHoldersReachIntoTheGroupDB closes the cross-module half of the
+// primitive guard.
+//
+// TestAdmissionPrimitivesAreCalledOnlyFromTheFunnel walks modules/group only, so
+// a caller elsewhere doing group.NewDB(ctx).InsertMember(m) tripped nothing —
+// raised by PR #846's review as P2-4. The needle below is the constructor rather
+// than the method names, because the method names collide with other modules'
+// own membership tables (modules/thread has its own InsertMember on its own
+// MemberModel) and a guard that cries wolf gets deleted.
+func TestOnlyDeclaredHoldersReachIntoTheGroupDB(t *testing.T) {
+	allowlist := map[string][]string{}
+	for file := range groupDBHolders {
+		allowlist[file] = []string{"group.NewDB("}
+	}
+	assertNoWritesOutsideAllowlistExcluding(t, "modules/group/",
+		"handles on the group DB",
+		[]string{"group.NewDB("},
+		allowlist,
+		"group.NewDB is the only way to a *group.DB, and that type carries the "+
+			"membership primitives. A new holder outside modules/group must be argued "+
+			"for here — add it to groupDBHolders with what it reads — because "+
+			"TestDeclaredHoldersDoNotWriteMembership then checks it for writes.")
+}
+
+// TestDeclaredHoldersDoNotWriteMembership is the other half: being on the
+// holder list must not become permission to call a primitive later.
+func TestDeclaredHoldersDoNotWriteMembership(t *testing.T) {
+	pwd, err := os.Getwd()
+	require.NoError(t, err)
+	root := filepath.Clean(filepath.Join(pwd, "..", ".."))
+
+	for file, why := range groupDBHolders {
+		raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(file)))
+		require.NoError(t, err, "holder %s (%s) is listed but missing — drop the entry", file, why)
+
+		inBlock := false
+		for i, line := range strings.Split(string(raw), "\n") {
+			var code string
+			code, inBlock = stripGoComments(line, inBlock)
+			for _, needle := range admissionPrimitiveNeedles {
+				require.NotContains(t, code, needle,
+					"%s:%d holds a *group.DB to %s and calls %s on it — a membership write "+
+						"outside the admission funnel does not consult I2. Route it through "+
+						"the group service, or reverse-register a step the way modules/space "+
+						"receives its preset-group admitter: %s",
+					file, i+1, why, needle, strings.TrimSpace(line))
+			}
+		}
+	}
 }
 
 func TestNoGroupMemberRowsBuiltOutsideModulesGroup(t *testing.T) {
