@@ -71,17 +71,50 @@ func exemptFromMembership(uid string) bool {
 // of scope here — but the project half must not copy it. `FOR SHARE` makes a
 // concurrent project-seat removal block until this transaction commits.
 //
-// # Lock order
+// # Lock order — what is actually true, and what is not
 //
-// The module's declared order is
+// An earlier version of this comment claimed the module's table order
 //
 //	space_member -> space -> project -> group -> group_member -> octo_project_member
 //
-// and octo_project_member is deliberately LAST. This function is therefore safe
-// to call at the point of admission, with the group rows already held: it only
-// ever adds the final link, never an earlier one, so it cannot close a cycle
-// against a path that took the same links in the same order. Callers must not
-// invert it by locking a project seat and then reaching back for a group row.
+// held here, with octo_project_member "deliberately LAST", and concluded that
+// calling this at the point of admission "with the group rows already held"
+// could not close a cycle. That was wrong, and PR #846's review reproduced the
+// consequence on MySQL 8.0.46. On the primary admission path the group rows are
+// NOT held: admitOrRestoreMembersTx calls the gate FIRST and issues the
+// group_member upsert SECOND, so the real acquisition order there is
+// octo_project_member -> group_member. A11 (the un-blacklist branch) is the
+// same. The project-group handover goes the other way — group_member first,
+// then this function's shared lock.
+//
+// Two such transactions do not deadlock, because both take octo_project_member
+// SHARED. Three can, because InnoDB will not grant a shared request that is
+// queued behind a waiting exclusive one:
+//
+//	T1 admission     holds S(pm)                    wants X(gm)
+//	T2 seat removal                                 wants X(pm)  -> queued behind T1
+//	T3 handover      holds X(gm)                    wants S(pm)  -> queued behind T2
+//
+// T1 -> T3 -> T2 -> T1. InnoDB picks a victim; the cascade job backs off and
+// retries and the API call errors, so the consequence is bounded — but it is
+// reachable, and the previous comment said it was impossible, which is the part
+// that cost something: nobody would look for it in a deadlock log.
+//
+// # The invariant that DOES hold, and must keep holding
+//
+//	No path takes an EXCLUSIVE lock on octo_project_member while holding any
+//	group_member lock.
+//
+// Every path was checked against it: the funnel and A11 take S(pm) before any
+// group_member row; the handover takes S(pm) — shared, deliberately, so a
+// concurrent admission is not serialised behind it — while holding group_member
+// rows; modules/project's seat writes take X(pm) holding no group locks at all.
+// TestNoExclusiveProjectMemberLockUnderAGroupMemberLock pins it.
+//
+// Tightening the handover's `FOR SHARE OF pm` to `FOR UPDATE` is what the
+// invariant forbids, and it is the change that looks harmless: it would turn
+// the three-way cycle above into a plain two-way ABBA between the funnel and
+// the handover, on the hottest write path in the module.
 //
 // uids are sorted before the IN clause so that two concurrent admissions to
 // different groups of the same project acquire their locks in the same order.

@@ -20,9 +20,20 @@ import (
 // Concretely: a membership write locks the octo_project row (lockActiveProjectTx)
 // BEFORE it touches octo_project_member, and the Space-side facts it needs
 // (CheckMembership, MemberRole) are read before that lock is taken. P0 touches no
-// group table at all, so the two middle positions are reserved for P1's group
-// admission; recording them now is what keeps P1 from choosing a different order
-// and deadlocking against this code.
+// group table at all, so the two middle positions were reserved for P1's group
+// admission; recording them was meant to keep P1 from choosing a different order.
+//
+// P1 chose a different order anyway, and the reservation above is NOT what its
+// admission path does — see the corrected account in
+// pkg/project.AssertMembersInProjectTx. The funnel takes octo_project_member
+// (SHARED) before any group_member row; the group-side handover takes it after.
+// A three-way cycle across those two plus this module's exclusive seat writes is
+// reachable and was reproduced on MySQL 8.0.46 in PR #846's review.
+//
+// What holds instead, and what every path here must keep holding: this module
+// takes its EXCLUSIVE octo_project_member locks while holding NO group_member
+// lock — it holds no group locks at all. That is the half of the invariant that
+// lives on this side of the import edge.
 //
 // space_member leads space, and that is NOT this module's choice — it is
 // modules/space's, recorded at modules/space/db.go:71-88 after an Error 1213 incident:
