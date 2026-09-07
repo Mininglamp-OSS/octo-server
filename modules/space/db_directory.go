@@ -8,7 +8,11 @@ import (
 
 const directoryAgentsPerOwner = 50
 
-const directoryOwnerDisplayNameExpr = "COALESCE(NULLIF(u.name, ''), NULLIF(uv.real_name, ''), CONCAT('" + memberDisplayNamePlaceholderPrefix + "', sm.uid))"
+// The legacy user and space_member tables can carry a different collation from
+// migration-created user_verification. Pin the completed display expression so
+// keyword matching remains valid on both schema shapes without changing the
+// DisplayName fallback order.
+const directoryOwnerDisplayNameExpr = "(COALESCE(NULLIF(u.name, ''), NULLIF(uv.real_name, ''), CONCAT('" + memberDisplayNamePlaceholderPrefix + "', sm.uid)) COLLATE utf8mb4_general_ci)"
 
 // queryDirectoryOwners loads every active human in a Space. The system-account
 // exclusion is shared with the rest of the Space package; a system account can
@@ -16,7 +20,7 @@ const directoryOwnerDisplayNameExpr = "COALESCE(NULLIF(u.name, ''), NULLIF(uv.re
 func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) ([]*directoryOwnerModel, error) {
 	var owners []*directoryOwnerModel
 	systemBots := spacepkg.SystemBotList()
-	args := make([]interface{}, 0, 5)
+	args := make([]interface{}, 0, 6)
 	query := `
 		SELECT
 			sm.uid,
@@ -26,7 +30,7 @@ func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) 
 		FROM space_member sm
 		INNER JOIN ` + "`user`" + ` u ON u.uid=sm.uid
 		LEFT JOIN user_verification uv
-			ON uv.user_id COLLATE utf8mb4_general_ci=sm.uid COLLATE utf8mb4_general_ci
+			ON uv.user_id=sm.uid COLLATE utf8mb4_general_ci
 	`
 	if keyword != "" {
 		query += `
