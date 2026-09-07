@@ -234,7 +234,6 @@ func (t *Thread) protectAIContainerSimpleMutation(c *wkhttp.Context) {
 		c.Next()
 		return
 	}
-	c.Set("ai_team_parent_group", model.GroupNo)
 	protected, err := aiteampkg.IsProtectedGroup(t.ctx.DB(), model.GroupNo)
 	if err != nil {
 		t.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", model.GroupNo))
