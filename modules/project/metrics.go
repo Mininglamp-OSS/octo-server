@@ -203,3 +203,21 @@ var removalBacklog = promauto.NewGauge(prometheus.GaugeOpts{
 	Name:      "removal_backlog_total",
 	Help:      "Pending project member-removal cascade jobs.",
 })
+
+// removalAbandoned counts cascade jobs that ran out of attempts.
+//
+// The brief asks for backlog AND abandoned counts and only backlog was built.
+// The two answer different questions and the second is the one that pages: an
+// abandoned job is terminal, and it leaves a member's seat at removing = 1 with
+// their group rows still in place — the state nothing else will repair. The
+// stall gauge does notice it, but only once the seat has sat there past the
+// stall threshold; this moves the moment the job gives up, which is when an
+// operator can still read last_error and act on it.
+//
+// A counter rather than a gauge: it is an event, and a gauge derived from a
+// COUNT would go back to zero as soon as the retention purge ran.
+var removalAbandoned = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: metricNamespace,
+	Name:      "removal_abandoned_total",
+	Help:      "Project member-removal cascade jobs abandoned after exhausting their attempts.",
+})

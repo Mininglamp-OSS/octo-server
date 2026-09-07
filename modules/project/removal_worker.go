@@ -247,10 +247,18 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 
 // retireRemovalJob writes one terminal state and reports whether it landed.
 //
-// A lost lease is a WARN, not an error: the job is not lost, another worker owns
-// it and will retire it. What must not happen silently is this worker believing
-// it retired a job it did not — hence the return value, which the abandon path
-// uses so its breadcrumb log describes what actually happened.
+// A refused write is not an error: the job is not lost. What must not happen
+// silently is this worker believing it retired a job it did not — hence the
+// return value, which the abandon path uses so its breadcrumb log describes what
+// actually happened.
+//
+// The fence refuses for two very different reasons, and they must not read the
+// same in a log. A lease that changed hands is a worker that fell behind and a
+// thing to look at. A job already retired as CANCELLED is D4 working exactly as
+// designed: re-admission retires the row in its own transaction, and it catches
+// CLAIMED rows too, so EVERY cancelled cascade ends with the worker's own
+// terminal write being refused. Reporting that as a lease-steal would make the
+// designed path look like an incident on every occurrence.
 func (p *Project) retireRemovalJob(job RemovalJob, owner string, status int, lastErr string) bool {
 	held, err := p.db.completeRemovalJob(job.ID, owner, status, lastErr, time.Now().UTC())
 	if err != nil {
@@ -258,13 +266,27 @@ func (p *Project) retireRemovalJob(job RemovalJob, owner string, status int, las
 			zap.Int64("job_id", job.ID), zap.Int("status", status), zap.Error(err))
 		return false
 	}
-	if !held {
+	if held {
+		return true
+	}
+	// Read the row back to say which of the two it was. One extra query, only on
+	// the path that already decided not to write.
+	current, readErr := p.db.removalJobStatus(job.ID)
+	switch {
+	case readErr != nil:
+		p.Warn("项目移除工单终态写入被拒，且无法复读工单状态",
+			zap.Int64("job_id", job.ID), zap.Int("status", status), zap.Error(readErr))
+	case current == removalJobCancelled:
+		p.Info("项目移除工单已被重新加入取消，放弃写入终态",
+			zap.Int64("job_id", job.ID), zap.Int("intended_status", status))
+	default:
 		p.Warn("项目移除工单租约已易主，放弃写入终态",
 			zap.Int64("job_id", job.ID),
 			zap.Int("status", status),
+			zap.Int("current_status", current),
 			zap.String("lease_owner", owner))
 	}
-	return held
+	return false
 }
 
 // removalCancelled reports whether the member was re-admitted since the job was
@@ -337,6 +359,8 @@ func (p *Project) rescheduleAfterFailure(job RemovalJob, owner string, cause err
 	now := time.Now().UTC()
 	if job.Attempts >= removalMaxAttempts {
 		if !p.retireRemovalJob(job, owner, removalJobAbandoned, cause.Error()) {
+			// Not abandoned after all — the write was refused. retireRemovalJob
+			// has already said why.
 			// The write did not land, so this job is not abandoned — either it
 			// errored or another worker owns it now. retireRemovalJob has already
 			// said which; claiming an abandon on top of that would be a false
@@ -344,8 +368,11 @@ func (p *Project) rescheduleAfterFailure(job RemovalJob, owner string, cause err
 			return
 		}
 		// Abandoned is terminal and means a member's project seat is stuck at
-		// removing = 1 with group rows still in place. The reconcile scan's
-		// stall alert is what surfaces it; this log is the breadcrumb.
+		// removing = 1 with group rows still in place. The counter is what an
+		// alert hangs off — the brief asks for backlog AND abandoned counts, and
+		// the stall scan only notices the symptom half an hour later. This log is
+		// the breadcrumb beside it.
+		removalAbandoned.Inc()
 		p.Error("项目移除工单已放弃，成员席位停在 removing=1",
 			zap.Int64("job_id", job.ID),
 			zap.String("project_id", job.ProjectID),

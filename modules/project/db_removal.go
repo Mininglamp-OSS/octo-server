@@ -379,6 +379,23 @@ func (d *DB) rescheduleRemovalJob(id int64, owner string, nextAttempt time.Time,
 	return affected == 1, nil
 }
 
+// removalJobStatus reads one job's current status.
+//
+// Only used on the path where a fenced write was refused, to say WHY: a job
+// already retired as cancelled is D4 working as designed, and a lease that
+// changed hands is a worker that fell behind. Reporting both as the second one
+// would make every cancelled cascade look like an incident.
+func (d *DB) removalJobStatus(id int64) (int, error) {
+	var status int
+	err := d.session.SelectBySql(
+		"SELECT status FROM `octo_project_member_removal_cleanup` WHERE id = ?", id,
+	).LoadOne(&status)
+	if err != nil {
+		return 0, fmt.Errorf("project: read removal job status: %w", err)
+	}
+	return status, nil
+}
+
 // purgeFinishedRemovalJobs deletes terminal rows older than the retention
 // window, in bounded batches, and reports how many it deleted.
 //
