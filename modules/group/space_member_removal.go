@@ -146,9 +146,16 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	//   - reason=space_disbanded：解散不会解散群，于是每个成员在每个群里各触发一次。
 	//     N 个成员 × M 个群就是 N×M 条系统消息（1000 人 × 50 群 = 五万条），
 	//     全都堆给最后被移除的那个人看。空间已经没了，逐个通告没有意义。
+	//   - reason=bot_deleted：Bot 被其所有者整体删除。「X 被 Y 移出群聊」在这里
+	//     是一句错话——没有人把它移出这个群，是这个账号不存在了。BotFather 的
+	//     删除命令自己走漏斗时就传 SuppressRemoveNotice=true 并在注释里写明那是
+	//     刻意保持现状；工单路径是同一次删除的另一半，必须给出同一个答案，
+	//     否则「同步那遍失败了、异步这遍补上」会顺带在群里冒出那句话。
+	//     要不要发一条「该 Bot 已被删除」是产品问题，两条路径都不擅自决定。
 	selfExit := removal.Reason == spacemod.MemberRemoveReasonLeft
 	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
-	suppressNotice := selfExit || spaceGone
+	botGone := removal.Reason == spacemod.MemberRemoveReasonBotDeleted
+	suppressNotice := selfExit || spaceGone || botGone
 
 	// bot 连带移除的 Tip 动作词：自助退出说「退出了」，其余沿用默认的「被移出」。
 	cascadeAction := ""

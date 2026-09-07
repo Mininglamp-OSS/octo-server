@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
@@ -647,12 +648,40 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	// 无声删掉。
 	h.removeBotFromGroups(botID)
 
-	// Remove bot from all Spaces
-	_, err = h.ctx.DB().UpdateBySql(
-		"UPDATE space_member SET status=0 WHERE uid=? AND status=1", botID,
-	).Exec()
-	if err != nil {
-		h.Error("移除Bot的Space成员记录失败", zap.Error(err))
+	// 关闭 Bot 在所有 Space 的席位，走 modules/space 的事务性工单入口。
+	//
+	// 原先这里是一条裸 `UPDATE space_member SET status=0 WHERE uid=? AND status=1`：
+	// 一条语句改掉所有 Space 的席位，不写任何清理工单。在 Bot 只能进群的年代那只是
+	// 「少跑一遍上面刚手工跑过的群清理」，没有可见后果。
+	//
+	// 项目层把 space_member 变成了授权链的根，于是它成了真实缺陷：
+	//
+	//	space_member.status=1 →（P0 级联）octo_project_member.status=1
+	//	                      →（P1 准入闸门）可以留在项目群里
+	//
+	// 裸 UPDATE 关掉根，却不通知链上任何一环——被删除的 Bot 的**项目席位**会永远
+	// 停在 status=1，I1 对账扫描从此每一轮都报一条谁也修不好的违规，而这个已经不
+	// 存在的账号还挂在项目成员名单里，凭那个席位继续满足项目群的准入谓词。
+	//
+	// CloseAllSpaceSeats 在关席位的同一个事务里写出清理工单，剩下的交给已有的
+	// worker 和已注册的步骤（关项目席位、退项目群、退 Space 下的群、清会话扩展）。
+	// 这里不再自己补一段项目清理：那是第二次重新实现级联，而重新实现级联正是本仓库
+	// 反复付过学费的事。
+	//
+	// **上面那段群移除循环保留不动**，不是冗余。它按 GetGroupsWithMemberUID 枚举
+	// Bot 所在的**全部**群，而工单是按 (space_id, uid) 键的、其群步骤只查该 Space
+	// 下的群（queryGroupsWithMemberUIDAndSpaceID）。把循环换成工单会静默丢掉
+	// space_id 为空的那些群。两者并存是安全的：群步骤先重读成员行，人已经不在群里
+	// 就直接返回 nil。
+	//
+	// 席位关闭本身仍是同步的——函数返回时 space_member 已经提交，异步的只有工单
+	// 驱动的清理步骤。
+	if _, closeErr := spacemod.CloseAllSpaceSeats(
+		h.ctx, botID, botID, spacemod.MemberRemoveReasonBotDeleted,
+	); closeErr != nil {
+		// 部分 Space 可能已经成功关闭并入队，失败的那些会被 I1 对账扫描报出来。
+		// 不回滚：没有什么可回滚的，而重试整个删除流程是幂等的。
+		h.Error("关闭Bot的Space席位失败", zap.String("botId", botID), zap.Error(closeErr))
 	}
 
 	// Remove bot from friend records with version for client sync (both directions)

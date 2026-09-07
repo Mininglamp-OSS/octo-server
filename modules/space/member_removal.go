@@ -26,6 +26,13 @@ const (
 	MemberRemoveReasonForceRemoved = "force_removed"
 	// MemberRemoveReasonSpaceDisbanded 空间被强制解散，全员一并移除
 	MemberRemoveReasonSpaceDisbanded = "space_disbanded"
+	// MemberRemoveReasonBotDeleted Bot 被其所有者删除，账号整体消失，
+	// 因此它在**所有** Space 的席位一并关闭（见 CloseAllSpaceSeats）。
+	//
+	// 它与 force_removed 分开，是因为群侧级联要按 Reason 决定发不发
+	// 「X 被 Y 移出群聊」。对一个整体消失的账号，那句话是错的——没有人把它
+	// 移出这个群。复用 force_removed 会让这句话出现在它待过的每个群里。
+	MemberRemoveReasonBotDeleted = "bot_deleted"
 )
 
 var memberRemoveReasons = map[string]bool{
@@ -33,6 +40,7 @@ var memberRemoveReasons = map[string]bool{
 	MemberRemoveReasonLeft:           true,
 	MemberRemoveReasonForceRemoved:   true,
 	MemberRemoveReasonSpaceDisbanded: true,
+	MemberRemoveReasonBotDeleted:     true,
 }
 
 // IsMemberRemoveReason 校验原因取值。写库前拦住拼错的字面量，避免出现
@@ -281,6 +289,18 @@ func (s *Space) startMemberRemovalCleanupWorker() {
 		// 指标单独一个更稀疏的节奏：那条查询是全表聚合，而这几个 gauge 是给
 		// 分钟级以上的趋势看的，没有必要每分钟扫一次表。
 		s.ctx.Schedule(removalMetricsInterval, s.refreshMemberRemovalCleanupMetrics)
+		// 让 CloseAllSpaceSeats 这类拿不到 *Space 的包外调用方也能在入队后
+		// 立刻推一轮，而不必干等一个 10s tick。见 member_removal_all_spaces.go。
+		setRemovalWorkerKick(func() {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.Error("worker kick panic", zap.Any("recover", r))
+					}
+				}()
+				s.processMemberRemovalCleanups()
+			}()
+		})
 	})
 }
 
