@@ -1,8 +1,8 @@
 ---
 type: Journal
 title: "Learning: binding groups to projects, and what a write-path convergence actually costs"
-description: "Converging eleven group-admission paths onto one entry to make invariant I2 real; the migration-placement rule that took two wrong answers to find; and three places where the brief was wrong about shipped code."
-tags: ["octospec-learning", "space", "isolation", "acl", "migration", "testing", "wire-contract"]
+description: "Converging eleven group-admission paths onto one entry to make invariant I2 real; the migration-placement rule that took two wrong answers to find; three places where the brief was wrong about shipped code; and the review round that showed a two-phase state machine re-opens every status check in the module."
+tags: ["octospec-learning", "space", "isolation", "acl", "migration", "testing", "wire-contract", "mysql", "collation"]
 timestamp: 2026-09-06T18:00:00Z
 source: self
 ---
@@ -101,6 +101,58 @@ subject to the Space half. Platform bots have no `space_member` row at all, so
 that "exemption" refused them from every project group — the exact opposite of
 its purpose. An exemption that applies to one half of a conjunction is not an
 exemption.
+
+## What the first review round changed
+
+Six high-priority findings, and **four were one shape**: a two-phase state
+machine turns every existing `status == active` check into a question that has to
+be re-answered, and the ones that answer wrongly fail silently in the
+safe-looking direction. The journal above already recorded that pattern from one
+instance; the review found it was systemic.
+
+* `status = 0 AND removing = 1` — the combination the schema documents as MUST
+  NOT EXIST — was reachable from two writers, and unrecoverable once reached:
+  `finishMemberRemovalTx` is guarded on `status = 1 AND removing = 1`, so nothing
+  could ever match the row again, while the stall scan has no status filter and
+  alerted on it every tick with no remedy.
+* A closing seat kept `actorRoleTx`'s answer, so a departing owner held disband
+  for the whole cascade window — on the in-transaction re-read whose only job is
+  to catch a role the middleware cache got wrong.
+* `promoteSuccessorTx` accepted a closing successor while `countActiveOwnersTx`
+  already excluded one, so the last-owner guard could be satisfied by an owner
+  who was disappearing: the outcome the guard exists to prevent, reached through
+  the guard itself.
+
+### "Self-correcting" is a claim that needs proving
+
+The I2 cursor advanced to the page's last GROUP id, so members past a page
+boundary were skipped, and a comment asserted the next rotation would catch them.
+It would not: the pages fall on the same boundary every time. A composite
+`(group_id, uid)` cursor was always available — P0's I1 scan already used that
+shape over `(project_id, uid)` — and the single-column version had also needed a
+second, differently-filtered query, which double-counted.
+
+### The COLLATE rule is about which SIDE a column is on
+
+Two mistakes in one file, in opposite directions, both found by a test rather
+than by reasoning: a legacy ⟷ legacy join carried a COLLATE it did not need (and
+lost its index for it), and `space_member_removal_cleanup` was treated as legacy
+when it is migration-created and pinned. A comparison in the SELECT list raises
+1267 exactly as one in an ON clause does.
+
+The second half only surfaced because the drift test ran the REAL query methods
+against a deliberately drifted database. The general form is in
+`learnings/pending/project-p1-group-binding.md`, including the measurement that
+settles when a COLLATE can replace a compatibility flag and when it cannot: it
+depends on which table DRIVES the join, not on whether the error went away.
+
+### Apostrophes pair up
+
+The migration test splits statements naively and treats a quote as a string
+delimiter, so a file with an EVEN number of apostrophes can pass by luck. It
+failed here because an unrelated edit forty lines away removed one and flipped
+the parity — and then pointed at an entirely innocent statement. The fix is not
+to count them; it is to use none.
 
 ## What we did not deliver
 
