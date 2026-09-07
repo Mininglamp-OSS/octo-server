@@ -203,6 +203,13 @@ func capabilitiesFor(projectRole, spaceRole int) Capabilities {
 		CanChangeRole:   canChangeMemberRole(projectRole),
 		CanLeave:        isProjectMember(projectRole),
 		CanViewMembers:  canViewMembers(projectRole, spaceRole),
+		// D15 — an ordinary member holds this and holds nothing else on the
+		// member endpoints. Emitted explicitly rather than left for the client to
+		// infer from the role number, like every other capability here: a client
+		// that re-derives the matrix drifts from the server the first time the
+		// matrix changes, and this row is new, so every existing client would
+		// derive it wrong.
+		CanManageOwnAgents: canManageOwnAgents(projectRole),
 	}
 }
 
@@ -307,6 +314,10 @@ type createInput struct {
 	Logo            string
 	Discoverability int
 	MaxMembers      int
+	// AgentUIDs are the creator's own AI agents to seat alongside them (D2).
+	// Eligibility is decided inside the create transaction; one ineligible uid
+	// rejects the whole create (D3).
+	AgentUIDs []string
 }
 
 // createProject runs createProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
@@ -317,7 +328,34 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 		model, e = p.createProjectOnce(in)
 		return e
 	})
-	return model, err
+	if err != nil || model == nil {
+		return model, err
+	}
+
+	// Provision the all-member group AFTER the transaction commits, and after the
+	// retry loop rather than inside it: a lock-conflict retry re-runs
+	// createProjectOnce, and a provisioner call inside the closure would run once
+	// per attempt, each attempt building a group for a project row that was then
+	// rolled back.
+	//
+	// Failure here does NOT fail the create (D4). The project is the real entity;
+	// the group is its attachment, and rolling a committed project back across a
+	// module boundary — after the group side may already have created an IM
+	// channel — is a worse failure than the one being handled. P1 made the same
+	// call for its disband steps, and this keeps the two consistent.
+	//
+	// The seeded members are the agents only: the creator is added by CreateGroup
+	// itself as the group's owner.
+	p.provisionAllMemberGroup(model.ProjectID, model.SpaceID, model.Creator, model.Name,
+		withoutUID(sanitizeUIDs(in.AgentUIDs), model.Creator))
+
+	// Re-read so the response carries the group number the provisioner just wrote.
+	// One extra point read on the create path, and it is what lets the client open
+	// the group immediately instead of polling for it.
+	if fresh, ferr := p.db.queryByProjectID(model.ProjectID); ferr == nil && fresh != nil {
+		model = fresh
+	}
+	return model, nil
 }
 
 // createProject inserts a project and its owner seat in ONE transaction.
@@ -377,6 +415,40 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	}
 	if !creatorIsMember {
 		return nil, errNotSpaceMember
+	}
+
+	// The agents' Space seats, locked in the SAME position in the lock order as the
+	// creator's — before the `space` row, never after (see the deadlock argument above;
+	// the order is space_member -> space -> project -> ... -> octo_project_member).
+	//
+	// lockSpaceSeatRowsTx, NOT lockSpaceSeatsTx. The latter joins `space`, and a table
+	// outside its `FOR SHARE OF` list is read as a consistent read that OPENS this
+	// transaction's read view — before the `space` lock below, so every quota counted
+	// after it would answer from a stale snapshot. That is the defect
+	// lockSpaceSeatRowTx exists to avoid and TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin
+	// pins; the first version of this block reopened it, and the guard caught it.
+	//
+	// One statement rather than one lockSpaceSeatRowTx per uid: the round-trips inside
+	// the transaction do not grow with the number of agents, and the rows are taken as a
+	// single deterministic set rather than one at a time in request order (which is
+	// caller-controlled and therefore a deadlock shape).
+	//
+	// I1 applies to an agent exactly as it does to a person: an agent with no active
+	// Space seat cannot hold a project seat. botfather writes space_member when it mints
+	// a bot, so this normally passes; failing it means the bot belongs to another Space,
+	// or D14's deletion path has already closed its seat.
+	var agentSeats map[string]bool
+	agentUIDs := sanitizeUIDs(in.AgentUIDs)
+	// Drop the creator BEFORE anything else looks at the list. Naming yourself in
+	// agent_uids is nonsense rather than an attack, and leaving it in would make
+	// classifyAgentsTx refuse the whole create with reason "not_a_bot" — a refusal
+	// whose message would be actively misleading.
+	agentUIDs = withoutUID(agentUIDs, in.Creator)
+	if len(agentUIDs) > 0 {
+		agentSeats, err = p.db.lockSpaceSeatRowsTx(tx, in.SpaceID, agentUIDs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// NOW lock the Space row. Two things depend on it, and neither is optional:
@@ -471,6 +543,63 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	}); err != nil {
 		return nil, err
 	}
+
+	// D2/D3 — the creator's own agents, seated in the SAME transaction.
+	//
+	// Same transaction, not a follow-up call: the dialog says "confirm and they join",
+	// and a project that exists without the agents the user picked is a state the user
+	// never asked for. It also keeps the failure story simple — one ineligible uid means
+	// nothing was written, so "fix it and retry" is the whole recovery.
+	//
+	// The eligibility verdict is computed here rather than in the handler because it
+	// depends on the Space seats locked above: a check before the transaction is a read
+	// that can expire, which is the same reason P0 moved the creator's own I1 check in
+	// here (see the comment on lockSpaceSeatRowTx above).
+	if len(agentUIDs) > 0 {
+		verdicts, err := p.classifyAgentsTx(tx, in.Creator, agentUIDs, agentSeats)
+		if err != nil {
+			return nil, err
+		}
+		if bad := ineligibleAgentUIDs(agentUIDs, verdicts); len(bad) > 0 {
+			// The uids go to the caller (they submitted them, so echoing them
+			// leaks nothing); the REASONS stay in the log. See errAgentNotEligible.
+			p.Warn("建项目：分身不合格，整单拒绝",
+				zap.String("spaceId", in.SpaceID), zap.String("creator", in.Creator),
+				zap.Strings("ineligible", bad),
+				zap.Any("reasons", ineligibleAgentReasons(agentUIDs, verdicts)))
+			return nil, errAgentNotEligible
+		}
+
+		// The agent seats count against max_members exactly like human seats: an agent
+		// reads the project's messages, so it costs a seat. Counted here, inside the
+		// transaction that holds the project row lock, for the same reason the create
+		// quotas are — a check outside it lets two concurrent writes both pass.
+		//
+		// count+1 for the owner seat inserted just above: countActiveMembersTx sees it
+		// (same transaction), so this reads the post-owner count and only has to add the
+		// agents.
+		seated, err := p.db.countActiveMembersTx(tx, model.ProjectID)
+		if err != nil {
+			return nil, err
+		}
+		if seated+len(agentUIDs) > p.cfg.effectiveMaxMembers(model.MaxMembers) {
+			return nil, errQuotaMembers
+		}
+		for _, uid := range agentUIDs {
+			if _, err := p.db.admitMemberTx(tx, &MemberModel{
+				ProjectID: model.ProjectID,
+				UID:       uid,
+				SpaceID:   in.SpaceID,
+				Role:      RoleCommon,
+				InviteUID: in.Creator,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
 	// construction under which "the project exists ⟹ its provisioning jobs exist" is
 	// true; a Redis queue or a post-commit call can drop the job or orphan it.
@@ -491,6 +620,12 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 		return nil, fmt.Errorf("project: commit create: %w", err)
 	}
 	p.invalidateProjectMemberCache(model.ProjectID, in.Creator)
+	for _, uid := range agentUIDs {
+		p.invalidateProjectMemberCache(model.ProjectID, uid)
+	}
+	// member_epoch stays at 0 (D11): the agents are part of the roster coming into
+	// existence, not a change to it. The first real membership write makes it 1.
+
 	// Off the request path, and only after the commit: "eager" should mean seconds,
 	// not up to a full interval tick. The interval remains the guarantee — this is
 	// just the nudge.
@@ -502,7 +637,12 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 
 // ---------- update / disband ----------
 
-// updateProject runs updateProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+// updateProject runs updateProjectOnce through the bounded lock-conflict retry
+// (see retryOnLockConflict), then syncs the all-member group's name (D8).
+//
+// The sync is after the retry loop for the same reason the provisioner is: a
+// lock-conflict retry re-runs the transaction, and a rename inside the closure
+// would fire once per attempt.
 func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
 	var model *Model
 	err := retryOnLockConflict(func() error {
@@ -510,6 +650,22 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 		model, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
 		return e
 	})
+	if err == nil && model != nil && req.Name != nil {
+		// D8 — the all-member group's name follows the project's.
+		//
+		// The name is how a user recognises which group belongs to which project;
+		// letting it drift means the group quietly stops being findable as "the
+		// project's group". Truncation to the group's own limit is the group
+		// side's job — that rule belongs to groups, not to projects.
+		//
+		// Only when the name actually changed: an update touching only the
+		// description has no business bumping the group's version and pushing a
+		// member-list refresh to every client.
+		//
+		// Failure leaves the two names out of step and is logged, not retried.
+		// The next rename converges them.
+		p.syncAllMemberGroupName(projectID, model.Name)
+	}
 	return model, err
 }
 
@@ -669,6 +825,22 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
+	// D10 — the all-member group stops being one, in the SAME transaction as the
+	// status flip.
+	//
+	// The group itself is untouched here: P1's disband step reverts it to
+	// Space-direct with its members intact, along with every other group of the
+	// project. What is cleared is only the FACT that it was the all-member group,
+	// and that fact stops being true the moment the project does.
+	//
+	// In the transaction rather than in the disband step, because the step is
+	// allowed to fail and P1 deliberately does not roll disband back for it. A
+	// disbanded project still pointing at a group would be a state that both the
+	// D7 protection predicate and the rebuild predicate would have to reason
+	// about; clearing it here means that state does not exist.
+	if err := p.db.clearAllMemberGroupNoTx(tx, projectID); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit disband: %w", err)
 	}
@@ -754,10 +926,36 @@ type addMemberResult struct {
 // admitted — not even by a caller who raced a Space removal. Checking before the
 // transaction would leave exactly that window open.
 func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string) ([]addMemberResult, error) {
+	// D4(c) — the rebuild point. If provisioning failed when the project was
+	// created, this is where it gets another go, under the CAS lease that keeps
+	// two concurrent adds from each building a group.
+	//
+	// Once per batch, not once per uid: the lease would make the repeats harmless
+	// but they would still be N failed CAS round-trips on a 200-uid batch.
+	//
+	// Before the loop, so that the members added below have a group to be admitted
+	// into. It is best-effort — a batch add must not fail because the group could
+	// not be built — so the admissions below tolerate its absence.
+	p.ensureAllMemberGroup(projectID, spaceID)
+
 	results := make([]addMemberResult, 0, len(uids))
 	for _, uid := range uids {
 		admitted, err := p.addOneFn(projectID, spaceID, actorUID, uid)
 		results = append(results, addMemberResult{UID: uid, Admitted: admitted, Err: err})
+		if admitted && err == nil {
+			// D12 — the seat is committed, so put them in the all-member group.
+			//
+			// AFTER the per-target transaction commits, never inside it: the
+			// admitter opens its own transaction in modules/group and then makes a
+			// blocking IM call. Holding the project seat's transaction across that
+			// would put a network round-trip inside a row lock.
+			//
+			// Best-effort by design (see admitAllMemberGroup): the seat is the
+			// authorization fact and the group is its projection. Failing the add
+			// because WuKongIM hiccuped would report failure for something that
+			// actually succeeded.
+			p.admitAllMemberGroup(projectID, spaceID, uid)
+		}
 		// An ACTOR-level or project-level failure ends the batch HERE, not in the handler.
 		//
 		// The handler used to be the only one to stop: it reported the remaining uids as
@@ -831,7 +1029,37 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	if err != nil {
 		return false, err
 	}
-	if !canManageMembers(actorRole) {
+
+	// D15 — an AI agent is admitted under DIFFERENT rules from a person.
+	//
+	// Before this, members/add had no rule about bots at all: any admin could seat
+	// any bot that happened to hold a Space seat, including one belonging to
+	// somebody who is not in the project, while an ordinary member had no way to
+	// bring their own. Both halves contradict what the create dialog promises
+	// ("only your own agents, they join on confirm"), and the second half is what
+	// makes D13 lopsided — agents follow their owner OUT with no matching way in.
+	//
+	// So: an agent may be seated only by its OWN owner, and only while that owner
+	// is an active member of this project. An admin cannot do it on someone
+	// else's behalf — the person being represented neither agreed nor knows.
+	//
+	// canManageOwnAgents is what an ordinary member holds here. It is deliberately
+	// narrower than canManageMembers: it authorizes exactly "my own agents".
+	isAgent, agentErr := p.authorizeAgentAdmissionTx(tx, projectID, actorUID, uid)
+	if agentErr != nil {
+		if errors.Is(agentErr, errAgentNotEligible) || errors.Is(agentErr, errAgentOwnerNotMember) {
+			p.Warn("加成员：分身不合格",
+				zap.String("projectId", projectID), zap.String("actor", actorUID),
+				zap.String("target", uid), zap.Error(agentErr))
+			return false, errAgentNotEligible
+		}
+		return false, agentErr
+	}
+	if isAgent {
+		if !canManageOwnAgents(actorRole) {
+			return false, errPermissionDenied
+		}
+	} else if !canManageMembers(actorRole) {
 		return false, errPermissionDenied
 	}
 
@@ -972,7 +1200,27 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	if err != nil {
 		return false, err
 	}
-	if !canManageMembers(actorRole) {
+
+	// D15 — removing an AI agent is authorized differently from removing a person.
+	//
+	// Symmetric with the admission rule, and it has to be: an ordinary member who
+	// can bring their own agent in must be able to take it back out, or the only
+	// way to undo their own action is to ask an admin. An admin keeps the wider
+	// power — they may remove ANY agent, exactly as they may remove any member —
+	// so this only ever widens, never narrows.
+	//
+	// queryAgentOwnerTx returns "" for a person, so a human target falls through
+	// to the unchanged canManageMembers gate below.
+	agentOwner, err := p.db.queryAgentOwnerTx(tx, targetUID)
+	if err != nil {
+		return false, err
+	}
+	ownsTargetAgent := agentOwner != "" && agentOwner == actorUID
+	if ownsTargetAgent {
+		if !canManageOwnAgents(actorRole) {
+			return false, errPermissionDenied
+		}
+	} else if !canManageMembers(actorRole) {
 		return false, errPermissionDenied
 	}
 
@@ -985,7 +1233,19 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	if target == nil || target.Status != MemberStatusActive || target.Removing != 0 {
 		return false, errMemberNotFound
 	}
-	if !canActOnTargetRole(actorRole, target.Role) {
+	// canActOnTargetRole implements the transitive protection between PEOPLE: an
+	// admin may not act on a peer admin or the owner, and an ordinary member may
+	// not act on anyone. That last clause would also block D15's own-agent
+	// removal, since an ordinary member is exactly who owns an agent — so the
+	// own-agent case bypasses it.
+	//
+	// Narrowed to RoleCommon deliberately. Nothing seats an agent above
+	// RoleCommon today, but changeMemberRole takes a uid and does not ask whether
+	// it is a bot; if an agent ever ends up holding admin, "it is mine" must stop
+	// being sufficient — otherwise an ordinary member could remove a project
+	// administrator by virtue of having minted it.
+	ownAgentBypass := ownsTargetAgent && target.Role == RoleCommon
+	if !ownAgentBypass && !canActOnTargetRole(actorRole, target.Role) {
 		return false, errTargetProtected
 	}
 	if target.Role == RoleOwner {
@@ -1009,7 +1269,7 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	// member_epoch is bumped HERE, not at the worker's final flip, because from
 	// every consumer's point of view the membership already changed: the seat
 	// stops granting anything the moment removing is set.
-	changed, err := p.beginRemovalWithCascadeTx(tx, projectID, spaceID, actorUID, targetUID,
+	changed, closedAgents, err := p.beginRemovalWithAgentsTx(tx, projectID, spaceID, actorUID, targetUID,
 		removalReasonKicked, now)
 	if err != nil {
 		return false, err
@@ -1019,11 +1279,19 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	}
 	if changed {
 		p.invalidateProjectMemberCache(projectID, targetUID)
+		// D13 — the agents lost their seats in the same transaction, so their
+		// cached roles are stale too. Missing these would leave an agent
+		// authorized against the project for a full cache TTL after its seat
+		// closed, which is the same leak the member's own invalidation prevents.
+		for _, agentUID := range closedAgents {
+			p.invalidateProjectMemberCache(projectID, agentUID)
+		}
 	}
 	return changed, nil
 }
 
-// leaveProject runs leaveProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
+// leaveProject runs leaveProjectOnce through the bounded lock-conflict retry, then
+// syncs the all-member group owner when the leave promoted a successor (D6).
 func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (string, error) {
 	var successor string
 	err := retryOnLockConflict(func() error {
@@ -1031,6 +1299,13 @@ func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (stri
 		successor, e = p.leaveProjectOnce(projectID, spaceID, uid, transferTo)
 		return e
 	})
+	// Only when a successor was promoted. A plain leave by a non-owner moves no
+	// ownership, and if the LEAVER was the group creator, P1's cascade already
+	// hands the group over on its way out — running this as well would be a
+	// second, racing answer to the same question.
+	if err == nil && successor != "" {
+		p.syncAllMemberGroupOwner(projectID)
+	}
 	return successor, err
 }
 
@@ -1097,7 +1372,7 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 
 	// Same two-phase close as the remove path (D4). Leaving is self-service, so
 	// the operator is the member themself.
-	changed, err := p.beginRemovalWithCascadeTx(tx, projectID, spaceID, uid, uid,
+	changed, closedAgents, err := p.beginRemovalWithAgentsTx(tx, projectID, spaceID, uid, uid,
 		removalReasonLeft, now)
 	if err != nil {
 		return "", err
@@ -1107,6 +1382,10 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 	}
 	if changed {
 		p.invalidateProjectMemberCache(projectID, uid)
+		// D13 — see removeMemberOnce.
+		for _, agentUID := range closedAgents {
+			p.invalidateProjectMemberCache(projectID, agentUID)
+		}
 	}
 	if successorPromoted != "" {
 		p.invalidateProjectMemberCache(projectID, successorPromoted)
@@ -1123,6 +1402,21 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 		changed, successor, e = p.changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID, role, transferTo)
 		return e
 	})
+	// D6 — a role change can move ownership, so re-check that the all-member
+	// group is still owned by an active project owner.
+	//
+	// Called on any successful change rather than only on promotions to owner,
+	// because a DEMOTION is the dangerous direction: the group creator being
+	// demoted out of owner is exactly how the group ends up with an owner who,
+	// under D7, can neither disband it, leave it, nor hand it on. The hook
+	// decides for itself and no-ops when nothing is wrong, so calling it
+	// unconditionally costs one point read.
+	//
+	// After the retry loop: a lock-conflict retry re-runs the transaction, and a
+	// transfer inside the closure would fire once per attempt.
+	if err == nil && (changed || successor != "") {
+		p.syncAllMemberGroupOwner(projectID)
+	}
 	return changed, successor, err
 }
 
@@ -1317,6 +1611,18 @@ func (p *Project) actorRoleTx(tx *dbr.Tx, projectID, actorUID string) (int, erro
 // the convention elsewhere in this repo (modules/app_bot/db.go,
 // modules/bot_api/obo_db.go); substring fallback so a test double emitting
 // errors.New("Error 1062: ...") still satisfies the contract.
+// withoutUID returns in without every occurrence of drop, preserving order.
+// Used to keep the creator out of the agent list before it is classified.
+func withoutUID(in []string, drop string) []string {
+	out := make([]string, 0, len(in))
+	for _, uid := range in {
+		if uid != drop {
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
 func isDuplicateKeyErr(err error) bool {
 	if err == nil {
 		return false
@@ -1369,15 +1675,111 @@ func (p *Project) beginRemovalWithCascadeTx(
 	projectID, spaceID, operatorUID, targetUID, reason string,
 	now time.Time,
 ) (bool, error) {
+	changed, _, err := p.beginRemovalWithAgentsTx(
+		tx, projectID, spaceID, operatorUID, targetUID, reason, now)
+	return changed, err
+}
+
+// beginRemovalWithAgentsTx is beginRemovalWithCascadeTx plus D13: the departing
+// member's OWN agents lose their seats in the same transaction, each with its own
+// cascade job, and the epoch moves exactly once for the whole group.
+//
+// Returns the agent uids whose seats were closed, so the caller can invalidate
+// their membership caches beside the member's own.
+//
+// # Why the agents have to go
+//
+// This is not a policy invented here, it is the project-side half of a rule the
+// group side has enforced since #354: RemoveGroupMembers takes the leaver's bots
+// out of the group with them, matched on robot.creator_uid, with no exception for
+// role. P1's detach reuses RemoveGroupMembers, so the moment a person's project
+// seat closes, their agents are already being pulled out of that project's groups.
+//
+// Without this, the agent keeps an ACTIVE project seat while sitting in none of
+// the project's groups. That is I4 broken — the all-member group's roster no
+// longer equals the project's roster — and nothing repairs it: the seat is
+// active, so no cascade will ever look at it again, and the admitter only runs on
+// a fresh add. The first member to leave any project would break the invariant
+// permanently.
+//
+// It is also what the word means. An agent runs AS its owner
+// (modules/bot_api/obo_fanout.go renders it that way to the model itself); an
+// owner who has left the project should not still have a proxy reading it.
+//
+// # Matched on robot.creator_uid, deliberately the same field as the group side
+//
+// queryOwnedAgentSeatsTx joins `robot` on creator_uid, exactly as
+// QueryBotsInvitedByUIDTx does. Matching on invite_uid instead would be the
+// obvious alternative and it is wrong: the two sides would then disagree about
+// whose agent something is, and every disagreement is a row that one side removed
+// and the other kept.
+//
+// # Owner transfer is not leaving
+//
+// Only seat-CLOSING paths reach here (kick, leave, Space cascade). An owner
+// handing the project to someone else stays a member, so their agents stay too.
+//
+// # One epoch bump for the whole set
+//
+// A member and their agents leaving is one membership change from a consumer's
+// point of view, and the rule is that the epoch only ever moves by +1 per write.
+// Bumping per uid would move it by 1+N and break the "+1 only" assertion P0
+// established.
+func (p *Project) beginRemovalWithAgentsTx(
+	tx *dbr.Tx,
+	projectID, spaceID, operatorUID, targetUID, reason string,
+	now time.Time,
+) (bool, []string, error) {
 	changed, err := p.db.beginMemberRemovalTx(tx, projectID, targetUID, now)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if !changed {
-		return false, nil
+		return false, nil, nil
 	}
+
+	// Read the agents BEFORE their seats are touched: queryOwnedAgentSeatsTx
+	// filters on status = 1 AND removing = 0, so reading after would return a
+	// shorter list on a retry and silently leave seats open.
+	agents, err := p.db.queryOwnedAgentSeatsTx(tx, projectID, targetUID)
+	if err != nil {
+		return false, nil, err
+	}
+	closedAgents := make([]string, 0, len(agents))
+	for _, agentUID := range agents {
+		if agentUID == "" || agentUID == targetUID {
+			continue
+		}
+		agentChanged, err := p.db.beginMemberRemovalTx(tx, projectID, agentUID, now)
+		if err != nil {
+			return false, nil, err
+		}
+		if !agentChanged {
+			continue
+		}
+		// Its own job, not a rider on the owner's: the cascade worker is keyed
+		// (project_id, uid) and re-reads THAT row under lock before each batch.
+		// A job that claimed to cover two uids could not be cancelled for one of
+		// them, and re-admission cancels per uid (D4).
+		//
+		// The operator is whoever triggered the owner's removal, and the reason
+		// is the owner's reason: the agent is not being kicked on its own
+		// account, and a distinct reason would have to be added to the group
+		// side's suppression logic to render sensibly.
+		if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
+			ProjectID:   projectID,
+			UID:         agentUID,
+			SpaceID:     spaceID,
+			OperatorUID: operatorUID,
+			Reason:      reason,
+		}, now); err != nil {
+			return false, nil, err
+		}
+		closedAgents = append(closedAgents, agentUID)
+	}
+
 	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
 		ProjectID:   projectID,
@@ -1386,7 +1788,7 @@ func (p *Project) beginRemovalWithCascadeTx(
 		OperatorUID: operatorUID,
 		Reason:      reason,
 	}, now); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return true, nil
+	return true, closedAgents, nil
 }

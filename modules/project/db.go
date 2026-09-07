@@ -82,7 +82,8 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	var models []*Model
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, status, created_at, updated_at "+
+			"discoverability, max_members, member_epoch, status, all_member_group_no, "+
+			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
 	if err != nil {
@@ -104,7 +105,8 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	var models []*Model
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, status, created_at, updated_at "+
+			"discoverability, max_members, member_epoch, status, all_member_group_no, "+
+			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
 	).Load(&models)
@@ -434,6 +436,57 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 //
 // Returns the set of uids that DO hold a seat. Callers decide which absence means what, since
 // actor and target absences carry different sentinels.
+// lockSpaceSeatRowsTx is lockSpaceSeatRowTx for a SET of uids: a shared lock on
+// each one's space_member row, taken in ONE statement, WITHOUT joining `space`.
+//
+// # Why not lockSpaceSeatsTx
+//
+// Because that one JOINs `space`, and createProject cannot afford it. A table
+// outside the `FOR SHARE OF` list is read as a CONSISTENT read, which OPENS the
+// transaction's read view — and in createProject this is the first statement, so
+// every creation quota counted after it would be answered from a snapshot taken
+// before the `space` row lock. That is not hypothetical: six concurrent creates
+// all passed MaxPerSpace=1 when the single-uid path had this shape, which is why
+// lockSpaceSeatRowTx exists at all and why
+// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin pins it. That guard caught
+// this function's absence — the agent seats were being locked through the
+// JOINing helper, reopening exactly the defect P0 closed.
+//
+// Nothing is lost by dropping the JOIN: createProject re-checks the Space's
+// activeness under the exclusive `space` lock immediately afterwards, which is
+// the authoritative check anyway.
+//
+// One statement rather than one per uid: the round-trips inside the transaction
+// then do not grow with the number of agents, and the rows are taken as a single
+// deterministic set instead of one at a time in caller-controlled order, which is
+// a deadlock shape.
+func (d *DB) lockSpaceSeatRowsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+	held := make(map[string]bool, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return held, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(uids)), ",")
+	args := make([]interface{}, 0, len(uids)+1)
+	args = append(args, spaceID)
+	for _, uid := range uids {
+		args = append(args, uid)
+	}
+	var found []string
+	_, err := tx.SelectBySql(
+		"SELECT uid FROM `space_member` "+
+			"WHERE space_id = ? AND uid IN ("+placeholders+") AND status = 1 "+
+			"ORDER BY uid FOR SHARE",
+		args...,
+	).Load(&found)
+	if err != nil {
+		return nil, fmt.Errorf("project: lock space seat rows: %w", err)
+	}
+	for _, uid := range found {
+		held[uid] = true
+	}
+	return held, nil
+}
+
 func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
 	held := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {
@@ -724,9 +777,21 @@ func (d *DB) listMembers(projectID string, offset, limit int) ([]*memberRosterMo
 	var rows []*memberRosterModel
 	_, err := d.session.SelectBySql(
 		"SELECT pm.project_id, pm.uid, pm.space_id, pm.role, pm.status, pm.invite_uid, "+
-			"pm.created_at, pm.updated_at, IFNULL(u.name, '') AS name "+
+			"pm.created_at, pm.updated_at, IFNULL(u.name, '') AS name, "+
+			// D16 — 名册要能区分人和分身，并给出分身的所有者，客户端才能像通讯录
+			// 那样把分身挂在人下面。两个 JOIN 都是 LEFT：没有 user 行的成员必须仍
+			// 然出现（见下面的注释），而 robot 行对每一个真人都不存在。
+			//
+			// robot 的 COLLATE 是必须的：`robot` 与 `user` 都是未声明 COLLATE 的
+			// 老表（生产库 utf8mb4_0900_ai_ci），octo_project_member 明确是
+			// general_ci，隐式比较在生产上报 1267 而在 CI 上一路绿灯。
+			// u.uid 那个 JOIN 是既有代码，未加 COLLATE —— 它比较的是两张老表
+			// （user / octo_project_member），本行不改它的行为，只在新加的比较上
+			// 补齐；改既有 JOIN 会顺带改动一条已在生产跑着的查询计划。
+			"IFNULL(u.robot, 0) AS robot, IFNULL(r.creator_uid, '') AS owner_uid "+
 			"FROM `octo_project_member` pm "+
 			"LEFT JOIN `user` u ON u.uid = pm.uid "+
+			"LEFT JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci AND r.status = 1 "+
 			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 "+
 			"ORDER BY pm.role DESC, pm.created_at ASC LIMIT ? OFFSET ?",
 		projectID, MemberStatusActive, limit, offset,

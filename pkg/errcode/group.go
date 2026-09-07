@@ -68,6 +68,31 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Only members of this project can be added to the group.",
 	})
+	// ErrGroupAllMemberGroupProtected refuses the four group operations that
+	// would break a project's all-member group (P2 D7): disband, exit, remove a
+	// member, and hand over the owner.
+	//
+	// The all-member group's roster IS the project's roster (invariant I4), so
+	// each of those has a project-side equivalent that must be used instead:
+	// leave the project, remove the member from the project, transfer project
+	// ownership. Disbanding has no equivalent — the group ends when the project
+	// does.
+	//
+	// details.action names which of the four was refused, so a client can render
+	// the right redirection ("leave the project instead") rather than a generic
+	// refusal. It leaks nothing: the caller performed that action and is a member
+	// of the group, both of which they already knew.
+	//
+	// The refusal is on the HTTP handlers ONLY. The service-layer primitives stay
+	// open, because P1's project cascade, the Space-removal cascade, botfather's
+	// bot deletion and P2's own owner-sync hook all go through them — blocking
+	// there would block the very cascades that keep I2 and I4 true.
+	ErrGroupAllMemberGroupProtected = register(codes.Code{
+		ID:             "err.server.group.all_member_group_protected",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
+		SafeDetailKeys: []string{"action"},
+	})
 	ErrGroupCategorySpaceMismatch = register(codes.Code{
 		ID:             "err.server.group.category_space_mismatch",
 		HTTPStatus:     http.StatusBadRequest,

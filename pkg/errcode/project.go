@@ -55,6 +55,24 @@ var (
 		DefaultMessage: "Too many members in a single request.",
 		SafeDetailKeys: []string{"max"},
 	})
+	// ErrProjectAgentNotEligible is the SINGLE answer for every reason an AI
+	// agent may not be seated in a project (D3/D15): it is not yours, it is not a
+	// bot, it is self-hosted, it has no active Space seat, it is a system bot, it
+	// does not exist, or its owner is not a member of this project.
+	//
+	// One code for seven reasons, deliberately. Splitting them apart turns
+	// members/add into an oracle: submit a uid and learn whether it exists,
+	// whether it is a bot, and who owns it. The specific reason goes to logs.
+	//
+	// Details carry the uids the CALLER submitted, so a client can highlight the
+	// offending rows in its picker. Echoing back the caller's own input leaks
+	// nothing — the leak would be saying which of them failed and why.
+	ErrProjectAgentNotEligible = register(codes.Code{
+		ID:             "err.server.project.agent_not_eligible",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "One or more selected AI agents cannot join this project.",
+		SafeDetailKeys: []string{"uids"},
+	})
 	// ErrProjectRoleInvalid covers an out-of-range role value.
 	ErrProjectRoleInvalid = register(codes.Code{
 		ID:             "err.server.project.role_invalid",
@@ -128,13 +146,28 @@ var (
 		DefaultMessage: "You have reached your project limit in this space.",
 		SafeDetailKeys: []string{"max"},
 	})
-	// There is deliberately NO code for the per-project member cap. It is reached only
-	// inside a batch add, where the brief's own exception applies: the cap surfaces as a
-	// per-uid "quota_members" reason in a 200 partial report, because the other uids in the
-	// batch may well be admissible. A registered code with no producer costs a zh-CN entry
-	// and an en-US marker maintained forever, which is the "register it and wait for a
-	// consumer" shape D3 argues against — so it is registered when a caller needs it, not
-	// before (PR #841 round 2, P2).
+	// ErrProjectQuotaMembers covers the per-project member cap.
+	//
+	// P0 deliberately did NOT register this: the cap was reachable only inside a batch
+	// add, where it surfaces as a per-uid "quota_members" reason in a 200 partial report
+	// (the other uids in the batch may well be admissible), and a registered code with no
+	// producer costs an en-US marker and a zh-CN entry maintained forever. That comment
+	// said it would be registered "when a caller needs it, not before".
+	//
+	// P2 is that caller. Creating a project with agent_uids seats N+1 members in ONE
+	// transaction and refuses the WHOLE request if they do not fit (D3), so there is no
+	// partial report to carry a per-uid reason — the refusal has to be an error code.
+	// Without it the create falls to the Internal store_failed code: a 5xx, with the
+	// message hidden, for what is an ordinary caller error with a number the client
+	// should show.
+	//
+	// The batch-add path is unchanged and still reports per-uid.
+	ErrProjectQuotaMembers = register(codes.Code{
+		ID:             "err.server.project.quota_members",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This project has reached its member limit.",
+		SafeDetailKeys: []string{"max"},
+	})
 	// ErrProjectQuotaDailyCreate covers the per-user per-day creation cap.
 	ErrProjectQuotaDailyCreate = register(codes.Code{
 		ID:             "err.server.project.quota_daily_create",

@@ -91,19 +91,29 @@ const (
 // It likewise has no IsOfficial field: no P0 code path writes that column, and
 // leaving it out of the model is what makes that checkable rather than aspirational.
 type Model struct {
-	ID              int64     `db:"id"`
-	ProjectID       string    `db:"project_id"`
-	SpaceID         string    `db:"space_id"`
-	Name            string    `db:"name"`
-	Description     string    `db:"description"`
-	Logo            string    `db:"logo"`
-	Creator         string    `db:"creator"`
-	Discoverability int       `db:"discoverability"`
-	MaxMembers      int       `db:"max_members"`
-	MemberEpoch     int64     `db:"member_epoch"`
-	Status          int       `db:"status"`
-	CreatedAt       time.Time `db:"created_at"`
-	UpdatedAt       time.Time `db:"updated_at"`
+	ID              int64  `db:"id"`
+	ProjectID       string `db:"project_id"`
+	SpaceID         string `db:"space_id"`
+	Name            string `db:"name"`
+	Description     string `db:"description"`
+	Logo            string `db:"logo"`
+	Creator         string `db:"creator"`
+	Discoverability int    `db:"discoverability"`
+	MaxMembers      int    `db:"max_members"`
+	MemberEpoch     int64  `db:"member_epoch"`
+	Status          int    `db:"status"`
+	// AllMemberGroupNo is this project's all-member group, or "" when it has
+	// none yet. "" is the sentinel and the column is NOT NULL, so every
+	// predicate in the feature is written `= ''` / `!= ''` (see D5).
+	//
+	// Empty is a REACHABLE state, not an error: the group is provisioned after
+	// the create transaction commits (the hook opens its own transaction in
+	// modules/group), so a provisioning failure leaves the project alive with no
+	// group. D4 makes that recoverable rather than terminal — the next write path
+	// on this project retries under a lease, and reconcile scan A reports it.
+	AllMemberGroupNo string    `db:"all_member_group_no"`
+	CreatedAt        time.Time `db:"created_at"`
+	UpdatedAt        time.Time `db:"updated_at"`
 }
 
 // MemberModel is an octo_project_member row.
@@ -138,11 +148,20 @@ type officialFlagModel struct {
 // ---------- API request payloads ----------
 
 type createReq struct {
-	Name            string `json:"name"`
-	Description     string `json:"description"`
-	Logo            string `json:"logo"`
-	Discoverability *int   `json:"discoverability"`
-	MaxMembers      *int   `json:"max_members"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Logo        string `json:"logo"`
+	// AgentUIDs are the caller's OWN AI agents to seat in the new project
+	// (D2/D15). Optional; the eligibility of every uid here is re-decided
+	// server-side inside the create transaction, never trusted from the client.
+	//
+	// One ineligible uid rejects the WHOLE request (D3): "the project was
+	// created but two of your agents are missing" is harder to explain than
+	// "fix it and retry", and a partial success would add a third meaning to
+	// D4's already-loaded failure story.
+	AgentUIDs       []string `json:"agent_uids"`
+	Discoverability *int     `json:"discoverability"`
+	MaxMembers      *int     `json:"max_members"`
 }
 
 type updateReq struct {
@@ -199,9 +218,23 @@ type Resp struct {
 	Creator         string `json:"creator"`
 	Discoverability int    `json:"discoverability"`
 	MaxMembers      int    `json:"max_members"`
-	MemberCount     int    `json:"member_count"`
-	MemberEpoch     int64  `json:"member_epoch"`
-	Status          int    `json:"status"`
+	// MemberCount counts HUMAN members only (D16). AI agents seated in the
+	// project are counted separately in AgentCount.
+	//
+	// This is a semantic change to an existing field, taken deliberately: a
+	// project with one person and two of their agents used to render "3 人",
+	// which is a sentence no user reads as true. The quota (MaxMembers) still
+	// counts every seat, agents included — an agent reads the project's
+	// messages, so it costs a seat.
+	MemberCount int `json:"member_count"`
+	// AgentCount is the number of active AI agent seats.
+	AgentCount  int   `json:"agent_count"`
+	MemberEpoch int64 `json:"member_epoch"`
+	Status      int   `json:"status"`
+	// AllMemberGroupNo is this project's all-member group, or "" when it has
+	// none yet (provisioning failed and has not been retried; see D4). A client
+	// showing an entry point to the group must handle "" rather than assuming.
+	AllMemberGroupNo string `json:"all_member_group_no"`
 	// MyRole is the caller's project role, or -1 when the caller is not a member
 	// (a Space admin reading a project they have not joined).
 	MyRole       int          `json:"my_role"`
@@ -219,6 +252,11 @@ type Capabilities struct {
 	CanChangeRole   bool `json:"can_change_role"`
 	CanLeave        bool `json:"can_leave"`
 	CanViewMembers  bool `json:"can_view_members"`
+	// CanManageOwnAgents is the narrow capability D15 adds: any active project
+	// member may seat and unseat THEIR OWN agents, without holding
+	// CanManageMember. It is deliberately not derivable from the role number —
+	// an ordinary member has it and cannot manage anyone else.
+	CanManageOwnAgents bool `json:"can_manage_own_agents"`
 }
 
 // MemberResp is one row of the project member roster.
@@ -227,6 +265,15 @@ type MemberResp struct {
 	Name      string `json:"name"`
 	Role      int    `json:"role"`
 	InviteUID string `json:"invite_uid"`
+	// Robot is 1 for an AI agent seat, 0 for a person (D16). Without it the
+	// roster cannot be rendered the way the directory renders it — agents
+	// nested under the person who owns them — and a client would have to guess
+	// from the uid shape.
+	Robot int `json:"robot"`
+	// OwnerUID is the agent's owner (robot.creator_uid); empty for a person and
+	// for an agent whose owner row is gone. It is the join key the client uses
+	// to nest an agent under its owner.
+	OwnerUID  string `json:"owner_uid"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -234,6 +281,11 @@ type MemberResp struct {
 type memberRosterModel struct {
 	MemberModel
 	Name string `db:"name"`
+	// Robot / OwnerUID come from `user` and `robot` respectively, both LEFT
+	// JOINed: a member whose user row is missing must still appear (see
+	// listMembers), and a robot row is absent for every person.
+	Robot    int    `db:"robot"`
+	OwnerUID string `db:"owner_uid"`
 }
 
 const respTimeFormat = "2006-01-02 15:04:05"

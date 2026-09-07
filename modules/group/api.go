@@ -240,6 +240,14 @@ func (g *Group) disband(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	// D7 —— 全员群不能被解散。它随项目结束而结束，没有别的等价物。
+	//
+	// 放在群主判定**之后**：先回答"你有没有权限做这件事"，再回答"这件事对这个群
+	// 允不允许"。反过来会让一个普通成员通过一条错误消息知道这个群是某项目的全员群。
+	if loginMember != nil && loginMember.Role == MemberRoleCreator &&
+		g.refuseIfAllMemberGroup(c, group, allMemberGroupActionDisband) {
+		return
+	}
 	if loginMember == nil || loginMember.Role != MemberRoleCreator {
 		g.Error("用户无权执行此操作", zap.Error(err))
 		respondGroupForbidden(c)
@@ -2950,6 +2958,15 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 		return
 	}
 
+	// D7 —— 全员群的群主不能手动转让。它始终跟着项目 owner 走（D6），由项目侧
+	// 在 owner 变动时驱动同步。
+	//
+	// 放在群主判定之后：只有群主本人会看到这条拒绝，别人先拿到 creator_only。
+	// 这一路仍在任何写入之前——下面才开始改成员角色。
+	if g.refuseIfAllMemberGroupByNo(c, groupNo, allMemberGroupActionTransfer) {
+		return
+	}
+
 	groupModel, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
@@ -3169,9 +3186,17 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 判断群是否存在
-	_, err := g.getGroupInfo(groupNo)
+	removeGroupInfo, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
+		return
+	}
+	// D7 —— 全员群里不能踢人。要把谁移出这个群，就是要把他移出这个项目。
+	//
+	// 放在这里而不是等操作者身份查完：这个 handler 后面会走 RemoveGroupMembers，
+	// 那条路径带 IM 退订、系统消息、bot 连带移除等一串副作用，守卫必须在任何副作用
+	// 之前。存在性已经由上面那次 getGroupInfo 回答过，所以这条拒绝不多说什么。
+	if g.refuseIfAllMemberGroup(c, removeGroupInfo, allMemberGroupActionRemove) {
 		return
 	}
 	var loginMember *MemberModel
@@ -3531,6 +3556,20 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	if err != nil {
 		// 不存在 / 已解散群 → 404；查询失败 → 500。getGroupInfo 已记录 DB 错误。
 		respondGroupInfoError(c, err)
+		return
+	}
+	// D7 —— 全员群不能退。要离开这个群，就是要离开这个项目。
+	//
+	// 位置是被这个 handler 的既有顺序决定的，不是随便挑的：**下面那次
+	// IMRemoveSubscriber 发生在成员校验之前**。守卫若放在成员校验旁边，一次被拒的
+	// 退群会先把人从 IM 频道上摘掉——人还在群里，却再也收不到消息，而且没有任何
+	// 路径会把订阅加回来。那是一个比这里的取舍严重得多的缺陷。
+	//
+	// 代价是这条拒绝先于"你是不是群成员"给出，于是一个非成员能从中读出这个群是
+	// 某项目的全员群。这个泄露是有界的：上面那次 getGroupInfo 已经用 404 与否
+	// 回答了"这个群存不存在"，而下面的 not_in_group 也一样——群的存在性在这个
+	// handler 上本来就不是秘密，多出来的只是"它属于某个项目"。
+	if g.refuseIfAllMemberGroup(c, groupInfo, allMemberGroupActionExit) {
 		return
 	}
 	// 调用IM的移除订阅者

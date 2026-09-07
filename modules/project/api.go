@@ -293,10 +293,25 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 		}
 		in.MaxMembers = *req.MaxMembers
 	}
+	// agent_uids is bounded here and re-decided in the transaction.
+	//
+	// Only the SHAPE is checked at this layer: the count. Eligibility needs the
+	// Space seats locked, so it belongs inside the create transaction — a check
+	// out here would be a read that can expire between the check and the write,
+	// which is the same reason P0 moved the creator's own I1 check inside.
+	//
+	// The cap reuses MemberBatchMax rather than inventing a second one: these are
+	// membership writes in a batch, exactly like members/add, and two caps for the
+	// same shape of request drift apart.
+	in.AgentUIDs = sanitizeUIDs(req.AgentUIDs)
+	if len(in.AgentUIDs) > p.cfg.MemberBatchMax {
+		respondProjectBatchTooLarge(c, p.cfg.MemberBatchMax)
+		return
+	}
 
 	model, err := p.createProject(in)
 	if err != nil {
-		p.respondCreateError(c, err, spaceID, uid)
+		p.respondCreateError(c, err, spaceID, uid, in.AgentUIDs)
 		return
 	}
 	p.audit(auditCreate, uid, "", model.ProjectID, spaceID, "")
@@ -305,12 +320,13 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 	// project they just created, so every capability is already determined. The Space role
 	// only ever widens READ visibility, which does not apply to a response about a project
 	// the caller owns.
-	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, 1))
+	humans, agents := p.splitSeatCounts(model.ProjectID, 1+len(in.AgentUIDs))
+	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, humans, agents))
 }
 
 // respondCreateError maps the create sentinels onto registered codes. Kept separate
 // so the handler reads as validation-then-call and the mapping table lives once.
-func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid string) {
+func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid string, agentUIDs []string) {
 	switch {
 	case errors.Is(err, errQuotaPerSpace):
 		observeRejected(entryProjectCreate, reasonQuotaPerSpace)
@@ -343,6 +359,20 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 		p.Error("创建项目失败：子系统预置工单写入失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))
 		respondStoreFailed(c)
+	case errors.Is(err, errAgentNotEligible):
+		// D3 — one ineligible agent rejects the whole create, and all seven
+		// reasons render identically. The uids echoed in details are the ones the
+		// caller submitted, so a picker can highlight them; the reasons went to
+		// the log inside createProjectOnce.
+		observeRejected(entryProjectCreate, reasonAgentNotEligible)
+		respondProjectAgentNotEligible(c, agentUIDs)
+	case errors.Is(err, errQuotaMembers):
+		// Reachable from create only via agent_uids: the owner seat alone cannot
+		// exceed a member quota. Before agents existed this arm did not need to be
+		// here, and without it the refusal would fall through to store_failed —
+		// an Internal 5xx for what is a caller error with a registered code.
+		observeRejected(entryProjectCreate, reasonQuotaMembers)
+		respondProjectQuota(c, errcode.ErrProjectQuotaMembers, p.cfg.MaxMembers)
 	default:
 		p.Error("创建项目失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))
@@ -396,7 +426,11 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 	resps := make([]*Resp, 0, len(rows))
 	for _, row := range rows {
 		model := row.Model
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount))
+		// The list route keeps ONE aggregate per row (the subquery in
+		// listVisibleInSpace) rather than splitting it: splitting would need a
+		// per-row join to `user`, turning one query into N+1 on a paged list.
+		// A list card shows a total; the detail route is where the split matters.
+		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, 0))
 	}
 	c.Response(resps)
 }
@@ -414,7 +448,8 @@ func (p *Project) getProjectHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
-	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), count))
+	humans, agents := p.splitSeatCounts(row.ProjectID, count)
+	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents))
 }
 
 func (p *Project) listMembersHandler(c *wkhttp.Context) {
@@ -440,6 +475,13 @@ func (p *Project) listMembersHandler(c *wkhttp.Context) {
 	resps := make([]*MemberResp, 0, len(rows))
 	for _, m := range rows {
 		resps = append(resps, &MemberResp{
+			// D16 — the roster tells people and agents apart, and names each
+			// agent's owner, so a client can nest agents under their owner the
+			// way the Space directory does. Both come from LEFT JOINs, so a
+			// member with no user row reads as robot=0 and owner_uid="" rather
+			// than dropping out of the roster.
+			Robot:     m.Robot,
+			OwnerUID:  m.OwnerUID,
 			UID:       m.UID,
 			Name:      m.Name,
 			Role:      m.Role,
@@ -539,7 +581,8 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
-	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), count))
+	humans, agents := p.splitSeatCounts(updated.ProjectID, count)
+	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents))
 }
 
 func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
@@ -585,24 +628,47 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 
 // ---------- response shaping ----------
 
-func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount int) *Resp {
+// toResp renders a project. memberCount counts HUMANS and agentCount counts AI
+// agents (D16); MaxMembers still bounds the two together, because a seat is a
+// seat regardless of who sits in it.
+func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int) *Resp {
 	return &Resp{
-		ProjectID:       m.ProjectID,
-		SpaceID:         m.SpaceID,
-		Name:            m.Name,
-		Description:     m.Description,
-		Logo:            m.Logo,
-		Creator:         m.Creator,
-		Discoverability: m.Discoverability,
-		MaxMembers:      p.cfg.effectiveMaxMembers(m.MaxMembers),
-		MemberCount:     memberCount,
-		MemberEpoch:     m.MemberEpoch,
-		Status:          m.Status,
-		MyRole:          myRole,
-		Capabilities:    capabilitiesFor(myRole, spaceRole),
-		CreatedAt:       formatTime(m.CreatedAt),
-		UpdatedAt:       formatTime(m.UpdatedAt),
+		ProjectID:        m.ProjectID,
+		SpaceID:          m.SpaceID,
+		Name:             m.Name,
+		Description:      m.Description,
+		Logo:             m.Logo,
+		Creator:          m.Creator,
+		Discoverability:  m.Discoverability,
+		MaxMembers:       p.cfg.effectiveMaxMembers(m.MaxMembers),
+		MemberCount:      memberCount,
+		AgentCount:       agentCount,
+		MemberEpoch:      m.MemberEpoch,
+		Status:           m.Status,
+		AllMemberGroupNo: m.AllMemberGroupNo,
+		MyRole:           myRole,
+		Capabilities:     capabilitiesFor(myRole, spaceRole),
+		CreatedAt:        formatTime(m.CreatedAt),
+		UpdatedAt:        formatTime(m.UpdatedAt),
 	}
+}
+
+// splitSeatCounts renders the human/agent split for one project, degrading to
+// "everything is a human" if the query fails.
+//
+// Degrading rather than failing the whole response is deliberate: the split is a
+// display refinement, and a project detail page that 500s because a COUNT with a
+// join to `user` hiccuped is a worse answer than one whose agent badge is
+// missing. The total is unaffected either way — humans+agents always equals the
+// seat count the quota uses.
+func (p *Project) splitSeatCounts(projectID string, total int) (humans, agents int) {
+	humans, agents, err := p.db.countActiveSeatsByKind(projectID)
+	if err != nil {
+		p.Warn("统计项目成员构成失败，按全部为真人回退",
+			zap.Error(err), zap.String("projectId", projectID))
+		return total, 0
+	}
+	return humans, agents
 }
 
 // pageParams parses offset/limit with bounds. An unbounded limit on a roster or a project

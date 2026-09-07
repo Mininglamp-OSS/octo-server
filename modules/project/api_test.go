@@ -521,6 +521,7 @@ const (
 var projectMigrationFiles = []string{
 	"sql/20260904000001_project_core.sql",
 	"sql/20260906000001_project_group_binding.sql",
+	"sql/20260907000001_project_all_member_group.sql",
 }
 
 // applyProjectMigration executes one section of every migration file this module

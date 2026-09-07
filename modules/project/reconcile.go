@@ -80,6 +80,16 @@ type reconcileCursors struct {
 	i2Run   int
 	i3Group int64
 	i3Run   int
+	// P2 scans (invariant I4). i4Missing rotates over octo_project.id alone;
+	// i4Gap needs the composite (project id, member uid) for the same reason I2
+	// does — its page is bounded on MEMBER rows and therefore cuts projects in
+	// half, so a project-only cursor would skip every member past the boundary on
+	// every rotation.
+	i4Missing    int64
+	i4MissingRun int
+	i4GapProject int64
+	i4GapUID     string
+	i4GapRun     int
 }
 
 var cursors reconcileCursors
@@ -141,6 +151,24 @@ func (c *reconcileCursors) i2Save(group int64, uid string, running int, done boo
 	c.i2Group, c.i2UID, c.i2Run = group, uid, running
 }
 
+// i4GapResume / i4GapSave are the mixed (int64, string) composite cursor the I4
+// gap rotation needs. Same contract as i2Resume/i2Save.
+func (c *reconcileCursors) i4GapResume() (int64, string, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.i4GapProject, c.i4GapUID, c.i4GapRun
+}
+
+func (c *reconcileCursors) i4GapSave(project int64, uid string, running int, done bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if done {
+		c.i4GapProject, c.i4GapUID, c.i4GapRun = 0, "", 0
+		return
+	}
+	c.i4GapProject, c.i4GapUID, c.i4GapRun = project, uid, running
+}
+
 // idResume / idSave are the same contract for the single-int64-cursor rotations.
 func (c *reconcileCursors) idResume(cursor *int64, running *int) (int64, int) {
 	c.mu.Lock()
@@ -181,6 +209,8 @@ func resetCursorsForTest() {
 	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
 	cursors.i2Group, cursors.i2UID, cursors.i2Run = 0, "", 0
 	cursors.i3Group, cursors.i3Run = 0, 0
+	cursors.i4Missing, cursors.i4MissingRun = 0, 0
+	cursors.i4GapProject, cursors.i4GapUID, cursors.i4GapRun = 0, "", 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly
@@ -270,6 +300,20 @@ func (p *Project) runReconcile() {
 	p.scanI2Violations()
 	p.scanI3Violations()
 	p.scanRemovingStalls()
+	// P2: the two halves of I4. I2 above is the subset direction (nobody in a
+	// project group who is not in the project); these are the superset direction,
+	// and only for the all-member group.
+	//
+	// Outside the gate for the same reason as the P1 scans: every comparison that
+	// crosses into the legacy schema carries an explicit COLLATE, so they survive
+	// the drift the gate exists for.
+	//
+	// REPORT ONLY, both of them. Scan A has a repair (D4's rebuild) and it lives
+	// on the write paths, not here — a reconcile worker that also writes
+	// group_member stops being the invariant's witness and becomes another thing
+	// that can break it.
+	p.scanMissingAllMemberGroups()
+	p.scanAllMemberGroupGaps()
 }
 
 // reconcileLogCap bounds the per-row Error lines ONE scan emits in ONE tick.

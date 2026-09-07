@@ -300,14 +300,52 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		wasSoleOwner = owners <= 1
 	}
 
+	// D13 — the departing member's OWN agents lose their seats with them, read
+	// BEFORE the member's row is touched (queryOwnedAgentSeatsTx filters on
+	// status = 1 AND removing = 0, so reading after would come back short).
+	//
+	// This path closes seats DIRECTLY (status = 0) rather than through D4's
+	// two-phase close, and the agents follow the same shape for the same reason:
+	// the group-side work is already covered here. The Space removal that drove
+	// this job also runs modules/group's cleanupSpaceMemberGroups, and
+	// RemoveGroupMembers pulls the leaver's bots out of every group with them
+	// (#354, matched on the same robot.creator_uid this reads). So there is
+	// nothing left for a project-side cascade job to do, and enqueuing one would
+	// only add a job that finds an empty group set.
+	//
+	// Without this the agent would keep an ACTIVE project seat while sitting in
+	// none of the project's groups: I4 broken, and broken permanently, because an
+	// active seat is never revisited by any cascade.
+	agents, err := p.db.queryOwnedAgentSeatsTx(tx, projectID, uid)
+	if err != nil {
+		return false, err
+	}
+
 	changed, err := p.db.deactivateMemberTx(tx, projectID, uid, now)
 	if err != nil {
 		return false, err
 	}
+	closedAgents := make([]string, 0, len(agents))
 	if changed {
+		for _, agentUID := range agents {
+			if agentUID == "" || agentUID == uid {
+				continue
+			}
+			agentChanged, err := p.db.deactivateMemberTx(tx, projectID, agentUID, now)
+			if err != nil {
+				return false, err
+			}
+			if agentChanged {
+				closedAgents = append(closedAgents, agentUID)
+			}
+		}
 		// Only when a row actually changed. The step is re-run on every job retry, so
 		// an unconditional bump would inflate the epoch on no-op reruns and break the
 		// "a no-op does not change the epoch" rule clients cache against.
+		//
+		// ONE bump for the member and every agent that went with them: a member
+		// leaving with their agents is one membership change, and the epoch is
+		// asserted to move by exactly +1 per write.
 		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, err
 		}
@@ -321,6 +359,9 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		// isolation boundary — but leaving a stale positive role cached would make the
 		// project's own membership answer disagree with the database for a full TTL.
 		p.invalidateProjectMemberCache(projectID, uid)
+		for _, agentUID := range closedAgents {
+			p.invalidateProjectMemberCache(projectID, agentUID)
+		}
 	}
 	if changed && wasSoleOwner {
 		p.Warn("项目唯一 owner 已被移出 Space，项目暂时无人可管理（P0 已知终局，处置待产品决策）",

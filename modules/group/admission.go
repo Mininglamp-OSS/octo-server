@@ -93,6 +93,16 @@ const (
 	// channel and to the group's threads, and touches NEITHER InsertMemberTx nor
 	// recoverMemberTx. It is an admission path because that is what it does.
 	AdmissionEntryUnblacklist = "a11_unblacklist"
+	// AdmissionEntryAllMemberGroup is the P2 all-member group admitter, reached
+	// through the registry modules/project exposes (modules/project cannot import
+	// modules/group). It runs when a uid becomes a project member, putting them
+	// into that project's all-member group.
+	//
+	// A twelfth entry rather than reusing a10_preset_groups, which it structurally
+	// resembles: the label breakdown exists so a path that silently stopped
+	// enforcing is visible per path, and folding two paths onto one label is
+	// exactly the visibility this metric was added to buy.
+	AdmissionEntryAllMemberGroup = "a12_all_member_group"
 )
 
 // Rejection reasons. Low-cardinality enum; never a free-form message.

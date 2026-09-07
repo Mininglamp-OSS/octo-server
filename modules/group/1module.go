@@ -48,6 +48,10 @@ func init() {
 		// 项目解散 → 群回落 Space 直属。同样是反向注册，modules/project 不能
 		// import 本模块。
 		api.registerProjectCascadeSteps()
+
+		// P2：全员群的四个钩子（建群 / 入群 / 群主同步 / 改名），同样反向注册进
+		// modules/project。见 all_member_group.go。
+		api.registerAllMemberGroupHooks()
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {

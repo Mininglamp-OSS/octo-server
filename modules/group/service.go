@@ -942,12 +942,21 @@ type GroupResp struct {
 	CanEditGroupMd           bool      `json:"can_edit_group_md"`           // 是否可编辑GROUP.md
 	CanManageBotAdmin        bool      `json:"can_manage_bot_admin"`        // 是否可管理Bot管理员
 	SpaceID                  string    `json:"space_id"`                    // Space ID
-	IsExternalGroup          int       `json:"is_external_group"`           // 是否外部群 0.否 1.是
-	AllowExternal            int       `json:"allow_external"`              // 是否允许外部成员 1.允许(默认) 0.禁止
-	AllowNoMention           int       `json:"allow_no_mention"`            // 群级是否允许免@生效 1.允许(默认) 0.禁止
-	CreatedAt                string    `json:"created_at"`
-	UpdatedAt                string    `json:"updated_at"`
-	Version                  int64     `json:"version"` // 群数据版本
+	// ProjectID 群所属项目；空串 = 直属 Space。P2 开始下发。
+	//
+	// 客户端要靠它把项目群归到项目名下展示，也要靠它知道这个群的成员是由项目
+	// 决定的（全员群还会被 D7 的四道保护挡住若干操作，客户端最好别把那些按钮
+	// 画出来）。P1 建立了这一列并让 I2 依赖它，但刻意没有下发——那是留给 P2 的
+	// 第一项透出工作。
+	//
+	// 只加字段、不改任何既有字段：老客户端读不到它，行为与今天完全一致。
+	ProjectID       string `json:"project_id"`        // 所属项目 ID（空串=直属 Space）
+	IsExternalGroup int    `json:"is_external_group"` // 是否外部群 0.否 1.是
+	AllowExternal   int    `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention  int    `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+	Version         int64  `json:"version"` // 群数据版本
 }
 
 func (g *GroupResp) from(model *DetailModel) *GroupResp {
@@ -982,6 +991,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
 		SpaceID:                  model.SpaceID,
+		ProjectID:                model.ProjectID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
 		AllowNoMention:           model.AllowNoMention,
@@ -1016,6 +1026,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
 		SpaceID:                  model.SpaceID,
+		ProjectID:                model.ProjectID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
 		AllowNoMention:           model.AllowNoMention,
@@ -1188,9 +1199,19 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	if req.Creator == "" {
 		return nil, errors.New("creator is required")
 	}
-	if len(req.Members) == 0 {
-		return nil, errors.New("members is required")
-	}
+	// Members MAY be empty — a group of just its creator is a legitimate group.
+	//
+	// This used to be rejected here, and the rejection has to go for P2: a project
+	// created with no agents picked needs an all-member group whose only initial
+	// member is the project owner. Refusing that would make "create a project"
+	// silently produce a project with no group in the most common case there is.
+	//
+	// The HTTP handler's own check is UNCHANGED (groupReq.Check still requires at
+	// least one member), so a user creating a group by hand still cannot create an
+	// empty one. What is relaxed is the SERVICE contract, for callers that are not
+	// a person filling in a form. The distinction matters: the handler rule is a
+	// product rule about a form, this one was a guard against an empty insert, and
+	// the insert below is not empty — the creator is always added.
 
 	var skippedMembers []string
 	// 跨 Space 外部成员标识：key=uid, value=source_space_id（uid 的默认 Space）

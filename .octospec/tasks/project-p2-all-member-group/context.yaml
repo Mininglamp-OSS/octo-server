@@ -1,0 +1,212 @@
+# octospec Implement-phase record for task project-p2-all-member-group.
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
+# tier available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml).
+# The brief's tags are: space, isolation, acl, error-response, i18n, rate-limit,
+# wire-contract, migration, testing, commit. All six repo rules match.
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go matches every file this task touches; brief tags
+      carry space / isolation / acl. Drives: the all-member group is created
+      with the project's own space_id and project_id so I2 keeps gating it;
+      agent eligibility (D2/D15) is decided server-side inside the create
+      transaction with a locked space_member read, never from the client's
+      agent_uids list; D13 closes an agent's seat by robot.creator_uid, the
+      same field the group side already uses, so the two cannot disagree about
+      whose agent it is; D14 routes bot deletion through the Space removal
+      outbox so the seat-closing cascade actually runs for bots.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + pkg/errcode/**; brief tags error-response / i18n /
+      wire-contract. Drives: err.server.project.agent_not_eligible and
+      err.server.group.all_member_group_protected registered in pkg/errcode,
+      httperr.ResponseErrorL everywhere, 5xx <=> Internal=true, zh-CN
+      translations, i18n-extract-check + i18n-lint, and adding every new file to
+      TestGroupNoLegacyResponseError / TestProjectNoLegacyResponseError (both
+      scan fixed file lists and cannot see a new file on their own).
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tag rate-limit. The task adds no route --
+      agent_uids rides the existing create route and the agent rules ride
+      members/add|remove, both already behind AuthMiddleware +
+      SharedUIDRateLimiter. Binds two ways: the provisioner / admitter hooks and
+      the I4 scans are not HTTP paths and must not grow a Redis counter, and the
+      D4 rebuild lease is a correctness lease on a table row, not a rate limiter.
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by touches:wire-contract, not by paths -- no inbound adapter, no
+      markdown rendering, no URL destinations. Two clauses apply. "Bound the
+      payload": agent_uids is capped at MemberBatchMax (200) like every other
+      member batch. And the anti-enumeration shape: the six agent-ineligibility
+      reasons collapse to one code with the submitted uids echoed back, so
+      "not yours" / "not a bot" / "another Space" / "does not exist" are
+      byte-identical on the wire, matching P1's project_unavailable precedent.
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go. Drives: testutil.NewTestServer + CleanAllTables,
+      explicit ratelimit:uid:* reset on UID-limited routes, and the
+      non-regression rule that no EXISTING test file may be edited -- an edited
+      assertion is a changed contract. New behaviour lands in new test files.
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ** -- English Conventional Commits; PR description in English.
+
+brief: .octospec/tasks/project-p2-all-member-group/brief.md
+
+# Confirmed by the requester on 2026-09-07: D1-D17 all take the brief's
+# recommended defaults. D6 / D7 / D8 are in scope (their "optional" markers were
+# removed in that same confirmation).
+scope_changes: []
+
+# Assumptions taken where the brief left a choice; each reversible at one site.
+assumptions:
+  - id: d14-keeps-the-synchronous-group-loop
+    decision: |
+      D14 replaces ONLY botfather's raw `UPDATE space_member SET status=0` with
+      the transactional outbox entry. Its existing synchronous group-removal
+      loop stays exactly as it is.
+      Why: the loop enumerates the bot's groups with GetGroupsWithMemberUID,
+      which is NOT Space-scoped, while the outbox is keyed (space_id, uid) and
+      its group step queries queryGroupsWithMemberUIDAndSpaceID. Replacing the
+      loop with the outbox would silently drop every group whose space_id is ''
+      -- a coverage regression dressed up as a refactor. Keeping both is safe
+      because the group step is idempotent by construction: it re-reads the
+      member row and returns nil when the row is already gone.
+      The brief's own Out of scope says D14 只接 Space 席位这一段, so this is
+      the reading it intends; recorded because "route bot deletion through the
+      outbox" could be read as replacing the loop.
+  - id: bot-deleted-is-its-own-removal-reason
+    decision: |
+      A new MemberRemoveReasonBotDeleted = "bot_deleted" rather than reusing
+      MemberRemoveReasonForceRemoved (the brief allowed either).
+      Why: the group cascade branches on Reason to decide whether to emit the
+      "X 被 Y 移出群聊" system message. botfather today passes
+      SuppressRemoveNotice: true and says in a comment that keeping it that way
+      is deliberate -- the sentence is factually wrong for a globally deleted
+      bot. Reusing force_removed would make the cascade emit that message into
+      every group the synchronous loop failed to clean, which is precisely the
+      "a refactor changed user-visible behaviour" failure the same comment warns
+      about. A distinct reason lets the group step suppress it by name.
+
+# Defects found DURING implementation, by the repo's own guards. Recorded because
+# each one was a real hole in the change, not a test being fussy.
+defects_found:
+  - id: create-took-the-joining-seat-lock
+    where: modules/project/service.go createProjectOnce
+    what: |
+      The first version locked the agents' Space seats with lockSpaceSeatsTx,
+      which JOINs `space`.
+    why_it_matters: |
+      A table outside that statement's `FOR SHARE OF` list is read as a
+      CONSISTENT read, which OPENS the transaction's read view. In
+      createProjectOnce it would have been the first such statement, so every
+      creation quota counted afterwards would answer from a snapshot taken
+      before the `space` row lock -- the exact defect P0 closed and documented
+      (six concurrent creates all passed MaxPerSpace=1).
+    caught_by: TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin
+    fix: |
+      New lockSpaceSeatRowsTx: the batch form of lockSpaceSeatRowTx, one
+      statement, no JOIN. Nothing is lost -- createProject rechecks the Space
+      under the exclusive `space` lock immediately afterwards.
+  - id: agent-seat-read-was-not-a-locking-read
+    where: modules/project/db_agent.go queryOwnedAgentSeatsTx
+    what: |
+      D13 read the departing member's agent seats with a plain SELECT inside the
+      removal transaction.
+    why_it_matters: |
+      The read view opens at the transaction's first statement, so an agent seat
+      committed after that is invisible: the owner leaves, the agent's seat stays
+      active, and nothing revisits it. That is the precise end state D13 exists
+      to prevent, reintroduced by the query meant to prevent it.
+    caught_by: TestNoWriteAuthorisingAggregateIsANonLockingRead
+    fix: "FOR UPDATE OF pm -- locking, and scoped so `robot` (outside the declared lock order) is not locked."
+  - id: collate-applied-between-two-legacy-tables
+    where: modules/project/db_agent.go queryAgentRowsTx
+    what: "An explicit COLLATE on `robot` JOIN `user`, both of which are legacy tables."
+    why_it_matters: |
+      P1's reconcile header states the rule in both directions: crossing the two
+      schemas needs COLLATE, and adding one between two same-collation columns
+      makes the predicate non-sargable, giving up the index for nothing. The
+      first version got the second half wrong.
+    caught_by: "review, prompted by the P1 header; the drift test then confirmed the corrected form"
+    fix: "COLLATE removed there; kept only where octo_project* meets group/group_member/user/robot, always on the driving side's values."
+  - id: roster-join-broke-the-collation-probe
+    where: modules/project/review8_collation_test.go
+    what: "listMembers now LEFT JOINs `robot`, which the drift probe database did not create."
+    why_it_matters: |
+      Not a code defect but a coverage one: without the table the probe failed
+      with "table doesn't exist" instead of the 1267 it asserts, so the drift
+      evidence for the roster query silently stopped being evidence.
+    fix: "`robot` added to collationProbeTables as a legacy table (it is one, created in 2019 with no COLLATE)."
+
+# Scoped out during implementation, with the reason. NOT silently dropped.
+not_delivered:
+  - id: real-provisioner-covered-only-indirectly
+    what: |
+      modules/project's tests drive the all-member group through stand-in hooks,
+      not through modules/group's real provisioner and admitter.
+    why_not: |
+      modules/project must never import modules/group, so the real hooks are not
+      reachable from that package at all. What IS testable there -- and is tested
+      -- is the registry contract: the hook runs after the project transaction
+      commits, and its failure never fails the caller. The group side is covered
+      from modules/group (predicate, owner pick, creator-only create, the four D7
+      refusals, and that construction registers all four hooks).
+    consequence: |
+      No single test drives "create a project and end up with a real group
+      containing real members". That needs a WuKongIM broker, which the group
+      package's own suite already requires and which CI provides; the pieces are
+      covered on both sides of the boundary but the seam is not covered end to
+      end in one case.
+  - id: d7-guard-not-behind-a-tree-walking-source-guard
+    what: |
+      A guard that a NEW group handler mutating membership must consult
+      refuseIfAllMemberGroup.
+    why_not: |
+      The forbidden thing is not a syntactic pattern -- it is "a new handler that
+      changes who is in a group", which no string match identifies. What IS
+      pinned is the inverse and it is the load-bearing half:
+      TestAllMemberGroupProtectionIsNotInTheServiceLayer stops the refusal from
+      being pushed down into the primitives, where it would block the cascades
+      that maintain I2 and I4.
+    consequence: "A future handler added on the four protected shapes has to remember the guard; the I4 reconcile scans are what would report the resulting drift."
+
+# Cannot be verified from here; must be checked before merge.
+open_verification:
+  - "The three items in the brief's 'must check before merge' section: the client
+     blast radius of member_count counting humans only (D16), whether the agent
+     picker already excludes self-hosted agents (D2), and whether any caller
+     depends on the synchronicity of botfather's old raw space_member update (D14)."
+  - "EXPLAIN for the two I4 scans on production-scale `group` / `group_member`.
+     Scan A drives from octo_project by id with a point lookup per row, and scan B
+     from octo_project with the (p.id, pm.uid) row-constructor cursor -- the same
+     shape P1 flagged as needing a real plan for queryI2Page, and for the same
+     reason the plan cannot be produced from CI."
+  - "Index build time for the two new indexes on octo_project at production row
+     counts. Both ADD COLUMNs are INSTANT on MySQL 8.0; the indexes are separate
+     online INPLACE statements whose duration is proportional to row count."
+  - "The 13 failing tests in modules/group, 2 in thread, 10 in integration, 1 in
+     user and 1 in channel are PRE-EXISTING in this environment (no WuKongIM
+     broker) -- verified by running each suite on a stashed clean tree and
+     comparing the failure sets, which matched exactly. They must still be green
+     in CI, which does run a broker."
