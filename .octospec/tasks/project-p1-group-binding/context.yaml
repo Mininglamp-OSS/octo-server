@@ -189,6 +189,36 @@ deferred_until_p0_merges:
       SELECT list raises 1267 just as one in an ON clause does), which is the
       case for having it rather than the comment.
 
+      REQUESTER ASKED (2026-09-07) whether OCTO_PROJECT_RECONCILE_ENABLED can now
+      be removed, on the earlier judgement that a second switch is redundant.
+      Answer: NOT YET, and the reason is measured rather than argued.
+      MEASURED on MySQL 8.0.46, a deliberately drifted schema (legacy tables
+      0900_ai_ci, octo_project* general_ci), 50k space_member / 5k
+      octo_project_member rows, EXPLAIN on P0's I1 statement with COLLATE added:
+        * drifted   -> sm is type ALL, 50118 rows scanned PER EXAMINED ROW;
+        * converged -> sm is type eq_ref on spacemember_spaceid_uid, 1 row.
+      So COLLATE is not a substitute for the flag on P0's scans. The difference
+      from P1's scans is which side DRIVES: P1 drives from the legacy `group`
+      table, so COLLATE lands on the driving row's values and the looked-up
+      octo_project* indexes stay usable; P0 drives from the pinned
+      octo_project_member, so resolving the mismatch forces the comparison to
+      general_ci and kills the legacy index. Writing the legacy collation instead
+      would work while drifted and raise 1267 the moment the conversion lands.
+      Consequences of the three options, so this is not re-derived:
+        1. delete the flag           -> 1267 every tick, gauges never publish,
+                                        the monitor reads as "zero violations" —
+                                        exactly the failure P0 round 5 fixed.
+        2. add COLLATE, then delete  -> no error, but a full scan of space_member
+                                        per examined row: 1000 rows/page, up to
+                                        25 pages/tick, every 5 minutes.
+        3. fold into the Project switch -> rejected by P0's review, for a reason
+                                        that still holds: turning writes off to
+                                        contain a problem is when the invariant
+                                        monitor is most wanted.
+      DECISION: keep it. It should be deleted by whichever change performs the
+      collation conversion, where the deletion is one line and costs nothing.
+      P1 changes nothing here — its own scans already run outside the gate.
+
 # Scoped out during implementation, with the reason. NOT silently dropped.
 not_delivered:
   - id: stale-subscriber-scan
