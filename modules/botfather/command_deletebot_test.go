@@ -3,12 +3,49 @@ package botfather
 import (
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type deleteBotGroupServiceSpy struct {
+	group.IService
+	listed   bool
+	groups   []*group.InfoResp
+	removals []*group.RemoveGroupMembersServiceReq
+}
+
+func (s *deleteBotGroupServiceSpy) GetGroupsWithMemberUIDForLifecycleCleanup(string) ([]*group.InfoResp, error) {
+	s.listed = true
+	return s.groups, nil
+}
+
+func (s *deleteBotGroupServiceSpy) RemoveGroupMembers(req *group.RemoveGroupMembersServiceReq) (*group.RemoveGroupMembersServiceResp, error) {
+	s.removals = append(s.removals, req)
+	return &group.RemoveGroupMembersServiceResp{Removed: 1, RemovedUIDs: append([]string(nil), req.Members...)}, nil
+}
+
+func TestDeleteBotGroupCleanupIncludesProtectedAIContainer(t *testing.T) {
+	spy := &deleteBotGroupServiceSpy{groups: []*group.InfoResp{
+		{GroupNo: "ordinary", Status: group.GroupStatusNormal},
+		{GroupNo: "ai-container", Status: group.GroupStatusNormal, Purpose: aiteam.GroupPurpose},
+		{GroupNo: "disbanded", Status: group.GroupStatusDisband, Purpose: aiteam.GroupPurpose},
+	}}
+	h := &commandHandler{groupService: spy}
+	h.removeBotFromGroups("bot")
+
+	require.True(t, spy.listed)
+	require.Len(t, spy.removals, 2)
+	assert.Equal(t, "ordinary", spy.removals[0].GroupNo)
+	assert.False(t, spy.removals[0].AllowProtected)
+	assert.Equal(t, "ai-container", spy.removals[1].GroupNo)
+	assert.True(t, spy.removals[1].AllowProtected)
+	assert.Equal(t, []string{"bot"}, spy.removals[1].Members)
+}
 
 // TestDeleteBotCleansUpGroupMembers verifies that deleting a bot
 // removes it from all group_member records.

@@ -78,5 +78,8 @@ source: self
   plus retained session channels in WuKongIM before returning ready state.
 - Prevented failed retries from overwriting ready session state and aligned rename
   locking with the agent -> session -> thread order.
+- Separated product-visible group lookup from authoritative Bot lifecycle lookup,
+  so deleting a User Bot also reaches its hidden AI container and is allowed to
+  remove the protected Bot membership through the normal removal funnel.
 - Re-ran build, vet, 52 unit packages, all four API/E2E shards, i18n checks and the
   focused WuKongIM persistence test successfully.

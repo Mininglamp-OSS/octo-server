@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"go.uber.org/zap"
@@ -645,34 +646,7 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	// 一个已知的行为差异：漏斗会静默跳过 role=creator 的成员。若某个 Bot 是某群的
 	// 创建者（正常流程产生不了），它的成员行会留下，由对账扫描报出来，而不是被
 	// 无声删掉。
-	groups, err := h.groupService.GetGroupsWithMemberUID(botID)
-	if err != nil {
-		h.Error("查询Bot所在群失败", zap.Error(err))
-	} else {
-		for _, g := range groups {
-			// 已解散的群跳过，不进漏斗。
-			//
-			// RemoveGroupMembers 对解散群直接返回 "group not found or disbanded"，
-			// 所以不跳过的话，每删一个在解散群里待过的 Bot 就会打出 N 条看起来
-			// 像故障的 Error 日志，而实际什么也做不了。
-			//
-			// 留下那条 group_member 行是**正确的**，不是遗留：群解散本来就只翻
-			// group.status、成员行原样保留（人也一样），解散群不授予任何东西，
-			// 也没有任何接口会去清它。旧代码那条裸 UPDATE 把 Bot 单独清掉，反而
-			// 让 Bot 和人在同一件事上表现不一致。
-			if g.Status == group.GroupStatusDisband {
-				continue
-			}
-			if _, rmErr := h.groupService.RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
-				GroupNo:              g.GroupNo,
-				Members:              []string{botID},
-				OperatorUID:          botID,
-				SuppressRemoveNotice: true,
-			}); rmErr != nil {
-				h.Error("从群移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(rmErr))
-			}
-		}
-	}
+	h.removeBotFromGroups(botID)
 
 	// Remove bot from all Spaces
 	_, err = h.ctx.DB().UpdateBySql(
@@ -717,6 +691,29 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
 	h.replyL(fromUID, MsgBotDeleted, map[string]any{"BotID": botID})
+}
+
+func (h *commandHandler) removeBotFromGroups(botID string) {
+	groups, err := h.groupService.GetGroupsWithMemberUIDForLifecycleCleanup(botID)
+	if err != nil {
+		h.Error("查询Bot所在群失败", zap.Error(err))
+		return
+	}
+	for _, g := range groups {
+		// 已解散的群跳过，不进漏斗。成员行与人类成员保持一致地保留。
+		if g.Status == group.GroupStatusDisband {
+			continue
+		}
+		if _, rmErr := h.groupService.RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
+			GroupNo:              g.GroupNo,
+			Members:              []string{botID},
+			OperatorUID:          botID,
+			SuppressRemoveNotice: true,
+			AllowProtected:       g.Purpose == aiteampkg.GroupPurpose,
+		}); rmErr != nil {
+			h.Error("从群移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(rmErr))
+		}
+	}
 }
 
 func (h *commandHandler) onRevokeConfirm(fromUID string, input string) {

@@ -42,6 +42,12 @@ parent plus all retained thread subscribers in WuKongIM. Provision failures no
 longer downgrade already-ready sessions, and rename follows the agent -> session ->
 thread lock order used by creation.
 
+Bot deletion now uses a lifecycle-only group lookup that includes hidden AI
+containers and opts into protected removal only for those containers. Focused
+`modules/group` and `modules/botfather` tests verify that product-facing group
+lists still hide the parent while the deletion cascade sees and removes it;
+`go build ./...` and `go vet ./...` pass after the interface change.
+
 The E2E/API coverage includes add/remove/re-add, replay and idempotency conflicts,
 concurrent single-parent creation, the exact two-member invariant, missing Space and
 foreign-Bot rejection, ordinary mutation protection, and hiding both AI parent groups

@@ -108,6 +108,9 @@ type IService interface {
 	ActiveMemberGroupNos(uid string) ([]string, error)
 	// GetGroupsWithMemberUID 获取某个用户的所有群
 	GetGroupsWithMemberUID(uid string) ([]*InfoResp, error)
+	// GetGroupsWithMemberUIDForLifecycleCleanup returns every active membership,
+	// including server-managed containers hidden from product-facing lists.
+	GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*InfoResp, error)
 	// 获取指定群的群成员的最大数据版本
 	GetGroupMemberMaxVersion(groupNo string) (int64, error)
 	// 获取用户所有超级群信息
@@ -230,6 +233,15 @@ func (s *Service) AddGroup(model *AddGroupReq) error {
 
 func (s *Service) GetGroupsWithMemberUID(uid string) ([]*InfoResp, error) {
 	groups, err := s.db.queryGroupsWithMemberUID(uid)
+	return groupModelsToInfo(groups, err)
+}
+
+func (s *Service) GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*InfoResp, error) {
+	groups, err := s.db.queryAllGroupsWithMemberUID(uid)
+	return groupModelsToInfo(groups, err)
+}
+
+func groupModelsToInfo(groups []*Model, err error) ([]*InfoResp, error) {
 	if err != nil {
 		return nil, err
 	}

@@ -769,6 +769,17 @@ func (d *DB) queryAllGroupsWithMemberUIDAndSpaceID(memberUID string, spaceID str
 	return models, err
 }
 
+// queryAllGroupsWithMemberUID is reserved for authoritative account/Bot
+// lifecycle cleanup. Product-facing lists must keep using the filtered query.
+func (d *DB) queryAllGroupsWithMemberUID(memberUID string) ([]*Model, error) {
+	var models []*Model
+	_, err := d.session.Select("distinct `group`.*").From("`group`").
+		LeftJoin("group_member", "`group`.group_no=group_member.group_no").
+		Where("group_member.uid=? and group_member.is_deleted=0", memberUID).
+		Load(&models)
+	return models, err
+}
+
 // 查询某个用户参与的所有群
 func (d *DB) queryGroupsWithMemberUID(memberUID string) ([]*Model, error) {
 	var models []*Model

@@ -2432,5 +2432,7 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   query-plan regression.
 - Closed org-sync membership mutation and Space-cleanup rejoin gaps for AI
   containers, including parent/thread WuKongIM subscriber reconciliation.
+- Added a lifecycle-only group lookup so User Bot deletion cannot strand a hidden
+  AI-container membership or its WuKongIM subscription.
 - Hardened provisioning state transitions and session rename lock ordering.
 - Re-ran build, vet, unit, all four API/E2E shards, i18n and focused WuKongIM gates.
