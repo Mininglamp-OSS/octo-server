@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -216,6 +217,57 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	}
 	decodeJSON(t, w, &restored)
 	assert.Equal(t, session1.GroupNo, restored.GroupNo)
+
+	// Model the authoritative Space-removal aftermath: the owner and their Bot
+	// have been soft-removed from the parent while the durable agent/session rows
+	// remain. Re-adding the Space seat and AI must repair both DB membership and
+	// every existing WuKongIM channel before returning the historical session.
+	_, err = testContext.DB().Update("space_member").Set("status", 0).
+		Where("space_id=? AND uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().Update("group_member").Set("is_deleted", 1).
+		Where("group_no=? AND uid IN ?", session1.GroupNo, []string{f.uid, f.botID}).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().Update("space_member").Set("status", 1).
+		Where("space_id=? AND uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	var reprovisioned []config.ChannelCreateReq
+	imStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" {
+			body, _ := io.ReadAll(r.Body)
+			var call config.ChannelCreateReq
+			_ = json.Unmarshal(body, &call)
+			mu.Lock()
+			reprovisioned = append(reprovisioned, call)
+			mu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer imStub.Close()
+	previousIMURL := testContext.GetConfig().WuKongIM.APIURL
+	testContext.GetConfig().WuKongIM.APIURL = imStub.URL
+	defer func() { testContext.GetConfig().WuKongIM.APIURL = previousIMURL }()
+
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var activeUIDs []string
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", session1.GroupNo).OrderBy("uid").Load(&activeUIDs)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.botID, f.uid}, activeUIDs)
+	w = request(t, f, http.MethodGet, "/v1/ai-team/sessions/"+session1.SessionID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	mu.Lock()
+	channels := make(map[string][]string, len(reprovisioned))
+	for _, call := range reprovisioned {
+		channels[call.ChannelID] = append([]string(nil), call.Subscribers...)
+	}
+	mu.Unlock()
+	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.GroupNo])
+	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.ChannelID])
 }
 
 func TestAITeamConcurrentInitializationUsesOneParent(t *testing.T) {
@@ -499,12 +551,15 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	// deliberate: a same-collation CI database cannot catch MySQL error 1267.
 	for _, ddl := range []string{
 		`CREATE TABLE system_setting (category VARCHAR(64), key_name VARCHAR(128), value TEXT, value_type VARCHAR(16), description VARCHAR(255), UNIQUE KEY uk_category_key(category,key_name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		`CREATE TABLE robot (robot_id VARCHAR(40), creator_uid VARCHAR(40), status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		`CREATE TABLE user (uid VARCHAR(40), name VARCHAR(100), status TINYINT, is_destroy TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		`CREATE TABLE space (space_id VARCHAR(40), status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		`CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		"CREATE TABLE `group` (group_no VARCHAR(40), purpose VARCHAR(32), status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-		`CREATE TABLE thread (short_id VARCHAR(32), group_no VARCHAR(40), name VARCHAR(100), status TINYINT, message_count BIGINT DEFAULT 0, last_message_content TEXT, last_message_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status TINYINT, KEY idx_robot_creator(creator_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		`CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(100), status TINYINT, is_destroy TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		`CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		`CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status TINYINT, UNIQUE KEY uk_space_member(space_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		"CREATE TABLE `group` (group_no VARCHAR(40) PRIMARY KEY, creator VARCHAR(40), space_id VARCHAR(40), project_id VARCHAR(40) NOT NULL DEFAULT '', purpose VARCHAR(32), status TINYINT, KEY idx_group_purpose(purpose)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		`CREATE TABLE group_member (group_no VARCHAR(40), uid VARCHAR(40), remark VARCHAR(100) NOT NULL DEFAULT '', role TINYINT, version BIGINT, status TINYINT, vercode VARCHAR(80), is_deleted TINYINT NOT NULL DEFAULT 0, invite_uid VARCHAR(40), robot TINYINT, bot_admin TINYINT NOT NULL DEFAULT 0, forbidden_expir_time BIGINT NOT NULL DEFAULT 0, is_external TINYINT NOT NULL DEFAULT 0, source_space_id VARCHAR(40) NOT NULL DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY uk_group_member(group_no,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		`CREATE TABLE thread (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, short_id VARCHAR(32), group_no VARCHAR(40), name VARCHAR(100), status TINYINT, message_count BIGINT DEFAULT 0, last_message_content TEXT, last_message_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uk_thread_short(short_id), KEY idx_thread_group(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE thread_setting (group_no VARCHAR(40), short_id VARCHAR(32), uid VARCHAR(40), mute TINYINT NOT NULL DEFAULT 0, UNIQUE KEY uk_thread_setting(group_no,short_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE user_pinned_channel (uid VARCHAR(40), space_id VARCHAR(40), channel_id VARCHAR(80), channel_type TINYINT, UNIQUE KEY uk_pinned(uid,space_id,channel_id,channel_type)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
 	} {
 		_, err = db.Exec(ddl)
 		require.NoError(t, err)
@@ -516,8 +571,9 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 		INSERT INTO robot(robot_id,creator_uid,status) VALUES ('bot','human',1);
 		INSERT INTO space(space_id,status) VALUES ('space',1);
 		INSERT INTO space_member(space_id,uid,status) VALUES ('space','human',1),('space','bot',1);
-		INSERT INTO ` + "`group`" + `(group_no,purpose,status) VALUES ('parent','ai_session_container',1);
-		INSERT INTO thread(short_id,group_no,name,status) VALUES ('session','parent','Session',1);
+		INSERT INTO ` + "`group`" + `(group_no,creator,space_id,purpose,status) VALUES ('parent','human','space','ai_session_container',1);
+		INSERT INTO group_member(group_no,uid,role,version,status,vercode,invite_uid,robot) VALUES ('parent','human',1,1,1,'human@1','human',0),('parent','bot',0,2,1,'bot@1','human',1);
+		INSERT INTO thread(short_id,group_no,name,status,last_message_content) VALUES ('session','parent','Session',1,'');
 		INSERT INTO ai_team_agent(space_id,user_uid,bot_id,group_no,is_added,container_state) VALUES ('space','human','bot','parent',1,2);
 		INSERT INTO ai_team_session(agent_id,short_id,idempotency_key,request_hash,state) SELECT id,'session','key','hash',2 FROM ai_team_agent;`)
 	require.NoError(t, err)
@@ -530,14 +586,40 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	require.NotNil(t, target)
 	assert.Equal(t, "bot", target.BotID)
 
-	// Exercise the same collation-pinned join family used by getAgent/ListAgents/GetSession.
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM ai_team_agent a
-		JOIN robot r ON r.robot_id COLLATE utf8mb4_general_ci=a.bot_id AND r.creator_uid COLLATE utf8mb4_general_ci=a.user_uid
-		JOIN user u ON u.uid COLLATE utf8mb4_general_ci=a.bot_id
-		JOIN space sp ON sp.space_id COLLATE utf8mb4_general_ci=a.space_id
-		JOIN space_member sm ON sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND sm.uid COLLATE utf8mb4_general_ci=a.user_uid`).Scan(&count))
-	assert.Equal(t, 1, count)
+	// Exercise the shipped service query families rather than a test-owned copy.
+	cfg := config.New()
+	cfg.DB.MySQLAddr = dsn
+	cfg.DB.Migration = false
+	ctx := config.NewContext(cfg)
+	t.Cleanup(func() { _ = ctx.DB().Close() })
+	svc := aiteammod.NewService(ctx)
+	agent, err := svc.AddAgent("space", "human", "bot")
+	require.NoError(t, err)
+	assert.Equal(t, "parent", agent.GroupNo)
+	agents, err := svc.ListAgents("space", "human", 0, 20)
+	require.NoError(t, err)
+	require.Len(t, agents.Items, 1)
+	gotSession, err := svc.GetSession("space", "human", "session")
+	require.NoError(t, err)
+	assert.Equal(t, "parent____session", gotSession.ChannelID)
+
+	// The pin belongs on the new AI-table operand. With indexed legacy tables,
+	// that keeps every identity/Space lookup on const/ref access instead of a
+	// deployment-sized full scan on the synchronous message path.
+	var plan string
+	require.NoError(t, db.QueryRow(`EXPLAIN FORMAT=JSON SELECT a.id
+		FROM ai_team_agent a
+		JOIN ai_team_session s ON s.agent_id=a.id AND s.state=2
+		JOIN thread t ON t.short_id=s.short_id AND t.group_no=a.group_no AND t.status<>3
+		JOIN `+"`group`"+` g ON g.group_no=a.group_no COLLATE utf8mb4_0900_ai_ci AND g.purpose='ai_session_container' AND g.status=1
+		JOIN robot r ON r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci
+		JOIN user human_u ON human_u.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_u.status=1 AND human_u.is_destroy<>2
+		JOIN user bot_u ON bot_u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_u.status=1 AND bot_u.is_destroy<>2
+		JOIN space sp ON sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1
+		JOIN space_member human_sm ON human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1
+		JOIN space_member bot_sm ON bot_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.status=1
+		WHERE a.group_no='parent' AND s.short_id='session' AND a.user_uid='human'`).Scan(&plan))
+	assert.NotContains(t, plan, `"access_type": "ALL"`, plan)
 }
 
 func TestAITeamHandlersUseLocalizedErrors(t *testing.T) {

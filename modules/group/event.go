@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"go.uber.org/zap"
 )
 
@@ -444,8 +445,13 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 	realList := make([]*config.OrgOrDeptEmployeeVO, 0)
 	for _, m := range req.Members {
 		isAdd := false
-		for _, g := range groups {
-			if m.GroupNo == g.GroupNo {
+		for _, groupModel := range groups {
+			if m.GroupNo == groupModel.GroupNo {
+				if groupModel.Purpose == aiteampkg.GroupPurpose {
+					g.Warn("组织成员同步不能修改 AI 会话容器",
+						zap.String("group_no", m.GroupNo), zap.String("uid", m.EmployeeUid), zap.String("action", m.Action))
+					break
+				}
 				isAdd = true
 				break
 			}

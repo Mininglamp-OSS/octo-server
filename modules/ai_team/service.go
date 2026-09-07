@@ -24,6 +24,12 @@ type Service struct {
 	log.Log
 }
 
+type lockedAgent struct {
+	ID             int64  `db:"id"`
+	GroupNo        string `db:"group_no"`
+	ContainerState int    `db:"container_state"`
+}
+
 func NewService(ctx *config.Context) *Service {
 	return &Service{ctx: ctx, threadService: thread.NewService(ctx), Log: log.NewTLog("AITeamService")}
 }
@@ -71,12 +77,67 @@ func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
 	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
 		return nil, err
 	}
-	_, err := s.ctx.DB().InsertBySql(`
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(tx, spaceID, userUID, botID); err != nil {
+		return nil, err
+	}
+	_, err = tx.InsertBySql(`
 		INSERT INTO ai_team_agent (space_id,user_uid,bot_id,is_added)
 		VALUES (?,?,?,1)
 		ON DUPLICATE KEY UPDATE is_added=1, updated_at=CURRENT_TIMESTAMP`, spaceID, userUID, botID).Exec()
 	if err != nil {
 		return nil, err
+	}
+	var agent *lockedAgent
+	_, err = tx.SelectBySql(`SELECT id,IFNULL(group_no,'') AS group_no,container_state FROM ai_team_agent
+		WHERE space_id=? AND user_uid=? AND bot_id=? FOR UPDATE`, spaceID, userUID, botID).Load(&agent)
+	if err != nil {
+		return nil, err
+	}
+	if agent == nil {
+		return nil, errNotFound
+	}
+
+	containerNeedsReconcile := false
+	if agent.GroupNo != "" {
+		repaired, repairErr := s.admitContainerMembersTx(tx, agent.GroupNo, spaceID, userUID, botID)
+		if repairErr != nil {
+			return nil, repairErr
+		}
+		containerNeedsReconcile = repaired || agent.ContainerState != containerReady
+		if containerNeedsReconcile {
+			if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	if containerNeedsReconcile {
+		if err = s.ensureContainerIMReady(agent.ID, agent.GroupNo, userUID, botID); err != nil {
+			s.markContainerFailure(agent.ID, err)
+			return nil, fmt.Errorf("%w: reconcile IM channels: %v", errIMUnavailable, err)
+		}
+		readyTx, beginErr := s.ctx.DB().Begin()
+		if beginErr != nil {
+			return nil, beginErr
+		}
+		defer readyTx.RollbackUnlessCommitted()
+		if err = validateAuthorityTx(readyTx, spaceID, userUID, botID); err != nil {
+			s.markContainerFailure(agent.ID, err)
+			return nil, err
+		}
+		if _, err = readyTx.Update("ai_team_agent").Set("container_state", containerReady).Where("id=?", agent.ID).Exec(); err != nil {
+			return nil, err
+		}
+		if err = readyTx.Commit(); err != nil {
+			return nil, err
+		}
 	}
 	return s.getAgent(spaceID, userUID, botID, false)
 }
@@ -85,13 +146,13 @@ func (s *Service) RemoveAgent(spaceID, userUID, botID string) error {
 	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
 		return err
 	}
-	result, err := s.ctx.DB().Update("ai_team_agent").Set("is_added", 0).
+	if _, err := s.getAgent(spaceID, userUID, botID, false); err != nil {
+		return err
+	}
+	_, err := s.ctx.DB().Update("ai_team_agent").Set("is_added", 0).
 		Where("space_id=? AND user_uid=? AND bot_id=?", spaceID, userUID, botID).Exec()
 	if err != nil {
 		return err
-	}
-	if n, _ := result.RowsAffected(); n == 0 {
-		return errNotFound
 	}
 	return nil
 }
@@ -100,13 +161,13 @@ func (s *Service) getAgent(spaceID, userUID, botID string, requireAdded bool) (*
 	q := s.ctx.DB().Select(
 		"a.id", "a.space_id", "a.user_uid", "a.bot_id", "u.name AS bot_name",
 		"IFNULL(a.group_no,'') AS group_no", "a.is_added", "a.container_state", "a.created_at", "a.updated_at",
-		"(SELECT COUNT(*) FROM ai_team_session ats2 JOIN thread t2 ON t2.short_id=ats2.short_id WHERE ats2.agent_id=a.id AND ats2.state=2 AND t2.status<>3) AS session_count",
+		"(SELECT COUNT(*) FROM ai_team_session ats2 JOIN thread t2 ON t2.short_id=ats2.short_id AND t2.group_no=a.group_no WHERE ats2.agent_id=a.id AND ats2.state=2 AND t2.status<>3) AS session_count",
 	).From(dbr.I("ai_team_agent").As("a")).
-		Join(dbr.I("robot").As("r"), "r.robot_id COLLATE utf8mb4_general_ci=a.bot_id AND r.status=1 AND r.creator_uid COLLATE utf8mb4_general_ci=a.user_uid").
-		Join(dbr.I("user").As("u"), "u.uid COLLATE utf8mb4_general_ci=a.bot_id AND u.status=1 AND u.is_destroy<>2").
-		Join(dbr.I("space").As("sp"), "sp.space_id COLLATE utf8mb4_general_ci=a.space_id AND sp.status=1").
-		Join(dbr.I("space_member").As("human_sm"), "human_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND human_sm.uid COLLATE utf8mb4_general_ci=a.user_uid AND human_sm.status=1").
-		Join(dbr.I("space_member").As("bot_sm"), "bot_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND bot_sm.uid COLLATE utf8mb4_general_ci=a.bot_id AND bot_sm.status=1").
+		Join(dbr.I("robot").As("r"), "r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci").
+		Join(dbr.I("user").As("u"), "u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND u.status=1 AND u.is_destroy<>2").
+		Join(dbr.I("space").As("sp"), "sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1").
+		Join(dbr.I("space_member").As("human_sm"), "human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1").
+		Join(dbr.I("space_member").As("bot_sm"), "bot_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.status=1").
 		Where("a.space_id=? AND a.user_uid=? AND a.bot_id=?", spaceID, userUID, botID)
 	if requireAdded {
 		q = q.Where("a.is_added=1")
@@ -129,13 +190,13 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	q := s.ctx.DB().Select(
 		"a.id", "a.space_id", "a.user_uid", "a.bot_id", "u.name AS bot_name",
 		"IFNULL(a.group_no,'') AS group_no", "a.is_added", "a.container_state", "a.created_at", "a.updated_at",
-		"(SELECT COUNT(*) FROM ai_team_session ats2 JOIN thread t2 ON t2.short_id=ats2.short_id WHERE ats2.agent_id=a.id AND ats2.state=2 AND t2.status<>3) AS session_count",
+		"(SELECT COUNT(*) FROM ai_team_session ats2 JOIN thread t2 ON t2.short_id=ats2.short_id AND t2.group_no=a.group_no WHERE ats2.agent_id=a.id AND ats2.state=2 AND t2.status<>3) AS session_count",
 	).From(dbr.I("ai_team_agent").As("a")).
-		Join(dbr.I("robot").As("r"), "r.robot_id COLLATE utf8mb4_general_ci=a.bot_id AND r.status=1 AND r.creator_uid COLLATE utf8mb4_general_ci=a.user_uid").
-		Join(dbr.I("user").As("u"), "u.uid COLLATE utf8mb4_general_ci=a.bot_id AND u.status=1 AND u.is_destroy<>2").
-		Join(dbr.I("space").As("sp"), "sp.space_id COLLATE utf8mb4_general_ci=a.space_id AND sp.status=1").
-		Join(dbr.I("space_member").As("human_sm"), "human_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND human_sm.uid COLLATE utf8mb4_general_ci=a.user_uid AND human_sm.status=1").
-		Join(dbr.I("space_member").As("bot_sm"), "bot_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND bot_sm.uid COLLATE utf8mb4_general_ci=a.bot_id AND bot_sm.status=1").
+		Join(dbr.I("robot").As("r"), "r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci").
+		Join(dbr.I("user").As("u"), "u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND u.status=1 AND u.is_destroy<>2").
+		Join(dbr.I("space").As("sp"), "sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1").
+		Join(dbr.I("space_member").As("human_sm"), "human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1").
+		Join(dbr.I("space_member").As("bot_sm"), "bot_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.status=1").
 		Where("a.space_id=? AND a.user_uid=? AND a.is_added=1", spaceID, userUID).
 		OrderDesc("a.id").Limit(uint64(limit + 1))
 	if beforeID > 0 {
@@ -159,6 +220,10 @@ func sessionRequestHash(name string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func (s *Service) admitContainerMembersTx(tx *dbr.Tx, groupNo, spaceID, userUID, botID string) (bool, error) {
+	return group.AdmitAITeamContainerMembersTx(s.ctx, tx, groupNo, spaceID, userUID, botID)
+}
+
 func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name string) (*Session, error) {
 	botName, err := s.validateAuthority(spaceID, userUID, botID)
 	if err != nil {
@@ -179,12 +244,8 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		return nil, err
 	}
 
-	type lockedAgent struct {
-		ID      int64  `db:"id"`
-		GroupNo string `db:"group_no"`
-	}
 	var agent *lockedAgent
-	_, err = tx.SelectBySql(`SELECT id,IFNULL(group_no,'') AS group_no FROM ai_team_agent
+	_, err = tx.SelectBySql(`SELECT id,IFNULL(group_no,'') AS group_no,container_state FROM ai_team_agent
 		WHERE space_id=? AND user_uid=? AND bot_id=? AND is_added=1 FOR UPDATE`, spaceID, userUID, botID).Load(&agent)
 	if err != nil {
 		return nil, err
@@ -213,21 +274,20 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		if err != nil {
 			return nil, err
 		}
-		ownerMemberVersion, genErr := s.ctx.GenSeq(common.GroupMemberSeqKey)
-		if genErr != nil {
-			return nil, genErr
-		}
-		botMemberVersion, genErr := s.ctx.GenSeq(common.GroupMemberSeqKey)
-		if genErr != nil {
-			return nil, genErr
-		}
-		if err = group.AdmitAITeamContainerMembersTx(
-			s.ctx, tx, groupNo, spaceID, userUID, botID, ownerMemberVersion, botMemberVersion,
-		); err != nil {
-			return nil, err
-		}
 		_, err = tx.Update("ai_team_agent").Set("group_no", groupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec()
 		if err != nil {
+			return nil, err
+		}
+		agent.ContainerState = containerProvisioning
+	}
+
+	membershipRepaired, err := s.admitContainerMembersTx(tx, groupNo, spaceID, userUID, botID)
+	if err != nil {
+		return nil, err
+	}
+	containerNeedsReconcile := agent.ContainerState != containerReady || membershipRepaired
+	if membershipRepaired && agent.ContainerState == containerReady {
+		if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
 			return nil, err
 		}
 	}
@@ -278,8 +338,13 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		return nil, err
 	}
 
-	if existing.State != sessionReady {
-		if err = s.ensureIMReady(groupNo, existing.ShortID, userUID, botID); err != nil {
+	if existing.State != sessionReady || containerNeedsReconcile {
+		if containerNeedsReconcile {
+			err = s.ensureContainerIMReady(agent.ID, groupNo, userUID, botID)
+		} else {
+			err = s.ensureIMReady(groupNo, existing.ShortID, userUID, botID)
+		}
+		if err != nil {
 			s.markProvisionFailure(agent.ID, existing.ShortID, err)
 			return nil, fmt.Errorf("%w: provision IM channels: %v", errIMUnavailable, err)
 		}
@@ -312,17 +377,46 @@ func (s *Service) ensureIMReady(groupNo, shortID, userUID, botID string) error {
 	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers})
 }
 
+func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID string) error {
+	subscribers := []string{userUID, botID}
+	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
+	}); err != nil {
+		return err
+	}
+	var shortIDs []string
+	_, err := s.ctx.DB().SelectBySql(`SELECT ats.short_id FROM ai_team_session ats
+		JOIN thread t ON t.short_id=ats.short_id AND t.group_no=? AND t.status<>3
+		WHERE ats.agent_id=?`, groupNo, agentID).Load(&shortIDs)
+	if err != nil {
+		return err
+	}
+	for _, shortID := range shortIDs {
+		if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+			ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) markProvisionFailure(agentID int64, shortID string, cause error) {
 	reason := cause.Error()
 	if runes := []rune(reason); len(runes) > 255 {
 		reason = string(runes[:255])
 	}
-	if _, err := s.ctx.DB().Update("ai_team_session").Set("state", sessionFailed).Set("last_error", reason).Where("agent_id=? AND short_id=?", agentID, shortID).Exec(); err != nil {
+	if _, err := s.ctx.DB().Update("ai_team_session").Set("state", sessionFailed).Set("last_error", reason).
+		Where("agent_id=? AND short_id=? AND state=?", agentID, shortID, sessionProvisioning).Exec(); err != nil {
 		s.Error("mark AI session provisioning failure", zap.Error(err), zap.String("short_id", shortID))
 	}
+	s.markContainerFailure(agentID, cause)
+}
+
+func (s *Service) markContainerFailure(agentID int64, cause error) {
 	if _, err := s.ctx.DB().Update("ai_team_agent").Set("container_state", containerFailed).
 		Where("id=? AND container_state<>?", agentID, containerReady).Exec(); err != nil {
-		s.Error("mark AI container provisioning failure", zap.Error(err), zap.Int64("agent_id", agentID))
+		s.Error("mark AI container provisioning failure", zap.Error(err), zap.Int64("agent_id", agentID), zap.NamedError("cause", cause))
 	}
 }
 
@@ -340,12 +434,12 @@ func (s *Service) GetSession(spaceID, userUID, shortID string) (*Session, error)
 		JOIN ai_team_agent a ON a.id=ats.agent_id
 		JOIN thread t ON t.short_id=ats.short_id AND t.group_no=a.group_no
 		LEFT JOIN thread_setting ts ON ts.group_no=t.group_no AND ts.short_id=t.short_id AND ts.uid=a.user_uid
-		JOIN robot r ON r.robot_id COLLATE utf8mb4_general_ci=a.bot_id AND r.status=1 AND r.creator_uid COLLATE utf8mb4_general_ci=a.user_uid
-		JOIN user bot_u ON bot_u.uid COLLATE utf8mb4_general_ci=a.bot_id AND bot_u.status=1 AND bot_u.is_destroy<>2
-		JOIN user human_u ON human_u.uid COLLATE utf8mb4_general_ci=a.user_uid AND human_u.status=1 AND human_u.is_destroy<>2
-		JOIN space sp ON sp.space_id COLLATE utf8mb4_general_ci=a.space_id AND sp.status=1
-		JOIN space_member human_sm ON human_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND human_sm.uid COLLATE utf8mb4_general_ci=a.user_uid AND human_sm.status=1
-		JOIN space_member bot_sm ON bot_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND bot_sm.uid COLLATE utf8mb4_general_ci=a.bot_id AND bot_sm.status=1
+		JOIN robot r ON r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci
+		JOIN user bot_u ON bot_u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_u.status=1 AND bot_u.is_destroy<>2
+		JOIN user human_u ON human_u.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_u.status=1 AND human_u.is_destroy<>2
+		JOIN space sp ON sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1
+		JOIN space_member human_sm ON human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1
+		JOIN space_member bot_sm ON bot_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.status=1
 		WHERE a.space_id=? AND a.user_uid=? AND ats.short_id=? AND ats.state=2 AND t.status<>3 LIMIT 1`,
 		common.ChannelTypeCommunityTopic.Uint8(), spaceID, userUID, shortID).Load(&out)
 	if err != nil {
@@ -377,7 +471,7 @@ func (s *Service) ListSessions(spaceID, userUID, botID string, statuses []int, p
 		"t.group_no", "t.name", "t.status", "t.message_count", "t.last_message_content",
 		"t.last_message_at", "t.created_at", "t.updated_at",
 		"IFNULL(ts.mute,0) AS mute",
-		"EXISTS(SELECT 1 FROM user_pinned_channel upc WHERE upc.uid=a.user_uid AND upc.space_id=a.space_id AND upc.channel_id=CONCAT(t.group_no,'____',t.short_id) AND upc.channel_type=5) AS is_pinned",
+		fmt.Sprintf("EXISTS(SELECT 1 FROM user_pinned_channel upc WHERE upc.uid=a.user_uid AND upc.space_id=a.space_id AND upc.channel_id=CONCAT(t.group_no,'____',t.short_id) AND upc.channel_type=%d) AS is_pinned", common.ChannelTypeCommunityTopic.Uint8()),
 	).From(dbr.I("ai_team_session").As("ats")).
 		Join(dbr.I("ai_team_agent").As("a"), "a.id=ats.agent_id").
 		Join(dbr.I("thread").As("t"), "t.short_id=ats.short_id AND t.group_no=a.group_no").
@@ -385,7 +479,7 @@ func (s *Service) ListSessions(spaceID, userUID, botID string, statuses []int, p
 		Where("a.space_id=? AND a.user_uid=? AND a.bot_id=? AND a.is_added=1", spaceID, userUID, botID).
 		Where("ats.state=2 AND t.status IN ?", statuses).
 		OrderBy("is_pinned DESC,COALESCE(t.last_message_at,t.created_at) DESC,t.id DESC").
-		Limit(uint64(pageSize + 1)).Offset(uint64((pageIndex - 1) * pageSize)).Load(&rows)
+		Limit(uint64(pageSize + 1)).Offset(uint64(pageIndex-1) * uint64(pageSize)).Load(&rows)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +495,8 @@ func (s *Service) ListSessions(spaceID, userUID, botID string, statuses []int, p
 }
 
 func (s *Service) RenameSession(spaceID, userUID, shortID, name string) error {
-	if _, err := s.GetSession(spaceID, userUID, shortID); err != nil {
+	current, err := s.GetSession(spaceID, userUID, shortID)
+	if err != nil {
 		return err
 	}
 	tx, err := s.ctx.DB().Begin()
@@ -409,16 +504,38 @@ func (s *Service) RenameSession(spaceID, userUID, shortID, name string) error {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
-	result, err := tx.UpdateBySql(`UPDATE thread t JOIN ai_team_session ats ON ats.short_id=t.short_id
-		JOIN ai_team_agent a ON a.id=ats.agent_id SET t.name=?
-		WHERE a.space_id=? AND a.user_uid=? AND t.short_id=? AND t.status<>3`, name, spaceID, userUID, shortID).Exec()
+	var groupNo string
+	count, err := tx.SelectBySql(`SELECT IFNULL(group_no,'') FROM ai_team_agent
+		WHERE id=? AND space_id=? AND user_uid=? FOR UPDATE`, current.AgentID, spaceID, userUID).Load(&groupNo)
 	if err != nil {
 		return err
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
+	if count != 1 || groupNo == "" {
 		return errNotFound
 	}
-	if _, err = tx.Update("ai_team_session").Set("manual_title", 1).Where("short_id=?", shortID).Exec(); err != nil {
+	var sessionID int64
+	count, err = tx.SelectBySql(`SELECT id FROM ai_team_session
+		WHERE id=? AND agent_id=? AND short_id=? AND state=? FOR UPDATE`,
+		current.ID, current.AgentID, shortID, sessionReady).Load(&sessionID)
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return errNotFound
+	}
+	var threadID int64
+	count, err = tx.SelectBySql(`SELECT id FROM thread
+		WHERE group_no=? AND short_id=? AND status<>3 FOR UPDATE`, groupNo, shortID).Load(&threadID)
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return errNotFound
+	}
+	if _, err = tx.Update("thread").Set("name", name).Where("id=?", threadID).Exec(); err != nil {
+		return err
+	}
+	if _, err = tx.Update("ai_team_session").Set("manual_title", 1).Where("id=?", sessionID).Exec(); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -276,8 +276,13 @@ type MemberAdmission struct {
 	SourceSpaceID string
 }
 
+type aiTeamActiveMember struct {
+	UID    string `db:"uid"`
+	Status int    `db:"status"`
+}
+
 // AdmitAITeamContainerMembersTx is the narrow admission bridge used while an
-// AI-team container is created. AI-team provisioning owns the surrounding
+// AI-team container is created or repaired. AI-team provisioning owns the surrounding
 // transaction, so calling the public AddGroupMembers service would break the
 // atomic group/association/session write. Keeping the write here still routes
 // it through the single admission primitive introduced for project isolation.
@@ -289,10 +294,9 @@ func AdmitAITeamContainerMembersTx(
 	ctx *config.Context,
 	tx *dbr.Tx,
 	groupNo, spaceID, ownerUID, botUID string,
-	ownerVersion, botVersion int64,
-) error {
+) (bool, error) {
 	if groupNo == "" || spaceID == "" || ownerUID == "" || botUID == "" || ownerUID == botUID {
-		return errors.New("group: invalid AI-team container admission")
+		return false, errors.New("group: invalid AI-team container admission")
 	}
 
 	var parent struct {
@@ -306,14 +310,34 @@ func AdmitAITeamContainerMembersTx(
 		groupNo,
 	).Load(&parent)
 	if err != nil {
-		return fmt.Errorf("group: query AI-team container for admission: %w", err)
+		return false, fmt.Errorf("group: query AI-team container for admission: %w", err)
 	}
 	if count != 1 || parent.SpaceID != spaceID || parent.Creator != ownerUID ||
 		parent.Purpose != aiteampkg.GroupPurpose || parent.ProjectID != "" {
-		return errors.New("group: AI-team container admission target mismatch")
+		return false, errors.New("group: AI-team container admission target mismatch")
 	}
 
-	return NewDB(ctx).admitOrRestoreMembersTx(tx, groupNo, spaceID, "", []MemberAdmission{
+	var before []*aiTeamActiveMember
+	if _, err = tx.SelectBySql(
+		"SELECT uid,status FROM group_member WHERE group_no=? AND is_deleted=0 FOR UPDATE",
+		groupNo,
+	).Load(&before); err != nil {
+		return false, fmt.Errorf("group: lock AI-team container members: %w", err)
+	}
+	wasComplete := hasExactAITeamMembers(before, ownerUID, botUID)
+	if wasComplete {
+		return false, nil
+	}
+	ownerVersion, err := ctx.GenSeq(common.GroupMemberSeqKey)
+	if err != nil {
+		return false, err
+	}
+	botVersion, err := ctx.GenSeq(common.GroupMemberSeqKey)
+	if err != nil {
+		return false, err
+	}
+
+	if err = NewDB(ctx).admitOrRestoreMembersTx(tx, groupNo, spaceID, "", []MemberAdmission{
 		{
 			UID:       ownerUID,
 			Version:   ownerVersion,
@@ -327,7 +351,42 @@ func AdmitAITeamContainerMembersTx(
 			InviteUID: ownerUID,
 			Robot:     1,
 		},
-	}, AdmissionEntryCreateGroup)
+	}, AdmissionEntryCreateGroup); err != nil {
+		return false, err
+	}
+
+	var after []*aiTeamActiveMember
+	if _, err = tx.SelectBySql(
+		"SELECT uid,status FROM group_member WHERE group_no=? AND is_deleted=0 FOR UPDATE",
+		groupNo,
+	).Load(&after); err != nil {
+		return false, fmt.Errorf("group: verify AI-team container members: %w", err)
+	}
+	if !hasExactAITeamMembers(after, ownerUID, botUID) {
+		return false, errors.New("group: AI-team container must contain exactly its owner and Bot")
+	}
+	return true, nil
+}
+
+func hasExactAITeamMembers(members []*aiTeamActiveMember, ownerUID, botUID string) bool {
+	if len(members) != 2 {
+		return false
+	}
+	foundOwner, foundBot := false, false
+	for _, member := range members {
+		if member.Status != int(common.GroupMemberStatusNormal) {
+			return false
+		}
+		switch member.UID {
+		case ownerUID:
+			foundOwner = true
+		case botUID:
+			foundBot = true
+		default:
+			return false
+		}
+	}
+	return foundOwner && foundBot
 }
 
 // admitOrRestoreMembersTx is the single admission entry. Every path that adds a

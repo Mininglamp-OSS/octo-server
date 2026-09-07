@@ -22,6 +22,26 @@ Date: 2026-09-07
 | i18n lint | `make i18n-lint` | PASS |
 | WuKongIM persistence | `go test -tags pilote2e ./pilote2e -run '^TestSummaryCard_DispatchesAndPersistsInWuKongIM$'` | PASS — type-17 message read back from WuKongIM |
 
+## Final review-blocker verification
+
+After the last review round, the full gate was rerun against the updated worktree:
+
+- `go build ./...` and `go vet ./...`: PASS.
+- `ci/run-unit-tests.sh`: PASS — 52 unit packages.
+- `MYSQL_CID=f34198f7a4f4 REDIS_CID=847a5f034ed2 ci/run-e2e-shard.sh <1..4> 4`: PASS — all four API/E2E shards, including `group`, `ai_team`, `thread`, and `space`.
+- `go test -count=1 ./modules/ai_team` on a freshly recreated database: PASS.
+- `go test -count=1 -tags pilote2e ./pilote2e -run '^TestSummaryCard_DispatchesAndPersistsInWuKongIM$'`: PASS.
+- `make i18n-extract-check`, `make i18n-lint`, and `git diff --check`: PASS.
+
+The review fixes keep collation conversion on the new AI-table operands so indexed
+legacy identity/Space columns remain sargable; a production-shape fixture now runs
+the shipped service queries and asserts the hot routing plan contains no full scan.
+Org-sync mutations skip AI containers. Re-adding an owner after Space cleanup
+restores exactly owner + Bot through the common admission funnel and recreates the
+parent plus all retained thread subscribers in WuKongIM. Provision failures no
+longer downgrade already-ready sessions, and rename follows the agent -> session ->
+thread lock order used by creation.
+
 The E2E/API coverage includes add/remove/re-add, replay and idempotency conflicts,
 concurrent single-parent creation, the exact two-member invariant, missing Space and
 foreign-Bot rejection, ordinary mutation protection, and hiding both AI parent groups

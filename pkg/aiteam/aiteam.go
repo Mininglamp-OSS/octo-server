@@ -60,13 +60,13 @@ func LookupReadySessionTarget(session *dbr.Session, channelID, senderUID string)
 		FROM ai_team_agent a
 		JOIN ai_team_session s ON s.agent_id=a.id AND s.state=2
 		JOIN thread t ON t.short_id=s.short_id AND t.group_no=a.group_no AND t.status<>3
-		JOIN `+"`group`"+` g ON g.group_no COLLATE utf8mb4_general_ci=a.group_no AND g.purpose=? AND g.status=1
-		JOIN robot r ON r.robot_id COLLATE utf8mb4_general_ci=a.bot_id AND r.status=1 AND r.creator_uid COLLATE utf8mb4_general_ci=a.user_uid
-		JOIN user human_u ON human_u.uid COLLATE utf8mb4_general_ci=a.user_uid AND human_u.status=1 AND human_u.is_destroy<>2
-		JOIN user bot_u ON bot_u.uid COLLATE utf8mb4_general_ci=a.bot_id AND bot_u.status=1 AND bot_u.is_destroy<>2
-		JOIN space sp ON sp.space_id COLLATE utf8mb4_general_ci=a.space_id AND sp.status=1
-		JOIN space_member human_sm ON human_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND human_sm.uid COLLATE utf8mb4_general_ci=a.user_uid AND human_sm.status=1
-		JOIN space_member bot_sm ON bot_sm.space_id COLLATE utf8mb4_general_ci=a.space_id AND bot_sm.uid COLLATE utf8mb4_general_ci=a.bot_id AND bot_sm.status=1
+		JOIN `+"`group`"+` g ON g.group_no=a.group_no COLLATE utf8mb4_0900_ai_ci AND g.purpose=? AND g.status=1
+		JOIN robot r ON r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci
+		JOIN user human_u ON human_u.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_u.status=1 AND human_u.is_destroy<>2
+		JOIN user bot_u ON bot_u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_u.status=1 AND bot_u.is_destroy<>2
+		JOIN space sp ON sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1
+		JOIN space_member human_sm ON human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1
+		JOIN space_member bot_sm ON bot_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_sm.status=1
 		WHERE a.group_no=? AND s.short_id=? AND a.user_uid=?
 		LIMIT 1`, GroupPurpose, parts[0], parts[1], senderUID).Load(&target)
 	return target, err

@@ -2425,3 +2425,12 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   funnel; its source guard now passes without allowlisting a direct table write.
 - Re-ran build, vet, 52 unit packages, all four MySQL/Redis/WuKongIM E2E/API shards,
   i18n checks and the direct WuKongIM persistence test successfully.
+
+## 2026-09-07 — my-ai-team-sessions (final review hardening)
+
+- Preserved legacy-index use across mixed collations and added a production-shape
+  query-plan regression.
+- Closed org-sync membership mutation and Space-cleanup rejoin gaps for AI
+  containers, including parent/thread WuKongIM subscriber reconciliation.
+- Hardened provisioning state transitions and session rename lock ordering.
+- Re-ran build, vet, unit, all four API/E2E shards, i18n and focused WuKongIM gates.

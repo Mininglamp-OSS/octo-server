@@ -66,3 +66,17 @@ source: self
   registered admission entry for ordinary Space-direct groups.
 - Build, vet, the 52-package unit suite, all four E2E/API shards, i18n checks and the
   focused WuKongIM persistence test were rerun successfully after the merge.
+
+## Final review hardening
+
+- Kept mixed-collation conversion on the new AI tables, preserving indexed access
+  on the legacy identity, Space and group columns; the regression fixture now uses
+  realistic indexes, shipped service calls and an `EXPLAIN FORMAT=JSON` guard.
+- Prevented org-sync events from adding or deleting AI-container members.
+- Made add/re-add and session creation repair Space-cleanup membership loss through
+  the shared admission funnel, reject any third member, and reconcile the parent
+  plus retained session channels in WuKongIM before returning ready state.
+- Prevented failed retries from overwriting ready session state and aligned rename
+  locking with the agent -> session -> thread order.
+- Re-ran build, vet, 52 unit packages, all four API/E2E shards, i18n checks and the
+  focused WuKongIM persistence test successfully.
