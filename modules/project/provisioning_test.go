@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -362,7 +363,12 @@ func TestNoClientResponseCarriesAContainerID(t *testing.T) {
 
 	bodies := map[string]string{}
 	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", token, map[string]any{"name": "P2"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	bodies["create"] = w.Body.String()
+	second := decodeResp(t, w)
+	// Drive the second project to ready as well, so its create response is compared
+	// against ids that actually exist on the other side.
+	p.processProvisioningJobs()
 	w = doOn(t, r, http.MethodGet, "/v1/projects/"+created.ProjectID, token, nil)
 	require.Equal(t, http.StatusOK, w.Code)
 	bodies["detail"] = w.Body.String()
@@ -396,8 +402,16 @@ func TestNoClientResponseCarriesAContainerID(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	bodies["verify"] = w.Body.String()
 
+	// BOTH projects' ids. The first version recorded the create response of the SECOND
+	// project into bodies["create"] but only iterated the FIRST project's rows, so a
+	// create response echoing its own container id under a field name containing neither
+	// "container" nor "provision" (workspace_id, slug) passed both assertions.
+	var allRows []provRow
+	allRows = append(allRows, readProvisioningRows(t, created.ProjectID)...)
+	allRows = append(allRows, readProvisioningRows(t, second.ProjectID)...)
+	require.Len(t, allRows, 4, "both projects should have one row per target")
 	for name, body := range bodies {
-		for _, row := range readProvisioningRows(t, created.ProjectID) {
+		for _, row := range allRows {
 			assert.NotContains(t, body, row.ContainerID, "%s response discloses a container id", name)
 		}
 		// Also catch a field that would carry it later under a different value.
@@ -642,6 +656,129 @@ func TestSweepAbandonsAHardKilledJob(t *testing.T) {
 	require.NotNil(t, rows[0].FinishedAt)
 }
 
+// TestSweepAbandonsACleanlyReleasedRowWhoseBudgetShrank is the P1-1 reproducer.
+//
+// releaseProvisioningJob NULLs lease_until on every retry, so the resting state of a
+// retrying row is (pending, attempts = k, lease_until NULL). While the sweep required
+// `lease_until IS NOT NULL` such a row was unsweepable, and once MaxAttempts was observed
+// as m <= k it was unclaimable too — pending forever, no retry, no terminal state, no
+// gauge, no log, and the only symptom a rising `pending` count that the runbook reads as
+// "the target is not responding". Lowering the knob during an incident is the everyday
+// route in; an out-of-range value casting to uint32(0) was the other, now refused at
+// config load.
+func TestSweepAbandonsACleanlyReleasedRowWhoseBudgetShrank(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	p.cfg.Provisioning.MaxAttempts = 8
+	fleet.setStatus(http.StatusInternalServerError)
+
+	created := createVia(t, r, token, "P")
+	// One real failed attempt, so the row is released the way production releases it:
+	// attempts advanced, lease_until back to NULL.
+	p.processProvisioningJobs()
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	require.Equal(t, provisionStatusPending, rows[0].Status)
+	require.Equal(t, uint32(1), rows[0].Attempts)
+	require.Empty(t, rows[0].LeaseOwner)
+	assertLeaseUntilIsNull(t, rows[0].ID)
+
+	// The operator lowers the budget below what this row has already spent.
+	p.cfg.Provisioning.MaxAttempts = 1
+
+	// Claim can no longer take it (attempts < max is false) …
+	p.processProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	require.Equal(t, uint32(1), rows[0].Attempts, "the row must not be claimable at the lowered budget")
+
+	// … so the sweep is the only thing that can move it, and it must.
+	p.sweepExhaustedProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusAbandoned, rows[0].Status,
+		"a cleanly released row past a lowered budget is neither claimable nor sweepable: "+
+			"it sits pending forever with no signal")
+	require.NotNil(t, rows[0].FinishedAt)
+}
+
+// assertLeaseUntilIsNull pins the precondition the reproducer above depends on — that a
+// clean release really does clear the lease. If that ever changes the test would still
+// pass while no longer testing the state it claims to.
+func assertLeaseUntilIsNull(t *testing.T, id uint64) {
+	t.Helper()
+	var nullCount int
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM `octo_project_provisioning` WHERE id = ? AND lease_until IS NULL", id,
+	).LoadOne(&nullCount))
+	require.Equal(t, 1, nullCount, "a released row must have lease_until = NULL")
+}
+
+// TestSweepLeavesANeverClaimedRowAlone is the other side of relaxing that predicate.
+//
+// The NULL arm is only safe because max >= 1 is guaranteed at config load: a never-claimed
+// row has attempts = 0, so `attempts >= max` excludes it. This is the test that would fail
+// if someone reintroduced a path to max = 0.
+func TestSweepLeavesANeverClaimedRowAlone(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "P")
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	require.Equal(t, uint32(0), rows[0].Attempts)
+	assertLeaseUntilIsNull(t, rows[0].ID)
+
+	p.sweepExhaustedProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusPending, rows[0].Status,
+		"a fresh, never-claimed row was swept to abandoned")
+}
+
+// TestWorkerAbandonsAPermanentFailureImmediately pins the short circuit.
+//
+// A container id mismatch means our mapping row points at a container nobody owns. The
+// budget used to be spent on it anyway — a dozen more calls over ~23 minutes to reach the
+// same terminal state, while re-hitting a target that already gave the answer.
+func TestWorkerAbandonsAPermanentFailureImmediately(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.respondWith = "octows-somethingelse"
+	p, r, token := provisioningSetup(t, fleet)
+
+	before := testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "container_id_mismatch"))
+	created := createVia(t, r, token, "P")
+	p.processProvisioningJobs()
+
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	assert.Equal(t, provisionStatusAbandoned, rows[0].Status)
+	assert.Equal(t, uint32(1), rows[0].Attempts, "a permanent failure must not spend the budget")
+	assert.Contains(t, rows[0].LastError, "permanent failure")
+	assert.Equal(t, before+1,
+		testutil.ToFloat64(provisioningAttempts.WithLabelValues(TargetFleet, "container_id_mismatch")))
+
+	// And it is not re-called: abandoned is terminal and not claimable.
+	calls, _ := fleet.snapshot()
+	assert.Equal(t, 1, calls, "a permanent failure was retried against the target")
+}
+
+// TestWorkerKeepsRetryingAMissingEnsureEndpoint is the counterpart, and it is why the
+// permanent set is small: a 404 is what a target that has not deployed its ensure endpoint
+// looks like — the expected state until precondition P-2 lands — and it becomes a 200 after
+// a deployment on the other side with nothing changing here. Abandoning it would turn a
+// self-healing situation into one needing a manual requeue.
+func TestWorkerKeepsRetryingAMissingEnsureEndpoint(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.setStatus(http.StatusNotFound)
+	p, r, token := provisioningSetup(t, fleet)
+
+	created := createVia(t, r, token, "P")
+	p.processProvisioningJobs()
+
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	assert.Equal(t, provisionStatusPending, rows[0].Status,
+		"a 404 must be retried: it is what a not-yet-deployed ensure endpoint looks like")
+	assert.Contains(t, rows[0].LastError, "target_no_ensure_endpoint")
+}
+
 // TestSweepSparesAJobStillInsideItsLease is the other half, and it is why the grace
 // period is a FULL lease rather than "the lease has expired": a job on its final
 // attempt has attempts == max while its executor is still legitimately running, and
@@ -766,13 +903,53 @@ func TestUnnarrowedContainerGaugeCountsReadyRowsOnUnnarrowedTargets(t *testing.T
 	assert.Equal(t, 1.0, testutil.ToFloat64(provisioningRows.WithLabelValues(TargetDrive, "ready")))
 	assert.Equal(t, 0.0, testutil.ToFloat64(provisioningRows.WithLabelValues(TargetDrive, "pending")))
 
-	// The gauge must fall back to 0 when the condition clears, rather than holding a
-	// stale reading that reads as an unresolved alert.
-	_, err := testCtx.DB().UpdateBySql("DELETE FROM `octo_project_provisioning`").Exec()
+	// pending and abandoned rows COUNT, because under at-least-once delivery a lost
+	// response leaves a container that exists behind a row that does not say so. The first
+	// version counted `ready` only, which contradicted what this module says elsewhere
+	// about abandoned rows ("we may well have created one and failed to record it") and
+	// made a security-surface gauge under-report.
+	insertProvisioningRowFixture(t, "p-pending", TargetDrive, provisionStatusPending)
+	insertProvisioningRowFixture(t, "p-abandoned", TargetDrive, provisionStatusAbandoned)
+	insertProvisioningRowFixture(t, "p-disbanded", TargetDrive, provisionStatusDisbandPending)
+	p.refreshProvisioningMetrics()
+	assert.Equal(t, 3.0, testutil.ToFloat64(provisioningUnnarrowedContainers.WithLabelValues(TargetDrive)),
+		"ready + pending + abandoned must all count as possibly-existing containers")
+
+	// disband_pending is excluded deliberately, not by the same oversight: those are
+	// explicitly enumerated for reclaim and stay visible in their own row bucket.
+	assert.Equal(t, 1.0, testutil.ToFloat64(provisioningRows.WithLabelValues(TargetDrive, "disband_pending")))
+
+	// A ROLLBACK must not make the exposure read zero. Clearing
+	// OCTO_PROJECT_PROVISION_TARGETS stops us talking to the target; it does not
+	// un-provision anything, and narrowing is a property of the subsystem rather than of
+	// whether we are currently configured for it.
+	p.cfg.Provisioning.Targets = nil
+	p.refreshProvisioningMetrics()
+	assert.Equal(t, 3.0, testutil.ToFloat64(provisioningUnnarrowedContainers.WithLabelValues(TargetDrive)),
+		"clearing the target list made the exposed surface read 0 while the containers still exist")
+
+	// It does fall to 0 once the rows are actually gone — a gauge that holds a stale
+	// reading after the condition clears reads as an unresolved alert.
+	_, err := testCtx.DB().DeleteBySql("DELETE FROM `octo_project_provisioning`").Exec()
 	require.NoError(t, err)
 	p.refreshProvisioningMetrics()
 	assert.Equal(t, 0.0, testutil.ToFloat64(provisioningUnnarrowedContainers.WithLabelValues(TargetDrive)))
 	assert.Equal(t, 0.0, testutil.ToFloat64(provisioningRows.WithLabelValues(TargetDrive, "ready")))
+}
+
+// insertProvisioningRowFixture writes one row in a given terminal/pending state.
+func insertProvisioningRowFixture(t *testing.T, projectID, target string, status uint8) {
+	t.Helper()
+	now := time.Now().UTC()
+	containerID, err := newContainerID(target)
+	require.NoError(t, err)
+	_, err = testCtx.DB().InsertBySql(
+		"INSERT INTO `octo_project_provisioning` "+
+			"(project_id, space_id, target, container_id, status, next_attempt_at, created_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?)",
+		projectID, spaceA, target, containerID, status, now, now,
+	).Exec()
+	require.NoError(t, err)
 }
 
 // ---------- config ----------
@@ -869,7 +1046,7 @@ func TestLoadProvisioningConfig(t *testing.T) {
 	})
 
 	t.Run("a malformed numeric knob falls back instead of disabling the control", func(t *testing.T) {
-		cfg, _ := loadProvisioningConfig(env(map[string]string{
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
 			envProvisionMaxAttempts: "12abc",
 			envProvisionBatch:       "-1",
 			envProvisionInterval:    "not-a-duration",
@@ -877,6 +1054,51 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		assert.Equal(t, defaultProvisionMaxAttempts, cfg.MaxAttempts)
 		assert.Equal(t, defaultProvisionBatch, cfg.BatchSize)
 		assert.Equal(t, defaultProvisionInterval, cfg.Interval)
+		// Falling back is right; falling back SILENTLY is what made the uint32 wrap
+		// below invisible, so a bad MaxAttempts must also be reported.
+		assert.NotEmpty(t, problems, "a rejected MaxAttempts must be reported, not only defaulted")
+	})
+
+	t.Run("MaxAttempts out of range is refused rather than cast into a no-op", func(t *testing.T) {
+		// 4294967296 = 2^32. It parses as a positive int and casts to uint32(0), which
+		// makes every claim predicate `attempts < 0` and turns the whole slice into a
+		// silent no-op from the first tick — with no signal anywhere.
+		for _, raw := range []string{"4294967296", "0", "-3", strconv.Itoa(maxProvisionAttemptsCeiling + 1)} {
+			cfg, problems := loadProvisioningConfig(env(map[string]string{envProvisionMaxAttempts: raw}))
+			assert.Equal(t, defaultProvisionMaxAttempts, cfg.MaxAttempts, "raw=%q", raw)
+			require.NotEmpty(t, problems, "raw=%q was accepted silently", raw)
+			assert.Contains(t, problems[0].Error(), envProvisionMaxAttempts)
+		}
+		// And a legitimate value inside the range still applies.
+		cfg, problems := loadProvisioningConfig(env(map[string]string{envProvisionMaxAttempts: "5"}))
+		assert.Equal(t, uint32(5), cfg.MaxAttempts)
+		assert.Empty(t, problems)
+	})
+
+	t.Run("a Timeout that could outlive the lease is refused", func(t *testing.T) {
+		// With no heartbeat, a call that outlives its lease gets a second executor on the
+		// same row and can be marked abandoned while it is still running. The relationship
+		// used to be only a comment.
+		for _, raw := range []string{"10m", "2m", "1m", "0s", "nonsense"} {
+			cfg, problems := loadProvisioningConfig(env(map[string]string{envProvisionTimeout: raw}))
+			assert.Equal(t, defaultProvisionTimeout, cfg.Timeout, "raw=%q", raw)
+			require.NotEmpty(t, problems, "raw=%q was accepted", raw)
+			assert.Contains(t, problems[0].Error(), envProvisionTimeout)
+		}
+		cfg, problems := loadProvisioningConfig(env(map[string]string{envProvisionTimeout: "20s"}))
+		assert.Equal(t, 20*time.Second, cfg.Timeout)
+		assert.Empty(t, problems)
+		// The default must itself satisfy the constraint, or the constraint is theatre.
+		assert.LessOrEqual(t, int64(defaultProvisionTimeout), int64(provisioningLease/maxProvisionTimeoutFraction))
+	})
+
+	t.Run("knob problems are reported even with no target enabled", func(t *testing.T) {
+		// Otherwise the misconfiguration is discovered on the day someone turns a target
+		// on, which is the worst possible moment.
+		cfg, problems := loadProvisioningConfig(env(map[string]string{envProvisionMaxAttempts: "0"}))
+		assert.False(t, cfg.Enabled())
+		assert.NotEmpty(t, problems)
+		assert.NotEmpty(t, cfg.Problems, "New() logs from cfg.Problems, so it must carry them too")
 	})
 }
 

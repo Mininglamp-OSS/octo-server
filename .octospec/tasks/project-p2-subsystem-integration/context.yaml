@@ -163,6 +163,62 @@ deviations:
       cardactiondispatch.Verify checks only the MAC. Written down now because neither
       subsystem has started its ensure endpoint — after they ship it is a cross-repo
       rework.
+  - id: no-lease-heartbeat
+    what: |
+      the outbox has NO lease heartbeat, and OCTO_PROJECT_PROVISION_TIMEOUT is rejected at
+      config load unless it is at most a quarter of the lease (maxProvisionTimeoutFraction).
+    why: |
+      D2 item 1 and the migration header both claimed a heartbeat that no code ever
+      implemented — the same "the doc says it is done" class as H-1/H-2, caught by review.
+      The claim is withdrawn rather than implemented: a heartbeat is machinery for long
+      jobs and this job is a single bounded outbound call. Without the heartbeat the
+      timeout-vs-lease relationship is a CORRECTNESS constraint, so it is now enforced
+      instead of commented.
+  - id: permanent-failure-short-circuit
+    what: |
+      container_id_mismatch / invalid_request / encode_failed abandon the row on the FIRST
+      attempt instead of spending the budget; there is no exported Retryable predicate.
+    why: |
+      Retryable existed, was computed and never consumed, and encoded the wrong question
+      ("does this STATUS justify another try") — the worker deliberately retries 404 and
+      401, because a not-yet-deployed ensure endpoint and a rotated secret both become 200
+      after a deployment on the other side. The failures that must not be retried are
+      identifiable by CATEGORY, not by status, so the decision moved to the worker and the
+      dead abstraction was deleted.
+  - id: unnarrowed-gauge-over-counts
+    what: |
+      provisioning_unnarrowed_containers counts ready + pending + abandoned, and an
+      unconfigured target counts as not narrowed.
+    why: |
+      The first version counted `ready` only, arguing "a pending row has no container on
+      the other side yet" — not true under at-least-once delivery (a lost response leaves
+      a container behind a row that does not say so), and contradicting what this module
+      says elsewhere about abandoned rows. A security-surface gauge must over-count.
+      Zeroing for an unconfigured target made the documented rollback read 0 while every
+      container still existed.
+  - id: sweep-predicate-and-rolling-max
+    what: |
+      the exhausted-row sweep treats lease_until IS NULL as due (plus full-lease grace for
+      a held lease), re-checks ALL predicates in its UPDATE, and MaxAttempts is bounded to
+      [1, 50] at config load.
+    why: |
+      release NULLs the lease, so a retrying row rests at (pending, k, NULL); requiring
+      IS NOT NULL made it unsweepable while a lowered max made it unclaimable — a silent
+      zombie exactly where the code claims to prevent one. The UPDATE re-check closes a
+      rolling-restart race where replicas disagree about max. The bounds exist because an
+      unbounded int cast to uint32 made every claim predicate false.
+  - id: conformance-vectors
+    what: |
+      internal/projectprovision ships four fixed request/verdict vectors (valid /
+      stale_timestamp / tampered_body / wrong_secret) plus the canonical string spelled out
+      byte by byte; passing them is a runbook precondition for enabling a target.
+    why: |
+      Go internal/ packages are not importable cross-repo, so pointing receivers at
+      cardactiondispatch.CanonicalRequest asked two codebases to reimplement it from prose.
+      A wrong canonical string fails closed and is self-announcing; a lenient timestamp
+      check fails open and is silent — the vectors make the silent one checkable, and the
+      drift test keeps the table from rotting away from the implementation.
+
   - id: provision-ensurer-interface
     what: |
       Project.provisionClient is typed on a local one-method interface declared in
@@ -198,6 +254,10 @@ assumptions:
      bodies are almost never logged, headers routinely are. An earlier revision put the
      raw id there and justified it with 'the body already carries it', which ignored that
      asymmetry."
+  - "octo_project_provisioning carries a space_id column that D2 item 1's column sketch
+     does not list. Added because the ensure body needs octo_space_id, and reading it from
+     octo_project on every attempt would add a query per call. Worth knowing when diffing
+     the spec against the table."
   - "A successful create nudges the worker in one goroutine so 'eager' means seconds
      rather than up to a full interval. Bounded by the project creation rate, which the
      per-day and per-Space quotas already cap — unlike modules/space's original per-uid

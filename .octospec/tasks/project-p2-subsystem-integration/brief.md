@@ -224,6 +224,17 @@ a background worker drives it from an outbox and the outbox's lease does
   (D10), but D10 level 2 must wait for that work.
 - **Disclosing any container id to a client.** PR-5 provisions but does not
   disclose.
+- **Backfilling a container for a project created while its target was off or invalid.**
+  Added 2026-09-07 after review. PR-5 enqueues only for targets that were enabled AND
+  valid at the instant of creation, and there is no backfill anywhere — so at FIRST
+  enablement every already-existing project gets no container, ever, and a window with a
+  typo'd URL leaves projects whose missing row nothing will retry. That is not an edge
+  case: since the default is empty and the runbook gates enablement on P-2 landing, "every
+  project predates enablement" is the *first* state an operator is in. Consequently D1's
+  invariant ("one Project maps to one fleet workspace and one drive shared space") is not
+  reachable by PR-5 alone. Out of scope here, with two things in its place: a bounded
+  remediation statement in the runbook (`plan.md` §3.4) so it is operable today, and PR-6
+  below so it is not lost.
 - **The `provisioning:` field on the project detail response.** An earlier sketch
   listed it; it is exactly the read path D12 forbids gating on. It may return later
   as display-only, never as a precondition.
@@ -269,8 +280,18 @@ Chosen by the product over subsystem-side lazy `ensure`.
    `next_attempt_at`, `lease_owner`, `lease_until`, `last_error`, `created_at`,
    `finished_at`. Shaped after
    `modules/space/sql/20260821000001_space_member_removal_cleanup.sql` with P1's
-   three corrections: app-written UTC (no `NOW()` / `ON UPDATE`), a lease
-   heartbeat, and a draining purge with its own `(status, finished_at)` index.
+   corrections: app-written UTC (no `NOW()` / `ON UPDATE`) and a draining purge with its
+   own `(status, finished_at)` index.
+
+   **No lease heartbeat** — corrected 2026-09-07. An earlier revision of this item listed
+   one and the migration header repeated the claim, while no code ever extended a held
+   lease. The claim is withdrawn rather than implemented: a heartbeat is machinery for
+   long jobs, and this job is a single bounded outbound call. What replaces it is an
+   *enforceable* form of the relationship the lease constant was justified by —
+   `OCTO_PROJECT_PROVISION_TIMEOUT` is rejected at config load unless it is at most a
+   quarter of the lease. With neither, a timeout configured above the lease lets a second
+   replica legitimately re-claim and run the same row concurrently, and lets the sweep
+   write `abandoned` under a still-running executor.
 2. **Enqueue in the same transaction as the project INSERT.** The only construction
    that makes "project exists ⟹ job exists" true. The existing Redis queue
    (`internal/cardactiondispatch/queue.go`, `RedisQueue`) cannot do it: not the same
@@ -324,6 +345,29 @@ header capture). Until R2/R3 land the container id is a capability, so putting i
 infrastructure nobody here controls will pick it up is a measurable widening for no
 gain — the receiver reads the real id from the body. The hash keeps both properties the
 slot needs: stable across replays of one job, and bound to one specific resource.
+
+**Conformance vectors ship with the contract** (`internal/projectprovision/conformance.go`,
+added 2026-09-07). Four fixed request/verdict pairs — valid, stale timestamp, tampered
+body, wrong secret — with the expected signature spelled out, plus the canonical string
+written byte by byte. Two reasons this is data rather than prose. Go `internal/` packages
+are not importable from another repository, so pointing a receiver at
+`cardactiondispatch.CanonicalRequest` asks two separate codebases to reimplement it from a
+description; and of the three MUST clauses, a wrong canonical string fails CLOSED and is
+self-announcing, while a lenient timestamp check fails OPEN and is silent — so the clause
+that actually matters is the one nothing on this side can detect. A test recomputes every
+published signature so the table cannot drift from the implementation. **Passing the
+vectors is a precondition for adding a target to `OCTO_PROJECT_PROVISION_TARGETS`**
+(`plan.md` §3.2).
+
+The receiver is deliberately NOT asked to dedupe requests it has already seen, and the
+reason is correctness rather than leniency: octo-server retries the same row, and two
+deliveries landing in the same second carry the same timestamp and therefore the same
+signature, so a receiver refusing an identical repeat would refuse a legitimate retry and
+burn an attempt. The timestamp window is the bound instead, and the residual risk is
+stated rather than papered over — inside that window a captured request can be replayed,
+recreating one specific container that octo-server itself asked for. It cannot create a
+container for another project, cannot change any field (the body is inside the MAC), and
+discloses nothing the captor did not already hold.
 
 **`name` is a fixed low-information label, not the project's name** (D3, and see PR-5's
 deviation note). The consequence on the receiving side is real: every container arrives
@@ -690,6 +734,7 @@ have is `createProjectOnce`, `addMembers` (`modules/project/service.go:675`) and
 | **PR-1** assistant kind / invitations / transfer | **P0**, with a rebase cost | the member model, `octo_project_invitation` and transfer all sit on P0's `addMembers` / `deactivateMemberTx`. P1 consolidates that path into `admitOrRestoreMembersTx`, so whichever lands second rebases onto the other. The group-interaction acceptance items need P1 |
 | **PR-3** existing external member surfaces | **split** | the `project_id` member filters are P0; passing `project_id` through `GET /v1/bot/groups*` needs `group.project_id`, so that part is P1 |
 | **PR-0** all-hands group | **P1, hard** | needs `group.project_id`, `admitOrRestoreMembersTx`, the reverse-registration registry, and the removal cascade that walks every project group. Its own acceptance says "through the existing P1 cascade" |
+| **PR-6** provisioning backfill / reconcile | **PR-5** (added 2026-09-07) | a bounded scan enqueueing a row for every active project that has none for a currently enabled target, so first enablement and any misconfiguration window converge without a human. Needed for D1's invariant to hold at all; see §Out of scope. Deliberately NOT folded into PR-5: it is a new cross-table scan and owes the same bounds the reconcile job already carries (`LIMIT` + persisted cursor, `TestReconcileQueriesAreBounded`), which is a slice's worth of work rather than a clause |
 
 So PR-5 does **not** depend on PR-0 — an earlier revision of this brief claimed it
 did, which was wrong: both enqueue into and extend the same P0 transaction, and they
@@ -808,8 +853,8 @@ in §Deferred so it is not lost if that PR merges without it.
 Ships the whole octo-server side and nothing that discloses a container id.
 
 > **Status: implemented** on branch `feat/project-p2-provisioning-outbox`, based on
-> `main` at `c7abadeb` (P0 #841 merged). Six deliberate deviations from the sketch
-> above, each recorded in
+> `main` (P0 #841 merged). The deliberate deviations from the sketch above are each
+> recorded in
 > [context.yaml](./context.yaml) with its reasoning; the two that change externally
 > visible behaviour are repeated here so a reader of the brief alone is not misled:
 >

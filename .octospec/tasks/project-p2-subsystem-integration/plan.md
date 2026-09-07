@@ -2,7 +2,8 @@
 
 > **状态：已实施**（2026-09-07）。分支 `feat/project-p2-provisioning-outbox`，
 > base = `main @ c7abadeb`（P0 #841 已合并；**P1 #846 仍 OPEN，本切片不依赖它**）。
-> 与 brief 草图的六处有意偏离及其理由见 [context.yaml](./context.yaml) 的 `deviations`。
+> 与 brief 草图的有意偏离及其理由，逐条见 [context.yaml](./context.yaml) 的 `deviations`
+> （刻意不在这里写条数 —— 早期版本写「六处」而 context.yaml 里是七条，数字本身就是一类漂移）。
 > 本文件只写落地结果、验证证据和运维手册；设计论证不重复，都在
 > [brief.md](./brief.md) 的 D1 / D2 / D12 里。
 
@@ -160,6 +161,53 @@ master key 加密 —— 等于在测试里重写一遍 `modules/common.insertAp
 
 ---
 
+### 2.5 上游 review round（yujiawei, CHANGES_REQUESTED）修掉的 15 项
+
+自动评审在本仓之外、只读 diff 的情况下，把「文档声称 vs 代码行为」这类问题几乎全部
+抓了出来 —— 包括我们自己变异验证漏掉的。16 项论断逐条核实**无一错报**。同样分两类记录：
+
+**Spec 缺口（2）**
+
+| | 问题 | 处置 |
+|---|---|---|
+| S-1 | D2 与迁移头声称「租约有心跳」，代码从未实现过 | **撤回声称而不是实现**（评审给的 B 选项）：心跳是长作业的机械结构，本作业是一次有界调用；代之以 `Timeout <= 租约/4` 的配置加载期校验（这同时是 P1-2 的修法）。迁移头与 brief 同步改写 |
+| S-2 | target 关闭/配错期间创建的项目**永远**拿不到容器，且未声明；首次启用时这是 operator 遇到的**第一个**状态 | Out of scope 声明 + runbook §3.4.2 补建 SQL（实测 `RANDOM_BYTES(16)` 与 `newContainerID` 输出形状一致）+ brief 新增 **PR-6** 切片（补建/reconcile），D1 的不变量由此才可达 |
+
+**代码（P1×2 + P2×7 + nit×4）**
+
+| | 问题 | 修法 | 变异验证 |
+|---|---|---|---|
+| P1-1 | 干净释放过、`attempts` ≥ 被下调的 `MaxAttempts` 的行：认领要 `attempts<max`、sweep 要 `lease_until IS NOT NULL` → 永久 pending 僵尸，且 runbook 把 `pending` 上涨读成「目标不响应」，主动误导诊断 | sweep 谓词放宽为 `IS NULL OR <= grace`（NULL 臂的安全性依赖 `MaxAttempts ∈ [1,50]` 的配置期保证，一并落地） | 还原旧谓词 → 新复现测试 FAIL |
+| P1-2 | `TIMEOUT` 无上界（`10m` 被原样接受）而租约固定 2 分钟、又无心跳：租约在调用中过期 → 并发重跑 + 被运行中写 abandoned | 同 S-1 的配置期校验（`maxProvisionTimeoutFraction=4`） | 越界用例表 |
+| P2-1 | sweep 的 UPDATE 只复查 `id+status`：滚动变更 `MAX_ATTEMPTS` 时两副本对 max 不一致，旧副本会在新副本认领后清掉新租约、把运行中的行写成 abandoned | `AND attempts >= ? AND (lease_until IS NULL OR lease_until <= ?)` 带进 UPDATE | 代码走查（滚动窗口竞态无法本地复现时序） |
+| P2-2 | query string 在 MAC 之外（canonical 只签 path，请求发完整 URL）：`?tenant=A` 未认证，改成 `?tenant=B` 照样验过 | `ValidateTarget` 拒绝 `RawQuery`/`ForceQuery`/`Fragment`/`Opaque`，`Hostname()` 替代 `Host`（`http://:8080/` 会骗过后者）；对齐 `cardactiondispatch.validateCallbackURL` | `TestValidateTarget` 四个新负例 |
+| P2-3 | 未收窄 gauge 只算 `ready` 且 target 被移出配置时归零 —— 少报 + 与本仓自己的另一段注释矛盾 | 改 `ready+pending+abandoned`；未配置的 target 按**未收窄**计；`disband_pending` 刻意排除并写明理由 | gauge 测试三种状态 + rollback 分支 |
+| P2-4 | `Retryable` 被计算、从未被消费；`container_id_mismatch` 文档写「永久」实际重试 12 次共 ~23 分钟 | **删除**该抽象（它编码了错误的问题——worker 故意重试 404/401）；worker 改按**类别**短路三个永久 outcome（`container_id_mismatch`/`invalid_request`/`encode_failed`），其余照旧重试 | 还原 → 立即放弃测试 FAIL；另加「404 必须继续重试」的反向测试 |
+| P2-5 | 两处注释声称「Space 级联与无主路径都经过 disbandProjectTx」——本 base 上它只有 1 个调用方 | 改写为前瞻式（这是未来级联会落地的位置），并把「Space 解散不触发项目解散 → ready 行永不转 reclaim」这个真实 gap 记录在案 | 文档 |
+| P2-6 | 三个守卫洞：`zap.Any("job", job)` 反射序列化绕过按名守卫；披露测试只遍历第一个项目的行；main-wiring 守卫子串匹配常量名而非 `os.Getenv` 值 | 禁 `zap.Any/Reflect` 整体记录 job；披露断言遍历**两个**项目的行；匹配 `os.Getenv(...)` 包裹 | `zap.Any` 注入 FAIL；把常量名换进 args FAIL；自检注入第二项目 id FAIL |
+| P2-7 | 单循环 + `target IN (...)`：一个不健康的 target 用 20×10s 占满批次，`provisioningRunning` 让 15s 的 tick 全部让位 → 健康的 drive 在 fleet 的超时后面排几分钟 | 每 target 一个 goroutine + 各自批次配额（`BatchSize/len(targets)`）；等待是**被移除**而不只是被限制 | 结构性，测试覆盖两 target 各自推进 |
+| nit | `main.go` 指向不存在的 `main_wiring_test.go`；偏离条数 6 vs 7；`space_id` 不在 D2 列清单；接收方拿不到 `internal/` 包的 canonical string | 全部更正；条数改为不写死的引用；`space_id` 记入 context.yaml；**canonical string 逐字节写进契约**（见下） | — |
+
+**一致性检查包（评审「需人工确认」第 1 条的落地）**
+
+`internal/projectprovision/conformance.go`：4 条固定向量（valid / stale_timestamp /
+tampered_body / wrong_secret，含期望签名与固定时钟）+ canonical string 六字段逐字节说明
++ 一个防漂移测试（每条签名用 `Sign` 重算）。**运行时决策：接收方被刻意**不**要求对已见
+请求去重** —— octo-server 的重试可能落在同一秒，时间戳与签名完全相同，要求拒绝重复会
+把合法重试拒掉烧掉一次尝试。时间戳窗口就是那条边界；残余风险（窗口内重放重建那**一个**
+容器）写死在注释里，不粉饰。**把 target 加进 `TARGETS` 的前置条件 = 该子系统的端点跑通
+这组向量**（runbook §3.2）。
+
+**评审确认正确、无需改动的**（原文照录要点）：`errors.Join` 与 1213 重试兼容；应用侧
+UTC 时钟两侧一致；`attempts` 恰好一次自增；`truncateProvisioningError` 的字节/字符处理
+正确；无 secret 进日志；锁序如文档；退避级数算术正确。
+
+**未修（经用户决策）**：不强制 https —— 有意允许，理由与代价（明文链路上 id 暴露 + 请求
+可被抓取）已写进 `ValidateTarget` 注释，并说明这正是新鲜度校验为 MUST、向量必须跑通的
+原因。
+
+---
+
 ## 3. 运维手册
 
 ### 3.1 默认状态：完全惰性
@@ -180,8 +228,22 @@ OCTO_PROJECT_PROVISION_FLEET_NARROWED=false
 
 env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关同一性质）。
 
-**打开之前必须确认 P-2（子系统侧服务身份）已经就绪。** 否则每个新项目都会产出一条
-在 **~23.5 分钟**后走到 `abandoned` 的行，而 `abandoned` 没有任何自动重驱动。
+**打开之前必须确认两件事：**
+
+1. **P-2（子系统侧服务身份）已经就绪。** 否则每个新项目都会产出一条在 **~23.5 分钟**后
+   走到 `abandoned` 的行，而 `abandoned` 没有任何自动重驱动。
+2. **该子系统的 ensure 端点已经跑通 4 条一致性向量**
+   （`internal/projectprovision/conformance.go`：valid / stale_timestamp / tampered_body /
+   wrong_secret）。这不是形式主义 —— 三条 MUST 里，canonical string 写错会 fail closed
+   会自己暴露，而**时间戳校验写松了 fail open 且完全静默**，本仓没有任何东西能发现它。
+   向量就是把「已评审」变成一个可执行动作。
+
+**两个 knob 有硬边界，越界会被拒绝并回落默认值**（配置加载期报 Error 日志）：
+
+| env | 允许范围 | 越界的后果（如果不拒） |
+|---|---|---|
+| `OCTO_PROJECT_PROVISION_MAX_ATTEMPTS` | `[1, 50]` | `4294967296` 会被 `int` 解析通过再 cast 成 `uint32(0)`，于是 `attempts < 0` 恒假 —— 整片从第一个 tick 起静默变 no-op |
+| `OCTO_PROJECT_PROVISION_TIMEOUT` | `> 0` 且 `<= 30s`（租约 2 分钟的四分之一） | 没有心跳，超时超过租约就会让另一副本并发跑同一行，且 sweep 会在执行者还在跑时写 `abandoned` |
 
 > 这个数字是算出来的，不是估的：`provisioningRetryDelay` 是 `min(2^attempt, 300s)`，
 > `release` 收到的 attempts 是 1..11（第 12 次放弃），
@@ -193,12 +255,18 @@ env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关�
 | 指标 | 含义 |
 |---|---|
 | `project_provisioning_rows{target,status}` | 行普查。`pending` 持续上涨 = 目标不响应；`abandoned` 非零 = 需要人 |
-| `project_provisioning_unnarrowed_containers{target}` | **暴露面大小**：该目标尚未声明按 Project 收窄，这些容器只靠 id 不可推导来保护 |
+| `project_provisioning_unnarrowed_containers{target}` | **暴露面大小**（多报）：`ready + pending + abandoned`，因为响应丢失会留下「容器存在而行不承认」的状态；target 被移出配置**不会**让它归零（收窄是子系统的属性，不是配置的属性）。`disband_pending` 刻意不算 —— 那些已明确列入回收清单，看 `provisioning_rows` |
 | `project_provisioning_target_misconfigured{target}` | 1 = 这个 target 被要求了但配置被拒（坏 URL / 短 secret / 凭据撞车），它不会预置任何东西 |
 | `project_provisioning_attempts_total{target,outcome}` | **一次尝试恰好一个增量**，所以 `sum by(outcome)` 就是尝试次数。`target_no_ensure_endpoint`（= 404，P-2 还没到）与 `target_5xx`（= 真故障）在**第一次尝试**就能分开；`panic` / `target_disabled` 也各有自己的 outcome。刻意**没有** `abandoned` 这个 outcome —— 「多少行放弃了」由上面那个 gauge 回答 |
 | `write_rejected_total{reason="provisioning_enqueue"}` | 建项目因为 outbox 写失败而失败。非零说明是本切片让 create 挂的 |
 
 ### 3.4 P-2 落地后重驱动已放弃的行
+
+这一节有**两种**要处理的形状，别混：一种是「行在、但放弃了」（`status = 2`），另一种是
+「压根没有行」—— 后者是**首次启用时的默认状态**（所有先于启用创建的项目都没有行），
+以及某个 target 配错期间创建的项目。
+
+### 3.4.1 行在但已放弃（`status = 2`）
 
 `abandoned` 刻意没有自动重驱动 —— 自动重驱动会抹掉「目标坏了」和「目标好着」的区别。
 人工重排是一条 UPDATE：
@@ -213,8 +281,39 @@ UPDATE octo_project_provisioning
 
 > `UTC_TIMESTAMP(3)` 只在这条**人工**语句里可以用：应用侧一律用 Go 的 UTC 时钟写入，
 > 因为认领是拿 Go 的时间去比 `next_attempt_at`（见 `db_provisioning.go` 头部）。
-> 这条语句要求执行者确认 MySQL 会话时区不会把它变成本地时间；分批 500 是为了不让一条
-> UPDATE 锁住大范围。
+> `UTC_TIMESTAMP` 与会话时区无关（不同于 `NOW()`），所以这里是安全的；分批 500 是为了
+> 不让一条 UPDATE 锁住大范围。
+
+### 3.4.2 压根没有行（首次启用 / 配错窗口）
+
+PR-5 只为「创建那一刻已启用且配置合法」的 target 入队，没有任何补建路径（见 brief 的
+Out of scope 与 PR-6）。所以**开一个 target 之后必须为已有项目补建一次**，每个 target
+各跑一遍（注意换前缀）：
+
+```sql
+-- fleet：前缀必须是 octows-；drive 是 octods-（见 containerIDPrefix）
+INSERT INTO octo_project_provisioning
+  (project_id, space_id, target, container_id, status, next_attempt_at, created_at)
+SELECT p.project_id, p.space_id, 'fleet',
+       CONCAT('octows-', LOWER(HEX(RANDOM_BYTES(16)))),
+       0, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)
+  FROM octo_project p
+  LEFT JOIN octo_project_provisioning pp
+    ON pp.project_id = p.project_id AND pp.target = 'fleet'
+ WHERE p.status = 1 AND pp.project_id IS NULL
+ LIMIT 500;
+```
+
+> **必须是 `RANDOM_BYTES(16)`，不能用 `RAND()` 也不能用 `UUID()`。** 这是整个系统里唯一
+> 由 SQL 生成容器 id 的地方，而容器 id 的不可推导性是 R2/R3 落地前唯一的阻断（D1）。
+> `RAND()` 不是密码学随机；`UUID()` 是 v1，含时间戳与 MAC，可推导。`RANDOM_BYTES` 走的是
+> OpenSSL 的 CSPRNG。
+>
+> 输出形状与 `newContainerID` 一致 —— **在 MySQL 8.0.33 上实测**：
+> `octows-` + 32 位小写 hex = 39 字符，落在 `container_id VARCHAR(64)` 内。
+>
+> `LIMIT 500` 分批重复跑到 0 行为止。`(project_id, target)` 上有唯一键，所以重复执行
+> 不会造出第二行；`status = 1` 保证已解散的项目不会被补建。
 
 ### 3.5 回滚
 

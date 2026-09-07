@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,9 +123,11 @@ func TestEnsureRejectsAMismatchedContainerID(t *testing.T) {
 	if Category(err) != "container_id_mismatch" {
 		t.Fatalf("category = %q, want container_id_mismatch (err=%v)", Category(err), err)
 	}
-	if Retryable(err) {
-		t.Error("a container id mismatch must not be retryable; retrying cannot repair a wrong mapping")
-	}
+	// There is no Retryable predicate any more (see the note in client.go): whether a
+	// category is permanent is the worker's decision, because it deliberately retries some
+	// statuses an HTTP-level predicate would call non-retryable. The permanence of THIS
+	// category is asserted where it is acted on —
+	// TestWorkerAbandonsAPermanentFailureImmediately in modules/project.
 }
 
 // TestEnsureErrorNeverCarriesTheContainerID is the confidentiality guard.
@@ -176,31 +179,26 @@ func TestEnsureErrorNeverCarriesTheContainerID(t *testing.T) {
 // splits a dashboard series.
 func TestStatusClassification(t *testing.T) {
 	cases := []struct {
-		status    int
-		category  string
-		retryable bool
+		status   int
+		category string
 	}{
-		{http.StatusInternalServerError, "target_5xx", true},
-		{http.StatusBadGateway, "target_5xx", true},
-		{http.StatusTooManyRequests, "target_rate_limited", true},
-		{http.StatusRequestTimeout, "target_timeout", true},
-		{http.StatusUnauthorized, "target_rejected_credential", false},
-		{http.StatusForbidden, "target_rejected_credential", false},
-		// 404 is the shape of "the target has not deployed its ensure endpoint yet",
-		// which is the EXPECTED state until brief precondition P-2 lands. It is not
-		// retryable in the status sense, and the worker retries it anyway under its own
-		// bounded budget — the distinct label is what makes the two situations
-		// separable on a dashboard.
-		{http.StatusNotFound, "target_no_ensure_endpoint", false},
-		{http.StatusBadRequest, "target_4xx", false},
-		{http.StatusConflict, "target_4xx", false},
+		{http.StatusInternalServerError, "target_5xx"},
+		{http.StatusBadGateway, "target_5xx"},
+		{http.StatusTooManyRequests, "target_rate_limited"},
+		{http.StatusRequestTimeout, "target_timeout"},
+		{http.StatusUnauthorized, "target_rejected_credential"},
+		{http.StatusForbidden, "target_rejected_credential"},
+		// 404 gets its own label because it is the shape of "the target has not deployed
+		// its ensure endpoint yet" — the EXPECTED state until brief precondition P-2
+		// lands — and the worker retries it deliberately. Separating it from target_5xx
+		// is what lets a dashboard tell "not shipped yet" from "shipped and broken".
+		{http.StatusNotFound, "target_no_ensure_endpoint"},
+		{http.StatusBadRequest, "target_4xx"},
+		{http.StatusConflict, "target_4xx"},
 	}
 	for _, tc := range cases {
 		if got := statusCategory(tc.status); got != tc.category {
 			t.Errorf("statusCategory(%d) = %q, want %q", tc.status, got, tc.category)
-		}
-		if got := statusRetryable(tc.status); got != tc.retryable {
-			t.Errorf("statusRetryable(%d) = %v, want %v", tc.status, got, tc.retryable)
 		}
 	}
 }
@@ -273,6 +271,16 @@ func TestValidateTarget(t *testing.T) {
 		// A bare origin is nearly always a truncated env value.
 		{"origin_only", Target{Name: "fleet", EnsureURL: "https://fleet.internal", Secret: testSecret}, true},
 		{"root_path", Target{Name: "fleet", EnsureURL: "https://fleet.internal/", Secret: testSecret}, true},
+		// A query string travels OUTSIDE the MAC — CanonicalRequest signs the path only —
+		// so `?tenant=A` is unauthenticated and an on-path rewrite still verifies.
+		{"query", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure?tenant=A", Secret: testSecret}, true},
+		// The bare trailing "?" form: RawQuery is empty but the separator survives onto
+		// the wire, so ForceQuery has to be checked too.
+		{"force_query", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure?", Secret: testSecret}, true},
+		{"fragment", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure#frag", Secret: testSecret}, true},
+		// Host alone keeps the ":port", so a host-less URL with a port would pass a
+		// `Host != ""` check; Hostname() is what actually rejects it.
+		{"port_without_host", Target{Name: "fleet", EnsureURL: "http://:8080/ensure", Secret: testSecret}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -309,8 +317,11 @@ func TestEnsureRejectsAnIncompleteRequest(t *testing.T) {
 	}
 }
 
-// TestEnsureCancelledContextIsNotRetryable stops a shutdown from burning a retry.
-func TestEnsureCancelledContextIsNotRetryable(t *testing.T) {
+// TestEnsureCancelledContextIsClassified pins that a shutdown produces a typed error
+// rather than a bare one, so the worker labels the attempt instead of reporting
+// "unclassified". It is not treated specially beyond that: `attempts` was already
+// incremented at claim, so there is nothing to save, and the row simply stays pending.
+func TestEnsureCancelledContextIsClassified(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(EnsureResponse{ContainerID: "octows-deadbeef"})
 	}))
@@ -323,11 +334,97 @@ func TestEnsureCancelledContextIsNotRetryable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error on a cancelled context")
 	}
-	if Retryable(err) {
-		t.Error("a cancelled parent context must not be retryable: the worker is shutting down")
-	}
 	var ensureErr *EnsureError
 	if !errors.As(err, &ensureErr) {
 		t.Fatalf("error is not an *EnsureError: %T", err)
+	}
+	if Category(err) != "transport_failed" {
+		t.Errorf("category = %q, want transport_failed", Category(err))
+	}
+}
+
+// TestConformanceVectorsMatchTheImplementation is the anti-drift pin.
+//
+// The vectors are literal hex because a receiver in another repository cannot import this
+// package and has to copy them. That copy is only worth anything if the literals still
+// describe what Sign produces, so every signature is recomputed here from the vector's own
+// inputs. A published vector that has drifted from the code is worse than no vector: it
+// sends the other team chasing a mismatch that is ours.
+func TestConformanceVectorsMatchTheImplementation(t *testing.T) {
+	vectors := ConformanceVectors()
+	if len(vectors) != 4 {
+		t.Fatalf("expected 4 vectors, got %d", len(vectors))
+	}
+	seen := map[string]bool{}
+	for _, v := range vectors {
+		if seen[v.Name] {
+			t.Errorf("duplicate vector name %q; names are cross-repo identifiers", v.Name)
+		}
+		seen[v.Name] = true
+
+		// The secret the signature was produced WITH is not always v.Secret — that is the
+		// point of wrong_secret — so pick it per vector rather than assuming.
+		signingSecret := v.Secret
+		signedBody := v.Body
+		switch v.Name {
+		case "wrong_secret":
+			signingSecret = conformanceOtherSecret
+		case "tampered_body":
+			// Signed over the ORIGINAL body, delivered with the tampered one.
+			signedBody = conformanceBody
+		}
+		want := cardactiondispatch.Sign(signingSecret, v.Method, v.Path, v.Timestamp, v.EventID, []byte(signedBody))
+		if v.Signature != want {
+			t.Errorf("vector %q signature drifted:\n have %s\n want %s", v.Name, v.Signature, want)
+		}
+	}
+}
+
+// TestConformanceVectorsExerciseEveryEnforceableClause keeps the set honest.
+//
+// Three clauses are checkable from outside (authentication, integrity, freshness) and each
+// needs at least one vector that must be REFUSED, plus one that must be accepted so a
+// receiver that refuses everything cannot pass. Idempotency is deliberately not covered:
+// it takes two deliveries and a state assertion, so it is a review item rather than a
+// vector.
+func TestConformanceVectorsExerciseEveryEnforceableClause(t *testing.T) {
+	byName := map[string]ConformanceVector{}
+	accepted, refused := 0, 0
+	for _, v := range ConformanceVectors() {
+		byName[v.Name] = v
+		if v.MustAccept {
+			accepted++
+		} else {
+			refused++
+		}
+	}
+	for _, required := range []string{"valid", "stale_timestamp", "tampered_body", "wrong_secret"} {
+		if _, ok := byName[required]; !ok {
+			t.Errorf("vector %q is missing; it covers a clause nothing else does", required)
+		}
+	}
+	if accepted == 0 {
+		t.Error("no vector must be accepted; a receiver that refuses everything would pass")
+	}
+	if refused < 3 {
+		t.Errorf("only %d refusal vectors; authentication, integrity and freshness each need one", refused)
+	}
+	// The freshness vector must be OUTSIDE the documented window, or it proves nothing.
+	stale := byName["stale_timestamp"]
+	var ts int64
+	if _, err := fmt.Sscanf(stale.Timestamp, "%d", &ts); err != nil {
+		t.Fatalf("stale vector timestamp %q is not an integer", stale.Timestamp)
+	}
+	if stale.NowUnix-ts <= MaxSkewSeconds {
+		t.Errorf("stale vector is only %ds old but the window is %ds; it would legitimately be accepted",
+			stale.NowUnix-ts, MaxSkewSeconds)
+	}
+	// And the baseline must be INSIDE it, or "valid" is not valid.
+	valid := byName["valid"]
+	if _, err := fmt.Sscanf(valid.Timestamp, "%d", &ts); err != nil {
+		t.Fatalf("valid vector timestamp %q is not an integer", valid.Timestamp)
+	}
+	if valid.NowUnix-ts > MaxSkewSeconds {
+		t.Errorf("the baseline vector is %ds old, outside the %ds window", valid.NowUnix-ts, MaxSkewSeconds)
 	}
 }

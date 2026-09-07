@@ -50,6 +50,34 @@ type provisionEnsurer interface {
 	Ensure(ctx context.Context, target projectprovision.Target, req projectprovision.EnsureRequest) (projectprovision.EnsureResponse, error)
 }
 
+// permanentProvisioningOutcomes are the failure categories that another attempt cannot
+// repair, so a row carrying one goes straight to `abandoned` instead of consuming its
+// whole retry budget.
+//
+// The set is deliberately SMALL, and the boundary is "is our own request wrong, or did
+// the receiver disagree about which resource this is". Everything else keeps the bounded
+// retry, including 4xx: a 404 is what a target that has not deployed its ensure endpoint
+// looks like (the expected state until precondition P-2 lands) and a 401 is what a
+// rotated secret looks like — both become 200 after a deployment on the other side, with
+// nothing changing here, so abandoning them would turn a self-healing situation into one
+// needing a manual requeue.
+//
+//   - container_id_mismatch: the target answered with a different id, so our mapping row
+//     points at a container nobody owns. Retrying cannot repair that, and it re-calls the
+//     target every time; it needs a human to work out which side generated the id.
+//   - invalid_request: the row is missing an identifying field, which means the enqueue
+//     side is broken.
+//   - encode_failed: a code defect in our own marshalling.
+var permanentProvisioningOutcomes = map[string]bool{
+	"container_id_mismatch": true,
+	"invalid_request":       true,
+	"encode_failed":         true,
+}
+
+func isPermanentProvisioningOutcome(outcome string) bool {
+	return permanentProvisioningOutcomes[outcome]
+}
+
 // newProvisionClient builds the single outbound client.
 //
 // It lives here rather than inline in New() so that api.go — the file that carries
@@ -177,12 +205,55 @@ func (p *Project) processProvisioningJobs() {
 	}()
 
 	targets := p.enabledProvisioningTargetNames()
+	if len(targets) == 0 {
+		return
+	}
+	// One goroutine per target, each with its own share of the batch.
+	//
+	// A single shared loop over `target IN (...)` let one unhealthy target starve the
+	// other, and the client's short timeout does NOT prevent that — the arithmetic was
+	// simply wrong. With fleet down and a due backlog, every one of a 20-row batch costs
+	// the full 10s timeout, so a batch runs for up to 200s; provisioningRunning makes
+	// every 15s tick in that window a no-op, so healthy drive rows wait behind fleet's
+	// timeouts for minutes.
+	//
+	// A per-target quota alone would only BOUND that wait. Separate goroutines remove it:
+	// each target advances at its own pace and an unhealthy one delays nobody. Two
+	// targets means at most two goroutines, so this is a fixed, tiny fan-out — not the
+	// per-uid fan-out modules/space had to walk back.
+	perTarget := p.cfg.Provisioning.BatchSize / len(targets)
+	if perTarget < 1 {
+		perTarget = 1
+	}
 	maxAttempts := p.cfg.Provisioning.MaxAttempts
-	for processed := 0; processed < p.cfg.Provisioning.BatchSize; processed++ {
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			// Per-goroutine recovery: a panic here would otherwise take down the process,
+			// because the batch-level recover is on a different goroutine's stack.
+			defer func() {
+				if r := recover(); r != nil {
+					p.Error("project provisioning target batch panicked",
+						zap.Any("recover", r), zap.String("target", target))
+				}
+			}()
+			p.runProvisioningBatchForTarget(target, perTarget, maxAttempts)
+		}(target)
+	}
+	wg.Wait()
+}
+
+// runProvisioningBatchForTarget claims and runs up to `limit` rows for one target.
+func (p *Project) runProvisioningBatchForTarget(target string, limit int, maxAttempts uint32) {
+	only := []string{target}
+	for processed := 0; processed < limit; processed++ {
 		owner := newProvisioningClaimOwner()
-		job, err := p.db.claimProvisioningJob(owner, targets, maxAttempts, time.Now().UTC())
+		job, err := p.db.claimProvisioningJob(owner, only, maxAttempts, time.Now().UTC())
 		if err != nil {
-			p.Error("claim project provisioning job failed", zap.Error(err))
+			p.Error("claim project provisioning job failed",
+				zap.String("target", target), zap.Error(err))
 			return
 		}
 		if job == nil {
@@ -293,15 +364,24 @@ const provisioningContainerName = "octo-project"
 func (p *Project) releaseOrAbandon(job *provisioningJob, owner, outcome string, cause error) {
 	now := time.Now().UTC()
 	observeProvisioningAttempt(job.Target, outcome)
-	if job.Attempts >= p.cfg.Provisioning.MaxAttempts {
+	permanent := isPermanentProvisioningOutcome(outcome)
+	if permanent || job.Attempts >= p.cfg.Provisioning.MaxAttempts {
+		reason := "retries exhausted"
+		if permanent {
+			// Short-circuited on the FIRST attempt. Spending ~23 minutes and a dozen more
+			// calls to reach the same terminal state would only delay the alert and keep
+			// hitting a target that already told us the answer.
+			reason = "permanent failure"
+		}
 		// Error, and on purpose it fires once per row rather than once per tick:
 		// abandoned has NO automatic re-drive. Once the target's precondition (brief
 		// P-2, a service identity) lands, these rows need a deliberate requeue.
-		p.Error("project provisioning abandoned after exhausting retries; no automatic re-drive, needs a requeue",
+		p.Error("project provisioning abandoned; no automatic re-drive, needs a requeue",
 			zap.Uint64("jobId", job.ID), zap.String("target", job.Target),
 			zap.String("projectId", job.ProjectID), zap.String("outcome", outcome),
+			zap.Bool("permanent", permanent),
 			zap.Uint32("attempts", job.Attempts), zap.Error(cause))
-		p.finishProvisioning(job, owner, provisionStatusAbandoned, outcome+": retries exhausted")
+		p.finishProvisioning(job, owner, provisionStatusAbandoned, outcome+": "+reason)
 		return
 	}
 	p.Warn("project provisioning attempt failed; will retry",
@@ -391,12 +471,39 @@ func (p *Project) refreshProvisioningMetrics() {
 		for _, status := range statuses {
 			provisioningRows.WithLabelValues(target, status).Set(float64(observed[target][status]))
 		}
+		// Two corrections here over the first version, both in the direction of
+		// OVER-counting, because this gauge is billed as the reason the slice can ship
+		// before R2/R3 — a security surface measurement that under-reports is worse than
+		// none.
+		//
+		// 1. `ready + pending + abandoned`, not `ready` alone. The first version argued
+		//    "a pending row has no container on the other side yet", which is not true
+		//    under at-least-once delivery: if the receiver creates the container and the
+		//    response is lost, the container exists while the row stays pending and may
+		//    later go abandoned. The module already said so elsewhere —
+		//    markProvisioningDisbandPendingTx explains that abandoned rows "record 'we
+		//    never confirmed a container', but we may well have created one and failed to
+		//    record it". Both statements could not be right.
+		//
+		//    disband_pending is still excluded, and that exclusion is a choice rather
+		//    than the same mistake: those containers are explicitly enumerated for
+		//    reclaim, and they remain visible as provisioning_rows{status=
+		//    "disband_pending"} for anyone who wants total-ever-created.
+		//
+		// 2. An UNCONFIGURED target counts as not narrowed. The first version zeroed the
+		//    gauge whenever the target was absent from cfg.Targets — so the documented
+		//    rollback (clear OCTO_PROJECT_PROVISION_TARGETS) made the exposure read 0
+		//    while every container still existed and was still unnarrowed. Narrowing is a
+		//    property of the SUBSYSTEM, not of whether we are currently talking to it.
+		narrowed := false
+		if t, ok := p.cfg.Provisioning.TargetByName(target); ok {
+			narrowed = t.Narrowed
+		}
 		unnarrowed := 0.0
-		if t, ok := p.cfg.Provisioning.TargetByName(target); ok && !t.Narrowed {
-			// `ready` only. A pending row has no container on the other side yet, and a
-			// disband_pending one is already slated for reclaim, so counting either
-			// would overstate the exposed surface.
-			unnarrowed = float64(observed[target]["ready"])
+		if !narrowed {
+			unnarrowed = float64(observed[target]["ready"] +
+				observed[target]["pending"] +
+				observed[target]["abandoned"])
 		}
 		provisioningUnnarrowedContainers.WithLabelValues(target).Set(unnarrowed)
 	}

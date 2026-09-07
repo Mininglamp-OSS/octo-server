@@ -706,8 +706,11 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// local check, and one leaked value would then authorize BOTH provisioning a
 		// container into fleet/drive AND minting that route's card action.
 		//
-		// modules/project/main_wiring_test.go asserts both arguments stay present so a
-		// refactor cannot drop them silently.
+		// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions in
+		// modules/project/provisioning_guard_test.go asserts both arguments stay present
+		// so a refactor cannot drop them silently. (This pointer exists so a future
+		// refactorer can find the guard — an earlier version named a file that does not
+		// exist, which defeats the only purpose the comment has.)
 		os.Getenv(project.ProvisionFleetSecretEnv),
 		os.Getenv(project.ProvisionDriveSecretEnv),
 	); err != nil {

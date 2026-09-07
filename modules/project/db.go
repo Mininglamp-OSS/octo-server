@@ -181,15 +181,21 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 	}
 	// Mark this project's subsystem containers reclaimable, in the same transaction.
 	//
-	// Here rather than in the service layer because this function is the SINGLE choke
-	// point for every disband in the module — the Space cascade and the ownerless path
-	// both route through it — so the transition is structural instead of a rule each
-	// caller has to remember. Teardown stays PULL-based (D9): nothing is sent outbound,
-	// and the subsystem learns by asking POST /v1/internal/projects/status.
+	// Here rather than in the service layer so that the transition is structural — every
+	// present and FUTURE disband path picks it up by construction instead of each caller
+	// having to remember. Today that is one caller (disbandProjectOnce); the Space-removal
+	// cascade only closes seats and the ownerless case is a recorded, deliberately
+	// unresolved end state, so this is where a future cascade would land rather than a
+	// junction that already exists. An earlier version of this comment claimed both
+	// already routed through here, which a reader would grep for and not find.
 	//
-	// LAST of the two, deliberately: octo_project_provisioning is the final lock this
-	// transaction acquires, which is what keeps the declared order intact now that P1's
-	// removal-job retirement shares the same tail.
+	// Teardown stays PULL-based (D9): nothing is sent outbound, and the subsystem learns
+	// by asking POST /v1/internal/projects/status.
+	//
+	// LAST of the two writes in this function, deliberately: octo_project_provisioning is
+	// the final lock this transaction acquires. That mattered less when this was the only
+	// tail statement; now that P1's removal-job retirement shares the same position, the
+	// order is what keeps the declared lock order intact.
 	if err := d.markProvisioningDisbandPendingTx(tx, projectID, now); err != nil {
 		return 0, err
 	}

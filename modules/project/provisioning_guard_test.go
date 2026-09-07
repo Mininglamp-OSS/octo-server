@@ -308,6 +308,12 @@ func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
 // real leak — and does not produce a false one either.
 func TestNoLogFieldCarriesTheContainerID(t *testing.T) {
 	zapField := regexp.MustCompile(`zap\.[A-Za-z]+\([^()]*[Cc]ontainer`)
+	// The by-name check above cannot see a REFLECTIVE leak: zap.Any("job", job) serialises
+	// provisioningJob.ContainerID with no "container" anywhere in the call text. So any
+	// whole-struct logging of a provisioning job is banned outright — there is no
+	// legitimate need for it, and the field-by-field form is what keeps the guard above
+	// meaningful.
+	reflective := regexp.MustCompile(`zap\.(Any|Reflect|Inline|Object)\([^()]*\b(job|provisioningJob|row|vector)\b`)
 	examined := 0
 	for _, f := range moduleSourceFiles(t) {
 		cleaned := readStripped(t, f)
@@ -317,6 +323,11 @@ func TestNoLogFieldCarriesTheContainerID(t *testing.T) {
 		if m := zapField.FindString(cleaned); m != "" {
 			t.Errorf("modules/project/%s logs a container id (%q). Until the target narrows "+
 				"authorization by Project, the id is the only thing protecting the container.", f, m)
+		}
+		if m := reflective.FindString(cleaned); m != "" {
+			t.Errorf("modules/project/%s logs a whole struct that may carry a container id (%q). "+
+				"zap.Any/Reflect serialises every field, so it walks straight past the "+
+				"by-name guard — log the fields you need instead.", f, m)
 		}
 	}
 	if examined == 0 {
@@ -344,9 +355,18 @@ func TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions(t *testin
 		t.Fatal("main.go no longer calls registry.ValidateNotifyTokenExclusions; if the call moved, " +
 			"move this guard's target too — the invariant still matters")
 	}
-	for _, want := range []string{"project.ProvisionFleetSecretEnv", "project.ProvisionDriveSecretEnv"} {
-		if !strings.Contains(args, want) {
-			t.Errorf("main.go: ValidateNotifyTokenExclusions(...) no longer includes %s.\nArgs:\n%s", want, args)
+	// Match the os.Getenv(...) WRAPPER, not just the constant. The constant is the env
+	// NAME; the exclusion check needs the env VALUE. A bare
+	// `project.ProvisionFleetSecretEnv` would satisfy a substring match while comparing
+	// the literal string "OCTO_PROJECT_PROVISION_FLEET_SECRET" against the notify tokens —
+	// i.e. the guard would be green and the check would be doing nothing.
+	for _, want := range []string{
+		"os.Getenv(project.ProvisionFleetSecretEnv)",
+		"os.Getenv(project.ProvisionDriveSecretEnv)",
+	} {
+		if !strings.Contains(strings.Join(strings.Fields(args), ""), strings.ReplaceAll(want, " ", "")) {
+			t.Errorf("main.go: ValidateNotifyTokenExclusions(...) no longer includes %s "+
+				"(the env VALUE, not just its name).\nArgs:\n%s", want, args)
 		}
 	}
 }

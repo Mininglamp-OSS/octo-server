@@ -118,6 +118,32 @@ const (
 	defaultProvisionBatch = 20
 )
 
+// maxProvisionAttemptsCeiling bounds OCTO_PROJECT_PROVISION_MAX_ATTEMPTS.
+//
+// A ceiling exists because the value is cast to uint32 and an UNBOUNDED int cast is a
+// silent kill switch: envPositiveIntFrom only rejects n <= 0, so
+// OCTO_PROJECT_PROVISION_MAX_ATTEMPTS=4294967296 parses as a positive int and becomes
+// uint32(0). Every claim predicate is `attempts < 0`, so the entire slice turns into a
+// no-op from the first tick with no misconfiguration signal anywhere. Reported and
+// refused now rather than clamped silently — a value an operator typed and we then
+// ignored is worse than one we rejected out loud.
+//
+// 50 rather than something larger: past ~11 attempts every backoff step is already the
+// 5-minute cap, so a bigger budget buys linear delay and nothing else, while the whole
+// argument for a SHORT budget is that exhaustion is a real alert (see
+// defaultProvisionMaxAttempts).
+const maxProvisionAttemptsCeiling = 50
+
+// maxProvisionTimeoutFraction is how much of the lease one ensure call may consume.
+//
+// This is the enforcement of a relationship that used to be only a comment. There is
+// deliberately NO lease heartbeat (see provisioningLease), so nothing can extend a lease
+// while a call is in flight — which means a Timeout at or above the lease lets another
+// replica legitimately re-claim and run the SAME row concurrently, and lets the sweep
+// write `abandoned` underneath a still-running executor. A quarter keeps the documented
+// ~10x headroom for the 10s default while leaving room for an operator to raise it.
+const maxProvisionTimeoutFraction = 4
+
 // provisionTarget is one resolved destination plus the two facts about it that
 // are octo-server's own: whether it is enabled, and whether it has declared
 // Project narrowing.
@@ -185,18 +211,32 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 	if getenv == nil {
 		getenv = os.Getenv
 	}
+	// Knob validation runs FIRST and unconditionally, before the target list is even
+	// read. Two of these values are load-bearing for the retry state machine rather than
+	// mere tuning, and an out-of-range value has to be refused with a reason whether or
+	// not any target happens to be enabled today — otherwise the misconfiguration is
+	// discovered the day someone turns a target on.
+	var problems []error
+	maxAttempts, attemptsErr := parseMaxAttempts(getenv)
+	if attemptsErr != nil {
+		problems = append(problems, attemptsErr)
+	}
+	timeout, timeoutErr := parseProvisionTimeout(getenv)
+	if timeoutErr != nil {
+		problems = append(problems, timeoutErr)
+	}
 	cfg := ProvisioningConfig{
 		Interval:    envDurationFrom(getenv, envProvisionInterval, defaultProvisionInterval),
-		Timeout:     envDurationFrom(getenv, envProvisionTimeout, defaultProvisionTimeout),
-		MaxAttempts: uint32(envPositiveIntFrom(getenv, envProvisionMaxAttempts, int(defaultProvisionMaxAttempts))),
+		Timeout:     timeout,
+		MaxAttempts: maxAttempts,
 		BatchSize:   envPositiveIntFrom(getenv, envProvisionBatch, defaultProvisionBatch),
 	}
 	requested := parseTargetList(getenv(envProvisionTargets))
 	if len(requested) == 0 {
-		return cfg, nil
+		cfg.Problems = problems
+		return cfg, problems
 	}
 
-	var problems []error
 	secrets := map[string]string{}
 	for _, name := range requested {
 		urlEnv, secretEnv, narrowedEnv, ok := targetEnvNames(name)
@@ -230,6 +270,48 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 	}
 	cfg.Problems = problems
 	return cfg, problems
+}
+
+// parseMaxAttempts resolves the retry budget, refusing a value outside
+// [1, maxProvisionAttemptsCeiling] instead of casting it into a silent no-op.
+//
+// Returns the DEFAULT plus an error on a bad value. Falling back is right — a broken
+// knob must not disable a security-adjacent control — but falling back SILENTLY is what
+// made the uint32 wrap invisible, so the error is what the caller reports.
+func parseMaxAttempts(getenv func(string) string) (uint32, error) {
+	raw := strings.TrimSpace(getenv(envProvisionMaxAttempts))
+	if raw == "" {
+		return defaultProvisionMaxAttempts, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > maxProvisionAttemptsCeiling {
+		return defaultProvisionMaxAttempts, fmt.Errorf(
+			"project provisioning: %s must be an integer in [1, %d]; using the default %d",
+			envProvisionMaxAttempts, maxProvisionAttemptsCeiling, defaultProvisionMaxAttempts)
+	}
+	return uint32(n), nil
+}
+
+// parseProvisionTimeout resolves the per-call timeout, refusing anything that is not
+// comfortably below the lease.
+//
+// The relationship is a correctness constraint, not a preference: with no heartbeat, a
+// call that outlives its lease gets a second executor on the same row and can be marked
+// `abandoned` while it is still running.
+func parseProvisionTimeout(getenv func(string) string) (time.Duration, error) {
+	raw := strings.TrimSpace(getenv(envProvisionTimeout))
+	if raw == "" {
+		return defaultProvisionTimeout, nil
+	}
+	d, err := time.ParseDuration(raw)
+	ceiling := provisioningLease / maxProvisionTimeoutFraction
+	if err != nil || d <= 0 || d > ceiling {
+		return defaultProvisionTimeout, fmt.Errorf(
+			"project provisioning: %s must be a positive duration at most %s (a quarter of the %s lease, "+
+				"which cannot be extended because there is no heartbeat); using the default %s",
+			envProvisionTimeout, ceiling, provisioningLease, defaultProvisionTimeout)
+	}
+	return d, nil
 }
 
 // checkSecretExclusivity refuses a secret that is reused across targets or shared

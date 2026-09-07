@@ -12,8 +12,18 @@
 -- 为什么不用 internal/cardactiondispatch 的 Redis 队列：那不是写项目行的同一个存储，
 -- 入队与提交之间会出现丢失或孤儿。形状抄的是
 -- modules/space/sql/20260821000001_space_member_removal_cleanup.sql，并带上 P1 记下的
--- 三处修正：时间列全部由应用侧写 UTC（禁 NOW() / ON UPDATE）、租约有心跳、
--- 终态清理有自己的 (status, finished_at) 索引。
+-- 修正：时间列全部由应用侧写 UTC（不设 MySQL 侧默认值）、终态清理有自己的
+-- (status, finished_at) 索引。
+--
+-- ⚠️ **没有租约心跳，这是有意的。** 本文件的早期版本（和 brief D2）声称有心跳，而代码里
+-- 从来没有 —— lease_until 只在认领时写入、在释放/终态时置 NULL，中间没有任何东西续约。
+-- 心跳是给长作业准备的机械结构；本作业的全部成本是一次有界的出网调用（默认 10s），
+-- 为它加一个续约循环是拿复杂度换一个不存在的问题。
+-- 取而代之的是把那条关系变成**可执行的校验**：OCTO_PROJECT_PROVISION_TIMEOUT 在配置
+-- 加载期被限制为不超过租约的四分之一（见 config_provisioning.go 的
+-- maxProvisionTimeoutFraction）。既没有心跳又没有这道校验时，一个被配成 10m 的超时会让
+-- 租约在调用进行中过期 —— 另一个副本会合法地重新认领并并发跑同一行，而 sweep 还会在
+-- 执行者仍在运行时把它写成 abandoned。
 --
 -- container_id 是**随机不可推导**的（D1），由 octo-server 在入队时生成，随后作为
 -- 「要创建的容器 id」发给目标子系统。它不是 project_id 的函数，理由是可推导 id 在

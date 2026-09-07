@@ -161,10 +161,9 @@ type EnsureResponse struct {
 // EnsureError carries a low-cardinality category so the worker can label a
 // metric and write a bounded last_error without ever touching the request body.
 type EnsureError struct {
-	Category  string
-	Status    int
-	retryable bool
-	cause     error
+	Category string
+	Status   int
+	cause    error
 }
 
 // Error is deliberately built from the category and the status only. It must stay
@@ -179,17 +178,21 @@ func (e *EnsureError) Error() string {
 
 func (e *EnsureError) Unwrap() error { return e.cause }
 
-// Retryable reports whether another attempt could plausibly succeed. A 4xx other
-// than 408 / 429 is NOT retryable in this sense — but the worker still retries it
-// under its own bounded budget, because "the target has not deployed its ensure
-// endpoint yet" presents as 404 and is expected to become 200 without anything on
-// this side changing. What this flag buys is a distinct metric label, so a
-// permanent contract break is visible on the first attempt instead of at
-// attempt-exhaustion an hour later.
-func Retryable(err error) bool {
-	var ensureErr *EnsureError
-	return errors.As(err, &ensureErr) && ensureErr.retryable
-}
+// There is deliberately NO Retryable predicate here, and the absence is a decision.
+//
+// An earlier version exported one, defined as "the status alone justifies another
+// attempt", and nothing consumed it — the worker classified on Category and the flag was
+// computed and discarded. The abstraction was wrong rather than merely unused: the worker
+// deliberately RETRIES two statuses that predicate calls non-retryable, because 404 is
+// what "the target has not deployed its ensure endpoint yet" looks like and 401 is what a
+// rotated secret looks like, and both become 200 after a deployment on the other side
+// with nothing changing here. Meanwhile the failures that genuinely must not be retried
+// are identified by their CATEGORY, not by an HTTP status (container_id_mismatch,
+// invalid_request, encode_failed).
+//
+// So the retry decision lives entirely in the worker, keyed on Category — see
+// isPermanentProvisioningOutcome in modules/project/provisioning_worker.go. Keeping a
+// predicate no caller should use is worse than not having one.
 
 // Category extracts the low-cardinality failure label, or "" for a non-ensure
 // error. Metric label values come from here so they can never be a free-form
@@ -209,15 +212,24 @@ func Category(err error) string {
 // a credential into every log line that prints the URL. A path is required
 // because a bare origin almost always means a truncated env value.
 //
-// What it deliberately does NOT do is reject private, loopback or link-local hosts
-// (169.254.169.254 and friends). Recorded as an ACCEPTED posture rather than left as
-// an omission a reader has to guess about: the destination is a deploy-time operator
-// value, not user input, so there is no untrusted party choosing it, and both real
-// targets are in-cluster services on private addresses — a private-range denylist
-// would reject every legitimate configuration. This is the same posture as
-// pkg/octosign, whose route URLs are operator-registered for the same
-// reason. It would have to change if an ensure URL ever became something a tenant
-// could influence.
+// Two things it deliberately does NOT do, both ACCEPTED postures rather than omissions
+// a reader has to guess about:
+//
+//   - It does not reject private, loopback or link-local hosts (169.254.169.254 and
+//     friends). The destination is a deploy-time operator value, not user input, so
+//     there is no untrusted party choosing it, and both real targets are in-cluster
+//     services on private addresses — a private-range denylist would reject every
+//     legitimate configuration. Same posture as internal/cardactiondispatch, whose
+//     route URLs are operator-registered for the same reason. It would have to change
+//     if an ensure URL ever became something a tenant could influence.
+//   - It permits `http://`. Reviewed and accepted deliberately (2026-09-07): both
+//     targets are in-cluster, and requiring TLS would block the ordinary in-cluster
+//     deployment. The cost is stated rather than hidden: on a plaintext link, an
+//     on-path observer inside the cluster sees the container id — which is a capability
+//     until R2/R3 land — and captures a replayable signed request. That is precisely
+//     why the receiver's timestamp-freshness clause below is a MUST and why the
+//     conformance vectors exist: with TLS declined, the receiver-side check is the layer
+//     that has to actually work.
 func ValidateTarget(t Target) error {
 	if strings.TrimSpace(t.Name) == "" {
 		return errors.New("projectprovision: target name required")
@@ -234,7 +246,10 @@ func ValidateTarget(t Target) error {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("projectprovision: %s ensure url must be http or https", t.Name)
 	}
-	if parsed.Host == "" {
+	// Hostname(), not Host: Host keeps the ":port", so "http://:8080/ensure" would pass a
+	// Host != "" check while having no host at all. Same reasoning as
+	// cardactiondispatch.validateCallbackURL.
+	if parsed.Hostname() == "" || parsed.Opaque != "" {
 		return fmt.Errorf("projectprovision: %s ensure url has no host", t.Name)
 	}
 	if parsed.User != nil {
@@ -242,6 +257,21 @@ func ValidateTarget(t Target) error {
 	}
 	if parsed.EscapedPath() == "" || parsed.EscapedPath() == "/" {
 		return fmt.Errorf("projectprovision: %s ensure url must include the ensure path", t.Name)
+	}
+	// A query string would travel OUTSIDE the MAC, so it is refused rather than
+	// tolerated. CanonicalRequest signs the PATH only, while the request is issued
+	// against the full URL — so `?tenant=A` is unauthenticated and an on-path rewrite to
+	// `?tenant=B` still verifies. cardactiondispatch rejects the same thing for the same
+	// signing scheme; reusing the format without reusing this restriction is what left
+	// the gap. ForceQuery covers the bare "trailing ?" form, where RawQuery is empty but
+	// the separator survives onto the wire.
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		return fmt.Errorf("projectprovision: %s ensure url must not contain a query", t.Name)
+	}
+	// A fragment is never sent, so one in configuration means the value was pasted from
+	// somewhere it did not belong.
+	if parsed.Fragment != "" {
+		return fmt.Errorf("projectprovision: %s ensure url must not contain a fragment", t.Name)
 	}
 	return nil
 }
@@ -332,14 +362,11 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 
 	response, err := c.client.Do(httpReq)
 	if err != nil {
-		// Retryable only when the deadline we imposed (or the caller's) has not
-		// already fired: a cancelled parent context means the worker is shutting
-		// down, and reporting that as retryable would burn an attempt on it.
-		return EnsureResponse{}, &EnsureError{
-			Category:  "transport_failed",
-			retryable: ctx.Err() == nil,
-			cause:     err,
-		}
+		// A cancelled parent context (worker shutdown) lands here too, and is
+		// deliberately not distinguished: `attempts` was already incremented at claim,
+		// so nothing is saved by labelling it differently, and the row simply stays
+		// pending for the next tick to pick up.
+		return EnsureResponse{}, &EnsureError{Category: "transport_failed", cause: err}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
@@ -347,15 +374,14 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		// an error body from an unnarrowed target is not something we want in a log.
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
 		return EnsureResponse{}, &EnsureError{
-			Category:  statusCategory(response.StatusCode),
-			Status:    response.StatusCode,
-			retryable: statusRetryable(response.StatusCode),
+			Category: statusCategory(response.StatusCode),
+			Status:   response.StatusCode,
 		}
 	}
 	var out EnsureResponse
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes))
 	if err := decoder.Decode(&out); err != nil {
-		return EnsureResponse{}, &EnsureError{Category: "invalid_response", retryable: true, cause: err}
+		return EnsureResponse{}, &EnsureError{Category: "invalid_response", cause: err}
 	}
 	if out.ContainerID != req.ContainerID {
 		// Fail loudly and permanently. A target that answers with a different id
@@ -397,12 +423,4 @@ func statusCategory(status int) string {
 	default:
 		return "target_4xx"
 	}
-}
-
-// statusRetryable reports whether the status alone justifies another attempt.
-// See Retryable for why the worker retries some non-retryable statuses anyway.
-func statusRetryable(status int) bool {
-	return status >= 500 ||
-		status == http.StatusRequestTimeout ||
-		status == http.StatusTooManyRequests
 }

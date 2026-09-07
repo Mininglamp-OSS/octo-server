@@ -97,11 +97,17 @@ func (d *DB) enqueueProvisioningTx(tx *dbr.Tx, projectID, spaceID string, target
 // markProvisioningDisbandPendingTx moves every non-terminal row of a project to
 // disband_pending, inside the disband transaction.
 //
-// Called from disbandProjectTx rather than from the service layer on purpose: that
-// DAO function is the single choke point for every disband in this module (the
-// Space cascade and the ownerless path both route through it), so putting the
-// transition there makes "any disband marks its containers reclaimable" structural
-// instead of a rule each caller has to remember.
+// Called from disbandProjectTx rather than from the service layer on purpose: putting the
+// transition in the DAO makes "any disband marks its containers reclaimable" structural,
+// so a future disband path inherits it instead of having to remember. On this base that
+// DAO function has exactly one caller (disbandProjectOnce) — the Space-removal cascade
+// only closes seats and the ownerless case is a recorded, unresolved end state — so the
+// claim is about where a future path would land, not about a junction that exists today.
+//
+// A related gap worth recording where someone will find it: no path disbands a project
+// when its SPACE is disbanded, so a project in a dead Space keeps its `ready` rows and
+// its containers are never marked reclaimable. D9's pull-based reclaim has no answer for
+// that today; it belongs to the Space-cascade work, not to this slice.
 //
 // abandoned rows move too. They record "we never confirmed a container", but we may
 // well have created one and failed to record it, so they are exactly as reclaimable
@@ -266,8 +272,26 @@ func (d *DB) releaseProvisioningJob(id uint64, owner string, attempts uint32, la
 // its own finish would then land on nothing and leave only a misleading
 // "lease changed hands" line.
 //
-// lease_until IS NOT NULL is required as well, so a row that was never claimed is
-// not swept.
+// The lease predicate is `IS NULL OR <= grace`, and the NULL arm is the fix for a real
+// zombie rather than defensive breadth. releaseProvisioningJob NULLs lease_until on every
+// retry, so the resting state of a retrying row is (pending, attempts = k, lease_until
+// NULL). Require IS NOT NULL here and that row is unsweepable; claiming needs
+// attempts < max, so if max is ever observed as m <= k the row is unclaimable too — it
+// then sits pending forever with no retry, no terminal state, no gauge and no log, and
+// the only visible symptom is a rising `pending` count that the runbook tells the
+// on-call means "the target is not responding". Reachable by lowering
+// OCTO_PROJECT_PROVISION_MAX_ATTEMPTS during an incident, and (before parseMaxAttempts
+// existed) by an out-of-range value casting to uint32(0). Exactly the state the
+// claim-side bound and this sweep are documented to prevent.
+//
+// The NULL arm is safe only because max >= 1 is now GUARANTEED at config load
+// (parseMaxAttempts): a never-claimed row has attempts = 0, so `attempts >= max`
+// excludes it. With max = 0 this sweep would abandon the whole table on its first tick,
+// so that validation is a prerequisite of this predicate, not an unrelated tidy-up.
+//
+// A NULL lease also means nobody is executing the row: the claim writes lease_until in
+// the same committed transaction that takes the row, and release/finish only NULL it
+// once the job is done. So there is no executor to write underneath.
 //
 // Two statements, not one UPDATE ... WHERE: `attempts` is in no index, so the only
 // available access path is `status`, and under REPEATABLE READ a single UPDATE would
@@ -277,8 +301,10 @@ func (d *DB) releaseProvisioningJob(id uint64, owner string, attempts uint32, la
 // inside the fail-closed create transaction — so a backlog made project creation fail
 // at random. A non-locking SELECT plus a primary-key UPDATE locks only the named rows.
 //
-// No extra locking is needed against the claim path: claiming requires attempts < max
-// and this requires attempts >= max, so the two predicates cannot select the same row.
+// No extra locking is needed against the claim path WITHIN one replica: claiming requires
+// attempts < max and this requires attempts >= max, so the two predicates cannot select
+// the same row. Across replicas mid-rollout they can disagree about max, which is why the
+// UPDATE below re-checks the predicates instead of trusting the SELECT.
 func (d *DB) abandonExhaustedProvisioningJobs(maxAttempts uint32, now time.Time, limit int) (int64, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -286,7 +312,8 @@ func (d *DB) abandonExhaustedProvisioningJobs(maxAttempts uint32, now time.Time,
 	var ids []uint64
 	if _, err := d.session.SelectBySql(
 		"SELECT id FROM `octo_project_provisioning` "+
-			"WHERE status = ? AND attempts >= ? AND lease_until IS NOT NULL AND lease_until <= ? "+
+			"WHERE status = ? AND attempts >= ? "+
+			"AND (lease_until IS NULL OR lease_until <= ?) "+
 			"LIMIT ?",
 		provisionStatusPending, maxAttempts, now.Add(-provisioningLease), limit,
 	).Load(&ids); err != nil {
@@ -295,11 +322,23 @@ func (d *DB) abandonExhaustedProvisioningJobs(maxAttempts uint32, now time.Time,
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	// The UPDATE re-checks EVERY predicate the SELECT used, not just id and status.
+	//
+	// Dropping them looked safe under the argument that claiming (attempts < max) and
+	// sweeping (attempts >= max) cannot select the same row — but that holds only while
+	// every replica agrees on max, and during a rolling change of
+	// OCTO_PROJECT_PROVISION_MAX_ATTEMPTS they do not. An old replica (max=5) selects an
+	// expired 5-attempt row; before its UPDATE lands, a new replica (max=12) claims it
+	// and starts the outbound call; the old UPDATE then matches on id + status alone,
+	// clears the fresh lease and writes `abandoned` while the call is in flight.
+	// Re-checking is one clause and removes the whole class.
 	result, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_provisioning` "+
 			"SET status = ?, finished_at = ?, lease_owner = '', lease_until = NULL, last_error = ? "+
-			"WHERE id IN ? AND status = ?",
+			"WHERE id IN ? AND status = ? AND attempts >= ? "+
+			"AND (lease_until IS NULL OR lease_until <= ?)",
 		provisionStatusAbandoned, now, "sweep: retries exhausted", ids, provisionStatusPending,
+		maxAttempts, now.Add(-provisioningLease),
 	).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("project: sweep exhausted provisioning jobs: %w", err)

@@ -37,8 +37,10 @@ var (
 	provisioningUnnarrowedContainers = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricNamespace,
 		Name:      "provisioning_unnarrowed_containers",
-		Help: "Containers provisioned into a target that has NOT yet declared it narrows " +
-			"authorization by Project. Protected by the opacity of the container id alone.",
+		Help: "Containers that MAY exist on a target which has not declared it narrows " +
+			"authorization by Project, i.e. protected by the opacity of the container id alone. " +
+			"Deliberately over-counts: ready + pending + abandoned, because a lost response " +
+			"leaves a container that exists behind a row that does not say so.",
 	}, []string{"target"})
 
 	// provisioningTargetMisconfigured is 1 for a target that was requested via
