@@ -2,7 +2,6 @@ package group
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -113,7 +112,6 @@ type IService interface {
 	// 获取用户所有超级群信息
 	GetUserSupers(uid string) ([]*InfoResp, error)
 	// 新增群成员
-	AddMember(model *AddMemberReq) error
 	// 获取指定一批群的指定成员信息
 	GetMembersWithUIDAndGroupIds(uid string, groupNos []string) ([]*MemberResp, error)
 	// 查询一批群的管理员及群主
@@ -376,13 +374,6 @@ func (s *Service) GetUserSupers(uid string) ([]*InfoResp, error) {
 	return infoResps, nil
 }
 
-func (s *Service) AddMember(model *AddMemberReq) error {
-	err := s.db.InsertMember(&MemberModel{
-		GroupNo: model.GroupNo,
-		UID:     model.MemberUID,
-	})
-	return err
-}
 func (s *Service) GetGroupMemberMaxVersion(groupNo string) (int64, error) {
 	version, err := s.db.queryGroupMemberMaxVersion(groupNo)
 	return version, err
@@ -724,12 +715,6 @@ type AddGroupReq struct {
 	Name    string
 }
 
-// AddMemberReq 添加群成员
-type AddMemberReq struct {
-	GroupNo   string
-	MemberUID string
-}
-
 // InfoResp 群信息
 type InfoResp struct {
 	GroupNo             string    `json:"group_no"`               // 群编号
@@ -1005,14 +990,17 @@ func GetGroupMdMaxSize() int {
 
 // CreateGroupServiceReq 创建群请求
 type CreateGroupServiceReq struct {
-	Creator     string   // 创建者 UID
-	Members     []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
-	Name        string   // 群名称（可为空，Service 会自动生成）
-	SpaceID     string   // Space ID（可为空）
-	BotUID      string   // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
-	CategoryID  string   // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText  string   // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int     // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
+	Creator string   // 创建者 UID
+	Members []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
+	Name    string   // 群名称（可为空，Service 会自动生成）
+	SpaceID string   // Space ID（可为空）
+	// ProjectID 群的项目归属（可为空=直属 Space）。非空时群成员受 I2 约束，
+	// 包括创建者自己——他不是该项目成员的话，建群会在准入闸门处被拒。
+	ProjectID   string // 所属项目 ID（可为空）
+	BotUID      string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
+	CategoryID  string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
+	AvatarText  string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
 // CreateGroupServiceResp 创建群响应
@@ -1238,6 +1226,12 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
 	// group_member 的 is_external_* 标记在同一事务内一致（与 ADD / DELETE
 	// 路径对称，bot-only 外部不会 flip 群标记）。
+	// 建群时的项目归属。空串=直属 Space。handler 已校验过它属于同一个 Space
+	// 且项目处于活跃状态；「创建者本人是不是该项目成员」由下面的准入闸门在事务
+	// 内判定，那才是不会过期的判定点。
+	newGroupProjectID := req.ProjectID
+	initialAdmissions := make([]MemberAdmission, 0, len(memberUsers))
+
 	isExternalGroup := 0
 	for _, memberUser := range memberUsers {
 		if memberUser.UID == req.Creator {
@@ -1260,6 +1254,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Version:             version,
 		AllowViewHistoryMsg: int(common.GroupAllowViewHistoryMsgEnabled),
 		SpaceID:             req.SpaceID,
+		ProjectID:           req.ProjectID,
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
 		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,
@@ -1300,27 +1295,32 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			isExt = 1
 			srcSpaceID = sourceSpaceMap[memberUser.UID]
 		}
-		err = s.db.InsertMemberTx(&MemberModel{
-			GroupNo:       groupNo,
+		initialAdmissions = append(initialAdmissions, MemberAdmission{
 			UID:           memberUser.UID,
-			Role:          role,
 			Version:       memberVersion,
+			Role:          role,
 			InviteUID:     req.Creator,
 			Robot:         memberUser.Robot,
-			Status:        int(common.GroupMemberStatusNormal),
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}, tx)
-		if err != nil {
-			s.Error("insert member failed", zap.Error(err), zap.String("uid", memberUser.UID))
-			return nil, errors.New("failed to insert group member")
-		}
+		})
 		realMemberUIDs = append(realMemberUIDs, memberUser.UID)
 		memberVos = append(memberVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
 	}
 	if len(realMemberUIDs) == 0 {
 		return nil, errors.New("no valid member to add")
+	}
+	// 收口到唯一准入口（A3）。newGroupProjectID 来自建群请求的 project_id：
+	// handler 已经校验过它存在、活跃、属于同一个 Space，且调用方在这个 Space 里；
+	// 「调用方是不是这个项目的成员」故意不在那里查，而是由下面这道闸门在**建群
+	// 事务内、持锁状态下**判定——放在 handler 里查是一次会过期的读。
+	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID,
+		initialAdmissions, AdmissionEntryCreateGroup); err != nil {
+		s.Error("insert members failed", zap.Error(err), zap.String("groupNo", groupNo))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("failed to insert group member")
 	}
 
 	// Bot 加入群
@@ -1330,16 +1330,16 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			s.Error("generate bot member version failed", zap.Error(err))
 			return nil, err
 		}
-		err = s.db.InsertMemberTx(&MemberModel{
-			GroupNo:   groupNo,
+		// 收口到唯一准入口（A4）。Bot 走的是与人相同的闸门：只有 pkg/space 白名单
+		// 里的系统 bot 才对项目成员资格豁免，普通 bot 需要显式的项目席位，否则
+		// 「邀请一个 bot」就成了往项目群里塞监听者的旁路。
+		err = s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID, []MemberAdmission{{
 			UID:       req.BotUID,
-			Role:      MemberRoleCommon,
 			Version:   botMemberVersion,
+			Role:      MemberRoleCommon,
 			InviteUID: req.Creator,
 			Robot:     1,
-			Status:    int(common.GroupMemberStatusNormal),
-			Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
-		}, tx)
+		}}, AdmissionEntryCreateGroupBot)
 		if err != nil {
 			s.Error("insert bot member failed", zap.Error(err))
 			// Bot 加入失败不阻断建群
@@ -1556,6 +1556,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 
 	var addedUIDs []string
 	var addedVos []*config.UserBaseVo
+	admissions := make([]MemberAdmission, 0, len(memberUsers))
 	hasNewExternal := false
 	for _, memberUser := range memberUsers {
 		if memberUser.IsDestroy == user.IsDestroyDone {
@@ -1579,31 +1580,15 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			srcSpaceID = sourceSpaceMap[memberUser.UID]
 		}
 
-		// 检查是否之前被删除过（需要恢复）
-		insStart := time.Now()
-		existDelete, _ := s.db.ExistMemberDelete(memberUser.UID, req.GroupNo)
-		newMember := &MemberModel{
-			GroupNo:       req.GroupNo,
+		admissions = append(admissions, MemberAdmission{
 			UID:           memberUser.UID,
-			Role:          MemberRoleCommon,
 			Version:       memberVersion,
-			Status:        int(common.GroupMemberStatusNormal),
+			Role:          MemberRoleCommon,
 			InviteUID:     req.OperatorUID,
 			Robot:         memberUser.Robot,
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}
-		if existDelete {
-			err = s.db.recoverMemberTx(newMember, tx)
-		} else {
-			err = s.db.InsertMemberTx(newMember, tx)
-		}
-		insertMs += time.Since(insStart).Milliseconds()
-		if err != nil {
-			s.Error("add group member failed", zap.Error(err), zap.String("uid", memberUser.UID))
-			continue
-		}
+		})
 		addedUIDs = append(addedUIDs, memberUser.UID)
 		addedVos = append(addedVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
 		// is_external_group 语义只反映人类外部成员：bot 即便 is_external=1
@@ -1614,6 +1599,18 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			hasNewExternal = true
 		}
 	}
+
+	// 收口到唯一准入口（I2 / D3）。原先是每个 uid 一次 ExistMemberDelete 会话查询
+	// 加一次 insert/recover，且单个失败时 continue；现在整批一条 upsert，失败即整批
+	// 回滚。原子失败优于部分成功：部分成功会让下面的成员添加事件通告一批人，其中
+	// 有些并没有真的写进去。
+	insStart := time.Now()
+	if err := s.db.admitOrRestoreMembersTx(tx, req.GroupNo, groupModel.SpaceID, groupModel.ProjectID,
+		admissions, AdmissionEntryAddMembers); err != nil {
+		s.Error("add group members failed", zap.Error(err), zap.String("groupNo", req.GroupNo))
+		return nil, err
+	}
+	insertMs += time.Since(insStart).Milliseconds()
 
 	// 首次出现外部成员时，在事务内将群标记为外部群，确保成员/群标记一致提交
 	markedExternal := false
@@ -1819,6 +1816,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	//
 	// 真正关掉它需要让 handOverGroupCreator 也按 uid 序取那两把锁，并给
 	// (group_no, created_at) 补索引让继任者扫描不再锁全群 —— 都记在 follow-up。
+	//
+	// P1 起这个 follow-up 多了第二个调用方：handOverProjectGroupIfCreator
+	// （modules/group/project_cascade.go）形状完全一样——先锁创建者行，再锁
+	// 继任者扫描命中的行，而那次扫描同样没有服务其 ORDER BY 的索引。
+	// 后果同样有界（工单退避重试），但 follow-up 现在要覆盖两处，不是一处。
 	//
 	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
 	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。

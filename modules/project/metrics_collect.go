@@ -66,9 +66,15 @@ func (p *Project) refreshDistributionMetrics() {
 	}
 	projectTotal.Set(float64(projects))
 
+	// `removing = 0` here and in the distribution below, for the same reason every
+	// other member read in this module carries it: a seat being closed is not a
+	// member. Without it the total and the histogram disagree with the roster, the
+	// member cap and the admission gate — which is the shape of drift that gets
+	// noticed as "the dashboard says 41, the UI says 40".
 	var members int64
 	if err := p.db.session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE status = ?", MemberStatusActive,
+		"SELECT COUNT(*) FROM `octo_project_member` WHERE status = ? AND removing = 0",
+		MemberStatusActive,
 	).LoadOne(&members); err != nil {
 		p.Warn("采集项目成员总数失败", zap.Error(err))
 		return
@@ -78,7 +84,7 @@ func (p *Project) refreshDistributionMetrics() {
 	var rows []*distributionRow
 	if _, err := p.db.session.SelectBySql(
 		"SELECT COUNT(*) AS member_count FROM `octo_project_member` "+
-			"WHERE status = ? GROUP BY project_id LIMIT ?",
+			"WHERE status = ? AND removing = 0 GROUP BY project_id LIMIT ?",
 		MemberStatusActive, p.cfg.ReconcileLimit,
 	).Load(&rows); err != nil {
 		p.Warn("采集项目成员分布失败", zap.Error(err))

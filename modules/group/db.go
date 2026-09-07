@@ -50,33 +50,52 @@ func (d *DB) UpdateGroupType(groupNo string, groupType GroupType) error {
 	return err
 }
 
-// InsertMemberTx 插入群成员信息(带事务)
+// InsertMemberTx 插入群成员信息(带事务)。
+//
+// **测试夹具专用，生产代码不得调用。** 全部准入已收口到
+// admitOrRestoreMembersTx；这条原语不带闸门，直接用它就是绕过 I2。
+// TestNoGroupMemberWritesOutsideTheAdmissionFunnel 会在 CI 里拦下任何非测试调用点。
+//
+// 之所以留着而不删：146 个受保护的测试文件用它建夹具，删掉等于改动这些既有测试，
+// 而「只能从漏斗调用」这件事守卫断言得比编译器的导出规则更准。
 func (d *DB) InsertMemberTx(m *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
-// InsertMember 插入群成员信息
+// InsertMember 插入群成员信息。测试夹具专用，理由同 InsertMemberTx。
 func (d *DB) InsertMember(m *MemberModel) error {
 	_, err := d.session.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
-// DeleteMemberTx 删除群成员
+// DeleteMemberTx 删除群成员（软删）。
+//
+// forbidden_expir_time is cleared here for two reasons, and both matter.
+//
+// The bug: CheckForbiddenLoop polls every row with a non-zero, expired
+// forbidden_expir_time and rewrites it. Its source query did not filter
+// is_deleted, and removal did not clear the column, so a member who was muted
+// and then removed was rewritten forever, outside any transaction, on every
+// tick. Filtering the query stops the reads; clearing here stops the rows.
+//
+// The semantics: a mute is a permission the GROUP granted, and group-granted
+// state must not survive leave-and-rejoin. The restore branch of the admission
+// funnel deliberately does not touch this column (recoverMemberTx did not
+// either), so clearing it on the way OUT is what makes a rejoining member come
+// back unmuted — the same rule as the bot_admin reset.
 func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.Tx) error {
-	_, err := tx.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
+	_, err := tx.Update("group_member").
+		Set("is_deleted", 1).
+		Set("version", version).
+		Set("forbidden_expir_time", 0).
+		Where("group_no=? and uid=?", groupNo, uid).Exec()
 	return err
 }
 
 // DeleteMember 删除群成员
 func (d *DB) DeleteMember(groupNo string, uid string, version int64) error {
 	_, err := d.session.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
-	return err
-}
-
-// 真实删除群成员
-func (d *DB) deleteMembersWithGroupNOTx(groupNo string, tx *dbr.Tx) error {
-	_, err := tx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec()
 	return err
 }
 
@@ -134,6 +153,36 @@ func (d *DB) queryGroupMemberMaxVersion(groupNo string) (int64, error) {
 func (d *DB) UpdateMemberRoleTx(groupNo string, uid string, role int, version int64, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").Set("role", role).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
 	return err
+}
+
+// updateMemberRoleIfLiveTx is UpdateMemberRoleTx plus the one fact the project
+// cascade cannot do without: whether a row actually changed.
+//
+// UpdateMemberRoleTx's WHERE carries `is_deleted = 0`, so a promotion aimed at a
+// member who was removed in the meantime affects zero rows and returns nil. A
+// caller that then demotes the outgoing creator leaves the group with no creator
+// and no error to notice it by. The lock in querySuccessorForProjectGroupTx is
+// what makes that window unreachable; this is the assertion that the lock is
+// doing its job, so a future change that drops it fails loudly instead of
+// silently.
+//
+// `version` is a fresh GenSeq value on every call, so a matched row is always a
+// changed row — RowsAffected == 0 means "no live row matched", never "matched
+// but identical".
+func (d *DB) updateMemberRoleIfLiveTx(tx *dbr.Tx, groupNo string, uid string, role int, version int64) (bool, error) {
+	res, err := tx.Update("group_member").
+		Set("role", role).
+		Set("version", version).
+		Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).
+		Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 // updateMemberForbiddenExpirTimeTx 修改成员禁言时长
@@ -259,18 +308,6 @@ func (d *DB) ExistMemberDelete(uid string, groupNo string) (bool, error) {
 	return count > 0, err
 }
 
-// UpdateMemberTx 更新成员信息
-func (d *DB) UpdateMemberTx(member *MemberModel, tx *dbr.Tx) error {
-	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
-		"remark":     member.Remark,
-		"role":       member.Role,
-		"version":    member.Version,
-		"is_deleted": member.IsDeleted,
-		"invite_uid": member.InviteUID,
-	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
-	return err
-}
-
 // recoverMemberTx 恢复成员信息
 //
 // 删除是软删（DeleteMemberTx 只置 is_deleted=1），整行连同各种权限位都留在表里，
@@ -282,6 +319,10 @@ func (d *DB) UpdateMemberTx(member *MemberModel, tx *dbr.Tx) error {
 //
 // 注意：解除拉黑走的是 updateMembersStatus，不经过这里，因此不受影响。
 // 回归见 TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd。
+//
+// 生产路径已不再调用它：恢复分支被 admitOrRestoreMembersTx 的 upsert 原样复刻
+// （包括这里的 bot_admin=0）。留作测试夹具与这段说明的载体——它记录的是那个
+// upsert 为什么要重置 bot_admin。
 func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
 		"remark":          member.Remark,
@@ -298,6 +339,29 @@ func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 }
 
 // UpdateMember 更新群成员
+//
+// # `is_deleted = 0` in the WHERE is load-bearing, not tidiness
+//
+// This statement writes `is_deleted` from a caller-supplied model, and all four
+// callers are read-then-write over the session: read a live member, mutate one
+// field, write the whole model back. Without the predicate, a row soft-deleted
+// between the read and the write is RESURRECTED — it comes back active, with its
+// pre-removal role, having never passed admitOrRestoreMembersTx.
+//
+// CheckForbiddenLoop is where that window is wide rather than theoretical: it
+// reads a batch of up to 100 and then, per row, does a GenSeq, this write, and
+// two IM calls, so the tail of a batch is written seconds after it was read. For
+// a group belonging to a project whose seat has closed in that window, the
+// resurrected row is a permanent I2 violation — the reconcile scan reports it
+// and nothing repairs it, because the removal job is already terminal.
+//
+// So this is an admission path in the sense admission.go:86-93 gives the term,
+// and the funnel's claim to be the complete boundary depends on it not being
+// one. `UpdateMember(` is in admissionPrimitiveNeedles for the same reason.
+//
+// A dead row now makes this a no-op rather than an error: every caller has
+// already established the member is live, and a member who left mid-request has
+// nothing left to update.
 func (d *DB) UpdateMember(member *MemberModel) error {
 	_, err := d.session.Update("group_member").SetMap(map[string]interface{}{
 		"remark":               member.Remark,
@@ -306,7 +370,23 @@ func (d *DB) UpdateMember(member *MemberModel) error {
 		"is_deleted":           member.IsDeleted,
 		"invite_uid":           member.InviteUID,
 		"forbidden_expir_time": member.ForbiddenExpirTime,
-	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
+	}).Where("group_no=? and uid=? and is_deleted=0", member.GroupNo, member.UID).Exec()
+	return err
+}
+
+// updateMembersStatusTx 是 updateMembersStatus 的事务版。
+//
+// 解除拉黑（status 回到 Normal）是一条**准入路径**：它把 uid 放回活跃成员集合、
+// 重新订阅 IM 频道、重新挂回群内子区，但它并不插入或恢复成员行，所以任何只挂在
+// 「插入/恢复」上的闸门都拦不到它。
+//
+// 所以这条路径必须能在事务内先过 admitOrRestoreMembersTx 再翻状态——闸门的共享锁
+// 只有在同一个事务里才有意义。会话版保留给拉黑方向（那是收回权限，不需要闸门）。
+func (d *DB) updateMembersStatusTx(tx *dbr.Tx, version int64, groupNo string, status int, uids []string) error {
+	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
+		"status":  status,
+		"version": version,
+	}).Where("group_no=? and uid in ?", groupNo, uids).Exec()
 	return err
 }
 
@@ -684,9 +764,20 @@ func (d *DB) queryGroupsWithMemberUID(memberUID string) ([]*Model, error) {
 }
 
 // 查询禁言时长到期成员
+// queryForbiddenExpirationTimeMembers feeds CheckForbiddenLoop, the unmute-expiry
+// poller (which, despite its name, is not loop detection).
+//
+// `is_deleted = 0` is a FIX, not a tightening. Without it the poller selected
+// removed members whose forbidden_expir_time was never cleared, and rewrote them
+// forever with a full-row UpdateMember outside any transaction — every tick, for
+// the life of the row. The other half of the same defect is fixed in
+// DeleteMemberTx, which now clears the column on removal, so rows already in
+// that state stop being produced as well as stopping being read.
 func (d *DB) queryForbiddenExpirationTimeMembers(limit int64) ([]*MemberModel, error) {
 	var models []*MemberModel
-	_, err := d.session.Select("*").From("group_member").Where("forbidden_expir_time <>0 and unix_timestamp(now())-forbidden_expir_time>0").Limit(uint64(limit)).Load(&models)
+	_, err := d.session.Select("*").From("group_member").
+		Where("is_deleted=0 and forbidden_expir_time <>0 and unix_timestamp(now())-forbidden_expir_time>0").
+		Limit(uint64(limit)).Load(&models)
 	return models, err
 }
 
@@ -738,6 +829,7 @@ type Model struct {
 	AllowMemberPinnedMessage int        // 是否允许群成员置顶消息
 	Category                 string     // 群分类
 	SpaceID                  string     // Space ID
+	ProjectID                string     // 所属项目ID；空串=直属 Space。非空即受不变量 I2 约束（见 admission.go）
 	IsExternalGroup          int        // 外部群 0.否 1.是（自动维护）
 	AllowExternal            int        // 是否允许外部成员加入 1.允许(默认) 0.禁止
 	AllowNoMention           int        // 群级是否允许免@生效 1.允许(默认) 0.禁止（bot 在本群必须被@）
@@ -1144,4 +1236,177 @@ func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole
 		return roles[0] == MemberRoleCommon, nil
 	}
 	return roles[0] != MemberRoleCreator, nil
+}
+
+// ---------------------------------------------------------------------------
+// Project binding (P1)
+// ---------------------------------------------------------------------------
+
+// queryProjectGroupNos returns every group attributed to a project.
+//
+// Driven off the new (space_id, project_id) index. space_id is included in the
+// predicate rather than trusted from project_id alone because it is the index's
+// leading column — without it the index cannot be used at all.
+func (d *DB) queryProjectGroupNos(spaceID, projectID string) ([]string, error) {
+	if spaceID == "" || projectID == "" {
+		return nil, nil
+	}
+	var groupNos []string
+	_, err := d.session.SelectBySql(
+		"SELECT group_no FROM `group` WHERE space_id = ? AND project_id = ?",
+		spaceID, projectID,
+	).Load(&groupNos)
+	return groupNos, err
+}
+
+// queryProjectGroupNosWithActiveMember returns the project's LIVE groups that uid
+// is an active member of.
+//
+// # Disbanded groups are excluded, and that filter is load-bearing
+//
+// RemoveGroupMembers refuses a disbanded group outright ("group not found or
+// disbanded"), so handing it one is not a wasted call — it is a permanent
+// failure. The cascade returns that error, the job backs off, and after eight
+// attempts it is marked abandoned, which is terminal: the departing member's seat
+// then sits at removing = 1 forever. One disbanded group anywhere in a project
+// was enough to break removal for every member still in it.
+//
+// Skipping is also the right answer on its own terms. Group disband only flips
+// group.status and deliberately leaves group_member rows in place, a disbanded
+// group grants no access, and there is no endpoint that would clean those rows
+// up — so the rows are expected, not a leak. The I2 scan carries the same filter
+// for the same reason; if it did not, it would report rows this path is now
+// correct to leave alone.
+//
+// # No COLLATE on this join
+//
+// `group` and `group_member` are BOTH legacy tables, so they share whatever
+// collation the server default gave them and compare cleanly without help.
+// Forcing one side to utf8mb4_general_ci would make the expression
+// non-sargable — the index on group_member.group_no could no longer serve the
+// join — to solve a mismatch that does not exist here. The COLLATE belongs
+// exactly where a legacy column meets an `octo_project*` one, which this query
+// does not do.
+func (d *DB) queryProjectGroupNosWithActiveMember(spaceID, projectID, uid string) ([]string, error) {
+	if spaceID == "" || projectID == "" || uid == "" {
+		return nil, nil
+	}
+	var groupNos []string
+	_, err := d.session.SelectBySql(
+		"SELECT g.group_no FROM `group` g "+
+			"INNER JOIN group_member gm ON gm.group_no = g.group_no "+
+			"WHERE g.space_id = ? AND g.project_id = ? AND g.status <> ? "+
+			"  AND gm.uid = ? AND gm.is_deleted = 0",
+		spaceID, projectID, GroupStatusDisband, uid,
+	).Load(&groupNos)
+	return groupNos, err
+}
+
+// queryGroupCreatorTx reads a group's creator role holder under the caller's
+// transaction. Empty string means the group currently has no creator row, which
+// happens after a creator was removed by some path that did not transfer first.
+func (d *DB) queryGroupCreatorTx(tx *dbr.Tx, groupNo string) (string, error) {
+	var uids []string
+	_, err := tx.SelectBySql(
+		"SELECT uid FROM group_member "+
+			"WHERE group_no = ? AND role = ? AND is_deleted = 0 LIMIT 1 FOR UPDATE",
+		groupNo, MemberRoleCreator,
+	).Load(&uids)
+	if err != nil {
+		return "", err
+	}
+	if len(uids) == 0 {
+		return "", nil
+	}
+	return uids[0], nil
+}
+
+// querySuccessorForProjectGroupTx picks who should own a project group when its
+// creator is leaving the project.
+//
+// Seniority, narrowed by I2. The candidate must be:
+//
+//   - an active, non-deleted, non-blacklisted member of the group;
+//   - not the departing uid, not external, not a robot;
+//   - an ACTIVE member of the same project, with removing = 0.
+//
+// The project constraint is the part that is easy to leave out and expensive to
+// leave out: handing a project group to someone who is not in the project makes
+// the new owner an I2 violation, created by the very cascade whose job is to
+// preserve I2.
+//
+// Ordering is managers before ordinary members, then oldest membership first —
+// "senior" in the same sense P0's Space cascade uses when it hands a project to
+// the senior remaining member.
+//
+// Returns "" when there is no candidate. The caller then detaches the group to
+// Space-direct rather than inventing an owner.
+//
+// # Both halves of the pick are LOCKED, and neither lock is optional
+//
+// `FOR UPDATE OF gm` is the lesson modules/group already paid for once, on the
+// Space-side cascade: querySecondOldestNonBotMemberTx locks its pick and says
+// why — an unlocked candidate can be soft-deleted by a concurrent kick, exit or
+// cleanup job between this SELECT and the promotion, whose WHERE carries
+// `is_deleted = 0`; the UPDATE then affects zero rows, reports no error, and the
+// group is left with no creator at all. This query reproduced the pre-fix shape
+// until it was found in review on PR #844.
+//
+// `FOR SHARE OF pm` closes the second shape of the same window: a seat that goes
+// `removing = 1` after this snapshot would make the promotion land on someone
+// the project is in the middle of removing — an I2 violation manufactured by the
+// cascade whose job is to preserve I2. Shared, not exclusive, because this
+// transaction only needs the seat to hold still; a concurrent admission taking
+// the same shared lock (pkg/project.AssertMembersInProjectTx) must not be
+// serialised behind a handover.
+//
+// Lock order is preserved: group_member is taken first (the creator row is
+// already held by queryGroupCreatorTx), octo_project_member last — the module's
+// declared order, with octo_project_member deliberately at the end. See
+// modules/project/service.go and pkg/project.AssertMembersInProjectTx.
+func (d *DB) querySuccessorForProjectGroupTx(tx *dbr.Tx, groupNo, projectID, departingUID string) (string, error) {
+	var uids []string
+	_, err := tx.SelectBySql(
+		"SELECT gm.uid FROM group_member gm "+
+			"INNER JOIN `octo_project_member` pm "+
+			"  ON pm.uid = gm.uid COLLATE utf8mb4_general_ci "+
+			"WHERE gm.group_no = ? AND gm.is_deleted = 0 AND gm.status = ? "+
+			"  AND gm.uid <> ? AND gm.is_external = 0 AND gm.robot = 0 "+
+			"  AND pm.project_id = ? AND pm.status = 1 AND pm.removing = 0 "+
+			"ORDER BY gm.role = ? DESC, gm.created_at ASC, gm.uid ASC LIMIT 1 "+
+			"FOR UPDATE OF gm FOR SHARE OF pm",
+		groupNo, int(common.GroupMemberStatusNormal), departingUID,
+		projectID, MemberRoleManager,
+	).Load(&uids)
+	if err != nil {
+		return "", err
+	}
+	if len(uids) == 0 {
+		return "", nil
+	}
+	return uids[0], nil
+}
+
+// detachGroupFromProjectTx reverts one group to Space-direct.
+//
+// Guarded on the current project_id so it is idempotent and cannot detach a
+// group that has since been attached elsewhere — though I3 makes that
+// impossible today, the guard costs nothing and removes the assumption.
+//
+// This and the create path are the ONLY writes of group.project_id in the tree;
+// TestNoProjectIDRewritesOutsideTheDetachStep enforces that.
+func (d *DB) detachGroupFromProjectTx(tx *dbr.Tx, groupNo, projectID string, version int64) (bool, error) {
+	res, err := tx.Update("group").
+		Set("project_id", "").
+		Set("version", version).
+		Where("group_no=? and project_id=?", groupNo, projectID).
+		Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }

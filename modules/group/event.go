@@ -88,6 +88,16 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 
 // handleRegisterUserEvent 用户注册时加入系统群
 func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) {
+	// Counted once per EXECUTION, at the top, before any branch can return.
+	//
+	// The counter answers one question — "is this listener live in production?" —
+	// and deletion of these handlers is gated on it reading zero over an
+	// observation window (D7). Counting deeper in meant a listener that fired and
+	// then bailed out on a config flag or an empty payload registered as zero, so
+	// "no publisher exists" and "the publisher exists and every event was skipped"
+	// looked identical. It also meant the two loop-nested call sites counted
+	// MEMBERS rather than executions, which the Help text does not say.
+	observeLegacyDirectoryListener(legacyListenerRegisterUser)
 	appconfig, _ := g.commonService.GetAppConfig()
 	if appconfig != nil && appconfig.NewUserJoinSystemGroup == 0 {
 		commit(nil)
@@ -166,13 +176,15 @@ func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) 
 			commit(err)
 			return
 		}
-		err = g.db.InsertMemberTx(&MemberModel{
-			GroupNo: g.ctx.GetConfig().Account.SystemGroupID,
-			UID:     g.ctx.GetConfig().Account.SystemUID,
-			Role:    MemberRoleCreator,
-			Status:  int(common.GroupMemberStatusNormal),
-			Version: memberVersion,
-		}, tx)
+		// 收口到唯一准入口（A6）。系统群不属于任何 Space 或项目，闸门在
+		// project_id 为空串时直接短路，一次查询都不发。
+		err = g.db.admitOrRestoreMembersTx(tx,
+			g.ctx.GetConfig().Account.SystemGroupID, "", "",
+			[]MemberAdmission{{
+				UID:     g.ctx.GetConfig().Account.SystemUID,
+				Version: memberVersion,
+				Role:    MemberRoleCreator,
+			}}, AdmissionEntryRegisterUser)
 		if err != nil {
 			g.Error("设置系统群创建者失败")
 			tx.Rollback()
@@ -242,6 +254,8 @@ func (g *Group) handleGroupMemberAddEvent(data []byte, commit config.EventCommit
 
 // 处理创建组织或部门事件
 func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommit) {
+	// Once per execution — see handleRegisterUserEvent.
+	observeLegacyDirectoryListener(legacyListenerOrgCreate)
 	var req config.MsgOrgOrDeptCreateReq
 	err := util.ReadJsonByByte(data, &req)
 	if err != nil {
@@ -313,14 +327,13 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 			commit(err)
 			return
 		}
-		err = g.db.InsertMemberTx(&MemberModel{
-			GroupNo: req.GroupNo,
-			UID:     req.Operator,
-			Role:    MemberRoleCreator,
-			Status:  int(common.GroupMemberStatusNormal),
-			Version: memberVersion,
-			Vercode: fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
-		}, tx)
+		// 收口到唯一准入口（A7 创建者）。组织架构建的群不带 Space/项目归属。
+		err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo, "", "",
+			[]MemberAdmission{{
+				UID:     req.Operator,
+				Version: memberVersion,
+				Role:    MemberRoleCreator,
+			}}, AdmissionEntryOrgCreate)
 		if err != nil {
 			g.Error("设置群创建者失败")
 			tx.Rollback()
@@ -338,14 +351,12 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 					commit(err)
 					return
 				}
-				err = g.db.InsertMemberTx(&MemberModel{
-					GroupNo: req.GroupNo,
-					UID:     member.EmployeeUid,
-					Role:    MemberRoleCommon,
-					Status:  int(common.GroupMemberStatusNormal),
-					Version: memberVersion,
-					Vercode: fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
-				}, tx)
+				err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo, "", "",
+					[]MemberAdmission{{
+						UID:     member.EmployeeUid,
+						Version: memberVersion,
+						Role:    MemberRoleCommon,
+					}}, AdmissionEntryOrgCreate)
 				if err != nil {
 					g.Error("添加群成员错误")
 					tx.Rollback()
@@ -403,6 +414,10 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 
 // 批量处理组织或部门成员改变部门事件
 func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCommit) {
+	// Once per execution — see handleRegisterUserEvent. The previous call site was
+	// inside the per-member loop's "add" branch, so it counted members, and an
+	// event carrying only removals counted nothing at all.
+	observeLegacyDirectoryListener(legacyListenerOrgEmployeeUpdate)
 	var req config.MsgOrgOrDeptEmployeeUpdateReq
 	err := util.ReadJsonByByte(data, &req)
 	if err != nil {
@@ -493,6 +508,19 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 
 	// 添加或修改群成员
 	for groupNo, members := range list {
+		// 群的 Space / 项目归属，供准入闸门使用。用会话读而不是事务读是安全的：
+		// I3 让 project_id 在建群后不可变，唯一的写是 detach（把它清空），所以一次
+		// 读旧可能得到「其实已经 detach 了的项目 ID」，闸门于是多跑一次并可能拒绝
+		// ——失败方向是保守的。反过来（该有项目却读到空）不可能发生。
+		var groupSpaceID, groupProjectID string
+		if gm, qErr := g.db.QueryWithGroupNo(groupNo); qErr != nil {
+			g.Error("查询群信息失败！", zap.Error(qErr), zap.String("groupNo", groupNo))
+			tx.Rollback()
+			commit(qErr)
+			return
+		} else if gm != nil {
+			groupSpaceID, groupProjectID = gm.SpaceID, gm.ProjectID
+		}
 		for _, member := range members {
 			version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
 			if err != nil {
@@ -501,28 +529,17 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 				commit(err)
 				return
 			}
-			existDelete, err := g.db.ExistMemberDelete(member.EmployeeUid, groupNo)
-			if err != nil {
-				g.Error("查询是否存在删除成员失败！", zap.Error(err))
-				tx.Rollback()
-				commit(err)
-				return
-			}
 			if member.Action == "add" {
-				newMember := &MemberModel{
-					GroupNo:   groupNo,
-					InviteUID: member.Operator,
-					UID:       member.EmployeeUid,
-					Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
-					Version:   version,
-					Status:    int(common.GroupMemberStatusNormal),
-					Robot:     0,
-				}
-				if existDelete {
-					err = g.db.recoverMemberTx(newMember, tx)
-				} else {
-					err = g.db.InsertMemberTx(newMember, tx)
-				}
+				// 收口到唯一准入口（A8）。这条路径原先自己查 ExistMemberDelete
+				// 再分支，现在由 upsert 内部决定插入还是恢复。
+				//
+				err = g.db.admitOrRestoreMembersTx(tx, groupNo, groupSpaceID, groupProjectID,
+					[]MemberAdmission{{
+						UID:       member.EmployeeUid,
+						Version:   version,
+						Role:      MemberRoleCommon,
+						InviteUID: member.Operator,
+					}}, AdmissionEntryOrgEmployeeUpdate)
 				if err != nil {
 					g.Error("添加群成员失败！", zap.Error(err))
 					tx.Rollback()
@@ -741,6 +758,11 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 
 // 处理组织成员退出
 func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
+	// This one had NO call site at all, so its label never appeared in the metric
+	// family — and an absent series reads exactly like a zero one on a dashboard.
+	// It is also the listener #797 calls the highest-stakes of the four (HR
+	// offboarding), i.e. the one whose deletion the counter most needs to gate.
+	observeLegacyDirectoryListener(legacyListenerOrgEmployeeExit)
 	var req config.OrgEmployeeExitReq
 	err := util.ReadJsonByByte(data, &req)
 	if err != nil {
@@ -858,4 +880,3 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 	}
 	commit(nil)
 }
-

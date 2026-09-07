@@ -286,6 +286,20 @@ var systemSettingSchema = []settingDef{
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
 
+	// Project（项目协作）总开关。与上面几个「展示开关」不同，它**同时**是服务端的
+	// 写入闸门：modules/project 的 requireWriteEnabled 读的就是这个值，
+	// GET /v1/common/appconfig 的 project_on 下发的也是这个值。单一真源是关键——
+	// 客户端开关和服务端开关分成两个的话，最坏的形态是「入口显示出来了、点进去每个
+	// 写操作都 403」。
+	//
+	// 缺行时回落到 P0 就有的 OCTO_PROJECT_CREATE_ENABLED，所以现有部署不改行为；
+	// 写了行就以行为准，管理台改完 60s 内多实例收敛，不需要滚动重启。
+	//
+	// 关掉它只停止「产生新的项目和项目群」，已有项目群的成员约束（不变量 I2）照常
+	// 强制——设计文档明确要求回滚不能放松已有项目群的约束。
+	{Category: "project", Key: "enabled", Type: settingTypeBool, Description: "是否开启项目(Project)协作模块；同时控制客户端入口展示与服务端写入闸门（默认关闭，缺行时回落 OCTO_PROJECT_CREATE_ENABLED）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ProjectEnabled()) }},
+
 	// Agent Mail 模块展示开关。默认关闭；部署完成 octo-mail 与网关配置后由管理台切
 	// mail.enabled 放量。仅控制客户端入口展示，不替代 Agent Mail 既有鉴权。
 	// 经 GET /v1/common/appconfig 的 mail_on 下发给客户端。

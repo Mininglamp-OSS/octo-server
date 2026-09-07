@@ -108,11 +108,20 @@ type Model struct {
 
 // MemberModel is an octo_project_member row.
 type MemberModel struct {
-	ProjectID string    `db:"project_id"`
-	UID       string    `db:"uid"`
-	SpaceID   string    `db:"space_id"`
-	Role      int       `db:"role"`
-	Status    int       `db:"status"`
+	ProjectID string `db:"project_id"`
+	UID       string `db:"uid"`
+	SpaceID   string `db:"space_id"`
+	Role      int    `db:"role"`
+	Status    int    `db:"status"`
+	// Removing is D4's seat-closing flag: 1 means the seat is being torn down
+	// while Status is still MemberStatusActive.
+	//
+	// Every authorization read treats Removing == 1 as a NON-member — the member
+	// list, the group admission gate, the middleware's role resolution. Status
+	// stays active until the group detach finishes, and that is what keeps I2
+	// from being literally violated by the removal itself: the group_member rows
+	// that have not been cleaned up yet still belong to a member of record.
+	Removing  int       `db:"removing"`
 	InviteUID string    `db:"invite_uid"`
 	CreatedAt time.Time `db:"created_at"`
 	UpdatedAt time.Time `db:"updated_at"`

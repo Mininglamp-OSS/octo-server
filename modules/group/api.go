@@ -34,6 +34,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -1004,6 +1005,73 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	// 零宽/格式字符撑爆 avatar_text VARCHAR(16) 导致 MySQL 截断。
 	req.AvatarText = avatarrender.GroupText(req.AvatarText)
 
+	// 校验 project_id。
+	//
+	// 四道门，顺序有意如此：
+	//
+	//  1. 必须同时给 space_id —— 项目本身就活在某个 Space 里，没有 Space 的项目群
+	//     无从谈起。
+	//  2. 功能开关必须打开。这是 brief D1 说的唯一回滚手段：关掉它只是「不再产生
+	//     新的项目群」，已有项目群的成员约束照常强制——设计文档明确不允许放松
+	//     已有约束。开关与 appconfig 的 project_on 是同一个值。
+	//  3. 调用方本人必须在这个 Space 里。见下面那段：Space 成员校验在 Service 里，
+	//     也就是在这之后，所以不先问这一句，第 4 道门就成了一个人人可用的探测器。
+	//  4. 项目必须存在、活跃、且属于同一个 Space。三种失败回同一个错误码，不区分
+	//     ——区分开就等于把建群变成一个探测器：拿着一个自己看不见的 project_id，
+	//     用一个自己有权限的 Space 就能问出「它存不存在、在哪个 Space」。
+	//
+	// 「创建者本人是不是这个项目的成员」不在这里查。那是准入闸门的事，发生在建群
+	// 事务内、持锁状态下；放在这里查是一次会过期的读。
+	if req.ProjectID != "" {
+		if req.SpaceID == "" {
+			respondGroupRequestInvalid(c, "space_id")
+			return
+		}
+		if !common2.EnsureSystemSettings(g.ctx).ProjectEnabled() {
+			g.Warn("项目功能未开启，拒绝创建项目群",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+		// 先确认调用方自己在这个 Space 里，再去问项目存不存在。
+		//
+		// 顺序不是风格问题。Space 成员校验被放在 Service 里（见下方 CreateGroup），
+		// 也就是**在这段之后**；于是先查项目就把建群接口变成了一个探测器：任何
+		// 持有效 token 的人都能拿 space_id + project_id 组合去问「这个项目在不在
+		// 这个 Space」，而这正是上一条注释说要避免的事——只不过它防住了「三种失败
+		// 回同一个码」，没防住「根本不该被回答」。
+		//
+		// 失败回同一个 ErrGroupProjectUnavailable，而不是一个「你不在这个 Space」
+		// 的专属错误：区分开来同样是在回答问题。真正的原因进日志。
+		creatorInSpace, err := spacepkg.CheckMembership(g.ctx.DB(), req.SpaceID, creator)
+		if err != nil {
+			g.Error("查询 Space 成员失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !creatorInSpace {
+			g.Warn("建项目群：调用方不在该 Space，不回答项目是否存在",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID),
+				zap.String("creator", creator))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+		ok, err := projectpkg.ResolveForGroup(g.ctx.DB(), req.SpaceID, req.ProjectID)
+		if err != nil {
+			g.Error("查询项目失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !ok {
+			// The distinguishing reason (absent / disbanded / other Space) stays
+			// in the log, never on the wire.
+			g.Warn("项目不可用：不存在、已解散，或不属于该 Space",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+	}
+
 	// 校验 category_id
 	if req.CategoryID != "" {
 		if req.SpaceID == "" {
@@ -1104,12 +1172,22 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 		Members:     realUids,
 		Name:        req.Name,
 		SpaceID:     req.SpaceID,
+		ProjectID:   req.ProjectID,
 		CategoryID:  req.CategoryID,
 		AvatarText:  req.AvatarText,
 		AvatarColor: req.AvatarColor,
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
+		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
+		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
+		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
+		// 变成 5xx，把本功能最常见的一次拒绝变成一条 on-call 告警；而 P1 专为
+		// 这次拒绝注册的错误码从此不可达，本地化文案永远不会出现。
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1608,6 +1686,11 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			return
 		}
 		g.Error("添加群成员失败", zap.Error(err))
+		// 与建群同理：准入被拒是 400，不是 500。见 groupCreate 处的说明。
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1842,6 +1925,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	 将成员信息存到数据库
 	**/
 	userBaseVos := make([]*config.UserBaseVo, 0, len(realMembers))
+	admissions := make([]MemberAdmission, 0, len(realMemberModels))
 	hasNewExternal := false
 	for _, realMember := range realMemberModels {
 		version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
@@ -1854,11 +1938,6 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			UID:  realMember.UID,
 			Name: realMember.Name,
 		})
-		existDelete, err := g.db.ExistMemberDelete(realMember.UID, groupNo)
-		if err != nil {
-			g.Error("查询是否存在删除成员失败！", zap.Error(err))
-			return nil, errors.New("查询是否存在删除成员失败！")
-		}
 		// 跨 Space 外部成员：写入 is_external=1 和 source_space_id（YUJ-53）。
 		isExt := 0
 		srcSpaceID := ""
@@ -1866,31 +1945,38 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			isExt = 1
 			srcSpaceID = sourceSpaceMap[realMember.UID]
 		}
-		newMember := &MemberModel{
-			GroupNo:       groupNo,
-			InviteUID:     operator,
+		admissions = append(admissions, MemberAdmission{
 			UID:           realMember.UID,
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			Version:       version,
-			Status:        int(common.GroupMemberStatusNormal),
+			Role:          MemberRoleCommon,
+			InviteUID:     operator,
 			Robot:         realMember.Robot,
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}
-		if existDelete {
-			err = g.db.recoverMemberTx(newMember, tx)
-		} else {
-			err = g.db.InsertMemberTx(newMember, tx)
-		}
-		if err != nil {
-			g.Error("添加群成员失败！", zap.Error(err))
-			return nil, errors.New("添加群成员失败！")
-		}
+		})
 		// is_external_group 只反映人类外部成员：bot 即便 is_external=1 也不应
 		// flip 群标记（与 DELETE 路径 robot=0 过滤对称）。
 		if isExt == 1 && realMember.Robot == 0 {
 			hasNewExternal = true
 		}
+	}
+	// 收口到唯一准入口（I2 / D3）。此前这里是「ExistMemberDelete 会话查询 →
+	// 分支 → InsertMemberTx / recoverMemberTx」，每个 uid 两次往返且带竞态；
+	// 现在整批一条 upsert，插入与恢复的列语义在 admission.go 里有实测记录。
+	//
+	// groupModel 在本函数前半段已按 groupNo 查出（外部成员判定要用它），
+	// 直接复用，不额外查一次。
+	var admitSpaceID, admitProjectID string
+	if groupModel != nil {
+		admitSpaceID, admitProjectID = groupModel.SpaceID, groupModel.ProjectID
+	}
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, admitSpaceID, admitProjectID,
+		admissions, AdmissionEntryInviteConfirm); err != nil {
+		g.Error("添加群成员失败！", zap.Error(err))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("添加群成员失败！")
 	}
 
 	// 首次出现外部人类成员时，在事务内将群标记为外部群。
@@ -2626,14 +2712,11 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		}
 	}
 
-	memberModel := &MemberModel{
-		GroupNo:   groupNo,
+	scanAdmission := MemberAdmission{
 		UID:       scaner,
-		Role:      MemberRoleCommon,
 		Version:   version,
-		Status:    int(common.GroupMemberStatusNormal),
+		Role:      MemberRoleCommon,
 		InviteUID: generator,
-		Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 		// 保留 scaner 的 robot 标记，与其它入群路径保持一致，
 		// 让 DELETE 路径的 QueryExternalMemberCountTx(robot=0) 能正确排除 bot。
 		Robot:         scanerInfo.Robot,
@@ -2673,21 +2756,16 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	existDelete, err := g.db.ExistMemberDelete(scaner, groupNo)
-	if err != nil {
-		tx.Rollback()
-		g.Error("查询是否存在删除成员失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	if existDelete {
-		err = g.db.recoverMemberTx(memberModel, tx)
-	} else {
-		err = g.db.InsertMemberTx(memberModel, tx)
-	}
-	if err != nil {
+	// 收口到唯一准入口（A5）。扫码入群是自助路径：扫码者自己决定加入，没有
+	// 任何管理员参与，所以它必须和被邀请入群受同一道闸门约束。
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, group.SpaceID, group.ProjectID,
+		[]MemberAdmission{scanAdmission}, AdmissionEntryScanJoin); err != nil {
 		tx.Rollback()
 		g.Error("添加群成员失败！", zap.Error(err))
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -3754,9 +3832,37 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	err = g.db.updateMembersStatus(version, groupNo, status, targetUIDs)
-	if err != nil {
-		g.Error("添加或移除群成员黑名单错误", zap.Error(err))
+	// A11 —— 解除拉黑是一条准入路径，必须过闸门。
+	//
+	// 它不碰 InsertMemberTx / recoverMemberTx，只把 status 翻回 Normal，然后
+	// 重新订阅 IM 频道（见下方 IMAddSubscriber）和群内子区。如果闸门只装在那两个
+	// 原语里，一个被移出项目的人只要曾经被拉黑过，就能被解除拉黑重新拿到项目群的
+	// 全部访问权——不经过任何准入检查。
+	//
+	// 拉黑方向（收回权限）不需要闸门，但两个方向共用同一个事务，免得后来的人
+	// 以为只有一条分支需要事务。
+	if txErr := func() error {
+		tx, beginErr := g.ctx.DB().Begin()
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.RollbackUnlessCommitted()
+		if status == int(common.GroupMemberStatusNormal) {
+			if gateErr := g.db.assertAdmissibleTx(tx, group.SpaceID, group.ProjectID,
+				targetUIDs, AdmissionEntryUnblacklist); gateErr != nil {
+				return gateErr
+			}
+		}
+		if updErr := g.db.updateMembersStatusTx(tx, version, groupNo, status, targetUIDs); updErr != nil {
+			return updErr
+		}
+		return tx.Commit()
+	}(); txErr != nil {
+		g.Error("添加或移除群成员黑名单错误", zap.Error(txErr))
+		if errors.Is(txErr, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -4752,12 +4858,19 @@ func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []mem
 }
 
 type groupReq struct {
-	Name        string   `json:"name"`         // 群名
-	Members     []string `json:"members"`      // 成员uid
-	SpaceID     string   `json:"space_id"`     // Space ID（可选）
-	CategoryID  string   `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
-	AvatarText  string   `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int     `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
+	Name    string   `json:"name"`     // 群名
+	Members []string `json:"members"`  // 成员uid
+	SpaceID string   `json:"space_id"` // Space ID（可选）
+	// ProjectID 把新群挂到某个项目下（可选，必须与 space_id 同时传）。
+	//
+	// 一旦设置就不可更改（不变量 I3）：没有任何接口能改群的项目归属，源码守卫
+	// 也禁止在创建路径和 detach 步骤之外写这一列。要换项目只能新建群。
+	//
+	// 非空时，群的成员集合从此受不变量 I2 约束——加人时必须是该项目的活跃成员。
+	ProjectID   string `json:"project_id"`   // 所属项目 ID（可选，需配合 space_id）
+	CategoryID  string `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
+	AvatarText  string `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
 }
 
 func (g groupReq) Check() error {

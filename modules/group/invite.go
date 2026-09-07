@@ -329,9 +329,13 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 		tx.Rollback()
 		g.Error("添加成员失败！", zap.Error(err))
 		// 透出 allow_external 等策略拒绝的具体错误，方便管理员定位；其他底层错误走兜底文案
-		if strings.Contains(err.Error(), "禁止外部成员") {
+		switch {
+		// 准入被拒是 400，不是 500。见 api.go groupCreate 处的说明。
+		case errors.Is(err, ErrAdmissionRefused):
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+		case strings.Contains(err.Error(), "禁止外部成员"):
 			httperr.ResponseErrorL(c, errcode.ErrGroupExternalJoinForbidden, nil, nil)
-		} else {
+		default:
 			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		}
 		return

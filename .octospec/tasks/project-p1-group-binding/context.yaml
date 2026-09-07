@@ -1,0 +1,296 @@
+# octospec Implement-phase record for task project-p1-group-binding.
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
+# tier available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml).
+# The brief's tags are: space, isolation, acl, error-response, i18n, rate-limit,
+# wire-contract, testing, commit, migration. All six repo rules match.
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go matches every file P1 touches; brief tags carry
+      space / isolation / acl. This is THE rule for P1: I2 is a Space-isolation
+      invariant one level down. Drives: the composite admission predicate
+      ("active Space member AND (project is '' OR active project member)")
+      evaluated INSIDE the admission transaction with a shared lock on the
+      project member row; the group-side Space check kept exactly as it is
+      (tightening it is out of scope, see brief); the create path validating
+      project_id against the group's space_id so a project from another Space
+      cannot own a group; thread admission left alone because it already gates
+      on ExistMemberActive against the parent group, so I2 reaches threads
+      transitively (C6).
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by touches:wire-contract, not by paths — P1 adds no inbound
+      adapter, renders no markdown and emits no URL destinations, so the
+      escaping and adapter-parity clauses have no target. Two clauses do apply.
+      "Bound the payload": project_ids on the verify endpoint is capped at 50
+      (D11) and the admission batch keeps the existing 200 cap. And the
+      anti-enumeration shape of the verify response — a member:false item
+      carries only project_id and member, so "not a member", "no such project"
+      and "a project in another Space" are byte-identical on the wire.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + pkg/errcode/**; brief tags error-response / i18n /
+      wire-contract. Drives: new codes in pkg/errcode/project.go and
+      pkg/errcode/group.go, httperr.ResponseErrorL everywhere, 5xx <=>
+      Internal=true, i18n-extract-check + i18n-lint gates, zh-CN translations,
+      and adding every new modules/group file to TestGroupNoLegacyResponseError's
+      fixed file list (it cannot see a new file on its own).
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tag rate-limit. P1 adds no new authenticated
+      route (the create parameter rides an existing one), so the rule's main
+      clause has no new mount point. It still binds two ways: the reconcile and
+      cascade workers are not HTTP paths and must not grow a Redis counter, and
+      /v1/auth/verify keeps its existing per-IP limiter unchanged (C9) — the
+      added project lookup must not become a reason to re-dimension it.
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go. Drives: testutil.NewTestServer + CleanAllTables,
+      explicit ratelimit:uid:* reset where a UID-limited route is hit, and the
+      non-regression rule that no EXISTING test file may be edited — an edited
+      assertion is a changed contract and has to be justified in the PR body.
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ** — English Conventional Commits; PR description in English.
+
+brief: .octospec/tasks/project-p1-group-binding/brief.md
+
+# Decisions taken by the requester during planning, each superseding the brief.
+scope_changes:
+  - id: single-pr
+    decision: |
+      The whole of P1 ships as ONE pull request. The brief plans PR-1 (schema,
+      predicate, single admission entry, guard, reconcile) / PR-2 (cascade, then
+      the create parameter) / PR-3 (the read contract) / optional PR-4.
+      Consequence, accepted by the requester: PR-1's "revertible independently"
+      property is gone — the write-path convergence, the cascade and the read
+      contract revert together or not at all. The brief's ordering constraint
+      ("no PR may leave a state where a project group can exist without a
+      cascade behind it") is satisfied trivially, since nothing intermediate
+      ships.
+  - id: project-switch-as-system-setting
+    decision: |
+      The feature switch becomes ONE source of truth shared by the server-side
+      write gate and the client: a `project.enabled` system_setting resolved
+      DB -> env -> false, shipped to clients as the appconfig field
+      `project_on`. This supersedes brief D1's "the rollback lever is the flag
+      that already exists, OCTO_PROJECT_CREATE_ENABLED", which is now the env
+      layer of that resolution rather than the whole of it.
+      Recorded here after PR #844's review flagged it as surface the brief did
+      not ask for (yujiawei S6 / Jerry-Xin N3) — correctly: it was built during
+      implementation and never written down.
+      Why it stays rather than being split out: two switches that can disagree
+      is the failure being avoided. With the env flag alone, a server with
+      writes disabled still ships a client that offers project creation, and
+      the user meets the refusal at the end of the flow instead of not being
+      offered it. Existing deployments are unaffected — with no system_setting
+      row the resolution falls through to the env flag and then to false, which
+      is exactly the pre-P1 behaviour.
+      Consequence, accepted: the switch is now runtime-mutable, so flipping it
+      no longer requires a redeploy — and turning it OFF does not retract
+      anything already created. It gates creation, not existing groups.
+  - id: group-creator-handover
+    decision: |
+      When the departing project member is a group's creator, the cascade
+      performs the group's NORMAL owner handover instead of stalling. This
+      supersedes brief D4's "blocks that group's detach, leaves removing = 1,
+      and raises the stall alert rather than force-transferring", and with it
+      the matching Acceptance line. Successor selection follows P0's precedent
+      for the Space cascade (the senior remaining member) narrowed by I2: the
+      successor must itself be an active member of the same project, because
+      handing the group to a non-project-member would break the invariant the
+      cascade exists to preserve.
+  - id: no-successor-detaches
+    decision: |
+      When a group has no remaining active project member to hand ownership to,
+      the group is detached to Space-direct (project_id = '') with its members
+      untouched — the same rule as project disband below, deliberately, so the
+      two situations are one rule rather than two. It is not disbanded: group
+      disband leaves group_member rows intact anyway, so it would destroy access
+      without cleaning anything up.
+  - id: disband-detaches-groups
+    decision: |
+      Disbanding a project reverts its groups to Space-direct with members
+      intact (the brief's option (a)), confirmed by the requester as a product
+      decision. Option (b) — disbanding the groups — destroys data and, because
+      group disband only flips group.status, would not even clean up
+      group_member. Two follow-ups recorded as product suggestions, both OUT OF
+      SCOPE here: the disband confirmation copy should state that the N groups
+      survive as ordinary groups, and if the product later wants "take the
+      groups away too" it should be an explicit opt-in named "archive", not the
+      default, because "disband" does not clean up what its name implies.
+  - id: migration-placement-corrected
+    decision: |
+      group.project_id ships from modules/space/sql, not modules/project/sql as
+      brief D2 specifies.
+      The rule is about DEPENDENCY DIRECTION, not ownership: a column must ship
+      from a migration directory present in every binary that reads it. Measured
+      with `go list -deps`, three modules read this column — modules/group (the
+      admission gate, the detach step), modules/space (joinPresetGroups skips
+      project groups; the Space settings endpoint refuses one as a preset group)
+      and modules/project (the I2/I3 reconcile scans) — and modules/space/sql is
+      the only directory present in all three binaries. modules/space's binary
+      contains no group migrations, and modules/project's contains neither.
+      Both wrong placements were found the same way, by a whole test package
+      failing with "Error 1054: Unknown column", not by reasoning:
+        * modules/project/sql — modules/group's binary has no project
+          migrations, so every group and channel test that inserted a group
+          failed (82 of them);
+        * modules/group/sql   — modules/space's binary has no group migrations,
+          so the Space settings endpoint failed the moment it read the column.
+      This is also the real reason group.space_id was added from modules/space's
+      own directory in 20260307000004_space_legacy03.sql. D2 cited that as a
+      precedent for "the module that owns the concept owns the column"; the
+      precedent is real but the explanation was not.
+      The Project-owned schema (octo_project_member.removing, the cascade
+      outbox) correctly stays in modules/project/sql, because only
+      modules/project reads or writes it.
+
+  - id: collation-follows-repo
+    decision: |
+      P1 follows what the repo already does rather than waiting on the
+      database-wide conversion: new tables keep utf8mb4_general_ci, and every
+      reconcile JOIN that crosses into a legacy table (group, group_member)
+      carries an explicit COLLATE, as modules/message/db_reminders.go:113 and
+      modules/bot_api/resolve_targets.go:148,165 already do. Recorded because
+      P0's round-4 verification measured production at utf8mb4_0900_ai_ci on
+      user / space / space_member, so an implicit JOIN would hit MySQL 1267 in
+      production while passing in CI (CI creates the database with
+      utf8mb4_general_ci).
+
+# Assumptions taken where the brief left a choice; each reversible at one site.
+assumptions: []
+
+# Deferred by the requester until #841 (P0) merges — do NOT act on these here.
+deferred_until_p0_merges:
+  - id: reconcile-switch-consolidation
+    note: |
+      Whether the reconcile job needs its own enable switch separate from
+      OCTO_PROJECT_CREATE_ENABLED.
+      RESOLVED BY P0, not by P1. Measured at e6a46cf there was no such switch;
+      P0's round-5 fix (cfbfa77, now in the base branch at b38d59c) adds
+      OCTO_PROJECT_RECONCILE_ENABLED, default false, gating exactly the three
+      scans that JOIN legacy Space tables with no COLLATE — for the reason the
+      argument for two switches predicted: turning writes off to contain a
+      problem is when the invariant monitor is most wanted, so coupling them
+      would blind it at that moment. There is nothing left to consolidate.
+      P1's position, decided here after the rebase and asserted rather than
+      argued: its three scans run OUTSIDE that gate.
+        * I2 and I3 do JOIN legacy tables, but every comparison crossing into
+          the pinned schema carries an explicit COLLATE, so they survive the
+          drift the gate exists for. TestP1ScansSurviveCollationDrift proves it
+          on a deliberately drifted database, and TestP1ScansRunWithTheReconcileGateOff
+          pins the scope in both directions, as P0's own gate test does.
+        * Gating them would default the invariant WITH TEETH to "no monitoring".
+          I2 has no read-path filter behind it, so it is the last of the five
+          that should be dark by default — the same failure P0 round 5 fixed,
+          reached from the other side.
+      Writing that test found two real COLLATE gaps the reasoning had missed
+      (space_member_removal_cleanup is pinned, not legacy; a comparison in the
+      SELECT list raises 1267 just as one in an ON clause does), which is the
+      case for having it rather than the comment.
+
+      REQUESTER ASKED (2026-09-07) whether OCTO_PROJECT_RECONCILE_ENABLED can now
+      be removed, on the earlier judgement that a second switch is redundant.
+      Answer: NOT YET, and the reason is measured rather than argued.
+      MEASURED on MySQL 8.0.46, a deliberately drifted schema (legacy tables
+      0900_ai_ci, octo_project* general_ci), 50k space_member / 5k
+      octo_project_member rows, EXPLAIN on P0's I1 statement with COLLATE added:
+        * drifted   -> sm is type ALL, 50118 rows scanned PER EXAMINED ROW;
+        * converged -> sm is type eq_ref on spacemember_spaceid_uid, 1 row.
+      So COLLATE is not a substitute for the flag on P0's scans. The difference
+      from P1's scans is which side DRIVES: P1 drives from the legacy `group`
+      table, so COLLATE lands on the driving row's values and the looked-up
+      octo_project* indexes stay usable; P0 drives from the pinned
+      octo_project_member, so resolving the mismatch forces the comparison to
+      general_ci and kills the legacy index. Writing the legacy collation instead
+      would work while drifted and raise 1267 the moment the conversion lands.
+      Consequences of the three options, so this is not re-derived:
+        1. delete the flag           -> 1267 every tick, gauges never publish,
+                                        the monitor reads as "zero violations" —
+                                        exactly the failure P0 round 5 fixed.
+        2. add COLLATE, then delete  -> no error, but a full scan of space_member
+                                        per examined row: 1000 rows/page, up to
+                                        25 pages/tick, every 5 minutes.
+        3. fold into the Project switch -> rejected by P0's review, for a reason
+                                        that still holds: turning writes off to
+                                        contain a problem is when the invariant
+                                        monitor is most wanted.
+      DECISION: keep it. It should be deleted by whichever change performs the
+      collation conversion, where the deletion is one line and costs nothing.
+      P1 changes nothing here — its own scans already run outside the gate.
+
+# Scoped out during implementation, with the reason. NOT silently dropped.
+not_delivered:
+  - id: stale-subscriber-scan
+    what: |
+      The fourth reconcile scan from the brief: WuKongIM's subscriber set versus
+      group_member, per (channel, uid). It is the observable face of the
+      IM-unsubscribe leak P1 deliberately inherits (D6), and the brief calls it
+      "the only P1 answer" to that leak.
+    why_not: |
+      There is no way to ask the broker for a channel's subscribers that a
+      production reconcile job should depend on.
+      MEASURED, not assumed. octo-lib's shared client (config/msg.go) exposes
+      IMAddSubscriber / IMRemoveSubscriber and no listing call at all. The
+      pinned broker v2.2.4-20260313 answers 404 on every plausible data-plane
+      path; extracting its routes from the binary shows the only subscriber
+      listing is GET /cluster/channels/{id}/{type}/subscribers — the MANAGEMENT
+      plane, which requires manager credentials, is versioned with the admin UI,
+      and is not part of the integration surface this repo builds against.
+      Delivering it would therefore mean either adding a capability to octo-lib
+      (a different repository, outside this PR) or wiring a reconcile job in
+      modules/project to the broker's management plane. The second is the kind
+      of dependency that works until the admin UI changes.
+    consequence: |
+      The inherited leak stays UNMEASURED at project granularity. Nothing else
+      in P1 depends on this scan, and P1 asserts nothing about IM convergence
+      it cannot deliver — but the honest statement is that the leak is invisible
+      here, not that it is absent. Issue #797 and
+      .octospec/tasks/im-pending-outbox/brief.md own the fix; this scan should
+      land with whichever of them adds a subscriber-listing capability to
+      octo-lib.
+
+# Cannot be verified from here; must be checked before merge.
+open_verification:
+  - "Index build time for (space_id, project_id) on production-scale `group` row
+     counts (brief C4). ADD COLUMN ... NOT NULL DEFAULT '' is INSTANT on MySQL
+     8.0; the index is a separate online INPLACE statement and its duration has
+     to be measured, not asserted."
+  - "EXPLAIN before/after for queryGroupsWithMemberUIDAndSpaceID and
+     modules/bot_api/groups.go:51 — (space_id, project_id) is the first index to
+     serve space_id, so these two query plans change (C4)."
+  - "EXPLAIN for modules/project/reconcile_p1.go queryI2Page on production-scale
+     `group` x group_member. Its keyset cursor is a row constructor spanning two
+     tables, (g.id, gm.uid) > (?, ?), which MySQL cannot reduce to a range on
+     `group`.PRIMARY — so each page re-walks from the start and the file's
+     'bounded on rows EXAMINED' claim does not hold for this statement. Raised
+     by PR #844's review (yujiawei Q3 / Jerry-Xin N2). PR #844 round 2 moved
+     `g.status <> 2` out of the WHERE and into the violating flag, which fixes
+     the predicate half; the cursor half needs the plan to decide, and the plan
+     cannot be produced from CI."
+  - "Whether the three org-directory event listeners are live in production
+     (brief D7): P1 converges them and adds a metric rather than deleting them.
+     Deleting becomes a separate change once production shows zero rows."
+
+defects_found: []

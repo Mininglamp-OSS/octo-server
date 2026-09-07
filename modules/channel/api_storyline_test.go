@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -102,9 +102,13 @@ func TestGetStoryline_EmptyChannel(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	err = groupService.AddMember(&group.AddMemberReq{
-		GroupNo:   groupNo,
-		MemberUID: testutil.UID,
+	// IService.AddMember 已删除：它没有事务、没有 Space 检查、不写 version，
+	// 却挂在 IService 上，任何模块都能经它绕过全部闸门。测试夹具改为直接写 DAO。
+	err = group.NewDB(ctx).InsertMember(&group.MemberModel{
+		GroupNo: groupNo,
+		UID:     testutil.UID,
+		Role:    0,
+		Version: 1,
 	})
 	assert.NoError(t, err)
 

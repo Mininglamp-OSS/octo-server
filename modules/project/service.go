@@ -10,6 +10,7 @@ import (
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
+	"go.uber.org/zap"
 )
 
 // Lock order for every write path in this module, followed without exception:
@@ -648,7 +649,54 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	for _, uid := range affectedUIDs {
 		p.invalidateProjectMemberCache(projectID, uid)
 	}
+
+	// Run the registered disband steps AFTER the commit. Today that means
+	// modules/group reverting this project's groups to Space-direct, members
+	// untouched — the product's answer to "what happens to the groups", and the
+	// same rule the cascade uses when a group's creator leaves and nobody in it
+	// is still in the project.
+	//
+	// After the commit rather than inside it, because the steps do their own
+	// transactional work across another module's tables, and holding the project
+	// row's exclusive lock across that would serialize disband against every
+	// group write in the project.
+	//
+	// A step failing does NOT fail the disband: the project IS disbanded, and
+	// re-running the handler is not available to the caller. What it leaves is a
+	// group whose project_id points at a disbanded project, which is precisely
+	// what the I3 reconcile scan reports — so the failure is visible and
+	// repairable rather than silent. Recorded here so nobody "fixes" this into a
+	// rollback that would leave the project alive with its groups already
+	// detached.
+	p.runDisbandSteps(ProjectDisband{ProjectID: projectID, SpaceID: spaceID})
+
 	return affectedUIDs, nil
+}
+
+// runDisbandSteps executes every registered disband step, logging failures.
+//
+// byCascade is false for every caller at HEAD, and that is a correction to the
+// task brief rather than an omission. The brief states that P0's round-2 review
+// made the Space cascade "disband the project when there is no successor", with
+// a project_cascade_ownerless_disbands_total metric. Measured at e6a46cf: no
+// such metric exists, disbandProject has exactly ONE caller (the handler seam in
+// New), and space_member_removal.go says in as many words that leaving an
+// ownerless project is "the whole P0 treatment: make it visible, decide it with
+// product". So there is no cascade branch to reach.
+//
+// The ByCascade field is kept anyway because the distinction is real the day
+// that branch exists — a project ending because a worker decided so is worth
+// telling apart from one a human disbanded — and adding the field later would
+// mean changing a registered step's signature across modules.
+func (p *Project) runDisbandSteps(disband ProjectDisband) {
+	for _, step := range snapshotDisbandSteps() {
+		if err := step.fn(p.ctx, disband); err != nil {
+			p.Error("项目解散级联步骤失败（项目已解散，遗留状态由 I3 对账扫描报出）",
+				zap.String("step", step.name),
+				zap.String("project_id", disband.ProjectID),
+				zap.Error(err))
+		}
+	}
 }
 
 // ---------- membership ----------
@@ -758,11 +806,25 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	if err != nil {
 		return false, err
 	}
-	if existing != nil && existing.Status == MemberStatusActive {
+	if existing != nil && existing.Status == MemberStatusActive && existing.Removing == 0 {
 		// Already a member: a no-op. Not an error — a batch add of a roster that
 		// partially overlaps must be idempotent — and specifically not an epoch bump.
 		return false, nil
 	}
+	// `existing.Removing == 1` deliberately does NOT take the branch above, and
+	// getting that wrong is silent.
+	//
+	// A seat being closed still has status = 1, so the plain status check treated
+	// a re-add during the removal window as "already a member" and returned a
+	// no-op — never reaching the upsert that clears `removing`, never cancelling
+	// the outbox job. The cascade then went ahead and removed a member an admin
+	// had just put back, and nothing reported it: the API said OK.
+	//
+	// D4's rule is that re-admission CANCELS an in-flight cascade, so this path
+	// has to run to completion for such a seat: the upsert clears removing, the
+	// job is retired, and the epoch moves again because the seat went from
+	// closing back to active, which is a membership change from every consumer's
+	// point of view.
 
 	count, err := p.db.countActiveMembersTx(tx, projectID)
 	if err != nil {
@@ -788,6 +850,26 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, err
 		}
+	}
+	// D4 — re-admission CANCELS an in-flight cascade rather than being rejected.
+	//
+	// admitMemberTx already cleared `removing` in the same statement; this
+	// retires the outbox job that was going to act on it. Both halves are needed
+	// and both are in this transaction: clearing the flag without cancelling the
+	// job leaves the worker to pick it up, re-read, find removing = 0 and drop it
+	// — burning a lease and an attempt each round and making a cancelled cascade
+	// indistinguishable from a stalled one in the queue.
+	//
+	// Unconditional rather than guarded on `changed`: a re-add that changed
+	// nothing (the member was already fully active) can still coexist with a
+	// stale pending job from an earlier remove/re-add cycle, and retiring it
+	// costs one bounded UPDATE on an indexed key.
+	//
+	// Why cancel and not reject: the cascade can legitimately run long, and a
+	// rejection would make an unrelated admin action fail for as long as it does,
+	// with no self-service remedy.
+	if _, err := p.db.cancelPendingRemovalJobsTx(tx, projectID, uid, now); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("project: commit add member: %w", err)
@@ -865,7 +947,9 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	if err != nil {
 		return false, err
 	}
-	if target == nil || target.Status != MemberStatusActive {
+	// removing = 1 reads as "not a member" here too. Acting on a closing seat is
+	// not a partial success to report, it is a target that no longer exists.
+	if target == nil || target.Status != MemberStatusActive || target.Removing != 0 {
 		return false, errMemberNotFound
 	}
 	if !canActOnTargetRole(actorRole, target.Role) {
@@ -883,14 +967,19 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 		}
 	}
 
-	changed, err := p.db.deactivateMemberTx(tx, projectID, targetUID, now)
+	// D4 — two-phase close. `removing = 1` goes in with `status` still 1, and the
+	// worker flips status only after the groups are detached. See db_removal.go
+	// for why the order is inverted: closing the seat first would leave a window
+	// where the member is not a member and their group_member rows still exist,
+	// which is I2 violated by the removal itself, every time.
+	//
+	// member_epoch is bumped HERE, not at the worker's final flip, because from
+	// every consumer's point of view the membership already changed: the seat
+	// stops granting anything the moment removing is set.
+	changed, err := p.beginRemovalWithCascadeTx(tx, projectID, spaceID, actorUID, targetUID,
+		removalReasonKicked, now)
 	if err != nil {
 		return false, err
-	}
-	if changed {
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
-			return false, err
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("project: commit remove member: %w", err)
@@ -946,7 +1035,9 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 	if err != nil {
 		return "", err
 	}
-	if self == nil || self.Status != MemberStatusActive {
+	// A member already on their way out cannot leave a second time; the first
+	// removal owns the seat and its cascade.
+	if self == nil || self.Status != MemberStatusActive || self.Removing != 0 {
 		return "", errMemberNotFound
 	}
 
@@ -971,14 +1062,12 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 		}
 	}
 
-	changed, err := p.db.deactivateMemberTx(tx, projectID, uid, now)
+	// Same two-phase close as the remove path (D4). Leaving is self-service, so
+	// the operator is the member themself.
+	changed, err := p.beginRemovalWithCascadeTx(tx, projectID, spaceID, uid, uid,
+		removalReasonLeft, now)
 	if err != nil {
 		return "", err
-	}
-	if changed {
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
-			return "", err
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("project: commit leave: %w", err)
@@ -1062,7 +1151,9 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 	if err != nil {
 		return false, "", err
 	}
-	if target == nil || target.Status != MemberStatusActive {
+	// See actorRoleTx: a closing seat is not a member, so it cannot be granted or
+	// stripped of a role either.
+	if target == nil || target.Status != MemberStatusActive || target.Removing != 0 {
 		return false, "", errMemberNotFound
 	}
 	if !canActOnTargetRole(actorRole, target.Role) {
@@ -1139,7 +1230,14 @@ func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, successorUID, depart
 	if err != nil {
 		return err
 	}
-	if successor == nil || successor.Status != MemberStatusActive {
+	// The successor must not be a seat that is CLOSING, and this is the sharpest
+	// case of the rule rather than another instance of it. countActiveOwnersTx
+	// already excludes removing = 1, so promoting one satisfies the last-owner
+	// guard while leaving the project with zero owners the moment the cascade
+	// finishes — the exact outcome that guard exists to prevent, reached through
+	// the guard itself. Nothing in P0 or P1 can promote a member without an owner,
+	// so the project would be unmanageable with no path back.
+	if successor == nil || successor.Status != MemberStatusActive || successor.Removing != 0 {
 		return errMemberNotFound
 	}
 	if _, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now); err != nil {
@@ -1167,7 +1265,14 @@ func (p *Project) actorRoleTx(tx *dbr.Tx, projectID, actorUID string) (int, erro
 	if err != nil {
 		return roleNonMember, err
 	}
-	if actor == nil || actor.Status != MemberStatusActive {
+	// A seat at removing = 1 is NOT a member for any authorization purpose — that
+	// is the whole contract of the two-phase close, and every other authorization
+	// read in the module already carries it (pkg/project's three predicates,
+	// countActiveOwnersTx, listMembers). This one deciding otherwise would leave a
+	// departing owner holding disband and role-change for the entire cascade
+	// window, on the re-read whose only job is to catch a role the middleware's
+	// cache got wrong.
+	if actor == nil || actor.Status != MemberStatusActive || actor.Removing != 0 {
 		return roleNonMember, nil
 	}
 	return actor.Role, nil
@@ -1211,4 +1316,44 @@ func sanitizeUIDs(in []string) []string {
 		out = append(out, uid)
 	}
 	return out
+}
+
+// beginRemovalWithCascadeTx performs the seat-closing half of D4's two-phase
+// removal inside the caller's transaction: set removing = 1, bump the epoch, and
+// enqueue the cascade job.
+//
+// All three in ONE transaction is the point. A crash between the flag and the
+// job would leave a member who is not a member of record and whose group rows
+// nobody is coming to clean up — an I2 violation with no worker behind it. That
+// is exactly the failure the outbox pattern exists to prevent, and why this is
+// not "flip the flag, then enqueue".
+//
+// Reports whether anything changed. False means the seat was already closing or
+// already closed, so the caller must not bump the epoch again or enqueue a
+// second job — the idempotence rule P0 established and nearly broke.
+func (p *Project) beginRemovalWithCascadeTx(
+	tx *dbr.Tx,
+	projectID, spaceID, operatorUID, targetUID, reason string,
+	now time.Time,
+) (bool, error) {
+	changed, err := p.db.beginMemberRemovalTx(tx, projectID, targetUID, now)
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		return false, nil
+	}
+	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		return false, err
+	}
+	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
+		ProjectID:   projectID,
+		UID:         targetUID,
+		SpaceID:     spaceID,
+		OperatorUID: operatorUID,
+		Reason:      reason,
+	}, now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
