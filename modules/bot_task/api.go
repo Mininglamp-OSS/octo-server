@@ -1,10 +1,14 @@
 package bot_task
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +40,8 @@ type BotTask struct {
 	sources        sourceRegistry
 	now            func() time.Time
 	notifyBotEvent func(robotID string)
+	sourceLimiter  *ratelimit.Limiter
+	sourceFloor    *sourceLocalFloor
 	log.Log
 }
 type ingressResponse struct {
@@ -60,26 +66,50 @@ func (m *BotTask) Route(r *wkhttp.WKHttp) {
 		options.MaxRetries = 1
 		options.PoolSize = 10
 	})
-	rps := ratelimit.SanitizeRPS(wkhttp.ParseRPSFromEnv("DM_BOT_TASK_IP_RPS", 20), 20)
-	burst := ratelimit.SanitizeBurst(wkhttp.ParseBurstFromEnv("DM_BOT_TASK_IP_BURST", 60), 60)
+	rps := ratelimit.SanitizeRPS(wkhttp.ParseRPSFromEnv("DM_BOT_TASK_IP_RPS", 100), 100)
+	burst := ratelimit.SanitizeBurst(wkhttp.ParseBurstFromEnv("DM_BOT_TASK_IP_BURST", 200), 200)
 	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "internal_bot_task", rps, burst)
+	sourceRPS := ratelimit.SanitizeRPS(wkhttp.ParseRPSFromEnv("DM_BOT_TASK_SOURCE_RPS", 20), 20)
+	sourceBurst := ratelimit.SanitizeBurst(wkhttp.ParseBurstFromEnv("DM_BOT_TASK_SOURCE_BURST", 60), 60)
+	m.sourceLimiter = ratelimit.New(
+		rlRedis,
+		"ratelimit:bot_task_source:",
+		"bot_task_source",
+		func() ratelimit.Params {
+			return ratelimit.Params{Enabled: true, RPS: sourceRPS, Burst: sourceBurst}
+		},
+		nil,
+		ratelimit.Params{Enabled: true, RPS: 20, Burst: 60},
+	)
+	m.sourceFloor = newSourceLocalFloor(m.sources, sourceRPS, sourceBurst)
 	// This service-to-service ingress uses the per-source bearer token below
 	// instead of end-user AuthMiddleware and does not access Space-scoped data.
-	r.Group("/v1/internal").POST("/bot-tasks", ipLimit, m.create)
+	r.Group("/v1/internal").POST(
+		"/bot-tasks",
+		ipLimit,
+		m.sourceAuthMiddleware(),
+		m.sourceRateLimitMiddleware(),
+		m.create,
+	)
 }
 
 func (m *BotTask) create(c *wkhttp.Context) {
+	authenticatedSource, ok := authenticatedTaskSource(c)
+	if !ok {
+		respondUnauthorized(c)
+		return
+	}
 	request, err := decodeTaskRequest(c)
 	if err != nil {
 		respondInvalid(c, "body")
 		return
 	}
 	request.Source = strings.TrimSpace(request.Source)
-	source, ok := m.sources[request.Source]
-	if !ok || !source.Enabled || !validBearerToken(c.GetHeader("Authorization"), source.Token) {
+	if request.Source != authenticatedSource {
 		respondUnauthorized(c)
 		return
 	}
+	source := m.sources[authenticatedSource]
 	task, err := normalizeTaskRequest(request)
 	if err != nil {
 		respondInvalid(c, invalidField(err))
@@ -163,11 +193,78 @@ func decodeTaskRequest(c *wkhttp.Context) (taskRequest, error) {
 	if err := decoder.Decode(&request); err != nil {
 		return taskRequest{}, err
 	}
-	// Do not probe the socket for a trailing JSON value here. MaxBytesReader
-	// bounds bytes, not time, so a client that sends one complete object without
-	// terminating the request body would otherwise pin this unauthenticated
-	// handler indefinitely. This matches the other HTTP ingresses in this repo.
+	// Inspect only bytes the decoder already buffered. Reading decoder.Buffered
+	// cannot wait on the socket, so a complete object still returns promptly,
+	// while an already-received second value or oversized tail is rejected.
+	trailing, err := io.ReadAll(decoder.Buffered())
+	if err != nil {
+		return taskRequest{}, err
+	}
+	if len(bytes.TrimSpace(trailing)) > 0 {
+		return taskRequest{}, errors.New("bot task request contains trailing data")
+	}
 	return request, nil
+}
+
+const authenticatedTaskSourceKey = "bot_task_source"
+
+func (m *BotTask) sourceAuthMiddleware() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		header := c.GetHeader("Authorization")
+		authenticatedSource := ""
+		for source, cfg := range m.sources {
+			if cfg.Enabled && validBearerToken(header, cfg.Token) {
+				authenticatedSource = source
+			}
+		}
+		if authenticatedSource == "" {
+			respondUnauthorized(c)
+			c.Abort()
+			return
+		}
+		c.Set(authenticatedTaskSourceKey, authenticatedSource)
+		c.Next()
+	}
+}
+
+func authenticatedTaskSource(c *wkhttp.Context) (string, bool) {
+	value, ok := c.Get(authenticatedTaskSourceKey)
+	source, typeOK := value.(string)
+	return source, ok && typeOK && source != ""
+}
+
+func (m *BotTask) sourceRateLimitMiddleware() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		source, ok := authenticatedTaskSource(c)
+		if !ok {
+			respondUnauthorized(c)
+			c.Abort()
+			return
+		}
+		if m.sourceFloor != nil && !m.sourceFloor.Allow(source) {
+			c.Header("Retry-After", "1")
+			respondRateLimited(c)
+			c.Abort()
+			return
+		}
+		if m.sourceLimiter != nil {
+			result := m.sourceLimiter.Check(source)
+			if result.ShouldSetHeaders() {
+				c.Header("X-RateLimit-Limit", strconv.Itoa(result.Burst))
+				c.Header("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
+				c.Header("X-RateLimit-Scope", "source")
+				if result.RetryAfter > 0 {
+					c.Header("Retry-After", strconv.Itoa(result.RetryAfter))
+				}
+			}
+			if result.ShouldReject() {
+				respondRateLimited(c)
+				c.Abort()
+				return
+			}
+		}
+		c.Next()
+	}
 }
 func validBearerToken(header, expected string) bool {
 	const prefix = "Bearer "

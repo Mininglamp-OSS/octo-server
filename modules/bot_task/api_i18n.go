@@ -26,6 +26,9 @@ func respondNotFound(c *wkhttp.Context) {
 func respondForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotTaskForbidden, nil, nil)
 }
+func respondRateLimited(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedRateLimited, nil, nil)
+}
 func respondInProgress(c *wkhttp.Context) {
 	c.Header("Retry-After", strconv.Itoa(int(claimRetryAfter/time.Second)))
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotTaskInProgress, nil, nil)
