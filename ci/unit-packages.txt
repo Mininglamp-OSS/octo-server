@@ -29,6 +29,7 @@
 ./pkg/i18n
 ./pkg/i18n/cmd/octo-i18n-extract
 ./pkg/i18n/codes
+./pkg/internaltoken
 ./pkg/keylock
 ./pkg/log
 ./pkg/markdown
