@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Mininglamp-OSS/octo-server/pkg/octosign"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Mininglamp-OSS/octo-server/pkg/octosign"
+	"unicode/utf8"
 )
 
 const testSecret = "0123456789abcdef0123456789abcdef" // 32 bytes, the configured minimum
@@ -464,5 +467,166 @@ func TestValidateTargetRejectsThePublishedConformanceSecrets(t *testing.T) {
 		Name: "fleet", EnsureURL: ensureURL, Secret: strings.Repeat("z", len(conformanceSecret)),
 	}); err != nil {
 		t.Fatalf("a real secret of the same length was rejected: %v", err)
+	}
+}
+
+// TestTransportDetailNamesTheReasonAndNeverTheRequest is the Q-2 fix's core property.
+//
+// Before it, a target that was down produced `last_error =
+// "transport_failed: projectprovision: transport_failed"` — the outcome label twice — while
+// connection-refused vs DNS vs deadline sat in the unexported cause, reachable only through
+// Unwrap, which nothing in the repository calls. That field is what the runbook sends a
+// human to read, the sweep appends to it because it is the only durable per-row evidence,
+// and this package has no logger, so an OOM-killed pod leaves no log line either.
+//
+// The second half of the assertion is the part that must not regress: the detail is drawn
+// from the transport error's INNER error, so nothing we sent can reach it.
+func TestTransportDetailNamesTheReasonAndNeverTheRequest(t *testing.T) {
+	const containerID = "octows-00112233445566778899aabbccddeeff"
+	req := EnsureRequest{
+		ContainerID: containerID, ProjectID: "p-secret", OctoSpaceID: "s-secret", Name: "n",
+	}
+	// A listener that is bound and then closed: the port is reachable and refuses, which is
+	// what a target whose Pod is not up looks like.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	refusedURL := "http://" + ln.Addr().String() + "/api/internal/workspaces/ensure"
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	c := NewClient(nil, nil)
+	_, err = c.Ensure(context.Background(), Target{
+		Name: "fleet", EnsureURL: refusedURL, Secret: testSecret, Timeout: 2 * time.Second,
+	}, req)
+	if err == nil {
+		t.Fatal("a closed port produced no error")
+	}
+	if Category(err) != "transport_failed" {
+		t.Fatalf("category = %q, want transport_failed", Category(err))
+	}
+
+	summary := Summary(err)
+	if summary == "" {
+		t.Fatal("Summary is empty: last_error would carry the outcome label and nothing else")
+	}
+	// The reason, not a restatement of the label.
+	if strings.Contains(summary, "transport_failed") {
+		t.Fatalf("Summary repeats the category the outcome label already carries: %q", summary)
+	}
+	if !strings.Contains(summary, "refused") {
+		t.Fatalf("Summary does not name the transport reason: %q", summary)
+	}
+
+	// Nothing we sent, in either the summary or the full error string.
+	for _, secret := range []string{containerID, "p-secret", "s-secret", testSecret} {
+		for label, text := range map[string]string{"Summary": summary, "Error": err.Error()} {
+			if strings.Contains(text, secret) {
+				t.Fatalf("%s leaks %q: %q", label, secret, text)
+			}
+		}
+	}
+	// The URL is deliberately excluded too: *url.Error's own message embeds it, so this
+	// asserts the inner error was taken rather than the wrapper.
+	if strings.Contains(summary, refusedURL) {
+		t.Fatalf("Summary carries the full URL, so it is the wrapper not the inner error: %q", summary)
+	}
+}
+
+// TestTransportDetailDistinguishesADeadlineFromARefusal — the two need different operator
+// actions (a slow target vs a target that is not up), so they must not read alike. The
+// deadline string is fixed rather than the standard library's, so a Go wording change
+// cannot silently rewrite what an operator greps for.
+func TestTransportDetailDistinguishesADeadlineFromARefusal(t *testing.T) {
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer blocked.Close()
+
+	c := NewClient(nil, nil)
+	_, err := c.Ensure(context.Background(), Target{
+		// A path is required by ValidateTarget, and without one this test measured
+		// invalid_target instead of a deadline — it passed for the wrong reason.
+		Name: "fleet", EnsureURL: blocked.URL + "/api/internal/workspaces/ensure",
+		Secret: testSecret, Timeout: 50 * time.Millisecond,
+	}, EnsureRequest{ContainerID: "octows-x", ProjectID: "p", OctoSpaceID: "s", Name: "n"})
+	if err == nil {
+		t.Fatal("a 500ms handler under a 50ms timeout produced no error")
+	}
+	if got := Summary(err); got != "deadline exceeded (per-call timeout)" {
+		t.Fatalf("deadline summary = %q, want the fixed string", got)
+	}
+}
+
+// TestSummaryAddsOnlyWhatTheOutcomeLabelDoesNotCarry pins the three shapes the worker
+// writes, so the 255-byte column is not spent restating its own label.
+func TestSummaryAddsOnlyWhatTheOutcomeLabelDoesNotCarry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"detail wins", &EnsureError{Category: "transport_failed", Detail: "dial tcp: refused"}, "dial tcp: refused"},
+		{"status when there is no detail", &EnsureError{Category: "target_5xx", Status: 500}, "status 500"},
+		{"nothing to add", &EnsureError{Category: "invalid_request"}, ""},
+		{"a non-ensure error keeps its own text", errors.New("boom"), "boom"},
+		{"nil", nil, ""},
+	} {
+		if got := Summary(tc.err); got != tc.want {
+			t.Errorf("%s: Summary = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestBoundedSingleLineIsSafeForA255ByteColumn covers the two ways this value could break
+// the write it feeds: a control character forging a second field in a log line, and a
+// byte-wise cut splitting a rune into an invalid UTF-8 sequence that MySQL in strict mode
+// rejects — which would fail the UPDATE and leave the row pending and unsweepable, the
+// zombie this module already closed once.
+func TestBoundedSingleLineIsSafeForA255ByteColumn(t *testing.T) {
+	// Newline/CR/tab become a space so words do not run together; any other control
+	// character is DROPPED rather than spaced, which is why NUL leaves "cd".
+	if got := boundedSingleLine("a\nb\tc\x00d", 64); got != "a b cd" {
+		t.Errorf("control characters survived: %q", got)
+	}
+	// Multi-byte runes, with the bound falling mid-rune.
+	const wide = "測試測試測試" // 3 bytes each
+	got := boundedSingleLine(wide, 7)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncation produced invalid UTF-8: %q", got)
+	}
+	if len(got) > 7 {
+		t.Fatalf("truncation exceeded the bound: %d bytes", len(got))
+	}
+	if got != "測試" {
+		t.Fatalf("expected a clean two-rune prefix, got %q", got)
+	}
+	if got := boundedSingleLine(strings.Repeat("x", 500), maxDetailBytes); len(got) != maxDetailBytes {
+		t.Errorf("bound not applied: %d bytes", len(got))
+	}
+}
+
+// TestConformanceEpochLabelMatchesTheConstant keeps a comment honest that a reader would
+// otherwise trust and a well-meaning editor would "fix" the wrong way.
+//
+// The label said 2026 while the epoch is 2025. The value cannot change — the published
+// signatures were computed over it — so the label is what has to track the value, and this
+// reads the source rather than a copy of it.
+func TestConformanceEpochLabelMatchesTheConstant(t *testing.T) {
+	src, err := os.ReadFile("conformance.go")
+	if err != nil {
+		t.Fatalf("read conformance.go: %v", err)
+	}
+	m := regexp.MustCompile(`conformanceNow is a fixed wall clock \((\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\)`).
+		FindSubmatch(src)
+	if m == nil {
+		t.Fatal("the conformanceNow comment no longer states a wall clock; this guard is now blind")
+	}
+	want := time.Unix(conformanceNow, 0).UTC().Format("2006-01-02T15:04:05Z")
+	if got := string(m[1]); got != want {
+		t.Errorf("comment says %s, conformanceNow is %s — fix the COMMENT, not the constant "+
+			"(the published signatures were computed over it)", got, want)
 	}
 }

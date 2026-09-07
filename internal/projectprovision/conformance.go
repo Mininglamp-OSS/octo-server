@@ -99,8 +99,10 @@ const (
 	// conformanceTamperedBody differs from conformanceBody in project_id only, and is
 	// sent under the signature computed over the ORIGINAL body.
 	conformanceTamperedBody = `{"container_id":"octows-00112233445566778899aabbccddeeff","project_id":"p-attacker000","octo_space_id":"s-conformance","name":"octo-project"}`
-	// conformanceNow is a fixed wall clock (2026-09-07T08:00:00Z) so the vectors do not
-	// depend on when they are run.
+	// conformanceNow is a fixed wall clock (2025-09-07T08:00:00Z) so the vectors do not
+	// depend on when they are run. The value is what the signatures below were computed
+	// over, so it must not be "corrected" to the current year — TestConformanceEpochLabel
+	// pins the label against the constant instead.
 	conformanceNow = int64(1757232000)
 )
 

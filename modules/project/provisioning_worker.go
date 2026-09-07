@@ -417,23 +417,40 @@ func (p *Project) releaseOrAbandon(job *provisioningJob, owner, outcome string, 
 			zap.String("projectId", job.ProjectID), zap.String("outcome", outcome),
 			zap.Bool("permanent", permanent),
 			zap.Uint32("attempts", job.Attempts), zap.Error(cause))
-		p.finishProvisioning(job, owner, provisionStatusAbandoned, outcome+": "+reason)
+		// The give-up reason AND the failure detail. finishProvisioningJob SETs last_error
+		// rather than appending, so writing the reason alone would overwrite the detail the
+		// releases had been accumulating — on the one row where an operator most needs it,
+		// since `abandoned` has no automatic re-drive and this is what the runbook sends
+		// them to read. Same argument the sweep's append was made for.
+		p.finishProvisioning(job, owner, provisionStatusAbandoned,
+			provisioningNote(outcome, cause)+" | "+reason)
 		return
 	}
 	p.Warn("project provisioning attempt failed; will retry",
 		zap.Uint64("jobId", job.ID), zap.String("target", job.Target),
 		zap.String("projectId", job.ProjectID), zap.String("outcome", outcome),
 		zap.Uint32("attempts", job.Attempts), zap.Error(cause))
-	// last_error carries the outcome label and the error's own string. Both are
-	// container-id-free by construction: projectprovision.EnsureError.Error is built
-	// from a category and a status only.
-	if err := p.db.releaseProvisioningJob(job.ID, owner, job.Attempts, outcome+": "+cause.Error(), now); err != nil {
+	// last_error carries the outcome label plus whatever the failure adds BEYOND that
+	// label — Summary, not Error(), because Error() re-states the category the outcome
+	// already is, and this column is 255 bytes shared with the sweep's appended marker.
+	// Container-id-free by construction: EnsureError's only request-derived field is its
+	// unexported cause, and neither Error() nor Summary() reads it.
+	if err := p.db.releaseProvisioningJob(job.ID, owner, job.Attempts, provisioningNote(outcome, cause), now); err != nil {
 		if errors.Is(err, errProvisioningLeaseLost) {
 			p.Warn("project provisioning lease changed hands before release", zap.Uint64("jobId", job.ID))
 			return
 		}
 		p.Warn("release project provisioning job failed", zap.Uint64("jobId", job.ID), zap.Error(err))
 	}
+}
+
+// provisioningNote formats last_error: the outcome label, plus the failure's own detail
+// when it has one the label does not already carry.
+func provisioningNote(outcome string, cause error) string {
+	if summary := projectprovision.Summary(cause); summary != "" {
+		return outcome + ": " + summary
+	}
+	return outcome
 }
 
 // finishProvisioning writes a terminal status. A lost lease is logged, not

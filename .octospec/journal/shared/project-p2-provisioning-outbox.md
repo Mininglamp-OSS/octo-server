@@ -110,3 +110,64 @@ Both found by mutation, not by reading:
 - **Mechanical renames damage prose.** A `sed` over an import path minted two
   paths that do not exist, in the very file other repositories are told to copy
   the wire contract from. Grep the prose after a path rename, not just the code.
+
+## The follow-up round: a field that was preserved and empty
+
+Both approving reviews independently named the same item as the one to fix before any target
+is enabled, and it is worth recording why a *cosmetic-looking* defect earned that.
+
+`last_error` for a target that is down read `transport_failed: projectprovision:
+transport_failed` — the outcome label, twice. The real reason (connection refused / DNS / TLS
+/ deadline) was captured in the error's unexported `cause`, `Unwrap()` existed, and **nothing
+in the repository ever called it.** So the module had gone to real trouble to protect that
+field — the sweep was deliberately changed to *append* to it rather than overwrite, on the
+argument that it is "the only durable per-row evidence of why provisioning failed" — while the
+field was empty for the first failure an operator would ever meet. Preserving a container
+carefully and leaving it empty is its own failure mode, and it is invisible to every test that
+only checks the field is *present*.
+
+Two things about the fix that are the actual content:
+
+- **The reason it was empty in the first place was a correct constraint.** `Error()` was built
+  from category and status only *because* that string lands in `last_error` and the container
+  id is a capability. Folding `cause` in would have satisfied the review and quietly broken
+  that: at the `encode_failed` site `cause` is a `json.Marshal` error over an `EnsureRequest`,
+  which carries the container id. `json.Marshal` of an all-string struct cannot realistically
+  fail — and "cannot realistically" is not the bar for a capability. So the detail is drawn
+  *only* from the transport error's **inner** error, which describes the network and
+  structurally cannot contain the request. The guarantee stays a property of construction
+  rather than an argument about how the standard library formats things.
+- **The fix did not reach the row that needed it most until it was traced.** `finishProvisioning`
+  *SET*s `last_error`, so the abandon path replaced the accumulated detail with "retries
+  exhausted" — on the one row with no automatic re-drive. Exactly the defect the sweep's append
+  had already fixed one layer away. Fixing the write and not the terminal write would have
+  shipped a green test suite and an empty field.
+
+## Making the doc-truth class mechanical
+
+Five consecutive rounds produced the same finding shape: **a comment or document asserting
+behaviour the code does not have.** Two instances were minted by a mechanical import rename,
+one by this slice's own index change invalidating untouched prose. Every one was caught by a
+human reading carefully — which is the wrong use of a careful human, because the references
+involved are ones a grep can settle.
+
+So two guards now own that half:
+
+- Every repository path named in the slice's comments or task documents must resolve in the
+  tree.
+- Every parenthesised column tuple made *entirely* of the table's own columns is read as a
+  claim about an index, and must be a **prefix** of a key the migration actually declares.
+
+Both found a real live instance on the first run — `brief.md` still enumerated
+`(status, finished_at)` after the index change, which three reviewers and I had all missed.
+Two implementation notes worth keeping:
+
+- **The first version of the path guard was all false positives.** It matched HTTP route
+  paths and URLs, because `/v1/internal/projects/status` contains a substring shaped exactly
+  like a package path. RE2 has no lookbehind, so the fix is a capture group on the preceding
+  character: a real reference starts at a non-path character. That one condition removed the
+  entire class.
+- **A guard that reads its own file cannot quote the defect it catches.** Both guards tripped
+  on their own explanatory comments. Describing the bad shape in words instead of quoting it
+  is not a workaround — it is the guard demonstrating that it works.
+

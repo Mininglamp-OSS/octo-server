@@ -513,3 +513,235 @@ func stripSQLComments(sql string) string {
 	}
 	return b.String()
 }
+
+// ---------- doc-truth guards ----------
+//
+// Five consecutive review rounds produced the same class of finding: a comment or a design
+// document asserting something the code does not have. Two instances were minted by a
+// mechanical import rename, one by an index change invalidating untouched prose, and each
+// was found by a human reading carefully. The class matters more than usual on this slice
+// because the feature is inert — nothing exercises it, so its correctness reaches an
+// operator only through the runbook and reaches two other teams only through a contract
+// file they are told to copy. The two guards below are the mechanical half: they check the
+// references a grep can settle, so review attention is left for the claims it cannot.
+
+// provisioningDocFiles is the text this slice ships: its Go sources, its migration, and its
+// task documents. Kept explicit rather than globbed so adding a file is a deliberate act.
+func provisioningDocFiles(t *testing.T) []string {
+	t.Helper()
+	root := repoRootForGuard(t)
+	var files []string
+	for _, pattern := range []string{
+		"modules/project/provisioning*.go",
+		"modules/project/config_provisioning.go",
+		"modules/project/db_provisioning.go",
+		"modules/project/metrics_provisioning.go",
+		"modules/project/sql/*_project_provisioning.sql",
+		"internal/projectprovision/*.go",
+		"pkg/octosign/*.go",
+		".octospec/tasks/project-p2-subsystem-integration/*.md",
+		".octospec/tasks/project-p2-subsystem-integration/*.yaml",
+	} {
+		matched, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		files = append(files, matched...)
+	}
+	if len(files) < 12 {
+		t.Fatalf("only %d slice text files found; the doc-truth guards would be near-vacuous. "+
+			"If files moved, update provisioningDocFiles.", len(files))
+	}
+	return files
+}
+
+// docPathReference matches a repository-relative path or Go package path as it appears in
+// prose: one of this repository's top-level directories followed by a slash-separated
+// identifier chain.
+//
+// Group 2 is the path. The leading group exists because RE2 has no lookbehind and the
+// preceding character is what separates a real reference from a coincidence: an HTTP route
+// like `/v1/internal/projects/status` and a URL like
+// `https://host/api/internal/workspaces/ensure` both contain a substring that looks exactly
+// like a package path, and both are preceded by `/`. Requiring the match to start at a
+// non-path character removes that entire class — which was every false positive on the first
+// attempt at this guard.
+var docPathReference = regexp.MustCompile(
+	`(^|[^/\w.-])((?:modules|internal|pkg|tools|cmd)/[A-Za-z0-9_]+(?:/[A-Za-z0-9_.+-]+)*)`)
+
+// docPathTrailingPunctuation is stripped before resolving. Prose ends a sentence right after
+// a path, so a trailing full stop belongs to the sentence and not to the filename.
+const docPathTrailingPunctuation = ".,;:)\"'`"
+
+// TestEveryPathReferencedInSliceTextExists is the guard for the failure that actually
+// happened twice.
+//
+// A `sed` over an import path rewrote prose as well as code and minted two paths that do not
+// exist — an `internal/` spelling of a package that lives under `pkg/`, and an `http.go`
+// inside it — in the very file other repositories are told to copy the wire contract from.
+// Nothing caught it; a reviewer read it. A path either resolves in the tree or it does not,
+// so this is exactly the half of the doc-truth problem a machine should own.
+//
+// (Stated without the literals on purpose: this guard reads its own file too, and quoting a
+// nonexistent path here to illustrate the point would trip it. That is the guard working.)
+func TestEveryPathReferencedInSliceTextExists(t *testing.T) {
+	root := repoRootForGuard(t)
+	checked := 0
+	for _, file := range provisioningDocFiles(t) {
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		rel, _ := filepath.Rel(root, file)
+		for _, groups := range docPathReference.FindAllStringSubmatch(string(body), -1) {
+			match := strings.TrimRight(groups[2], docPathTrailingPunctuation)
+			// A `go test ./modules/project/...` style wildcard names the directory.
+			match = strings.TrimSuffix(strings.TrimSuffix(match, "..."), "/")
+			if match == "" {
+				continue
+			}
+			// A directory reference, a file reference, or a package path whose directory
+			// exists — all three are legitimate ways this slice's prose names something.
+			candidates := []string{match}
+			if ext := filepath.Ext(match); ext == "" {
+				// `pkg/octosign` (a package) and `modules/project/provisioning` (a symbol
+				// prefix nobody writes) are distinguished by whether the directory exists,
+				// so only the directory form is accepted here.
+				candidates = append(candidates, filepath.Dir(match))
+			}
+			found := false
+			for _, candidate := range candidates {
+				if _, err := os.Stat(filepath.Join(root, candidate)); err == nil {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s references %q, which does not exist in the tree", rel, match)
+			}
+			checked++
+		}
+	}
+	// Non-vacuity: this slice's text is dense with cross-references, so a low count means
+	// the regex or the file list stopped matching rather than that everything resolves.
+	if checked < 40 {
+		t.Fatalf("only %d path references examined; the guard is no longer reading the slice's text", checked)
+	}
+}
+
+// indexColumnTuple matches a parenthesised, comma-separated lower_snake_case list of two or
+// more identifiers, which is how both a real index definition and a comment enumerating one
+// are written.
+var indexColumnTuple = regexp.MustCompile(`\(\s*` + "`?" + `[a-z][a-z0-9_]*` + "`?" +
+	`(?:\s*,\s*` + "`?" + `[a-z][a-z0-9_]*` + "`?" + `){1,5}\s*\)`)
+
+// TestNoCommentEnumeratesAStaleIndex catches the third instance of the class.
+//
+// Leading both scan indexes with `target` left the claim path's comment still enumerating the
+// pre-change column order — status first, `target` absent — i.e. an index that no longer
+// exists, inside the argument a future reader would use to decide whether the missing ORDER
+// BY is still right. (Spelled out in words rather than as a tuple because this guard reads
+// its own file: quoting the stale tuple to illustrate it would trip the check. That is the
+// guard working, the same way it is in the path guard above.) The
+// mechanical form of the check: any comment tuple whose every element is a column of this
+// table is claiming to be an index, so it must be a PREFIX of one that the migration
+// actually declares. A prefix rather than an exact match, because naming the leading columns
+// of a longer index is a legitimate and useful thing to write.
+func TestNoCommentEnumeratesAStaleIndex(t *testing.T) {
+	root := repoRootForGuard(t)
+	migrations, err := filepath.Glob(filepath.Join(root, "modules/project/sql/*_project_provisioning.sql"))
+	if err != nil || len(migrations) != 1 {
+		t.Fatalf("expected exactly one provisioning migration, got %v (err %v)", migrations, err)
+	}
+	ddl := stripSQLComments(readFileForGuard(t, migrations[0]))
+
+	// Columns of the table, and the column list of every key it declares.
+	columns := map[string]bool{}
+	for _, m := range regexp.MustCompile("(?m)^\\s*`([a-z][a-z0-9_]*)`\\s+[A-Z]").FindAllStringSubmatch(ddl, -1) {
+		columns[m[1]] = true
+	}
+	if len(columns) < 8 {
+		t.Fatalf("only parsed %d columns out of the migration; this guard cannot judge a tuple "+
+			"without the column set", len(columns))
+	}
+	// Every key, including the single-column ones. They can never match a tuple the comment
+	// regex produces (which needs two or more columns), but a complete set is what makes the
+	// non-vacuity count below mean "the migration was parsed" rather than "some of it was".
+	keyColumns := regexp.MustCompile(`(?m)^\s*(?:PRIMARY KEY|UNIQUE KEY|KEY)\b[^(]*\(([^)]*)\)`)
+	var declared [][]string
+	for _, m := range keyColumns.FindAllStringSubmatch(ddl, -1) {
+		declared = append(declared, parseColumnTuple(m[1]))
+	}
+	if len(declared) < 5 {
+		t.Fatalf("only parsed %d key definitions out of the migration; expected the primary key, "+
+			"two unique keys and two scan indexes", len(declared))
+	}
+
+	isPrefixOfSomeIndex := func(tuple []string) bool {
+		for _, index := range declared {
+			if len(tuple) > len(index) {
+				continue
+			}
+			match := true
+			for i, col := range tuple {
+				if index[i] != col {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+		return false
+	}
+
+	examined := 0
+	for _, file := range provisioningDocFiles(t) {
+		if strings.HasSuffix(file, ".sql") {
+			continue // the migration is the source of truth, not a claim about it
+		}
+		rel, _ := filepath.Rel(root, file)
+		for _, tuple := range indexColumnTuple.FindAllString(readFileForGuard(t, file), -1) {
+			cols := parseColumnTuple(tuple)
+			// Only tuples made ENTIRELY of this table's columns are read as index claims.
+			// A Go argument list or an English parenthetical will contain something else.
+			allColumns := true
+			for _, col := range cols {
+				if !columns[col] {
+					allColumns = false
+					break
+				}
+			}
+			if !allColumns {
+				continue
+			}
+			examined++
+			if !isPrefixOfSomeIndex(cols) {
+				t.Errorf("%s enumerates %s as an index, but no key in the migration starts with "+
+					"those columns", rel, tuple)
+			}
+		}
+	}
+	if examined == 0 {
+		t.Fatal("no index enumeration found in any slice text; this guard is now blind — " +
+			"if the comments stopped naming index columns, delete it rather than leaving it green")
+	}
+}
+
+func parseColumnTuple(tuple string) []string {
+	var out []string
+	for _, part := range strings.Split(strings.Trim(tuple, "()"), ",") {
+		out = append(out, strings.Trim(strings.TrimSpace(part), "`"))
+	}
+	return out
+}
+
+func readFileForGuard(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(body)
+}

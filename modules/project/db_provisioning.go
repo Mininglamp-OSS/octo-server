@@ -167,11 +167,11 @@ func (d *DB) claimProvisioningJob(owner string, targets []string, maxAttempts ui
 			"WHERE status = ? AND target IN ? AND attempts < ? AND next_attempt_at <= ? "+
 			"AND (lease_until IS NULL OR lease_until <= ?) "+
 			// No ORDER BY id, deliberately. With it the optimizer prefers a PRIMARY
-			// scan taking the first match over the (status, next_attempt_at,
-			// lease_until) index; terminal rows are never deleted before their
-			// retention expires and cluster at low ids, so the scan length would grow
-			// with deployment age. FIFO is not a guarantee here anyway — SKIP LOCKED
-			// already makes multi-replica pick order non-deterministic.
+			// scan taking the first match over idx_octo_project_provisioning_pending
+			// (target, status, next_attempt_at, lease_until); terminal rows are never
+			// deleted before their retention expires and cluster at low ids, so the scan
+			// length would grow with deployment age. FIFO is not a guarantee here anyway —
+			// SKIP LOCKED already makes multi-replica pick order non-deterministic.
 			"LIMIT 1 FOR UPDATE SKIP LOCKED",
 		provisionStatusPending, targets, maxAttempts, now, now,
 	).LoadOne(&job)

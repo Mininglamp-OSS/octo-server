@@ -232,8 +232,11 @@ create/disband/claim/sweep/purge 交错**零 1213/1205**；`(project_id,target)`
 一个赢家 + 一个 1062；两个并发 `SKIP LOCKED` 认领取到不同行且 `attempts` 各自 +1；
 迁移在**生产形状**（默认 collation `utf8mb4_0900_ai_ci`）的服务器上干净应用，且本片每条
 语句都是单表、不存在跨表表达式面（#842 判定过的 1267/1270 类根本不会出现）；
-EXPLAIN 实测 claim/sweep 走 `idx_..._pending`、purge 走 `idx_..._finished`、disband 标记走
-`uk_..._target`；对 #846 活头 merge-tree **恰好两处文本冲突**（与 PR body 声称一致）、
+EXPLAIN 实测 disband 标记走 `uk_..._target`；claim / sweep / purge 三条各自走
+`idx_..._pending` 或 `idx_..._finished` —— **两个索引现在共享 `(target, status)` 前缀，所以
+任一个都能服务这三条语句，优化器具体挑哪个在不同数据量下会互换，功能等价**（这条记录写于索引
+改成 target 前缀之前，当时的观测是 claim/sweep 走 pending、purge 走 finished；之后复审实测两侧
+互换）。普查 `GROUP BY target, status` 现在是覆盖索引读（`Using index`）；对 #846 活头 merge-tree **恰好两处文本冲突**（与 PR body 声称一致）、
 迁移 id 不撞、两种合并顺序都无锁环。
 
 ---

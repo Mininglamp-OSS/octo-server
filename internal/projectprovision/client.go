@@ -83,6 +83,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/octosign"
 )
@@ -163,17 +165,44 @@ type EnsureResponse struct {
 type EnsureError struct {
 	Category string
 	Status   int
-	cause    error
+	// Detail is a bounded transport-layer reason, and it is set at exactly the two
+	// sites where it can be derived WITHOUT reading anything we sent.
+	//
+	// It exists because category-plus-status is empty for the failure an operator hits
+	// first. A target that is down produced `last_error = "transport_failed:
+	// projectprovision: transport_failed"` — the outcome label twice — while the actual
+	// reason (connection refused vs DNS vs TLS vs deadline) sat in `cause`, reachable
+	// only through Unwrap, which nothing calls. That field is what the runbook sends a
+	// human to read, the sweep was deliberately changed to APPEND to it because it is the
+	// only durable per-row evidence, and this package has no logger by design — so for an
+	// OOM-killed pod there is no log line to fall back on either.
+	//
+	// Why a separate field rather than folding `cause` into Error(): `cause` is whatever
+	// the standard library produced, and at two of the construction sites that is a
+	// function of OUR request — encode_failed wraps a json.Marshal error over an
+	// EnsureRequest, which carries the container id. json.Marshal of an all-string struct
+	// cannot realistically fail, but "cannot realistically" is not the bar for a value the
+	// package comment calls a capability. Detail is only ever filled from the transport
+	// error's INNER error, which describes the network and structurally cannot contain the
+	// request. The container-id-freedom of last_error stays a property of construction, not
+	// an argument about stdlib formatting.
+	Detail string
+	cause  error
 }
 
-// Error is deliberately built from the category and the status only. It must stay
-// that way: this string lands in octo_project_provisioning.last_error, and the
-// container id is a capability (see the package comment).
+// Error is built from the category, the status and the bounded transport Detail — never
+// from the request. It must stay that way: this string lands in
+// octo_project_provisioning.last_error, and the container id is a capability (see the
+// package comment and the Detail field).
 func (e *EnsureError) Error() string {
+	msg := "projectprovision: " + e.Category
 	if e.Status > 0 {
-		return fmt.Sprintf("projectprovision: %s (status %d)", e.Category, e.Status)
+		msg = fmt.Sprintf("projectprovision: %s (status %d)", e.Category, e.Status)
 	}
-	return "projectprovision: " + e.Category
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	return msg
 }
 
 func (e *EnsureError) Unwrap() error { return e.cause }
@@ -193,6 +222,38 @@ func (e *EnsureError) Unwrap() error { return e.cause }
 // So the retry decision lives entirely in the worker, keyed on Category — see
 // isPermanentProvisioningOutcome in modules/project/provisioning_worker.go. Keeping a
 // predicate no caller should use is worse than not having one.
+
+// Summary returns the container-id-free failure text WITHOUT the category.
+//
+// The caller already labels the row and the metric with its own outcome string, which is
+// derived from Category — so including the category here produced `last_error =
+// "transport_failed: projectprovision: transport_failed"`, the same label twice, in a
+// 255-byte column that a human is sent to read and that the sweep appends to. This returns
+// only the part the outcome does not already say:
+//
+//	transport_failed -> "dial tcp 10.0.0.4:8080: connect: connection refused"
+//	target_5xx       -> "status 500"
+//	invalid_request  -> ""            (nothing to add; the category IS the reason)
+//
+// A non-EnsureError falls back to its own message, which is how a panic or a DB error keeps
+// its text. Same container-id-freedom guarantee as Error(): the only request-derived field
+// on EnsureError is `cause`, and this never reads it.
+func Summary(err error) string {
+	var ensureErr *EnsureError
+	if !errors.As(err, &ensureErr) {
+		if err == nil {
+			return ""
+		}
+		return err.Error()
+	}
+	if ensureErr.Detail != "" {
+		return ensureErr.Detail
+	}
+	if ensureErr.Status > 0 {
+		return fmt.Sprintf("status %d", ensureErr.Status)
+	}
+	return ""
+}
 
 // Category extracts the low-cardinality failure label, or "" for a non-ensure
 // error. Metric label values come from here so they can never be a free-form
@@ -364,7 +425,9 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	defer cancel()
 	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, target.EnsureURL, bytes.NewReader(body))
 	if err != nil {
-		return EnsureResponse{}, &EnsureError{Category: "request_failed", cause: err}
+		return EnsureResponse{}, &EnsureError{
+			Category: "request_failed", Detail: transportDetail(err), cause: err,
+		}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("User-Agent", "octo-server/project-provisioning-v1")
@@ -375,11 +438,20 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 
 	response, err := c.client.Do(httpReq)
 	if err != nil {
-		// A cancelled parent context (worker shutdown) lands here too, and is
-		// deliberately not distinguished: `attempts` was already incremented at claim,
-		// so nothing is saved by labelling it differently, and the row simply stays
-		// pending for the next tick to pick up.
-		return EnsureResponse{}, &EnsureError{Category: "transport_failed", cause: err}
+		// One category for every way the call did not produce a response — connection
+		// refused, DNS failure, TLS handshake, the per-call deadline — because the retry
+		// decision is the same for all of them and the metric label must stay a closed
+		// enum. Which one it was goes in Detail, where an operator can read it.
+		//
+		// The reachable cancellation is this client's own deadline, NOT a parent context:
+		// the caller passes context.Background() and the module registers no Stop hook, so
+		// SIGTERM does not interrupt an in-flight call at all. What actually happens on
+		// shutdown is that the process is killed mid-call, the lease expires, and the
+		// sweep recovers the row — attempts was already incremented at claim, and
+		// container_id is the receiver's idempotency key, so the retry cannot double-create.
+		return EnsureResponse{}, &EnsureError{
+			Category: "transport_failed", Detail: transportDetail(err), cause: err,
+		}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
@@ -404,6 +476,73 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		return EnsureResponse{}, &EnsureError{Category: "container_id_mismatch", Status: response.StatusCode}
 	}
 	return out, nil
+}
+
+// maxDetailBytes bounds a transport Detail.
+//
+// last_error is VARCHAR(255) and it is SHARED: the worker prefixes an outcome label and
+// the sweep appends its own marker, and the truncation on the way in keeps the OLDEST
+// text. So an unbounded detail would not just be clipped — it would push the sweep's
+// marker out of the column. Small enough that several attempts still fit.
+const maxDetailBytes = 96
+
+// transportDetail renders the reason a call produced no response, drawn ONLY from the
+// transport error.
+//
+// Two properties, both load-bearing:
+//
+//   - It never reads the request. A *url.Error's own message embeds the method and the full
+//     URL; this returns its INNER error instead, which describes the network. Nothing we
+//     sent — least of all the container id — can reach the returned string. (The target's
+//     identity is already its own column, so the URL adds nothing an operator needs here.)
+//   - The two deadline/cancel shapes get FIXED strings rather than the stdlib's, so the
+//     common case reads the same in every row and cannot vary with Go's wording.
+//
+// Control characters are stripped: this value lands in a log line and a DB column, and a
+// newline from a hostile-ish transport error should not be able to forge a second log field.
+func transportDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		// This is the client's own per-call timeout, bounded to a quarter of the lease at
+		// config load. Named explicitly because it is the one an operator will see when a
+		// target is slow rather than down, and the two need different actions.
+		return "deadline exceeded (per-call timeout)"
+	case errors.Is(err, context.Canceled):
+		return "context canceled"
+	}
+	inner := err
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		inner = urlErr.Err
+	}
+	return boundedSingleLine(inner.Error(), maxDetailBytes)
+}
+
+// boundedSingleLine collapses control characters and truncates on a rune boundary.
+//
+// Truncating a UTF-8 string by bytes can split a rune and leave an invalid sequence, which
+// MySQL in strict mode rejects on a utf8mb4 column — that would make the UPDATE fail and
+// leave the row pending and unsweepable, which is the zombie this module already closed
+// once. Cutting at a rune boundary is what keeps that closed.
+func boundedSingleLine(s string, max int) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == '\n' || r == '\r' || r == '\t' {
+			r = ' '
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // containerEventID derives the wire event id from a container id.

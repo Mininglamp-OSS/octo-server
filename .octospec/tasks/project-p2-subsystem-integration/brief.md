@@ -281,7 +281,9 @@ Chosen by the product over subsystem-side lazy `ensure`.
    `finished_at`. Shaped after
    `modules/space/sql/20260821000001_space_member_removal_cleanup.sql` with P1's
    corrections: app-written UTC (no `NOW()` / `ON UPDATE`) and a draining purge with its
-   own `(status, finished_at)` index.
+   own `(target, status, finished_at)` index. Both scan indexes lead with `target` because
+   every claim/sweep/purge statement filters on it and, without that leading column, one
+   target's scan locks the other's rows and `SKIP LOCKED` then starves it.
 
    **No lease heartbeat** — corrected 2026-09-07. An earlier revision of this item listed
    one and the migration header repeated the claim, while no code ever extended a held

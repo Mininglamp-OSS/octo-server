@@ -274,6 +274,47 @@ deviations:
       published HMAC key, and conformanceTamperedBody is literally the forgery that key
       authorises — a valid signature over an attacker-chosen project_id. The MAC is the
       load-bearing layer precisely because ValidateTarget declines to require TLS.
+  - id: last-error-carries-the-transport-reason
+    what: |
+      EnsureError gained a bounded Detail field, filled ONLY at the two transport-layer
+      construction sites from the transport error's inner error; Summary() returns the
+      container-id-free text minus the category; and the abandon path writes the detail
+      alongside the give-up reason instead of replacing it.
+    why: |
+      Category-plus-status was empty for the failure an operator meets first: a target that
+      is down wrote `last_error = "transport_failed: projectprovision: transport_failed"` —
+      the outcome label twice — while connection-refused vs DNS vs TLS vs deadline sat in the
+      unexported cause, reachable only through Unwrap, which nothing calls. That field is
+      what the runbook sends a human to read, the sweep was deliberately changed to append to
+      it because it is the only durable per-row evidence, and this package has no logger by
+      design, so an OOM-killed pod leaves nothing else. A separate Detail field rather than
+      folding cause into Error(), because cause at the encode_failed site is a json.Marshal
+      error over an EnsureRequest, which carries the container id — realistically impossible
+      to trigger, but "realistically" is not the bar for a value the package comment calls a
+      capability. Detail is drawn only from the transport error's inner error, which describes
+      the network and structurally cannot contain the request, so container-id-freedom stays a
+      property of construction rather than an argument about stdlib formatting. The abandon
+      change is the same argument as the sweep's append: finishProvisioningJob SETs
+      last_error, so writing the reason alone destroyed the detail on the one row with no
+      automatic re-drive.
+  - id: mechanical-doc-truth-guards
+    what: |
+      two source guards over the slice's own text: every repository path referenced in a
+      comment or task document must resolve in the tree, and every parenthesised column tuple
+      made entirely of octo_project_provisioning columns must be a prefix of a key the
+      migration actually declares.
+    why: |
+      Five consecutive review rounds produced the same class of finding — a comment or
+      document asserting behaviour the code does not have — and every instance was caught by a
+      human reading carefully. Two were minted by a mechanical import rename (two nonexistent
+      paths, in the file other repositories are told to copy the wire contract from), one by
+      an index change invalidating untouched prose. Those are references a grep can settle, so
+      review attention should not be spent on them. The class matters more than usual here
+      because the feature is inert: nothing exercises it, so its correctness reaches an
+      operator only through the runbook and reaches two other teams only through a contract
+      file. Both guards found a real live instance on their first run (a stale index
+      enumeration in brief.md that three reviewers and the author had missed), and both are
+      mutation-verified against the exact shapes that shipped.
   - id: conformance-vectors
     what: |
       internal/projectprovision ships four fixed request/verdict vectors (valid /

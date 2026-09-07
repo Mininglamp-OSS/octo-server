@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -472,6 +473,74 @@ func makeProvisioningRowDue(t *testing.T, id uint64) {
 		time.Now().UTC().Add(-time.Minute), id,
 	).Exec()
 	require.NoError(t, err)
+}
+
+// TestLastErrorCarriesTheTransportReasonAndSurvivesAbandon is the Q-2 fix end to end.
+//
+// A target that is down is the first failure an operator meets, and it used to write
+// `transport_failed: projectprovision: transport_failed` — the outcome label twice — while
+// the actual reason (refused / DNS / TLS / deadline) was captured and discarded. This is the
+// field §3.4.1 of the runbook sends a human to read to decide whether to requeue, the sweep
+// was deliberately changed to append to it because it is the only durable per-row evidence,
+// and the client package has no logger by design, so an OOM-killed pod leaves nothing else.
+//
+// The second assertion is the half that would otherwise still be missing: finishProvisioning
+// SETs last_error rather than appending, so the abandon path used to overwrite the detail
+// with "retries exhausted" — on the one row that has no automatic re-drive and therefore
+// needs the reason most.
+func TestLastErrorCarriesTheTransportReasonAndSurvivesAbandon(t *testing.T) {
+	// A bound-then-closed port: reachable and refusing, which is what a target whose Pod is
+	// not up looks like. A stopped httptest server would do the same, but this cannot race
+	// with the server's own shutdown.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	refusedURL := "http://" + ln.Addr().String() + "/api/internal/workspaces/ensure"
+	require.NoError(t, ln.Close())
+
+	_, p := setup(t)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	p.nudgeProvisioningFn = func() {}
+	p.cfg.Provisioning = ProvisioningConfig{
+		Targets: []provisionTarget{{Target: projectprovision.Target{
+			Name: TargetFleet, EnsureURL: refusedURL, Secret: provTestSecretFleet,
+			Timeout: 2 * time.Second,
+		}}},
+		Interval: time.Hour, Timeout: 2 * time.Second, MaxAttempts: 2,
+		BatchSize: defaultProvisionBatch,
+	}
+
+	created := createVia(t, r, token, "P")
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	id, containerID := rows[0].ID, rows[0].ContainerID
+
+	p.processProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	require.Equal(t, provisionStatusPending, rows[0].Status)
+	retryError := rows[0].LastError
+	assert.Contains(t, retryError, "transport_failed", "the outcome label must still be there")
+	assert.Contains(t, retryError, "refused",
+		"last_error does not name WHY the call failed — this is the field the runbook sends a human to read")
+	// Not the label twice: exactly one occurrence.
+	assert.Equal(t, 1, strings.Count(retryError, "transport_failed"),
+		"last_error restates its own outcome label, spending a 255-byte column on nothing: %q", retryError)
+	assert.NotContains(t, retryError, containerID, "last_error leaks the container id")
+	assert.NotContains(t, retryError, provTestSecretFleet, "last_error leaks the HMAC secret")
+	assert.NotContains(t, retryError, refusedURL, "last_error carries the URL, so it took the wrapper not the inner error")
+
+	// Second attempt exhausts the budget and abandons.
+	makeProvisioningRowDue(t, id)
+	p.processProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	require.Equal(t, provisionStatusAbandoned, rows[0].Status)
+	assert.Contains(t, rows[0].LastError, "retries exhausted", "the give-up reason must be recorded")
+	assert.Contains(t, rows[0].LastError, "refused",
+		"the abandon write overwrote the transport reason — on the row with no automatic re-drive")
+	assert.NotContains(t, rows[0].LastError, containerID)
+	assert.LessOrEqual(t, len(rows[0].LastError), 255, "last_error must fit its column")
 }
 
 // TestWorkerRetriesThenAbandons pins the terminal failure path, including that
