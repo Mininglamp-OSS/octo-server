@@ -13,12 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
-	sharedratelimit "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
-	"github.com/go-redis/redis"
 )
 
 const testSourceToken = "0123456789abcdef0123456789abcdef"
@@ -86,6 +85,9 @@ type taskErrorEnvelope struct {
 	Error struct {
 		Code       string `json:"code"`
 		HTTPStatus int    `json:"http_status"`
+		Details    struct {
+			Field string `json:"field"`
+		} `json:"details"`
 	} `json:"error"`
 }
 
@@ -449,13 +451,19 @@ func TestBotTaskRejectsMalformedAndOversizeBodies(t *testing.T) {
 	}
 	for _, body := range [][]byte{
 		[]byte("{not-json"),
-		oversizeJSON,
 		append(append([]byte{}, validJSON...), []byte(` {"source":"loop"}`)...),
 	} {
 		w := doTaskRequest(t, router, testSourceToken, body)
 		if w.Code != http.StatusBadRequest || decodeTaskError(t, w).Error.Code != "err.shared.param.invalid" {
 			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 		}
+	}
+	oversizeResponse := doTaskRequest(t, router, testSourceToken, oversizeJSON)
+	oversizeError := decodeTaskError(t, oversizeResponse)
+	if oversizeResponse.Code != http.StatusBadRequest ||
+		oversizeError.Error.Code != "err.shared.param.invalid" ||
+		oversizeError.Error.Details.Field != "body" {
+		t.Fatalf("oversize body must be rejected by the body cap: status=%d body=%s", oversizeResponse.Code, oversizeResponse.Body.String())
 	}
 }
 
@@ -473,38 +481,22 @@ func TestBotTaskPrepareFailureReleasesClaim(t *testing.T) {
 
 func TestBotTaskSourceRateLimitIsIndependentAndFailClosedWhenRedisIsDown(t *testing.T) {
 	const wikiToken = "wiki-token-0123456789abcdef0123456789"
+	t.Setenv("DM_BOT_TASK_IP_RPS", "1000")
+	t.Setenv("DM_BOT_TASK_IP_BURST", "1000")
+	t.Setenv("DM_BOT_TASK_SOURCE_RPS", "0.001")
+	t.Setenv("DM_BOT_TASK_SOURCE_BURST", "1")
+	cfg := config.New()
+	cfg.Test = true
+	cfg.DB.RedisAddr = "127.0.0.1:1"
 	module := newTestBotTask(
 		&stubTaskRobotService{exists: true, eventID: 88},
 		&claimStore{backend: &memoryClaimBackend{values: map[string]string{}}, doneTTL: time.Hour},
 	)
+	module.ctx = config.NewContext(cfg)
 	module.sources["wiki"] = sourceConfig{Token: wikiToken, Enabled: true, AllowedBotUIDs: []string{"bot-1"}}
-	module.sourceFloor = newSourceLocalFloor(module.sources, 0.001, 1)
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:         "127.0.0.1:1",
-		DialTimeout:  10 * time.Millisecond,
-		ReadTimeout:  10 * time.Millisecond,
-		WriteTimeout: 10 * time.Millisecond,
-		MaxRetries:   0,
-	})
-	t.Cleanup(func() { _ = redisClient.Close() })
-	module.sourceLimiter = sharedratelimit.New(
-		redisClient,
-		"ratelimit:test_bot_task_source:",
-		"bot_task_source",
-		func() sharedratelimit.Params {
-			return sharedratelimit.Params{Enabled: true, RPS: 0.001, Burst: 1}
-		},
-		nil,
-		sharedratelimit.Params{Enabled: true, RPS: 0.001, Burst: 1},
-	)
 	router := wkhttp.New()
 	router.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
-	router.Group("/v1/internal").POST(
-		"/bot-tasks",
-		module.sourceAuthMiddleware(),
-		module.sourceRateLimitMiddleware(),
-		module.create,
-	)
+	module.Route(router)
 
 	if first := doTaskRequest(t, router, testSourceToken, validTaskRequest()); first.Code != http.StatusAccepted {
 		t.Fatalf("first loop request status=%d body=%s", first.Code, first.Body.String())
