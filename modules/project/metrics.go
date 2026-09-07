@@ -42,6 +42,10 @@ const (
 	reasonPermissionDenied = "permission_denied"
 	reasonLastOwner        = "last_owner"
 	reasonNameDuplicated   = "name_duplicated"
+	// reasonProvisioningEnqueue is the outbox-write failure inside project creation.
+	// Separate from a generic store failure because this slice is what made create
+	// depend on that write at all; see errProvisioningEnqueueFailed.
+	reasonProvisioningEnqueue = "provisioning_enqueue"
 )
 
 var (

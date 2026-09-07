@@ -471,10 +471,32 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	}); err != nil {
 		return nil, err
 	}
+	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
+	// construction under which "the project exists ⟹ its provisioning jobs exist" is
+	// true; a Redis queue or a post-commit call can drop the job or orphan it.
+	//
+	// Fail-closed, and this is a real behavioural change to create: a failure to write
+	// the outbox rows aborts the create. It is bounded — the failure modes are a DB
+	// error (which would have failed the create anyway) and a crypto/rand failure
+	// (see newContainerID, where a fallback would silently reintroduce a derivable
+	// container id). It is a no-op with no target enabled, which is the default, so
+	// create's availability is unchanged until an operator turns a target on.
+	//
+	// LAST statement before the commit, which is where the lock order puts it — see
+	// enqueueProvisioningTx.
+	if err := p.db.enqueueProvisioningTx(tx, model.ProjectID, in.SpaceID, p.cfg.Provisioning.Targets, now); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit create: %w", err)
 	}
 	p.invalidateProjectMemberCache(model.ProjectID, in.Creator)
+	// Off the request path, and only after the commit: "eager" should mean seconds,
+	// not up to a full interval tick. The interval remains the guarantee — this is
+	// just the nudge.
+	if p.nudgeProvisioningFn != nil {
+		p.nudgeProvisioningFn()
+	}
 	return model, nil
 }
 

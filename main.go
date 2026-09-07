@@ -32,6 +32,7 @@ import (
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
+	"github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -697,6 +698,18 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// modules/internal_resolve/main_wiring_test.go asserts this argument
 		// stays present so a future refactor cannot delete it silently.
 		os.Getenv(internal_resolve.DriveInternalTokenEnv),
+		// The two project provisioning secrets, for the same reason and with the same
+		// limitation: modules/project can check them against each other and against the
+		// four FIXED internal-token envs, but it cannot see the dynamic route-scoped
+		// notify tokens / callback secrets. Without these two arguments an operator who
+		// set a provisioning secret equal to a route's notify_token_env would pass every
+		// local check, and one leaked value would then authorize BOTH provisioning a
+		// container into fleet/drive AND minting that route's card action.
+		//
+		// modules/project/main_wiring_test.go asserts both arguments stay present so a
+		// refactor cannot drop them silently.
+		os.Getenv(project.ProvisionFleetSecretEnv),
+		os.Getenv(project.ProvisionDriveSecretEnv),
 	); err != nil {
 		return nil, err
 	}
