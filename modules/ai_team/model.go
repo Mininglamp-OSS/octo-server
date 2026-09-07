@@ -12,10 +12,9 @@ const (
 	sessionReady        = 2
 	sessionFailed       = 3
 
-	defaultSessionName = "新对话"
-	maxPageSize        = 100
-	defaultPageSize    = 20
-	maxIdempotencyKey  = 128
+	maxPageSize       = 100
+	defaultPageSize   = 20
+	maxIdempotencyKey = 128
 )
 
 type Agent struct {
@@ -47,6 +46,8 @@ type Session struct {
 	UpdatedAt          time.Time  `db:"updated_at" json:"updated_at"`
 	State              int        `db:"state" json:"state"`
 	ManualTitle        int        `db:"manual_title" json:"manual_title"`
+	Mute               int        `db:"mute" json:"mute"`
+	IsPinned           bool       `db:"is_pinned" json:"is_pinned"`
 	RequestHash        string     `db:"request_hash" json:"-"`
 }
 

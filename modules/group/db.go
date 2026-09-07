@@ -676,6 +676,19 @@ func (d *DB) queryGroupsWithMemberUIDAndSpaceID(memberUID string, spaceID string
 	return models, err
 }
 
+// queryAllGroupsWithMemberUIDAndSpaceID is reserved for authoritative lifecycle
+// cleanup. Product-facing lists use queryGroupsWithMemberUIDAndSpaceID so AI
+// containers remain hidden, but Space removal must also revoke their membership
+// and WuKongIM subscriptions.
+func (d *DB) queryAllGroupsWithMemberUIDAndSpaceID(memberUID string, spaceID string) ([]*Model, error) {
+	var models []*Model
+	_, err := d.session.Select("distinct `group`.*").From("`group`").
+		LeftJoin("group_member", "`group`.group_no=group_member.group_no").
+		Where("group_member.uid=? and group_member.is_deleted=0 and `group`.space_id=?", memberUID, spaceID).
+		Load(&models)
+	return models, err
+}
+
 // 查询某个用户参与的所有群
 func (d *DB) queryGroupsWithMemberUID(memberUID string) ([]*Model, error) {
 	var models []*Model

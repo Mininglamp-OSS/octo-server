@@ -174,6 +174,33 @@ func TestGroupCascadeRemovesMemberFromSpaceGroupsOnly(t *testing.T) {
 	assert.True(t, inB, "其它 Space 的群绝不能被牵连")
 }
 
+// TestGroupCascadeIncludesAIContainer proves product-list hiding does not leak
+// into the authoritative Space lifecycle query. Losing the Space seat must also
+// remove the owner from the private parent and its WuKongIM subscriber set.
+func TestGroupCascadeIncludesAIContainer(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, owner, bot = "sp-ai-cleanup", "u-ai-owner", "bot-ai-cleanup"
+
+	seedGroupInSpace(t, ctx, "g-ai-cleanup", spaceID, owner)
+	_, err := ctx.DB().Update("group").Set("purpose", "ai_session_container").
+		Where("group_no=?", "g-ai-cleanup").Exec()
+	require.NoError(t, err)
+	seedGroupMember(t, ctx, "g-ai-cleanup", owner, MemberRoleCreator)
+	seedInvitedBot(t, ctx, "g-ai-cleanup", bot, owner, "AI bot")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: owner, OperatorUID: "u-admin", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	_, stillIn := liveMemberRole(t, ctx, "g-ai-cleanup", owner)
+	assert.False(t, stillIn, "AI container membership must be removed with the Space seat")
+	_, botStillIn := liveMemberRole(t, ctx, "g-ai-cleanup", bot)
+	assert.False(t, botStillIn, "the owner's Bot must be removed with the container owner")
+	assert.Contains(t, stub.unsubscribed("g-ai-cleanup"), owner)
+	assert.Contains(t, stub.unsubscribed("g-ai-cleanup"), bot)
+}
+
 // TestGroupCascadeUnsubscribesFromIM 退群必须同时摘掉 WuKongIM 订阅，
 // 否则人虽然不在成员表里，仍然收得到群消息。
 func TestGroupCascadeUnsubscribesFromIM(t *testing.T) {

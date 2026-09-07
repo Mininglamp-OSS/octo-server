@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 
 	// space 迁移脚本依赖 group 和 robot 表
 	depDDLs := []string{
-		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, purpose VARCHAR(32) NOT NULL DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		"CREATE TABLE IF NOT EXISTS group_member (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) DEFAULT '', uid VARCHAR(40) DEFAULT '', role INT DEFAULT 0, is_deleted SMALLINT DEFAULT 0, status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		// robot 与 user 同样显式重建：共享 test 库里遗留的旧版 robot 表缺少
 		// 通讯录依赖的 description / agent_hosting 列时，IF NOT EXISTS 不会补列。
@@ -778,6 +778,26 @@ func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
 		_, err := testCtx.DB().SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=?", groupNo, testutil.UID).Load(&count)
 		return err == nil && count == 1
 	}, time.Second, 10*time.Millisecond, "群成员记录应该只有一条（幂等）")
+}
+
+func TestJoinPresetGroupsSkipsAIContainer(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	const groupNo, spaceID, uid = "g-ai-preset", "sp-ai-preset", "u-ai-preset"
+
+	_, err = testCtx.DB().InsertInto("group").
+		Columns("group_no", "name", "creator", "status", "space_id", "purpose").
+		Values(groupNo, "private AI container", "owner", 1, spaceID, "ai_session_container").Exec()
+	assert.NoError(t, err)
+
+	f.joinPresetGroups(uid, spaceID, `["`+groupNo+`"]`)
+
+	var count int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, uid,
+	).Load(&count)
+	assert.NoError(t, err)
+	assert.Zero(t, count, "preset groups must not bypass the AI container membership invariant")
 }
 
 func TestJoinSpacePresetGroupDisbanded(t *testing.T) {

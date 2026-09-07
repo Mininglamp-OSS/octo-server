@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -148,14 +149,13 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 		// resolved from the persisted association and full thread channel, never
 		// from client-controlled robot_id/purpose/mention fields. The lookup also
 		// checks active Space seats, Bot ownership/status and thread readiness.
-		if message.ChannelType == common.ChannelTypeCommunityTopic.Uint8() &&
-			!isSystemContentTypeForAITeam(payloadValue.Get("type").Int()) {
+		if aiteampkg.Enabled() &&
+			message.ChannelType == common.ChannelTypeCommunityTopic.Uint8() &&
+			isAITeamUserContentType(payloadValue.Get("type").Int()) {
 			resolved, resolveErr := aiteampkg.LookupReadySessionTarget(rb.ctx.DB(), message.ChannelID, message.FromUID)
 			if resolveErr != nil {
 				rb.Error("resolve AI session target failed", zap.Error(resolveErr), zap.String("channelID", message.ChannelID), zap.Int64("messageID", message.MessageID))
-				continue
-			}
-			if resolved != nil {
+			} else if resolved != nil {
 				aiTarget = resolved
 				robotID = resolved.BotID
 				rb.maybeSetAISessionTitle(resolved, payloadValue.Get("content").String())
@@ -486,8 +486,15 @@ type aiSessionDelivery struct {
 	InputID    int64
 }
 
-func isSystemContentTypeForAITeam(contentType int64) bool {
-	return contentType >= int64(common.FriendApply)
+func isAITeamUserContentType(contentType int64) bool {
+	switch common.ContentType(contentType) {
+	case common.Text, common.Image, common.GIF, common.Voice,
+		common.Video, common.Location, common.Card, common.File,
+		common.MultipleForward, common.VectorSticker, common.EmojiSticker,
+		common.RichText:
+		return true
+	}
+	return contentType == int64(cardmsg.InteractiveCard)
 }
 
 func (rb *Robot) maybeSetAISessionTitle(target *aiteampkg.SessionTarget, content string) {
@@ -503,7 +510,7 @@ func (rb *Robot) maybeSetAISessionTitle(target *aiteampkg.SessionTarget, content
 		content = string(runes[:100])
 	}
 	if _, err := rb.ctx.DB().Update("thread").Set("name", content).
-		Where("group_no=? AND short_id=? AND name=?", target.GroupNo, target.ShortID, "新对话").Exec(); err != nil {
+		Where("group_no=? AND short_id=? AND name=?", target.GroupNo, target.ShortID, aiteampkg.DefaultSessionName).Exec(); err != nil {
 		rb.Warn("update initial AI session title failed", zap.Error(err), zap.String("short_id", target.ShortID))
 	}
 }

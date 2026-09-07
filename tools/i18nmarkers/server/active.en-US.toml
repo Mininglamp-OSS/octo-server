@@ -42,9 +42,6 @@ other = "The AI session is not ready. Please retry."
 ["err.server.ai_team.not_found"]
 other = "AI team resource not found."
 
-["err.server.ai_team.query_failed"]
-other = "Failed to query AI team data."
-
 ["err.server.ai_team.request_invalid"]
 other = "Invalid AI team request."
 

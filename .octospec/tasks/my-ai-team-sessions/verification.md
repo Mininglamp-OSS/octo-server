@@ -9,10 +9,12 @@ Date: 2026-09-07
 | Build | `go build ./...` | PASS |
 | Unit suite | `ci/run-unit-tests.sh` | PASS — 52 unit packages |
 | E2E shard 1 | `MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 1 4` | PASS |
-| E2E shard 2 | `MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 2 4` | PASS |
-| E2E shard 3 | `MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 3 4` | PASS |
-| E2E shard 4 | `MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 4 4` | PASS |
+| E2E shard 2 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 2 4` | PASS |
+| E2E shard 3 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 3 4` | PASS after final review/UI-control changes |
+| E2E shard 4 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 4 4` | PASS |
 | Focused AI/message regression | `go test ./modules/ai_team ./modules/message` | PASS |
+| Fresh DB AI API controls | `go test -count=1 ./modules/ai_team` | PASS — rename, pin ordering, mute, per-user clear, soft delete, ownership and scan-join guard |
+| Production-shape collation regression | `go test -count=1 ./modules/ai_team -run TestAITeamQueriesSurviveProductionCollationShape` | PASS — real MySQL with 0900 legacy identity tables joined to general-ci AI/thread tables |
 | Static analysis | `go vet ./...` | PASS |
 | i18n extraction | `make i18n-extract` | PASS |
 | i18n extraction consistency | `make i18n-extract-check` | PASS |
@@ -22,7 +24,10 @@ Date: 2026-09-07
 The E2E/API coverage includes add/remove/re-add, replay and idempotency conflicts,
 concurrent single-parent creation, the exact two-member invariant, missing Space and
 foreign-Bot rejection, ordinary mutation protection, and hiding both AI parent groups
-and their thread sessions from recent/follow lists.
+and their thread sessions from recent/follow lists. The final review round also covers
+Space-removal lifecycle cleanup, preset-group and QR/scan-join bypasses, Bot API
+mutation rejection, inactive-seat routing rejection, and the personal session controls
+shown by the client: rename, pin ordering, mute, per-user history clear, and soft delete.
 
 ## Fresh-database migration verification
 

@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -1360,6 +1361,15 @@ func (s *Space) joinPresetGroups(uid string, spaceID string, presetGroupIdsJSON 
 		count, err := session.SelectBySql("SELECT status FROM `group` WHERE group_no=? AND space_id=?", groupNo, spaceID).Load(&groupStatus)
 		if err != nil || count == 0 || groupStatus != 1 {
 			s.Warn("预设群组不存在、已解散或不属于当前 Space，跳过", zap.String("group_no", groupNo), zap.String("space_id", spaceID))
+			continue
+		}
+		protected, err := aiteampkg.IsProtectedGroup(session, groupNo)
+		if err != nil {
+			s.Warn("检查预设群组用途失败，跳过", zap.String("group_no", groupNo), zap.Error(err))
+			continue
+		}
+		if protected {
+			s.Warn("AI 会话容器不能作为预设群组，跳过", zap.String("group_no", groupNo))
 			continue
 		}
 		// 检查用户是否已在群中

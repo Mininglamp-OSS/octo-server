@@ -24,7 +24,7 @@ func (g *Group) registerSpaceMemberRemovalCleanup() {
 
 // cleanupSpaceMemberGroups 把被移出 Space 的成员从该 Space 下的每个群里清出去。
 //
-// 幂等：群集合来自 queryGroupsWithMemberUIDAndSpaceID，它只返回 is_deleted=0 的成员行，
+// 幂等：群集合来自 queryAllGroupsWithMemberUIDAndSpaceID，它只返回 is_deleted=0 的成员行，
 // 所以已经退掉的群在重跑时天然不再命中。
 //
 // 单个群失败不中断其余群——部分完成是持久的（退掉的群不会再出现在下一轮的集合里），
@@ -58,7 +58,7 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 		return nil
 	}
 
-	groups, err := g.db.queryGroupsWithMemberUIDAndSpaceID(removal.UID, removal.SpaceID)
+	groups, err := g.db.queryAllGroupsWithMemberUIDAndSpaceID(removal.UID, removal.SpaceID)
 	if err != nil {
 		return fmt.Errorf("query groups of removed space member: %w", err)
 	}
@@ -116,7 +116,7 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // 「下次重载会把他加回来」的 YUJ-4185 注释，在这个版本同样不成立。
 //
 // 为什么这里没有顺手修掉：光把错误上抛没用——删行之后
-// queryGroupsWithMemberUIDAndSpaceID 已经查不到这个群，重跑是空转，只会把一次
+// queryAllGroupsWithMemberUIDAndSpaceID 已经查不到这个群，重跑是空转，只会把一次
 // 真实故障洗成 done；把 IMRemoveSubscriber 提到删行之前也没用，那只是换一个
 // 时刻失败。真正的修法是在删行的同一个事务里写一条持久化的 IM-pending 记录
 // （范围不依赖 group_member 活跃行），由本 worker 消费。但它修的是

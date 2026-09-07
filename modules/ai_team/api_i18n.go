@@ -14,20 +14,20 @@ func respondInvalid(c *wkhttp.Context, field string) {
 	if field != "" {
 		details["field"] = field
 	}
-	httperr.ResponseErrorL(c, errcode.ErrAITeamRequestInvalid, nil, details)
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamRequestInvalid, nil, details)
 }
 
 func respondServiceError(c *wkhttp.Context, err error) {
 	switch {
 	case errors.Is(err, errForbidden):
-		httperr.ResponseErrorL(c, errcode.ErrAITeamForbidden, nil, nil)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamForbidden, nil, nil)
 	case errors.Is(err, errNotFound):
-		httperr.ResponseErrorL(c, errcode.ErrAITeamNotFound, nil, nil)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamNotFound, nil, nil)
 	case errors.Is(err, errIdempotencyConflict):
-		httperr.ResponseErrorL(c, errcode.ErrAITeamIdempotencyConflict, nil, nil)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamIdempotencyConflict, nil, nil)
 	case errors.Is(err, errIMUnavailable):
-		httperr.ResponseErrorL(c, errcode.ErrAITeamIMUnavailable, nil, nil)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamIMUnavailable, nil, nil)
 	default:
-		httperr.ResponseErrorL(c, errcode.ErrAITeamStoreFailed, nil, nil)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamStoreFailed, nil, nil)
 	}
 }

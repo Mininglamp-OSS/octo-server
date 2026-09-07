@@ -37,6 +37,8 @@ session. Ordinary user messages in these threads automatically target the bound 
   not trust payload `robot_id` or `purpose`.
 - Dedicated parents and sessions are excluded from ordinary group/sidebar surfaces;
   AI/session lists are bounded, stable and SQL-paginated.
+- Session controls cover rename, pin/unpin, mute/unmute, archive/unarchive, soft
+  delete and per-user history clearing without reopening ordinary thread mutation APIs.
 - New API routes use Auth -> SharedUIDRateLimiter -> SpaceMiddleware, reject a missing
   Space explicitly, and return registered localized error envelopes.
 
@@ -45,7 +47,7 @@ session. Ordinary user messages in these threads automatically target the bound 
 - Shared/third-party Bot entitlement, App Bot support, multiple humans/Bots per
   session, cross-Space sessions, participant changes, and conversion to normal groups.
 - Front-end implementation, adapter implementation, old DM migration, cross-session
-  memory, hard deletion, cancellation, or a general workflow/outbox platform.
+  memory, physical message deletion, cancellation, or a general workflow/outbox platform.
 - Claiming end-to-end adapter isolation without verifying the external adapter build.
 
 ## Acceptance
@@ -63,6 +65,10 @@ session. Ordinary user messages in these threads automatically target the bound 
   not loop. Ordinary group mention behavior remains unchanged.
 - AI/session pagination, ordering, archive behavior, sidebar hiding, migrations,
   localized errors, and route middleware are covered by tests.
+- AI session rename/mute/soft-delete use owner-scoped AI routes. Pinning reuses the
+  Space-scoped channel pin contract and is reflected in AI list ordering. “Clear
+  chat history” reuses the per-user message offset contract and never deletes the
+  Bot's or another user's persisted history.
 - The global effective thread auto-archive setting is disabled for rollout
   (`thread_auto_archive_enabled=false`); the code default is already false, and
   deployment verification must also check that no DB override enables it.

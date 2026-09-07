@@ -1505,9 +1505,6 @@ other = "该幂等键已用于不同的请求。"
 ["err.server.ai_team.container_protected"]
 other = "AI 会话专用群不能通过普通群接口修改。"
 
-["err.server.ai_team.query_failed"]
-other = "查询 AI 团队数据失败。"
-
 ["err.server.ai_team.store_failed"]
 other = "保存 AI 团队数据失败。"
 

@@ -39,6 +39,8 @@ assumptions:
   - "Idempotency ledger rows are retained with session history; no finite TTL can safely permit the same key to create another thread later."
   - "Removing an AI hides the association only; existing session access and automatic execution remain valid while Bot/Space authority remains active."
   - "Thread auto-archive is a global policy and must be effectively disabled for rollout; the existing code default is false, but a DB system-setting override must be checked operationally."
+  - "The UI delete action uses the existing thread soft-delete contract (deleted status + banned IM channel); it does not physically erase stored messages."
+  - "Session pinning and per-user history clearing reuse the existing Space-scoped pinned-channel and message-offset contracts; AI list responses expose pin/mute state."
 
 external_verification:
   - "Frontend and adapter E1-E5 from the source brief require their own repositories and deployed versions; server events expose authoritative session metadata for that work."
