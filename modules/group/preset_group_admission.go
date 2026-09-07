@@ -57,11 +57,14 @@ func (g *Group) admitToPresetGroup(ctx *config.Context, spaceID, groupNo, uid st
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// projectID is deliberately passed as the empty sentinel rather than read
-	// from the group row: modules/space has ALREADY refused to auto-join a group
-	// whose project_id is non-empty, and a preset group is never a project group
-	// by construction. Passing "" here would be a fail-OPEN shortcut if that
-	// check were ever removed, so the gate is kept honest by reading the row.
+	// projectID is READ FROM THE GROUP ROW rather than passed as the empty
+	// sentinel, and that is the whole point of this lookup.
+	//
+	// modules/space has already refused to auto-join a group whose project_id is
+	// non-empty, so passing "" would be correct today — and would become a
+	// fail-OPEN shortcut the moment that check moved or was relaxed, with nothing
+	// here to notice. Reading the row costs one query on a path that runs once per
+	// Space join and keeps the gate answering from the group's own attribution.
 	groupModel, err := g.db.QueryWithGroupNo(groupNo)
 	if err != nil {
 		return fmt.Errorf("group: preset admission query group: %w", err)

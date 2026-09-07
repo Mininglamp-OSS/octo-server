@@ -148,8 +148,18 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 		Exec(); err != nil {
 		return 0, fmt.Errorf("project: disband project: %w", err)
 	}
+	// `removing` is cleared in the SAME statement that closes the seat.
+	//
+	// Without it a seat whose two-phase close was still in flight (removing = 1)
+	// lands on status = 0 AND removing = 1 — the one combination db_removal.go's
+	// state table marks as MUST NOT EXIST, and it is unrecoverable rather than
+	// merely wrong: finishMemberRemovalTx is guarded on `status = 1 AND
+	// removing = 1`, so nothing can ever match the row again, while
+	// scanRemovingStalls has no status filter and alerts on it every tick with no
+	// remedy an operator can apply.
 	res, err := tx.Update("octo_project_member").
 		Set("status", MemberStatusRemoved).
+		Set("removing", 0).
 		Set("updated_at", now).
 		Where("project_id = ? AND status = ?", projectID, MemberStatusActive).
 		Exec()
@@ -159,6 +169,15 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("project: disband affected rows: %w", err)
+	}
+	// Retire the cascade jobs those seats had outstanding, in this transaction.
+	// The worker would otherwise claim each one, re-read the member, find
+	// removing = 0 and drop it — burning a lease and an attempt per job to
+	// discover work that no longer exists. That is precisely what
+	// cancelPendingRemovalJobsTx exists to avoid on the re-admission path, and a
+	// disband closes every seat at once, so the waste scales with the project.
+	if _, err := d.cancelPendingRemovalJobsForProjectTx(tx, projectID, now); err != nil {
+		return 0, err
 	}
 	return affected, nil
 }
@@ -263,8 +282,15 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			"(SELECT COUNT(*) FROM `octo_project_member` mc "+
 			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0) AS member_count "+
 			"FROM `octo_project` p "+
+			// `removing = 0` on the JOIN as well as on the count: without it a member
+			// whose seat is closing keeps my_role, and — worse — keeps
+			// `pm.uid IS NOT NULL`, which is the clause that reveals UNLISTED
+			// projects. So a departing member would go on seeing projects they are
+			// not supposed to be able to enumerate, for the whole cascade window,
+			// while the member_count beside them already excluded them.
 			"LEFT JOIN `octo_project_member` pm "+
 			"  ON pm.project_id = p.project_id AND pm.uid = ? AND pm.status = 1 "+
+			"     AND pm.removing = 0 "+
 			"WHERE p.space_id = ? AND p.status = ? "+
 			"  AND (p.discoverability = ? OR pm.uid IS NOT NULL) "+
 			"ORDER BY p.id DESC LIMIT ? OFFSET ?",
@@ -585,8 +611,15 @@ func (d *DB) admitMemberTx(tx *dbr.Tx, m *MemberModel) (bool, error) {
 // The status filter is what makes the Space-cascade step idempotent: a rerun finds
 // no active row, affects zero rows, and therefore does not bump the epoch again.
 func (d *DB) deactivateMemberTx(tx *dbr.Tx, projectID, uid string, now time.Time) (bool, error) {
+	// `removing` is cleared here for the same reason disbandProjectTx clears it,
+	// and this is the path that actually reaches the state: the Space cascade
+	// closes a project seat for a uid leaving the Space, and it can land on a seat
+	// whose project-side removal is still in flight. Leaving removing = 1 on a
+	// status = 0 row makes finishMemberRemovalTx permanently unable to match it,
+	// so the seat stalls forever and the stall scan alerts with nothing to do.
 	res, err := tx.Update("octo_project_member").
 		Set("status", MemberStatusRemoved).
+		Set("removing", 0).
 		Set("updated_at", now).
 		Where("project_id = ? AND uid = ? AND status = ?", projectID, uid, MemberStatusActive).
 		Exec()
@@ -596,6 +629,15 @@ func (d *DB) deactivateMemberTx(tx *dbr.Tx, projectID, uid string, now time.Time
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("project: deactivate member affected rows: %w", err)
+	}
+	if affected > 0 {
+		// Same reasoning as the disband path: the seat is closed, so any job still
+		// queued for it has no work left. Retiring it here rather than letting the
+		// worker discover that keeps a lease and an attempt from being spent on a
+		// no-op.
+		if _, err := d.cancelPendingRemovalJobsTx(tx, projectID, uid, now); err != nil {
+			return false, err
+		}
 	}
 	return affected > 0, nil
 }
