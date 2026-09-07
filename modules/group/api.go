@@ -1766,6 +1766,18 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 		g.Error("查询群信息失败", zap.Error(err))
 		return nil, errors.New("查询群信息失败")
 	}
+	// 群行查不到就不再往下走（I2 / D3）。
+	//
+	// 原来下游是 `if groupModel != nil { admitSpaceID, admitProjectID = ... }`：
+	// 查不到时两者留空，准入口拿到的是「这不是项目群」这个断言，于是整批放行。
+	// 这与 preset_group_admission.go 为自己那条路径写下的理由是同一条——空
+	// project_id 是一个 fail-OPEN 的捷径，只要群行读不到就自动生效。两个调用方
+	// （memberAdd、邀请确认）都作用在已存在的群上，且此函数上方已校验操作者是
+	// 该群成员，所以这里读不到群行只可能是并发解散或数据损坏，都不该继续加人。
+	if groupModel == nil {
+		g.Error("群不存在，拒绝加人", zap.String("group_no", groupNo))
+		return nil, errors.New("群不存在！")
+	}
 	// 跨 Space 外部成员标识：与 scanjoin / Service.AddGroupMembers 语义对齐。
 	// 群属于某 Space 时，不在 Space 的成员标记 is_external=1 并写 source_space_id，
 	// 让消息头 from_is_external / from_source_space_name 下发路径可正确渲染
@@ -1775,7 +1787,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	externalMap := make(map[string]bool)
 	sourceSpaceMap := make(map[string]string)
 	var operatorMemberForSpace *MemberModel
-	if groupModel != nil && groupModel.SpaceID != "" && groupModel.AllowExternal == 0 {
+	if groupModel.SpaceID != "" && groupModel.AllowExternal == 0 {
 		operatorMember, opErr := g.db.QueryMemberWithUID(operator, groupNo)
 		if opErr != nil {
 			g.Error("查询操作者群成员失败", zap.Error(opErr))
@@ -1797,7 +1809,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			}
 		}
 	}
-	if groupModel != nil && groupModel.SpaceID != "" {
+	if groupModel.SpaceID != "" {
 		if operatorMemberForSpace == nil {
 			operatorMemberForSpace, _ = g.db.QueryMemberWithUID(operator, groupNo)
 		}
@@ -1965,12 +1977,9 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	// 现在整批一条 upsert，插入与恢复的列语义在 admission.go 里有实测记录。
 	//
 	// groupModel 在本函数前半段已按 groupNo 查出（外部成员判定要用它），
-	// 直接复用，不额外查一次。
-	var admitSpaceID, admitProjectID string
-	if groupModel != nil {
-		admitSpaceID, admitProjectID = groupModel.SpaceID, groupModel.ProjectID
-	}
-	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, admitSpaceID, admitProjectID,
+	// 直接复用，不额外查一次；查不到已在上面直接返回，所以这里无需再判空——
+	// 判空会重新引入「空 project_id = 不是项目群」的放行分支。
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, groupModel.SpaceID, groupModel.ProjectID,
 		admissions, AdmissionEntryInviteConfirm); err != nil {
 		g.Error("添加群成员失败！", zap.Error(err))
 		if errors.Is(err, ErrAdmissionRefused) {
@@ -1981,7 +1990,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 
 	// 首次出现外部人类成员时，在事务内将群标记为外部群。
 	markedExternal := false
-	if hasNewExternal && groupModel != nil && groupModel.IsExternalGroup == 0 {
+	if hasNewExternal && groupModel.IsExternalGroup == 0 {
 		if updateErr := g.db.UpdateIsExternalGroupTx(groupNo, 1, tx); updateErr != nil {
 			g.Error("更新 is_external_group 失败", zap.Error(updateErr), zap.String("group_no", groupNo))
 			return nil, errors.New("更新 is_external_group 失败")
