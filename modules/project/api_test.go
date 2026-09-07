@@ -505,15 +505,48 @@ const (
 	migrateDown
 )
 
-// applyProjectMigration executes one section of the module's real migration file.
+// projectMigrationFiles are this module's migration files, in APPLY order.
 //
-// Splitting on the `-- +migrate Up` / `-- +migrate Down` markers is safe for THIS file
-// specifically: it uses neither StatementBegin/StatementEnd nor a semicolon inside any
-// string literal, both of which are asserted below so a future edit that breaks the
-// assumption fails here rather than silently executing a truncated statement.
+// EDITED IN P1. The helper below used to read one hard-coded filename, which
+// encoded the assumption that modules/project has exactly one migration. P1
+// breaks that assumption by adding octo_project_member.removing and the cascade
+// outbox in a second file, and the consequence was not subtle: the Down/Up lap
+// dropped both tables and rebuilt them from P0's file alone, so
+// octo_project_member came back WITHOUT `removing`, and every test that ran
+// after this one in the same binary failed with
+// `Error 1054: Unknown column 'removing'`. 82 failures from one stale helper.
+//
+// Down is applied in REVERSE order for the usual reason: the later file's Down
+// drops objects the earlier file's Down would otherwise pull out from under it.
+var projectMigrationFiles = []string{
+	"sql/20260904000001_project_core.sql",
+	"sql/20260906000001_project_group_binding.sql",
+}
+
+// applyProjectMigration executes one section of every migration file this module
+// ships.
+//
+// Splitting on the `-- +migrate Up` / `-- +migrate Down` markers is safe for THESE
+// files specifically: they use neither StatementBegin/StatementEnd nor a semicolon
+// inside any string literal, both of which are asserted below so a future edit that
+// breaks the assumption fails here rather than silently executing a truncated
+// statement.
 func applyProjectMigration(t *testing.T, db *sql.DB, dir migrateDirection) {
 	t.Helper()
-	raw, err := sqlFS.ReadFile("sql/20260904000001_project_core.sql")
+	files := append([]string(nil), projectMigrationFiles...)
+	if dir == migrateDown {
+		for i, j := 0, len(files)-1; i < j; i, j = i+1, j-1 {
+			files[i], files[j] = files[j], files[i]
+		}
+	}
+	for _, name := range files {
+		applyOneProjectMigrationFile(t, db, name, dir)
+	}
+}
+
+func applyOneProjectMigrationFile(t *testing.T, db *sql.DB, name string, dir migrateDirection) {
+	t.Helper()
+	raw, err := sqlFS.ReadFile(name)
 	require.NoError(t, err)
 	body := string(raw)
 

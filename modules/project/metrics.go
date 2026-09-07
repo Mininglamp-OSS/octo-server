@@ -159,3 +159,65 @@ var (
 func observeRejected(entry, reason string) {
 	writeRejected.WithLabelValues(entry, reason).Inc()
 }
+
+// ---------------------------------------------------------------------------
+// P1 — group-binding invariants
+// ---------------------------------------------------------------------------
+
+// i2Violations counts active group_member rows in a project group whose uid is
+// not an active member of that project.
+//
+// The one to alert on. I2 has NO read-path filter behind it: a violating row
+// means that person sees the group in sidebar/sync, receives its messages over
+// WuKongIM, and can post in it. Non-zero is a live access-control failure, not a
+// data-quality nit.
+var i2Violations = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "i2_violations_total",
+	Help:      "Active members of a project group who are not active members of that project.",
+})
+
+// i3Violations counts groups whose project_id points at a project that is
+// disbanded, in another Space, or absent.
+var i3Violations = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "i3_violations_total",
+	Help:      "Groups whose project attribution is disbanded, cross-Space or missing.",
+})
+
+// removingStalls counts seats stuck mid-removal past the stall threshold.
+//
+// A DISTINCT signal from i2_violations_total, with the opposite meaning: I2 says
+// the invariant broke, this says the cascade stopped. Alerting on them together
+// would make an operator treat a stuck worker as a security incident and a
+// security incident as a stuck worker.
+var removingStalls = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "removing_stalled_total",
+	Help:      "Project seats sitting at removing=1 past the stall threshold.",
+})
+
+// removalBacklog counts pending cascade jobs.
+var removalBacklog = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "removal_backlog_total",
+	Help:      "Pending project member-removal cascade jobs.",
+})
+
+// removalAbandoned counts cascade jobs that ran out of attempts.
+//
+// The brief asks for backlog AND abandoned counts and only backlog was built.
+// The two answer different questions and the second is the one that pages: an
+// abandoned job is terminal, and it leaves a member's seat at removing = 1 with
+// their group rows still in place — the state nothing else will repair. The
+// stall gauge does notice it, but only once the seat has sat there past the
+// stall threshold; this moves the moment the job gives up, which is when an
+// operator can still read last_error and act on it.
+//
+// A counter rather than a gauge: it is an event, and a gauge derived from a
+// COUNT would go back to zero as soon as the retention purge ran.
+var removalAbandoned = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: metricNamespace,
+	Name:      "removal_abandoned_total",
+	Help:      "Project member-removal cascade jobs abandoned after exhausting their attempts.",
+})

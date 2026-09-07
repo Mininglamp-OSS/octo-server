@@ -203,6 +203,14 @@ func newSuperAdminServer(t *testing.T) (*wkhttp.WKHttp, *config.Context) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// 入口也要 Reload，不只是出口。
+	//
+	// 校验读的是进程级 SystemSettings 单例，不是刚被清空的表。同包里有 handler
+	// 用例（如 TestManagerSystemSetting_UpdateAcceptsInRangeIntBoundaries）通过
+	// 接口写 sidebar.recent_filter_thread_days 后不做出口清理，值留在单例里；
+	// 本文件只清表不刷单例的话，下一条用例的第一次写入就会拿存量 3650 去比 7 而
+	// 被 400 拒掉。-shuffle=on 下这取决于排列顺序，CI 里表现为偶发失败。
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 	require.NoError(t, ctx.Cache().Set(
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),

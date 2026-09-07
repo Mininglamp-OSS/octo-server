@@ -68,6 +68,18 @@ type reconcileCursors struct {
 	abandonedProject string
 	abandonedUID     string
 	abandonRun       int
+	// P1 scans. Both rotate over `group`.id, which is why they reuse the
+	// idResume/idSave pair rather than the composite cursor the member scans need.
+	// i2Group / i2UID form the composite cursor over (group.id, group_member.uid).
+	// A single-int64 cursor is NOT enough here and that cost a real defect: the I2
+	// page is bounded on member rows, so it cuts groups in half, and resuming at
+	// "the group after the last one seen" skipped every member past the boundary
+	// on every rotation. See queryI2Page.
+	i2Group int64
+	i2UID   string
+	i2Run   int
+	i3Group int64
+	i3Run   int
 }
 
 var cursors reconcileCursors
@@ -109,6 +121,26 @@ func (c *reconcileCursors) abandonedSave(project, uid string, running int, done 
 	c.abandonedProject, c.abandonedUID, c.abandonRun = project, uid, running
 }
 
+// i2Resume / i2Save are the mixed (int64, string) composite cursor the I2
+// rotation needs. Same contract as i1Resume/i1Save: a COMPLETED rotation resets
+// to the start and drops the running total, an incomplete one keeps both so the
+// next tick continues where this one stopped.
+func (c *reconcileCursors) i2Resume() (int64, string, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.i2Group, c.i2UID, c.i2Run
+}
+
+func (c *reconcileCursors) i2Save(group int64, uid string, running int, done bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if done {
+		c.i2Group, c.i2UID, c.i2Run = 0, "", 0
+		return
+	}
+	c.i2Group, c.i2UID, c.i2Run = group, uid, running
+}
+
 // idResume / idSave are the same contract for the single-int64-cursor rotations.
 func (c *reconcileCursors) idResume(cursor *int64, running *int) (int64, int) {
 	c.mu.Lock()
@@ -147,6 +179,8 @@ func resetCursorsForTest() {
 	cursors.epoch = 0
 	cursors.ownerless, cursors.ownerlessRun = 0, 0
 	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
+	cursors.i2Group, cursors.i2UID, cursors.i2Run = 0, "", 0
+	cursors.i3Group, cursors.i3Run = 0, 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly
@@ -220,6 +254,22 @@ func (p *Project) runReconcile() {
 	// state P0 cannot repair, which is precisely what should not be waiting on an ops window.
 	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
+	// P1: the group-binding invariants. I2 is the one with teeth — there is no
+	// read-path filter behind it, so a violation is a person seeing a project
+	// group they are not in. I3 catches attribution that survived a failed
+	// detach. The stall scan is deliberately separate from I2: it means the
+	// machinery stopped, not that the invariant broke.
+	//
+	// OUTSIDE the gate, on purpose. I2 and I3 do JOIN legacy tables, but every
+	// comparison that crosses into the pinned schema carries an explicit COLLATE,
+	// so they survive the drift the gate exists for — asserted, not assumed, by
+	// TestP1ScansSurviveCollationDrift against a deliberately drifted database.
+	// Gating them would default the invariant with teeth to "no monitoring", which
+	// is the failure P0's round 5 was about, arrived at from the other side. The
+	// stall scan touches only this module's own table.
+	p.scanI2Violations()
+	p.scanI3Violations()
+	p.scanRemovingStalls()
 }
 
 // reconcileLogCap bounds the per-row Error lines ONE scan emits in ONE tick.

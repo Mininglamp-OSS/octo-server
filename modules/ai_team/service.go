@@ -213,20 +213,18 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		if err != nil {
 			return nil, err
 		}
-		for _, member := range []struct {
-			uid   string
-			role  int
-			robot int
-		}{{userUID, group.MemberRoleCreator, 0}, {botID, group.MemberRoleCommon, 1}} {
-			memberVersion, genErr := s.ctx.GenSeq(common.GroupMemberSeqKey)
-			if genErr != nil {
-				return nil, genErr
-			}
-			_, err = tx.InsertBySql("INSERT INTO group_member (group_no,uid,role,version,status,vercode,invite_uid,robot) VALUES (?,?,?,?,?,?,?,?)",
-				groupNo, member.uid, member.role, memberVersion, int(common.GroupMemberStatusNormal), fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember), userUID, member.robot).Exec()
-			if err != nil {
-				return nil, err
-			}
+		ownerMemberVersion, genErr := s.ctx.GenSeq(common.GroupMemberSeqKey)
+		if genErr != nil {
+			return nil, genErr
+		}
+		botMemberVersion, genErr := s.ctx.GenSeq(common.GroupMemberSeqKey)
+		if genErr != nil {
+			return nil, genErr
+		}
+		if err = group.AdmitAITeamContainerMembersTx(
+			s.ctx, tx, groupNo, spaceID, userUID, botID, ownerMemberVersion, botMemberVersion,
+		); err != nil {
+			return nil, err
 		}
 		_, err = tx.Update("ai_team_agent").Set("group_no", groupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec()
 		if err != nil {

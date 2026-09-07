@@ -80,22 +80,66 @@ redis_flush() {
   fi
 }
 
+# Per-package Go timeout.
+#
+# It was 5m, and modules/user grew into it: measured at 272s with
+# `-race -shuffle=on` on a machine comparable to a runner, i.e. 9% of headroom
+# against the cap. A runner a little slower than that tips the package over and
+# the shard fails for a reason that has nothing to do with the code — which is
+# what happened on PR #846, and what made #844's shard-1 failure so hard to
+# read, since a timeout and a broken test look identical from the outside.
+#
+# Kept as a Go timeout rather than deleted, deliberately. The job's own
+# `timeout-minutes: 30` already bounds the shard, but it kills the runner and
+# prints nothing; Go's timeout panics and dumps every goroutine, which is the
+# only artifact that tells you WHICH test hung. The value is the slowest
+# package plus real headroom, not a guess at how long a test "should" take.
+#
+# Overridable so a bisect or a slow runner does not need a commit.
+PKG_TIMEOUT="${E2E_PKG_TIMEOUT:-12m}"
+
+logdir="$(mktemp -d)"
+trap 'rm -rf "$logdir"' EXIT
+
 fail=0
 failed=()
+failed_logs=()
 
 for pkg in "${packages[@]}"; do
   mysql_exec "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
   redis_flush
+  pkglog="$logdir/$(printf '%s' "$pkg" | tr '/.' '__').log"
   echo "::group::go test $pkg"
-  if ! go test -race -shuffle=on -count=1 -timeout 5m "$pkg"; then
+  # tee, so the same output can be replayed in the summary below. `pipefail` is
+  # already set, so the pipeline still reports go test's status.
+  if ! go test -race -shuffle=on -count=1 -timeout "$PKG_TIMEOUT" "$pkg" 2>&1 | tee "$pkglog"; then
     fail=1
     failed+=("$pkg")
+    failed_logs+=("$pkglog")
     echo "::error title=Package failed::$pkg"
   fi
   echo "::endgroup::"
 done
 
 if [ "$fail" -ne 0 ]; then
+  # Repeat the verdict lines at the END of the step.
+  #
+  # Not decoration. These packages boot a real server per test, so one shard
+  # emits hundreds of thousands of lines of gin route dumps and broker debug
+  # logs, and the service-container teardown adds hundreds of thousands more
+  # AFTER the step. The GitHub log API only serves a bounded tail, so the
+  # `--- FAIL` lines end up outside anything a reader — or a tool — can fetch.
+  # That happened three times on #844/#846 and cost more than the bugs did.
+  # Reprinting them last puts the one thing you need where it is always
+  # reachable.
+  echo "::group::E2E shard $shard/$total — failure summary"
+  for i in "${!failed[@]}"; do
+    echo "----- ${failed[$i]}"
+    grep -E '^(panic:|fatal error:|--- FAIL|=== FAIL|FAIL|ok )|test timed out' \
+      "${failed_logs[$i]}" | head -n 80 || true
+    echo
+  done
+  echo "::endgroup::"
   echo "::error title=E2E shard $shard/$total summary::${#failed[@]} package(s) failed: ${failed[*]}"
 fi
 exit "$fail"

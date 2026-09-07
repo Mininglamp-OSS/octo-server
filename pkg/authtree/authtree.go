@@ -112,6 +112,31 @@
 //     Project seat either, and every Project route's gate is the caller's own Space
 //     membership.
 //
+// P1 added a Project dimension to two EXISTING session routes, and neither
+// changes the picture above — recorded so the absence of a census entry is a
+// decision rather than an oversight:
+//
+//   - POST /v1/group/create gained an optional body field `project_id`. It is on
+//     no tree, and it is deliberately NOT Project-scoped in the tree sense: what
+//     confines it is still the caller's Space membership, and project_id is
+//     validated to belong to that same Space before the group is created. A
+//     project id from another Space is answered with the same error as one that
+//     does not exist, so the field cannot be used to learn which Space a project
+//     lives in.
+//   - POST /v1/auth/verify gained optional body fields `space_id` and
+//     `project_ids[]`, answered only under ?include=context. It carries no
+//     AuthMiddleware by design — the token IS the request — and the answers are
+//     scoped to the token holder: a request can only ask about projects, and only
+//     ever learns whether the TOKEN HOLDER is a member. Non-membership, absence
+//     and cross-Space are one indistinguishable answer, so naming an arbitrary
+//     project id reveals nothing the caller did not already supply.
+//
+// Both are BODY parameters, which the mediation note below explicitly does not
+// cover. That remains true and is why neither route can be contributed to a tree
+// as-is: enforceKeySpace mediates path params, the query string and X-Space-ID,
+// so a tree-mounted non-GET route would need its body reconciled with the Space
+// frozen into the credential first.
+//
 // If a Project route is ever contributed to a tree, it needs a census entry above
 // with each of its request-derived inputs enumerated, exactly like the others.
 //

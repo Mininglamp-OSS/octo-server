@@ -436,6 +436,12 @@ func TestManagerSystemSetting_UpdateAcceptsInRangeIntBoundaries(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// 本用例通过 handler 写 sidebar.recent_filter_thread_days=3650，既落表也落进程级
+	// 单例。不做出口清理的话，这个值会跟着单例活到后续用例里。
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		_ = EnsureSystemSettings(ctx).Reload()
+	})
 	require.NoError(t, ctx.Cache().Set(
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
