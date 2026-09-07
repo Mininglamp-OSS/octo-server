@@ -180,10 +180,21 @@ func (p *Project) queryI2Page(cursorGroupID int64, cursorUID string, limit int) 
 			// belongs in the flag rather than the WHERE for the reason the cost
 			// guard states: `group`.status leads no index, so as disbanded groups
 			// accumulate a WHERE predicate on it turns LIMIT back into a bound on
-			// rows RETURNED. `IS NOT NULL AND` keeps it exactly equivalent to the
-			// WHERE clause it replaces — the column is nullable, and `NULL <> 2`
-			// is NULL, which the WHERE dropped and a bare AND here would load
-			// into a Go bool.
+			// rows RETURNED.
+			//
+			// `IS NOT NULL AND` keeps the flag two-valued. An earlier version of
+			// this comment justified it by calling the column nullable, and PR
+			// #846's review corrected that: in the schema this scan runs against,
+			// `group`.status is NOT NULL DEFAULT 0
+			// (modules/group/sql/20191106000002_group_legacy01.sql), and nothing
+			// later changes it.
+			//
+			// It stays because the correction is narrower than it looks. Binaries
+			// whose migration set does not include modules/group get a `group`
+			// STUB instead, and that one declares status nullable — the same
+			// per-binary schema divergence the project_id migration header is
+			// entirely about. A bare `AND g.status <> 2` would load NULL into a Go
+			// bool there. One redundant predicate against that is a good trade.
 			"   AND (g.status IS NOT NULL AND g.status <> 2)) "+
 			"  AS violating "+
 			"FROM `group` g "+

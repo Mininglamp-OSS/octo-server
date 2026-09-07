@@ -88,6 +88,49 @@ scope_changes:
       ("no PR may leave a state where a project group can exist without a
       cascade behind it") is satisfied trivially, since nothing intermediate
       ships.
+  - id: im-subscribe-stays-outside-the-admission-entry
+    decision: |
+      D3 lists IMAddSubscriber in the side-effect set the single admission entry
+      must own. It stays OUTSIDE: every converged path still makes its own IM
+      call after its transaction commits.
+      The literal requirement is not implementable as written. The entry runs
+      inside the CALLER'S transaction, and a blocking WuKongIM call must not —
+      modules/group/preset_group_admission.go says so at the one call site that
+      had to decide. An entry that both gated and subscribed would either hold a
+      row lock across a network call or subscribe before the admission commits.
+      Consequence, accepted and stated because D3 names it: the funnel does NOT
+      own the IM call, so the next path converged onto it has to remember the
+      call on its own — and a missing IMAddSubscriber is one of the four
+      historical defects the brief cites for A10 (the member joins and receives
+      nothing). Recorded here after PR #846's review found the funnel's own doc
+      claiming a completeness it does not have.
+  - id: admission-primitives-stay-exported
+    decision: |
+      D3 says InsertMemberTx / InsertMember / recoverMemberTx "become unexported
+      and callable only from" the admission entry. They stay exported, and
+      TestAdmissionPrimitivesAreCalledOnlyFromTheFunnel delivers the intent
+      instead.
+      The two requirements cannot both hold: 41 existing test files in group,
+      thread, space, message, botfather and bot_api build fixtures through
+      InsertMember, and the brief's own non-regression acceptance forbids editing
+      an existing test file. "Callable only from the funnel" is a property a
+      guard can assert exactly; the compiler's export rules only approximate it,
+      and they approximate it in the direction that breaks the suite.
+  - id: update-member-narrowed-to-live-rows
+    decision: |
+      DB.UpdateMember's WHERE gains `is_deleted = 0`, so a write against a row
+      that was removed between the caller's read and its write is now a silent
+      no-op instead of a resurrection. Not in the brief; found by PR #844's
+      review, and it changes the semantics of three existing handlers (member
+      remark, mute/unmute, the unmute-expiry poller).
+      It belongs to P1 because I2 depends on it: the funnel claims to be the
+      complete boundary for putting a uid back into a group's active member set,
+      and this statement could do exactly that from outside it. All four callers
+      read a live member first, so none of them wanted the old behaviour.
+      Consequence, accepted: a member who leaves mid-request no longer has their
+      remark or mute written back, and the handler still reports success. That is
+      the right answer for a member who is gone, and it is not distinguishable
+      from the old one by any client.
   - id: project-switch-as-system-setting
     decision: |
       The feature switch becomes ONE source of truth shared by the server-side
@@ -293,4 +336,25 @@ open_verification:
      (brief D7): P1 converges them and adds a metric rather than deleting them.
      Deleting becomes a separate change once production shows zero rows."
 
-defects_found: []
+defects_found:
+  - id: brief-605-context-included-is-fail-open
+    where: brief:605 and its matching Acceptance line
+    what: |
+      The brief says /v1/auth/verify must clear `context_included` when the
+      project-context lookup fails. The implementation does the opposite: it
+      keeps the flag true and adds a separate `context_error` field.
+    why_the_brief_is_wrong: |
+      `context_included` does not mean "the context is populated", it means
+      "this server speaks the v2 contract". Consumers branch on it to decide
+      whether to trust the server's Space/project answer or fall back to the
+      pre-v2 path, which trusts the CLIENT-supplied X-Space-Id header. So
+      clearing it on a failed lookup does not fail closed, it fails open — a
+      database blip would downgrade every gateway in front of octo-server to
+      trusting a header the caller controls.
+      Keeping the flag and reporting the failure separately lets a consumer tell
+      "no projects" from "we could not answer", which is the distinction the
+      brief was reaching for.
+    disposition: |
+      Implemented against the brief, deliberately. Recorded here rather than as a
+      scope change because it is a defect IN THE BRIEF, not a change of scope —
+      PR #846's review asked for exactly this record.
