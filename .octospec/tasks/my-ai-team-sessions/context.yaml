@@ -1,0 +1,44 @@
+# octospec Implement-phase rule injection record.
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: "New user-data APIs, dedicated group ACL, Bot ownership, Space and thread isolation."
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: "Automatic Bot routing and adapter wire metadata must come from persisted server authority, with bounded input."
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: "New handlers and error codes must use the localized envelope and safe details."
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: "All authenticated AI-team routes mount SharedUIDRateLimiter after AuthMiddleware."
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: "Security, idempotency, migration, API, IM integration and regression coverage are required."
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: "All files match; any eventual commit and PR use English Conventional Commits."
+brief: .octospec/tasks/my-ai-team-sessions/brief.md
+source_brief: /Users/kense/Downloads/brief.md
+
+assumptions:
+  - "Initial entitlement is intentionally owner-only: robot.creator_uid must equal the caller; shared Bot grants remain denied."
+  - "DM_AI_TEAM_ON is the rollout switch and defaults off; disabling the API never disables persisted-container ACL protection."
+  - "Idempotency ledger rows are retained with session history; no finite TTL can safely permit the same key to create another thread later."
+  - "Removing an AI hides the association only; existing session access and automatic execution remain valid while Bot/Space authority remains active."
+  - "Thread auto-archive is a global policy and must be effectively disabled for rollout; the existing code default is false, but a DB system-setting override must be checked operationally."
+
+external_verification:
+  - "Frontend and adapter E1-E5 from the source brief require their own repositories and deployed versions; server events expose authoritative session metadata for that work."

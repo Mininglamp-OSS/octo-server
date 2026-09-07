@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
@@ -97,39 +98,40 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	groups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
+		protectAIContainer := g.protectAIContainerMutation
 		// 移除成员的两条路由（DELETE /members 与其别名 POST /members_delete）自
 		// bot-owner-self-removal 起对**普通成员**开放（自助移除自己名下的 bot，
 		// octo-web#1511），因此按认证路由惯例挂 per-UID 限流。
 		// 只挂这两条：/v1/groups 组还有 ~26 个端点，整组挂会改变它们的既有行为。
 		memberRemoveRateLimiter := appwkhttp.SharedUIDRateLimiter(r, g.ctx)
-		groups.POST("/:group_no/members", g.memberAdd)                                     // 添加群成员
-		groups.DELETE("/:group_no/members", memberRemoveRateLimiter, g.memberRemove)       // 移除群成员
-		groups.GET("/:group_no/members", g.membersGet)                                     // 获取群成员
-		groups.GET("/:group_no/members/:uid", g.memberGet)                                 // 查询单个 uid 是否为群成员（命中时返回成员详情）
-		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, g.memberRemove)  // 移除群成员
-		groups.GET("/:group_no/membersync", g.syncMembers)                                 // 同步群成员
-		groups.GET("/:group_no", g.groupGet)                                               // 获取群信息
-		groups.PUT("/:group_no/setting", g.groupSettingUpdate)                             // 修改群设置
-		groups.PUT("/:group_no", g.groupUpdate)                                            // 修改群信息
-		groups.PUT("/:group_no/members/:uid", g.memberUpdate)                              // 修改群的群成员信息
-		groups.POST("/:group_no/exit", g.groupExit)                                        // 退出群聊
-		groups.POST("/:group_no/managers", g.managerAdd)                                   // 添加群管理员
-		groups.DELETE("/:group_no/managers", g.managerRemove)                              // 移除群管理员
-		groups.POST("/:group_no/forbidden/:on", g.groupForbidden)                          // 群全员禁言
-		groups.GET("/:group_no/qrcode", g.groupQRCode)                                     // 获取群二维码信息
-		groups.POST("/:group_no/transfer/:to_uid", g.transferGrouper)                      // 群主转让
-		groups.POST("/:group_no/member/invite", g.groupMemberInviteAdd)                    // 群成员邀请
-		groups.GET("/:group_no/member/h5confirm", g.getToGroupMemberConfirmInviteDetailH5) // 获取确认邀请的h5页面
-		groups.POST("/:group_no/blacklist/:action", g.blacklist)                           // 添加或移除黑名单
-		groups.POST("/:group_no/forbidden_with_member", g.forbiddenWithGroupMember)        // 禁言或解禁某个群成员
-		groups.POST("/:group_no/avatar", g.avatarUpload)                                   // 上传群头像
-		groups.DELETE("/:group_no/disband", g.disband)                                     // 解散群
-		groups.GET("/:group_no/detail", g.groupDetailGet)                                  // 获取群详情
-		groups.GET("/:group_no/md", g.groupMdGet)                                          // 获取GROUP.md
-		groups.PUT("/:group_no/md", g.groupMdUpdate)                                       // 更新GROUP.md
-		groups.DELETE("/:group_no/md", g.groupMdDelete)                                    // 删除GROUP.md
-		groups.PUT("/:group_no/bot_admin/:uid", g.botAdminSet)                             // 设置Bot管理员
-		groups.DELETE("/:group_no/bot_admin/:uid", g.botAdminRemove)                       // 移除Bot管理员
+		groups.POST("/:group_no/members", protectAIContainer, g.memberAdd)                                    // 添加群成员
+		groups.DELETE("/:group_no/members", memberRemoveRateLimiter, protectAIContainer, g.memberRemove)      // 移除群成员
+		groups.GET("/:group_no/members", g.membersGet)                                                        // 获取群成员
+		groups.GET("/:group_no/members/:uid", g.memberGet)                                                    // 查询单个 uid 是否为群成员（命中时返回成员详情）
+		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, protectAIContainer, g.memberRemove) // 移除群成员
+		groups.GET("/:group_no/membersync", g.syncMembers)                                                    // 同步群成员
+		groups.GET("/:group_no", g.groupGet)                                                                  // 获取群信息
+		groups.PUT("/:group_no/setting", protectAIContainer, g.groupSettingUpdate)                            // 修改群设置
+		groups.PUT("/:group_no", protectAIContainer, g.groupUpdate)                                           // 修改群信息
+		groups.PUT("/:group_no/members/:uid", protectAIContainer, g.memberUpdate)                             // 修改群的群成员信息
+		groups.POST("/:group_no/exit", protectAIContainer, g.groupExit)                                       // 退出群聊
+		groups.POST("/:group_no/managers", protectAIContainer, g.managerAdd)                                  // 添加群管理员
+		groups.DELETE("/:group_no/managers", protectAIContainer, g.managerRemove)                             // 移除群管理员
+		groups.POST("/:group_no/forbidden/:on", protectAIContainer, g.groupForbidden)                         // 群全员禁言
+		groups.GET("/:group_no/qrcode", protectAIContainer, g.groupQRCode)                                    // 获取群二维码信息
+		groups.POST("/:group_no/transfer/:to_uid", protectAIContainer, g.transferGrouper)                     // 群主转让
+		groups.POST("/:group_no/member/invite", protectAIContainer, g.groupMemberInviteAdd)                   // 群成员邀请
+		groups.GET("/:group_no/member/h5confirm", g.getToGroupMemberConfirmInviteDetailH5)                    // 获取确认邀请的h5页面
+		groups.POST("/:group_no/blacklist/:action", protectAIContainer, g.blacklist)                          // 添加或移除黑名单
+		groups.POST("/:group_no/forbidden_with_member", protectAIContainer, g.forbiddenWithGroupMember)       // 禁言或解禁某个群成员
+		groups.POST("/:group_no/avatar", protectAIContainer, g.avatarUpload)                                  // 上传群头像
+		groups.DELETE("/:group_no/disband", protectAIContainer, g.disband)                                    // 解散群
+		groups.GET("/:group_no/detail", g.groupDetailGet)                                                     // 获取群详情
+		groups.GET("/:group_no/md", g.groupMdGet)                                                             // 获取GROUP.md
+		groups.PUT("/:group_no/md", protectAIContainer, g.groupMdUpdate)                                      // 更新GROUP.md
+		groups.DELETE("/:group_no/md", protectAIContainer, g.groupMdDelete)                                   // 删除GROUP.md
+		groups.PUT("/:group_no/bot_admin/:uid", protectAIContainer, g.botAdminSet)                            // 设置Bot管理员
+		groups.DELETE("/:group_no/bot_admin/:uid", protectAIContainer, g.botAdminRemove)                      // 移除Bot管理员
 	}
 	openGroups := r.Group("/v1/groups")
 	{ // 获取群头像
@@ -191,6 +193,25 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	// 邀请详情需要认证
 	group.GET("/invites/:invite_no", g.groupMemberInviteDetail) // 获取邀请详情
 	go g.CheckForbiddenLoop()
+}
+
+// protectAIContainerMutation keeps the two-member AI container invariant on
+// every ordinary group-admin route. Read/history routes intentionally remain
+// available and still use the normal parent membership checks.
+func (g *Group) protectAIContainerMutation(c *wkhttp.Context) {
+	protected, err := aiteampkg.IsProtectedGroup(g.ctx.DB(), c.Param("group_no"))
+	if err != nil {
+		g.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
 }
 
 // 解散群
@@ -1649,6 +1670,13 @@ func (g *Group) addMembersTx(members []string, groupNo string, operator, operato
 // 非空时优先作为跨 Space 邀请新成员的 source_space_id；空时沿用历史兜底逻辑
 // （operator 外部 → operator.SourceSpaceID；否则 → 被邀请者 home Space）。
 func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator, operatorName, inviterSpaceID string, tx *dbr.Tx) (func(), error) {
+	var purpose string
+	if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
+		return nil, err
+	}
+	if purpose == aiteampkg.GroupPurpose {
+		return nil, aiteampkg.ErrContainerProtected
+	}
 
 	/**
 	判断操作者是否在群内，如果不在群内是不允许邀请好友的

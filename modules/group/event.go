@@ -858,4 +858,3 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 	}
 	commit(nil)
 }
-

@@ -1484,3 +1484,32 @@ other = "查询项目数据失败。"
 
 ["err.server.project.store_failed"]
 other = "保存项目数据失败。"
+
+# ---- modules/ai_team：我的 AI 团队 ----
+
+["err.server.ai_team.request_invalid"]
+other = "AI 团队请求参数有误。"
+
+["err.server.ai_team.disabled"]
+other = "AI 团队功能已被管理员关闭。"
+
+["err.server.ai_team.forbidden"]
+other = "你无权在当前空间使用该 AI。"
+
+["err.server.ai_team.not_found"]
+other = "AI 团队资源不存在。"
+
+["err.server.ai_team.idempotency_conflict"]
+other = "该幂等键已用于不同的请求。"
+
+["err.server.ai_team.container_protected"]
+other = "AI 会话专用群不能通过普通群接口修改。"
+
+["err.server.ai_team.query_failed"]
+other = "查询 AI 团队数据失败。"
+
+["err.server.ai_team.store_failed"]
+other = "保存 AI 团队数据失败。"
+
+["err.server.ai_team.im_unavailable"]
+other = "AI 会话尚未就绪，请稍后重试。"

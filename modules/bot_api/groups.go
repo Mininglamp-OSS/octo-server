@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -48,12 +49,12 @@ func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	var err error
 	if spaceID != "" {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ?",
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose = ''",
 			robotID, spaceID,
 		).Load(&groups)
 	} else {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0",
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose = ''",
 			robotID,
 		).Load(&groups)
 	}
@@ -518,6 +519,9 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	groupNo := c.Param("group_no")
+	if ba.rejectAIContainerMutation(c, groupNo) {
+		return
+	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
@@ -592,6 +596,9 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	groupNo := c.Param("group_no")
+	if ba.rejectAIContainerMutation(c, groupNo) {
+		return
+	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
@@ -677,6 +684,9 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	groupNo := c.Param("group_no")
+	if ba.rejectAIContainerMutation(c, groupNo) {
+		return
+	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
@@ -779,6 +789,28 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	}
 
 	c.Response(map[string]interface{}{"ok": true, "removed": removeResp.Removed})
+}
+
+func (ba *BotAPI) rejectAIContainerMutation(c *wkhttp.Context, groupNo string) bool {
+	protected, err := aiteampkg.IsProtectedGroup(ba.ctx.DB(), groupNo)
+	if err != nil {
+		ba.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", groupNo))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return true
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		return true
+	}
+	return false
+}
+
+func (ba *BotAPI) protectAIContainerMutation(c *wkhttp.Context) {
+	if ba.rejectAIContainerMutation(c, c.Param("group_no")) {
+		c.Abort()
+		return
+	}
+	c.Next()
 }
 
 // sendGroupMdNotification sends GROUP.md event notification.

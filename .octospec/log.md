@@ -2330,3 +2330,18 @@ Two reviewers converged on the same headline; all four verified against code bef
   live. Both corrected in the same commit as the code they describe.
 - **Assertions one level weaker than their own comments** — four of them, all
   cheap to strengthen, all on the path where the next regression would land.
+
+## 2026-09-07 — my-ai-team-sessions
+
+- Added a feature-gated personal AI API backed by one owner/Bot parent group and
+  idempotently provisioned thread sessions, with server-authoritative Bot routing.
+- Protected the two-member container invariant across ordinary group, manager,
+  thread and Bot mutation paths; Space lifecycle cleanup remains authoritative.
+- Filtered both parent group and type-5 topic channel shapes from normal recent,
+  follow, group and Bot group lists. The durable discriminator is the new
+  server-owned `group.purpose`, not the transport-facing `group_type`.
+- Disabled global thread auto-archive through an authoritative DB setting; a fresh
+  migration query returned `thread / auto_archive_enabled / 0`.
+- Build, unit, four E2E/API shards, focused regression, i18n, vet and direct
+  WuKongIM persistence passed. Full pilote2e retains an unrelated baseline
+  card-template catalog fixture failure.

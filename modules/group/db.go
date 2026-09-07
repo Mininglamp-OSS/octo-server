@@ -665,21 +665,21 @@ func (d *DB) queryCreatedCountWithDate(date string) (int64, error) {
 // querySavedGroups 查询我保存的群
 func (d *DB) querySavedGroups(uid string) ([]*DetailModel, error) {
 	var detailModels []*DetailModel
-	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no").Where("`group_setting`.save=1 and `group_setting`.uid=?", uid).Load(&detailModels)
+	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no").Where("`group_setting`.save=1 and `group_setting`.uid=? and `group`.purpose=''", uid).Load(&detailModels)
 	return detailModels, err
 }
 
 // queryGroupsWithMemberUIDAndSpaceID 查询某用户在某 Space 下加入的所有群
 func (d *DB) queryGroupsWithMemberUIDAndSpaceID(memberUID string, spaceID string) ([]*Model, error) {
 	var models []*Model
-	_, err := d.session.Select("distinct `group`.*").From("`group`").LeftJoin("group_member", "`group`.group_no=group_member.group_no").Where("group_member.uid=? and group_member.is_deleted=0 and `group`.space_id=?", memberUID, spaceID).Load(&models)
+	_, err := d.session.Select("distinct `group`.*").From("`group`").LeftJoin("group_member", "`group`.group_no=group_member.group_no").Where("group_member.uid=? and group_member.is_deleted=0 and `group`.space_id=? and `group`.purpose=''", memberUID, spaceID).Load(&models)
 	return models, err
 }
 
 // 查询某个用户参与的所有群
 func (d *DB) queryGroupsWithMemberUID(memberUID string) ([]*Model, error) {
 	var models []*Model
-	_, err := d.session.Select("distinct `group`.*").From("`group`").LeftJoin("group_member", "`group`.group_no=group_member.group_no").Where("group_member.uid=? and group_member.is_deleted=0", memberUID).Load(&models)
+	_, err := d.session.Select("distinct `group`.*").From("`group`").LeftJoin("group_member", "`group`.group_no=group_member.group_no").Where("group_member.uid=? and group_member.is_deleted=0 and `group`.purpose=''", memberUID).Load(&models)
 	return models, err
 }
 
@@ -719,6 +719,7 @@ type DetailModel struct {
 // Model 群db model
 type Model struct {
 	GroupNo                  string     // 群编号
+	Purpose                  string     // 服务端管理的用途；客户端不可写
 	GroupType                int        // 群类型 0.普通群 1.超大群
 	Name                     string     // 群名称
 	IsNamed                  int        // 1=改版前老群/0=新群；由 #500 迁移回填，新群恒为 0。默认头像取群名文字仅对 1 生效（grandfather 老群），新群一律双人图标

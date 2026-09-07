@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -733,6 +734,7 @@ type AddMemberReq struct {
 // InfoResp 群信息
 type InfoResp struct {
 	GroupNo             string    `json:"group_no"`               // 群编号
+	Purpose             string    `json:"purpose,omitempty"`      // 服务端管理用途
 	GroupType           GroupType `json:"group_type"`             // 群类型
 	Name                string    `json:"name"`                   // 群名称
 	Notice              string    `json:"notice"`                 // 群公告
@@ -754,6 +756,7 @@ type InfoResp struct {
 func toInfoResp(m *Model) *InfoResp {
 	return &InfoResp{
 		GroupNo:             m.GroupNo,
+		Purpose:             m.Purpose,
 		GroupType:           GroupType(m.GroupType),
 		Name:                m.Name,
 		Notice:              m.Notice,
@@ -842,6 +845,7 @@ func toSettingResp(m *Setting) *SettingResp {
 
 type GroupResp struct {
 	GroupNo                  string    `json:"group_no"`                    // 群编号
+	Purpose                  string    `json:"purpose,omitempty"`           // 服务端管理用途
 	GroupType                GroupType `json:"group_type"`                  // 群类型
 	Category                 string    `json:"category"`                    // 群分类
 	Name                     string    `json:"name"`                        // 群名称
@@ -890,6 +894,7 @@ type GroupResp struct {
 func (g *GroupResp) from(model *DetailModel) *GroupResp {
 	resp := &GroupResp{
 		GroupNo:                  model.GroupNo,
+		Purpose:                  model.Purpose,
 		GroupType:                GroupType(model.GroupType),
 		Category:                 model.Category,
 		Name:                     model.Name,
@@ -936,6 +941,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 func (g *GroupResp) fromModel(model *Model) *GroupResp {
 	resp := &GroupResp{
 		GroupNo:                  model.GroupNo,
+		Purpose:                  model.Purpose,
 		GroupType:                GroupType(model.GroupType),
 		Category:                 model.Category,
 		Name:                     model.Name,
@@ -1073,6 +1079,10 @@ type RemoveGroupMembersServiceReq struct {
 	// N×M 条堆给最后一个人看）。普通移除和自愿退出都**应该**发——群成员看见 bot
 	// 凭空消失，有权知道原因，这与「谁移出了谁」是两件事。
 	SuppressBotCascadeTip bool
+
+	// AllowProtected is reserved for authoritative lifecycle cleanup (Space
+	// removal/disband). User and Bot API callers must leave it false.
+	AllowProtected bool
 }
 
 // RemoveGroupMembersServiceResp 移除群成员响应。
@@ -1434,6 +1444,11 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	if len(req.Members) == 0 {
 		return nil, errors.New("members is required")
 	}
+	if protected, err := aiteampkg.IsProtectedGroup(s.ctx.DB(), req.GroupNo); err != nil {
+		return nil, err
+	} else if protected {
+		return nil, aiteampkg.ErrContainerProtected
+	}
 
 	// 链路耗时定位（邀请成员入群慢排查）：startedAt 覆盖整条 AddGroupMembers，
 	// 配合事务提交点与各 WuKongIM 调用的分段计时，区分 DB 阶段 vs IM 阶段。
@@ -1746,6 +1761,13 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	}
 	if len(req.Members) == 0 {
 		return nil, errors.New("members is required")
+	}
+	if !req.AllowProtected {
+		if protected, err := aiteampkg.IsProtectedGroup(s.ctx.DB(), req.GroupNo); err != nil {
+			return nil, err
+		} else if protected {
+			return nil, aiteampkg.ErrContainerProtected
+		}
 	}
 
 	// 群存在性检查

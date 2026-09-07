@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,6 +53,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -631,6 +633,16 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		items = dropArchivedThreadItems(items)
 	}
 
+	// Dedicated AI parent groups and their thread conversations live only in
+	// /v1/ai-team. Hiding just the parent would still leak every session through
+	// target_type=5, so filter both shapes from one authoritative purpose query.
+	items, err = sb.excludeAITeamItems(items)
+	if err != nil {
+		sb.Error("sidebar sync: AI container filter failed (fail-closed)", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+
 	// 4. Enrich pinned flag (follow tab items also need it)
 	for _, item := range items {
 		k := channelKey(item.TargetID, uint8(item.TargetType))
@@ -658,6 +670,34 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		Version:       respVersion,
 		FollowVersion: followVersion,
 	})
+}
+
+func (sb *Sidebar) excludeAITeamItems(items []*SidebarItem) ([]*SidebarItem, error) {
+	keys := make([][2]string, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, [2]string{item.TargetID, strconv.Itoa(item.TargetType)})
+	}
+	protected, err := aiteampkg.ExcludeProtectedItems(sb.ctx.DB(), keys)
+	if err != nil || len(protected) == 0 {
+		return items, err
+	}
+	return filterAITeamSidebarItems(items, protected), nil
+}
+
+func filterAITeamSidebarItems(items []*SidebarItem, protected map[string]struct{}) []*SidebarItem {
+	out := make([]*SidebarItem, 0, len(items))
+	for _, item := range items {
+		groupNo := item.TargetID
+		if item.TargetType == int(common.ChannelTypeCommunityTopic) {
+			if parts := strings.Split(groupNo, "____"); len(parts) == 2 {
+				groupNo = parts[0]
+			}
+		}
+		if _, hidden := protected[groupNo]; !hidden {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

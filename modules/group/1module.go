@@ -210,6 +210,9 @@ func newChannelRespWithGroupResp(groupResp *GroupResp) *model.ChannelResp {
 	extraMap["chat_pwd_on"] = groupResp.ChatPwdOn
 	extraMap["allow_view_history_msg"] = groupResp.AllowViewHistoryMsg
 	extraMap["group_type"] = groupResp.GroupType
+	if groupResp.Purpose != "" {
+		extraMap["purpose"] = groupResp.Purpose
+	}
 	extraMap["allow_member_pinned_message"] = groupResp.AllowMemberPinnedMessage
 	extraMap["is_named"] = groupResp.IsNamed
 	extraMap["avatar_text"] = groupResp.AvatarText

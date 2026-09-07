@@ -170,6 +170,7 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		//   - 解散：整条不发，与上面同一个 N×M 理由。
 		BotCascadeTipAction:   cascadeAction,
 		SuppressBotCascadeTip: spaceGone,
+		AllowProtected:        true,
 	})
 	if err != nil {
 		return fmt.Errorf("remove group member: %w", err)

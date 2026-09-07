@@ -1627,10 +1627,16 @@ type robotEventResp struct {
 	InlineQuery *InlineQuery            `json:"inline_query"`         // 查询
 	EventType   string                  `json:"event_type,omitempty"` // 自定义事件类型
 	EventData   map[string]interface{}  `json:"event_data,omitempty"` // 自定义事件数据
+	SpaceID     string                  `json:"space_id,omitempty"`
+	SessionKey  string                  `json:"session_key,omitempty"`
+	InputID     int64                   `json:"input_id,omitempty"`
 }
 
 func (s *robotEventResp) from(resp *robotEvent) {
 	s.EventID = resp.EventID
+	s.SpaceID = resp.SpaceID
+	s.SessionKey = resp.SessionKey
+	s.InputID = resp.InputID
 	if resp.Message != nil {
 		simpleRobotMessageResp := &simpleRobotMessageResp{}
 		simpleRobotMessageResp.from(resp.Message)
