@@ -336,3 +336,132 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 	}
 	return out, nil
 }
+
+// ProjectEpochsInSpace returns member_epoch for each named ACTIVE project in
+// spaceID, keyed by project_id.
+//
+// Absent from the map means the project does not exist, is disbanded, or lives
+// in another Space. The caller maps all three to epoch 0 — one indistinguishable
+// answer, for the same reason MembershipsInSpace folds them together: telling
+// them apart would let a caller probe which Space a project id lives in.
+//
+// `status = 1` is what makes disband converge without a separate event: a
+// disbanded project drops out of this result, the caller reads 0, and an
+// authorization snapshot taken against the old epoch stops matching.
+func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []string) (map[string]int64, error) {
+	out := make(map[string]int64, len(projectIDs))
+	if spaceID == "" || len(projectIDs) == 0 {
+		return out, nil
+	}
+	lookup := dedupeNonEmpty(projectIDs)
+	if len(lookup) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		ProjectID   string `db:"project_id"`
+		MemberEpoch int64  `db:"member_epoch"`
+	}
+	_, err := session.SelectBySql(
+		"SELECT project_id, member_epoch FROM `octo_project` "+
+			"WHERE space_id = ? AND project_id IN ? AND status = 1",
+		spaceID, lookup,
+	).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.ProjectID] = r.MemberEpoch
+	}
+	return out, nil
+}
+
+// ProjectMemberships answers, for ONE project, which of the named uids hold an
+// active seat — the mirror image of MembershipsInSpace, which answers one uid
+// across many projects.
+//
+// Returns epoch 0 and an empty map when the project is not an active project of
+// spaceID. Same folded answer as ProjectEpochsInSpace, same reason.
+//
+// # Read order is load-bearing
+//
+// The epoch is read BEFORE the member rows, and that order must not be swapped.
+// A membership write bumps member_epoch in the same transaction, so a consumer
+// caches this answer under the epoch and re-checks the epoch later to decide
+// whether the cache is still good. The invariant that makes that sound is:
+//
+//	the returned epoch is never NEWER than the returned membership data.
+//
+// Read epoch first and a change landing between the two queries yields an OLD
+// epoch beside NEW membership: the consumer's next epoch check differs, so it
+// re-verifies. One wasted round trip, no stale grant.
+//
+// Read members first and the same interleaving yields NEW epoch beside OLD
+// membership: the consumer caches a stale positive under the current epoch, and
+// its epoch check keeps agreeing. A removed member stays authorized until the
+// next unrelated bump. That is the bug this ordering exists to prevent, and it
+// is invisible in a single-threaded test — see the ordering guard test.
+//
+// `removing = 0` is here for the same reason as every other predicate in this
+// package: a seat being closed is not a member.
+func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
+	roles := make(map[string]int, len(uids))
+	if spaceID == "" || projectID == "" {
+		return 0, roles, nil
+	}
+
+	// Step 1 — epoch + existence, in that order. See the doc comment.
+	epochs, err := ProjectEpochsInSpace(session, spaceID, []string{projectID})
+	if err != nil {
+		return 0, nil, err
+	}
+	epoch, active := epochs[projectID]
+	if !active {
+		return 0, roles, nil
+	}
+
+	lookup := dedupeNonEmpty(uids)
+	if len(lookup) == 0 {
+		return epoch, roles, nil
+	}
+
+	// Step 2 — the seats. project_id + uid is the primary key, so this is a PK
+	// range scan. space_id is redundant on the member row and is repeated here as
+	// defence in depth: step 1 already established that projectID belongs to
+	// spaceID, so this predicate can only ever remove rows whose denormalized
+	// copy has drifted — which is a bug we would rather fail closed on.
+	var rows []struct {
+		UID  string `db:"uid"`
+		Role int    `db:"role"`
+	}
+	_, err = session.SelectBySql(
+		"SELECT uid, role FROM `octo_project_member` "+
+			"WHERE project_id = ? AND space_id = ? AND uid IN ? "+
+			"  AND status = 1 AND removing = 0",
+		projectID, spaceID, lookup,
+	).Load(&rows)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, r := range rows {
+		roles[r.UID] = r.Role
+	}
+	return epoch, roles, nil
+}
+
+// dedupeNonEmpty drops empty and repeated ids while preserving first-seen order.
+//
+// Shared by both batch queries so neither can grow its own copy that forgets the
+// empty-string case — an empty id in an IN list matches nothing but still costs a
+// bind parameter, and callers reach these functions straight off the wire.
+func dedupeNonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, v := range in {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}

@@ -1,0 +1,155 @@
+schema_version: 1
+task: loop-project-fleet-integration
+brief: .octospec/tasks/loop-project-fleet-integration/brief.md
+resolved_at: 2026-09-07T15:20:00+00:00
+
+# This increment implements O2 + O3 only — the two inbound internal endpoints.
+# O1 (schema) and O4-O7 (the outbound event chain) are deliberately not here;
+# see `increment` at the bottom.
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      Both endpoints answer authorization questions about project membership, so
+      a cross-Space answer is a cross-tenant leak. The rule's usual mechanism —
+      "go through the Space middleware" — does not apply: these routes have no
+      end user and no uid, so isolation is enforced instead by making space_id a
+      REQUIRED part of every query predicate, with a project in another Space
+      folded into the same answer as one that does not exist. The rule also asks
+      that skipping AuthMiddleware be documented in code; Route()'s doc comment
+      does that explicitly.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Every refusal goes through httperr.ResponseErrorLWithStatus with a
+      registered pkg/errcode code; no raw c.JSON / AbortWithStatusJSON anywhere.
+      No new codes were registered — the shared err.shared.* set covers all three
+      shapes, which is also the anti-enumeration choice: a per-reason code would
+      tell an unauthenticated caller whether a token is unset versus wrong.
+      make i18n-extract-check and make i18n-lint both pass.
+  - id: rate-limit
+    source: repo
+    load_bearing: true
+    why: >
+      Applies with its default INVERTED, and the inversion is the point. The rule
+      says authenticated routes mount SharedUIDRateLimiter; these routes have no
+      logged-in uid, so that middleware would silently fail open. They mount
+      StrictIPRateLimitMiddleware instead, on a new tag that shares no bucket
+      with any existing one, with env values passed through ratelimit.SanitizeRPS
+      / SanitizeBurst so a NaN typo cannot disable the control. No hand-rolled
+      Redis counter.
+  - id: trust-boundary
+    source: repo
+    load_bearing: true
+    applied: partial
+    why: >
+      Matched via the wire-contract touches tag and read in full. Most of it does
+      not apply: no adapter, no external content rendered into message payloads,
+      no markdown or URL destinations, so the escaping, adapter-parity and
+      URL-breakout rules have nothing to bind to. One rule DOES apply and is
+      implemented — "bound the payload": structural limits (<=50 uids, <=50
+      project ids) enforced ON TOP OF a byte cap, because a byte cap alone still
+      admits a well-formed-but-pathological payload and both inputs become SQL IN
+      lists. Recorded as partial rather than false so the applicable half is not
+      lost the next time this rule is resolved.
+  - id: testing
+    source: repo
+    load_bearing: false
+    why: >
+      MySQL/Redis were unavailable in this environment, so the design puts a
+      membershipStore seam between the handlers and pkg/project — the same shape
+      modules/internal_resolve uses for identityResolver. That makes every
+      answer-shape and fail-closed assertion runnable with no infrastructure
+      rather than deferred to an integration suite. Ordering and predicate
+      properties that cannot be observed single-threaded are held by source
+      guards, following TestMemberEpochOnlyEverIncrements.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Implement does not commit. Finish uses an English Conventional Commit
+      subject.
+
+decisions:
+  - id: C1
+    status: decided
+    what: project_id is a 36-character hyphenated canonical UUID.
+    impact_on_this_increment: none
+    note: >
+      Both endpoints treat project_id as an opaque string, so the format change
+      does not reach them. It lands in O1 together with the generator change.
+  - id: C3
+    status: decided
+    what: projects gain an archivable, restorable state.
+    impact_on_this_increment: none
+    note: >
+      The epoch predicate is `status = 1`, so any archived state — being some
+      value other than 1 — already reads as epoch 0 without further change. That
+      is the wanted behaviour: epochs is the backstop for a lost or delayed
+      lifecycle event, so a missed archive still converges within the consumer's
+      cache window. The cost is that the consumer reports an epoch mismatch
+      rather than "archived"; the archived state itself travels by event.
+  - id: C2
+    status: contract-only
+    note: No code change. Consumers must read context_error, not context_included.
+  - id: C4
+    status: follows-C3
+    note: Lifecycle version column lands with the archived state in O1.
+  - id: C5
+    status: provisional
+    note: >
+      Implemented at the provisional path from the integration document, which
+      states that adjusting the URI does not change the section's semantics.
+      Role encoding (0/1/2) and the batch bound (50) are already agreed by both
+      documents; error codes and SLA remain for contract review.
+
+deviations:
+  - what: 401 for an unset token, not 503.
+    why: >
+      The integration document specifies 503 for "not configured" and 401 for
+      "bad token". Implemented as 401 for both, matching
+      modules/internal_resolve and modules/bot_mention. Splitting them lets an
+      unauthenticated caller probe deployment state; operators get the
+      distinction from a startup log line naming the misconfigured env, which is
+      where it is actionable. Pinned by TestUnauthorizedIsIndistinguishable.
+  - what: No new error codes, against the brief's load-bearing item that predicted some.
+    why: >
+      The shared err.shared.* codes cover every shape, and reusing them is the
+      stronger choice for the same anti-enumeration reason. Nothing was skipped:
+      make i18n-extract-check and make i18n-lint pass with no new registrations.
+  - what: >
+      The startup collision check across fixed internal-token envs reports rather
+      than refuses to boot.
+    why: >
+      It was written as a boot failure first, and that broke
+      TestCardActionDispatchScopesBotMentionTokenCollisionFailures, which pins a
+      deliberate contract: a fixed-vs-fixed token collision disables the affected
+      capability module-locally and the server still boots, while a collision
+      with a dynamic route credential fails startup. Escalating the first case
+      would refuse to start deployments that run with the collision today — a
+      rollout decision, not something to change while adding a capability. The
+      check now logs the colliding env NAMES at error level, which adds the
+      missing visibility without changing behaviour.
+
+security_notes:
+  - Tests and fixtures use synthetic UIDs, Space IDs and Project IDs only.
+  - Token values never reach logs, errors or metric labels; every message names
+    the ENV. Pinned by TestTokenErrorsNeverContainTheValue and the collision
+    tests.
+  - >
+    A non-member answer omits `role` on the wire rather than sending 0, because
+    0 is a real role. Asserted at the byte level, not through the decoded struct.
+  - >
+    Store failures are 500, never an empty 200 — an empty answer set would read
+    as "nobody is a member" to a consumer whose contract is to fail closed.
+
+increment:
+  implemented: [O2, O3]
+  deferred:
+    - id: O1
+      reason: schema — unblocked by the C1/C3 decisions, not yet started.
+    - id: O4-O7
+      reason: outbound event chain — depends on O1.
