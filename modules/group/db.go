@@ -155,6 +155,36 @@ func (d *DB) UpdateMemberRoleTx(groupNo string, uid string, role int, version in
 	return err
 }
 
+// updateMemberRoleIfLiveTx is UpdateMemberRoleTx plus the one fact the project
+// cascade cannot do without: whether a row actually changed.
+//
+// UpdateMemberRoleTx's WHERE carries `is_deleted = 0`, so a promotion aimed at a
+// member who was removed in the meantime affects zero rows and returns nil. A
+// caller that then demotes the outgoing creator leaves the group with no creator
+// and no error to notice it by. The lock in querySuccessorForProjectGroupTx is
+// what makes that window unreachable; this is the assertion that the lock is
+// doing its job, so a future change that drops it fails loudly instead of
+// silently.
+//
+// `version` is a fresh GenSeq value on every call, so a matched row is always a
+// changed row — RowsAffected == 0 means "no live row matched", never "matched
+// but identical".
+func (d *DB) updateMemberRoleIfLiveTx(tx *dbr.Tx, groupNo string, uid string, role int, version int64) (bool, error) {
+	res, err := tx.Update("group_member").
+		Set("role", role).
+		Set("version", version).
+		Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).
+		Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 // updateMemberForbiddenExpirTimeTx 修改成员禁言时长
 func (d *DB) updateMemberForbiddenExpirTimeTx(groupNo string, uid string, time int, version int64, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").Set("forbidden_expir_time", time).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
@@ -309,6 +339,29 @@ func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 }
 
 // UpdateMember 更新群成员
+//
+// # `is_deleted = 0` in the WHERE is load-bearing, not tidiness
+//
+// This statement writes `is_deleted` from a caller-supplied model, and all four
+// callers are read-then-write over the session: read a live member, mutate one
+// field, write the whole model back. Without the predicate, a row soft-deleted
+// between the read and the write is RESURRECTED — it comes back active, with its
+// pre-removal role, having never passed admitOrRestoreMembersTx.
+//
+// CheckForbiddenLoop is where that window is wide rather than theoretical: it
+// reads a batch of up to 100 and then, per row, does a GenSeq, this write, and
+// two IM calls, so the tail of a batch is written seconds after it was read. For
+// a group belonging to a project whose seat has closed in that window, the
+// resurrected row is a permanent I2 violation — the reconcile scan reports it
+// and nothing repairs it, because the removal job is already terminal.
+//
+// So this is an admission path in the sense admission.go:86-93 gives the term,
+// and the funnel's claim to be the complete boundary depends on it not being
+// one. `UpdateMember(` is in admissionPrimitiveNeedles for the same reason.
+//
+// A dead row now makes this a no-op rather than an error: every caller has
+// already established the member is live, and a member who left mid-request has
+// nothing left to update.
 func (d *DB) UpdateMember(member *MemberModel) error {
 	_, err := d.session.Update("group_member").SetMap(map[string]interface{}{
 		"remark":               member.Remark,
@@ -317,7 +370,7 @@ func (d *DB) UpdateMember(member *MemberModel) error {
 		"is_deleted":           member.IsDeleted,
 		"invite_uid":           member.InviteUID,
 		"forbidden_expir_time": member.ForbiddenExpirTime,
-	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
+	}).Where("group_no=? and uid=? and is_deleted=0", member.GroupNo, member.UID).Exec()
 	return err
 }
 
@@ -1288,6 +1341,29 @@ func (d *DB) queryGroupCreatorTx(tx *dbr.Tx, groupNo string) (string, error) {
 //
 // Returns "" when there is no candidate. The caller then detaches the group to
 // Space-direct rather than inventing an owner.
+//
+// # Both halves of the pick are LOCKED, and neither lock is optional
+//
+// `FOR UPDATE OF gm` is the lesson modules/group already paid for once, on the
+// Space-side cascade: querySecondOldestNonBotMemberTx locks its pick and says
+// why — an unlocked candidate can be soft-deleted by a concurrent kick, exit or
+// cleanup job between this SELECT and the promotion, whose WHERE carries
+// `is_deleted = 0`; the UPDATE then affects zero rows, reports no error, and the
+// group is left with no creator at all. This query reproduced the pre-fix shape
+// until it was found in review on PR #844.
+//
+// `FOR SHARE OF pm` closes the second shape of the same window: a seat that goes
+// `removing = 1` after this snapshot would make the promotion land on someone
+// the project is in the middle of removing — an I2 violation manufactured by the
+// cascade whose job is to preserve I2. Shared, not exclusive, because this
+// transaction only needs the seat to hold still; a concurrent admission taking
+// the same shared lock (pkg/project.AssertMembersInProjectTx) must not be
+// serialised behind a handover.
+//
+// Lock order is preserved: group_member is taken first (the creator row is
+// already held by queryGroupCreatorTx), octo_project_member last — the module's
+// declared order, with octo_project_member deliberately at the end. See
+// modules/project/service.go and pkg/project.AssertMembersInProjectTx.
 func (d *DB) querySuccessorForProjectGroupTx(tx *dbr.Tx, groupNo, projectID, departingUID string) (string, error) {
 	var uids []string
 	_, err := tx.SelectBySql(
@@ -1297,7 +1373,8 @@ func (d *DB) querySuccessorForProjectGroupTx(tx *dbr.Tx, groupNo, projectID, dep
 			"WHERE gm.group_no = ? AND gm.is_deleted = 0 AND gm.status = ? "+
 			"  AND gm.uid <> ? AND gm.is_external = 0 AND gm.robot = 0 "+
 			"  AND pm.project_id = ? AND pm.status = 1 AND pm.removing = 0 "+
-			"ORDER BY gm.role = ? DESC, gm.created_at ASC, gm.uid ASC LIMIT 1",
+			"ORDER BY gm.role = ? DESC, gm.created_at ASC, gm.uid ASC LIMIT 1 "+
+			"FOR UPDATE OF gm FOR SHARE OF pm",
 		groupNo, int(common.GroupMemberStatusNormal), departingUID,
 		projectID, MemberRoleManager,
 	).Load(&uids)

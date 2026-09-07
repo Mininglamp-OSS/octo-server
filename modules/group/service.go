@@ -1817,6 +1817,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// 真正关掉它需要让 handOverGroupCreator 也按 uid 序取那两把锁，并给
 	// (group_no, created_at) 补索引让继任者扫描不再锁全群 —— 都记在 follow-up。
 	//
+	// P1 起这个 follow-up 多了第二个调用方：handOverProjectGroupIfCreator
+	// （modules/group/project_cascade.go）形状完全一样——先锁创建者行，再锁
+	// 继任者扫描命中的行，而那次扫描同样没有服务其 ORDER BY 的索引。
+	// 后果同样有界（工单退避重试），但 follow-up 现在要覆盖两处，不是一处。
+	//
 	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
 	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。
 	sort.Slice(removableMembers, func(i, j int) bool {

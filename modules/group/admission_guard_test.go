@@ -329,10 +329,18 @@ func itoa(n int) string {
 // hypothetical: IService.AddMember was exactly that shape — no transaction, no
 // Space check, no version, no vercode — exported on the service interface, and
 // this change deletes it.
+// UpdateMember( is here because a primitive that can put a uid BACK into the
+// active member set is an admission primitive, whatever its name says. It writes
+// is_deleted from a caller-supplied model, so before PR #844's review round a
+// read-then-write caller could resurrect a row that was soft-deleted in between
+// — outside the funnel, with no gate, no metric and no test. Its WHERE now
+// carries is_deleted = 0 (see DB.UpdateMember); this needle is what stops the
+// next caller of it from being added without that being looked at.
 var admissionPrimitiveNeedles = []string{
 	"InsertMemberTx(",
 	"InsertMember(",
 	"recoverMemberTx(",
+	"UpdateMember(",
 }
 
 // admissionPrimitiveAllowlist — inside modules/group, only these files may call
@@ -356,6 +364,13 @@ var admissionPrimitiveNeedles = []string{
 var admissionPrimitiveAllowlist = map[string][]string{
 	"modules/group/db.go":        admissionPrimitiveNeedles, // the definitions
 	"modules/group/admission.go": admissionPrimitiveNeedles, // the single entry
+
+	// The remark, mute/unmute and unmute-expiry handlers. They update a member
+	// who is already live and never intend to change is_deleted; the predicate
+	// in DB.UpdateMember is what makes that true rather than intended. Listed
+	// explicitly, and ONLY for this needle, so a fifth caller — or the same call
+	// appearing in a new file — has to be argued for rather than merged.
+	"modules/group/api.go": {"UpdateMember("},
 }
 
 func TestAdmissionPrimitivesAreCalledOnlyFromTheFunnel(t *testing.T) {
