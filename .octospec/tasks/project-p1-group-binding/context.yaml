@@ -88,6 +88,27 @@ scope_changes:
       ("no PR may leave a state where a project group can exist without a
       cascade behind it") is satisfied trivially, since nothing intermediate
       ships.
+  - id: project-switch-as-system-setting
+    decision: |
+      The feature switch becomes ONE source of truth shared by the server-side
+      write gate and the client: a `project.enabled` system_setting resolved
+      DB -> env -> false, shipped to clients as the appconfig field
+      `project_on`. This supersedes brief D1's "the rollback lever is the flag
+      that already exists, OCTO_PROJECT_CREATE_ENABLED", which is now the env
+      layer of that resolution rather than the whole of it.
+      Recorded here after PR #844's review flagged it as surface the brief did
+      not ask for (yujiawei S6 / Jerry-Xin N3) — correctly: it was built during
+      implementation and never written down.
+      Why it stays rather than being split out: two switches that can disagree
+      is the failure being avoided. With the env flag alone, a server with
+      writes disabled still ships a client that offers project creation, and
+      the user meets the refusal at the end of the flow instead of not being
+      offered it. Existing deployments are unaffected — with no system_setting
+      row the resolution falls through to the env flag and then to false, which
+      is exactly the pre-P1 behaviour.
+      Consequence, accepted: the switch is now runtime-mutable, so flipping it
+      no longer requires a redeploy — and turning it OFF does not retract
+      anything already created. It gates creation, not existing groups.
   - id: group-creator-handover
     decision: |
       When the departing project member is a group's creator, the cascade
@@ -259,6 +280,15 @@ open_verification:
   - "EXPLAIN before/after for queryGroupsWithMemberUIDAndSpaceID and
      modules/bot_api/groups.go:51 — (space_id, project_id) is the first index to
      serve space_id, so these two query plans change (C4)."
+  - "EXPLAIN for modules/project/reconcile_p1.go queryI2Page on production-scale
+     `group` x group_member. Its keyset cursor is a row constructor spanning two
+     tables, (g.id, gm.uid) > (?, ?), which MySQL cannot reduce to a range on
+     `group`.PRIMARY — so each page re-walks from the start and the file's
+     'bounded on rows EXAMINED' claim does not hold for this statement. Raised
+     by PR #844's review (yujiawei Q3 / Jerry-Xin N2). PR #844 round 2 moved
+     `g.status <> 2` out of the WHERE and into the violating flag, which fixes
+     the predicate half; the cursor half needs the plan to decide, and the plan
+     cannot be produced from CI."
   - "Whether the three org-directory event listeners are live in production
      (brief D7): P1 converges them and adds a metric rather than deleting them.
      Deleting becomes a separate change once production shows zero rows."
