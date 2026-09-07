@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -106,6 +107,27 @@ func (s *ambiguousTaskClaimStore) Commit(_ *claimLease, event robot.PreparedBotT
 	return false, errors.New("redis response lost after commit")
 }
 func (s *ambiguousTaskClaimStore) Release(*claimLease) (bool, error) { return true, nil }
+
+type failedCommitTaskClaimStore struct {
+	current   claimOutcome
+	lookupErr error
+	committed bool
+}
+
+func (s *failedCommitTaskClaimStore) Lookup(string, string) (claimOutcome, error) {
+	if s.committed {
+		return s.current, s.lookupErr
+	}
+	return claimOutcome{State: claimMissing}, nil
+}
+func (s *failedCommitTaskClaimStore) Begin(string, string) (claimOutcome, *claimLease, error) {
+	return claimOutcome{State: claimAcquired}, &claimLease{}, nil
+}
+func (s *failedCommitTaskClaimStore) Commit(*claimLease, robot.PreparedBotTypedEvent) (bool, error) {
+	s.committed = true
+	return false, nil
+}
+func (s *failedCommitTaskClaimStore) Release(*claimLease) (bool, error) { return true, nil }
 
 func newTestBotTask(robots robotService, claims claimService) *BotTask {
 	return &BotTask{
@@ -280,6 +302,29 @@ func TestBotTaskRecoversAmbiguousCommitAsReplay(t *testing.T) {
 	}
 }
 
+func TestBotTaskCommitFailureDispatchesCurrentOutcome(t *testing.T) {
+	tests := []struct {
+		name       string
+		current    claimOutcome
+		lookupErr  error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "conflict", current: claimOutcome{State: claimConflict}, wantStatus: http.StatusConflict, wantCode: "err.server.bot_task.idempotency_conflict"},
+		{name: "lookup failure", lookupErr: errors.New("redis unavailable"), wantStatus: http.StatusInternalServerError, wantCode: "err.server.bot_task.store_failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &failedCommitTaskClaimStore{current: tc.current, lookupErr: tc.lookupErr}
+			module := newTestBotTask(&stubTaskRobotService{exists: true, eventID: 78}, store)
+			w := doTaskRequest(t, newTaskRouter(module), testSourceToken, validTaskRequest())
+			if w.Code != tc.wantStatus || decodeTaskError(t, w).Error.Code != tc.wantCode {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestBotTaskRejectsUnauthorizedDisallowedAndMissingBot(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -301,6 +346,60 @@ func TestBotTaskRejectsUnauthorizedDisallowedAndMissingBot(t *testing.T) {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestBotTaskAuthenticatesBeforeFieldValidation(t *testing.T) {
+	request := validTaskRequest()
+	request.Prompt = ""
+	w := doTaskRequest(t, newTaskRouter(newTestBotTask(
+		&stubTaskRobotService{exists: true},
+		&claimStore{backend: &memoryClaimBackend{values: map[string]string{}}, doneTTL: time.Hour},
+	)), strings.Repeat("x", 32), request)
+	if w.Code != http.StatusUnauthorized || decodeTaskError(t, w).Error.Code != "err.shared.auth.token_invalid" {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestBotTaskCompleteObjectDoesNotWaitForRequestEOF(t *testing.T) {
+	module := newTestBotTask(
+		&stubTaskRobotService{exists: true, eventID: 79},
+		&claimStore{backend: &memoryClaimBackend{values: map[string]string{}}, doneTTL: time.Hour},
+	)
+	router := newTaskRouter(module)
+	raw, err := json.Marshal(validTaskRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyReader, bodyWriter := io.Pipe()
+	defer bodyWriter.Close()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := bodyWriter.Write(raw)
+		writeDone <- writeErr
+	}()
+	req := httptest.NewRequest(http.MethodPost, "/v1/internal/bot-tasks", bodyReader)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testSourceToken)
+	w := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-handlerDone:
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	case <-time.After(500 * time.Millisecond):
+		_ = bodyWriter.Close()
+		<-handlerDone
+		t.Fatal("handler waited for request EOF after receiving one complete JSON object")
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write request body: %v", err)
 	}
 }
 

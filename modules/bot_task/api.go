@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -165,12 +163,10 @@ func decodeTaskRequest(c *wkhttp.Context) (taskRequest, error) {
 	if err := decoder.Decode(&request); err != nil {
 		return taskRequest{}, err
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return taskRequest{}, errors.New("bot task request contains multiple JSON values")
-		}
-		return taskRequest{}, err
-	}
+	// Do not probe the socket for a trailing JSON value here. MaxBytesReader
+	// bounds bytes, not time, so a client that sends one complete object without
+	// terminating the request body would otherwise pin this unauthenticated
+	// handler indefinitely. This matches the other HTTP ingresses in this repo.
 	return request, nil
 }
 func validBearerToken(header, expected string) bool {
