@@ -494,7 +494,7 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 		// validatePresetGroupIds itself stays a pure string validator with no
 		// database access — the semantic half belongs at a call site that has a
 		// session, not bolted onto a parser.
-		if bad, err := s.firstProjectGroupAmongPresets(*req.PresetGroupIds); err != nil {
+		if bad, err := s.firstProjectGroupAmongPresets(spaceId, *req.PresetGroupIds); err != nil {
 			s.Error("校验预设群组失败", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
@@ -2333,12 +2333,20 @@ func (s *Space) loadKnownSpaceIDs() {
 }
 
 // firstProjectGroupAmongPresets returns the first group_no in the preset list
-// that belongs to a project, or "" when none does.
+// that belongs to a project of THIS Space, or "" when none does.
 //
 // One query for the whole list rather than one per id: the list is admin-supplied
 // and bounded only by a byte cap, so a per-id loop would let a large payload turn
 // one settings save into an unbounded number of round-trips.
-func (s *Space) firstProjectGroupAmongPresets(raw string) (string, error) {
+//
+// space_id is in the WHERE because without it this validation answers a question
+// about groups the caller cannot see: a Space admin who guesses a group_no in
+// another Space learns from the error whether it is a project group. Scoping it
+// costs nothing here — a preset group in another Space is unusable anyway, and
+// joinPresetGroups re-checks the attribution at execution time (see the call
+// site), so the pair of checks is unchanged for every group this Space can
+// actually preset.
+func (s *Space) firstProjectGroupAmongPresets(spaceID, raw string) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
@@ -2353,8 +2361,8 @@ func (s *Space) firstProjectGroupAmongPresets(raw string) (string, error) {
 	}
 	var bad []string
 	_, err := s.ctx.DB().SelectBySql(
-		"SELECT group_no FROM `group` WHERE group_no IN ? AND project_id <> '' LIMIT 1",
-		groupNos,
+		"SELECT group_no FROM `group` WHERE space_id = ? AND group_no IN ? AND project_id <> '' LIMIT 1",
+		spaceID, groupNos,
 	).Load(&bad)
 	if err != nil {
 		return "", err
