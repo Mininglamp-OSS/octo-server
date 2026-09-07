@@ -96,6 +96,25 @@
 //	  GET /groups/:group_no/threads/:short_id/messages/:message_id  ScopeRouteGuard
 //	      :group_no   same
 //
+// # Routes NOT on any tree, recorded deliberately
+//
+// modules/project's routes (/v1/space/:space_id/projects and /v1/projects/*) are
+// session routes and are contributed to NO tree. That is a decision, not an
+// omission, so it is written here rather than left as the absence of an Add call:
+//
+//   - `uk_*` User API Keys stay SPACE-scoped and are intentionally NOT
+//     Project-scoped. A key freezes one Space at issue time; giving it a Project
+//     dimension would mean a second tenant axis on a credential whose holder cannot
+//     see or rotate that axis, and Project is explicitly not a read boundary — Space
+//     remains the only security boundary. An automation credential therefore reaches
+//     exactly the Space it was issued against, whatever Projects exist inside it.
+//   - Bot tokens likewise gain nothing: a bot has no space_member row, so it has no
+//     Project seat either, and every Project route's gate is the caller's own Space
+//     membership.
+//
+// If a Project route is ever contributed to a tree, it needs a census entry above
+// with each of its request-derived inputs enumerated, exactly like the others.
+//
 // Mediation covers path params, the query string and X-Space-ID — NOT request
 // bodies. Every route above is a GET, so that is complete today; see
 // enforceKeySpace's comment before adding a non-GET route.

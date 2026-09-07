@@ -4,6 +4,63 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
+
+- **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的
+  anyApplied 契约）；join_mode 与 is_official 完全对称撤出全部客户端面（S-2：P2 上线自助
+  加入前必须先消灭"现在写入的 join_mode=0 将追溯性变成开放加入"的存量数据）。
+- **Fixed (non-blocking)** — anyApplied 改按 committed 判定（no-op 不冒充已提交）；
+  successor/target 的 space_member 共享锁前置到 project 锁之前，消除三方死锁环（Q2）；
+  projectMiddleware 的成员与角色合成一次 MemberRole 读取（Q3/Q8，banned 在下一请求即生效）；
+  五条特权写路径事务内复核 actor 的 Space 席位（Q6，新增 requireActorSpaceSeatTx）；
+  reconcile 分页改为 base 行 LIMIT + 每行 violating 标记（Q4：LIMIT 从此约束"检查行"而非
+  "返回行"）；ForTest 全局函数指针改为实例字段（Q7）；orphan 扫描覆盖解散 Space；
+  bumpMemberEpochTx 不再搅动 updated_at 且加 status 谓词；指标改名 write_rejected_total（S-3）；
+  brief 成员配额验收措辞按批量契约修订（S-1）。
+- **Learned** — 行为级测试必须做变异检查：reentrancy 测试重写为读 histogram SampleSum 后
+  才杀得掉"删 guard"变异；两个源码 guard join 续行后立即抓到跨行绝对赋值变异。TDD 循环里
+  新写的守卫（bumpMemberEpochTx 的 status 谓词）当场抓到既有代码的顺序缺陷（disband 先翻转
+  后 bump 吞掉 epoch）——测试先行不是仪式，是捕获手段。
+- **Learned** — 测试断言不能从 wire 读被刻意排除的字段（committed 是 json:"-"），必须断言
+  其行为后果（403 vs 200 per-target report）。
+- **Test hardening** — setup Redis helper Skipf→require；级联注册可断言（space 导出
+  MemberRemovalCleanupStepNames）；级联 step 导出供外部测试恢复真实注册；缓存 seam 三分支
+  与 corrupt-cache 回落补测；并发测试加 start barrier + loser 断言；RoutesReject 断言
+  registered code；COUNT(1) 纳入黑名单；schema 测试要求两表齐备。
+
+## 2026-09-06 — project-p0-foundation (P0 implemented, 4 review rounds)
+
+- **Added** — `modules/project`：Space 内项目协作层 P0。`octo_project` / `octo_project_member`
+  两表（`active_name` 生成列让解散释放重名），CRUD + 成员管理在请求事务内同步校验不变量 I1，
+  `member_epoch` 与每次成员写在同一事务内 `+1`（写纪律由源码级 guard 钉死），Space 移除级联经
+  反向注册清理步骤接入既有 outbox 工单，reconcile 只读对账（LIMIT+cursor，跨 tick 轮转），
+  四类配额 + 审计 + 按 entry point 拆分的拒绝指标。`project_create_enabled` fail-closed。
+  未触碰 group/thread/message；回滚 = 删两张表 + 去掉一个 blank import。
+  See [journal](journal/shared/project-p0-foundation.md).
+- **Learned** — 不变量只存在于它被强制执行的路径上，而每条新写路径都是一个新的执行点。
+  I1 的校验在 addOneMember 有了、createProject 的 owner 席位没有过；转让路径复核了 Space 席位、
+  直接 role change 却没有。brief 早已预言（「十一条群写路径证明 retrofit 会漏」），仍然发生。
+  对策是把「枚举写路径并断言各自含不变量调用」做成源码级 guard。
+- **Learned** — 「后续会有人补」必须写成代码。三处缺陷都是注释在断言代码不具备的性质：
+  cascade 注释说 reconcile 是第一页之后席位的「backstop」（reconcile 按设计只读）；
+  页数上限注释说「下一 tick 继续」（cursor 是局部变量，每 tick 从头开始，~25k 行之后
+  永远不被扫描）；批次标签 `not_attempted` 在 remove 路径是真话、在 add 路径是谎话
+  （service 先跑完整批，handler 事后标注）。
+- **Fixed (4 rounds of review)** — 事务内 I1 校验（`FOR SHARE OF` 锁 space_member 行）、
+  三个配额改为锁 space 行后计数（daily 维度跨 Space 的窄窗口为已接受例外）、特权写路径
+  一律锁内重读 actor 角色、提升/继任均复核目标 Space 席位、级联每短事务复核 + 页预算
+  耗尽返回可重试错误、abandoned 对账改为分页统计泄漏席位并排除在途工单、leave 只容忍
+  io.EOF、所有权交接补继任者审计、部分提交批次返回 per-target 结果。
+- **Deferred (产品待决，已记录进 brief Open questions)** — 唯一 owner 被移出 Space 后留下
+  无 owner 项目：自动提拔与自动解散都是产品决策，P0 只打 Warn；与 group 模块
+  `handOverGroupCreator` 无继任者时的既有终局一致。
+- **范围收敛** — 按需求方指示回退三处超出 brief 的扩展：级联的自动转让/自动解散、
+  Space admin 在用户侧列表对 unlisted 的放宽（brief 只授权 detail；枚举属 P2 admin surface）、
+  `member_epoch_bumped_total` 指标。
+- **Known gap** — 每日创建配额的跨 Space 并发窄窗口（per-space / per-creator 两个硬配额已在
+  space 行锁内计数，跨 Space 的 daily 维度未加锁）；生产 collation 待人工确认
+  （legacy 表未写 COLLATE，若生产默认非 `utf8mb4_general_ci`，对账 JOIN 会撞 1267）。
+
 ## 2026-09-04 (bot-agent-hosting · review round 4)
 
 - **Learned** — **注释声称有区分力、实际没有的测试，比没有测试更糟：它会被相信。**
@@ -2043,3 +2100,110 @@ Two reviewers converged on the same headline; all four verified against code bef
 - **Learning** — `learnings/pending/batch-write-validate-what-lands.md`: reduce a
   batch to the state it will actually produce before validating it; a validator
   that stops at the first match for a key approves one value and persists another.
+
+## 2026-09-06 — project P0：PR #841 第二轮 review 修复
+
+两位 reviewer 对新 head 重审，独立收敛到同一组三个 blocker。三条均为"本 PR 自己引入的
+保证，在除一处以外的全部调用点生效，而遗漏未被记录"：`addOneMember` 漏了 actor 的 Space
+席位复核、list 路由丢弃 `MemberRole` 的 `ok`、`createProject` 的锁序与 `modules/space` 记录
+的死锁事故顺序相反。
+
+- **B-3 的实测比预测更糟**：复现出 Error 1213，InnoDB 选中的受害者是**解散事务**而非
+  create —— 正是 `modules/space/db.go:71-88` 那条注释担心的一侧，而解散是成员移除安全
+  级联的一步。
+- **修 B-3 时引入的第二个缺陷，被既有验收测试当场抓住**：锁序交换让六个并发 create 全部
+  通过 `MaxPerSpace=1`。根因不在锁，在 read view —— `FOR SHARE OF sm` 里**不在 OF 列表中
+  的 JOIN 表按一致性读处理，而一致性读会打开事务的 read view**，于是快照冻结在 `space`
+  行锁之前，三个创建配额全按旧快照计数。在 MySQL 8.0.33 上做了有/无 JOIN 的对照实验坐实。
+  修法是给 create 单独一个无 JOIN 的席位锁；丢掉的 JOIN 不损失保证，Space 活性由紧随其后
+  的排他锁更强地复核。为此加了源码 guard，因为把两个 helper "统一"回去会静默重现它。
+- **一个 code 的文案也是分类的一部分**：actor 级失败复用 target 级 code，文案会说"目标用户
+  不是该空间的有效成员"——对调用者自己而言仍指错方向。新注册 actor 级 code；create 端点
+  本来就无 target，那处是既有误标。
+- **非回归证据从推理升级为实测**：建基线 worktree 对照 brief 点名的四个包。`modules/group`
+  初次 5 个 FAIL 定位为 WuKongIM 容器老化（同一份基线代码两次跑失败集 3 → 39，全是 IM
+  context deadline），重启容器后 HEAD 整包全绿；`modules/thread` 两侧同构 flaky（迁移竞态）。
+- **方法论修正**：`timeout` 在 macOS 不存在，批量跑包时命令静默失败、测试根本没执行，而
+  grep 无输出被读成"无失败"。凡是"没有输出即通过"的判断都要先确认命令真的跑了。
+
+## 2026-09-06 — project P0：PR #841 第三轮 review 修复（改为结构化而非点状补丁）
+
+两位 reviewer 都在真 MySQL 上执行并发断言，独立收敛到一个 P0 + 两个 P1，并都指出同一个
+模式：连续三轮，每轮的修复都在**上一轮修复没走到的路径**上留下同类问题。
+
+- **本轮的教训是范围而不是原因**。第二轮我把 read view 陷阱的原因写对了（甚至写进 guard 的
+  失败消息），却把 guard 指向了一个调用点。另外五条写路径的首条语句仍是 JOIN 版 helper，
+  后果比配额失效严重得多：**两个 owner 并发退出让项目变成 0 owner**，P0 无修复路径、四个
+  对账扫描无一检测。实测复现（service 方法在 project 行锁上真实排队 ~700ms，拿到锁后
+  `queryMemberTx` 是 FOR UPDATE 读新值、授权聚合读旧快照——所以 code review 看不出来）。
+- **两个纪律都做成结构性的**：读可见性 guard 改为解析每条在 `*dbr.Tx` 上执行的 SELECT
+  （新代码自动覆盖）；所有席位锁改为一条 `uid IN (...)` 语句让 InnoDB 定序（排序无效，
+  disband 扫描按 id 排不按 uid 排）；七个写入口统一经有界 1213/1205 重试。
+- **险情，与第二轮同一失败模式**：把写方法重命名为 `...Once` 后，三个源码 guard 开始检查空的
+  重试包装器——一个响亮失败，**两个变绿却什么都没检查**。能被一次重命名打败的 guard 不是
+  guard；现在统一经 `implBody()` 解析实现体，并在包装器背后改实现重做了变异验证。
+- **guard 的判据要精确到执行上下文**：读可见性 guard 初版用"文件里是否出现裸 COUNT"，误报了
+  列表端点的 `member_count` 列和指标采集——那两处在 session 上、不在写事务里、不授权任何
+  东西。改判据为"是否在 `*dbr.Tx` 上执行"。
+- **顺带发现统一 helper 能免费修好另一条 review 项**：所有路径都走同一个席位锁 helper 之后，
+  actor/target 分类自动补齐 6/6，update/disband 不再把授权拒绝渲染成 Internal 500。
+- **P2 拆后续 PR**（reviewer 建议）：缓存 cache-aside stale positive、对账随历史行增长。
+  collation 按指示本轮不查，PR 明确标注未在具名部署验证。
+
+## 2026-09-06 — project P0：PR #841 第四轮 review 修复
+
+第三轮那个"结构化"的修复 commit 自己引入了两个 blocker：给四个 handler 加 actor arm 时
+**全都忘了 `return`**。Go 的 case 不贯穿到下一个 case，但会掉出 switch，于是控制流走上成功
+路径——update **真的 panic**（nil model 进 toResp），disband 给一次**被拒绝的解散**写了审计并
+在错误信封上叠了第二个 JSON body。reviewer 只报了这两个；leave/role 也缺 return，无害纯粹
+因为它们的 switch 恰好是函数最后一句。
+
+- **单点变异不够，要变异"写错"而不只是"删掉"**。第三轮我给这个 arm 写了 guard，但只是
+  `assert.Contains(sentinel)`，且只变异验证了「删掉 arm」。substring 检查看不出 arm 是否终止。
+- **判据要精确到语境**。强化 guard 的第一版要求每个 arm 都 return，立刻标红三个——核对后是
+  要求错了：leave/role 以 switch 结尾（掉出去即函数结束），addMembers 的 switch 在逐目标循环
+  里、不终止正是"继续下一个 uid"。改为「switch 之后有代码时才要求终止」。
+- **guard 家族被系统性审了一遍，四条成立**：复现测试驱动重试包装器（P0 级复现变成抛硬币，
+  同类问题我自己还漏了 createProject 那个）；`LessOrEqual(n,1)` 允许 0；
+  `strings.Count("reconcileMaxPages")<4` 因函数名含同名子串而不可能失败；一个测试用自己手写的
+  SQL 当 oracle、从不调用产品代码，而那条 SQL 正是代码注释说明"错了三重"的废弃形态——测试把
+  删掉的 bug 编码成了断言。
+- **写新 guard 时当场又犯同一类错**：禁止 `p.Error(` 的检查被 `zap.Error(err)` 误报（za**p.Error(**）。
+  子串匹配的 guard 要用词边界。
+- **`cursors` 是包级全局，reset 从未在 setup 调用，而且漏了我自己第三轮加的两个字段**。CI 跑
+  `-shuffle=on`，所以"期望 0"的对账断言可能因为前一个用例留下的截断轮转而通过。已在 setup
+  调用 + 加字段覆盖 guard。
+- **collation 有实测答案了**：生产四列全是 `0900_ai_ci`。根因是 dump 导入（mysqldump 对
+  collation 等于源库默认的表省略 COLLATE），所以 `general_ci` 是意图、`0900` 是导入事故。
+  **不能逐表转**——那三张表还和 robot/group_member/group/app_bot/opanalytics 维表 JOIN，只转
+  它们会打破现在兼容的那些。方案是把 dump 那批一次转完。顺带发现：默认 collation 的库上
+  **迁移无法从零重放**（category 的 `group_setting ⋈ group_category` 1267），会咬到下个新环境。
+
+## 2026-09-06 — project P0：PR #841 第五轮 review 修复
+
+三位 reviewer 收敛到同一组：两个 blocker + 一处记录不一致。两人各自在真 MySQL 上验证。
+
+- **我上一轮亲手写的安全声明不成立**。迁移注释写着「create flag 默认 false 使这成为 pre-enable
+  检查项而非故障」——对 HTTP 面成立，对后台任务不成立：`startReconcileWorker()` 是 `Route()` 第
+  一句，不看任何 flag。两人独立确认**空表也失败**（collation 在语句**解析**时聚合）。而且三个
+  gauge 只在完整轮转时 publish → **永远不 publish** → 监控读起来是「健康、零违约」，实际从未跑过。
+- **没照搬 reviewer 的门控建议，两处故意不同**：① 不复用 create flag——写开关关掉时（止血）恰恰
+  最需要不变量监控，耦合会在那一刻让它变瞎；② 不门控整个 worker——ownerless/epoch/分布指标只碰
+  本模块自己的表，一刀切白丢能工作的观测，而 ownerless 检测的是 P0 无法修复的状态。测试**双向**
+  钉住范围（过度门控同样变红）。
+- **让门控诚实而非遮盖**：flag 关时启动 Warn 点名 env 变量（没人宣布的「监控缺失」比「监控坏了」
+  更糟）；新增 `reconcile_scan_failures_total`（此前「从未跑」与「跑了没发现」在看板上同形，
+  这正是漂移会呈现的样子）。
+- **又一次：我的测试固定了错误行为**。I1 扫描对 banned Space 豁免过宽，而那个测试的 fixture 用
+  `removeSpaceMember`(status=0) 再 ban——cleanup 语义下那人**不是成员**，cascade 不会跳过他，
+  所以测试恰好在两者**不一致**的场景上断言了「一致」。一个 cleanup 语义谓词替掉原来的两个。
+- **删函数会让 guard 变 vacuous**：删掉 `checkSpaceMembershipForWriteTx` 后，`assert.NotContains`
+  那句永远成立。改为点名**仍存在**的 JOIN 版 helper。它的测试不是删而是**改指在用的函数**。
+- **实施中自己抓到三个**：指标标签不一致（`abandoned_leak` vs histogram 的 `abandoned`，看板
+  join 不上，已加一致性 guard）；既有 helper `histogramSum` 只 return 第一个 series 而非求和
+  （加第五个标签后整包跑失败、单独跑通过）；leave/role 缺 return 今天无害只因 switch 恰在函数末尾。
+- **collation 的正确 guard 形态**：CI 建库就是 general_ci，所以断言 legacy 列是 general_ci 的
+  guard 靠继承通过、永不失败。改成**故意制造漂移**：独立库（共享表不能在 shuffle 下改）+
+  `CREATE TABLE ... LIKE` 从真实 schema 复制（零手写 DDL）+ 调产品查询方法。它同时是转换的验收证据。
+- **Jerry-Xin 撤回了他自己第四轮的建议**：只转 space/space_member/user 会让 `modules/space` 与
+  `modules/user` 的现网 join 报 1267（robot/group_member 仍 0900）。坐实「不能逐表转」。
