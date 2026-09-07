@@ -373,7 +373,7 @@ func TestConformanceVectorsMatchTheImplementation(t *testing.T) {
 			// Signed over the ORIGINAL body, delivered with the tampered one.
 			signedBody = conformanceBody
 		}
-		want := cardactiondispatch.Sign(signingSecret, v.Method, v.Path, v.Timestamp, v.EventID, []byte(signedBody))
+		want := octosign.Sign(signingSecret, v.Method, v.Path, v.Timestamp, v.EventID, []byte(signedBody))
 		if v.Signature != want {
 			t.Errorf("vector %q signature drifted:\n have %s\n want %s", v.Name, v.Signature, want)
 		}
