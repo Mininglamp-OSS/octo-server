@@ -29,6 +29,44 @@ change-log convention (§7). Newest first.
   [journal](journal/shared/project-collaboration-roles.md); reusable pagination guidance
   is staged in [learnings/pending](learnings/pending/project-collaboration-roles.md).
 
+## 2026-09-07 — internal-token-registry (extract pkg/internaltoken)
+
+- **Done** — one registry now owns the four fixed internal-token envs, the
+  `X-Internal-Token` header name and the shared 32-byte floor.
+  `Resolve(env, getenv)` enforces the floor and compares against every env
+  registered *before* it, so every unordered pair is checked exactly once and
+  appending a Spec needs no edit anywhere else. `modules/notify`,
+  `modules/bot_mention` and `modules/internal_resolve` collapse to one call each;
+  `main.go` feeds `ValidateNotifyTokenExclusions` from `internaltoken.Values`
+  and logs each colliding pair by ENV name before the card-dispatch installers,
+  so a malformed `OCTO_CARD_ACTION_ROUTES` cannot swallow the diagnostic.
+  `internal/cardactiondispatch` drops its two hardcoded `32` literals.
+- **Learned (the load-bearing one)** — the first cut made `Resolve` symmetric
+  ("one secret opens two doors, neither stays open"). It was strictly more
+  coverage and strictly worse: `NOTIFY_INTERNAL_TOKEN == OCTO_DOCS_NOTIFY_TOKEN`
+  had been disabling docs only and leaving the legacy ingress serving; symmetric
+  resolution 401s the whole `/v1/internal` notify group on the next rolling
+  deploy. Registration order as a *precedence* order keeps complete coverage AND
+  the pre-existing survivor. The ladder the four modules had built by accident
+  was the right semantics — what was wrong was that it lived in four places.
+- **Learned** — length floors are a rollout decision, not a refactor decision.
+  Three of four envs ship without the 32-byte bar and `pilote2e` proves short
+  values are in use; the waivers are explicit `MinBytes: 0` entries pinned by a
+  test rather than a silent uniform raise.
+- **Learned** — `Values`/`Collisions` panic on a nil `getenv`: returning an empty
+  slice would turn the one gate that *aborts* startup into a no-op.
+- **Gotcha (environment, not code)** — running the suite locally needs the two
+  things CI sets and a naive `go test ./...` does not: `OCTO_MASTER_KEY` and
+  `SET GLOBAL max_connections = 1000`. Skipping them produced 5 failures that
+  looked like regressions and were not. `ci/run-unit-tests.sh` +
+  `ci/run-e2e-shard.sh` already do the per-package DB drop/recreate (each package
+  registers only its own module set's migrations, so a shared ledger aborts with
+  `unknown migration in database`) and fall back to local binaries when
+  `MYSQL_CID`/`REDIS_CID` are unset — use them instead of hand-rolling a runner.
+- **Verified** — 102 packages, 0 failures via both CI lanes. `pilote2e`'s 3
+  failures (`cardtmpl ... default catalog not wired`) reproduce identically on
+  the parent commit.
+
 ## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
 
 - **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的
