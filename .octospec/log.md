@@ -2416,3 +2416,12 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - Build, unit, four E2E/API shards, focused regression, i18n, vet and direct
   WuKongIM persistence passed. Full pilote2e retains an unrelated baseline
   card-template catalog fixture failure.
+
+## 2026-09-07 — my-ai-team-sessions (upstream-main integration)
+
+- Merged open-source `main` at `96b3b926` and resolved the Space preset-group and
+  zh-CN catalog conflicts without dropping either side's behavior.
+- Integrated AI container initialization with #846's single group-member admission
+  funnel; its source guard now passes without allowlisting a direct table write.
+- Re-ran build, vet, 52 unit packages, all four MySQL/Redis/WuKongIM E2E/API shards,
+  i18n checks and the direct WuKongIM persistence test successfully.

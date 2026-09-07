@@ -10,9 +10,10 @@ Date: 2026-09-07
 | Unit suite | `ci/run-unit-tests.sh` | PASS — 52 unit packages |
 | E2E shard 1 | `MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 1 4` | PASS |
 | E2E shard 2 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 2 4` | PASS |
-| E2E shard 3 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 3 4` | PASS after final review/UI-control changes |
+| E2E shard 3 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 3 4` | PASS after merging upstream `main` at `96b3b926` |
 | E2E shard 4 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 4 4` | PASS |
 | Focused AI/message regression | `go test ./modules/ai_team ./modules/message` | PASS |
+| Upstream admission compatibility | `go test -count=1 ./modules/group` and `go test -count=1 ./modules/space` on fresh databases | PASS — AI container creation and preset-group protection coexist with #846's single group admission funnel |
 | Fresh DB AI API controls | `go test -count=1 ./modules/ai_team` | PASS — rename, pin ordering, mute, per-user clear, soft delete, ownership and scan-join guard |
 | Production-shape collation regression | `go test -count=1 ./modules/ai_team -run TestAITeamQueriesSurviveProductionCollationShape` | PASS — real MySQL with 0900 legacy identity tables joined to general-ci AI/thread tables |
 | Static analysis | `go vet ./...` | PASS |
@@ -28,6 +29,12 @@ and their thread sessions from recent/follow lists. The final review round also 
 Space-removal lifecycle cleanup, preset-group and QR/scan-join bypasses, Bot API
 mutation rejection, inactive-seat routing rejection, and the personal session controls
 shown by the client: rename, pin ordering, mute, per-user history clear, and soft delete.
+
+After merging upstream `main` at `96b3b926` (`#846`), the new source guard correctly
+identified the AI container's former direct `group_member` insert. Container creation
+now enters the group admission funnel through a narrow same-transaction bridge that
+verifies the parent Space, owner, purpose and empty project binding before admitting
+exactly the owner and Bot. All four E2E/API shards above were rerun after that merge.
 
 ## Fresh-database migration verification
 

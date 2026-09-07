@@ -50,3 +50,19 @@ source: self
   fixture failure; its direct WuKongIM persistence test passes.
 - Client and external adapter E1-E5 remain deployment-level handoff checks; this PR
   does not claim those repositories were exercised.
+
+## Upstream-main integration
+
+- Merging `origin/main` at `96b3b926` brought in #846's single group-member
+  admission funnel and its whole-tree source guard. The guard caught the AI
+  container's intentionally atomic but direct two-row member insert.
+- The integration keeps the AI association/group/session transaction intact via a
+  narrow group-owned admission bridge. Before writing, the bridge locks and checks
+  that the parent belongs to the requested Space and owner, has
+  `purpose=ai_session_container`, and has no project binding; it then admits exactly
+  the owner and Bot through the shared funnel.
+- Conflict resolution in `modules/space/api.go` preserves both invariants: preset
+  groups reject AI containers and project-bound groups, then use the upstream
+  registered admission entry for ordinary Space-direct groups.
+- Build, vet, the 52-package unit suite, all four E2E/API shards, i18n checks and the
+  focused WuKongIM persistence test were rerun successfully after the merge.
