@@ -151,8 +151,27 @@ func (p *Project) scanMissingAllMemberGroups() {
 // idx_octo_project_all_member_group, and a disbanded project is not a violation
 // to be flagged but a row that is out of scope.
 //
-// The LEFT JOIN is a point lookup per examined row against group_groupNo (UNIQUE
-// on group_no), so the work per row is one index dive, not a scan.
+// # The LEFT JOIN's plan, stated accurately
+//
+// An earlier version of this comment said the join is "a point lookup per examined
+// row against group_groupNo, so the work per row is one index dive, not a scan".
+// That holds in CI and NOT in production, and the difference is this file's own
+// COLLATE rule: an explicit COLLATE has coercibility 0, so the comparison is
+// general_ci and `group`.group_no — 0900_ai_ci in production — must be converted
+// per row, which its UNIQUE index cannot serve. Measured on MySQL 8.0.46 with
+// `group` at 0900_ai_ci: `g ALL key=NULL rows=<all groups>`, plus `Using temporary`
+// on the driving side, which also defeats the ORDER BY / LIMIT paging this scan
+// depends on. CI creates its database with general_ci on both sides, so every plan
+// there is eq_ref and the suite cannot see it.
+//
+// Not fixed by moving the COLLATE to the `group` side: that is correct only until
+// the legacy-collation conversion lands and then silently wrong in the mirror
+// direction. The two user-facing predicates (pkg/project.IsAllMemberGroup and
+// queryAllMemberGroupNo) were split into single-table reads instead, which needs no
+// collation opinion at all — but a paged scan cannot be split that way. So this one
+// inherits P0/P1's pending conversion, and open_verification carries the EXPLAIN
+// item. Bounded meanwhile by ReconcileLimit and a 5-minute interval. PR #855's
+// fifth review measured it.
 func (p *Project) queryMissingAllMemberGroupPage(cursor int64, limit int) ([]*i4MissingRow, error) {
 	var rows []*i4MissingRow
 	_, err := p.db.session.SelectBySql(

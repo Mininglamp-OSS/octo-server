@@ -70,6 +70,24 @@ var (
 			"The seat is committed; the group membership is not. Reconcile scan B reports the gap.",
 	}, []string{"reason"})
 
+	// allMemberGroupRosterTruncated 计数"补建时名册被截断"。
+	//
+	// 截断是可达的：updateProject 接受 max_members 且不校验当前活跃席位数，把配额
+	// 调到低于现有成员数之后，每一次补建都只会带进前 max_members 个人，其余的人
+	// 由 I4 扫描 B 报成缺口。
+	//
+	// 只有日志不够，而这不是"多加个指标更好"的问题：PR #855 第五轮 review 用变异
+	// 测试证明，把名册查询的 +1 探针行拿掉之后（那正是上一轮的缺陷），
+	// TestRebuildWarnsWhenTheRosterIsTruncated 仍然全绿——因为它断言的是种子的上界，
+	// 而上界在两种写法下相同，唯一的差别就是这个信号发不发。一个只存在于日志里的
+	// 信号，测试断言不了，于是它被删掉过一次、还能再被删一次。
+	allMemberGroupRosterTruncated = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "all_member_group_roster_truncated_total",
+		Help: "Rebuilds whose seed roster was cut at the project's max_members. " +
+			"The members beyond the cut are not in the group; reconcile scan B reports them.",
+	}, []string{"reason"})
+
 	// allMemberGroupSyncFailures 计数群主/群名同步失败。
 	allMemberGroupSyncFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
@@ -106,6 +124,17 @@ func observeAllMemberGroupProvisionFailure(reason string) {
 func observeAllMemberGroupAdmitFailure(reason string) {
 	allMemberGroupAdmitFailures.WithLabelValues(reason).Inc()
 }
+
+// observeAllMemberGroupRosterTruncated 记录一次补建时的名册截断。
+//
+// reason 目前只有一个取值（over_max_members），保留标签是因为下一个截断来源
+// （比如为了限制同步耗时而加的硬上限）应该分得开，而不是共用一个数字。
+func observeAllMemberGroupRosterTruncated(reason string) {
+	allMemberGroupRosterTruncated.WithLabelValues(reason).Inc()
+}
+
+// reasonTruncatedOverMaxMembers：活跃成员数超过项目的 max_members。
+const reasonTruncatedOverMaxMembers = "over_max_members"
 
 func observeAllMemberGroupSyncFailure(kind string) {
 	allMemberGroupSyncFailures.WithLabelValues(kind).Inc()

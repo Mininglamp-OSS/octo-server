@@ -258,25 +258,37 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	if projectID == "" {
 		return "", nil
 	}
-	var groupNos []string
-	_, err := d.session.SelectBySql(
-		"SELECT p.all_member_group_no FROM `octo_project` p "+
-			// COLLATE 在驱动侧的值上：p.* 是 pinned 的 general_ci，`group` 是老表。
-			// 与 pkg/project.IsAllMemberGroup 的写法一致。
-			"INNER JOIN `group` g "+
-			"  ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
-			"  AND g.status <> ? "+
-			"  AND g.project_id = p.project_id COLLATE utf8mb4_general_ci "+
-			"WHERE p.project_id = ? AND p.status = ? AND p.all_member_group_no <> ''",
-		groupStatusDisband, projectID, StatusNormal,
-	).Load(&groupNos)
-	if err != nil {
-		return "", fmt.Errorf("project: query all-member group: %w", err)
+	// 两条单表查询，不是一次连接 —— 与 pkg/project.IsAllMemberGroup 同一个理由，
+	// 那里有实测：显式 COLLATE 的 coercibility 是 0，所以比较落在 general_ci，
+	// 而生产里 0900_ai_ci 的 `group`.group_no 必须逐行转换，group_groupNo 用不上，
+	// 计划从 const 退化成全表扫。跨过 schema 的比较一旦不存在，就不需要对排序规则
+	// 有任何意见，转换落地之后也不用回来改。
+	//
+	// 这条查询在加人批次的开头、群主同步、改名同步上各跑一次，都是写路径。
+	var pointers []string
+	if _, err := d.session.SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` "+
+			"WHERE project_id = ? AND status = ? AND all_member_group_no <> ''",
+		projectID, StatusNormal,
+	).Load(&pointers); err != nil {
+		return "", fmt.Errorf("project: query all-member group pointer: %w", err)
 	}
-	if len(groupNos) == 0 {
+	if len(pointers) == 0 || pointers[0] == "" {
 		return "", nil
 	}
-	return groupNos[0], nil
+	// 群侧那一半：群还在、没解散、而且**还属于本项目**。缺了它，一个被 P1 detach
+	// 成 Space 直属的群仍会被当成全员群使用（见本函数上方的注释）。
+	var alive []int
+	if _, err := d.session.SelectBySql(
+		"SELECT 1 FROM `group` WHERE group_no = ? AND status <> ? AND project_id = ?",
+		pointers[0], groupStatusDisband, projectID,
+	).Load(&alive); err != nil {
+		return "", fmt.Errorf("project: query all-member group row: %w", err)
+	}
+	if len(alive) == 0 {
+		return "", nil
+	}
+	return pointers[0], nil
 }
 
 // queryActiveOwnerCandidatesForProvision 按资历返回项目的活跃 owner 候选（最老在前）。

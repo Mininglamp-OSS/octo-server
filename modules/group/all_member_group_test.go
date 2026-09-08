@@ -3,6 +3,7 @@ package group
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -251,4 +252,49 @@ func TestGroupStatusDisbandMatchesPkgProject(t *testing.T) {
 	require.Equal(t, GroupStatusDisband, projectpkg.GroupStatusDisband,
 		"pkg/project.GroupStatusDisband mirrors this module's constant by hand; update it "+
 			"in the same commit that changes this one")
+}
+
+// TestAllMemberAdmissionPairsThreadSubscriptionWithTheParent is a source guard on
+// the pairing every admission path in this module observes.
+//
+// WuKongIM gives each thread its own channel (`groupNo____shortId`) and checks
+// send permission against that channel's own subscriber table, so subscribing to
+// the parent group does not carry into its threads. Every other admission path
+// pairs IMAddSubscriber with addUsersToGroupThreads — memberAdd, groupScanJoin,
+// un-blacklist, Service.AddGroupMembers, event.go — and removal is symmetric
+// (RemoveGroupMembers → removeUserFromGroupThreads).
+//
+// The all-member admitter shipped without the second half, so a member added to a
+// project could not post in the all-member group's threads and did not receive
+// them — permanently, since the admitter runs once per join, and invisibly, since
+// I4 scan B reads group_member rows rather than thread subscriptions.
+//
+// A source guard rather than a behavioural test because asserting the effect needs
+// the broker's subscriber table read back, and nothing in this repository can do
+// that — the same limitation recorded in open_verification for the group's own
+// subscriber set. What CAN be checked is that the two calls stay together.
+func TestAllMemberAdmissionPairsThreadSubscriptionWithTheParent(t *testing.T) {
+	raw, err := os.ReadFile("all_member_group.go")
+	require.NoError(t, err)
+	body := string(raw)
+
+	i := strings.Index(body, "func (g *Group) admitToAllMemberGroup(")
+	require.Positive(t, i, "admitToAllMemberGroup not found")
+	end := strings.Index(body[i:], "\n}\n")
+	require.Positive(t, end, "could not delimit admitToAllMemberGroup")
+	fn := body[i : i+end]
+
+	require.Contains(t, fn, "IMAddSubscriber",
+		"precondition: the admitter subscribes to the parent channel")
+	require.Contains(t, fn, "addUsersToGroupThreads",
+		"the admitter must ALSO subscribe the new member to the group's threads. A thread "+
+			"is its own WuKongIM channel and its own subscriber list, so the parent "+
+			"subscription does not carry into it: without this the member cannot post in "+
+			"any of the all-member group's threads and does not receive them, permanently "+
+			"(the admitter runs once per join) and invisibly (I4 scan B reads group_member "+
+			"rows, not subscriptions). Every other admission path in this module pairs the "+
+			"two, and removal is symmetric.")
+
+	require.Less(t, strings.Index(fn, "IMAddSubscriber"), strings.Index(fn, "addUsersToGroupThreads"),
+		"the parent subscription comes first, matching every sibling path")
 }

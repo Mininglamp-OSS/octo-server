@@ -701,7 +701,12 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	// 因此在这条路径上也是零额外查询（C1）。
 	groupStatus, groupProjectID, err := ba.queryGroupStatusAndProject(groupNo)
 	if err != nil {
-		ba.Error("查询群是否已解散错误", zap.Error(err))
+		// A missing group row arrives as dbr.ErrNotFound and is refused here, the
+		// same as before this handler read the two columns together. Answering
+		// "not disbanded, no project" for a group that does not exist would let the
+		// request walk past both guards to be refused later by ExistMember — a
+		// different code, a later stage, and one fewer signal.
+		ba.Error("查询群状态失败", zap.Error(err), zap.String("groupNo", groupNo))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}

@@ -168,6 +168,20 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, _, groupNo, uid strin
 			zap.String("groupNo", groupNo), zap.String("uid", uid), zap.Error(err))
 		return fmt.Errorf("group: all-member admission IM subscribe: %w", err)
 	}
+
+	// 子区订阅。父频道订阅**不覆盖**子区：WuKongIM 里每个子区是独立频道
+	// （channel_id = groupNo____shortId），发言权限查的是那个频道自己的订阅者表。
+	//
+	// 本模块其它五条准入路径都是这两步配对出现（memberAdd、groupScanJoin、
+	// 解除拉黑、Service.AddGroupMembers、event.go），移除侧也是对称的
+	// （RemoveGroupMembers → removeUserFromGroupThreads）。这里少了这一步，于是
+	// 一个被加进项目的人在全员群的子区里发不了言、也收不到实时消息——而且是永久的，
+	// 因为准入器每人只跑一次；I4 扫描 B 看的是 group_member 行，看不见订阅。
+	// PR #855 第五轮 review。
+	//
+	// best-effort，与父频道订阅同一个取舍：失败只记日志（addUsersToGroupThreads
+	// 自己记），不让整次入群失败——人已经在群里了。
+	g.addUsersToGroupThreads(groupNo, []string{uid})
 	return nil
 }
 

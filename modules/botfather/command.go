@@ -32,12 +32,20 @@ type commandHandler struct {
 	appService    app.IService
 	apiKeyService UserAPIKeyService
 	langSvc       *user.LanguageService // resolves recipient language for replyL
+	// closeSeatsFn 是删除 Bot 时关闭其全部 Space 席位的入口，可注入。
+	//
+	// 存在的唯一理由是让"关席位失败必须中止删除"这条规则可被测试**看见**。
+	// PR #855 第五轮 review 用变异测试证明了它的必要性：把那条中止改回
+	// log-and-continue，整个 modules/botfather 套件仍然全绿——也就是说上一轮
+	// 阻塞掉的缺陷可以在没有任何测试变红的情况下被改回去。
+	closeSeatsFn func(ctx *config.Context, uid, operatorUID, reason string) ([]string, error)
 	log.Log
 }
 
 func newCommandHandler(ctx *config.Context) *commandHandler {
 	return &commandHandler{
 		ctx:           ctx,
+		closeSeatsFn:  spacemod.CloseAllSpaceSeats,
 		db:            newBotfatherDB(ctx),
 		sm:            newStateMachine(ctx),
 		userService:   user.NewService(ctx),
@@ -680,7 +688,7 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	// operatorUID 是**发起删除的主人**，不是 Bot 自己。它会流进
 	// deactivateSeatForCascade 的审计与日志归因，前一版两个参数都传 botID，于是
 	// 审计记录读作"这个 Bot 把自己从每个项目里移除了"——一个不存在的行为者。
-	if closed, closeErr := spacemod.CloseAllSpaceSeats(
+	if closed, closeErr := h.closeSeatsFn(
 		h.ctx, botID, fromUID, spacemod.MemberRemoveReasonBotDeleted,
 	); closeErr != nil {
 		// 关不掉席位就**不往下走**，尤其不能走到 deleteRobot。

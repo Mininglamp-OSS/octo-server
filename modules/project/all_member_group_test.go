@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1401,6 +1402,8 @@ func TestRebuildWarnsWhenTheRosterIsTruncated(t *testing.T) {
 		map[string]any{"uids": []string{"u_a", "u_b", "u_c"}})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
+	truncatedBefore := truncationCount(t)
+
 	// Lower the cap below the roster, exactly as updateProject permits.
 	_, err := testCtx.DB().UpdateBySql(
 		"UPDATE `octo_project` SET max_members = 2 WHERE project_id = ?", resp.ProjectID).Exec()
@@ -1420,4 +1423,23 @@ func TestRebuildWarnsWhenTheRosterIsTruncated(t *testing.T) {
 	assert.NotEmpty(t, stub.seeds[0].Members,
 		"and must not collapse to nothing — a bound of 2 still admits one member "+
 			"beside the owner")
+
+	// The SIGNAL, which is the whole reason the query fetches maxMembers + 1.
+	//
+	// Asserting the bound alone does not pin the fix: with LIMIT = maxMembers the
+	// bound holds too, and the only difference is that the truncation goes
+	// unreported. PR #855's fifth review demonstrated exactly that by mutation —
+	// remove the +1 and this test stayed green while the signal died, which is the
+	// same silent death the round before had already caused once.
+	assert.Equal(t, truncatedBefore+1, truncationCount(t),
+		"the truncation must be REPORTED, not just bounded. Fetching maxMembers + 1 is "+
+			"what lets the caller tell 'exactly full' from 'cut', and a counter is what "+
+			"lets a test see the difference at all")
+}
+
+// truncationCount reads the roster-truncation counter.
+func truncationCount(t *testing.T) float64 {
+	t.Helper()
+	return testutil.ToFloat64(
+		allMemberGroupRosterTruncated.WithLabelValues(reasonTruncatedOverMaxMembers))
 }

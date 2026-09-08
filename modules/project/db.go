@@ -839,9 +839,16 @@ func (d *DB) listMembers(projectID string, offset, limit int) ([]*memberRosterMo
 			// robot 的 COLLATE 是必须的：`robot` 与 `user` 都是未声明 COLLATE 的
 			// 老表（生产库 utf8mb4_0900_ai_ci），octo_project_member 明确是
 			// general_ci，隐式比较在生产上报 1267 而在 CI 上一路绿灯。
-			// u.uid 那个 JOIN 是既有代码，未加 COLLATE —— 它比较的是两张老表
-			// （user / octo_project_member），本行不改它的行为，只在新加的比较上
-			// 补齐；改既有 JOIN 会顺带改动一条已在生产跑着的查询计划。
+			// u.uid 那个 JOIN 是既有代码，未加 COLLATE。上一版这里写着"它比较的是
+			// 两张老表（user / octo_project_member）"——**这句是错的**，而且与上面
+			// 两行自相矛盾：octo_project_member 由它自己的迁移 pin 成 general_ci。
+			// 所以那个比较是 general_ci ⟷ 0900_ai_ci，在生产上会报 1267，本函数
+			// 在转换落地之前根本执行不了（PR #855 第五轮 review 实测确认）。
+			//
+			// 不在本次改它：那是 P0 留下的、跟着排序规则转换一起走的既有账，
+			// 改它等于顺带改动一条已在生产跑着的查询计划。但它是 D16 的名册接口，
+			// 开关一开就是用户可见的，所以"转换已落地（或这个 JOIN 已 pin）"是
+			// 上线前的硬门槛，记在 open_verification 里。
 			"IFNULL(u.robot, 0) AS robot, IFNULL(r.creator_uid, '') AS owner_uid "+
 			"FROM `octo_project_member` pm "+
 			"LEFT JOIN `user` u ON u.uid = pm.uid "+

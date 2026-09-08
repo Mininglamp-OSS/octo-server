@@ -94,8 +94,15 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 		ok, err := closeOneSeatAndEnqueueTx(ctx, spaceID, uid, operatorUID, reason)
 		if err != nil {
 			// 单个 Space 失败不中断其余 Space：已提交的那些工单已经落库，
-			// 而失败的这个 Space 的席位仍然是 status=1，I1 对账会把它报出来。
 			// 中断反而会让后面那些 Space 连工单都没有。
+			//
+			// 失败的这个 Space 的席位仍然是 status=1，而**没有任何扫描会报它**。
+			// 上一版这里写着"I1 对账会把它报出来"，那句是错的：I1 的定义域是
+			// octo_project_member（"项目席位还活着但 Space 席位没了"），而这里
+			// 恰好相反——Space 席位活着，项目席位可能压根不存在。
+			// 兜底靠调用方：botfather 删 Bot 那条路径在 closeErr 非空时**中止删除**
+			// 并让用户重试（robot 行仍可选中），所以这个残留不会静默留存。
+			// PR #855 第五轮 review。
 			if firstErr == nil {
 				firstErr = err
 			}

@@ -865,6 +865,116 @@ pr_855_round_3_fixed:
       can change, since D7 then refuses them transfer, exit and disband.
     status: "re-aimed in open_verification, still a product call rather than decided here."
 
+# PR #855 fifth pass. Two reviewers on the same head (yujiawei, and Jerry-Xin
+# joining), converging independently on the same two blocking items.
+pr_855_round_4_fixed:
+  - id: collate-placement-made-the-probe-index-unusable-on-user-traffic
+    severity: blocking
+    where: pkg/project/all_member_group.go IsAllMemberGroup, and modules/project/db_all_member_group.go queryAllMemberGroupNo
+    what: |
+      The repo rule is "put the explicit COLLATE on the driving side's values so
+      the driving table's indexes stay usable". That is true and it hides the
+      cost: an explicit COLLATE has coercibility 0, so the COMPARISON is in that
+      collation and the OTHER side must be converted per row -- its index cannot
+      serve it. `group.group_no` is 0900_ai_ci in production; group_groupNo, its
+      UNIQUE index, was unusable.
+    measured: |
+      Reproduced locally on MySQL 8.0.46, `group` at 0900_ai_ci / 5000 rows:
+        shipped join:  p const uk_octo_project_project_id 1 row
+                       g ALL   possible_keys=group_groupNo  key=NULL  rows=5000
+        split reads:   p const uk_octo_project_project_id 1 row
+                       g const group_groupNo               1 row
+    consequence: |
+      IsAllMemberGroup is the WHOLE of the D7 guard, reached from six user-facing
+      handlers (group disband / exit / member removal / owner transfer / blacklist,
+      and the bot API member removal). A full scan of `group` -- a core IM table --
+      on every group exit. In P0 and P1 this shape only touched background scans;
+      P2 is the first time it reached request traffic.
+    fix: |
+      Both predicates split into two single-table reads with NO cross-schema
+      comparison. Deliberately not "move the COLLATE to the legacy side": that is
+      correct today and silently wrong in the mirror direction the moment the
+      collation conversion lands. A comparison that crosses no schemas needs no
+      collation opinion.
+    not_fixed: |
+      The two paged reconcile scans cannot be split that way. Their comment
+      claiming a per-row index dive was corrected to state the measured plan
+      (`g ALL`, plus `Using temporary` defeating the ORDER BY / LIMIT paging), and
+      open_verification now carries that as the EXPLAIN item rather than an
+      assumption. They inherit P0/P1's pending conversion and are bounded by
+      ReconcileLimit and a 5-minute interval meanwhile.
+    note: "CI creates its database with general_ci on both sides, so every one of these plans is const there. P0's migration header says exactly this -- a green suite is structurally not evidence."
+  - id: the-one-query-optimisation-loosened-a-fail-closed-bot-guard
+    severity: blocking
+    where: modules/bot_api/send.go queryGroupStatusAndProject
+    what: |
+      Round 4's Q6 fix merged isGroupDisbanded's lookup with the D7 guard's
+      project_id read, replacing LoadOne with Load. A missing group row therefore
+      became (status 0, "", nil) -- "not disbanded" -- instead of dbr.ErrNotFound.
+    consequence: |
+      errBotSendPermGroupNotFound and the sendPermissionReasonNotFound metric,
+      whose job is to separate "a bot is probing channel ids that do not exist"
+      from "a query failed", became unreachable through the DB. On the OBO send
+      path the disband guard was the ONLY existence check (checkOBO returns early
+      with an enabled scope row). And modules/bot_api started answering
+      differently from modules/robot and modules/message on the same question,
+      while its own doc comment still claimed the not-found signal was preserved.
+    why_the_suite_was_green: |
+      Both "missing group" cases drive groupStatusQueryOverride -- the stub seam,
+      which the change did not touch. The changed branch had no test at all.
+    fix: "the not-found signal is wrapped and propagated; the D7 half short-circuits on projectID == \"\" independently. Two tests drive the REAL query with no stub."
+    self_assessment: "This was mine, introduced to save one query for a P2 latency nit, on a PR labelled security-sensitive. The reviewer's framing is the right one."
+  - id: admission-subscribed-the-parent-channel-but-not-its-threads
+    severity: blocking
+    where: modules/group/all_member_group.go admitToAllMemberGroup
+    what: |
+      Each thread is its own WuKongIM channel with its own subscriber list, and
+      send permission is checked against that list. Every other admission path in
+      the module pairs IMAddSubscriber with addUsersToGroupThreads -- memberAdd,
+      groupScanJoin, un-blacklist, Service.AddGroupMembers, event.go -- and removal
+      is symmetric. The all-member admitter had only the first half.
+    consequence: "a member added to a project could not post in the all-member group's threads and did not receive them: permanently (the admitter runs once per join) and invisibly (I4 scan B reads group_member rows, not subscriptions)."
+    fix: "addUsersToGroupThreads after the parent subscribe, held by a source guard on the pairing -- the effect itself is not assertable, since nothing here can read the broker's subscriber table back."
+  - id: two-fixes-shipped-without-anything-pinning-them
+    severity: blocking-adjacent
+    raised_as: "Jerry-Xin P2-5, by mutation testing"
+    what: |
+      Reverting round 4's botfather abort to log-and-continue left the entire
+      modules/botfather suite GREEN. Removing the +1 probe row from the roster
+      query left TestRebuildWarnsWhenTheRosterIsTruncated GREEN -- a test named
+      for the warning, asserting only the bound, which is identical either way.
+    why_it_matters: "both are fixes the previous two rounds BLOCKED on, one revert away from returning with nothing going red."
+    fix: |
+      A closeSeatsFn seam in botfather plus two cases (abort on failure with the
+      robot row still selectable; proceed on success). And the truncation is now a
+      COUNTER, not only a log line -- a signal that exists only in a log cannot be
+      asserted, which is how it got deleted silently once already.
+    both_verified: "by re-running the reviewer's mutations: each test goes red."
+  - id: comments-naming-detection-that-does-not-cover-the-residue
+    raised_as: "Jerry-Xin P2-2"
+    fixes: |
+      CloseAllSpaceSeats's partial-failure comment said "I1 will report it". I1's
+      domain is octo_project_member ("project seat alive, Space seat gone"); this
+      residue is the opposite and no scan looks for it. The comment now says so and
+      names the real backstop -- botfather aborting the deletion.
+      The provisioning !ok Warn named only one of its three cases and routed the
+      on-call reader to scan A for all of them; it now names all three (pointer
+      taken, lease taken with the pointer still empty, project disbanded -- the
+      last being I3's domain, not A's).
+  - id: spec-record-and-journal-drift
+    raised_as: "Jerry-Xin P2-1 / P2-3 / P2-4"
+    fixes: |
+      db.go's comment called octo_project_member a legacy table while the two lines
+      above it say it is pinned -- and the consequence is worse than a wrong word:
+      that pre-existing join raises 1267 under the production shape, so listMembers
+      (D16's roster surface) cannot execute at all until the conversion lands. Added
+      to open_verification as a gating item rather than left in a comment.
+      The brief said "four protected operations" in four more places after the D7
+      section was corrected to five, and still described D5 as "add an index" after
+      the second one was dropped. The journal still described scan B as not
+      exempting banned Spaces and counted end-to-end cases that have since grown.
+      All corrected; the journal also gained the two lessons this round produced.
+
 # octospec Verify phase. Each injected rule re-read and checked against the diff,
 # then the brief's Acceptance walked line by line.
 verify:
@@ -990,7 +1100,20 @@ open_verification:
      blast radius of member_count counting humans only (D16), whether the agent
      picker already excludes self-hosted agents (D2), and whether any caller
      depends on the synchronicity of botfather's old raw space_member update (D14)."
-  - "EXPLAIN for the two I4 scans on production-scale `group` / `group_member`.
+  - "EXPLAIN for the two I4 scans on production-scale `group` / `group_member`,
+     under the PRODUCTION collation shape rather than CI's.
+     PR #855's fifth review measured the shape this item was written about and it
+     is worse than assumed: an explicit COLLATE has coercibility 0, so the
+     comparison lands in general_ci and the legacy side's index cannot serve it.
+     Measured on MySQL 8.0.46 with `group` at 0900_ai_ci / 5000 rows, the scan-A
+     join plans as `g ALL key=NULL` plus `Using temporary` on the driving side,
+     which defeats the ORDER BY / LIMIT paging as well as the per-row cost.
+     The two USER-FACING predicates were fixed rather than measured --
+     pkg/project.IsAllMemberGroup and queryAllMemberGroupNo are now two
+     single-table reads with no cross-schema comparison, verified const/const --
+     because a full scan of `group` on every group exit is not a background cost.
+     The paged scans cannot be split that way and inherit P0/P1's pending
+     conversion; they are what this item is now about.
      Scan A drives from octo_project by id with a point lookup per row, and scan B
      from octo_project with the (p.id, pm.uid) row-constructor cursor -- the same
      shape P1 flagged as needing a real plan for queryI2Page, and for the same
@@ -1033,3 +1156,11 @@ open_verification:
      Still not decided here: it is a product call about which failure a user is
      walked into, and splitting the guard by action costs the property that all
      five answer identically. But it should be asked about transfer."
+  - "GATING: modules/project listMembers cannot execute under the production
+     collation shape at all -- its pre-existing `LEFT JOIN user u ON u.uid = pm.uid`
+     compares 0900_ai_ci (`user`) with pinned general_ci (octo_project_member) and
+     raises 1267. This is P0's join and rides the pending conversion, not this
+     change; it is listed here because it is D16's roster surface and becomes
+     user-visible the moment the feature switch flips. Either the conversion lands
+     or that join is pinned BEFORE project groups are enabled for real traffic.
+     PR #855's fifth review verified the 1267 by execution."

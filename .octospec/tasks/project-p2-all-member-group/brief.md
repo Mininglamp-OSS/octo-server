@@ -180,7 +180,10 @@ bot 在本 Space 有活跃 `space_member` 行、不在 `pkg/space.SystemBots` �
 对账驱动补建——对账只报不修是仓库纪律，且补建会写群表，对账 worker 不该持有写路径。
 
 **D5 — 全员群身份记录在项目侧：`octo_project.all_member_group_no VARCHAR(40) NOT NULL
-DEFAULT ''`，加普通索引。** 一个项目一个值，"有且仅有一个"由列本身保证，不需要在 `group` 表上
+DEFAULT ''`，加**一条**普通索引 `(status, all_member_group_no)`。**（本段原写"加普通索引"，
+实现时一度加了两条；第二条 `(all_member_group_no)` 在第四轮 review 时删掉了——把每条碰这
+一列的语句列一遍，没有任何一条单独按它过滤，那条索引服务不了任何查询，而它要付出一次
+非 INSTANT 的在线构建和每次写入多维护一棵 B+ 树。） 一个项目一个值，"有且仅有一个"由列本身保证，不需要在 `group` 表上
 做带 NULL 技巧的唯一索引；迁移放 `modules/project/sql`，因为只有 `modules/project` 写它。群侧
 要判断"这个群是不是全员群"时（D7），通过 `pkg/project` 新增的谓词
 `IsAllMemberGroup(session, spaceID, projectID, groupNo)` 查项目行，**只在 `group.project_id != ''`
@@ -204,7 +207,7 @@ detach 会按"群主离开"路径把群主移交给资深项目成员，是现�
 `DELETE|POST /:group_no/members(_delete)`、`POST /:group_no/transfer/:to_uid`、
 `POST /:group_no/blacklist/add`，仅当该群是全员群时拒绝，新错误码 `err.server.group.all_member_group_protected`（一个码，`details.action`
 区分动作）。**保护只加在 HTTP handler 层，不加在 `RemoveGroupMembers` 等服务层函数上**：
-P1 的 detach、Space 级联、botfather 删 bot、本期的四个钩子都走服务层，加在那里等于把 I2 的
+P1 的 detach、Space 级联、botfather 删 bot、本期的四类钩子都走服务层，加在那里等于把 I2 的
 级联一起挡掉。**手动加人不禁止**：加项目成员会被幂等吸收，加非项目成员会被 I2 拒绝，无需
 新规则。这是本期最大的一块新增限制，单独一个 PR（PR-C）。
 
@@ -345,7 +348,11 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
   列，放 `modules/project/sql`；`ADD COLUMN … NOT NULL DEFAULT ''` 在 MySQL 8.0 为 INSTANT；
   无 `group` 表变更。迁移文件注释不得出现撇号（P1 迁移文件记录的解析缺陷）。touches: `migration`
 - **反探测。** 分身校验失败一个码；`IsAllMemberGroup` 对非项目成员不暴露项目是否存在
-  （群侧四个接口在拒绝之前已经要求调用方是群成员，所以不新增探测面）。touches: `isolation`
+  （群侧五个接口里，转让/解散/拉黑在拒绝之前已经要求调用方是群主或管理员；**踢人和退群
+  这两条不是**——它们的守卫排在"读调用方的群成员身份"之前，退群那一处还是被
+  IMRemoveSubscriber 的位置逼出来的。所以泄露面不是零而是**有界**：一个非成员能读出
+  "这个群属于某个项目"，而"这个群存不存在"上游的 getGroupInfo 已经用 404 回答过了。
+  实现侧的注释按这个口径写，本行原来的"所以不新增探测面"是错的）。touches: `isolation`
 - **响应契约。** 项目 `Resp` 新增 `all_member_group_no`（空串表示尚未建成）、`agent_count`，
   `member_count` 语义改为只数人（D16，**既有字段语义变更**）；`MemberResp` 新增 `robot`、
   `owner_uid`；`Capabilities` 新增 `can_manage_own_agents`；`GroupResp` 及群详情新增
@@ -435,14 +442,14 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
 - [ ] 对全员群：群主 `disband` 被拒、任何成员 `exit` 被拒、`members` 删除被拒、
       `transfer` 被拒，码为 `err.server.group.all_member_group_protected`，
       `details.action ∈ {disband, exit, remove, transfer}`。
-- [ ] 对同一项目下用户手动建的项目群、以及任意 Space 直属群，这四个接口的响应与改动前
+- [ ] 对同一项目下用户手动建的项目群、以及任意 Space 直属群，这五个接口的响应与改动前
       **字节一致**（golden 断言）；Space 直属群路径上不多出任何查询（计数断言，C1 纪律），
       普通项目群最多多一次索引点查。
 - [ ] 服务层不受保护：P1 detach 把一个人从全员群移除、botfather 删 bot 把它从全员群移除，
       都仍然成功——用测试钉住，否则 D7 会挡掉 I2 的级联。
 - [ ] 手动向全员群加项目成员：幂等成功；加非项目成员：被 I2 以
       `err.server.group.project_member_required` 拒绝（既有行为，不新增码）。
-- [ ] 一个已被 P1 detach 成 Space 直属、但 `all_member_group_no` 仍指向它的群，四个接口
+- [ ] 一个已被 P1 detach 成 Space 直属、但 `all_member_group_no` 仍指向它的群，五个接口
       **不再**被拒（谓词要求 `group.project_id = 项目 id`）。
 
 **owner 与名称同步（D6 / D8）**
@@ -482,7 +489,7 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
    合并后：全员群存在，退出方向由 P1 + D13 维护，加入方向还没有。
 2. **PR-B 加入同步**：准入器 + `members/add` 后同步 + I4 扫描 B。合并后：I4 在没有人为破坏时
    成立。
-3. **PR-C 保护与同步**：D7 四个接口的拒绝 + D6 群主同步 + D8 改名同步。合并后：I4 在有人为
+3. **PR-C 保护与同步**：D7 五个接口的拒绝 + D6 群主同步 + D8 改名同步。合并后：I4 在有人为
    操作时也成立。
 4. **PR-D 透出**：群详情 / 群列表 `project_id`。与前三者无依赖，可并行。
 

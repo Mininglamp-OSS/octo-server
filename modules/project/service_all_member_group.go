@@ -75,11 +75,21 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 		return
 	}
 	if !ok {
-		// 租约在建群期间过期、别人接手并已经建成。刚建出来的这个群不是全员群，
-		// 它是一个普通项目群（group.project_id 已指向本项目，I2 照常约束它）。
-		// 记下来让它可查，由 I4 扫描 A 报出——不静默删除：删一个已经建好、已经
-		// 发出创建通知、已经有 IM 频道的群，比留着它更危险。
-		p.Warn("全员群写回落空：租约期间已有另一个群被登记为全员群，本次建出的群将作为普通项目群留存",
+		// 写回落空，三种情况，处置相同而**说法必须准确**：
+		//
+		//  1. 别人接手并已经登记了另一个群（指针非空）；
+		//  2. 别人只是**认领**了（租约被换成他的 deadline），指针还是空的，此刻
+		//     还没有任何群被登记 —— 围栏加上之后新增的这一种；
+		//  3. 项目在建群期间被解散（status 已不是 Normal），因此不在扫描 A 的
+		//     定义域里，报出它的是 I3 而不是 A。
+		//
+		// 上一版的文案只写了第 1 种并断言"由 I4 扫描 A 报出"，于是在另外两种情况下
+		// 把 on-call 指到错的地方。PR #855 第五轮 review。
+		//
+		// 无论哪一种，刚建出来的这个群都是一个普通项目群（group.project_id 已指向
+		// 本项目，I2 照常约束它）。不静默删除：删一个已经建好、已经发出创建通知、
+		// 已经有 IM 频道的群，比留着它更危险。
+		p.Warn("全员群写回落空（指针已被他人登记 / 租约已被他人认领 / 项目已解散），本次建出的群将作为普通项目群留存",
 			zap.String("projectId", projectID), zap.String("groupNo", groupNo))
 		observeAllMemberGroupProvisionFailure(reasonProvisionRaceLost)
 		return
@@ -190,6 +200,10 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
 	if len(roster) > maxMembers {
 		// 多读的那一行只是探针，不进群。
 		roster = roster[:maxMembers]
+		// 计数而不只是记日志：日志里的信号断言不了，于是它被静默删掉过一次
+		// （上一轮把 >= 改成 > 却没改 LIMIT），而变异测试证明它还能再被删一次。
+		// 见 allMemberGroupRosterTruncated 的注释。
+		observeAllMemberGroupRosterTruncated(reasonTruncatedOverMaxMembers)
 		p.Warn("补建全员群：项目活跃成员多于 max_members，名册被截断，超出的成员未带入新群（由 I4 扫描 B 报出）",
 			zap.String("projectId", projectID), zap.Int("maxMembers", maxMembers))
 	}

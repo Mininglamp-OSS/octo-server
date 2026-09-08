@@ -664,7 +664,9 @@ func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
 // failure signal on a disband rejection, so octo-server must self-check.
 // The raw lookup error is preserved for errors.Is classification. Callers stay
 // fail-closed and decide whether dbr.ErrNotFound is a business not-found result
-// or whether another error is an internal query failure.
+// or whether another error is an internal query failure. A missing group row IS
+// dbr.ErrNotFound — see queryGroupStatusAndProject for why that had to be
+// restored after being briefly collapsed into "status 0".
 func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
 	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
 	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
@@ -686,8 +688,28 @@ func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
 // its own lookup on every bot-driven member removal — including the Space-direct
 // ones, where the budget is zero. PR #855s fourth review, Q6.
 //
-// projectID is "" when the group row is missing, which reads as Space-direct and
-// short-circuits the guard — the same answer the guard reaches on its own.
+// # A missing group row is dbr.ErrNotFound, not "status 0"
+//
+// The first version of this function replaced isGroupDisbanded's LoadOne with a
+// Load and returned (0, "", nil) for a missing row. That silently rewrote the
+// contract of the whole bot send-permission surface, which was the point of
+// LoadOne: send.go's callers classify dbr.ErrNotFound into
+// errBotSendPermGroupNotFound and the sendPermissionReasonNotFound metric, whose
+// job is to separate "a bot is probing channel ids that do not exist" from "a
+// query failed" — and send_permission_observability.go gives it its own log
+// level. Reading a missing row as "not disbanded" made both unreachable through
+// the DB, removed the only existence check on the OBO send path (checkOBO
+// returns early with an enabled scope row and nothing downstream re-asks), and
+// left this module answering differently from modules/robot and modules/message,
+// which still use LoadOne on the same question.
+//
+// So the not-found signal is preserved and wrapped, and isGroupDisbanded
+// propagates it unchanged. Saving one query for a latency nit is not a reason to
+// loosen a fail-closed guard on the bot authorization path. PR #855s fifth review.
+//
+// projectID is "" for a group with no project (Space-direct), which short-circuits
+// the D7 guard — the two questions are independent, and collapsing them is what
+// lost the distinction.
 func (ba *BotAPI) queryGroupStatusAndProject(groupNo string) (int, string, error) {
 	// The status seam stays honoured: a stub that answers only status gets ""
 	// for project_id, which reads as Space-direct — the D7 guard then short-circuits
@@ -716,7 +738,9 @@ func (ba *BotAPI) queryGroupStatusAndProject(groupNo string) (int, string, error
 		return 0, "", fmt.Errorf("query group status: %w", err)
 	}
 	if len(rows) == 0 {
-		return 0, "", nil
+		// Wrapped, not bare, so a reader sees which lookup failed; errors.Is still
+		// matches, which is what every caller classifies on.
+		return 0, "", fmt.Errorf("query group status: %w", dbr.ErrNotFound)
 	}
 	return rows[0].Status, rows[0].ProjectID, nil
 }

@@ -153,7 +153,7 @@ binary.
 
 The claim also conflated two obstacles — an architectural rule that does not
 apply, and a missing WuKongIM broker in the dev environment, which is an
-environment gap. Eight end-to-end cases now run against the real implementation
+environment gap. A suite of end-to-end cases now runs against the real implementation
 and assert on actual `group` / `group_member` rows.
 
 ### A process-wide latest-wins registry needs snapshot/restore in tests
@@ -192,6 +192,46 @@ Decide **ownership** first (it is the only thing an ordinary member may act on),
 then the permission gate, and let the type-specific refusal become visible only
 to a caller who already passed it.
 
+### Arguing a predicate away is not the same as showing it cannot fire
+
+Scan B's banned-Space exemption was left out on the reasoning that no NEW gap can
+open during a ban — every add and removal is refused while the Space is banned, so
+nothing can go wrong that was not already wrong. That is true, and beside the
+point: the exemption is not there to stop gaps appearing, it is there to stop the
+gauge holding rows **nobody can act on**. A gap that predates the ban is still
+reported, and its only documented repair goes through the path the ban refuses.
+
+The more useful half is how the wrong answer was defended: with a test that opened
+a gap AFTER the ban and asserted it was still reported. That checks the scan still
+works. It does not check that what it reports is actionable, which was the whole
+question. When a reviewer asks for an exemption and the answer is "the state
+cannot arise", the test has to construct the state the exemption is about — not a
+neighbouring one.
+
+### The COLLATE rule had a second half nobody had written down
+
+The repo's rule is "put the explicit COLLATE on the driving side's values, so the
+driving table's indexes stay usable". True, and it hides what it costs: an explicit
+COLLATE has coercibility 0, so the COMPARISON is in that collation and the OTHER
+side must be converted per row — its index cannot serve it. In P0 and P1 that only
+touched background scans. P2 put the same shape on `pkg/project.IsAllMemberGroup`,
+which is the entire D7 guard, reached from six user-facing handlers: measured on
+MySQL 8.0.46 it planned as a full scan of `group` on every group exit.
+
+Two fixes were available and they are not equivalent. Moving the COLLATE to the
+legacy side restores the plan **today** and becomes silently wrong the moment the
+collation conversion lands, in the mirror direction. Splitting the join into two
+single-table reads has no cross-schema comparison at all, needs no collation
+opinion, and survives the conversion untouched. Where a join must stay — the paged
+reconcile scans — the honest move was to correct the comment that asserted a plan
+the production shape does not give, and leave the item in `open_verification`.
+
+CI cannot see any of this: the test database is created with `general_ci` on both
+sides, so every one of these plans is `const` there. The migration header P0 wrote
+says exactly that — *"a green suite is structurally not evidence"* — and it took a
+reviewer running EXPLAIN against a deliberately drifted database to make it
+concrete.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on
@@ -200,14 +240,13 @@ to a caller who already passed it.
   to be the invariant's witness. The documented operator action — re-add the
   member — is now actually wired: it used to be gated on the seat write having
   changed something, which is false precisely in the state the gauge reports.
-- **Scan B does not exempt banned Spaces**, though the brief listed it. P1's I2
-  scan needs that exemption because the Space cascade deliberately leaves those
-  seats alone and the group rows are *expected* to remain — that is the ⊆
-  direction. Scan B is ⊇, and the state it would suppress cannot arise: the
-  cascade leaves both sides alone, `removing = 1` already exempts the closing
-  case, and every path that could strip a group row without touching the seat is
-  now refused by D7. The exemption would be a `space` lookup per examined row that
-  can never fire.
+- **The all-member group's threads.** The admitter subscribes the new member to the
+  parent channel and, since the fifth review round, to the group's threads. Nothing
+  reconciles thread subscriptions: I4 scan B reads `group_member` rows, and a
+  member who is in the group but missing from a thread's subscriber list is
+  invisible to every scan here. The pairing is held by a source guard, not by a
+  behavioural test, for the same reason as the item below — the broker's subscriber
+  table cannot be read back.
 - **The all-member group's IM subscriber list is not asserted to equal its member
   set.** Nothing in octo-server or octo-lib can read a channel's subscribers back
   from the broker, so the equality is not assertable from a test. Same gap P1

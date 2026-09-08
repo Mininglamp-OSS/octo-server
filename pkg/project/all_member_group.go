@@ -33,6 +33,39 @@ const projectRoleOwner = 2
 // rebuild purposes (D4). Asking only the project side would keep protecting a
 // group the project no longer owns, and its members could never leave it.
 //
+// # No cross-schema comparison, and that is a performance requirement
+//
+// This used to be ONE statement joining `octo_project` to `group`, with an
+// explicit COLLATE so the comparison would not raise 1267 against production,
+// where `group` is utf8mb4_0900_ai_ci and octo_project is pinned general_ci. The
+// COLLATE was written on the octo_project side, with a comment saying that keeps
+// the octo_project indexes usable. True, and it hid the cost: an explicit COLLATE
+// has coercibility 0, so the COMPARISON is general_ci, and `group.group_no` must
+// then be converted per row — group_groupNo, its UNIQUE index, cannot serve it.
+//
+// Measured on MySQL 8.0.46 with `group` at 0900_ai_ci / 5000 rows:
+//
+//	joined form:  p const uk_octo_project_project_id 1 row
+//	              g ALL   possible_keys=group_groupNo  key=NULL  rows=5000
+//	split form:   p const uk_octo_project_project_id 1 row
+//	              g const group_groupNo               1 row
+//
+// This predicate is the WHOLE of the D7 guard, reached from six user-facing
+// handlers (group disband / exit / member removal / owner transfer / blacklist,
+// and the bot API member removal). A full scan of `group` — a core IM table — on
+// every group exit is not a background cost. Raised in PR #855's fifth review.
+//
+// Two statements rather than moving the COLLATE to the group side, because the
+// second option is right only until the collation conversion lands and then
+// silently wrong in the same way: naming 0900_ai_ci would, after conversion, force
+// the octo_project side to convert instead. A comparison that crosses no schemas
+// needs no collation opinion and survives the conversion untouched.
+//
+// Not atomic against a concurrent detach — and neither was the join: nothing here
+// takes a lock, so both forms answer from a snapshot that can be stale by the time
+// the caller acts on it. D7's guard tolerates that (its failure mode is a refusal
+// that should have been allowed, or the reverse, both of which the I4 scans see).
+//
 // # Callers MUST short-circuit on an empty projectID
 //
 // A Space-direct group carries the empty project_id sentinel and this predicate does not apply to
@@ -45,36 +78,30 @@ func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, er
 	if projectID == "" || groupNo == "" {
 		return false, nil
 	}
-	var count int
-	err := session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project` p "+
-			// The `group` side of the join carries the COLLATE: `group` is a legacy
-			// table with no declared collation (utf8mb4_0900_ai_ci in production)
-			// while octo_project is pinned to utf8mb4_general_ci, and an implicit
-			// comparison raises MySQL 1267 in production while passing in CI, whose
-			// database is created with general_ci. Written on the driving side's
-			// values so the octo_project indexes stay usable — the same rule P1's
-			// reconcile scans follow.
-			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
-			"WHERE p.project_id = ? AND p.status = 1 "+
-			"  AND p.all_member_group_no = ? "+
-			// A disbanded group is not the project's all-member group any more,
-			// and the two other predicates over this same fact —
-			// queryAllMemberGroupNo and I4 scan A — both say so. Leaving it out
-			// here made three readers of one fact answer with two different
-			// answers, which is the shape that already cost a review round
-			// (clearStaleAllMemberGroupPointer exists because the read side got
-			// stricter than the write side and nobody noticed until the rebuild
-			// silently stopped happening).
-			//
-			"  AND g.status <> ? "+
-			"  AND g.project_id = ? COLLATE utf8mb4_general_ci",
-		projectID, groupNo, GroupStatusDisband, projectID,
-	).LoadOne(&count)
-	if err != nil {
+	// Two single-table reads, not one join. See the "no cross-schema comparison"
+	// section above for the measurement.
+	var pointers []string
+	if _, err := session.SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ? AND status = 1",
+		projectID,
+	).Load(&pointers); err != nil {
 		return false, err
 	}
-	return count > 0, nil
+	if len(pointers) == 0 || pointers[0] != groupNo {
+		return false, nil
+	}
+	// The group side, on its own. `status <> disband` and `project_id = ?` are the
+	// second half of the predicate, and the reason they are required is in the doc
+	// comment: a group P1 detached to Space-direct is no longer the project's, and
+	// keeping it protected would leave its members unable to ever leave it.
+	var ok []int
+	if _, err := session.SelectBySql(
+		"SELECT 1 FROM `group` WHERE group_no = ? AND status <> ? AND project_id = ?",
+		groupNo, GroupStatusDisband, projectID,
+	).Load(&ok); err != nil {
+		return false, err
+	}
+	return len(ok) > 0, nil
 }
 
 // GroupStatusDisband mirrors modules/group.GroupStatusDisband.
