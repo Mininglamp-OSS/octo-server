@@ -131,7 +131,17 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	f := seedFixture(t)
 	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), `"items":[]`)
+	var emptyPage aiteammod.AgentPage
+	decodeJSON(t, w, &emptyPage)
+	require.Len(t, emptyPage.Groups, 3)
+	assert.Equal(t, aiteammod.AgentGroupTypeCloudClone, emptyPage.Groups[0].Type)
+	assert.Equal(t, aiteammod.AgentGroupTypePersonalAssistant, emptyPage.Groups[1].Type)
+	assert.Equal(t, aiteammod.AgentGroupTypeDigitalEmployee, emptyPage.Groups[2].Type)
+	for _, group := range emptyPage.Groups {
+		assert.Zero(t, group.Count)
+		assert.NotNil(t, group.Items)
+		assert.Empty(t, group.Items)
+	}
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -274,6 +284,90 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	mu.Unlock()
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.GroupNo])
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.ChannelID])
+}
+
+func TestAITeamListAgentsGroupsByHostingAndKeepsCursorTotals(t *testing.T) {
+	f := seedFixture(t)
+	_, err := testContext.DB().Update("robot").Set("agent_hosting", "octo_hosted").
+		Where("robot_id=?", f.botID).Exec()
+	require.NoError(t, err)
+	require.NoError(t, insertAgentForListTest(f, f.botID))
+
+	type botSpec struct {
+		suffix  string
+		hosting string
+	}
+	botIDs := make(map[string]string)
+	for _, spec := range []botSpec{
+		{suffix: "self", hosting: "self_hosted"},
+		{suffix: "vendor", hosting: "vendor_hosted"},
+		{suffix: "empty", hosting: ""},
+		{suffix: "cloud", hosting: "octo_hosted"},
+	} {
+		botID := "ai_" + spec.suffix + "_" + util.GenerUUID()[:8]
+		botIDs[spec.suffix] = botID
+		_, err = testContext.DB().InsertBySql(
+			"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)",
+			botID, spec.suffix, botID).Exec()
+		require.NoError(t, err)
+		_, err = testContext.DB().InsertBySql(
+			"INSERT INTO robot (robot_id,creator_uid,status,agent_hosting) VALUES (?,?,1,?)",
+			botID, f.uid, spec.hosting).Exec()
+		require.NoError(t, err)
+		_, err = testContext.DB().InsertBySql(
+			"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, botID).Exec()
+		require.NoError(t, err)
+		require.NoError(t, insertAgentForListTest(f, botID))
+	}
+
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents?limit=3", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "agent_hosting", "hosting is classification input, not a new wire field")
+	var first aiteammod.AgentPage
+	decodeJSON(t, w, &first)
+	assertAgentGroupShape(t, first.Groups, 2, 3)
+	require.NotEmpty(t, first.NextCursor)
+	assert.Equal(t, []string{botIDs["cloud"]}, agentBotIDs(first.Groups[0].Items))
+	assert.Equal(t, []string{botIDs["empty"], botIDs["vendor"]}, agentBotIDs(first.Groups[1].Items))
+
+	w = request(t, f, http.MethodGet, "/v1/ai-team/agents?limit=3&cursor="+first.NextCursor, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var second aiteammod.AgentPage
+	decodeJSON(t, w, &second)
+	assertAgentGroupShape(t, second.Groups, 2, 3)
+	assert.Empty(t, second.NextCursor)
+	assert.Equal(t, []string{f.botID}, agentBotIDs(second.Groups[0].Items))
+	assert.Equal(t, []string{botIDs["self"]}, agentBotIDs(second.Groups[1].Items))
+}
+
+func insertAgentForListTest(f fixture, botID string) error {
+	_, err := testContext.DB().InsertBySql(
+		"INSERT INTO ai_team_agent (space_id,user_uid,bot_id,is_added) VALUES (?,?,?,1)",
+		f.spaceID, f.uid, botID).Exec()
+	return err
+}
+
+func assertAgentGroupShape(t *testing.T, groups []*aiteammod.AgentGroup, cloudCount, personalCount int64) {
+	t.Helper()
+	require.Len(t, groups, 3)
+	assert.Equal(t, aiteammod.AgentGroupTypeCloudClone, groups[0].Type)
+	assert.Equal(t, cloudCount, groups[0].Count)
+	assert.NotNil(t, groups[0].Items)
+	assert.Equal(t, aiteammod.AgentGroupTypePersonalAssistant, groups[1].Type)
+	assert.Equal(t, personalCount, groups[1].Count)
+	assert.NotNil(t, groups[1].Items)
+	assert.Equal(t, aiteammod.AgentGroupTypeDigitalEmployee, groups[2].Type)
+	assert.Zero(t, groups[2].Count)
+	assert.NotNil(t, groups[2].Items)
+	assert.Empty(t, groups[2].Items)
+}
+
+func agentBotIDs(agents []*aiteammod.Agent) []string {
+	botIDs := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		botIDs = append(botIDs, agent.BotID)
+	}
+	return botIDs
 }
 
 func TestAITeamConcurrentInitializationUsesOneParent(t *testing.T) {
@@ -560,7 +654,7 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	// deliberate: a same-collation CI database cannot catch MySQL error 1267.
 	for _, ddl := range []string{
 		`CREATE TABLE system_setting (category VARCHAR(64), key_name VARCHAR(128), value TEXT, value_type VARCHAR(16), description VARCHAR(255), UNIQUE KEY uk_category_key(category,key_name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		`CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status TINYINT, KEY idx_robot_creator(creator_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		`CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status TINYINT, agent_hosting VARCHAR(64) NOT NULL DEFAULT '', KEY idx_robot_creator(creator_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(100), status TINYINT, is_destroy TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status TINYINT, UNIQUE KEY uk_space_member(space_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
@@ -607,7 +701,8 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	assert.Equal(t, "parent", agent.GroupNo)
 	agents, err := svc.ListAgents("space", "human", 0, 20)
 	require.NoError(t, err)
-	require.Len(t, agents.Items, 1)
+	require.Len(t, agents.Groups, 3)
+	require.Len(t, agents.Groups[1].Items, 1)
 	gotSession, err := svc.GetSession("space", "human", "session")
 	require.NoError(t, err)
 	assert.Equal(t, "parent____session", gotSession.ChannelID)

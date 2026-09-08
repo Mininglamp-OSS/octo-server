@@ -1,0 +1,783 @@
+swagger: "2.0"
+
+info:
+  title: "Octo AI Team API"
+  version: "1.0.0"
+
+basePath: "/v1"
+
+host: "10.33.77.127:8091"
+
+schemes:
+  - http
+
+produces:
+  - application/json
+
+tags:
+  - name: ai-team
+    description: AI 团队
+
+securityDefinitions:
+  token:
+    type: apiKey
+    in: header
+    name: token
+
+paths:
+  /ai-team/agents:
+    get:
+      tags:
+        - ai-team
+      operationId: listAITeamAgents
+      summary: 获取 AI 团队成员列表
+      description: |
+        返回固定顺序的三个分组：
+
+        1. `cloud_clone`：云端分身
+        2. `personal_assistant`：个人助理
+        3. `digital_employee`：数字员工
+
+        分类规则：
+
+        - `agent_hosting=octo_hosted` → `cloud_clone`
+        - `agent_hosting=self_hosted` → `personal_assistant`
+        - 未上报或其他值 → `personal_assistant`
+        - `digital_employee` 预留给 App Bot，当前固定返回空数组
+
+        `agent_hosting` 仅用于展示分类，不会返回给客户端，也不参与鉴权。
+
+        每个分组的 `count` 是分页前的总数，`items` 仅包含当前 cursor
+        分页中的成员。分页顺序为 AI Team Agent ID 倒序，三个分组共享
+        同一个 cursor。
+      security:
+        - token: []
+      parameters:
+        - name: X-Space-ID
+          in: header
+          required: true
+          type: string
+          description: 当前 Space ID
+        - name: cursor
+          in: query
+          required: false
+          type: string
+          description: 上一页返回的 next_cursor
+        - name: limit
+          in: query
+          required: false
+          type: integer
+          default: 20
+          maximum: 100
+          description: 每页总成员数，不是每个分组的数量
+      responses:
+        200:
+          description: 获取成功
+          schema:
+            $ref: "#/definitions/AITeamAgentPage"
+          examples:
+            application/json:
+              groups:
+                - type: cloud_clone
+                  count: 1
+                  items:
+                    - space_id: space_001
+                      user_uid: user_001
+                      bot_id: bot_cloud
+                      bot_name: 云端助手
+                      is_added: 1
+                      container_state: 2
+                      session_count: 3
+                      created_at: "2026-09-08T10:00:00+08:00"
+                      updated_at: "2026-09-08T10:00:00+08:00"
+                - type: personal_assistant
+                  count: 1
+                  items:
+                    - space_id: space_001
+                      user_uid: user_001
+                      bot_id: bot_personal
+                      bot_name: 个人助理
+                      is_added: 1
+                      container_state: 0
+                      session_count: 0
+                      created_at: "2026-09-08T10:00:00+08:00"
+                      updated_at: "2026-09-08T10:00:00+08:00"
+                - type: digital_employee
+                  count: 0
+                  items: []
+              next_cursor: "123"
+        400:
+          description: Space ID 或请求参数无效
+          schema:
+            $ref: "#/definitions/AITeamErrorResponse"
+        401:
+          description: 未登录或 token 无效
+          schema:
+            $ref: "#/definitions/AITeamErrorResponse"
+        403:
+          description: AI Team 功能已关闭或当前用户无权访问
+          schema:
+            $ref: "#/definitions/AITeamErrorResponse"
+        429:
+          description: 请求频率超限
+          schema:
+            $ref: "#/definitions/AITeamErrorResponse"
+        500:
+          description: 查询失败
+          schema:
+            $ref: "#/definitions/AITeamErrorResponse"
+
+  /ai-team/agents/{bot_id}:
+    post:
+      tags:
+        - ai-team
+      operationId: addAITeamAgent
+      summary: 添加 AI 团队成员
+      description: |
+        将当前用户创建的 User Bot 添加到当前 Space 的 AI 团队。
+        Bot 必须处于启用状态，且用户和 Bot 都必须是当前 Space 的有效成员。
+        此操作不会立即创建会话容器群；首次创建 Session 时才会按需创建。
+        重复添加是幂等的，并会恢复之前已移除的成员。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamBotID"
+      responses:
+        200:
+          description: 添加成功
+          schema:
+            $ref: "#/definitions/AITeamAgent"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+    delete:
+      tags:
+        - ai-team
+      operationId: removeAITeamAgent
+      summary: 移除 AI 团队成员
+      description: |
+        将 User Bot 从 AI 团队选择器和列表中移除。
+        已创建的 Session 和消息历史不会被删除，仍可通过已有 Session ID 访问。
+        后续可再次调用添加接口恢复该成员。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamBotID"
+      responses:
+        200:
+          description: 移除成功
+          schema:
+            $ref: "#/definitions/AITeamOK"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+  /ai-team/agents/{bot_id}/sessions:
+    get:
+      tags:
+        - ai-team
+      operationId: listAITeamSessions
+      summary: 获取指定 AI 的会话列表
+      description: |
+        返回指定 AI 的可用 Session。AI 必须仍处于已添加状态。
+
+        排序规则：置顶优先，其次按最后消息时间或创建时间倒序。
+        默认仅返回活跃会话；可通过 `status` 查询已归档会话。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamBotID"
+        - name: status
+          in: query
+          required: false
+          type: string
+          enum: [active, archived, all]
+          default: active
+          description: "active=活跃，archived=已归档，all=活跃和已归档"
+        - name: page_index
+          in: query
+          required: false
+          type: integer
+          minimum: 1
+          default: 1
+        - name: page_size
+          in: query
+          required: false
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+      responses:
+        200:
+          description: 获取成功
+          schema:
+            $ref: "#/definitions/AITeamSessionPage"
+        400:
+          $ref: "#/responses/AITeamBadRequest"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+    post:
+      tags:
+        - ai-team
+      operationId: createAITeamSession
+      summary: 创建 AI 会话
+      description: |
+        为指定 AI 创建一个 Session。首次创建时会同时创建仅包含当前用户和该 Bot
+        的受保护会话容器群，并在 WuKongIM 创建父群及 Session 频道。
+
+        `Idempotency-Key` 必填。同一个 key 与相同请求体重复提交时返回同一个 Session；
+        同一个 key 配合不同名称时返回 409。请求体可省略，名称默认使用“新对话”。
+      security:
+        - token: []
+      consumes:
+        - application/json
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamBotID"
+        - $ref: "#/parameters/AITeamIdempotencyKey"
+        - name: body
+          in: body
+          required: false
+          schema:
+            $ref: "#/definitions/AITeamCreateSessionRequest"
+      responses:
+        200:
+          description: 创建成功或幂等重放成功
+          schema:
+            $ref: "#/definitions/AITeamSession"
+        400:
+          $ref: "#/responses/AITeamBadRequest"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        409:
+          $ref: "#/responses/AITeamIdempotencyConflict"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+        503:
+          $ref: "#/responses/AITeamIMUnavailable"
+
+  /ai-team/sessions/{short_id}:
+    get:
+      tags:
+        - ai-team
+      operationId: getAITeamSession
+      summary: 获取 AI 会话详情
+      description: |
+        获取当前用户拥有的已就绪 Session。即使 AI 已从团队列表移除，已有 Session
+        仍可继续访问；Bot、用户及双方 Space 席位必须保持有效。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamShortID"
+      responses:
+        200:
+          description: 获取成功
+          schema:
+            $ref: "#/definitions/AITeamSession"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+    put:
+      tags:
+        - ai-team
+      operationId: renameAITeamSession
+      summary: 重命名 AI 会话
+      description: 重命名后会将 Session 标记为手工标题，后续不再作为自动标题处理。
+      security:
+        - token: []
+      consumes:
+        - application/json
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamShortID"
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/AITeamRenameSessionRequest"
+      responses:
+        200:
+          description: 重命名成功
+          schema:
+            $ref: "#/definitions/AITeamOK"
+        400:
+          $ref: "#/responses/AITeamBadRequest"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+    delete:
+      tags:
+        - ai-team
+      operationId: deleteAITeamSession
+      summary: 删除 AI 会话
+      description: |
+        对底层 Thread 执行软删除并禁用对应 WuKongIM 频道。
+        消息历史不会物理删除；删除后该 Session 不再出现在列表或详情中。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamShortID"
+      responses:
+        200:
+          description: 删除成功
+          schema:
+            $ref: "#/definitions/AITeamOK"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+  /ai-team/sessions/{short_id}/setting:
+    put:
+      tags:
+        - ai-team
+      operationId: updateAITeamSessionSetting
+      summary: 更新 AI 会话个人设置
+      description: 当前仅支持设置当前用户对该 Session 的免打扰状态。
+      security:
+        - token: []
+      consumes:
+        - application/json
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamShortID"
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/AITeamSessionSettingRequest"
+      responses:
+        200:
+          description: 更新成功
+          schema:
+            $ref: "#/definitions/AITeamOK"
+        400:
+          $ref: "#/responses/AITeamBadRequest"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+  /ai-team/sessions/{short_id}/archive:
+    post:
+      tags:
+        - ai-team
+      operationId: archiveAITeamSession
+      summary: 归档 AI 会话
+      description: 将活跃 Session 归档。归档后的 Session 可通过 status=archived 查询。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamShortID"
+      responses:
+        200:
+          description: 归档成功
+          schema:
+            $ref: "#/definitions/AITeamOK"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+  /ai-team/sessions/{short_id}/unarchive:
+    post:
+      tags:
+        - ai-team
+      operationId: unarchiveAITeamSession
+      summary: 取消归档 AI 会话
+      description: 将已归档 Session 恢复为活跃状态。
+      security:
+        - token: []
+      parameters:
+        - $ref: "#/parameters/AITeamSpaceID"
+        - $ref: "#/parameters/AITeamShortID"
+      responses:
+        200:
+          description: 取消归档成功
+          schema:
+            $ref: "#/definitions/AITeamOK"
+        401:
+          $ref: "#/responses/AITeamUnauthorized"
+        403:
+          $ref: "#/responses/AITeamForbidden"
+        404:
+          $ref: "#/responses/AITeamNotFound"
+        429:
+          $ref: "#/responses/AITeamRateLimited"
+        500:
+          $ref: "#/responses/AITeamStoreFailed"
+
+parameters:
+  AITeamSpaceID:
+    name: X-Space-ID
+    in: header
+    required: true
+    type: string
+    description: 当前 Space ID。也可通过同名 `space_id` query 参数传递。
+
+  AITeamBotID:
+    name: bot_id
+    in: path
+    required: true
+    type: string
+    description: 当前用户创建的 User Bot ID
+
+  AITeamShortID:
+    name: short_id
+    in: path
+    required: true
+    type: string
+    description: AI Session ID，对应底层 Thread short_id
+
+  AITeamIdempotencyKey:
+    name: Idempotency-Key
+    in: header
+    required: true
+    type: string
+    maxLength: 128
+    description: 创建 Session 的幂等键，同一个 Bot 下不可复用于不同请求内容
+
+responses:
+  AITeamBadRequest:
+    description: 请求参数无效
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamUnauthorized:
+    description: 未登录或 token 无效
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamForbidden:
+    description: AI Team 功能已关闭，或当前用户无权执行该操作
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamNotFound:
+    description: AI Team 成员或 Session 不存在
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamIdempotencyConflict:
+    description: Idempotency-Key 已用于不同请求，或对应 Session 已删除
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamRateLimited:
+    description: 当前用户请求频率超限
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamStoreFailed:
+    description: 服务端存储或查询失败
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+  AITeamIMUnavailable:
+    description: WuKongIM 频道初始化失败，请使用相同 Idempotency-Key 重试
+    schema:
+      $ref: "#/definitions/AITeamErrorResponse"
+
+definitions:
+  AITeamAgentPage:
+    type: object
+    required:
+      - groups
+    properties:
+      groups:
+        type: array
+        minItems: 3
+        maxItems: 3
+        description: 固定包含三个分组，顺序不变
+        items:
+          $ref: "#/definitions/AITeamAgentGroup"
+      next_cursor:
+        type: string
+        description: 下一页 cursor；没有下一页时不返回
+
+  AITeamAgentGroup:
+    type: object
+    required:
+      - type
+      - count
+      - items
+    properties:
+      type:
+        type: string
+        enum:
+          - cloud_clone
+          - personal_assistant
+          - digital_employee
+      count:
+        type: integer
+        format: int64
+        minimum: 0
+        description: 当前分组分页前的成员总数
+      items:
+        type: array
+        description: 当前 cursor 页中属于该分组的成员，空分组返回 []
+        items:
+          $ref: "#/definitions/AITeamAgent"
+
+  AITeamAgent:
+    type: object
+    required:
+      - space_id
+      - user_uid
+      - bot_id
+      - bot_name
+      - is_added
+      - container_state
+      - session_count
+      - created_at
+      - updated_at
+    properties:
+      space_id:
+        type: string
+      user_uid:
+        type: string
+      bot_id:
+        type: string
+      bot_name:
+        type: string
+      group_no:
+        type: string
+        description: AI 会话容器群编号；尚未创建会话时不返回
+      is_added:
+        type: integer
+        enum: [1]
+      container_state:
+        type: integer
+        enum: [0, 1, 2, 3]
+        description: "0=未创建，1=创建中，2=就绪，3=失败"
+      session_count:
+        type: integer
+        format: int64
+        minimum: 0
+      created_at:
+        type: string
+        format: date-time
+      updated_at:
+        type: string
+        format: date-time
+
+  AITeamSessionPage:
+    type: object
+    required:
+      - items
+      - page_index
+      - page_size
+      - has_more
+    properties:
+      items:
+        type: array
+        description: 当前页 Session，空结果返回 []
+        items:
+          $ref: "#/definitions/AITeamSession"
+      page_index:
+        type: integer
+        minimum: 1
+      page_size:
+        type: integer
+        minimum: 1
+        maximum: 100
+      has_more:
+        type: boolean
+        description: 是否还有下一页
+
+  AITeamSession:
+    type: object
+    required:
+      - session_id
+      - group_no
+      - channel_id
+      - name
+      - status
+      - message_count
+      - created_at
+      - updated_at
+      - state
+      - manual_title
+      - mute
+      - is_pinned
+    properties:
+      session_id:
+        type: string
+        description: Session ID，对应底层 Thread short_id
+      group_no:
+        type: string
+        description: 该 AI 专属的受保护会话容器群编号
+      channel_id:
+        type: string
+        description: "WuKongIM 子区频道 ID，格式为 {group_no}____{session_id}"
+      name:
+        type: string
+        maxLength: 100
+      status:
+        type: integer
+        enum: [1, 2]
+        description: "底层 Thread 状态：1=活跃，2=已归档"
+      message_count:
+        type: integer
+        format: int64
+        minimum: 0
+      last_message_content:
+        type: string
+        description: 最后一条消息摘要；没有消息时不返回
+      last_message_at:
+        type: string
+        format: date-time
+        description: 最后一条消息时间；没有消息时不返回
+      created_at:
+        type: string
+        format: date-time
+      updated_at:
+        type: string
+        format: date-time
+      state:
+        type: integer
+        enum: [2]
+        description: 返回给客户端的 Session 已完成初始化，固定为 2（ready）
+      manual_title:
+        type: integer
+        enum: [0, 1]
+        description: "0=默认或自动标题，1=用户已手工命名"
+      mute:
+        type: integer
+        enum: [0, 1]
+        description: "当前用户免打扰设置：0=关闭，1=开启"
+      is_pinned:
+        type: boolean
+        description: 当前用户是否已通过通用频道置顶接口置顶该 Session
+
+  AITeamCreateSessionRequest:
+    type: object
+    properties:
+      name:
+        type: string
+        maxLength: 100
+        default: 新对话
+        description: Session 名称；缺省或去除首尾空格后为空时使用“新对话”
+
+  AITeamRenameSessionRequest:
+    type: object
+    required:
+      - name
+    properties:
+      name:
+        type: string
+        minLength: 1
+        maxLength: 100
+        description: 新名称，服务端会去除首尾空格
+
+  AITeamSessionSettingRequest:
+    type: object
+    required:
+      - mute
+    properties:
+      mute:
+        type: integer
+        enum: [0, 1]
+        description: "0=关闭免打扰，1=开启免打扰"
+
+  AITeamOK:
+    type: object
+    required:
+      - ok
+    properties:
+      ok:
+        type: boolean
+        enum: [true]
+
+  AITeamErrorDetail:
+    type: object
+    required:
+      - code
+      - message
+      - details
+      - http_status
+    properties:
+      code:
+        type: string
+      message:
+        type: string
+      details:
+        type: object
+        additionalProperties: true
+      http_status:
+        type: integer
+
+  AITeamErrorResponse:
+    type: object
+    required:
+      - error
+      - msg
+      - status
+    properties:
+      error:
+        $ref: "#/definitions/AITeamErrorDetail"
+      msg:
+        type: string
+      status:
+        type: integer

@@ -17,6 +17,14 @@ const (
 	maxIdempotencyKey = 128
 )
 
+type AgentGroupType string
+
+const (
+	AgentGroupTypeCloudClone        AgentGroupType = "cloud_clone"
+	AgentGroupTypePersonalAssistant AgentGroupType = "personal_assistant"
+	AgentGroupTypeDigitalEmployee   AgentGroupType = "digital_employee"
+)
+
 type Agent struct {
 	ID             int64     `db:"id" json:"-"`
 	SpaceID        string    `db:"space_id" json:"space_id"`
@@ -29,6 +37,7 @@ type Agent struct {
 	SessionCount   int64     `db:"session_count" json:"session_count"`
 	CreatedAt      time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`
+	AgentHosting   string    `db:"agent_hosting" json:"-"`
 }
 
 type Session struct {
@@ -58,7 +67,13 @@ type SessionPage struct {
 	HasMore   bool       `json:"has_more"`
 }
 
+type AgentGroup struct {
+	Type  AgentGroupType `json:"type"`
+	Count int64          `json:"count"`
+	Items []*Agent       `json:"items"`
+}
+
 type AgentPage struct {
-	Items      []*Agent `json:"items"`
-	NextCursor string   `json:"next_cursor,omitempty"`
+	Groups     []*AgentGroup `json:"groups"`
+	NextCursor string        `json:"next_cursor,omitempty"`
 }
