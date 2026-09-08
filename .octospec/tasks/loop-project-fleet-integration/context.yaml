@@ -59,13 +59,18 @@ injected_rules:
     source: repo
     load_bearing: false
     why: >
-      MySQL/Redis were unavailable in this environment, so the design puts a
-      membershipStore seam between the handlers and pkg/project — the same shape
-      modules/internal_resolve uses for identityResolver. That makes every
-      answer-shape and fail-closed assertion runnable with no infrastructure
-      rather than deferred to an integration suite. Ordering and predicate
-      properties that cannot be observed single-threaded are held by source
-      guards, following TestMemberEpochOnlyEverIncrements.
+      The design puts a membershipStore seam between the handlers and
+      pkg/project — the same shape modules/internal_resolve uses for
+      identityResolver — so every answer-shape and fail-closed assertion runs
+      with no infrastructure rather than being deferred to an integration suite.
+      Ordering and predicate properties that cannot be observed single-threaded
+      are held by source guards, following TestMemberEpochOnlyEverIncrements.
+      A real MySQL/Redis/WuKongIM stack became available later in the increment,
+      so the review fixes are covered against the ENGINE as well: the epoch
+      repair, the migration backfill statement, and both pkg/project predicates
+      (which had no engine coverage in any lane) now run against real rows from
+      modules/project. Stub-only coverage was what let the P1 sentinel collision
+      through — a fake store agreed with itself about the epoch.
   - id: commit-style
     source: repo
     load_bearing: false
@@ -84,14 +89,18 @@ decisions:
   - id: C3
     status: decided
     what: projects gain an archivable, restorable state.
-    impact_on_this_increment: none
+    impact_on_this_increment: conditional
     note: >
-      The epoch predicate is `status = 1`, so any archived state — being some
-      value other than 1 — already reads as epoch 0 without further change. That
-      is the wanted behaviour: epochs is the backstop for a lost or delayed
-      lifecycle event, so a missed archive still converges within the consumer's
-      cache window. The cost is that the consumer reports an epoch mismatch
-      rather than "archived"; the archived state itself travels by event.
+      DEPENDS ON HOW ARCHIVE IS MODELLED, and this increment does not decide it.
+      If archive is a distinct `status` value, the existing `status = 1`
+      predicate already folds it into epoch 0 with no change here. If it is a
+      separate `archived_at` column beside `status = 1` — the shape O1b drafted
+      and then retracted — the predicate needs an explicit `archived_at IS NULL`
+      and does NOT come for free. The earlier note asserted the first reading
+      unconditionally; it is recorded as conditional until O1 lands the column.
+      Either way epochs is the backstop for a lost or delayed lifecycle event:
+      the consumer sees an epoch mismatch rather than "archived", and the
+      archived state itself travels by event.
   - id: C2
     status: contract-only
     note: No code change. Consumers must read context_error, not context_included.
@@ -114,16 +123,75 @@ review_fixes:
       Confirmed empirically against MySQL, not inferred: a newly created project
       reads member_epoch=0, status=1, active_members=1.
     decision: >
-      Fixed at the source rather than on the wire — new projects insert
-      member_epoch=1 and a migration bumps existing zero rows. That is the only
-      option requiring no change from the consumer: the frozen numeric contract
-      stays exactly as written, and 0 becomes a value no real project can hold.
-      A null or negative sentinel would change the contract, and null
-      unmarshals to 0 in Go, which is the same collision on the other side.
+      Fixed at the source rather than on the wire — creation BUMPS the epoch
+      through the shared bumpMemberEpochTx, and a migration increments existing
+      zero rows. That is the only option requiring no change from the consumer:
+      the frozen numeric contract stays exactly as written. A null or negative
+      sentinel would change the contract, and null unmarshals to 0 in Go, which
+      is the same collision on the other side.
+      NOTE the mechanism: the first attempt SEEDED member_epoch in the insert
+      column list and was rejected by TestIsOfficialHasNoWriter, which pins that
+      the column may only ever be written as `member_epoch + 1`. Satisfying the
+      guard produced the better fix — creation writes the owner seat, which IS a
+      membership write. Recorded because this file described the rejected shape
+      for a round.
     touches: >
-      modules/project (insert column list, create path, one migration). This
-      gives up the property that the PR touched no modules/project files, which
-      is a scheduling cost against PR #850 rather than a correctness one.
+      modules/project (create path, reconcile scan, one migration). This gives
+      up the property that the PR touched no modules/project files, which is a
+      scheduling cost against PR #850 rather than a correctness one.
+  - id: P1b
+    finding: >
+      The epoch>=1 invariant that P1's fix rests on was enforced at ONE INSTANT:
+      the create-path bump covers only new binaries, and the backfill runs once
+      per deployment and is recorded in the migration ledger. A rolling deploy
+      keeps old pods inserting at the column default after the backfill has run,
+      and the migration Down section told operators "rolling back the binary is
+      enough" — true for readers, false for writers, since rollback restores the
+      zero-inserting create path indefinitely while the ledger prevents a
+      re-run. Nothing detected either: scanEpochSanity did not select status.
+    decision: >
+      Enforced continuously instead. The scheduled scan now reports
+      `status = 1 AND member_epoch = 0` as an anomaly and repairs it with the
+      same increment-only statement, whose own WHERE clause is its
+      compare-and-swap so no cross-pod lease is needed. The three artifacts that
+      claimed 0 was unreachable (endpoint doc, migration comment, journal) now
+      state which of the three writers enforces what.
+    touches: modules/project (reconcile.go, db.go), docs/project-member-epoch-rollout.md
+  - id: P1c
+    finding: >
+      ProjectMemberships answered from the project seat alone. The Space to
+      project cascade is asynchronous and its cleanup gives up after a retry cap
+      with the row kept but never re-claimed, so a user removed from a Space
+      kept a seat that read as an active membership for an unbounded window —
+      and the epoch does not move while the seat is untouched, so the consumer
+      staleness check agreed with the stale positive.
+    decision: >
+      The Space half is conjoined server-side, through space.ActiveMembers so it
+      cannot drift from CheckMembership, and read AFTER the seats because that
+      read can only narrow the answer. Server-side rather than by consumer
+      obligation: this consumer asks about a THIRD party whose token it does not
+      hold, and no endpoint here answers "is uid X in Space S" for someone else,
+      so the documented "layer your Space check on top" is advice it cannot act
+      on. MembershipsInSpace is unchanged — it answers for the caller own token
+      holder behind SpaceMiddleware.
+    open: >
+      FRESH answers only. A grant cached BEFORE the removal still rides epoch
+      agreement. Closing it needs either an epoch bump at Space-removal commit
+      time (the O5/O7 event slice) or a hard TTL in the peer contract that does
+      not depend on epoch agreement.
+    touches: pkg/project/membership.go
+  - id: P1d
+    finding: >
+      decodeVerifyRequest rejected trailing content with a second
+      decoder.Decode, which cannot return without reading another byte off the
+      socket. A peer or proxy that stalls after a complete object parked the
+      handler indefinitely — MaxBytesReader bounds bytes, not time, and the
+      route is served by a zero-value http.Server.
+    decision: >
+      Switched to the shape this repository already adjudicated in PR #837 and
+      settled on in modules/bot_task: inspect decoder.Buffered, which cannot
+      wait on the socket. Strictness against trailing content is unchanged.
+    touches: modules/internal_membership/api.go
 
 deviations:
   - what: 401 for an unset token, not 503.
@@ -152,6 +220,45 @@ deviations:
       rollout decision, not something to change while adding a capability. The
       check now logs the colliding env NAMES at error level, which adds the
       missing visibility without changing behaviour.
+  - what: >
+      The verify endpoint REJECTS duplicate uids rather than deduplicating them,
+      and rejects identifiers carrying surrounding whitespace.
+    why: >
+      Its answers are an ARRAY, so a repeated uid would produce a repeated or
+      missing answer a consumer could mis-pair; the epochs endpoint answers a
+      MAP and therefore dedupes instead. Padded ids are rejected for the same
+      reason: trimming would answer under a different key than the caller asked
+      about, and the response echoes project_id and every uid back. Both are
+      STRICTER than the integration document, which says "dedupe" — recorded
+      because Fleet implements against that word, and the contract has to be
+      aligned before it does. Fail-closed either way.
+  - what: >
+      The module-local token-collision refusal lists cover main.go registry in
+      full, while the older modules (notify, bot_mention, internal_resolve)
+      remain asymmetric.
+    why: >
+      Widening those is a change to those modules, not to this capability. The
+      two lists this PR owns or pairs with are complete and pinned by
+      TestModuleLocalRefusalsCoverTheCentralRegistry; the asymmetry elsewhere is
+      the documented pre-existing norm.
+  - what: >
+      The strict IP bucket is consumed BEFORE the token check, so it is spent by
+      whoever shares the peer observed source IP rather than by the credential
+      holder.
+    why: >
+      Pre-auth is deliberate — otherwise token probing aborts before consuming
+      the strict bucket and falls back to the far wider global one. The cost is
+      that a co-located unauthenticated actor can drain the burst and cause the
+      deny-end-users outcome the loose sizing exists to avoid. The fix is a
+      second, credential-scoped quota AFTER auth, which needs a per-consumer
+      identity the current one-shared-token contract does not have. Recorded in
+      config.go beside the sizing rationale.
+  - what: >
+      role is reported without a paired capabilities field.
+    why: >
+      Role encoding (0/1/2) is agreed by both integration documents; a
+      capability list is not, and inventing one here would freeze a vocabulary
+      the peer has not agreed to. Open for contract review with C5.
 
 security_notes:
   - Tests and fixtures use synthetic UIDs, Space IDs and Project IDs only.
@@ -169,6 +276,10 @@ increment:
   implemented: [O2, O3]
   deferred:
     - id: O1
-      reason: schema — unblocked by the C1/C3 decisions, not yet started.
+      reason: >
+        schema — unblocked by the C1/C3 decisions. Drafted on a separate branch
+        and NOT in this increment; the one schema-adjacent artifact that did
+        land here is the member_epoch backfill migration, which is a data fix
+        for the P1 blocker rather than part of O1.
     - id: O4-O7
       reason: outbound event chain — depends on O1.

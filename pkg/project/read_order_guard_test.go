@@ -149,10 +149,16 @@ func funcSourceBody(t *testing.T, name string) string {
 }
 
 // TestProjectEpochsExcludesInactiveProjects pins that the epoch query filters on
-// status. This is what makes disband (and any future archived state, which is
-// also not status 1) converge without a dedicated event: the project drops out,
-// the caller reads 0, and every authorization snapshot taken against the old
-// epoch stops matching.
+// status. This is what makes disband converge without a dedicated event: the
+// project drops out, the caller reads 0, and every authorization snapshot taken
+// against the old epoch stops matching.
+//
+// It covers a future ARCHIVED state only if archive is modelled as a status
+// value. If it lands as a separate `archived_at` column beside `status = 1`,
+// this predicate does NOT fold it in and the statement needs an explicit
+// `archived_at IS NULL` — an earlier version of this comment asserted the free
+// coverage unconditionally, which would have read as "already handled" to
+// whoever adds the column.
 func TestProjectEpochsExcludesInactiveProjects(t *testing.T) {
 	raw, err := os.ReadFile("membership.go")
 	if err != nil {
@@ -168,8 +174,8 @@ func TestProjectEpochsExcludesInactiveProjects(t *testing.T) {
 		body = body[:end]
 	}
 	if !strings.Contains(body, "status = 1") {
-		t.Error("ProjectEpochsInSpace must restrict to status = 1, so a disbanded or " +
-			"archived project reads as epoch 0")
+		t.Error("ProjectEpochsInSpace must restrict to status = 1, so a disbanded project " +
+			"reads as epoch 0")
 	}
 	if !strings.Contains(body, "space_id = ?") {
 		t.Error("ProjectEpochsInSpace must filter by space_id: a project in another " +
