@@ -1,6 +1,7 @@
 package message
 
 import (
+	"os"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -146,4 +147,42 @@ func TestCollectGroupSpaceMapStillWorks(t *testing.T) {
 	m, ok := CollectGroupSpaceMap(convs, nil, svc)
 	require.True(t, ok)
 	assert.Equal(t, "space_a", m["g1"])
+}
+
+// TestProjectIDShipsOnlyOnTheSpaceScopedPath pins the gate the requester chose over
+// arguing that an opaque project id is harmless.
+//
+// Without an X-Space-ID the handler skips Space filtering entirely, and only
+// COMMUNITY_TOPIC items get the fail-closed parent-membership check YUJ-4185 added
+// — plain GROUP items get none. So a removed member whose IM conversation row
+// outlives the removal still receives the item on that path. The pre-existing hole
+// belongs to project-p2-read-path-hardening; what this gate does is refuse to widen
+// it by one field.
+//
+// Both directions are asserted. Only checking the empty case would pass on a gate
+// that dropped the map unconditionally, i.e. on a gate that quietly disabled the
+// feature.
+func TestProjectIDShipsOnlyOnTheSpaceScopedPath(t *testing.T) {
+	built := map[string]string{"g1": "p_1"}
+
+	assert.Empty(t, projectMapForSpaceScope("", built),
+		"no X-Space-ID means no Space filtering ran, so the caller's membership was "+
+			"never checked for plain group items; project_id must not ride along")
+
+	assert.Equal(t, built, projectMapForSpaceScope("space_a", built),
+		"and on the Space-scoped path the field must still ship, or the gate has "+
+			"turned into a silent feature kill")
+}
+
+// TestTheSidebarAppliesTheProjectScopeGate pins that the handler actually calls it.
+//
+// The gate is one line in a 400-line function; a refactor that drops it leaves
+// every other test in this file green, because they all drive the builders directly
+// with a map they supply themselves.
+func TestTheSidebarAppliesTheProjectScopeGate(t *testing.T) {
+	raw, err := os.ReadFile("api_sidebar.go")
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "groupProjectMap = projectMapForSpaceScope(spaceID, groupProjectMap)",
+		"the sidebar handler must pass the project map through projectMapForSpaceScope; "+
+			"without that call the field ships on the path where no membership check ran")
 }

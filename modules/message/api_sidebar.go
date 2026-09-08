@@ -490,6 +490,22 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		groupSpaceMap = map[string]string{}
 		groupProjectMap = map[string]string{}
 	}
+	// project_id ships ONLY on the Space-scoped path.
+	//
+	// Without an X-Space-ID the handler skips FilterRawConversationsBySpace
+	// entirely (see step 2 above), and only COMMUNITY_TOPIC items then get the
+	// fail-closed parent-membership check YUJ-4185 added — plain GROUP items get
+	// none, and decideConvKeepInSpace never had a membership predicate. So a
+	// removed member whose IM conversation row outlives the removal still receives
+	// the item on that path.
+	//
+	// That hole is pre-existing and belongs to project-p2-read-path-hardening, not
+	// here: closing it means adding a membership predicate for every group item,
+	// not for project ones. What this line does is refuse to WIDEN it. PR #861's
+	// review raised it and the requester chose this over the alternative of
+	// arguing that an opaque project id is harmless to a caller who can resolve
+	// nothing with it.
+	groupProjectMap = projectMapForSpaceScope(spaceID, groupProjectMap)
 
 	// 2g. externalGroupMap：当前 user 作为外部成员加入的 (groupNo -> source_space_id)
 	//     映射，用来回填 SidebarItem.MySourceSpaceID（GH octo-server#153 Round-2 P1）。
@@ -1179,6 +1195,23 @@ func appendThreadParentGroupNos(groupNos []string, threadExtRows []*convext.Mode
 // parseThreadChannelIDSidebar splits "{groupNo}____{shortID}" → (groupNo, shortID).
 // Uses the 4-underscore separator convention matching the thread package.
 const threadSeparator = "____"
+
+// projectMapForSpaceScope drops the project map on the no-X-Space-ID path.
+//
+// A named function rather than an inline `if`, because the property it enforces is
+// worth a test of its own: this is the only thing standing between the sidebar's
+// project_id and a caller the no-Space path never checked for membership. An inline
+// condition is testable only through the whole handler, which has no HTTP rig here.
+//
+// Returns an EMPTY map rather than nil so every construction site keeps reading a
+// map — a nil map reads fine in Go, but the empty value makes the intent obvious to
+// the next reader and cannot be mistaken for "not built yet".
+func projectMapForSpaceScope(spaceID string, projectMap map[string]string) map[string]string {
+	if spaceID == "" {
+		return map[string]string{}
+	}
+	return projectMap
+}
 
 func parseThreadChannelIDSidebar(channelID string) (groupNo, shortID string, err error) {
 	idx := strings.Index(channelID, threadSeparator)
