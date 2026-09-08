@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFilterAITeamSidebarItemsDropsParentAndSessionsFromNormalTabs(t *testing.T) {
@@ -30,6 +31,24 @@ func TestIsAITeamConversationMatchesParentAndThread(t *testing.T) {
 	assert.True(t, isAITeamConversation("protected", common.ChannelTypeGroup.Uint8(), groups))
 	assert.True(t, isAITeamConversation("protected____session-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
 	assert.False(t, isAITeamConversation("normal____thread-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
+}
+
+func TestFilterAITeamLegacyConversationsDropsParentAndSessions(t *testing.T) {
+	items := []conversationResp{
+		{ChannelID: "normal", ChannelType: common.ChannelTypeGroup.Uint8()},
+		{ChannelID: "protected", ChannelType: common.ChannelTypeGroup.Uint8()},
+		{ChannelID: "protected____session-1", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+		{ChannelID: "normal____thread-1", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+	}
+	groups := map[string]*group.GroupResp{
+		"normal":    {GroupNo: "normal"},
+		"protected": {GroupNo: "protected", Purpose: "ai_session_container"},
+	}
+
+	got := filterAITeamLegacyConversations(items, groups)
+	require.Len(t, got, 2)
+	assert.Equal(t, "normal", got[0].ChannelID)
+	assert.Equal(t, "normal____thread-1", got[1].ChannelID)
 }
 
 func sidebarTargetIDs(items []*SidebarItem) []string {

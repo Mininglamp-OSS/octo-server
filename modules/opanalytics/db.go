@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 )
@@ -33,7 +34,7 @@ func (d *opanalyticsDB) countSpacesTotal(spaceIDs []string) (int64, error) {
 // countGroupsTotal 群组总数；给定 spaceIDs 时只数其中的群。
 func (d *opanalyticsDB) countGroupsTotal(spaceIDs []string) (int64, error) {
 	var n int64
-	stmt := d.session.Select("count(*)").From("`group`").Where("status=1")
+	stmt := d.session.Select("count(*)").From("`group`").Where("status=1 AND purpose<>?", aiteampkg.GroupPurpose)
 	stmt = applySpaceFilter(stmt, spaceIDs)
 	_, err := stmt.Load(&n)
 	return n, err
@@ -332,7 +333,8 @@ func (d *opanalyticsDB) queryGroupCountBySpace() (map[string]int64, error) {
 		Cnt     int64  `db:"cnt"`
 	}
 	_, err := d.session.SelectBySql(
-		"SELECT space_id, COUNT(*) AS cnt FROM `group` WHERE status=1 GROUP BY space_id",
+		"SELECT space_id, COUNT(*) AS cnt FROM `group` WHERE status=1 AND purpose<>? GROUP BY space_id",
+		aiteampkg.GroupPurpose,
 	).Load(&rows)
 	if err != nil {
 		return nil, err
@@ -434,12 +436,12 @@ func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus strin
 	// INNER JOIN 活的 group 表(status=1)：硬删除的群(无 group 行)与已解散群(status≠1)不再展示。
 	// dim_channel 只 upsert 不删旧群行，故权威存在性/状态以 group 表为准。
 	base := "FROM octo_dim_channel c " +
-		"JOIN `group` g ON g.group_no = c.channel_id AND g.status=1 " +
+		"JOIN `group` g ON g.group_no = c.channel_id AND g.status=1 AND g.purpose<>? " +
 		"LEFT JOIN (SELECT channel_id, SUM(human_msg_count) AS hm, SUM(agent_msg_count) AS am " +
 		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND space_id=? AND channel_type=2 " +
 		"GROUP BY channel_id) f ON f.channel_id=c.channel_id " +
 		"WHERE c.space_id=? AND c.channel_type=2" + activeCond
-	args := []interface{}{start, end, spaceID, spaceID}
+	args := []interface{}{aiteampkg.GroupPurpose, start, end, spaceID, spaceID}
 	base = applyUint8FilterSQL(base, &args, "c.conv_type", convTypes)
 	base = applyChannelMemberKeywordSQL(base, &args, memberKeyword)
 
@@ -513,9 +515,9 @@ func (d *opanalyticsDB) groupChannelExists(channelID string) (bool, error) {
 	var n int64
 	_, err := d.session.SelectBySql(
 		"SELECT COUNT(*) FROM octo_dim_channel c "+
-			"JOIN `group` g ON g.group_no=c.channel_id AND g.status=1 "+
+			"JOIN `group` g ON g.group_no=c.channel_id AND g.status=1 AND g.purpose<>? "+
 			"WHERE c.channel_id=? AND c.channel_type=2",
-		channelID,
+		aiteampkg.GroupPurpose, channelID,
 	).Load(&n)
 	return n > 0, err
 }

@@ -1223,7 +1223,13 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 					visitorNo, _ := co.ctx.GetConfig().GetCustomerServiceVisitorUID(resp.ChannelID)
 					visitorNos = append(visitorNos, visitorNo)
 				} else {
-					groupNos = append(groupNos, resp.ChannelID)
+					groupNo := resp.ChannelID
+					if resp.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+						if parentNo, _, parseErr := thread.ParseChannelID(resp.ChannelID); parseErr == nil {
+							groupNo = parentNo
+						}
+					}
+					groupNos = append(groupNos, groupNo)
 				}
 
 			}
@@ -1252,17 +1258,33 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 
 			}
 		}
+		groupMap := make(map[string]*group.GroupResp, len(groupDetails))
 		if len(groupDetails) > 0 {
-			for _, group := range groupDetails {
-				groupResps = append(groupResps, groupResp{}.from(group))
+			for _, detail := range groupDetails {
+				info := &group.GroupResp{GroupNo: detail.GroupNo, Purpose: detail.Purpose}
+				groupMap[detail.GroupNo] = info
+				if info.Purpose != aiteampkg.GroupPurpose {
+					groupResps = append(groupResps, groupResp{}.from(detail))
+				}
 			}
 		}
+		conversationResps = filterAITeamLegacyConversations(conversationResps, groupMap)
 	}
 	c.JSON(http.StatusOK, conversationWrapResp{
 		Conversations: conversationResps,
 		Groups:        groupResps,
 		Users:         userResps,
 	})
+}
+
+func filterAITeamLegacyConversations(items []conversationResp, groups map[string]*group.GroupResp) []conversationResp {
+	visible := make([]conversationResp, 0, len(items))
+	for _, item := range items {
+		if !isAITeamConversation(item.ChannelID, item.ChannelType, groups) {
+			visible = append(visible, item)
+		}
+	}
+	return visible
 }
 
 // 清除最近会话未读数

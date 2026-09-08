@@ -2549,3 +2549,6 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - 生命周期清理把群主不可删除视为带告警的预期 no-op，并禁止以后把普通群群主转让给 Bot。
 - mention preference、Bot target resolve 与管理端群列表均隐藏/拒绝 AI 容器；resolve 同时过滤其 thread。
 - 新增 DB/HTTP 回归，完整 `group`、`robot`、`bot_api` 包以及 build、vet、i18n、diff 门禁通过。
+- 继续关闭第六轮发现的路由族缺口：四组 incoming-webhook 管理挂载统一在成员鉴权后拒绝
+  AI 容器；旧版最近会话和运营看板也不再展示容器、thread 或成员明细。
+- 完整 `incomingwebhook`、`message`、`opanalytics` 套件通过。

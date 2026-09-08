@@ -22,3 +22,8 @@ of the operator does not prove the target is a Bot rather than a human user. Cle
 wrappers must also preserve intentional no-op outcomes from their shared primitive
 (for example, creator membership cannot be removed) instead of turning them into a
 misleading hard failure after earlier destructive steps have committed.
+
+When one handler set is mounted on multiple authentication faces or resource
+scopes, enforce protected-resource policy inside the shared authorization
+funnel, after the caller's membership is established. This covers the whole
+route family and avoids leaking the protected purpose to unaffiliated callers.

@@ -78,6 +78,13 @@ The carried visibility gaps are also closed: owner mention-preference routes,
 Bot resolve-target search, and manager group listings exclude protected AI
 containers (and resolve-target search also excludes their threads).
 
+The subsequent route-family sweep is closed as well. All four user/Bot,
+group/thread incoming-webhook management mounts reject protected containers
+after membership authorization. The deprecated `/v1/coversations` response
+filters both the parent and thread conversations, and operational analytics
+excludes protected containers from source dimensions, aggregate group counts,
+channel listings, and direct channel-member lookup.
+
 Checks run against freshly recreated local `test` databases where applicable:
 
 - Focused `modules/group` lifecycle/transfer/manager-list regressions: PASS.
@@ -86,6 +93,9 @@ Checks run against freshly recreated local `test` databases where applicable:
 - `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/group`: PASS (31.352s).
 - `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/robot`: PASS (7.030s).
 - `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/bot_api`: PASS (51.036s).
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/incomingwebhook`: PASS (19.149s).
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/message`: PASS (3.262s).
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/opanalytics`: PASS (8.971s).
 - `make i18n-extract`, `make i18n-extract-check`, `make i18n-lint`,
   `go build ./...`, `go vet ./...`, and `git diff --check`: PASS.
 

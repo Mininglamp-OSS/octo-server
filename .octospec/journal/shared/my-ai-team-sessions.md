@@ -120,3 +120,9 @@ source: self
   thread channels.
 - DB-backed focused tests and the complete affected `group`, `robot`, and `bot_api`
   packages passed, followed by build, vet, i18n, and diff gates.
+- The final route-family sweep moved the incoming-webhook protection into the
+  shared actor resolver after membership authorization, covering all four
+  user/Bot and group/thread mounts without exposing a purpose oracle.
+- The deprecated recent-conversation response and operational analytics now hide
+  protected parents and session threads too, including stale analytics dimensions
+  created before a group acquired the protected purpose.
