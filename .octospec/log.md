@@ -4,6 +4,20 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-08 — eva-assistant-eager-ai-group
+
+- **Changed** — `POST /v1/ai-team/agents/{bot_id}` now creates or repairs the
+  protected owner+Bot group and its WuKongIM parent channel before returning,
+  while creating no thread/session. `CreateSession` reuses the shared container
+  helper and keeps legacy empty-`group_no` recovery.
+- **Integrated** — EVA assistant auto-connect now registers the new Bot through
+  the authenticated, Space-scoped Agent endpoint before persisting/enabling the
+  local Bot; existing Bot records with Bot/Space identifiers are reconciled too.
+- **Learned** — a database `ready` bit cannot prove external IM state still
+  exists, so explicit idempotent registration must replay external upserts. See
+  [journal](journal/shared/eva-assistant-eager-ai-group.md) and
+  [learning](learnings/pending/external-readiness-needs-reconciliation.md).
+
 ## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
 
 - **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的

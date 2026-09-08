@@ -74,7 +74,8 @@ func validateAuthorityTx(tx *dbr.Tx, spaceID, userUID, botID string) error {
 }
 
 func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
-	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
+	botName, err := s.validateAuthority(spaceID, userUID, botID)
+	if err != nil {
 		return nil, err
 	}
 	tx, err := s.ctx.DB().Begin()
@@ -102,42 +103,34 @@ func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
 		return nil, errNotFound
 	}
 
-	containerNeedsReconcile := false
-	if agent.GroupNo != "" {
-		repaired, repairErr := s.admitContainerMembersTx(tx, agent.GroupNo, spaceID, userUID, botID)
-		if repairErr != nil {
-			return nil, repairErr
-		}
-		containerNeedsReconcile = repaired || agent.ContainerState != containerReady
-		if containerNeedsReconcile {
-			if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
-				return nil, err
-			}
-		}
+	groupNo, _, err := s.ensureContainerTx(tx, agent, botName, spaceID, userUID, botID)
+	if err != nil {
+		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	if containerNeedsReconcile {
-		if err = s.ensureContainerIMReady(agent.ID, agent.GroupNo, userUID, botID); err != nil {
-			s.markContainerFailure(agent.ID, err)
-			return nil, fmt.Errorf("%w: reconcile IM channels: %v", errIMUnavailable, err)
-		}
-		readyTx, beginErr := s.ctx.DB().Begin()
-		if beginErr != nil {
-			return nil, beginErr
-		}
-		defer readyTx.RollbackUnlessCommitted()
-		if err = validateAuthorityTx(readyTx, spaceID, userUID, botID); err != nil {
-			s.markContainerFailure(agent.ID, err)
-			return nil, err
-		}
-		if _, err = readyTx.Update("ai_team_agent").Set("container_state", containerReady).Where("id=?", agent.ID).Exec(); err != nil {
-			return nil, err
-		}
-		if err = readyTx.Commit(); err != nil {
-			return nil, err
-		}
+	// Re-run the idempotent IM upserts even for an already-ready Agent. The DB
+	// cannot tell whether WuKongIM lost a channel, so every explicit AddAgent is
+	// also the repair operation for the parent and any existing topics.
+	if err = s.ensureContainerIMReady(agent.ID, groupNo, userUID, botID); err != nil {
+		s.markContainerFailure(agent.ID, err)
+		return nil, fmt.Errorf("%w: reconcile IM channels: %v", errIMUnavailable, err)
+	}
+	readyTx, beginErr := s.ctx.DB().Begin()
+	if beginErr != nil {
+		return nil, beginErr
+	}
+	defer readyTx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(readyTx, spaceID, userUID, botID); err != nil {
+		s.markContainerFailure(agent.ID, err)
+		return nil, err
+	}
+	if _, err = readyTx.Update("ai_team_agent").Set("container_state", containerReady).Where("id=?", agent.ID).Exec(); err != nil {
+		return nil, err
+	}
+	if err = readyTx.Commit(); err != nil {
+		return nil, err
 	}
 	return s.getAgent(spaceID, userUID, botID, false)
 }
@@ -258,6 +251,55 @@ func (s *Service) admitContainerMembersTx(tx *dbr.Tx, groupNo, spaceID, userUID,
 	return group.AdmitAITeamContainerMembersTx(s.ctx, tx, groupNo, spaceID, userUID, botID)
 }
 
+// ensureContainerTx creates or repairs the private parent group while the
+// caller holds the ai_team_agent row lock. It deliberately provisions no
+// thread: adding an Agent makes the owner+Bot group ready, while sessions stay
+// an explicit follow-up action.
+func (s *Service) ensureContainerTx(
+	tx *dbr.Tx,
+	agent *lockedAgent,
+	botName, spaceID, userUID, botID string,
+) (string, bool, error) {
+	groupNo := agent.GroupNo
+	if groupNo == "" {
+		groupNo = util.GenerUUID()
+		groupName := strings.TrimSpace(botName)
+		if groupName == "" {
+			groupName = botID
+		}
+		groupName += " · AI"
+		if r := []rune(groupName); len(r) > group.MaxGroupNameLen {
+			groupName = string(r[:group.MaxGroupNameLen])
+		}
+		version, err := s.ctx.GenSeq(common.GroupSeqKey)
+		if err != nil {
+			return "", false, err
+		}
+		if _, err = tx.InsertBySql("INSERT INTO `group` (group_no,name,creator,status,version,allow_view_history_msg,space_id,allow_external,allow_no_mention,purpose) VALUES (?,?,?,?,?,?,?,?,?,?)",
+			groupNo, groupName, userUID, group.GroupStatusNormal, version, 1, spaceID, 0, 1, aiteampkg.GroupPurpose).Exec(); err != nil {
+			return "", false, err
+		}
+		if _, err = tx.Update("ai_team_agent").Set("group_no", groupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+			return "", false, err
+		}
+		agent.GroupNo = groupNo
+		agent.ContainerState = containerProvisioning
+	}
+
+	membershipRepaired, err := s.admitContainerMembersTx(tx, groupNo, spaceID, userUID, botID)
+	if err != nil {
+		return "", false, err
+	}
+	containerNeedsReconcile := agent.ContainerState != containerReady || membershipRepaired
+	if containerNeedsReconcile && agent.ContainerState != containerProvisioning {
+		if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+			return "", false, err
+		}
+		agent.ContainerState = containerProvisioning
+	}
+	return groupNo, containerNeedsReconcile, nil
+}
+
 func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name string) (*Session, error) {
 	botName, err := s.validateAuthority(spaceID, userUID, botID)
 	if err != nil {
@@ -288,42 +330,9 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		return nil, errNotFound
 	}
 
-	groupNo := agent.GroupNo
-	if groupNo == "" {
-		groupNo = util.GenerUUID()
-		groupName := strings.TrimSpace(botName)
-		if groupName == "" {
-			groupName = botID
-		}
-		groupName += " · AI"
-		if r := []rune(groupName); len(r) > group.MaxGroupNameLen {
-			groupName = string(r[:group.MaxGroupNameLen])
-		}
-		version, genErr := s.ctx.GenSeq(common.GroupSeqKey)
-		if genErr != nil {
-			return nil, genErr
-		}
-		_, err = tx.InsertBySql("INSERT INTO `group` (group_no,name,creator,status,version,allow_view_history_msg,space_id,allow_external,allow_no_mention,purpose) VALUES (?,?,?,?,?,?,?,?,?,?)",
-			groupNo, groupName, userUID, group.GroupStatusNormal, version, 1, spaceID, 0, 1, aiteampkg.GroupPurpose).Exec()
-		if err != nil {
-			return nil, err
-		}
-		_, err = tx.Update("ai_team_agent").Set("group_no", groupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec()
-		if err != nil {
-			return nil, err
-		}
-		agent.ContainerState = containerProvisioning
-	}
-
-	membershipRepaired, err := s.admitContainerMembersTx(tx, groupNo, spaceID, userUID, botID)
+	groupNo, containerNeedsReconcile, err := s.ensureContainerTx(tx, agent, botName, spaceID, userUID, botID)
 	if err != nil {
 		return nil, err
-	}
-	containerNeedsReconcile := agent.ContainerState != containerReady || membershipRepaired
-	if membershipRepaired && agent.ContainerState == containerReady {
-		if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
-			return nil, err
-		}
 	}
 
 	var existing *Session
