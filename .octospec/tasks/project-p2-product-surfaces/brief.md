@@ -274,6 +274,27 @@ At `5dd80d4` that handler builds its response as a hand-written `gin.H`
 (`modules/group/api.go:5040-5100`) rather than through `GroupResp`, so it is not exposed by
 #855's change and must not be "tidied up" onto `GroupResp` by this one. A test pins that.
 
+**D6 amendment (post-review, requester-approved).** The paragraph above is wrong about one
+population and the review found it. `SidebarItem`s are NOT uniformly built from channels the
+caller is a current member of: without an `X-Space-ID` the handler skips Space filtering
+entirely, and only `COMMUNITY_TOPIC` items get the fail-closed parent-membership check
+(`filterThreadConvsByParentMembership`, which runs on every path). Plain `GROUP` items get no
+membership predicate there, so a removed member whose IM conversation row outlives the removal
+still receives the item. The disclosure argument D6 inherited from #855 therefore does not
+cover that path.
+
+Two options were put to the requester: keep the field everywhere (the marginal disclosure is an
+opaque id no route will resolve for that caller), or ship it only where Space filtering ran.
+The requester chose the gate. So `project_id` is emitted **only on the Space-scoped path**, for
+every target type including the one that was checked — gating per type would let a topic and its
+own parent group disagree inside one response, which is the property PR-2 exists to preserve.
+
+Consequence to hand to the client teams: on the no-`X-Space-ID` path `""` means "not
+evaluated", not "直属 Space", and the two are indistinguishable in the payload. It is written
+into the `SidebarItem.ProjectID` comment. The underlying hole is NOT closed here — closing it
+means a membership predicate for every group item — and belongs to
+`project-p2-read-path-hardening`.
+
 **D7 — `join_mode = 0` self-join (PR-3) needs a writer before it needs an endpoint.**
 
 `join_mode` today has no writer, no reader, and no wire field — `CreateReq` / `UpdateReq` /
@@ -483,11 +504,16 @@ golangci-lint run ./...
 
 **PR-2 — `project_id` on the sidebar** (the rest landed in #855) — SHIPPED as implemented below:
 
-- `project_id` present and correct on the `/v1/sidebar/*` payload for a project group, `""`
-  (omitted) for a Space-direct group, and `""` for a DM — the same three-way split
-  `SidebarItem.SpaceID` already documents at `modules/message/api_sidebar.go:112-119`.
-- For a COMMUNITY_TOPIC item, `project_id` is the **parent group's**, matching how `SpaceID` is
-  resolved for that target type. Asserted, not assumed.
+- **On a request carrying `X-Space-ID`**: `project_id` present and correct on the
+  `/v1/sidebar/*` payload for a project group, `""` (omitted) for a Space-direct group, and
+  `""` for a DM — the same three-way split `SidebarItem.SpaceID` already documents.
+- **On a request WITHOUT `X-Space-ID`**: `""` for every item, deliberately. See the amendment
+  to D6 — this was not in the brief as written and is a requester-approved narrowing, added
+  after review. Stated here rather than only in D6's rationale, because this section is what a
+  future contributor implements against, and read without it the gate looks like a bug to
+  remove.
+- For a COMMUNITY_TOPIC item on the Space-scoped path, `project_id` is the **parent group's**,
+  matching how `SpaceID` is resolved for that target type. Asserted, not assumed.
 - No extra per-item query: the value must come from the batch the sidebar already runs, not a
   per-group round-trip on the hot read path.
 - `project_id` still absent from the public invite-preview response (D6), pinned by a test.

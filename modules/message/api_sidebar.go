@@ -133,6 +133,12 @@ type SidebarItem struct {
 	// 空串 = 直属 Space，与 group.project_id 的哨兵值一致；omitempty，所以老客户端
 	// 的 payload 逐字节不变。
 	//
+	// 例外，客户端必须知道：不带 X-Space-ID 的请求上，本字段整条链路一律为空串
+	// （见 projectMapForSpaceScope）。也就是说在那条路径上空串有第二个含义——
+	// 「服务端没有下发」，而不是「直属 Space」，两者在 payload 上不可区分。要按
+	// 项目分组的客户端在那条路径上应当认为自己没有项目信息，而不是把这些条目
+	// 归进直属 Space 分组。带 X-Space-ID 时不存在这个歧义。
+	//
 	// 客户端靠它在消息列表里按项目分组。P1 建立了这一列，#855 把它下发到
 	// GroupResp 和群详情，这里是同一次透出剩下的一跳。
 	//
@@ -1206,6 +1212,26 @@ const threadSeparator = "____"
 // Returns an EMPTY map rather than nil so every construction site keeps reading a
 // map — a nil map reads fine in Go, but the empty value makes the intent obvious to
 // the next reader and cannot be mistaken for "not built yet".
+//
+// # It drops the map for EVERY target type, including the one that was checked
+//
+// Reviewer yujiawei's follow-up on PR #861: the blanket drop is wider than the hole
+// it refuses to widen. filterThreadConvsByParentMembership runs on ALL paths, this
+// one included, and is fail-closed through ExistMembersActive — so a COMMUNITY_TOPIC
+// item here HAS had its parent membership verified, and its project_id is blanked
+// anyway. Only plain GROUP items are the unchecked ones.
+//
+// Gating per target type was the alternative and is worse, for the reason PR-2 exists
+// to serve: SpaceID and ProjectID are read at the same site with the same key so that
+// a group and its own thread cannot disagree about one conversation. Per-type gating
+// makes exactly that happen on this path — the topic would carry a project_id while
+// its parent group, in the same response, would not. A client grouping by project
+// would split one project across two buckets, which is a worse answer than having no
+// project information at all.
+//
+// So the drop stays blanket, and the cost is that "" means two things on this path:
+// 直属 Space, and "not evaluated". That is written into the ProjectID field comment
+// rather than left here, because the client team reads the field, not this function.
 func projectMapForSpaceScope(spaceID string, projectMap map[string]string) map[string]string {
 	if spaceID == "" {
 		return map[string]string{}

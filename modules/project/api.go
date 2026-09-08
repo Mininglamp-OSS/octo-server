@@ -473,11 +473,14 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 	resps := make([]*Resp, 0, len(rows))
 	for _, row := range rows {
 		model := row.Model
-		// The split comes from the list query itself (two bounded correlated
-		// subqueries), so a list card and the detail route agree about what
-		// member_count means. Reporting the full seat count here while the detail
-		// route reported humans only would have been D16's own bug, one endpoint
-		// away.
+		// Both halves of the split come from fillMemberCounts, out of one roster
+		// read, so a list card and the detail route agree about what member_count
+		// means. Reporting the full seat count here while the detail route
+		// reported humans only would have been D16's own bug, one endpoint away.
+		//
+		// This used to say "two bounded correlated subqueries", which was one too
+		// many after #855 removed member_count's and zero too many after PR-5
+		// removed seat_count's.
 		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount(), row.Pinned == 1))
 	}
 	c.Response(resps)

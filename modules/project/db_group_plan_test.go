@@ -155,6 +155,13 @@ func TestTheProjectStatementsAreWhatProductionRuns(t *testing.T) {
 // stop being every visible project — pins are capped at six per Space, so the
 // shape that gets there is one bounded read of the caller's pinned ids plus the
 // existing p.id DESC page, concatenated with the offset arithmetic done in Go.
+//
+// And it has a detector, because a condition nobody can observe arrives as user
+// latency instead of as a signal: project_space_project_count, sampled on the
+// sparse metrics tick (metrics.go). It measures projects per Space rather than the
+// sort input itself — the sort input is the subset one caller can see, which needs
+// a per-caller query — and bounds it from above, which is the conservative
+// direction. Reviewer yujiawei asked for it on PR #861.
 func TestTheProjectListReachesItsRowsByAnIndex(t *testing.T) {
 	setup(t)
 	p := New(testCtx)
