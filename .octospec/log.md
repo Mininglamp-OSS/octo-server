@@ -2721,3 +2721,13 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - CI 单元 lane、E2E shard 4/4、AI Team race 测试、build、vet 与 diff 门禁均通过。
 - Review 后将分页 items 与总数统计统一到同一个 SQL 分类表达式，避免后续新增 hosting slug 时
   两套条件漂移；独立 Swagger 文档不进入 PR。
+
+## 2026-09-08 — project-provisioning-followups
+
+PR #850 merged as one squash commit whose message describes the slice rather than
+its seven review rounds, so a cross-workstream design decision (the fleet container
+id is provisional and becomes project_id once the peer-side narrowing lands) and six
+deliberately-open P2 findings existed only in a closed PR thread. Both categories go
+live at the same moment — the first time a provisioning target is enabled — so they
+are recorded together as an actionable brief, each item verified against the merged
+tree. See `.octospec/tasks/project-provisioning-followups/brief.md`.
