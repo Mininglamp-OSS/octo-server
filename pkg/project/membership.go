@@ -403,6 +403,42 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 //
 // `removing = 0` is here for the same reason as every other predicate in this
 // package: a seat being closed is not a member.
+//
+// # The Space half is conjoined here, and only here
+//
+// A project seat alone is NOT the answer to "may this uid act in this project".
+// The Space→project cascade is ASYNCHRONOUS: when a user is removed from a Space,
+// the project seat survives until a background job gets to it, that job's cleanup
+// step deactivates the seat directly without the synchronous `removing = 1` phase
+// (modules/project/space_member_removal.go), and it gives up after
+// removalCleanupMaxAttempts with the row kept but never re-claimed. So `status = 1
+// AND removing = 0` on its own reports a removed user as a member for a window
+// that is unbounded in the failure case.
+//
+// Every OTHER caller of that predicate runs downstream of a Space gate — the
+// project routes go through spacepkg.CheckMembership in middleware, and group
+// admission conjoins spacepkg.ActiveMembers explicitly. This function is the
+// first caller with no gate in front of it: its consumer is a peer control plane
+// asking about a THIRD party, for whom it holds no token, and no endpoint in this
+// repository lets it obtain the Space half itself. "Keep your Space check and
+// layer this on top" is advice that consumer cannot act on, so the conjunction
+// has to happen server-side.
+//
+// The predicate comes from spacepkg.ActiveMembers rather than being spelled out
+// again, so it cannot drift from CheckMembership's.
+//
+// MembershipsInSpace is deliberately NOT changed: it answers for the caller's OWN
+// token holder on a route that already ran SpaceMiddleware, so its consumer both
+// has the Space half and has already applied it.
+//
+// # What this does NOT close
+//
+// Only FRESH answers. A grant the consumer cached BEFORE the Space removal keeps
+// riding epoch agreement, because a Space removal does not move member_epoch —
+// the epoch only bumps when the cascade actually changes a project row. Closing
+// that requires either an epoch bump at Space-removal commit time or a hard TTL
+// in the peer contract that does not depend on epoch agreement. Neither is in
+// this function.
 func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	roles := make(map[string]int, len(uids))
 	if spaceID == "" || projectID == "" {
@@ -442,7 +478,31 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	if err != nil {
 		return 0, nil, err
 	}
+	if len(rows) == 0 {
+		return epoch, roles, nil
+	}
+
+	// Step 3 — the Space half. LAST on purpose, and for the same reason step 1 is
+	// first: this read is the one that can only ever REMOVE a uid from the answer,
+	// so the newest data landing here is the fail-closed direction. Reading it
+	// before the seats would let a Space removal committing in between produce a
+	// stale positive; reading it after can at worst deny someone who was
+	// re-admitted microseconds ago, and they re-verify.
+	//
+	// Only the uids that actually hold a seat are asked about, so the batch is
+	// bounded by the answer rather than by the request.
+	seated := make([]string, 0, len(rows))
 	for _, r := range rows {
+		seated = append(seated, r.UID)
+	}
+	inSpace, err := space.ActiveMembers(session, spaceID, seated)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, r := range rows {
+		if !inSpace[r.UID] {
+			continue
+		}
 		roles[r.UID] = r.Role
 	}
 	return epoch, roles, nil

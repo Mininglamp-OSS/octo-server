@@ -88,6 +88,66 @@ func TestBatchPredicatesExcludeClosingSeats(t *testing.T) {
 	}
 }
 
+// TestProjectMembershipsConjoinsTheSpaceHalf pins the other half of the answer.
+//
+// A project seat is not authorization on its own: the Space→project cascade is
+// asynchronous, its cleanup step deactivates the seat without the synchronous
+// `removing = 1` phase, and it stops retrying after a cap with the row kept but
+// never re-claimed. A user removed from the Space therefore keeps a `status = 1
+// AND removing = 0` seat for a window that is unbounded in the failure case.
+//
+// Every other caller of that predicate sits behind a Space gate. This one does
+// not — its consumer is a peer asking about a third party it holds no token for,
+// and no endpoint here lets it obtain the Space half — so the conjunction is the
+// server's job. Deleting it would be invisible to any test whose fixtures keep
+// the two tables agreeing, which is why this is a source guard.
+func TestProjectMembershipsConjoinsTheSpaceHalf(t *testing.T) {
+	body := funcSourceBody(t, "ProjectMemberships")
+	if !strings.Contains(body, "space.ActiveMembers(") {
+		t.Fatal("ProjectMemberships must conjoin the Space half through space.ActiveMembers — " +
+			"a project seat outlives Space removal by an unbounded window, and this " +
+			"function's consumer cannot apply the Space check itself. See this test's comment.")
+	}
+
+	// AFTER the seats. The Space read can only remove uids from the answer, so it
+	// is the one read whose freshest data is the fail-closed direction. Placed
+	// before the seats, a Space removal committing in between yields a stale
+	// positive — the exact bug the conjunction is here to remove.
+	seatsAt := strings.Index(body, "octo_project_member")
+	spaceAt := strings.Index(body, "space.ActiveMembers(")
+	if spaceAt < seatsAt {
+		t.Fatal("the Space check must run AFTER the seat query: it can only narrow the answer, " +
+			"so reading it last is the fail-closed order")
+	}
+
+	// Through pkg/space, not a hand-rolled copy. A near-copy of
+	// `space_member.status = 1 AND space.status = 1` drifts from CheckMembership's,
+	// and pkg/space's own comment says so.
+	if strings.Contains(body, "space_member") {
+		t.Error("ProjectMemberships must not spell the Space predicate out itself; " +
+			"space.ActiveMembers exists so the two cannot drift")
+	}
+}
+
+// funcSourceBody returns the source of one function in membership.go.
+func funcSourceBody(t *testing.T, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile("membership.go")
+	if err != nil {
+		t.Fatalf("read membership.go: %v", err)
+	}
+	src := string(raw)
+	start := strings.Index(src, "func "+name+"(")
+	if start < 0 {
+		t.Fatalf("%s not found — if it moved, point this guard at the new location rather than deleting it", name)
+	}
+	body := src[start:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	return body
+}
+
 // TestProjectEpochsExcludesInactiveProjects pins that the epoch query filters on
 // status. This is what makes disband (and any future archived state, which is
 // also not status 1) converge without a dedicated event: the project drops out,
