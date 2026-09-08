@@ -225,8 +225,28 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 	// 上一版这里只按 group_no 读 group_member，从头到尾没问过归属。
 	// PR #855 第十轮 review 的 P2-3。
 	//
-	// 与准入那边一样是非锁定读：它读进本事务的读视图，不是一把锁。真正的互斥来自
-	// 下面 group_member 上的 FOR UPDATE。
+	// 非锁定读，与准入那边同一种。它**收窄**了窗口，没有关闭：读进的是本事务的读视图，
+	// 之后提交的 detach 对本事务不可见——而"不可见"不等于"被挡住"。随后拿的
+	// group_member 锁不会回头校验 group 行，所以理论上这次同步仍可能落在一个刚变成
+	// Space 直属的群上。第十一轮 review 的 P2-2 指出了这一点，说得对。
+	//
+	// 为什么**没有**按建议改成 FOR SHARE：那样会引入一类现在没有的死锁。
+	// P1 级联的 handOverProjectGroupIfCreator（project_cascade.go:282）先对 group_member
+	// 取 FOR UPDATE（queryGroupCreatorTx），无人可继任时再对同一个 group 行取排他锁
+	// （detachGroupFromProjectTx）——顺序是 group_member → group。本函数是
+	// group → group_member。两者都能作用在**同一个全员群**上（成员只剩离开者本人的
+	// 单人项目正好走到级联那条 detach 分支），于是并发时构成 ABBA，MySQL 判定 1213
+	// 杀掉其中一个。改之前实测过这个方向：加锁能挡住 detach，但代价是这条新死锁。
+	//
+	// 真正的顺序问题在级联那边：声明的锁序是
+	// space_member → space → project → group → group_member → octo_project_member，
+	// 而它先 group_member 后 group，是一处既有的倒置。把那条理顺之后，这里的 FOR SHARE
+	// 才是安全的——那是它自己的一次改动，要带自己的分析和用例，不该搭在这次 fast-follow 上。
+	//
+	// 在那之前，剩下的窗口有多大、后果是什么，说清楚而不是含糊过去：需要一次 detach
+	// 恰好落在本事务开读视图之后，终态是一个 Space 直属的群带着一个可能不对的群主——
+	// 而它既然已经 Space 直属，就不再受 D7 保护，一次普通的群主转让就能修好。与上一轮
+	// 那个"谁也改不了"的状态是两回事。
 	txGroup, err := g.db.QueryWithGroupNoTx(tx, groupNo)
 	if err != nil {
 		return fmt.Errorf("group: re-read group for all-member owner sync: %w", err)

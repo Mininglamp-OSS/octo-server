@@ -37,6 +37,9 @@ package space
 //     the handler and the primitive, this reports the wrapper — which fails loudly
 //     and is the safe direction, rather than passing because the seam is one frame
 //     further up.
+//   - Indirection is resolved ONE level, and only for the caller-supplied-field-map
+//     shape (step 0 below). A primitive assembled across two hops would still be
+//     invisible.
 
 import (
 	"go/ast"
@@ -86,6 +89,9 @@ var d14Seam = map[string]bool{
 // rawRobotDisable matches the raw-SQL spelling of "turn this bot's account off".
 var rawRobotDisable = regexp.MustCompile(`(?is)update\s+` + "`?robot`?" + `\s+set\s+status\s*=\s*0`)
 
+// rawRobotDelete matches the raw-SQL spelling of "remove the bot's account row".
+var rawRobotDelete = regexp.MustCompile(`(?is)delete\s+from\s+` + "`?robot`?" + `\b`)
+
 type censusFunc struct {
 	name   string
 	file   string
@@ -98,6 +104,10 @@ type censusFunc struct {
 	setsStatusZero bool
 	// rawDisablesRobot is the raw-SQL spelling of the same write.
 	rawDisablesRobot bool
+	// deletesRobotRow is `DeleteFrom("robot")` or raw `DELETE FROM robot` — a HARD
+	// delete of the account row. A bot whose robot row is gone is at least as deleted
+	// as one whose status is 0, so this counts too.
+	deletesRobotRow bool
 }
 
 // scanRepoFuncs parses every non-test Go file under the given roots.
@@ -138,6 +148,9 @@ func scanRepoFuncs(t *testing.T, repoRoot string, roots ...string) []*censusFunc
 						if name == "Update" && len(v.Args) == 1 && stringLit(v.Args[0]) == "robot" {
 							cf.updatesRobotTable = true
 						}
+						if name == "DeleteFrom" && len(v.Args) == 1 && stringLit(v.Args[0]) == "robot" {
+							cf.deletesRobotRow = true
+						}
 					case *ast.KeyValueExpr:
 						if stringLit(v.Key) == "status" && intLit(v.Value) == "0" {
 							cf.setsStatusZero = true
@@ -147,8 +160,14 @@ func scanRepoFuncs(t *testing.T, repoRoot string, roots ...string) []*censusFunc
 					case *ast.Ident:
 						cf.idents[v.Name] = true
 					case *ast.BasicLit:
-						if v.Kind == token.STRING && rawRobotDisable.MatchString(v.Value) {
+						if v.Kind != token.STRING {
+							return true
+						}
+						if rawRobotDisable.MatchString(v.Value) {
 							cf.rawDisablesRobot = true
+						}
+						if rawRobotDelete.MatchString(v.Value) {
+							cf.deletesRobotRow = true
 						}
 					}
 					return true
@@ -202,11 +221,24 @@ func intLit(e ast.Expr) string {
 // disablesBotAccount reports whether this function turns a bot's `robot` row off,
 // in either spelling used in this repository.
 //
-// The dbr form needs BOTH halves — `.Update("robot")` and a literal `"status": 0` —
-// so updateRobotInfo (a caller-supplied field map) and `"status": 0` written to some
-// other table both stay out, and `updateRobot` ("status": m.Status) stays out too.
+// Three spellings count, because all three end with an account that cannot be used:
+//
+//   - the dbr disable, needing BOTH halves — `.Update("robot")` and a literal
+//     `"status": 0` — so `"status": 0` written to some other table stays out, and
+//     `updateRobot` ("status": m.Status) stays out too;
+//   - the raw-SQL disable;
+//   - the HARD delete, in either spelling. This one was missing until the eleventh
+//     review, which proved it by adding a `DeleteFrom("robot")` door and watching the
+//     guard pass. The gap was invisible from inside because deleteCreatedBotArtifacts
+//     — which uses exactly that spelling at modules/botfather/db.go:239 — was already
+//     in the known-primitives list, registering only via the raw UPDATE in its
+//     fail-closed fallback. It passed for the wrong reason, so it could not expose the
+//     matcher's blind spot.
+//
+// The fourth shape, a caller-supplied field map, is resolved one hop up in step 0 of
+// the test rather than here, because neither half of it is in one function.
 func (c *censusFunc) disablesBotAccount() bool {
-	return c.rawDisablesRobot || (c.updatesRobotTable && c.setsStatusZero)
+	return c.rawDisablesRobot || c.deletesRobotRow || (c.updatesRobotTable && c.setsStatusZero)
 }
 
 func (c *censusFunc) String() string { return c.file + ":" + c.name }
@@ -217,7 +249,32 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 
 	funcs := scanRepoFuncs(t, repoRoot, "modules", "pkg", "internal")
 
-	// Step 1: the primitives — everything that turns a bot account off.
+	// Step 0: functions that write the `robot` table with a CALLER-SUPPLIED field map.
+	//
+	// updateRobotInfo (modules/robot/db.go) is the one that exists: it holds the
+	// `.Update("robot")` and no literal, while a caller passing {"status": 0} holds the
+	// literal and no `.Update("robot")`. Split that way, NEITHER half is a primitive and
+	// the caller is not a door — a bypass the eleventh review found by reading the
+	// matcher rather than by finding a live instance of it.
+	//
+	// Resolving one level of indirection closes it, and is the right shape rather than
+	// an exemption: the caller genuinely does disable a bot, it just borrows someone
+	// else's UPDATE to do it. Recording updateRobotInfo as EXEMPT would have said the
+	// opposite — that its callers may skip D14 — which is false. The resolved caller
+	// joins the DOOR set in step 2, not the primitive set; see the note there for why
+	// that distinction is what makes the mutation red.
+	//
+	// No false positive today: robotUpdate builds its map from *req.Status, a pointer
+	// deref rather than a literal 0, so it is not flagged. That is correct — it is a
+	// reversible disable, not a deletion.
+	robotFieldWriters := map[string]bool{}
+	for _, f := range funcs {
+		if f.updatesRobotTable && !f.setsStatusZero {
+			robotFieldWriters[f.name] = true
+		}
+	}
+
+	// Step 1: the primitives — everything that turns a bot account off or removes it.
 	primitives := map[string]*censusFunc{}
 	for _, f := range funcs {
 		if f.disablesBotAccount() {
@@ -243,18 +300,67 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			known)
 	}
 
-	// Step 2: the doors — every function that calls a non-exempt primitive.
+	// Step 2: the doors — every function that calls a non-exempt primitive, plus every
+	// function that spells the disable across two hops (step 0).
+	//
+	// The split-spelling function is a DOOR, not a primitive, and getting that wrong is
+	// how the first attempt at this fix passed its own mutation: classified as a
+	// primitive it was skipped by the "a primitive is not a door onto itself" rule, and
+	// since nothing called it, nothing was ever asserted about it. The classification is
+	// not cosmetic — in that shape the deletion site IS the function holding the
+	// literal, because the `.Update("robot")` it borrows lives in a generic helper that
+	// is not itself a deletion.
 	var doors []*censusFunc
-	for _, f := range funcs {
-		if primitives[f.name] != nil {
-			continue // a primitive is not a door onto itself
+	seen := map[string]bool{}
+	addDoor := func(f *censusFunc) {
+		if seen[f.String()] {
+			return
 		}
+		seen[f.String()] = true
+		doors = append(doors, f)
+	}
+	called := map[string]bool{}
+	for _, f := range funcs {
 		for name := range primitives {
-			if _, exempt := d14ExemptPrimitives[name]; exempt {
-				continue
+			if f.name != name && f.calls[name] {
+				called[name] = true
 			}
-			if f.calls[name] {
-				doors = append(doors, f)
+		}
+	}
+	// A primitive NOTHING calls is its own door.
+	//
+	// "A primitive is not a door onto itself" assumes primitives are db-layer helpers
+	// with a handler above them — true of all three today. It is false for a handler
+	// that does the deletion inline, and the failure is silent in the worst way: the
+	// function is classified, excluded from the door set by that rule, and then checked
+	// by nothing. That is the same shape as the split-spelling fix's first attempt, one
+	// level over, and it is why this rule is stated rather than assumed.
+	for name, f := range primitives {
+		if _, exempt := d14ExemptPrimitives[name]; exempt {
+			continue
+		}
+		if !called[name] {
+			addDoor(f)
+		}
+	}
+	for _, f := range funcs {
+		if primitives[f.name] == nil {
+			for name := range primitives {
+				if _, exempt := d14ExemptPrimitives[name]; exempt {
+					continue
+				}
+				if f.calls[name] {
+					addDoor(f)
+					break
+				}
+			}
+		}
+		if !f.setsStatusZero || f.disablesBotAccount() {
+			continue
+		}
+		for writer := range robotFieldWriters {
+			if f.calls[writer] {
+				addDoor(f)
 				break
 			}
 		}

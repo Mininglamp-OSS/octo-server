@@ -1642,6 +1642,174 @@ pr_855_round_10_fixed:
       project that stays without a group until someone with higher privilege happens
       to write, and every admission in between is skipped with reasonAdmitSkippedNoGroup.
 
+# PR #855 merged as 566e625. The eleventh review APPROVED it and recorded three P2s plus a
+# nit and a coverage gap, explicitly as owned fast-follows. This section is that follow-up,
+# on a fresh branch off the merged main.
+pr_855_round_11_fixed:
+  - id: the-census-guard-did-not-have-the-property-its-commit-claimed
+    severity: medium
+    reported_by: "yujiawei P2-1 (executed, with two mutations)"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The round-10 commit message said "a fourth door added tomorrow fails this test the
+      moment it is written". Not true, in two spellings.
+      (a) The HARD delete was invisible: the matcher knew `UPDATE robot SET status=0` and
+      `.Update("robot")` and nothing else, so a `DeleteFrom("robot")` door passed. The
+      reviewer proved it by adding one. Worse, that spelling is already in the tree --
+      deleteCreatedBotArtifacts uses it (modules/botfather/db.go:239) and registers as a
+      primitive only via the raw UPDATE in its fail-closed fallback. It passed the
+      anti-vacuity list for the WRONG REASON, which is precisely why that list could not
+      expose the blind spot.
+      (b) The two halves can live in different functions: updateRobotInfo holds the
+      `.Update("robot")` with no literal, a caller holds `{"status": 0}` with no Update.
+      Neither half is a primitive and the caller is not a door.
+    fix: |
+      Hard delete recognised in both spellings (`DeleteFrom("robot")` and raw
+      `DELETE FROM robot`). The split spelling is resolved one hop: functions that write
+      the robot table with a caller-supplied field map are collected first, and a function
+      holding a literal `"status": 0` that calls one becomes a DOOR.
+      Not an exemption entry: recording updateRobotInfo as exempt would have said its
+      callers may skip D14, which is false.
+    a-fix-that-failed-its-own-mutation-first: |
+      The first attempt classified the split-spelling function as a PRIMITIVE. Primitives
+      are skipped by the "a primitive is not a door onto itself" rule, and nothing called
+      it, so nothing was asserted and the mutation stayed green. The classification is
+      load-bearing: in that shape the deletion site IS the function holding the literal,
+      because the Update it borrows lives in a generic helper that is not itself a
+      deletion. Caught only by running the mutation.
+    mutation: |
+      Both of the reviewer's probes now turn it red: a DeleteFrom("robot") door, and a
+      caller passing {"status": 0} to updateRobotInfo. Baseline still green, still finding
+      3 primitives and 4 doors.
+  - id: the-finalizers-retry-could-not-make-progress
+    severity: medium
+    reported_by: "yujiawei P2-3"
+    where: modules/project/space_member_removal.go, modules/project/metrics_all_member_group.go
+    what: |
+      convergeAllMemberGroupOwners returned errCascadeIncomplete on a spent page budget,
+      with a comment claiming parity with the cascade's retryable error. The claim is false
+      in exactly the half that makes retry useful: the cascade re-queries ACTIVE seats, so
+      the rows it closes leave its own result set and each retry starts smaller. This query
+      deliberately has no status filter (with one it returns the empty set and converges
+      nothing), so a retry re-reads from project_id > '' and walks the same first 5000 rows
+      forever -- until the job burns its attempt budget and is marked abandoned, dragging
+      every already-successful cleanup step through twenty pointless re-runs.
+      Reachable rather than theoretical: octo_project_member rows are never deleted
+      (rejoining is an UPDATE) and the per-Space quota counts only ACTIVE projects, so the
+      historical row count for one (space_id, uid) is unbounded.
+    fix: |
+      A spent budget no longer asks for a retry: it counts a new metric reason
+      (owner_budget_spent), logs the resume cursor, and returns nil. What is given up is
+      stated in the code: the projects past the budget are not converged this time, and
+      wait for their own next kick / leave / role change -- all three of which already call
+      the same sync. Persisting the cursor would need a column on
+      space_member_removal_cleanup, which belongs to modules/space; inverting that layering
+      for a project-side finalizer is its own task.
+    test: TestOwnerConvergenceDoesNotAskForARetryItCannotWin, plus TestOwnerConvergenceStillWalksEveryPageWithinBudget as the control
+    mutation: "putting errCascadeIncomplete back turns the first case red."
+  - id: the-attribution-re-read-narrowed-the-window-without-closing-it
+    severity: medium
+    reported_by: "yujiawei P2-2"
+    resolution: "documented, not closed -- the suggested fix introduces a deadlock"
+    where: modules/group/all_member_group.go
+    what: |
+      The round-10 fix re-read the group row in-transaction, but non-locking. That read is
+      the transaction's first, so it OPENS the read view: a detach committing after it is
+      invisible, the group_member locks taken next do not revalidate the group row, and the
+      sync goes on to promote or demote creators in a group that is now Space-direct.
+      The review is right about all of that, and right that the comment declining FOR SHARE
+      cited the wrong subject (that argument is about the octo_project_member role read).
+    what-i-did-and-why-not-the-suggested-fix: |
+      Took FOR SHARE, ran the suites, then this branch's own code review found the reason it
+      cannot stay: it introduces an ABBA deadlock that did not exist before.
+      P1's cascade, handOverProjectGroupIfCreator (project_cascade.go:282), locks
+      group_member FOR UPDATE first (queryGroupCreatorTx) and then, on the no-successor
+      path, takes an exclusive lock on the SAME group row (detachGroupFromProjectTx) --
+      group_member then group. The owner sync with FOR SHARE is group then group_member.
+      Both reach the same all-member group: the cascade's detach branch needs "no group
+      member is still in the project", which a one-person project satisfies exactly when its
+      owner leaves. Concurrent, that is ABBA and MySQL kills one side with 1213.
+      Reverted to the non-locking read, with the window, its consequence and its prerequisite
+      written into the code instead of waved at.
+    the-real-ordering-defect-is-one-file-over: |
+      The declared lock order is
+      space_member -> space -> project -> group -> group_member -> octo_project_member.
+      handOverProjectGroupIfCreator takes group_member before group, which INVERTS it. That
+      inversion is what makes the correct fix here unsafe. Straightening it is its own change
+      on a load-bearing P1 path and needs its own analysis and cases; recorded as a follow-up
+      rather than ridden along on a fast-follow.
+    what-the-remaining-window-costs: |
+      A detach has to commit inside the gap between this transaction's first read and its
+      group_member writes. The end state is a Space-direct group with a possibly-wrong
+      creator -- and being Space-direct it is no longer under D7, so an ordinary owner
+      transfer repairs it. Materially different from the unrepairable state round 10 fixed.
+  - id: the-one-new-statement-shipped-without-its-plan
+    severity: low
+    reported_by: "yujiawei, the nit"
+    where: modules/project/db.go
+    fix: |
+      queryProjectIDsForSpaceMemberPage now carries its measured plan, like every other new
+      statement in this change. MySQL 8.0.46, 10k rows over 200 uids x 50 Spaces, after
+      ANALYZE: `ref idx_octo_project_member_space_uid key_len=324 ref=const,const rows=50`,
+      `Using where; Using filesort`. The index seeks to the (space_id, uid) range, which is
+      the part that must be right; the filesort is expected, because the index is
+      (space_id, uid, status) and constraining status is exactly what this query must not
+      do. Bounded by the set: one row per project the member was ever in.
+  - id: the-gate-tests-name-outgrew-its-coverage
+    severity: low
+    reported_by: "yujiawei, the coverage note"
+    where: modules/project/review8_reconcile_gate_test.go
+    what: |
+      runReconcile now runs ten scans, five gated and five not. The list of ungated scans in
+      the test still named two, so i2, i3 and removing_stall were asserted nowhere -- an
+      edit that accidentally gated one would pass a test whose name claims it covers exactly
+      the gated set. i2 is the one that matters: a violation there is a person seeing a
+      project group they are not in. The file header also read "two of the five ... the
+      other five", which is seven against an actual ten.
+    fix: "all five ungated scans asserted; header arithmetic corrected."
+    mutation: "gating scanI2Violations now turns it red; before this it did not."
+  - id: the-census-still-skipped-a-handler-that-deletes-inline
+    severity: medium
+    reported_by: "self, /code-review on this branch"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Teaching the matcher the hard-delete spelling created a third instance of the same
+      bug it was fixing. A handler that runs `DeleteFrom("robot")` INLINE is classified a
+      primitive, and "a primitive is not a door onto itself" then excludes it from the door
+      set -- so step 3 never checks it for D14 routing. That rule silently assumes every
+      primitive is a db-layer helper with a handler above it, which is true of all three
+      today and false for an inline one.
+    fix: |
+      A primitive nothing calls is its own door. Stated as a rule rather than left to the
+      assumption, since this is now the third time the same assumption produced a hole.
+    mutation: "a handler with an inline DeleteFrom(\"robot\") and no seam now turns it red."
+  - id: the-budget-spent-signal-was-filed-as-a-failure
+    severity: low
+    reported_by: "self, /code-review on this branch"
+    where: modules/project/metrics_all_member_group.go
+    what: |
+      owner_budget_spent was added as a `kind` on all_member_group_sync_failures_total,
+      whose Help says it counts failed sync attempts. It is not a failure: the projects
+      reached were converged. Any alert summing that counter across kinds would page on a
+      normal event -- and telling that it was normal would require already knowing this kind
+      exists, which defeats the alert.
+    fix: "its own counter, all_member_group_owner_convergence_incomplete_total."
+  - id: one-metric-shipped-under-a-different-namespace-from-its-six-siblings
+    severity: low
+    reported_by: "self, while checking a merge-impact list"
+    where: pkg/project/all_member_group.go
+    what: |
+      AllMemberGroupGuardFailures registered under namespace `octo_project` -- named after
+      the table prefix rather than the module -- while the feature's other six metrics use
+      `project`, and every other module in the repo uses one namespace per module (`group`,
+      `dmwork`). It is the single metric an operator most needs, because D7 fails open and
+      this counter is the only thing separating a database hiccup from the guard having been
+      off since Tuesday. Under a different prefix it would not appear beside its siblings on
+      a dashboard, and a merge-impact list written from the sibling names had it wrong.
+    fix: |
+      Renamed to `project_all_member_group_guard_failures_total`. Done now because the
+      feature is off by default and no dashboard exists yet; later it is a breaking rename.
+
 verify:
   rules_rechecked:
     - id: space-isolation

@@ -493,6 +493,85 @@ every five minutes on every pod against a core IM table. The two scans now ride 
 same switch as the three that cannot survive the drift, for a different stated
 reason, so the next reader does not "fix" the inconsistency by moving them back.
 
+### A guard passing for the wrong reason cannot expose its own blind spot
+
+The bot-deletion census kept a list of primitives it must keep recognising, precisely so
+the matcher could not rot into a test that asserts nothing. `deleteCreatedBotArtifacts`
+was on that list and was found on every run — and the matcher was still blind to the
+spelling that function actually uses. It uses `DeleteFrom("robot")`, which the matcher
+did not know; it registered as a primitive only because of an unrelated raw `UPDATE` in
+its fail-closed fallback.
+
+So the anti-vacuity check was green, and green for a reason unrelated to the thing it was
+protecting. That is a failure mode worth naming separately from vacuity: an assertion can
+be non-vacuous, correct, and still incapable of detecting the defect it was written
+against, because the sample it holds up is passing through a different code path than the
+one under test. The check for it is the same one that keeps catching things here — mutate,
+and mutate with the shape you claim to cover, not the shape you already handle.
+
+### Classifying a thing wrongly can make a fix pass its own mutation
+
+The fix for the second census bypass — a disable spelled across two functions — was
+written first as "the caller is a primitive". It was, in a sense. It also meant the caller
+was skipped by the rule that a primitive is not a door onto itself, and since nothing
+called it, nothing was asserted about it. The mutation stayed green against the fix
+written for it.
+
+The correct classification is that the caller is a **door**: in that shape the deletion
+site is the function holding the literal, because the `UPDATE` it borrows lives in a
+generic helper that is not itself a deletion. Same code, same coverage, opposite outcome
+— the taxonomy was load-bearing and looked like naming.
+
+### "Same retryable error" is a claim about the input, not about the error
+
+The Space-removal finalizer returned the cascade's retryable error when its page budget
+ran out, and said so in a comment: same error, same meaning. The error was the same. The
+meaning was not, and the difference is the only property that makes a retry worth asking
+for.
+
+The cascade re-queries *active* seats, so every row it closes leaves its own result set:
+each retry starts from a smaller input and the walk terminates. The finalizer's query
+deliberately has no status filter — with one it returns the empty set and converges
+nothing — so a retry re-reads the same first page forever, and the job spends its whole
+attempt budget on a walk that cannot advance, dragging every already-successful step
+through the re-runs with it.
+
+Two call sites can share an error value, a retry mechanism and a page budget and still
+disagree about whether retrying does anything. The question to ask of any "retry later" is
+not what it returns; it is what will be different next time.
+
+### A non-locking read narrows a window; it does not close one — and the obvious fix was a deadlock
+
+An in-transaction re-read was added to make the owner sync judge attribution from an
+authoritative snapshot. It reads into the transaction's read view, which means a write
+committing afterwards is invisible to it — and *invisible* is not *blocked*. The
+subsequent `group_member` locks do not revalidate the `group` row, so the sync proceeds on
+an attribution that is no longer true.
+
+The distinction is easy to lose because both readings sound like isolation. "I will not
+see a later write" protects you from a torn view of the past. "A later write will wait for
+me" is what protects a decision you are about to act on. Only the second one was wanted
+here, and taking a shared lock on the `group` row looked free: it sits exactly where the
+declared lock order already puts it.
+
+It was not free, and the reason is the more useful half of this entry. P1's cascade takes
+`group_member` first and then, on its no-successor branch, an exclusive lock on the same
+`group` row — `group_member` then `group`. A locking re-read here is `group` then
+`group_member`. Both paths reach the same all-member group (the cascade's detach branch
+needs "nobody in the group is still in the project", which a one-person project satisfies
+the moment its owner leaves), so concurrently that is ABBA and MySQL kills one side.
+
+So the lock was reverted and the window written down instead — with what it costs (a
+Space-direct group with a possibly-wrong creator, repairable by an ordinary transfer,
+because Space-direct means D7 no longer applies) and what has to happen first (the
+cascade's inversion of the declared order is the actual defect; straightening it is a
+change to a load-bearing path and deserves its own analysis).
+
+Two things worth keeping from this. **"It is in the declared lock order" is a statement
+about one call site, not about the system** — the order only holds if every path obeys it,
+and the one that did not was the reason. And **a fix that survives the full suite can still
+be wrong**: nothing here failed. It took reading the other path's lock sequence to see it.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

@@ -143,6 +143,26 @@ func observeAllMemberGroupRosterTruncated(reason string) {
 // reasonTruncatedOverMaxMembers：活跃成员数超过项目的 max_members。
 const reasonTruncatedOverMaxMembers = "over_max_members"
 
+// allMemberGroupConvergenceIncomplete 计 Space 级联的群主收敛「这一次没走完」。
+//
+// 单独一个指标，不是 all_member_group_sync_failures_total 的一个 kind——那个计数器的
+// Help 说的是"同步失败的次数"，而这件事**不是失败**：已经走到的项目都收敛了，只是这个
+// 成员的历史项目行多到一次工单装不下。混进去，任何按名字对 kind 求和的告警都会因为一件
+// 正常事件而呼人，而分辨它是不是失败恰恰需要先知道有这么个 kind——那就白设告警了。
+// 第十一轮 fast-follow 的自审。
+var allMemberGroupConvergenceIncomplete = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: metricNamespace,
+	Name:      "all_member_group_owner_convergence_incomplete_total",
+	Help: "Space-removal owner convergences that spent their page budget with projects " +
+		"left unvisited. Not a failure: the projects reached were converged, and the rest " +
+		"are picked up by their own next membership change.",
+})
+
+// observeAllMemberGroupConvergenceIncomplete 记一次没走完的收敛。
+func observeAllMemberGroupConvergenceIncomplete() {
+	allMemberGroupConvergenceIncomplete.Inc()
+}
+
 func observeAllMemberGroupSyncFailure(kind string) {
 	allMemberGroupSyncFailures.WithLabelValues(kind).Inc()
 }
