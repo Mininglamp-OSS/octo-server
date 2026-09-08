@@ -34,6 +34,9 @@ source: user
 - App Bots are not queried or admitted. A future digital-employee implementation
   needs its own App Bot authority and session design rather than interpreting a
   User Bot hosting slug.
+- Page rows and aggregate totals are classified by the same SQL expression,
+  built from the wire group constants. A future mapping change therefore cannot
+  update item placement while silently leaving group counts on an older rule.
 
 ## Verification
 

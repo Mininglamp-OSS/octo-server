@@ -2568,3 +2568,5 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - 分页查询与总数查询复用同一套 Space、owner、User Bot 和有效席位约束；未知托管值保守归入
   个人助理，`agent_hosting` 不参与权限判断且不出现在响应中。
 - CI 单元 lane、E2E shard 4/4、AI Team race 测试、build、vet 与 diff 门禁均通过。
+- Review 后将分页 items 与总数统计统一到同一个 SQL 分类表达式，避免后续新增 hosting slug 时
+  两套条件漂移；独立 Swagger 文档不进入 PR。

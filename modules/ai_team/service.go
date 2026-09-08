@@ -201,7 +201,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	q := s.eligibleAgentsQuery(spaceID, userUID,
 		"a.id", "a.space_id", "a.user_uid", "a.bot_id", "u.name AS bot_name",
 		"IFNULL(a.group_no,'') AS group_no", "a.is_added", "a.container_state", "a.created_at", "a.updated_at",
-		"IFNULL(r.agent_hosting,'') AS agent_hosting",
+		fmt.Sprintf("%s AS agent_group", agentGroupSQL),
 		"(SELECT COUNT(*) FROM ai_team_session ats2 JOIN thread t2 ON t2.short_id=ats2.short_id AND t2.group_no=a.group_no WHERE ats2.agent_id=a.id AND ats2.state=2 AND t2.status<>3) AS session_count",
 	).OrderDesc("a.id").Limit(uint64(limit + 1))
 	if beforeID > 0 {
@@ -212,20 +212,27 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	if err != nil {
 		return nil, err
 	}
-	var counts struct {
-		CloudClone        int64 `db:"cloud_clone"`
-		PersonalAssistant int64 `db:"personal_assistant"`
-	}
-	err = s.eligibleAgentsQuery(spaceID, userUID,
-		"COALESCE(SUM(CASE WHEN r.agent_hosting='octo_hosted' THEN 1 ELSE 0 END),0) AS cloud_clone",
-		"COALESCE(SUM(CASE WHEN r.agent_hosting='octo_hosted' THEN 0 ELSE 1 END),0) AS personal_assistant",
-	).LoadOne(&counts)
+	groupCounts := make([]struct {
+		Type  AgentGroupType `db:"agent_group"`
+		Count int64          `db:"agent_count"`
+	}, 0, 2)
+	_, err = s.eligibleAgentsQuery(spaceID, userUID,
+		fmt.Sprintf("%s AS agent_group", agentGroupSQL),
+		"COUNT(*) AS agent_count",
+	).GroupBy(agentGroupSQL).Load(&groupCounts)
 	if err != nil {
 		return nil, err
 	}
+	counts := map[AgentGroupType]int64{
+		AgentGroupTypeCloudClone:        0,
+		AgentGroupTypePersonalAssistant: 0,
+	}
+	for _, groupCount := range groupCounts {
+		counts[groupCount.Type] = groupCount.Count
+	}
 	page := &AgentPage{Groups: []*AgentGroup{
-		{Type: AgentGroupTypeCloudClone, Count: counts.CloudClone, Items: make([]*Agent, 0)},
-		{Type: AgentGroupTypePersonalAssistant, Count: counts.PersonalAssistant, Items: make([]*Agent, 0)},
+		{Type: AgentGroupTypeCloudClone, Count: counts[AgentGroupTypeCloudClone], Items: make([]*Agent, 0)},
+		{Type: AgentGroupTypePersonalAssistant, Count: counts[AgentGroupTypePersonalAssistant], Items: make([]*Agent, 0)},
 		{Type: AgentGroupTypeDigitalEmployee, Count: 0, Items: make([]*Agent, 0)},
 	}}
 	if len(rows) > limit {
@@ -233,7 +240,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 		page.NextCursor = fmt.Sprintf("%d", rows[limit-1].ID)
 	}
 	for _, agent := range rows {
-		if agent.AgentHosting == "octo_hosted" {
+		if agent.GroupType == AgentGroupTypeCloudClone {
 			page.Groups[0].Items = append(page.Groups[0].Items, agent)
 			continue
 		}

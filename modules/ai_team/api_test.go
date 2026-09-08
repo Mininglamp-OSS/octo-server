@@ -323,6 +323,7 @@ func TestAITeamListAgentsGroupsByHostingAndKeepsCursorTotals(t *testing.T) {
 	w := request(t, f, http.MethodGet, "/v1/ai-team/agents?limit=3", "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.NotContains(t, w.Body.String(), "agent_hosting", "hosting is classification input, not a new wire field")
+	assert.NotContains(t, w.Body.String(), "agent_group", "the computed group is represented by the response envelope")
 	var first aiteammod.AgentPage
 	decodeJSON(t, w, &first)
 	assertAgentGroupShape(t, first.Groups, 2, 3)
