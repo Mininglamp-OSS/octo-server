@@ -145,23 +145,41 @@ func TestUpdateGroupInfoDoesNotWriteTheWholeRow(t *testing.T) {
 	// write, the three publish steps must not run. Asserted at the source because
 	// reproducing it needs a hook between the service's pooled status read and its
 	// write, which does not exist. PR #855s seventh review, P2-1.
-	require.True(t, strings.Contains(fn, "return errGroupGoneOrDisbanded"),
-		"and it must REPORT it: a rename that did not land is the same fact as a rename "+
-			"refused at the status check, and updateAvatarCustom one screen away already "+
-			"answers not-found for the identical TOCTOU. D8s sync swallows it with errors.Is; "+
-			"the human handler should not answer 200 OK for a group that is gone")
-
 	zero := strings.Index(fn, "if affected == 0")
 	require.Positive(t, zero,
 		"UpdateGroupInfo must inspect the rows affected: 0 means the group was "+
 			"disbanded after its snapshot, and the database is then clean while the "+
 			"clients are not")
+
+	// The publishes, and the earliest of them.
+	//
+	// Asserted as a WINDOW rather than as "the file contains a return", which is
+	// what the first version did. `return errGroupGoneOrDisbanded` appears twice in
+	// this function — the status-check refusal at the top and this block — so a
+	// Contains over the whole body was satisfied by the FIRST one: deleting only
+	// this block's return, keeping the if and the Warn, left the guard green while
+	// the publishes ran. PR #855's ninth review found that; a guard that pins a
+	// token's existence rather than its position is the same family of mistake as
+	// the ones this file's history is made of.
+	firstPublish := len(fn)
 	for _, publish := range []string{"InvalidateGroupName(", "SendGroupUpdate(", "SendChannelUpdateToGroup("} {
 		at := strings.Index(fn, publish)
 		require.Positive(t, at, "%s must still be part of the happy path", publish)
 		require.Less(t, zero, at,
-			"the affected == 0 return must come BEFORE %s — otherwise a rename that "+
+			"the affected == 0 branch must come BEFORE %s — otherwise a rename that "+
 				"wrote nothing still tells every client the group was renamed, and the "+
 				"API reports success", publish)
+		if at < firstPublish {
+			firstPublish = at
+		}
 	}
+
+	require.True(t,
+		strings.Contains(fn[zero:firstPublish], "return errGroupGoneOrDisbanded"),
+		"the affected == 0 branch must RETURN, between itself and the first publish "+
+			"call. A rename that did not land is the same fact as one refused at the "+
+			"status check, and updateAvatarCustom one screen away already answers "+
+			"not-found for the identical TOCTOU; D8s sync swallows it with errors.Is. "+
+			"Falling through from here means every client is told a group that is gone "+
+			"was renamed, and the API reports success")
 }

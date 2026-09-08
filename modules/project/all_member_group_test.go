@@ -2,11 +2,14 @@ package project
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1463,4 +1466,61 @@ func truncationCount(t *testing.T) float64 {
 	t.Helper()
 	return testutil.ToFloat64(
 		allMemberGroupRosterTruncated.WithLabelValues(reasonTruncatedOverMaxMembers))
+}
+
+// admitFailureCount reads one reason label off the admit-failure counter.
+func admitFailureCount(t *testing.T, reason string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(allMemberGroupAdmitFailures.WithLabelValues(reason))
+}
+
+// TestASubscribeFailureAfterCommitIsCountedAsItself pins the one admit failure
+// whose damage is not what the generic label would suggest.
+//
+// When the admission transaction commits and the broker subscribe then fails, the
+// member IS in group_member — so I4 scan B, which compares active seats against
+// group_member rows, reports nothing. What is missing is a subscriber entry, which
+// nothing in this repository can read back. Counting it as admit_failed points
+// on-call at a scan that is structurally blind to the state.
+//
+// PR #855's ninth review noted the sentinel had nothing pinning it: unwrapping it
+// on the group side left every test green, so the mislabelling could come back
+// silently. This is the caller half; the group side's wrapping is pinned by a
+// source guard in modules/group.
+func TestASubscribeFailureAfterCommitIsCountedAsItself(t *testing.T) {
+	_, p := setup(t)
+	stub := stubAllMemberGroup(t, "grp_subfail")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+	seedUser(t, "u_joiner")
+	seedSpaceMember(t, spaceA, "u_joiner", 0, 1)
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "subfail"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decodeResp(t, w)
+
+	subscribeBefore := admitFailureCount(t, reasonAdmitSubscribeFailed)
+	genericBefore := admitFailureCount(t, reasonAdmitCallFailed)
+
+	// The admitter's transaction committed; the broker call after it did not.
+	stub.admitErr = fmt.Errorf("%w: group: all-member admission IM subscribe: %v",
+		projectpkg.ErrAdmittedButNotSubscribed, errors.New("broker unreachable"))
+
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_joiner"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.NotNil(t, memberRow(t, resp.ProjectID, "u_joiner"),
+		"precondition: the seat is committed — the admission is best-effort")
+
+	require.Equal(t, subscribeBefore+1, admitFailureCount(t, reasonAdmitSubscribeFailed),
+		"a post-commit subscribe failure must be counted as itself. The row is in "+
+			"group_member, so scan B cannot see this state; the alarm has to say that the "+
+			"subscription is what is missing")
+	require.Equal(t, genericBefore, admitFailureCount(t, reasonAdmitCallFailed),
+		"and it must NOT also land on the generic admit failure, which means the "+
+			"opposite thing — no group row, reported by scan B")
 }

@@ -1424,6 +1424,45 @@ pr_855_round_8_fixed:
       from it and from the plan guard.
     fix: "queryOwnedAgentSeatsTx and listVisibleInSpace added to the drift suite; the former also to the plan guard. The PR description claim is corrected."
 
+# PR #855 ninth pass: Jerry-Xin APPROVED 5ec2764 with every round-7/8 blocker
+# verified by executed mutation. He left two advisories, both of the "the guard is
+# vacuous" family this change has been caught by four times. Closed here rather
+# than deferred, because a follow-up on a guard is exactly what did not happen the
+# last three times.
+pr_855_round_9_fixed:
+  - id: the-subscribe-failure-sentinel-had-nothing-pinning-it
+    severity: medium
+    where: modules/group/all_member_group.go, modules/project/{service_all_member_group,all_member_group_test}.go
+    what: |
+      ErrAdmittedButNotSubscribed and its reason label were referenced by no test.
+      Unwrapping the sentinel on the group side left every test in both modules
+      green, so the mislabelling the round-7 fix removed could come back silently:
+      a post-commit subscribe failure would again be logged as "the member is not in
+      the group, scan B will report it", and both halves of that are false for that
+      path.
+    fix: |
+      Both halves pinned. The caller half behaviourally, through the stub admitter
+      seam: an error wrapping the sentinel must increment
+      subscribe_failed_after_commit and must NOT increment admit_failed. The group
+      half by a body-scoped source guard, because reproducing it needs a broker that
+      accepts the group creation and then refuses the subscribe mid-transaction.
+    test: TestASubscribeFailureAfterCommitIsCountedAsItself, TestAdmissionMarksAPostCommitSubscribeFailureAsItself
+    mutation: "unwrapping the sentinel turns the group guard red; removing the errors.Is branch turns the project test red."
+  - id: the-rename-guard-pinned-a-token-not-a-position
+    severity: medium
+    where: modules/group/update_group_info_column_write_test.go
+    what: |
+      `return errGroupGoneOrDisbanded` appears twice in UpdateGroupInfo -- the
+      status-check refusal at the top and the affected == 0 block -- so a Contains
+      over the whole body was satisfied by the first. Deleting ONLY the second
+      return, keeping the if and the Warn, left the guard green while all three
+      publish calls ran: the database clean, every client told a disbanded group was
+      renamed, and the API reporting success.
+    fix: |
+      The assertion is a WINDOW: the return must appear between `if affected == 0`
+      and the earliest of the three publish calls. Position, not existence.
+    mutation: "the partial edit above now turns it red; a full revert was already caught."
+
 verify:
   rules_rechecked:
     - id: space-isolation

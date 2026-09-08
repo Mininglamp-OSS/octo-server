@@ -521,3 +521,41 @@ func mustPickActiveOwner(t *testing.T, tctx *config.Context, projectID string) s
 	require.NoError(t, err)
 	return got
 }
+
+// TestAdmissionMarksAPostCommitSubscribeFailureAsItself is the group half of the
+// pin: the admitter must WRAP pkg/project.ErrAdmittedButNotSubscribed when the
+// transaction committed and the broker subscribe then failed.
+//
+// Without the wrap, modules/project counts the failure as a generic admit failure
+// and logs that the member is not in the group and scan B will report it — and
+// both halves of that sentence are false for this path. The row is committed, so
+// scan B is blind to it; what is missing is a broker subscription, which nothing
+// here can read back.
+//
+// A source guard because the behaviour needs a broker that accepts the group
+// creation and then refuses the subscribe, mid-transaction. PR #855's ninth review
+// noted the sentinel had nothing pinning it at all: unwrapping it left every test
+// in both modules green.
+func TestAdmissionMarksAPostCommitSubscribeFailureAsItself(t *testing.T) {
+	raw, err := os.ReadFile("all_member_group.go")
+	require.NoError(t, err)
+	body := string(raw)
+
+	i := strings.Index(body, "func (g *Group) admitToAllMemberGroup(")
+	require.Positive(t, i, "admitToAllMemberGroup not found")
+	end := strings.Index(body[i:], "\n}\n")
+	require.Positive(t, end, "could not delimit admitToAllMemberGroup")
+	fn := stripLineComments(body[i : i+end])
+
+	commit := strings.Index(fn, "tx.Commit()")
+	require.Positive(t, commit, "precondition: the admission commits before it subscribes")
+	subscribe := strings.Index(fn, "ctx.IMAddSubscriber(")
+	require.Less(t, commit, subscribe, "precondition: the subscribe follows the commit")
+
+	require.True(t, strings.Contains(fn[subscribe:], "projectpkg.ErrAdmittedButNotSubscribed"),
+		"the IM-subscribe failure AFTER the commit must be wrapped in "+
+			"pkg/project.ErrAdmittedButNotSubscribed. Returning a plain error makes the "+
+			"project side count it as a generic admit failure and point on-call at I4 "+
+			"scan B — which cannot see this state, because the group_member row is "+
+			"committed and only the broker subscription is missing")
+}

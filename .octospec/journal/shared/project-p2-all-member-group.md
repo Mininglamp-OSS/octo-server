@@ -399,6 +399,26 @@ So the comment was still wrong — it credited `robot`'s primary key, which the
 COLLATE does make unusable — and the honest fix was to say what carries the join
 and pin the plan, rather than to restructure a locking read on an argument.
 
+### "Does the token appear" and "is the token in the right place" are different guards
+
+The last two holes found in this change were the same mistake at two scales. A
+guard asserted that `return errGroupGoneOrDisbanded` appeared somewhere in a
+function — and the function contains that line twice, because the same answer is
+given at two points. Deleting the one that mattered left the guard green.
+
+Every source guard here has now been bitten by the size of its haystack: the file
+list (a guard that names its subject file cannot see the file added beside it),
+the inputs (an enumeration guard is only as good as the paths it drives), the text
+(prose beside the code satisfies a token match), the file scope (a constant
+referenced by the test helper satisfies an occurrence count), and now the position
+(a token that appears twice satisfies a check meant for one of them).
+
+The shape of the fix has been the same every time: narrow the haystack to exactly
+the thing being asserted. Slice the function, not the file. Strip the comments.
+Match the call, not the name. Assert the window between two landmarks, not the
+presence of a string. None of these is clever; what they have in common is that
+the assertion and the property finally have the same boundaries.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on
