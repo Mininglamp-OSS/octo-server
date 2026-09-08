@@ -167,7 +167,8 @@ func mentionClaimLogHash(claimKey string) string {
 // unset or equal to the value of any env registered BEFORE it. That is more
 // than the two siblings this function used to know about by hand, and it grows
 // on its own; it is not symmetric, though — a capability registered after this
-// one is normally the side that yields.
+// one is the side that yields, disabling itself rather than this ingress.
+// Refusal returns the empty string, which fails the ingress closed.
 //
 // OCTO_MARKETPLACE_INTERNAL_TOKEN (#827) is the exception: it is registered
 // after this env, but that pair was deliberately made symmetric, so the

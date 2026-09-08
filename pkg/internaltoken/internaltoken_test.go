@@ -317,7 +317,14 @@ func TestValuesPanicsOnNilGetenv(t *testing.T) {
 	}
 }
 
-func TestCollisionsReportEveryPairByEnvName(t *testing.T) {
+// TestCollisionsNeverNameADarkEnvAsTheSurvivor is the multi-way case the
+// obvious "report every unordered pair" implementation gets wrong. Three envs
+// sharing one secret is the single-secret-for-everything misconfiguration this
+// package exists to catch: Resolve disables the two juniors, so exactly two
+// lines are correct, both naming the first env — the one still serving. A third
+// line pairing the two juniors would advertise a dark env as the survivor, and
+// an operator acting on it rotates the wrong secret.
+func TestCollisionsNeverNameADarkEnvAsTheSurvivor(t *testing.T) {
 	shared := longEnough("s")
 	getenv := envMap(map[string]string{
 		NotifyInternalTokenEnv: shared,
@@ -327,28 +334,73 @@ func TestCollisionsReportEveryPairByEnvName(t *testing.T) {
 	})
 
 	got := Collisions(getenv)
-	// Three envs sharing one value ⇒ 3 unordered pairs.
-	if len(got) != 3 {
-		t.Fatalf("Collisions() = %v, want 3 pairs", got)
+	if len(got) != 2 {
+		t.Fatalf("Collisions() = %+v, want one line per DISABLED env (2), not one per unordered pair (3)", got)
 	}
 	for _, collision := range got {
-		if collision.Senior == "" || collision.Junior == "" || collision.Senior == collision.Junior {
-			t.Fatalf("malformed collision %+v", collision)
+		if collision.Senior != NotifyInternalTokenEnv {
+			t.Fatalf("collision %+v names %s as the survivor; only the first env of the "+
+				"equal-value group actually resolves", collision, collision.Senior)
 		}
-		if collision.Senior == DriveInternalTokenEnv || collision.Junior == DriveInternalTokenEnv {
-			t.Fatalf("%s holds a unique value but was reported in %+v", DriveInternalTokenEnv, collision)
+		if collision.Junior == NotifyInternalTokenEnv || collision.Junior == DriveInternalTokenEnv {
+			t.Fatalf("collision %+v disabled the wrong env", collision)
 		}
-		// Senior/Junior must match the precedence order Resolve acts on,
-		// otherwise the log line names the wrong survivor.
-		_, seniorIndex, _ := lookup(collision.Senior)
-		_, juniorIndex, _ := lookup(collision.Junior)
-		if seniorIndex >= juniorIndex {
-			t.Fatalf("collision %+v has the survivor and the disabled env the wrong way round", collision)
+		// Every reported survivor must really resolve — the property the log
+		// line at main.go claims.
+		if !collision.SeniorServing {
+			t.Fatalf("collision %+v reports its senior as dark, but %s resolves", collision, collision.Senior)
+		}
+		if _, err := Resolve(collision.Senior, getenv); err != nil {
+			t.Fatalf("reported survivor %s does not resolve: %v", collision.Senior, err)
+		}
+		if _, err := Resolve(collision.Junior, getenv); err == nil {
+			t.Fatalf("reported junior %s still resolves; it was not disabled", collision.Junior)
 		}
 	}
 
 	if Collisions(envMap(map[string]string{NotifyInternalTokenEnv: shared})) != nil {
 		t.Fatal("a single configured env cannot collide with anything")
+	}
+}
+
+// TestCollisionsRespectTheLengthFloor pins that the boot report does not undo
+// Resolve's length-before-collision ordering. A value below its floor is
+// refused for length, so naming a sibling env would hand the operator a second
+// cause to rule out for a token that could not authenticate either way.
+func TestCollisionsRespectTheLengthFloor(t *testing.T) {
+	short := strings.Repeat("x", DefaultMinBytes-1)
+	getenv := envMap(map[string]string{
+		NotifyInternalTokenEnv: short, // MinBytes 0 — legacy waiver, resolves fine
+		DriveInternalTokenEnv:  short, // MinBytes 32 — refused for length, not collision
+	})
+
+	if _, err := Resolve(DriveInternalTokenEnv, getenv); err == nil {
+		t.Fatal("precondition: the short drive token must be refused")
+	}
+	if got := Collisions(getenv); got != nil {
+		t.Fatalf("Collisions() = %+v; a too-short value must not be reported as a collision, "+
+			"or the boot report contradicts Resolve's own reason", got)
+	}
+}
+
+func TestCollisionsPairSurvivorWithDisabled(t *testing.T) {
+	shared := longEnough("s")
+	getenv := envMap(map[string]string{
+		NotifyInternalTokenEnv: shared,
+		DocsNotifyTokenEnv:     shared,
+	})
+	got := Collisions(getenv)
+	if len(got) != 1 {
+		t.Fatalf("Collisions() = %+v, want exactly one", got)
+	}
+	if got[0].Senior != NotifyInternalTokenEnv || got[0].Junior != DocsNotifyTokenEnv {
+		t.Fatalf("collision = %+v; the earlier-registered env is the survivor", got[0])
+	}
+	if !got[0].SeniorServing {
+		t.Fatalf("collision = %+v; %s resolves and must be reported as serving", got[0], got[0].Senior)
+	}
+	if strings.Contains(got[0].Senior+got[0].Junior, shared) {
+		t.Fatal("a collision must carry env names only, never a value")
 	}
 }
 

@@ -84,6 +84,59 @@ to make it a property of the data, not to replace it.
   passes. It pins `internaltoken.Values(os.Getenv)` plus a runtime assertion
   that the registry contains the drive env.
 
+## Review round 2 (PR #853) — the symmetric claim outlived the symmetric code
+
+Two reviewers, one human and one automated, independently found the same thing:
+the PR *documented and tested a symmetric guard the registry deliberately does
+not implement.* When the design changed from symmetric to precedence, the
+`bot_mention` and `notify` tests were rewritten into the `yields_to_` /
+`outranks_` two-branch shape — and `modules/internal_resolve/api_test.go` was
+not. It asserted refusal against **every** other registered env.
+
+It passed. Not because it was right, but because `OCTO_DRIVE_INTERNAL_TOKEN`
+happens to be registered last, which makes every sibling a senior. Appending one
+`Spec` — the single operation the package doc tells you is "the whole change" —
+turns it red:
+
+```
+api_test.go:434: expected error when OCTO_DRIVE_INTERNAL_TOKEN == OCTO_FUTURE_CAP_TOKEN
+```
+
+That is worse than a stale comment. The next person to append a `Spec` meets a
+red assertion whose comment says the code guarantees something it does not, and
+the cheapest way out of a red assertion is to weaken it. The
+coverage-by-convention decay this task set out to end would have survived — it
+would just have moved from a comment in `config.go` to a comment in
+`api_test.go`.
+
+Four prose sites carried the same overstatement (`internal_resolve/config.go`
+×2, `bot_mention/config.go`, `notify/api.go` — the last one neither reviewer
+caught), plus the brief's own Acceptance section, which claimed "no test edit"
+while the tree required one.
+
+Fixed by giving `internal_resolve` the same two-branch shape, which also buys
+the `outranks_*` half nothing previously asserted, and by rewording every site to
+"every env registered BEFORE it". Verified the way a reader would: append a
+hypothetical fifth `Spec` and confirm the module tests **re-classify** the new
+env as a junior instead of failing.
+
+### `Collisions` is now derived from `Resolve`
+
+Both reviewers also flagged the boot report. It compared every unordered pair
+independently of `Resolve`, so it could contradict it two ways: it ignored the
+length floor (re-surfacing the sibling name that `Resolve`'s ordering
+deliberately suppresses), and in a three-way collision it emitted the
+(docs-notify, bot-mention) pair with docs-notify as `serving_env` — a capability
+`Resolve` had already disabled. An operator acting on that line rotates the wrong
+secret and leaves a second ingress dark.
+
+Rewritten to call `Resolve` per env and report only the ones refused with
+`ReasonCollision`. Now the report cannot disagree with the thing it reports on:
+a too-short value yields no pair, and a three-way collision produces two lines,
+both naming the first env. The `SeniorServing` field carries the "still serving"
+claim explicitly, because a senior *can* be dark for its own reason once the
+registry grows an env with a floor above index 0.
+
 ## Verification
 
 `go build ./...`, `go vet ./...`, `golangci-lint`, `make i18n-extract-check`,

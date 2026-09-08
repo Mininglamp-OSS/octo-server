@@ -679,18 +679,24 @@ func (r *cardActionDispatchRuntime) Stop() {
 	}
 }
 
-// reportFixedInternalTokenCollisions logs one line per pair of fixed
-// internal-token envs sharing a value, naming the env that keeps serving and
-// the one pkg/internaltoken disabled. Env names only — never a value.
+// reportFixedInternalTokenCollisions logs one line per capability that
+// pkg/internaltoken disabled over a duplicated value, naming the env that
+// duplicated and the earlier env it duplicated. Env names only — never a value.
+//
+// The message does not claim the other env is still serving; the
+// duplicates_env_serving field says so, because a senior can be dark for its
+// own reason (a value below its floor) and an operator who rotates the wrong
+// secret on the strength of a "still serving" line leaves an ingress off.
 //
 // Log-only by design: a fixed-vs-fixed collision degrades module-locally and
 // must not fail boot (main_carddispatch_test.go). Promoting it to a boot
 // failure is a separate rollout decision.
 func reportFixedInternalTokenCollisions(getenv func(string) string) {
 	for _, collision := range internaltoken.Collisions(getenv) {
-		log.Error("two fixed internal-token envs share a value; the junior capability is disabled — give each one its own secret",
-			zap.String("serving_env", collision.Senior),
-			zap.String("disabled_env", collision.Junior))
+		log.Error("fixed internal-token env disabled: its value duplicates an earlier env — give each capability its own secret",
+			zap.String("disabled_env", collision.Junior),
+			zap.String("duplicates_env", collision.Senior),
+			zap.Bool("duplicates_env_serving", collision.SeniorServing))
 	}
 }
 

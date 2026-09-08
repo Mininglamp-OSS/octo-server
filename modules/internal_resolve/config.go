@@ -12,12 +12,15 @@ import (
 // / rotate one consumer without disturbing the rest, and shrinks the blast
 // radius if any single token leaks.
 //
-// The intra-set guard — "OCTO_DRIVE_INTERNAL_TOKEN must differ from every
-// other fixed internal-token env" — is no longer hand-rolled here. It lives in
-// pkg/internaltoken, which owns the registry of those envs and compares the
-// one being resolved against every OTHER registered entry, so a capability
-// added tomorrow is covered without this file changing. See that package's doc
-// for why coverage-by-convention was replaced.
+// The intra-set guard is no longer hand-rolled here. It lives in
+// pkg/internaltoken, which owns the registry of those envs and compares the one
+// being resolved against every entry registered BEFORE it. Registration order
+// is a precedence order, so the guard is directional, not symmetric: this token
+// yields to its seniors, and a capability registered after it is covered from
+// the other direction — by that junior capability disabling itself. Either way
+// a shared value never leaves two capabilities enabled, and a capability added
+// tomorrow needs no edit in this file. See that package's doc for why
+// coverage-by-convention was replaced.
 //
 // The strongest cross-capability guard still lives in main.go's
 // cardactiondispatch.Registry.ValidateNotifyTokenExclusions call, which is
@@ -85,8 +88,10 @@ const (
 
 // resolveDriveInternalToken loads OCTO_DRIVE_INTERNAL_TOKEN through the shared
 // registry, which refuses to enable the capability when the value is unset, too
-// short, or equal to ANY other registered fixed internal-token env. Refusal
-// yields the empty string, so ratelimitedInternalTokenAuth below fails closed.
+// short, or equal to the value of any env registered BEFORE it. Refusal yields
+// the empty string, so ratelimitedInternalTokenAuth below fails closed. A
+// capability registered AFTER this one is the side that yields on a collision,
+// so it disables itself rather than this endpoint.
 //
 // Cross-capability collision with the *dynamic* per-route notify tokens /
 // callback secrets loaded from OCTO_CARD_ACTION_ROUTES is checked centrally by

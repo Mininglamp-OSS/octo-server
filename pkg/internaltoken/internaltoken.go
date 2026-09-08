@@ -62,7 +62,10 @@
 // TestErrorsNeverContainTokenValue pins that no value can reach them.
 package internaltoken
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Header is the wire header carrying an internal-service credential. One
 // convention across every internal API in octo-server, owned here alongside the
@@ -95,6 +98,14 @@ const (
 // credentials. internal/cardactiondispatch applies the same constant to the
 // dynamic per-route callback secrets and notify tokens, so operators have one
 // bar to remember and raising it here raises it everywhere.
+//
+// "Everywhere" is not one blast radius, though, and raising this constant is a
+// rollout decision on the same footing as the MinBytes waivers below. A FIXED
+// env below the floor is disabled module-locally and boot succeeds. A DYNAMIC
+// route credential below the floor fails validateRouteSpec, which propagates
+// out of installCardActionDispatch and PANICS main. So a bump from 32 to, say,
+// 48 would quietly disable a fixed ingress AND hard-fail boot for any
+// deployment whose route callback secret or route notify token is 32-47 bytes.
 const DefaultMinBytes = 32
 
 // Spec describes one fixed internal-token env. Registry position is meaningful:
@@ -279,21 +290,41 @@ func Values(getenv func(string) string) []string {
 	return out
 }
 
-// Collision names one pair of registered envs sharing a value. Senior is the
-// env registered first (the one that keeps serving); Junior is the one Resolve
-// disables. Env names only — no value is ever carried.
+// Collision names one env that Resolve disabled because its value duplicates an
+// env registered earlier. Env names only — no value is ever carried.
 type Collision struct {
+	// Senior is the earlier-registered env whose value the junior duplicated.
 	Senior string
+	// Junior is the env Resolve disabled over the shared value.
 	Junior string
+	// SeniorServing reports whether the senior itself resolves. It is normally
+	// true — that is the whole point of the precedence rule — but a senior can
+	// be dark for its own reason (a value below its floor), and a log line that
+	// says "this one is still serving" must not say it then.
+	SeniorServing bool
 }
 
-// Collisions reports every pair of registered envs that share a non-empty
-// value, in precedence order.
+// Collisions reports every capability Resolve disabled over a shared value, in
+// precedence order.
 //
-// Resolve already disables the junior side on its own. This exists so boot can
-// show the whole picture at once: an operator reading "docs capability
-// disabled" as a standalone line has to work out which other env it collided
-// with, and that the other one is still serving.
+// It is derived from Resolve rather than re-deriving the comparison, so the
+// boot report cannot contradict what actually happened. Two consequences worth
+// stating, because the obvious "compare every pair" implementation gets both
+// wrong:
+//
+//   - A value below its env's floor is refused for length, not collision, so no
+//     pair is reported for it. That preserves Resolve's deliberate ordering —
+//     "lengthen this secret" is the whole fix, and naming a sibling env
+//     alongside it only adds a second thing for the operator to rule out.
+//
+//   - When three envs share one value, only two lines appear, both naming the
+//     first env as the survivor. Reporting all three unordered pairs would name
+//     the middle env as a survivor while Resolve has it disabled, and an
+//     operator acting on that line rotates the wrong secret.
+//
+// Resolve already disables each junior on its own; this exists so boot can show
+// the whole picture at once, since a standalone "docs capability disabled" line
+// leaves the operator to work out which env it duplicated.
 //
 // A nil getenv panics, for the same reason as Values.
 func Collisions(getenv func(string) string) []Collision {
@@ -301,16 +332,18 @@ func Collisions(getenv func(string) string) []Collision {
 		panic("internaltoken: Collisions requires a getenv; a nil lookup would silently report no collisions")
 	}
 	var out []Collision
-	for i, junior := range registry {
-		value := getenv(junior.Env)
-		if value == "" {
+	for _, spec := range registry {
+		_, err := Resolve(spec.Env, getenv)
+		var resolveErr *Error
+		if !errors.As(err, &resolveErr) || resolveErr.Reason != ReasonCollision {
 			continue
 		}
-		for _, senior := range registry[:i] {
-			if value == getenv(senior.Env) {
-				out = append(out, Collision{Senior: senior.Env, Junior: junior.Env})
-			}
-		}
+		_, seniorErr := Resolve(resolveErr.Other, getenv)
+		out = append(out, Collision{
+			Senior:        resolveErr.Other,
+			Junior:        spec.Env,
+			SeniorServing: seniorErr == nil,
+		})
 	}
 	return out
 }

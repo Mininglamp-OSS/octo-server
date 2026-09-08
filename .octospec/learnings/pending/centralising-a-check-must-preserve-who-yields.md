@@ -91,3 +91,28 @@ it a property of the data, not to replace it with something tidier.**
 - **Ask the availability question out loud in review.** "What does a broken-but-
   working deployment do on the next deploy?" catches this class; "does the
   invariant hold?" does not.
+
+## Postscript: the abandoned design leaves fingerprints
+
+Switching from the symmetric rule to precedence updated the implementation and
+two of the three module tests. The third kept asserting the symmetric shape —
+"refuse against every OTHER registered env" — and **passed**, because its subject
+happened to be registered last, which made every sibling a senior. Five prose
+comments kept describing the symmetric guard too, in security-sensitive files.
+
+Two reviewers found it independently; the test suite and the linter could not,
+because a positional accident is invisible to both.
+
+So the rule has a second half: **when you abandon a design mid-change, grep for
+the sentences and the assertions that described it.** An executable assertion
+that outlives the design it was written for is worse than a stale comment — the
+next person to exercise the new design meets a red test whose comment says the
+code guarantees something it does not, and the cheapest way out of a red
+assertion is to weaken it. That is the same convention-decay the centralisation
+was meant to end, relocated into the test file.
+
+The check that catches it is cheap and specific: **perform the extension the new
+design advertises.** Here that was "append one registry entry and re-run" — it
+produced the failure in seconds, and after the fix it produced a passing
+`outranks_*` subtest instead, which is the positive proof that the claim
+"appending needs no edit anywhere else" is now true.

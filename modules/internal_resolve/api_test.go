@@ -413,11 +413,13 @@ func TestResolveDriveInternalTokenRejectsShortValue(t *testing.T) {
 func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 	// Enumerate the shared registry rather than a hand-written sibling list.
 	//
-	// The registry guard is directional: the drive token yields to every env
-	// registered BEFORE it, and an env registered after it is covered from the
-	// other direction, by that junior capability disabling itself. Branching on
-	// the precedence index rather than asserting refusal against every sibling
-	// is what makes this test survive an appended Spec.
+	// The guard is directional: the drive token yields to every env registered
+	// BEFORE it; envs registered after it are covered from the other direction,
+	// by that junior capability disabling itself. Branching on the precedence
+	// index rather than asserting refusal against every sibling is what makes
+	// this test survive an appended Spec — asserting the symmetric shape would
+	// go red the moment the registry grows, and the cheapest way out of a red
+	// assertion is to delete it.
 	//
 	// OCTO_MARKETPLACE_INTERNAL_TOKEN is checked separately below: it is not in
 	// the registry yet, and #827 made that pair symmetric rather than
@@ -472,6 +474,9 @@ func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 			continue
 		}
 		t.Run("outranks_"+sibling, func(t *testing.T) {
+			// The junior env is the side that gets disabled, so this endpoint
+			// keeps serving. Asserted from this module so a future reordering of
+			// the registry shows up as a behaviour change here too.
 			token, err := resolveDriveInternalToken(getenv)
 			if err != nil {
 				t.Fatalf("unexpected refusal when the junior env %s duplicates this token: %v", sibling, err)

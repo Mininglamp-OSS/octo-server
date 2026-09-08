@@ -105,12 +105,16 @@ func TestMainWiresDriveTokenIntoValidateNotifyTokenExclusions(t *testing.T) {
 	}
 }
 
-// TestDriveTokenIsGuardedAgainstEverySibling pins the property this module used
-// to hand-roll: the drive token is compared against every OTHER fixed
-// internal-token env, not just the ones that existed when this module was
-// written. Enumerating the registry means a capability added later is covered
-// with no edit here.
-func TestDriveTokenIsGuardedAgainstEverySibling(t *testing.T) {
+// TestDriveTokenIsRegisteredWithSiblings pins the precondition this module used
+// to hand-roll for itself: the drive token is in the shared registry alongside
+// the other fixed internal-token envs, so Resolve compares it against its
+// seniors and any capability added later yields to it. Enumerating the registry
+// means an appended env needs no edit here.
+//
+// This asserts membership, not the comparison itself — that is
+// TestResolveDriveInternalTokenRejectsSiblingCollision's job, and it branches on
+// the precedence index because the guard is directional.
+func TestDriveTokenIsRegisteredWithSiblings(t *testing.T) {
 	envs := internaltoken.Envs()
 	if len(envs) < 2 {
 		t.Fatalf("registry holds %d envs; the cross-capability guard would be vacuous", len(envs))

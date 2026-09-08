@@ -49,7 +49,12 @@ naming the other two.
 
 The fix keeps the ladder's *semantics* and makes it a property of the data:
 appending a Spec guards it against every existing env, and every existing env
-against it, with no edit anywhere else.
+against it, with no edit anywhere else. The guard is **directional** — the
+appended env yields to all of them, and they are protected from the other
+direction, by it disabling itself. Module tests must therefore branch on the
+precedence index; a test that asserts the symmetric shape passes only while its
+subject happens to be registered last, and goes red the moment the registry
+grows (PR #853 review, P1).
 
 `main.go` remains the only place that also sees the *dynamic* per-route notify
 tokens and callback secrets from `OCTO_CARD_ACTION_ROUTES`.
@@ -110,10 +115,16 @@ was disabled before is enabled now.
 
 - `pkg/internaltoken` table test enumerates the registry and asserts every
   unordered pair is covered exactly once, that the junior side is disabled and
-  the senior side keeps serving, so a newly registered env is covered against
-  all existing ones with no test edit
-  (`TestResolveCoversEveryRegisteredPair`). The precedence order itself is
-  pinned by `TestRegistryPrecedenceOrderIsStable`.
+  the senior side keeps serving (`TestResolveCoversEveryRegisteredPair`). The
+  precedence order itself is pinned by `TestRegistryPrecedenceOrderIsStable`.
+- **Appending a fifth `Spec` requires no edit to production code or to any
+  test.** Verified the way a reader would: append a hypothetical entry, run
+  `pkg/internaltoken` plus the three module packages, and confirm the module
+  tests re-classify the new env as a junior (`outranks_*`) instead of failing.
+- The boot collision report never names a disabled env as the survivor, and
+  never reports a value refused for length as a collision
+  (`TestCollisionsNeverNameADarkEnvAsTheSurvivor`,
+  `TestCollisionsRespectTheLengthFloor`).
 - `Values` / `Collisions` panic on a nil lookup rather than reporting an empty
   credential set, so the one gate that aborts startup cannot degrade into a
   no-op (`TestValuesPanicsOnNilGetenv`), and `main_wiring_test.go` pins that
