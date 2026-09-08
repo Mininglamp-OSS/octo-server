@@ -56,6 +56,19 @@ type Project struct {
 	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, error)
 	disbandFn func(projectID, actorUID, spaceID string) ([]string, error)
 
+	// lifecycleEventSender is the delivery seam for the lifecycle outbox.
+	//
+	// Nil in production, where lifecycleSenderOrDefault builds the real HTTP
+	// client from config. A test sets it to drive the outcomes that decide
+	// whether an undelivered event eventually lands or is abandoned — a 409, an
+	// auth failure mid-rotation, a timeout — none of which can be produced
+	// reliably by standing up a server and hoping.
+	//
+	// An instance field, not a package var, for the reason recorded on the batch
+	// seams above: a mutable function pointer shared across the process is not
+	// something to put on a delivery path that carries revocations.
+	lifecycleEventSender lifecycleSender
+
 	// nudgeProvisioningFn is the post-create worker trigger, as an instance seam on the
 	// same terms as the five above: production gets the real goroutine, and a test that
 	// needs to observe the outbox BEFORE the worker touches it swaps this on its own
@@ -124,6 +137,14 @@ func New(ctx *config.Context) *Project {
 	p.nudgeProvisioningFn = p.nudgeProvisioningWorker
 
 	p.registerSpaceMemberRemovalCleanup()
+	// 项目生命周期事件发件箱。自身带 fail-closed 开关：未开启或配置不完整时不注册任何
+	// 定时任务，也就不会对一个该部署根本不关心的表发起扫描——这正是本模块之前在没有
+	// 项目、没有流量的 pod 上仍每 tick 跑三个失败扫描的成因。
+	//
+	// registerAllMemberGroupOwnerFinalizer 不在这里了：main 把那个函数删掉了（全员群
+	// owner 的收尾改由 #887 的 syncAllMemberGroupOwner 在转让路径上同步做），rebase
+	// 时保留调用会编译不过。
+	p.startLifecycleEventWorker()
 	// Publish the provisioning configuration verdict at CONSTRUCTION, not in Route():
 	// a rejected target must be visible even in a crash loop that never reaches Route,
 	// and a startup log line alone is lost within minutes.
