@@ -52,6 +52,7 @@ const (
 	envMaxPerSpace    = "OCTO_PROJECT_MAX_PER_SPACE"
 	envMaxPerCreator  = "OCTO_PROJECT_MAX_PER_CREATOR_PER_SPACE"
 	envMaxMembers     = "OCTO_PROJECT_MAX_MEMBERS"
+	envMaxPinned      = "OCTO_PROJECT_MAX_PINNED"
 	envMaxDailyCreate = "OCTO_PROJECT_MAX_DAILY_CREATE"
 	envMemberBatchMax = "OCTO_PROJECT_MEMBER_BATCH_MAX"
 	envDayBoundaryTZ  = "OCTO_PROJECT_DAY_BOUNDARY_TZ"
@@ -69,9 +70,16 @@ const (
 // Defaults. The three project/member caps come from the brief; the batch cap and
 // the worker cadence are chosen here.
 const (
-	defaultMaxPerSpace    = 1000
-	defaultMaxPerCreator  = 100
-	defaultMaxMembers     = 500
+	defaultMaxPerSpace   = 1000
+	defaultMaxPerCreator = 100
+	defaultMaxMembers    = 500
+	// defaultMaxPinned caps how many projects one user may pin PER SPACE.
+	//
+	// Per Space, not globally: the pinned section is rendered inside one Space's
+	// project list, so a global budget would let pinning in a Space the caller is
+	// looking at be refused because of pins in a Space they cannot see — a limit
+	// whose cause is invisible from where it is enforced.
+	defaultMaxPinned      = 6
 	defaultMaxDailyCreate = 20
 	// defaultMemberBatchMax bounds one add/remove request structurally, on top of
 	// any byte cap: a well-formed payload of ten thousand uids would otherwise turn
@@ -115,6 +123,7 @@ type Config struct {
 	MaxPerSpace       int
 	MaxPerCreator     int
 	MaxMembers        int
+	MaxPinned         int
 	MaxDailyCreate    int
 	MemberBatchMax    int
 	DayBoundary       *time.Location
@@ -153,6 +162,7 @@ func loadConfig() Config {
 		MaxPerSpace:       envPositiveInt(envMaxPerSpace, defaultMaxPerSpace),
 		MaxPerCreator:     envPositiveInt(envMaxPerCreator, defaultMaxPerCreator),
 		MaxMembers:        envPositiveInt(envMaxMembers, defaultMaxMembers),
+		MaxPinned:         envPositiveInt(envMaxPinned, defaultMaxPinned),
 		MaxDailyCreate:    envPositiveInt(envMaxDailyCreate, defaultMaxDailyCreate),
 		MemberBatchMax:    envPositiveInt(envMemberBatchMax, defaultMemberBatchMax),
 		DayBoundary:       loc,

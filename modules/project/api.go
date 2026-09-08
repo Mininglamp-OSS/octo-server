@@ -197,6 +197,10 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		// a role check — see listProjectGroupsHandler.
 		projectScoped.GET("/:project_id/groups", p.listProjectGroupsHandler)
 
+		// Personal preferences for one project (pinning). A settings bag rather
+		// than /pin + /unpin, mirroring PUT /v1/groups/:group_no/setting.
+		projectScoped.PUT("/:project_id/setting", p.updateSettingHandler)
+
 		projectScoped.GET("/:project_id/members", p.listMembersHandler)
 		projectScoped.POST("/:project_id/members/add", p.addMembersHandler)
 		projectScoped.POST("/:project_id/members/remove", p.removeMembersHandler)
@@ -343,7 +347,10 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 	// only ever widens READ visibility, which does not apply to a response about a project
 	// the caller owns.
 	humans, agents := p.splitSeatCounts(model.ProjectID)
-	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, humans, agents))
+	// pinned is false and that is provable, not assumed: this project id was
+	// generated inside the transaction that just committed, so no settings row
+	// for it can exist yet.
+	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, humans, agents, false))
 }
 
 // respondCreateError maps the create sentinels onto registered codes. Kept separate
@@ -471,7 +478,7 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 		// member_count means. Reporting the full seat count here while the detail
 		// route reported humans only would have been D16's own bug, one endpoint
 		// away.
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount()))
+		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount(), row.Pinned == 1))
 	}
 	c.Response(resps)
 }
@@ -484,7 +491,13 @@ func (p *Project) getProjectHandler(c *wkhttp.Context) {
 		return
 	}
 	humans, agents := p.splitSeatCounts(row.ProjectID)
-	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents))
+	pinned, err := p.db.queryProjectPinned(row.ProjectID, c.GetLoginUID())
+	if err != nil {
+		p.Error("查询项目置顶状态失败", zap.Error(err), zap.String("projectId", row.ProjectID))
+		respondQueryFailed(c)
+		return
+	}
+	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents, pinned))
 }
 
 func (p *Project) listMembersHandler(c *wkhttp.Context) {
@@ -615,7 +628,16 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	// caller their write failed when it did not, which is the one thing a response
 	// after a successful write must not do.
 	humans, agents := p.splitSeatCounts(updated.ProjectID)
-	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents))
+	// The pin survives a rename, so it has to be re-read rather than defaulted:
+	// reporting false here would make the caller watch their own card leave the
+	// pinned section until the next list fetch.
+	pinned, err := p.db.queryProjectPinned(updated.ProjectID, c.GetLoginUID())
+	if err != nil {
+		p.Error("查询项目置顶状态失败", zap.Error(err), zap.String("projectId", updated.ProjectID))
+		respondQueryFailed(c)
+		return
+	}
+	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents, pinned))
 }
 
 func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
@@ -664,7 +686,15 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 // toResp renders a project. memberCount counts HUMANS and agentCount counts AI
 // agents (D16); MaxMembers still bounds the two together, because a seat is a
 // seat regardless of who sits in it.
-func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int) *Resp {
+// toResp shapes one project for the wire.
+//
+// pinned is a parameter rather than a field on Model because it is a fact about
+// the CALLER, not about the project: the same row is pinned for one user and not
+// for the next. Every call site must therefore supply it truthfully — a default of
+// false would make the update route report a project as un-pinned right after the
+// caller renamed it, and the client would watch its own card jump out of the
+// pinned section until the next list fetch.
+func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int, pinned bool) *Resp {
 	return &Resp{
 		ProjectID:        m.ProjectID,
 		SpaceID:          m.SpaceID,
@@ -679,6 +709,7 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount in
 		MemberEpoch:      m.MemberEpoch,
 		Status:           m.Status,
 		AllMemberGroupNo: m.AllMemberGroupNo,
+		Pinned:           pinned,
 		MyRole:           myRole,
 		Capabilities:     capabilitiesFor(myRole, spaceRole),
 		CreatedAt:        formatTime(m.CreatedAt),

@@ -1,8 +1,9 @@
 # octospec Implement-phase record for task project-p2-product-surfaces, PR-1.
 #
-# Scope of this record: PR-1 only — GET /v1/projects/:project_id/groups. PR-2
-# (project_id on the sidebar) and PR-3..PR-5 are not implemented and are not
-# covered here.
+# Scope of this record: PR-1 (GET /v1/projects/:project_id/groups) and PR-5
+# (per-user project pinning, capped at 6 per Space). PR-2 (project_id on the
+# sidebar), PR-3 (join_mode self-join) and PR-4 (is_official) are not implemented
+# and are not covered here.
 #
 # Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
 # tier available), so every injected rule resolves to the repo tier.
@@ -82,6 +83,16 @@ injected:
     why: |
       paths ** matches everything; brief tag commit. English Conventional
       Commits.
+
+  - id: migration
+    source: none
+    why: |
+      No repo rule carries a migration tag - the brief lists it, _index.yaml does
+      not define it - so nothing was injected for it. The conventions applied are
+      the ones the module already documents in its own SQL: octo_ prefix,
+      utf8mb4_general_ci, application-written UTC with no CURRENT_TIMESTAMP or ON
+      UPDATE, and no apostrophes anywhere in the file because the module migration
+      test splits statements naively and apostrophes cancel in pairs.
 
 brief: .octospec/tasks/project-p2-product-surfaces/brief.md
 

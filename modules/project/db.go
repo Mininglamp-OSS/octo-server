@@ -330,7 +330,8 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			// stays in the statement.
 			"(SELECT COUNT(*) FROM `octo_project_member` sc "+
 			"  WHERE sc.project_id = p.project_id AND sc.status = 1 AND sc.removing = 0"+
-			"  ) AS seat_count "+
+			"  ) AS seat_count, "+
+			"IFNULL(s.pinned, 0) AS pinned "+
 			"FROM `octo_project` p "+
 			// `removing = 0` on the JOIN as well as on the count: without it a member
 			// whose seat is closing keeps my_role, and — worse — keeps
@@ -341,10 +342,35 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			"LEFT JOIN `octo_project_member` pm "+
 			"  ON pm.project_id = p.project_id AND pm.uid = ? AND pm.status = 1 "+
 			"     AND pm.removing = 0 "+
+			// The caller-specific pin. A LEFT JOIN rather than a correlated
+			// subquery because it also drives the ORDER BY, and it costs one
+			// equality probe on uk_octo_project_user_setting (project_id, uid) —
+			// the same key the upsert is idempotent on, which is why this table
+			// needs no second index.
+			"LEFT JOIN `octo_project_user_setting` s "+
+			// Both sides are octo_project*, i.e. both general_ci. No COLLATE: one
+			// between two same-collation columns is not free — an explicit COLLATE
+			// has coercibility 0, so the other side is converted per row and its
+			// index stops serving the predicate. PR #855 measured that exact cost
+			// on this schema.
+			"  ON s.project_id = p.project_id AND s.uid = ? "+
 			"WHERE p.space_id = ? AND p.status = ? "+
 			"  AND (p.discoverability = ? OR pm.uid IS NOT NULL) "+
-			"ORDER BY p.id DESC LIMIT ? OFFSET ?",
-		roleNonMember, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed, limit, offset,
+			// Pinned first, most recently pinned before the rest, then the
+			// pre-existing order UNCHANGED. Two properties are load-bearing:
+			//
+			//   - Totality. p.id is unique, so the three keys together are a total
+			//     order however the first two tie. OFFSET pagination silently drops
+			//     and duplicates rows across pages under a non-total ORDER BY, and
+			//     this list is paginated.
+			//   - IFNULL rather than relying on NULL ordering. An unpinned project
+			//     has no row here, so s.pinned is NULL; MySQL sorts NULL lowest, so
+			//     plain DESC would happen to be right today. Writing it out means a
+			//     reader does not have to know that, and a future port to a database
+			//     that orders NULLs the other way does not silently invert the list.
+			"ORDER BY IFNULL(s.pinned, 0) DESC, s.pinned_at DESC, p.id DESC "+
+			"LIMIT ? OFFSET ?",
+		roleNonMember, uid, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed, limit, offset,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: list projects in space: %w", err)
@@ -442,6 +468,10 @@ type listRow struct {
 	// behind that choice. Computed by the page statement, i.e. under a DIFFERENT
 	// read view from MemberCount — see AgentCount.
 	SeatCount int `db:"seat_count"`
+	// Pinned is the CALLER's pin, not a property of the project — the same row
+	// reads 1 for one user and 0 for the next. It comes from the LEFT JOIN, so an
+	// unpinned project reads 0 rather than dropping out of the list.
+	Pinned int `db:"pinned"`
 }
 
 // AgentCount is the agent half of D16's split, derived from the two counts.

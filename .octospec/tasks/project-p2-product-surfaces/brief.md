@@ -57,7 +57,11 @@ Four surfaces, in the order they unblock things:
 1. **`GET /v1/projects/:project_id/groups`** — the caller's groups within one project (PR-1).
 2. **`project_id` on the sidebar** — the last hop of the passthrough #855 starts (PR-2).
 3. **`join_mode = 0` self-join** — a column P0 shipped with no writer and no reader (PR-3).
-4. **`is_official` management** and **per-user project pinning** (PR-4, PR-5).
+4. **`is_official` management** (PR-4) and **per-user project pinning** (PR-5).
+
+PR-1 and PR-5 ship together in #861 at the requester's direction (2026-09-08). They are
+independent features sharing a branch, which is a review cost paid deliberately, not a
+dependency.
 
 PR-1 and PR-2 are independently shippable and are the whole of the unblock. PR-3 to PR-5
 carry their own product questions and must not hold PR-1 up.
@@ -291,7 +295,7 @@ so `SharedUIDRateLimiter` is the right layer, but it is a *membership write* dri
 alone, which is a new shape for this module. Quota interaction with
 `ErrProjectQuotaPerSpace` / `ErrProjectQuotaDailyCreate` must be spelled out in the PR.
 
-**D8 — Per-user project pinning (PR-5) is a new table, not a column.**
+**D8 — Per-user project pinning (PR-5) is a new table, not a column. SHIPPED, with a cap.**
 
 `octo_project_user_setting (project_id, uid, pinned, pinned_at, created_at, updated_at)`,
 `UNIQUE (project_id, uid)`, `octo_` prefix, `utf8mb4_general_ci`, application-written UTC times
@@ -304,6 +308,33 @@ A column on `octo_project_member` was considered and rejected: pinning is not a 
 (a Space admin can see a `space_listed` project they have not joined, and could reasonably pin
 it), and every write to `octo_project_member` is on the epoch-bumping path — a pin is not a
 membership change and must not bump `member_epoch`.
+
+*As implemented*, three things the draft did not settle:
+
+- **The write is a settings bag, not `/pin` + `/unpin`.** `PUT /v1/projects/:project_id/setting`
+  with a pointer field, following `PUT /v1/groups/:group_no/setting` (top / mute / save /
+  remark through one route onto `group_setting (group_no, uid)`). Two verb routes are simpler
+  only while there is one preference; the second costs two routes and two handlers where this
+  costs a key. PUT is also idempotent by contract, so "pin an already-pinned project" needs no
+  answer invented for it.
+- **The read is a field on the existing list, not a second endpoint.** A separate "my pinned
+  projects" route would make the client fetch twice and merge — and the *order* has to be the
+  server's, because OFFSET pagination needs a total order that a client-side merge cannot
+  reconstruct. `ORDER BY IFNULL(s.pinned,0) DESC, s.pinned_at DESC, p.id DESC` keeps the
+  pre-existing tail order byte-identical.
+- **A cap of 6 pinned projects PER SPACE** (`OCTO_PROJECT_MAX_PINNED`, requester's call,
+  2026-09-08), refused with `err.server.project.quota_pinned` carrying `max` in details.
+  Per Space rather than per user because the pinned section is rendered inside one Space's
+  list: a global budget would refuse a pin in the Space the caller is looking at because of
+  pins in a Space they cannot see. Unpinning is never refused (it is the operation that frees
+  a slot), re-pinning something already pinned is never refused (it adds no row), and a
+  disbanded project releases its slot (its owner can no longer see it to unpin it).
+
+The count and the write share a transaction so the check reads the snapshot the write lands in.
+That is NOT atomicity against a concurrent pin by the same uid: two requests that both count 5
+both insert, leaving 7. The window is a double-click inside a 2 rps shared bucket and its worst
+outcome is one extra row the user can remove, so it does not justify serialising every pin
+behind a lock. Recorded because "there is a transaction here" reads like "this is atomic".
 
 ### Also parked by P0/P1, still unowned at HEAD
 

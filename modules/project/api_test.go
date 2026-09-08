@@ -528,6 +528,7 @@ var projectMigrationFiles = []string{
 	// tiebreak is not an order anybody chose.
 	"sql/20260907000001_project_provisioning.sql",
 	"sql/20260907000002_project_all_member_group.sql",
+	"sql/20260908000001_project_user_setting.sql",
 }
 
 // applyProjectMigration executes one section of every migration file this module

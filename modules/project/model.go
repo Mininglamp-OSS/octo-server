@@ -172,6 +172,21 @@ type updateReq struct {
 	MaxMembers      *int    `json:"max_members"`
 }
 
+// settingReq is the caller's personal preferences for one project.
+//
+// Shaped as a settings bag with pointer fields rather than as /pin and /unpin
+// routes, following PUT /v1/groups/:group_no/setting, which carries top / mute /
+// save / remark through one endpoint. Two verb routes look simpler while there is
+// one preference and stop looking simpler at the second: a preference then costs a
+// key here, not two routes and two handlers.
+//
+// A pointer distinguishes "not mentioned" from "set to false", so a client that
+// learns about a future preference does not have to send every field to change
+// one. An empty body is a no-op, not a reset.
+type settingReq struct {
+	Pinned *bool `json:"pinned"`
+}
+
 type membersReq struct {
 	UIDs []string `json:"uids"`
 }
@@ -237,6 +252,12 @@ type Resp struct {
 	AllMemberGroupNo string `json:"all_member_group_no"`
 	// MyRole is the caller's project role, or -1 when the caller is not a member
 	// (a Space admin reading a project they have not joined).
+	// Pinned is the CALLER's own pin, not a property of the project: the same
+	// project reads true for one user and false for the next. It is on the list
+	// AND the detail route, because a field present on one and absent on the other
+	// makes the two disagree about the same project — the defect
+	// all_member_group_no already had to be fixed for once.
+	Pinned       bool         `json:"pinned"`
 	MyRole       int          `json:"my_role"`
 	Capabilities Capabilities `json:"capabilities"`
 	CreatedAt    string       `json:"created_at"`

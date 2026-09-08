@@ -28,6 +28,7 @@ const (
 	entryProjectCreate  = "project_create"
 	entryProjectUpdate  = "project_update"
 	entryProjectDisband = "project_disband"
+	entryProjectSetting = "project_setting"
 )
 
 // Rejection reasons. Low-cardinality enum; never a free-form message.
@@ -37,6 +38,7 @@ const (
 	reasonQuotaPerSpace    = "quota_per_space"
 	reasonQuotaPerCreator  = "quota_per_creator"
 	reasonQuotaDailyCreate = "quota_daily_create"
+	reasonQuotaPinned      = "quota_pinned"
 	reasonProjectDisbanded = "project_disbanded"
 	reasonFlagOff          = "flag_off"
 	reasonPermissionDenied = "permission_denied"
