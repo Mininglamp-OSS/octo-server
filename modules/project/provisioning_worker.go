@@ -15,11 +15,18 @@ import (
 
 // The eager subsystem-provisioning worker (brief D2, Shape S).
 //
-// This file, and only this file, is allowed to import
-// internal/projectprovision. That is the "outbound confinement" rule: a request
-// handler that reaches fleet or drive makes a user request depend on another
-// service being up, so the outbound client stays behind a package boundary a
-// source guard can check (TestProvisioningClientIsConfinedToTheWorker).
+// No REQUEST HANDLER may import internal/projectprovision, and this file is the only one
+// that CALLS it. That is the "outbound confinement" rule: a handler that reaches fleet or
+// drive makes a user request depend on another service being up, so the outbound client
+// stays behind a package boundary a source guard can check
+// (TestProvisioningClientIsConfinedToTheWorker, which checks exactly that — no handler file
+// imports the package, and .Ensure( appears in one file).
+//
+// Stated as "no handler" rather than "only this file", which is what it used to say and was
+// false: config_provisioning.go imports the package too, for Target and ValidateTarget at
+// boot. That is fine and intended — the rule is about the request path, not about the
+// identifier — but the comment claimed a stronger property than either the design or the
+// guard has.
 //
 // The driver is the outbox row, not this code. Retry, backoff and the give-up
 // decision are all persisted, because a pod restart must not lose them. What lives

@@ -6,9 +6,13 @@
 // mechanism rather than tidiness. The brief's "outbound confinement" rule says no
 // request handler may reach fleet or drive, because a handler that does makes a
 // user request depend on another service being up. A package boundary makes that
-// checkable: modules/project's provisioning worker is the only file in this
-// repository allowed to import this package, and a source guard in that module
-// asserts it (TestProvisioningClientIsConfinedToTheWorker).
+// checkable: no REQUEST HANDLER in this repository may import this package, and
+// modules/project's provisioning worker is the only file that calls Ensure. A source
+// guard in that module asserts both (TestProvisioningClientIsConfinedToTheWorker).
+//
+// Not "only one file may import it" — modules/project/config_provisioning.go imports it too,
+// for Target and ValidateTarget at boot, which is intended. The earlier wording claimed a
+// property neither the design nor the guard has.
 //
 // # What this package deliberately does NOT do
 //

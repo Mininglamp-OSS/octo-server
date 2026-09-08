@@ -113,8 +113,9 @@ Both found by mutation, not by reading:
 
 ## The follow-up round: a field that was preserved and empty
 
-Both approving reviews independently named the same item as the one to fix before any target
-is enabled, and it is worth recording why a *cosmetic-looking* defect earned that.
+Both approving reviews named the same item as the one to fix before any target is enabled —
+the first raised it, the second arbitrated and concurred with explicit credit, so "converged",
+not "independently" — and it is worth recording why a *cosmetic-looking* defect earned that.
 
 `last_error` for a target that is down read `transport_failed: projectprovision:
 transport_failed` — the outcome label, twice. The real reason (connection refused / DNS / TLS
@@ -158,8 +159,36 @@ So two guards now own that half:
 - Every parenthesised column tuple made *entirely* of the table's own columns is read as a
   claim about an index, and must be a **prefix** of a key the migration actually declares.
 
-Both found a real live instance on the first run — `brief.md` still enumerated
+The **tuple** guard found a real live instance on its first run — `brief.md` still enumerated
 `(status, finished_at)` after the index change, which three reviewers and I had all missed.
+
+I wrote "both" in four places. That was false, and the way it was false is the lesson. The
+path guard's first run produced a screenful of output, **all of it false positives** from an
+over-greedy regex I then fixed — and I recorded "produced output on first run" as "caught a
+real instance". A reviewer replayed both guards against the pre-fix tree and the path guard
+found nothing; I reproduced that before accepting it. A false efficacy claim is worse than no
+claim, because it is exactly what makes the next reader skip mutation-checking that guard —
+and this one needed it: **the first version could not see a two-segment package misspelling,
+which is one of the two defects the guard is named for.** Its parent-directory fallback
+resolved any two-segment reference through its always-present top-level directory, and my own
+mutation had used an extension-bearing path, which takes the other arm. The fallback now
+applies only at three or more segments.
+
+Three more things that came out of the same round, all of them about guards rather than about
+the feature:
+
+- **A coverage floor must sit above the count that survives losing the subject.** The file
+  floor was 12 against 15 matched files, three of which were the handover documents — the
+  exact class both historical defects occurred in. Deleting that directory passed the floor
+  while the guard silently stopped covering its own subject.
+- **A guard that only matches unwrapped text does not pin the instance it describes.** The
+  tuple guard could not see an enumeration wrapped across two comment lines — which is the
+  shape the historical instance actually had. It pinned the current text, not the defect.
+- **"The DDL is the source of truth" inverts for a header comment.** The tuple guard skipped
+  `.sql` files on that reasoning, and a stale enumeration survived in the migration header —
+  in the same commit that added the guard to make that shape impossible. Prose *above* a
+  statement is a claim *about* it.
+
 Two implementation notes worth keeping:
 
 - **The first version of the path guard was all false positives.** It matched HTTP route

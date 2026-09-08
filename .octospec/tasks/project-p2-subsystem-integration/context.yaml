@@ -8,7 +8,14 @@
 
 slice: PR-5 (provisioning outbox, octo-server half only)
 branch: feat/project-p2-provisioning-outbox
-base: main @ c7abadeb (P0 #841 merged; P1 #846 still OPEN and NOT required by this slice)
+base: main @ d5b091a6 (P0 #841 and P1 #846 both merged; rebased onto P1 on 2026-09-07)
+# Originally written against main @ c7abadeb, when P1 #846 was still open and this slice was
+# built and verified without it. That independence was real and is what let the two ship in
+# parallel — but it stopped being TRUE of the shipped tree the moment P1 merged and this
+# branch rebased onto it, and the record kept asserting it for three heads. It is now the
+# opposite: P1 made modules/group depend on modules/project, which closed an import cycle
+# through internal/cardactiondispatch and forced the pkg/octosign extraction. See the
+# octosign-leaf-extraction deviation.
 
 injected:
   - id: space-isolation
@@ -160,7 +167,7 @@ deviations:
       The gap that matters is freshness: the timestamp is inside the signed string so it
       cannot be edited, but a captured request can still be REPLAYED, and because ensure
       is idempotent a replay resurrects a container the subsystem had already reclaimed.
-      cardactiondispatch.Verify checks only the MAC. Written down now because neither
+      octosign.Verify checks only the MAC. Written down now because neither
       subsystem has started its ensure endpoint — after they ship it is a cross-repo
       rework.
   - id: no-lease-heartbeat
@@ -312,9 +319,15 @@ deviations:
       review attention should not be spent on them. The class matters more than usual here
       because the feature is inert: nothing exercises it, so its correctness reaches an
       operator only through the runbook and reaches two other teams only through a contract
-      file. Both guards found a real live instance on their first run (a stale index
-      enumeration in brief.md that three reviewers and the author had missed), and both are
-      mutation-verified against the exact shapes that shipped.
+      file. The TUPLE guard found a real live instance on its first run — a stale index
+      enumeration in brief.md that three reviewers and the author had missed. The PATH guard
+      found none: an earlier revision of this entry said "both", which was wrong. Its first
+      run produced a screenful of output, all false positives from an over-greedy regex that
+      was then fixed, and that was mistaken for a catch. Corrected after a reviewer replayed
+      both guards against the pre-fix tree. It matters because a false efficacy claim is
+      exactly what makes the next reader skip mutation-checking a guard — and the path guard
+      genuinely needed it: its first version could not see a two-segment package
+      misspelling, which is one of the two defects it is named for.
   - id: conformance-vectors
     what: |
       internal/projectprovision ships four fixed request/verdict vectors (valid /
@@ -322,7 +335,7 @@ deviations:
       byte by byte; passing them is a runbook precondition for enabling a target.
     why: |
       Go internal/ packages are not importable cross-repo, so pointing receivers at
-      cardactiondispatch.CanonicalRequest asked two codebases to reimplement it from prose.
+      octosign.CanonicalRequest asked two codebases to reimplement it from prose.
       A wrong canonical string fails closed and is self-announcing; a lenient timestamp
       check fails open and is silent — the vectors make the silent one checkable, and the
       drift test keeps the table from rotting away from the implementation.

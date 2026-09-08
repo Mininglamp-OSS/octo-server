@@ -1,7 +1,11 @@
 # 实施计划：project-p2-subsystem-integration / PR-5（子系统容器预置 outbox）
 
 > **状态：已实施**（2026-09-07）。分支 `feat/project-p2-provisioning-outbox`，
-> base = `main @ c7abadeb`（P0 #841 已合并；**P1 #846 仍 OPEN，本切片不依赖它**）。
+> base = `main @ d5b091a6`（P0 #841 与 **P1 #846 均已合并**；本分支已于 2026-09-07 rebase 到 P1 之上）。
+> 本片最初是在 `main @ c7abadeb`、P1 还 OPEN 时写就并验证的，那种独立性当时是真的、也正是两片
+> 能并行推进的原因 —— 但 P1 合并、本分支 rebase 之后它就不再是**已交付这棵树**的事实了，而记录
+> 还照旧断言了三个 head。现在恰好相反：P1 让 `modules/group` 依赖 `modules/project`，闭合了一条
+> 经由 `internal/cardactiondispatch` 的导入环，`pkg/octosign` 的抽取就是被它逼出来的。
 > 与 brief 草图的有意偏离及其理由，逐条见 [context.yaml](./context.yaml) 的 `deviations`
 > （刻意不在这里写条数 —— 早期版本写「六处」而 context.yaml 里是七条，数字本身就是一类漂移）。
 > 本文件只写落地结果、验证证据和运维手册；设计论证不重复，都在
@@ -21,10 +25,18 @@ D9 要求 `unknown` 把「项目不存在」和「不在本 consumer 的 grant �
 并把那条验收标为未满足，要么叠在 PR-5 上。选了后者：反正 PR-5 是先写的那一片，
 (a) 换不来任何进度。
 
-**P1 完全不参与本切片。** `group.project_id` / `admitOrRestoreMembersTx` /
-`cascade_registry.go` / `removal_worker.go` 在 P0 上都不存在，而本切片一个都没用到 ——
-它只在 `createProjectOnce` 事务尾部加一条 INSERT，在 `disbandProjectTx` 里加一条
-UPDATE，其余全是新文件。
+**本切片不使用 P1 的任何符号。** `group.project_id` / `admitOrRestoreMembersTx` /
+`cascade_registry.go` / `removal_worker.go` 一个都没用到 —— 它只在 `createProjectOnce`
+事务尾部加一条 INSERT，在 `disbandProjectTx` 里加一条 UPDATE，其余全是新文件。这是它能
+在 P1 还 OPEN 时独立写完并验证的原因。
+
+> **但「不使用它的符号」不等于「与它无关」，这一条更新于 2026-09-07。** P1 合并后本分支
+> rebase 到它上面，而 P1 让 `modules/group` 依赖 `modules/project` —— 这闭合了一条
+> `modules/project → internal/projectprovision → internal/cardactiondispatch → … →
+> modules/group` 的导入环，于是 v1 签名原语必须被抽到叶子包 `pkg/octosign`。所以本片**在
+> 构建层面确实依赖 P1 已落地**，`internal/cardactiondispatch/signature.go` 与
+> `pkg/octosign/octosign.go` 的包注释正是这么写的。本文件早期版本写的「P1 完全不参与本切片」
+> 与那两处注释直接矛盾。
 
 ---
 
@@ -43,9 +55,12 @@ UPDATE，其余全是新文件。
 | `modules/project/provisioning_worker.go` | worker、`provisionEnsurer` 接口、指标发布 |
 | `modules/project/metrics_provisioning.go` | 5 个指标，标签全是闭集 |
 | `modules/project/provisioning_test.go` | 集成测试 + 配置表驱动测试 |
-| `modules/project/provisioning_guard_test.go` | 6 个源码守卫 |
+| `modules/project/provisioning_guard_test.go` | 10 个源码守卫（7 个不变量守卫 + 3 个文档失真守卫） |
 
-### 改动（共 90 行）
+### 改动（共 +129 / −24 行，8 个既有文件）
+
+`git diff --numstat origin/main` 实测；早期版本写的「共 90 行」既低估了行数，也漏掉了
+`internal/cardactiondispatch` 的两个文件 —— 那两个恰恰是本片唯一改到**已上线路径**的地方。
 
 | 文件 | 改动 |
 |---|---|
@@ -55,12 +70,14 @@ UPDATE，其余全是新文件。
 | `modules/project/config.go` | `Config.Provisioning` |
 | `modules/project/metrics.go` | `reasonProvisioningEnqueue` |
 | `main.go` | 两个 provisioning secret 进 `ValidateNotifyTokenExclusions` |
+| `internal/cardactiondispatch/signature.go` | v1 原语搬到 `pkg/octosign` 后改为纯委托（唯一改到已上线路径的改动之一） |
+| `internal/cardactiondispatch/http.go` | 三个 header 常量改为别名 `pkg/octosign` 的 |
 
 **没有新增 pkg/errcode 码，也没有新增 zh-CN 条目** —— 这是核对后的结论而不是漏做：
 本切片唯一新增的用户可见失败是「建项目因 outbox 写失败而失败」，客户端对它和对任何
 存储失败能做的事完全一样，所以复用 `ErrProjectStoreFailed`（500 / `Internal=true` /
 先记 `zap.Error`）。真正需要区分的是运维视角，那走的是 metric label
-`write_rejected_total{entry="project_create",reason="provisioning_enqueue"}`。
+`project_write_rejected_total{entry="project_create",reason="provisioning_enqueue"}`。
 
 ---
 
@@ -245,9 +262,20 @@ EXPLAIN 实测 disband 标记走 `uk_..._target`；claim / sweep / purge 三条�
 
 ### 3.1 默认状态：完全惰性
 
-`OCTO_PROJECT_PROVISION_TARGETS` 为空（默认）时：不入队、不起 worker、不出网，
-建项目的行为与合并前逐字节相同。**合并本 PR 不需要任何配置变更，也不改变任何现有
-行为。**
+`OCTO_PROJECT_PROVISION_TARGETS` 为空（默认）时：不入队、不起 worker、**不出网**，
+建项目的行为与合并前逐字节相同。**合并本 PR 不需要任何配置变更。**
+
+默认状态下仍在跑的只有两件事，都是有意的、且都不产生任何出网或用户可见行为：
+
+- **解散事务里对本表的 UPDATE 是无条件的**（`markProvisioningDisbandPendingTx`）。加
+  `Enabled()` 门会让「启用过 → 产出过行 → 后来关掉」的 target 不再标记可回收，那是真泄漏。
+  空表上这条 UPDATE 影响 0 行。参见 §3.5 步骤 2 的方框 —— 这也正是回滚必须先退二进制的原因。
+- **行数普查按 `MetricsInterval` 无条件调度**（`startProvisioningMetrics`）。放在启用门内
+  会让文档化的回滚把所有 provisioning 计量一起带走，而回滚恰恰是有人在盯这些数字的时候。
+  空表上是一次覆盖索引的 `GROUP BY`。
+
+（早期版本这里写的是「也不改变任何现有行为」—— 上面两条使那句话略微过头，虽然两者都不产生
+外部可观察的行为变化。）
 
 ### 3.2 打开一个 target（P-2 落地之后再做）
 
@@ -319,7 +347,7 @@ OCTO_PROJECT_PROVISION_DRIVE_RECLAIM_CONSUMER_LIVE=false
 | `project_provisioning_unnarrowed_containers{target}` | **暴露面大小**（多报）：`ready + pending + abandoned`，因为响应丢失会留下「容器存在而行不承认」的状态；target 被移出配置**不会**让它归零（收窄是子系统的属性，不是配置的属性）。`disband_pending` 刻意不算 —— 那些已明确列入回收清单，看 `provisioning_rows` |
 | `project_provisioning_target_misconfigured{target}` | 1 = 这个 target 被要求了但配置被拒（坏 URL / 短 secret / 凭据撞车），它不会预置任何东西 |
 | `project_provisioning_attempts_total{target,outcome}` | **一次尝试恰好一个增量**，所以 `sum by(outcome)` 就是尝试次数。`target_no_ensure_endpoint`（= 404，P-2 还没到）与 `target_5xx`（= 真故障）在**第一次尝试**就能分开；`panic` / `target_disabled` 也各有自己的 outcome。刻意**没有** `abandoned` 这个 outcome —— 「多少行放弃了」由上面那个 gauge 回答 |
-| `write_rejected_total{reason="provisioning_enqueue"}` | 建项目因为 outbox 写失败而失败。非零说明是本切片让 create 挂的 |
+| `project_write_rejected_total{reason="provisioning_enqueue"}` | 建项目因为 outbox 写失败而失败。非零说明是本切片让 create 挂的 |
 
 ### 3.4 P-2 落地后重驱动已放弃的行
 
@@ -408,13 +436,27 @@ SELECT p.project_id, p.space_id, 'fleet',
    >
    > 1. **先把二进制回退**到不含本迁移的版本（或至少不含 `modules/project` 本切片的版本），
    >    滚动重启完成、确认没有旧 Pod 还在服务。此时已经没有任何代码路径引用本表。
-   > 2. 再退表，**走 migration 的 Down 段，不要手工 DDL**：
-   >    ```bash
-   >    sql-migrate down -limit=1 -env=<env>   # 对应 20260907000001_project_provisioning.sql
+   > 2. 再退表。**必须把删表和删账本行放进同一个事务**：
+   >    ```sql
+   >    START TRANSACTION;
+   >    DROP TABLE IF EXISTS `octo_project_provisioning`;
+   >    DELETE FROM `gorp_migrations` WHERE id = '20260907000001_project_provisioning.sql';
+   >    COMMIT;
    >    ```
-   >    Down 段是 `DROP TABLE IF EXISTS octo_project_provisioning`，且 sql-migrate 会
-   >    **同时**删掉 `gorp_migrations` 里的账本行 —— 这正是手工 drop 缺的那一半，也是
-   >    「以后再上线时能重建」的前提。
+   >    账本行才是关键的那一半，也是「手工 drop」之所以被禁止的全部理由 —— 只 drop 不删
+   >    账本，sql-migrate 认为这条迁移已应用，**重启不会重建表**；两条一起做，则以后重新
+   >    部署新二进制时会干净地重建。**已在本地 MySQL 8.0.46 实测走通**：两条执行后表和账本
+   >    行都消失，再启动一次进程，两者都按预期回来。
+   >
+   >    > ⚠️ 本仓**没有** `dbconfig.yml`，也没有 Makefile 的迁移目标：迁移是由
+   >    > `pkg/db/mysql.go` 的 `migrate.Exec(..., migrate.Up)` 在**进程启动时**对各模块
+   >    > `go:embed` 的 SQL 目录施加的，没有可用的 `sql-migrate` 命令行入口。本文件早期
+   >    > 版本写的 `sql-migrate down -limit=1 -env=<env>` **在本仓根本跑不起来** —— 而一个
+   >    > 跑不通的补救步骤，恰恰会把操作者推回同一段落禁止的手工 DDL。如果将来引入了
+   >    > dbconfig，再换回 Down 段调用；在那之前，上面那个事务就是等价物。
+   >
+   >    （对照：migration 的 Down 段本身写的是 `DROP TABLE IF EXISTS
+   >    octo_project_provisioning`，与上面第一条语句一致。）
    > 3. 退表**之前**必须确认没有已创建的容器还需要回收：表一旦删掉，本地就再也答不出
    >    「哪些项目曾被预置进 fleet/drive」。若还有，先按 §3.4.2 的口径把
    >    `container_id` 导出留档。

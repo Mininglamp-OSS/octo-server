@@ -13,7 +13,7 @@
 -- 入队与提交之间会出现丢失或孤儿。形状抄的是
 -- modules/space/sql/20260821000001_space_member_removal_cleanup.sql，并带上 P1 记下的
 -- 修正：时间列全部由应用侧写 UTC（不设 MySQL 侧默认值）、终态清理有自己的
--- (status, finished_at) 索引。
+-- (target, status, finished_at) 索引。
 --
 -- ⚠️ **没有租约心跳，这是有意的。** 本文件的早期版本（和 brief D2）声称有心跳，而代码里
 -- 从来没有 —— lease_until 只在认领时写入、在释放/终态时置 NULL，中间没有任何东西续约。

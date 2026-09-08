@@ -1,6 +1,7 @@
 package project
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -411,7 +412,10 @@ func grepPackageForImport(t *testing.T, dir, importPath string) []string {
 		// first version's bug: the real import line is
 		// "github.com/Mininglamp-OSS/octo-server/internal/projectprovision", so `"`+path+`"`
 		// never matched and the guard passed on a file that did import it. The trailing
-		// quote is what stops `internal/projectprovisionfoo` from matching.
+		// quote is what stops a longer package whose name merely STARTS with this one from
+		// matching. (Named in words rather than spelled out, because
+		// TestEveryPathReferencedInSliceTextExists reads this file too and a fictional path
+		// here would trip it — which is that guard working.)
 		if strings.Contains(src[open:open+end], importPath+`"`) {
 			hits = append(hits, name)
 		}
@@ -468,7 +472,7 @@ func repoRootForGuard(t *testing.T) string {
 	}
 }
 
-// TestProvisioningMigrationDeclaresTheInvariantsTheCodeRelies On is a schema guard:
+// TestProvisioningMigrationDeclaresTheInvariants is a schema guard:
 // the two unique keys and the app-written time columns are load-bearing and easy to
 // lose in a later migration edit.
 func TestProvisioningMigrationDeclaresTheInvariants(t *testing.T) {
@@ -548,9 +552,16 @@ func provisioningDocFiles(t *testing.T) []string {
 		}
 		files = append(files, matched...)
 	}
-	if len(files) < 12 {
-		t.Fatalf("only %d slice text files found; the doc-truth guards would be near-vacuous. "+
-			"If files moved, update provisioningDocFiles.", len(files))
+	// The floor has to sit ABOVE the count that survives losing the task documents, which
+	// are the file class both historical defects occurred in. At 12 it did not: the globs
+	// match 15, three of them are the handover documents, and deleting that directory left
+	// the floor passing while the guard silently stopped covering its own subject. A floor
+	// that survives the loss of the subject is not a floor.
+	const minDocFiles = 15
+	if len(files) < minDocFiles {
+		t.Fatalf("only %d slice text files found, want at least %d; the doc-truth guards would "+
+			"stop covering the handover documents. If files moved, update provisioningDocFiles.",
+			len(files), minDocFiles)
 	}
 	return files
 }
@@ -603,10 +614,17 @@ func TestEveryPathReferencedInSliceTextExists(t *testing.T) {
 			// A directory reference, a file reference, or a package path whose directory
 			// exists — all three are legitimate ways this slice's prose names something.
 			candidates := []string{match}
-			if ext := filepath.Ext(match); ext == "" {
-				// `pkg/octosign` (a package) and `modules/project/provisioning` (a symbol
-				// prefix nobody writes) are distinguished by whether the directory exists,
-				// so only the directory form is accepted here.
+			// The parent-directory fallback exists for a reference like
+			// `modules/project/provisioning_worker` — a file named without its extension, or
+			// a symbol prefix — where the containing directory is what should resolve.
+			//
+			// It applies ONLY at three or more segments, and that condition is the whole
+			// point. Applied at two, the fallback resolved every extensionless reference
+			// through its top-level directory, which always exists — so a misspelt package
+			// name, the exact first half of the pair of defects this guard is named for, went
+			// green. The recorded mutation missed it because it used an
+			// extension-bearing path, which takes the other arm.
+			if ext := filepath.Ext(match); ext == "" && strings.Count(match, "/") >= 2 {
 				candidates = append(candidates, filepath.Dir(match))
 			}
 			found := false
@@ -624,8 +642,11 @@ func TestEveryPathReferencedInSliceTextExists(t *testing.T) {
 	}
 	// Non-vacuity: this slice's text is dense with cross-references, so a low count means
 	// the regex or the file list stopped matching rather than that everything resolves.
-	if checked < 40 {
-		t.Fatalf("only %d path references examined; the guard is no longer reading the slice's text", checked)
+	// Same reasoning as minDocFiles: 40 was below the ~71 that survive losing the task
+	// documents, so the floor could not notice their absence. Measured at 164 here.
+	if checked < 120 {
+		t.Fatalf("only %d path references examined; the guard is no longer reading the slice's "+
+			"text — most likely the task documents dropped out of provisioningDocFiles", checked)
 	}
 }
 
@@ -698,11 +719,17 @@ func TestNoCommentEnumeratesAStaleIndex(t *testing.T) {
 
 	examined := 0
 	for _, file := range provisioningDocFiles(t) {
-		if strings.HasSuffix(file, ".sql") {
-			continue // the migration is the source of truth, not a claim about it
-		}
 		rel, _ := filepath.Rel(root, file)
-		for _, tuple := range indexColumnTuple.FindAllString(readFileForGuard(t, file), -1) {
+		text := readFileForGuard(t, file)
+		if strings.HasSuffix(file, ".sql") {
+			// The DDL is the source of truth, but the PROSE ABOVE IT is a claim about the
+			// DDL — and that is where the surviving stale enumeration was found, after this
+			// guard had been added specifically to make that shape impossible. So the
+			// migration is read for its comments only, with the statements removed.
+			text = sqlCommentsOnly(text)
+		}
+		text = joinCommentContinuations(text)
+		for _, tuple := range indexColumnTuple.FindAllString(text, -1) {
 			cols := parseColumnTuple(tuple)
 			// Only tuples made ENTIRELY of this table's columns are read as index claims.
 			// A Go argument list or an English parenthetical will contain something else.
@@ -729,6 +756,30 @@ func TestNoCommentEnumeratesAStaleIndex(t *testing.T) {
 	}
 }
 
+// joinCommentContinuations removes comment-continuation prefixes so a tuple wrapped across
+// two lines reads as one.
+//
+// The tuple pattern allows whitespace between items, and a wrapped enumeration carries the
+// next line's `//` or `--` between them — so the guard saw only unwrapped text and would have
+// missed the historical instance in the shape it actually had. It is not enough to pin the
+// current wrapping: any later edit that rewraps a tuple would slip it again silently.
+func joinCommentContinuations(text string) string {
+	return regexp.MustCompile(`\n\s*(?://|--|#|\*)[ \t]*`).ReplaceAllString(text, " ")
+}
+
+// sqlCommentsOnly keeps the `--` comment text and drops everything else, so a migration can
+// be checked for claims about itself without its own DDL answering them.
+func sqlCommentsOnly(sql string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		if idx := strings.Index(line, "--"); idx >= 0 {
+			b.WriteString(line[idx:])
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 func parseColumnTuple(tuple string) []string {
 	var out []string
 	for _, part := range strings.Split(strings.Trim(tuple, "()"), ",") {
@@ -744,4 +795,94 @@ func readFileForGuard(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(body)
+}
+
+// testNameCitation matches a Go test-function name as it appears in prose, capturing any
+// explicit truncation marker that follows it.
+//
+// A cited name followed by an ellipsis in a documentation table is an ABBREVIATION, not a
+// claim that a function has that exact name — the marker says so — and rejecting it would
+// push the handover tables toward names too long to read. A bare name carries no such hedge,
+// so it must resolve exactly. Group 2 is the marker, empty when there is none. (Stated
+// without an example, because this guard reads its own file: an illustrative fake name here
+// would trip it, which is the guard working.)
+var testNameCitation = regexp.MustCompile(`\b(Test[A-Z][A-Za-z0-9_]*)(\.\.\.|…|\*)?`)
+
+// TestEveryTestNameCitedInSliceTextExists is the third arm of the same mechanical check.
+//
+// Paths and index tuples were the first two classes a grep could settle; a cited test name is
+// the third, and it had already failed twice by the time it was noticed — once in a comment
+// telling a future editor which guard protects a constant (so the pointer led nowhere
+// precisely when someone was about to change the thing it guards), once in a doc comment that
+// had drifted from its own function name. Both were found by a reviewer reading.
+//
+// Scope is deliberately narrow: test-function identifiers only, not every symbol. A general
+// identifier check needs the type checker to avoid drowning in false positives, and the
+// demonstrated failure is test names — a pointer that a reader follows and a maintainer
+// trusts. Broader symbol citations remain a human's job, which is the right split.
+func TestEveryTestNameCitedInSliceTextExists(t *testing.T) {
+	root := repoRootForGuard(t)
+	declared := map[string]bool{}
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if name := d.Name(); name == ".git" || name == "vendor" || name == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		for _, m := range regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]+)\(`).FindAllStringSubmatch(string(body), -1) {
+			declared[m[1]] = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(declared) < 200 {
+		t.Fatalf("only %d test functions found in the repository; the citation guard cannot "+
+			"judge a name without the declared set", len(declared))
+	}
+
+	cited := 0
+	for _, file := range provisioningDocFiles(t) {
+		rel, _ := filepath.Rel(root, file)
+		for _, groups := range testNameCitation.FindAllStringSubmatch(readFileForGuard(t, file), -1) {
+			name, abbreviated := groups[1], groups[2] != ""
+			cited++
+			if declared[name] {
+				continue
+			}
+			if abbreviated && someDeclaredNameStartsWith(declared, name) {
+				continue
+			}
+			hint := ""
+			if abbreviated {
+				hint = " (marked as abbreviated, but no test function starts with it either)"
+			}
+			t.Errorf("%s cites %s, which is not a test function anywhere in the repository%s",
+				rel, name, hint)
+		}
+	}
+	if cited < 30 {
+		t.Fatalf("only %d test-name citations examined; the guard is no longer reading the "+
+			"slice's text", cited)
+	}
+}
+
+func someDeclaredNameStartsWith(declared map[string]bool, prefix string) bool {
+	for name := range declared {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
