@@ -2552,3 +2552,11 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - 继续关闭第六轮发现的路由族缺口：四组 incoming-webhook 管理挂载统一在成员鉴权后拒绝
   AI 容器；旧版最近会话和运营看板也不再展示容器、thread 或成员明细。
 - 完整 `incomingwebhook`、`message`、`opanalytics` 套件通过。
+
+## 2026-09-08 — my-ai-team-sessions（PR #848 独立 review-fix）
+
+- 管理列表与统计面板的群总数统一排除 AI 容器，修复可见列表与聚合口径不一致。
+- 空 agent/session 页固定输出 `items: []`；软删除 session 的幂等 key 重放明确返回 409。
+- 非文本消息不再把原始结构化 payload 写入 session 标题，改用已有内容类型展示文案。
+- build、全仓 vet、AI Team 全包和 Robot 聚焦测试通过；Group DB 回归保留给干净数据库 CI，
+  本机共享库的 migration 账本包含当前分支不存在的旧迁移，未为跑绿而破坏共享状态。

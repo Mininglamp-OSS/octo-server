@@ -35,6 +35,25 @@ func TestAITeamUserContentTypeAllowlist(t *testing.T) {
 	}
 }
 
+func TestAISessionTitleFromPayloadDoesNotUseStructuredContent(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     string
+		contentType int64
+		want        string
+	}{
+		{name: "text uses content", payload: `{"type":1,"content":"First question"}`, contentType: int64(common.Text), want: "First question"},
+		{name: "image uses display text", payload: `{"type":2,"content":{"url":"https://example.com/private.png"}}`, contentType: int64(common.Image), want: common.GetDisplayText(common.Image.Int())},
+		{name: "interactive card uses placeholder", payload: `{"type":17,"plain":"untrusted title"}`, contentType: int64(cardmsg.InteractiveCard), want: cardmsg.DisplayText()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, aiSessionTitleFromPayload([]byte(tt.payload), tt.contentType))
+		})
+	}
+}
+
 // TestExtractBotCommand tests the bot command extraction logic with bounds checking.
 // This test addresses issue #251 where malformed offset/length values could cause panic.
 func TestExtractBotCommand(t *testing.T) {

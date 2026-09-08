@@ -40,6 +40,9 @@ func TestManagerGroupQueriesExcludeAIContainers(t *testing.T) {
 	count, err := managerDB.queryGroupCountWithKeyWord("manager query")
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, count)
+	count, err = db.queryGroupCount()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count)
 	count, err = managerDB.queryGroupCountWithStatus(GroupStatusNormal)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, count)
@@ -54,6 +57,17 @@ func TestManagerGroupQueriesExcludeAIContainers(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.Equal(t, "manager-visible", list[0].GroupNo)
+	count, err = db.queryCreatedCountWithDate(today)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count)
+
+	service := NewService(ctx)
+	count, err = service.GetAllGroupCount()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count, "statistics total must use the product-visible group population")
+	count, err = service.GetCreatedCountWithDate(today)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count, "statistics daily total must use the product-visible group population")
 }
 
 func TestGroupList(t *testing.T) {

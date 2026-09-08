@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -731,14 +732,14 @@ func (d *DB) QueryMemberCount(groupNo string) (int64, error) {
 // 查询群总数
 func (d *DB) queryGroupCount() (int64, error) {
 	var count int64
-	_, err := d.session.Select("count(*)").From("`group`").Load(&count)
+	_, err := d.session.Select("count(*)").From("`group`").Where("purpose<>?", aiteampkg.GroupPurpose).Load(&count)
 	return count, err
 }
 
 // 查询某天的新建群数量
 func (d *DB) queryCreatedCountWithDate(date string) (int64, error) {
 	var count int64
-	_, err := d.session.Select("count(*)").From("`group`").Where("date_format(created_at,'%Y-%m-%d')=?", date).Load(&count)
+	_, err := d.session.Select("count(*)").From("`group`").Where("date_format(created_at,'%Y-%m-%d')=? and purpose<>?", date, aiteampkg.GroupPurpose).Load(&count)
 	return count, err
 }
 

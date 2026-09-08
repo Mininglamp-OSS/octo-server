@@ -158,7 +158,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 			} else if resolved != nil {
 				aiTarget = resolved
 				robotID = resolved.BotID
-				rb.maybeSetAISessionTitle(resolved, payloadValue.Get("content").String())
+				rb.maybeSetAISessionTitle(resolved, aiSessionTitleFromPayload(message.Payload, payloadValue.Get("type").Int()))
 			}
 		}
 		// aisBroadcastSet captures the robotIDs that were added to
@@ -495,6 +495,16 @@ func isAITeamUserContentType(contentType int64) bool {
 		return true
 	}
 	return contentType == int64(cardmsg.InteractiveCard)
+}
+
+func aiSessionTitleFromPayload(payload []byte, contentType int64) string {
+	if contentType == int64(common.Text) {
+		return gjson.GetBytes(payload, "content").String()
+	}
+	if contentType == int64(cardmsg.InteractiveCard) {
+		return cardmsg.DisplayText()
+	}
+	return common.GetDisplayText(int(contentType))
 }
 
 func (rb *Robot) maybeSetAISessionTitle(target *aiteampkg.SessionTarget, content string) {

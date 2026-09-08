@@ -165,3 +165,30 @@ verified by this server checkout.
 
 `golangci-lint` is not installed in the local environment; `go vet ./...` and the
 repository's build/test/i18n checks were used instead.
+
+## Stacked review-fix verification on 2026-09-08
+
+The follow-up branch closes the four findings reported against `808f1257`:
+
+- manager and statistics group totals now apply the same AI-container predicate
+  as their visible rows;
+- empty agent and session pages encode `items` as `[]`;
+- replaying a retained idempotency key after soft deletion returns the existing
+  409 idempotency-conflict envelope instead of a permanent 404;
+- automatic titles use raw `content` only for text and established display text
+  for structured message types.
+
+Final gates:
+
+- `go build ./...`: PASS.
+- `go vet ./...`: PASS.
+- `go test ./modules/ai_team -count=1`: PASS.
+- focused AI-title tests in `modules/robot`: PASS.
+- `go test ./modules/group ./modules/statistics -run '^$' -count=1`: PASS.
+- `git diff --check`: PASS.
+- The DB-backed `TestManagerGroupQueriesExcludeAIContainers` could not execute
+  locally because the shared `test.gorp_migrations` ledger contains migrations
+  absent from this PR branch (`robot_legacy01.sql`). The package compiles, the
+  new assertions are retained for clean-database CI, and no shared database state
+  was destructively rewritten to hide the environment mismatch.
+- `golangci-lint` is unavailable in this environment.

@@ -129,8 +129,11 @@ func decodeJSON(t *testing.T, w *httptest.ResponseRecorder, out any) {
 
 func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"items":[]`)
 
-	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var first struct {
 		BotID   string `json:"bot_id"`
@@ -142,6 +145,9 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodGet, "/v1/ai-team/agents/"+f.botID+"/sessions", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"items":[]`)
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID+"/sessions", "idem-1", map[string]string{"name": "First"})
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -399,6 +405,9 @@ func TestAITeamSessionPersonalControls(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	w = request(t, f, http.MethodGet, "/v1/ai-team/sessions/"+first.SessionID, "", nil)
 	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID+"/sessions", "controls-1", map[string]string{"name": "First"})
+	assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.idempotency_conflict")
 	var status int
 	require.NoError(t, testContext.DB().Select("status").From("thread").Where("short_id=?", first.SessionID).LoadOne(&status))
 	assert.Equal(t, 3, status, "session deletion must remain a recoverable DB soft delete")

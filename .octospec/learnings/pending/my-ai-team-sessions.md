@@ -27,3 +27,19 @@ When one handler set is mounted on multiple authentication faces or resource
 scopes, enforce protected-resource policy inside the shared authorization
 funnel, after the caller's membership is established. This covers the whole
 route family and avoids leaking the protected purpose to unaffiliated callers.
+
+# Keep paired contracts aligned
+
+When a product predicate hides rows from an enumeration, trace every aggregate
+used beside or above that enumeration. A filtered list with an unfiltered count
+creates impossible pages and misleading dashboards even though each query is
+locally valid.
+
+Durable idempotency keys also need an explicit terminal-state replay contract.
+If deletion keeps the ledger row, detect its tombstoned resource and return a
+stable conflict; do not let replay fall through to a lookup that necessarily
+returns not found.
+
+For JSON paging contracts, initialize empty result slices before ORM loading.
+Many ORMs leave a nil destination unchanged on zero rows, turning `[]` into
+`null` at the wire.

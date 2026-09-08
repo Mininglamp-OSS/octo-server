@@ -126,3 +126,16 @@ source: self
 - The deprecated recent-conversation response and operational analytics now hide
   protected parents and session threads too, including stale analytics dimensions
   created before a group acquired the protected purpose.
+
+## Review-fix stacked PR
+
+- Applied the hidden-container predicate to the two shared group aggregates used
+  by the manager list and statistics dashboard, keeping enumeration and totals on
+  the same population.
+- Initialized both page result slices so a zero-row query preserves the wire
+  contract as `items: []` rather than `items: null`.
+- Kept soft-deleted sessions in the durable idempotency ledger and made same-key
+  replay return the existing conflict response explicitly.
+- Restricted automatic title extraction to text messages. Structured content now
+  uses established content-type display text, so media metadata cannot become a
+  session title.

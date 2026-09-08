@@ -202,7 +202,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	if beforeID > 0 {
 		q = q.Where("a.id<?", beforeID)
 	}
-	var rows []*Agent
+	rows := make([]*Agent, 0)
 	_, err := q.Load(&rows)
 	if err != nil {
 		return nil, err
@@ -302,6 +302,12 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		return nil, err
 	}
 	if existing != nil && existing.RequestHash != requestHash {
+		return nil, errIdempotencyConflict
+	}
+	// A deleted thread remains part of the durable idempotency ledger. Reusing
+	// its key must fail explicitly instead of falling through to GetSession and
+	// turning a create replay into a permanent not-found response.
+	if existing != nil && existing.Status == thread.ThreadStatusDeleted {
 		return nil, errIdempotencyConflict
 	}
 	if existing == nil {
@@ -465,7 +471,7 @@ func (s *Service) ListSessions(spaceID, userUID, botID string, statuses []int, p
 	if len(statuses) == 0 {
 		statuses = []int{thread.ThreadStatusActive}
 	}
-	var rows []*Session
+	rows := make([]*Session, 0)
 	_, err := s.ctx.DB().Select(
 		"ats.id", "ats.agent_id", "ats.short_id", "ats.state", "ats.manual_title",
 		"t.group_no", "t.name", "t.status", "t.message_count", "t.last_message_content",
