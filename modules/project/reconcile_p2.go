@@ -58,6 +58,9 @@ type i4MissingRow struct {
 	// a group that is gone", which are different operational problems even though
 	// they are one gauge.
 	GroupNo string `db:"group_no"`
+	// Violating is computed in SQL rather than filtered by a WHERE, so LIMIT
+	// bounds rows EXAMINED and not rows RETURNED. See queryMissingAllMemberGroupPage.
+	Violating bool `db:"violating"`
 }
 
 // scanMissingAllMemberGroups reports active projects with no usable all-member
@@ -101,6 +104,9 @@ func (p *Project) scanMissingAllMemberGroups() {
 			break
 		}
 		for _, row := range rows {
+			if !row.Violating {
+				continue
+			}
 			reason := "never_provisioned"
 			if row.GroupNo != "" {
 				reason = "group_gone_or_detached"
@@ -124,21 +130,33 @@ func (p *Project) scanMissingAllMemberGroups() {
 	cursors.idSave(&cursors.i4Missing, &cursors.i4MissingRun, cursor, total, completed)
 }
 
-// queryMissingAllMemberGroupPage returns one bounded page of active projects
-// whose all-member group is missing or unusable.
+// queryMissingAllMemberGroupPage returns one bounded page of active projects,
+// each flagged with whether its all-member group is missing or unusable.
 //
-// Driven from octo_project by id, so the page bounds rows examined on THIS
-// module's own table rather than on `group`. The LEFT JOIN is a point lookup per
-// examined row against group_groupNo (UNIQUE on group_no), so the work per row
-// is one index dive, not a scan.
+// # The flag is computed in SQL, and that is what makes the page bounded
 //
-// The predicate is expressed as "the join found nothing usable" rather than as
-// three ORed conditions on the project row, because two of the three states are
-// facts about the GROUP, not about the project.
+// An earlier version put `g.id IS NULL` in the WHERE. LIMIT then bounds rows
+// RETURNED, not rows EXAMINED — so in the HEALTHY case, where every project has
+// its group, the statement matches nothing and walks the whole of octo_project
+// with a `group` lookup per row, every tick, forever. The cost is highest exactly
+// when there is nothing to report.
+//
+// Flag-over-base-page is the shape P0 and P1 use for the same reason, and
+// TestReconcileP2QueriesAreBounded now applies P1's guard to this file so a
+// future scan cannot regress to a filtering WHERE.
+//
+// `p.status` stays in the WHERE deliberately: it selects the BASE population
+// (active projects are what the invariant is about), it is served by
+// idx_octo_project_all_member_group, and a disbanded project is not a violation
+// to be flagged but a row that is out of scope.
+//
+// The LEFT JOIN is a point lookup per examined row against group_groupNo (UNIQUE
+// on group_no), so the work per row is one index dive, not a scan.
 func (p *Project) queryMissingAllMemberGroupPage(cursor int64, limit int) ([]*i4MissingRow, error) {
 	var rows []*i4MissingRow
 	_, err := p.db.session.SelectBySql(
-		"SELECT p.id, p.project_id, p.space_id, p.all_member_group_no AS group_no "+
+		"SELECT p.id, p.project_id, p.space_id, p.all_member_group_no AS group_no, "+
+			"  (g.id IS NULL) AS violating "+
 			"FROM `octo_project` p "+
 			// COLLATE on the driving side's value: p.all_member_group_no is
 			// general_ci, g.group_no is the legacy collation. Written this way so
@@ -152,7 +170,7 @@ func (p *Project) queryMissingAllMemberGroupPage(cursor int64, limit int) ([]*i4
 			"  ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
 			"  AND g.status <> ? "+
 			"  AND g.project_id = p.project_id COLLATE utf8mb4_general_ci "+
-			"WHERE p.status = ? AND p.id > ? AND g.id IS NULL "+
+			"WHERE p.status = ? AND p.id > ? "+
 			"ORDER BY p.id LIMIT ?",
 		groupStatusDisband, StatusNormal, cursor, limit,
 	).Load(&rows)

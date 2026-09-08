@@ -141,6 +141,12 @@ var (
 	// group owner or a manager (mirrors the Web API memberRemove rule where a
 	// manager cannot kick managers/creator). The first offending uid is
 	// surfaced via Details so the adapter can pinpoint the rejected target.
+	ErrBotAPICannotRemovePrivileged = register(codes.Code{
+		ID:             "err.server.bot_api.cannot_remove_privileged",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The group owner and managers cannot be removed through the bot API.",
+		SafeDetailKeys: []string{"uid"},
+	})
 	// ErrBotAPIAllMemberGroupProtected refuses a bot-API member removal on a
 	// project's all-member group (P2 D7).
 	//
@@ -157,12 +163,9 @@ var (
 		ID:             "err.server.bot_api.all_member_group_protected",
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
-	})
-	ErrBotAPICannotRemovePrivileged = register(codes.Code{
-		ID:             "err.server.bot_api.cannot_remove_privileged",
-		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "The group owner and managers cannot be removed through the bot API.",
-		SafeDetailKeys: []string{"uid"},
+		// No SafeDetailKeys: the refusal names no uid. Which member the bot tried
+		// to remove is irrelevant — every member of an all-member group is refused,
+		// because the group's roster is the project's.
 	})
 	// ErrBotAPINotSpaceMember covers the bot/user-not-a-space-member guard.
 	ErrBotAPINotSpaceMember = register(codes.Code{

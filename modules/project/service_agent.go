@@ -159,3 +159,25 @@ func ineligibleAgentReasons(uids []string, verdicts map[string]agentEligibility)
 // 单独成为一个能力位而不是让客户端从 role 推导，与 capabilitiesFor 的整体口径一致：
 // 客户端一旦自己推导权限矩阵，它就会在矩阵第一次变化时与服务端分叉。
 func canManageOwnAgents(projectRole int) bool { return isProjectMember(projectRole) }
+
+// agentNotEligibleError carries the ineligible SUBSET out to the handler.
+//
+// D3 rejects the whole request when any one agent is ineligible, but the refusal
+// still has to name WHICH uids were bad, or the picker cannot highlight them. The
+// first version echoed every uid the caller submitted, which is a different claim:
+// with one bad uid in a batch of ten it tells the client all ten were refused, and
+// the user's only recovery is to re-pick from scratch.
+//
+// It carries uids and nothing else. The REASONS stay in the log — see
+// errAgentNotEligible for why splitting them would build an oracle.
+type agentNotEligibleError struct {
+	// UIDs is the ineligible subset, in the caller's submission order.
+	UIDs []string
+}
+
+func (e *agentNotEligibleError) Error() string { return errAgentNotEligible.Error() }
+
+// Unwrap keeps errors.Is(err, errAgentNotEligible) true, so every existing arm that
+// tests the sentinel — including the per-uid members/add path, which does not need
+// the subset — keeps working unchanged.
+func (e *agentNotEligibleError) Unwrap() error { return errAgentNotEligible }

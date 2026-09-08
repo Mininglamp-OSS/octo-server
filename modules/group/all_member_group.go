@@ -196,15 +196,28 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 		return nil
 	}
 
-	// 继任者必须已经在群里。全员群的成员集合等于项目成员集合，所以一个项目 owner
-	// 正常总是在群里；不在，说明 D12 的那次入群失败了（I4 扫描 B 正盯着这件事）。
-	// 这种情况下不把群主交给他——一个不在群里的群主，客户端渲染不出来，而且下一次
-	// 入群成功时他会以普通成员身份被写回，角色就丢了。留在原处，等扫描报出来。
-	successorMember, err := g.db.QueryMemberWithUID(successor, groupNo)
-	if err != nil {
-		return fmt.Errorf("group: query successor membership: %w", err)
+	// 继任者的成员行必须在**事务内、行锁下**读出。
+	//
+	// 无锁读 + 随后的两次写是这条路径最危险的形状：读到"他在群里"，项目侧的级联在
+	// 这之后把他的行软删除，于是下面的提升影响 0 行（UpdateMemberRoleTx 的 WHERE
+	// 带 is_deleted=0 且**不报错**），而降级照常执行——群里从此**一个群主都没有**。
+	// 而 D7 恰好禁止对全员群做转让、退群、解散，所以这个群谁也救不回来。
+	//
+	// 兄弟路径 project_cascade.go 的 handOverGroupCreator 早就是这么做的：
+	// FOR UPDATE 选继任者、用 updateMemberRoleIfLiveTx 拿"到底改没改到行"、
+	// 改不到就**硬失败**。这里当初两样都没做，等于把那条路径吃过的亏重演一遍。
+	var successorLive []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		groupNo, successor,
+	).Load(&successorLive); err != nil {
+		return fmt.Errorf("group: lock successor membership: %w", err)
 	}
-	if successorMember == nil || successorMember.IsDeleted == 1 {
+	if len(successorLive) == 0 {
+		// 全员群的成员集合等于项目成员集合，所以一个项目 owner 正常总是在群里；
+		// 不在，说明 D12 的那次入群失败了（I4 扫描 B 正盯着这件事）。这种情况下
+		// 不把群主交给他——一个不在群里的群主客户端渲染不出来，而且下一次入群成功时
+		// 他会以普通成员身份被写回，角色就丢了。留在原处，等扫描报出来。
 		g.Warn("全员群群主同步：目标 owner 不在群内，保持原群主不变（I4 扫描 B 会报出缺口）",
 			zap.String("projectId", projectID), zap.String("groupNo", groupNo),
 			zap.String("successor", successor))
@@ -215,8 +228,16 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 	if err != nil {
 		return fmt.Errorf("group: generate successor version: %w", err)
 	}
-	if err := g.db.UpdateMemberRoleTx(groupNo, successor, MemberRoleCreator, successorVersion, tx); err != nil {
+	promoted, err := g.db.updateMemberRoleIfLiveTx(tx, groupNo, successor, MemberRoleCreator, successorVersion)
+	if err != nil {
 		return fmt.Errorf("group: promote all-member group creator: %w", err)
+	}
+	if !promoted {
+		// 上面刚在 FOR UPDATE 下确认过这一行是活的，所以走到这里是 bug 而不是竞态——
+		// 但它**绝不能**继续往下走到降级。在一次落空的提升之上再降一次级，正是群里
+		// 一个群主都不剩的成因，而且全程无声。返回错误让事务回滚，什么都不改。
+		return fmt.Errorf(
+			"group: promote %s as creator of %s affected no live member row", successor, groupNo)
 	}
 	demoteVersion, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {

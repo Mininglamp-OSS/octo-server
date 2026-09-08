@@ -311,10 +311,22 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 
 	model, err := p.createProject(in)
 	if err != nil {
-		p.respondCreateError(c, err, spaceID, uid, in.AgentUIDs, in.MaxMembers)
+		p.respondCreateError(c, err, spaceID, uid, in.MaxMembers)
 		return
 	}
 	p.audit(auditCreate, uid, "", model.ProjectID, spaceID, "")
+	// D2/D3 — the agent seats written inside the create transaction are member adds
+	// like any other, and the acceptance criterion is that EVERY write path leaves an
+	// audit entry. Without these, the only membership write on this endpoint that the
+	// trail records is the owner seat, and an agent that gained access to the project
+	// at creation is invisible to whoever later asks how it got there.
+	//
+	// Emitted here, after createProject returned nil, and only then: the create is
+	// whole-request (D3), so success means every uid in the list was seated. Emitting
+	// inside the transaction would log seats a rollback then discarded.
+	for _, agentUID := range in.AgentUIDs {
+		p.audit(auditMemberAdd, uid, agentUID, model.ProjectID, spaceID, auditReasonAgentOnCreate)
+	}
 	// The Space role is passed as MemberRoleCommon rather than read from the database:
 	// projectMiddleware has not run on this group, and the creator is the owner of the
 	// project they just created, so every capability is already determined. The Space role
@@ -326,7 +338,12 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 
 // respondCreateError maps the create sentinels onto registered codes. Kept separate
 // so the handler reads as validation-then-call and the mapping table lives once.
-func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid string, agentUIDs []string, maxMembers int) {
+//
+// It deliberately does NOT take the request's agent_uids: the only arm that needs
+// uids needs the ineligible SUBSET, which travels on the error itself. Handing the
+// full submitted list in as a parameter is what made echoing all of them the easy
+// thing to write.
+func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid string, maxMembers int) {
 	switch {
 	case errors.Is(err, errQuotaPerSpace):
 		observeRejected(entryProjectCreate, reasonQuotaPerSpace)
@@ -361,11 +378,20 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 		respondStoreFailed(c)
 	case errors.Is(err, errAgentNotEligible):
 		// D3 — one ineligible agent rejects the whole create, and all seven
-		// reasons render identically. The uids echoed in details are the ones the
-		// caller submitted, so a picker can highlight them; the reasons went to
-		// the log inside createProjectOnce.
+		// reasons render identically. The uids echoed in details are the INELIGIBLE
+		// SUBSET, carried out of the transaction by agentNotEligibleError, so a
+		// picker highlights the rows the user actually has to fix rather than every
+		// row they picked; the reasons went to the log inside createProjectOnce.
+		//
+		// A bare sentinel with no subset attached echoes nothing: guessing would
+		// mean naming uids that may well have been fine.
 		observeRejected(entryProjectCreate, reasonAgentNotEligible)
-		respondProjectAgentNotEligible(c, agentUIDs)
+		var ineligible *agentNotEligibleError
+		if errors.As(err, &ineligible) {
+			respondProjectAgentNotEligible(c, ineligible.UIDs)
+		} else {
+			respondProjectAgentNotEligible(c, nil)
+		}
 	case errors.Is(err, errQuotaMembers):
 		// Reachable from create only via agent_uids: the owner seat alone cannot
 		// exceed a member quota. Before agents existed this arm did not need to be

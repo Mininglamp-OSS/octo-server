@@ -211,7 +211,8 @@ func TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent(t *testing.T) {
 	seedAgent(t, spaceA, "bot_local", "u_owner", "self_hosted")     // self-hosted
 	seedAgent(t, spaceB, "bot_elsewhere", "u_owner", "octo_hosted") // another Space
 
-	bodies := make([]string, 0, 4)
+	type refusal struct{ bad, details string }
+	refusals := make([]refusal, 0, 4)
 	for _, bad := range []string{"bot_theirs", "bot_local", "bot_elsewhere", "u_other"} {
 		w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner, map[string]any{
 			"name":       "proj-" + bad,
@@ -227,7 +228,7 @@ func TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent(t *testing.T) {
 		}
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &env), "body: %s", w.Body.String())
 		require.Equal(t, "err.server.project.agent_not_eligible", env.Error.Code, "case %s", bad)
-		bodies = append(bodies, string(env.Error.Details))
+		refusals = append(refusals, refusal{bad: bad, details: string(env.Error.Details)})
 
 		// Nothing was written: not the project, and not the eligible agent's seat.
 		var count int
@@ -237,12 +238,22 @@ func TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent(t *testing.T) {
 		require.Zero(t, count, "case %s must not create the project", bad)
 	}
 
-	// Every refusal carries the same SHAPE — the submitted uids and nothing else.
+	// Every refusal carries the same SHAPE — the INELIGIBLE uids and nothing else.
 	// The four reasons are indistinguishable apart from which uid is named, which
 	// is the caller's own input.
-	for i, body := range bodies {
-		require.Contains(t, body, "bot_ok", "case %d details must echo the submitted uids", i)
-		require.NotContains(t, body, "reason", "case %d must not leak WHY", i)
+	//
+	// bot_ok must NOT appear. D3 rejects the whole request, but "the request was
+	// rejected" and "this uid was the problem" are different facts, and only the
+	// second belongs in details: a picker that highlights every submitted row
+	// leaves the user re-choosing from scratch to find the one that was wrong.
+	// The first version echoed the full submitted list, so this assertion is the
+	// pin, not a restatement.
+	for _, ref := range refusals {
+		require.Contains(t, ref.details, ref.bad,
+			"case %s: details must name the ineligible uid", ref.bad)
+		require.NotContains(t, ref.details, "bot_ok",
+			"case %s: details must not name the ELIGIBLE agent — it was not the problem", ref.bad)
+		require.NotContains(t, ref.details, "reason", "case %s must not leak WHY", ref.bad)
 	}
 }
 
@@ -922,4 +933,129 @@ func TestRebuildRecoversAProjectWhoseGroupWasDetached(t *testing.T) {
 		"a project whose group was detached must be able to get a new one; leaving the "+
 			"stale pointer in place makes the claim CAS fail forever, with no error and "+
 			"no metric, and reconcile scan A reports it with nothing able to fix it")
+}
+
+// ---------- D12: the projection is self-healing ----------
+
+// TestReAddingAnActiveMemberReAdmitsThemToTheGroup pins the repair the brief
+// documents for an I4 scan-B gap.
+//
+// Scan B reports "the seat exists, the group row does not" and repairs nothing by
+// design; the operator action it names is "an admin re-adds the member". That only
+// works if a re-add actually runs the admitter — and the first version gated the
+// admission on `admitted`, which is false precisely when the seat is already there.
+// So the one repair path the gauge points at was a silent no-op, and the gauge
+// stayed red however many times it was tried.
+func TestReAddingAnActiveMemberReAdmitsThemToTheGroup(t *testing.T) {
+	_, p := setup(t)
+	stub := stubAllMemberGroup(t, "grp_repair")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+	seedUser(t, "u_new")
+	seedSpaceMember(t, spaceA, "u_new", 0, 1)
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "repair"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decodeResp(t, w)
+
+	// The admitter fails, so the seat commits without a group row — the exact state
+	// scan B reports.
+	stub.admitErr = errStubAdmit
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_new"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.NotContains(t, stub.admitted, "u_new", "the gap exists: seat yes, group row no")
+
+	seat := memberRow(t, resp.ProjectID, "u_new")
+	require.NotNil(t, seat)
+	require.Equal(t, MemberStatusActive, seat.Status)
+
+	// The repair: the same add again. The SEAT write is a no-op — that is the whole
+	// point — but the admission must still run.
+	stub.admitErr = nil
+	before := epochOf(t, resp.ProjectID)
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_new"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	require.Contains(t, stub.admitted, "u_new",
+		"re-adding an active member must re-run the admission; that is the documented "+
+			"repair for an I4 scan-B gap")
+	require.Equal(t, before, epochOf(t, resp.ProjectID),
+		"the seat did not change, so the epoch must not move — the repair touches the "+
+			"projection only")
+}
+
+// ---------- audit: the agent write paths ----------
+
+// TestAgentSeatsAreAudited covers the two membership writes P2 added that no
+// handler issues a request for: the agent seats written inside the create
+// transaction (D2/D3) and the agent seats closed when their owner leaves (D13).
+//
+// TestEveryWritePathEmitsAnAuditEntry does not reach either — it never sends
+// agent_uids and seeds no agents — so before this case both wrote membership rows
+// that left no trace at all, and "how did this bot get access to the project" was
+// unanswerable from the trail.
+func TestAgentSeatsAreAudited(t *testing.T) {
+	_, p := setup(t)
+	rec := &auditRecorder{}
+	p.auditSink = rec.sink
+	stubAllMemberGroup(t, "grp_audit")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+	member := seedUser(t, "u_member")
+	seedSpaceMember(t, spaceA, "u_member", 0, 1)
+	seedAgent(t, spaceA, "bot_at_create", "u_owner", "octo_hosted")
+	seedAgent(t, spaceA, "bot_of_member", "u_member", "octo_hosted")
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner, map[string]any{
+		"name":       "audited-agents",
+		"agent_uids": []string{"bot_at_create"},
+	})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decodeResp(t, w)
+
+	require.True(t, auditHasTarget(rec.entries, auditMemberAdd, "bot_at_create"),
+		"an agent seated by the create must be audited like any other member add")
+	for _, e := range rec.byAction(auditMemberAdd) {
+		require.Equal(t, "u_owner", e.ActorUID, "the creator is the actor")
+		require.Equal(t, auditReasonAgentOnCreate, e.Reason,
+			"the reason must say the seat rode in on the create, not on a members/add")
+		require.Equal(t, resp.ProjectID, e.ProjectID)
+		require.Equal(t, spaceA, e.SpaceID)
+	}
+
+	// Now the removal half: the member joins with their own agent, then leaves.
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_member"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", member,
+		map[string]any{"uids": []string{"bot_of_member"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/leave", member, map[string]any{})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var followed *AuditEntry
+	removals := rec.byAction(auditMemberRemove)
+	for i := range removals {
+		if removals[i].TargetUID == "bot_of_member" {
+			followed = &removals[i]
+		}
+	}
+	require.NotNil(t, followed,
+		"D13 closes the leaver's agent seat, so the trail must carry that removal")
+	require.Equal(t, auditReasonAgentFollowsOwner, followed.Reason,
+		"the reason must say the agent was not removed on its own account")
+	require.Equal(t, "u_member", followed.ActorUID,
+		"the leaver is the actor: they closed their own seat and the agent followed")
+	require.Equal(t, resp.ProjectID, followed.ProjectID)
+	require.Equal(t, spaceA, followed.SpaceID)
 }

@@ -18,6 +18,23 @@ const (
 	auditCascade      = "project.space_cascade"
 )
 
+// Audit reasons that are not tied to one call site. Same low-cardinality rule as
+// the actions above.
+const (
+	// auditReasonAgentOnCreate marks the seats D2/D3 write for the creator's own
+	// agents inside the create transaction.
+	//
+	// A distinct reason rather than the empty string members/add uses, because these
+	// entries have no request of their own behind them: reading the trail, "a1 was
+	// added to P by u1" is indistinguishable from an ordinary add unless the entry
+	// says it rode in on the create.
+	auditReasonAgentOnCreate = "agent_on_create"
+	// auditReasonAgentFollowsOwner marks the seats D13 closes when their owner is
+	// kicked or leaves. The actor is whoever triggered the OWNER's removal, which is
+	// why the reason has to say that the agent was not removed on its own account.
+	auditReasonAgentFollowsOwner = "agent_follows_owner"
+)
+
 // AuditEntry is one audit record.
 //
 // A struct plus an injectable sink rather than a bare log call, because otherwise the

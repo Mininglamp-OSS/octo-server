@@ -561,13 +561,14 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 			return nil, err
 		}
 		if bad := ineligibleAgentUIDs(agentUIDs, verdicts); len(bad) > 0 {
-			// The uids go to the caller (they submitted them, so echoing them
-			// leaks nothing); the REASONS stay in the log. See errAgentNotEligible.
+			// The INELIGIBLE SUBSET goes to the caller (they submitted those uids, so
+			// echoing them leaks nothing); the REASONS stay in the log. See
+			// errAgentNotEligible and agentNotEligibleError.
 			p.Warn("建项目：分身不合格，整单拒绝",
 				zap.String("spaceId", in.SpaceID), zap.String("creator", in.Creator),
 				zap.Strings("ineligible", bad),
 				zap.Any("reasons", ineligibleAgentReasons(agentUIDs, verdicts)))
-			return nil, errAgentNotEligible
+			return nil, &agentNotEligibleError{UIDs: bad}
 		}
 
 		// The agent seats count against max_members exactly like human seats: an agent
@@ -942,7 +943,7 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 	for _, uid := range uids {
 		admitted, err := p.addOneFn(projectID, spaceID, actorUID, uid)
 		results = append(results, addMemberResult{UID: uid, Admitted: admitted, Err: err})
-		if admitted && err == nil {
+		if err == nil {
 			// D12 — the seat is committed, so put them in the all-member group.
 			//
 			// AFTER the per-target transaction commits, never inside it: the
@@ -954,6 +955,20 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 			// authorization fact and the group is its projection. Failing the add
 			// because WuKongIM hiccuped would report failure for something that
 			// actually succeeded.
+			//
+			// # On err == nil rather than admitted && err == nil
+			//
+			// The only way to get (false, nil) out of addOneMemberOnce is "already
+			// an active member" — an idempotent no-op on the SEAT. It is not a
+			// no-op on the projection, and gating the admission on `admitted` made
+			// it one: an I4 scan-B gap (seat present, group row missing) is
+			// precisely the state where the seat write has nothing to do, so the
+			// repair the brief documents for that gauge — an admin re-adds the
+			// member — did nothing at all, quietly, and the gauge stayed red.
+			//
+			// The cost is one idempotent admitter round-trip per already-member in
+			// a batch. That is the price of the projection being self-healing, and
+			// it is paid only on a roster that overlaps what is already there.
 			p.admitAllMemberGroup(projectID, spaceID, uid)
 		}
 		// An ACTOR-level or project-level failure ends the batch HERE, not in the handler.
@@ -1307,8 +1322,16 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 		// cached roles are stale too. Missing these would leave an agent
 		// authorized against the project for a full cache TTL after its seat
 		// closed, which is the same leak the member's own invalidation prevents.
+		//
+		// Audited in the same loop, and for the same reason the seat closure is
+		// not silent: these are member removals, so the trail has to carry them.
+		// The caller's handler cannot do it — closedAgents does not leave this
+		// function — which is why the audit sits in the service here rather than
+		// beside the target's own entry, the way space_member_removal.go does it.
 		for _, agentUID := range closedAgents {
 			p.invalidateProjectMemberCache(projectID, agentUID)
+			p.audit(auditMemberRemove, actorUID, agentUID, projectID, spaceID,
+				auditReasonAgentFollowsOwner)
 		}
 		// D6 — removing a member can remove an OWNER (an admin may not, but an
 		// owner may remove a co-owner), and if that owner held the all-member
@@ -1426,9 +1449,12 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 	}
 	if changed {
 		p.invalidateProjectMemberCache(projectID, uid)
-		// D13 — see removeMemberOnce.
+		// D13 — see removeMemberOnce. The actor is the leaver: they closed their
+		// own seat, and the agents followed.
 		for _, agentUID := range closedAgents {
 			p.invalidateProjectMemberCache(projectID, agentUID)
+			p.audit(auditMemberRemove, uid, agentUID, projectID, spaceID,
+				auditReasonAgentFollowsOwner)
 		}
 	}
 	if successorPromoted != "" {

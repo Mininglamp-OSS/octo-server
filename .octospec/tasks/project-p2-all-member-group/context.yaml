@@ -346,6 +346,91 @@ review_round_2_fixed:
       cannot be forgotten the same way. Exactly the failure mode P1's D8 gives as
       the reason to prefer guards that enumerate over guards that match strings.
 
+# Third /code-review pass, run on the pushed branch. Six findings, all verified
+# against the code before fixing; the two audit gaps below were found while fixing
+# them and are the same omission on the other write path.
+review_round_3_fixed:
+  - id: all-member-group-could-be-left-with-no-creator
+    severity: critical
+    where: modules/group/all_member_group.go ensureAllMemberGroupOwner
+    what: |
+      It read the successor's group_member row without a lock, promoted with
+      UpdateMemberRoleTx (which affects zero rows on a soft-deleted row and reports
+      no error), then demoted the sitting creator unconditionally.
+    why: |
+      A concurrent soft-delete of the successor's row between the read and the
+      write leaves the group with NO creator -- and D7 then makes that unfixable
+      from the group side: nobody can transfer, leave or disband it. The repo
+      already had the answer: project_cascade.go:335 locks the successor FOR UPDATE
+      and hard-fails if the promote did not land.
+    fix: "SELECT 1 ... FOR UPDATE on the successor, updateMemberRoleIfLiveTx, and a hard error if !promoted BEFORE the demote."
+  - id: i4-scan-a-filtered-in-the-where
+    severity: high
+    where: modules/project/reconcile_p2.go queryMissingAllMemberGroupPage
+    what: "`g.id IS NULL` was a WHERE predicate, so LIMIT bounded rows RETURNED."
+    why: |
+      In the HEALTHY case the predicate matches nothing, so the statement walked
+      the whole of octo_project with a `group` lookup per row, every tick. The cost
+      was highest exactly when there was nothing to report. Same defect P1 fixed in
+      queryI2Page, reintroduced.
+    fix: "flag-over-base-page: (g.id IS NULL) AS violating, skipped in the loop."
+    test: |
+      TestReconcileP2QueriesAreBounded and
+      TestP2PagedQueriesUseTheFlagOverBasePageShape, mirroring
+      reconcile_p1_bounds_test.go -- neither existing guard read this file, which is
+      how the regression got in. Confirmed non-vacuous by mutating the source and
+      watching both assertions fire.
+  - id: agent-refusal-echoed-every-submitted-uid
+    severity: medium
+    where: modules/project/api.go respondCreateError
+    what: |
+      ineligibleAgentUIDs was computed and only logged; details.uids carried the
+      whole submitted list, contradicting D3 and the helper's own doc comment.
+    why: "One bad uid in a batch of ten told the client all ten were refused, leaving the user to re-pick from scratch to find the one that was wrong."
+    fix: |
+      agentNotEligibleError carries the ineligible subset out of the transaction
+      (Unwrap keeps errors.Is on the sentinel true, so the per-uid members/add path
+      is unchanged). respondCreateError no longer TAKES the submitted list -- having
+      it in scope is what made echoing it the easy thing to write.
+    test: "TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent now asserts the eligible agent is NOT named."
+  - id: re-add-was-a-silent-no-op-for-the-documented-i4-repair
+    severity: medium
+    where: modules/project/service.go addMembers
+    what: "admitAllMemberGroup ran only when the seat write changed something."
+    why: |
+      An I4 scan-B gap is exactly the state where the seat already exists, so the
+      operator action the gauge points at -- an admin re-adds the member -- did
+      nothing, quietly, however many times it was tried.
+    fix: "the admission runs on every add that did not error. The cost is one idempotent round-trip per already-member; the projection being self-healing is worth it."
+    test: TestReAddingAnActiveMemberReAdmitsThemToTheGroup
+  - id: agent-seats-left-no-audit-trail
+    severity: medium
+    where: modules/project/api.go (create) and service.go (D13 removal)
+    what: |
+      The agent seats written inside the create transaction, and the agent seats
+      D13 closes when their owner is kicked or leaves, emitted no audit entry.
+    why: |
+      The acceptance criterion is that every write path leaves one, and
+      TestEveryWritePathEmitsAnAuditEntry passed vacuously here because it never
+      sends agent_uids and seeds no agents. "How did this bot get access to the
+      project" was unanswerable from the trail.
+    fix: |
+      auditMemberAdd with reason agent_on_create at create; auditMemberRemove with
+      reason agent_follows_owner in the two post-commit loops that already
+      invalidate the agents' caches (closedAgents does not leave the service, which
+      is why the audit sits there rather than in the handler -- the same split
+      space_member_removal.go uses).
+    test: TestAgentSeatsAreAudited
+  - id: new-code-orphaned-a-neighbours-doc-comment
+    severity: low
+    where: pkg/errcode/bot_api.go
+    fix: |
+      ErrBotAPIAllMemberGroupProtected had been inserted between
+      ErrBotAPICannotRemovePrivileged's doc comment and its declaration, so that
+      comment -- which describes uid Details -- documented a code that registers no
+      SafeDetailKeys. Declaration moved back under its own comment, and the new code
+      now says explicitly why it carries no detail keys.
+
 # Cannot be verified from here; must be checked before merge.
 open_verification:
   - "The three items in the brief's 'must check before merge' section: the client
