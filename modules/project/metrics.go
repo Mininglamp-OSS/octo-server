@@ -351,3 +351,25 @@ var lifecycleEventOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
 	Name:      "lifecycle_event_oldest_age_seconds",
 	Help:      "Age of the oldest pending project lifecycle event.",
 })
+
+// awaitingActivation is how many projects the peer still cannot see (O6).
+//
+// Every one of these is a project a user created and can use in this
+// application, while the subsystem side has not confirmed a container — so the
+// peer answers about it as if it did not exist. A steady small number is normal
+// (creates in flight); a number that only grows means the confirming step has
+// stopped.
+var awaitingActivation = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "awaiting_activation",
+	Help:      "Active projects whose subsystem container has not been confirmed, so the peer treats them as nonexistent.",
+})
+
+// awaitingActivationOldestAgeSeconds is the one to alert on, for the reason the
+// lifecycle queue's age gauge exists: a count cannot separate a burst of fresh
+// creates from a queue that stopped, and both read as "several rows".
+var awaitingActivationOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "awaiting_activation_oldest_age_seconds",
+	Help:      "Age of the oldest project still awaiting subsystem confirmation.",
+})

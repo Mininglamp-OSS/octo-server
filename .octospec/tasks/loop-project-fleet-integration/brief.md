@@ -418,14 +418,26 @@ its P-2 has landed」，再加上 P-3。
 | 单 | 内容 | 依赖 | 状态 |
 | --- | --- | --- | --- |
 | O1a | project_id 切 36 位带横线 UUID + `lifecycle_version` 列与递增纪律 | C1/C4 已决 | ✅ 已实现 |
-| O1b | 归档状态 + `archived_at` + 写路径拒绝 + archive/restore 接口 | 与 #850 无关；当前**半接线**（列与模型已加，无任何强制） | 待决：收尾或回退 |
+| O1b | 归档状态 + `archived_at` + 写路径拒绝 + archive/restore 接口 | 与 #850 无关 | ⏸ **契约已冻结（§8），代码有意不写**（按指示）。**注意本行早先写的「半接线」已失效**：那批列/模型/响应字段在已废弃的本地分支上，当前谱系里**根本不存在**，没有东西需要回退 |
 | O2 | `GET /v1/internal/membership/epochs` | 无（不依赖 O1） | ✅ 已实现 |
 | O3 | `POST /v1/internal/project-memberships/_verify` | C5（临时路径） | ✅ 已实现 |
-| ~~O4~~ | ~~独立的 Fleet 事件 outbox~~ | — | ❌ **作废**：改用 #850 的发件箱与出站通道，见「与 PR #850 的边界」 |
-| O5 | 五类事件接入各写路径，均在业务事务内入队 | #850 合并后；archived/restored 另需 O1b | 阻塞 |
-| O6 | 创建链路两阶段化：provisioning → 调 Fleet → 校验 workspace_id → active | #850 合并后 + fleet 侧收窄落地 | 阻塞 |
-| O7 | Space 移除级联：席位关闭事务内补写 member_revoked | #850 合并后 | 阻塞 |
-| O8 | 合同文档 + Mock + SLA/告警 + collation 转换预案 | 全部 | 未开始 |
+| ~~O4~~ | ~~搭载 #850 发件箱~~ | — | ✅ **已实现，但用独立表**：`octo_project_provisioning` 是 `UNIQUE (project_id, target)` 的**映射表**，一个项目每个目标只有一行，装不下 append-only 事件流。下面「落地顺序」第 3 条写于核对该约束之前。需要带过去的「载荷入队即冻结」已带过去（`TestPayloadIsFrozenAtEnqueue`） |
+| O5 | 五类事件接入各写路径，均在业务事务内入队 | #850 合并后；archived/restored 另需 O1b | ✅ 已实现（archived/restored 仅定义常量与载荷，无生产者——O1b 未实现） |
+| O6 | 创建链路两阶段化：provisioning → 调 Fleet → 校验 workspace_id → active | #850 合并后 + fleet 侧收窄落地 | ✅ **闸门已实现**，且**不依赖 fleet 收窄**：见下 |
+| O7 | Space 移除级联：席位关闭事务内补写 member_revoked | #850 合并后 | ✅ 已实现 |
+| O8 | 合同文档 + Mock + SLA/告警 + collation 转换预案 | 全部 | 部分：契约文档 `docs/project-lifecycle-contract.md` 已冻结；Mock / SLA / 告警 / collation 预案未开始 |
+
+**O6 为什么不再被 fleet 收窄阻塞**：本行原先把两件事绑在一起——「两阶段闸门」和
+「`workspace_id == project_id` 逐字节相等」。前者只需要「有没有拿到确认」，与 id 形态无关，
+已实现（`octo_project.activated_at`，未确认时两个入站接口一律按不存在作答）。后者仍然阻塞，
+而且**顺序不能反**：在 fleet 收窄落地前把容器 id 换成 `project_id`，等于亲手打开
+P-3 那条提权链路。当前校验的是「目标回显的 id == 我方要求创建的 id」，与契约那条是同一个校验，
+只是两个 id 还不是同一个值；fleet 收窄落地后换 id，**本处代码不变**，校验自然字面成立。
+
+**为什么用 `activated_at` 列而不是第三个 status 值**：与 O1b 下面那段论证同源——
+约二十处谓词读 `status = 1` 且含义各不相同，第三个值会一次性改变全部含义，漏改一处
+就是「成员静默变非成员 → I2 判违规 → 群被拆」。列的漏改代价只是「对端早看到一小会儿」，
+和今天的窗口一样。
 
 O2 / O3 已完成且零冲突，可立即独立评审。
 

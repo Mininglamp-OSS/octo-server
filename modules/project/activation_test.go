@@ -1,0 +1,189 @@
+package project
+
+import (
+	"context"
+	"database/sql"
+	"testing"
+	"time"
+
+	pkgproject "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// Two-phase create (O6, docs/project-lifecycle-contract.md section 7).
+//
+// The property under test is a NEGATIVE one: between create and the subsystem
+// confirmation, the peer control plane must answer about the project exactly as
+// it answers about one that does not exist. A test that only checked the happy
+// path would pass with the gate deleted.
+
+// activatedAtOf reads the latch.
+//
+// sql.NullTime rather than *time.Time: dbr materializes a NULL into a non-nil
+// pointer at the zero time, so a `*time.Time` result cannot distinguish "not
+// confirmed" from "confirmed at year zero" — and the first version of this
+// helper reported every unlatched project as latched.
+func activatedAtOf(t *testing.T, projectID string) *time.Time {
+	t.Helper()
+	var rows []sql.NullTime
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT activated_at FROM `octo_project` WHERE project_id = ?", projectID,
+	).Load(&rows)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "no project row for %s", projectID)
+	if !rows[0].Valid {
+		return nil
+	}
+	at := rows[0].Time
+	return &at
+}
+
+// TestCreateActivatesImmediatelyWithNoFleetTarget is the default posture, and it
+// is the one that must not regress: with nothing configured to confirm, a
+// project that waited would wait forever and be invisible to the peer for its
+// whole life.
+func TestCreateActivatesImmediatelyWithNoFleetTarget(t *testing.T) {
+	_, p := setup(t)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "actOwner")
+	seedSpaceMember(t, spaceA, "actOwner", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "activate-default")
+
+	require.NotNil(t, activatedAtOf(t, created.ProjectID),
+		"with no fleet target nothing would ever confirm this project, so the create must "+
+			"latch it immediately — a NULL here is a project the peer can never see")
+
+	epochs, err := pkgproject.ProjectEpochsInSpace(testCtx.DB().NewSession(nil), spaceA,
+		[]string{created.ProjectID})
+	require.NoError(t, err)
+	assert.Contains(t, epochs, created.ProjectID, "the peer must see it right away")
+}
+
+// TestCreateWaitsForConfirmationWithFleetEnabled is the gate itself.
+func TestCreateWaitsForConfirmationWithFleetEnabled(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "activate-wait")
+
+	require.Nil(t, activatedAtOf(t, created.ProjectID),
+		"with the fleet target on, a fresh project must wait for confirmation")
+
+	// The whole point: the peer cannot see it, and cannot authorize anyone into it.
+	session := testCtx.DB().NewSession(nil)
+	epochs, err := pkgproject.ProjectEpochsInSpace(session, spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	assert.NotContains(t, epochs, created.ProjectID,
+		"an unconfirmed project must be indistinguishable from one that does not exist, or "+
+			"the peer can grant access into a workspace that is not there yet")
+
+	epoch, roles, err := pkgproject.ProjectMemberships(context.Background(), session, spaceA, created.ProjectID,
+		[]string{"owner1"})
+	require.NoError(t, err)
+	assert.Zero(t, epoch, "epoch 0, the same answer as a nonexistent project")
+	assert.Empty(t, roles,
+		"the CREATOR is an owner in this repository and must still read as a non-member to "+
+			"the peer while the project is unconfirmed")
+
+	// And the confirmation flips it.
+	p.processProvisioningJobs()
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	require.Equal(t, provisionStatusReady, rows[0].Status, "last_error=%q", rows[0].LastError)
+
+	require.NotNil(t, activatedAtOf(t, created.ProjectID), "a ready fleet job must latch the project")
+	epochs, err = pkgproject.ProjectEpochsInSpace(session, spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	assert.Contains(t, epochs, created.ProjectID, "confirmed projects are visible")
+	_, roles, err = pkgproject.ProjectMemberships(context.Background(), session, spaceA, created.ProjectID,
+		[]string{"owner1"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{"owner1": RoleOwner}, roles)
+}
+
+// TestFailedProvisioningLeavesTheProjectUnseen: the contract says a confirmation
+// that never arrives is terminal plus an alert, NOT an eventual activation.
+// Latching on anything other than success would defeat the gate entirely.
+func TestFailedProvisioningLeavesTheProjectUnseen(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.setStatus(500)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "activate-fail")
+
+	p.processProvisioningJobs()
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	require.NotEqual(t, provisionStatusReady, rows[0].Status)
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"a failed confirmation must NOT latch the project: the gate exists precisely for "+
+			"the case where the container was not created")
+}
+
+// TestDriveReadyDoesNotActivate: drive is storage. It says nothing about whether
+// the peer control plane may act on the project, and treating it as confirmation
+// would open the gate on a deployment that runs drive without fleet.
+func TestDriveReadyDoesNotActivate(t *testing.T) {
+	fleet := newFakeTarget(t)
+	drive := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet, drive)
+	created := createVia(t, r, token, "activate-drive")
+
+	// Take fleet out of the picture without touching the enqueued rows, so only
+	// the drive job can run this tick.
+	p.cfg.Provisioning.Targets = []provisionTarget{driveTargetOn(drive)}
+	p.processProvisioningJobs()
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"a ready DRIVE job must not activate the project; only the fleet confirmation does")
+}
+
+// TestActivationIsALatch pins that a second confirmation does not move the
+// timestamp. The value answers "when were we first told", and a redelivery
+// rewriting it would report the retry instead of the fact.
+func TestActivationIsALatch(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "activate-latch")
+
+	p.processProvisioningJobs()
+	first := activatedAtOf(t, created.ProjectID)
+	require.NotNil(t, first)
+
+	requeueProvisioningRow(t, readProvisioningRows(t, created.ProjectID)[0].ID)
+	time.Sleep(5 * time.Millisecond)
+	p.processProvisioningJobs()
+
+	second := activatedAtOf(t, created.ProjectID)
+	require.NotNil(t, second)
+	assert.True(t, first.Equal(*second),
+		"activated_at must not move on a redelivery: %v -> %v", first, second)
+}
+
+// TestAwaitingActivationCensusCountsOnlyLiveProjects. A disbanded project that
+// never activated is finished, not stuck, and counting it would make the gauge
+// an operator watches climb forever on a number nobody can act on.
+func TestAwaitingActivationCensusCountsOnlyLiveProjects(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "activate-census")
+
+	count, err := p.db.countAwaitingActivation()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count)
+
+	age, err := p.db.oldestAwaitingActivationAge(time.Now().UTC())
+	require.NoError(t, err)
+	assert.Positive(t, age.Seconds(), "the age gauge is what an alert watches")
+
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET status = ? WHERE project_id = ?",
+		StatusDisbanded, created.ProjectID).Exec()
+	require.NoError(t, err)
+
+	count, err = p.db.countAwaitingActivation()
+	require.NoError(t, err)
+	assert.Zero(t, count, "a disbanded project is finished, not stuck")
+}

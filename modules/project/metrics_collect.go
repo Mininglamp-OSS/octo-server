@@ -81,6 +81,21 @@ func (p *Project) refreshDistributionMetrics() {
 	}
 	memberTotal.Set(float64(members))
 
+	// Two-phase create (O6): projects this application can use but the peer
+	// cannot see. Warn and CONTINUE rather than return — the distribution below
+	// is a separate question, and a failure here should not silently stop
+	// collecting it.
+	if awaiting, err := p.db.countAwaitingActivation(); err != nil {
+		p.Warn("采集待激活项目数失败", zap.Error(err))
+	} else {
+		awaitingActivation.Set(float64(awaiting))
+		if age, err := p.db.oldestAwaitingActivationAge(time.Now().UTC()); err != nil {
+			p.Warn("采集最旧待激活项目年龄失败", zap.Error(err))
+		} else {
+			awaitingActivationOldestAgeSeconds.Set(age.Seconds())
+		}
+	}
+
 	var rows []*distributionRow
 	if _, err := p.db.session.SelectBySql(
 		"SELECT COUNT(*) AS member_count FROM `octo_project_member` "+

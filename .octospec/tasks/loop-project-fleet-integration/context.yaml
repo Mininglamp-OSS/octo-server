@@ -550,3 +550,143 @@ increment:
         for the P1 blocker rather than part of O1.
     - id: O4-O7
       reason: outbound event chain — depends on O1.
+
+# ---------------------------------------------------------------------------
+# Increment 2 — the outbound half, on branch
+# claude/loop-project-fleet-integration-dea1yz, built on increment 1 head.
+# ---------------------------------------------------------------------------
+
+increment_2:
+  implemented: [O1a, O4, O5, O6, O7, contract]
+  not_implemented:
+    - id: O1b
+      what: archive / restore
+      reason: >
+        Contract frozen (section 8), code deliberately not written, by explicit
+        instruction. Nothing half-wired exists: the `archived_at` column,
+        model field and response field the brief describes as already added were
+        on the discarded local branch and are NOT in this lineage. The brief
+        paragraph calling O1b "half-wired, finish it or roll it back" is
+        therefore stale — there is nothing to roll back.
+    - id: O8
+      what: mock, SLA, alert rules, collation conversion plan
+      reason: not started.
+
+  decisions:
+    - id: D-outbox-table
+      what: >
+        Lifecycle events get their OWN table
+        (octo_project_lifecycle_event), not the provisioning outbox.
+      why: >
+        Reverses landing-order item 3 in the brief, which said to carry the
+        events on octo_project_provisioning. That table is UNIQUE
+        (project_id, target) — one row per project per target, a mapping — and
+        an event stream is append-only with many rows per project. The two
+        shapes are mutually exclusive; the brief item was written before that
+        was checked. The property it wanted carried over IS carried over: the
+        payload is serialized at enqueue and replayed verbatim, pinned by
+        TestPayloadIsFrozenAtEnqueue.
+    - id: D-two-counters
+      what: member_epoch and lifecycle_version stay separate columns.
+      why: >
+        member_epoch answers "has the roster changed" and every consumer keys a
+        cached authorization decision on it; lifecycle_version orders statements
+        about the project itself. One shared counter would make every rename
+        invalidate every cached grant downstream, and every membership change
+        look like a lifecycle statement. Both carry the same increment-only
+        write discipline, enforced by the same parameterized source guard.
+    - id: D-revocation-carries-no-version
+      what: project.member_revoked ships with project_version = null.
+      why: >
+        A consumer discards a lifecycle statement not newer than what it holds.
+        Right for statements about the project; catastrophic for a revocation,
+        which must be applied even when late — dropping it as stale leaves a
+        removed member executing. Contract section 3.
+    - id: D-o6-column-not-status
+      what: >
+        Two-phase create is octo_project.activated_at (a nullable one-way
+        latch), not a third `status` value, even though contract section 7
+        draws it as `status=provisioning`.
+      why: >
+        About twenty predicates read status = 1 and mean different things by it
+        (the seat exists / the name is taken / it counts against quota / it is
+        visible / it is writable). A third value changes all of them at once,
+        and the two ways of getting it wrong are asymmetric: a missed predicate
+        on the status route silently turns members into non-members, which the
+        I2 reconcile then reads as a violation and tears the project group down.
+        Section 8 chose a column for archive on the same argument. The peer
+        cannot observe the difference — the two inbound endpoints answer exactly
+        as the section draws them — and section 7 now records this explicitly.
+    - id: D-o6-gate-follows-the-target
+      what: >
+        A new project waits for confirmation only when the fleet provisioning
+        target is enabled; otherwise the latch is set inside the create
+        transaction.
+      why: >
+        The confirming step IS the fleet ensure. With the target off — every
+        deployment today — nothing would ever set the latch, so a NULL default
+        would make every new project permanently invisible to the peer. Not
+        given a switch of its own, because a switch could be on while the target
+        was off, which is exactly the state that strands projects.
+    - id: D-o6-identity-check
+      what: >
+        Activation is gated on the existing "the target echoed the id we asked
+        it to create" check, not on a literal workspace_id == project_id
+        comparison.
+      why: >
+        They are the SAME check — the id we ask fleet to create is its workspace
+        id — but not yet the same VALUE. The fleet container id is still PR
+        #850's opaque random form, which the brief records as temporary: it
+        becomes project_id once fleet lands the authorization narrowing
+        (V1.1 sections 3.2/3.3). Making them equal BEFORE that narrowing would
+        open the known escalation chain the opaque id currently blocks (list
+        project_id -> use as workspace_id -> fleet admits on Space membership
+        and materializes the caller as a workspace member). So the order is:
+        peer narrows first, we swap the id form second — and this call site does
+        not change when they do.
+
+  deviations:
+    - what: >
+        The lifecycle event secret is refused when it equals any other fixed
+        capability credential, including the two provisioning secrets.
+      why: >
+        main.go's registry sees the pair but only LOGS it, leaving both
+        capabilities live. Provisioning and the event feed both talk to fleet;
+        one value for both means a leak from either grants both. The refusal is
+        symmetric, so a collision disables both channels rather than picking a
+        winner — with one value serving two capabilities there is no half that
+        is safe to keep.
+    - what: >
+        refusedEnvs in main_internaltoken_test.go now resolves identifiers
+        package-wide rather than file-locally.
+      why: >
+        A refusal list naming a constant declared in a sibling file of the same
+        package reported a false failure. The fix the file-scoped resolver
+        invites is re-declaring the literal locally, which is the duplication
+        the exported constant exists to prevent.
+    - what: >
+        The pkg/project source guard now strips line comments before searching.
+      why: >
+        A mutation that deleted `activated_at IS NOT NULL` from the SQL passed,
+        because the comment explaining the filter — inside the function body —
+        still contained the string. A guard a comment can satisfy reports green
+        for exactly the thing it was written to catch.
+
+  open_questions:
+    - id: Q-409-codes
+      what: >
+        The exact trigger conditions for IDEMPOTENCY_CONFLICT and
+        WORKSPACE_ID_CONFLICT are still owed by the peer. Until they arrive the
+        client treats every non-401/403/408/429 4xx as terminal.
+    - id: Q-ttl
+      what: >
+        The hard TTL asked for in S4-Q1 is now DEFENCE IN DEPTH, not required.
+        Moving the Space-removal epoch bump into the removal transaction (P1g)
+        removed the dependency on a peer commitment. The peer has not been told
+        this yet.
+    - id: Q-event-list
+      what: >
+        The v2 reply to the peer named project.disbanded and omitted
+        project.metadata_updated. The frozen contract supersedes it: disband
+        converges through the epoch predicate, and reclamation goes through
+        provisioning's disband_pending. The peer has not been told this yet.

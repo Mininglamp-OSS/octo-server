@@ -100,6 +100,12 @@ func NewDB(ctx *config.Context) *DB {
 var projectInsertColumns = []string{
 	"project_id", "space_id", "name", "description", "logo", "creator",
 	"discoverability", "max_members", "status",
+	// activated_at is WRITTEN at insert (unlike member_epoch / lifecycle_version,
+	// which are bumped): it is a latch, not a counter, so there is no monotonicity
+	// discipline to protect and no UPDATE that could race it backwards. The value
+	// is a timestamp when nothing has to confirm the project, and NULL when
+	// something does — see createProjectOnce.
+	"activated_at",
 	"created_at", "updated_at",
 	// join_mode is deliberately absent: the column exists with its DDL default (1) and
 	// nothing above the storage layer touches it until the P2 join path lands. See the
@@ -115,6 +121,7 @@ func (d *DB) insertProjectTx(tx *dbr.Tx, m *Model) error {
 		Columns(projectInsertColumns...).
 		Values(m.ProjectID, m.SpaceID, m.Name, m.Description, m.Logo, m.Creator,
 			m.Discoverability, m.MaxMembers, m.Status,
+			m.ActivatedAt,
 			m.CreatedAt, m.UpdatedAt).
 		Exec()
 	if err != nil {
@@ -136,7 +143,8 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
 			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
-			"lifecycle_version, status, all_member_group_no, created_at, updated_at "+
+			"lifecycle_version, status, activated_at, all_member_group_no, "+
+			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
 	if err != nil {
@@ -159,7 +167,8 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
 			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
-			"lifecycle_version, status, all_member_group_no, created_at, updated_at "+
+			"lifecycle_version, status, activated_at, all_member_group_no, "+
+			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
 	).Load(&models)

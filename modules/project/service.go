@@ -1,6 +1,7 @@
 package project
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -494,6 +495,22 @@ func (p *Project) createProjectTxWithSeatRefs(
 		return nil, err
 	}
 
+	// Two-phase create (O6, contract section 7). A project is ACTIVE to the peer
+	// only once the subsystem side has confirmed it has a container; until then
+	// the two inbound endpoints answer about it exactly as they answer about a
+	// project that does not exist.
+	//
+	// The latch is set here, at insert, whenever nothing is going to confirm it.
+	// That default is the load-bearing half, not a convenience: with the fleet
+	// target off — which is every deployment today — no confirmation step ever
+	// runs, so leaving it NULL would make every new project permanently invisible
+	// to the peer. Gating on the target rather than on a switch of its own means
+	// the phase that exists is exactly the phase something will finish.
+	var activatedAt sql.NullTime
+	if !p.twoPhaseCreateApplies() {
+		activatedAt = sql.NullTime{Time: now, Valid: true}
+	}
+
 	model := &Model{
 		ProjectID:       projectID,
 		SpaceID:         in.SpaceID,
@@ -504,6 +521,7 @@ func (p *Project) createProjectTxWithSeatRefs(
 		Discoverability: in.Discoverability,
 		MaxMembers:      in.MaxMembers,
 		Status:          StatusNormal,
+		ActivatedAt:     activatedAt,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}

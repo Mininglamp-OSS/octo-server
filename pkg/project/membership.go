@@ -370,9 +370,22 @@ func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs 
 		ProjectID   string `db:"project_id"`
 		MemberEpoch int64  `db:"member_epoch"`
 	}
+	// `activated_at IS NOT NULL` is the two-phase create gate (O6, contract
+	// section 7). A project whose subsystem container has not been confirmed
+	// must be indistinguishable here from one that does not exist, so that
+	// nothing can be authorized into a workspace that is not there yet.
+	//
+	// It belongs in THIS query specifically, not in each endpoint:
+	// ProjectMemberships runs this function as its step 1 and returns early when
+	// the project is absent from the result, so one predicate closes both
+	// inbound endpoints and they cannot drift apart.
+	//
+	// Rows created before the column existed were backfilled to created_at, so
+	// this filter removes nothing that used to be visible.
 	_, err := session.SelectBySql(
 		"SELECT project_id, member_epoch FROM `octo_project` "+
-			"WHERE space_id = ? AND project_id IN ? AND status = 1",
+			"WHERE space_id = ? AND project_id IN ? AND status = 1 "+
+			"  AND activated_at IS NOT NULL",
 		spaceID, lookup,
 	).Load(&rows)
 	if err != nil {
