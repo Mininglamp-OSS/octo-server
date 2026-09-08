@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -97,32 +98,128 @@ func TestFixedInternalTokenExclusionsTolerateNoEnvAccessor(t *testing.T) {
 	}
 }
 
-// TestFixedInternalTokenEnvsCoversEveryKnownCapability pins the registry itself.
-// A new internal-token capability that forgets to register here gets no pairwise
-// protection at all, and nothing else would notice.
-func TestFixedInternalTokenEnvsCoversEveryKnownCapability(t *testing.T) {
-	want := []string{
-		"NOTIFY_INTERNAL_TOKEN",
-		"OCTO_DOCS_NOTIFY_TOKEN",
-		"OCTO_DOCS_BOT_MENTION_TOKEN",
-		internal_resolve.DriveInternalTokenEnv,
-		internal_membership.MembershipInternalTokenEnv,
-		project.ProvisionFleetSecretEnv,
-		project.ProvisionDriveSecretEnv,
+// TestFixedInternalTokenRegistryIsCompleteBySweep checks that the registry is
+// COMPLETE, not merely self-consistent.
+//
+// The version this replaces built its expectation as a hand copy of
+// fixedInternalTokenEnvs, so both sides of the assertion came from the same
+// place: it pinned that the list equals itself, and a capability that was never
+// registered passed silently. Two reviewers found the same three that way —
+// TS_WEBHOOK_SECRET_KEY, OCTO_MAIL_GATEWAY_SECRET and TS_GRPC_AUTH_TOKEN — and a
+// membership token equal to the first grants membership reads plus webhook
+// forgery with nothing anywhere saying so.
+//
+// So the expectation now comes from the TREE. Every credential-shaped env
+// literal in non-test Go source must be classified: in the registry, or in the
+// annotated exclusion list below with a reason. A new one is neither, so it
+// fails until someone decides which it is — which is the only version of this
+// test that can catch the next omission.
+func TestFixedInternalTokenRegistryIsCompleteBySweep(t *testing.T) {
+	// Not capability credentials. Each reason is load-bearing: "it is a secret"
+	// is not the criterion — "one value that authenticates one service-to-service
+	// capability" is.
+	excluded := map[string]string{
+		"DM_OIDC_AEGIS_CLIENT_SECRET":     "OAuth client secret for one relying party, not a capability of this binary",
+		"DM_OIDC_PROVIDER_CLIENT_SECRET":  "OAuth client secret, provider side; same reason",
+		"DM_OIDC_RT_ENC_KEY":              "encryption key for refresh tokens, not an auth credential",
+		"DM_PUSH_APNS_KEY_ID":             "an APNs key IDENTIFIER, not a secret",
+		"DM_USERSECRET_RESOLVE_IP_BURST":  "rate-limit knob; matches only because USERSECRET contains SECRET",
+		"DM_USERSECRET_RESOLVE_IP_RPS":    "rate-limit knob; same",
+		"OCTO_MASTER_KEY":                 "signing key for sticker upload handles",
+		"OCTO_OIDC_BEARER_JWT_SECRET":     "JWT signing secret",
+		"OCTO_OIDC_BIND_TOKEN_TTL_SEC":    "a duration; matches on TOKEN",
+		"OCTO_OIDC_PROVIDER_ID_TOKEN_TTL": "a duration; same",
+		"OCTO_PII_ENCRYPTION_SECRET":      "column encryption key",
+		"OCTO_SEARCH_CURSOR_HMAC":         "cursor signing key",
+		"OCTO_USER_API_KEY_SECRET":        "key-encryption key for user API keys",
+		"TS_CACHE_TOKENEXPIRE":            "a duration; matches on TOKEN",
 	}
-	if len(fixedInternalTokenEnvs) != len(want) {
-		t.Fatalf("registry size changed: want %d, got %d (%v) — add the new capability to `want` too",
-			len(want), len(fixedInternalTokenEnvs), fixedInternalTokenEnvs)
-	}
-	have := make(map[string]bool, len(fixedInternalTokenEnvs))
+
+	registered := make(map[string]bool, len(fixedInternalTokenEnvs))
 	for _, e := range fixedInternalTokenEnvs {
-		have[e] = true
+		registered[e] = true
 	}
-	for _, e := range want {
-		if !have[e] {
-			t.Errorf("fixedInternalTokenEnvs is missing %s", e)
+
+	found := sweepCredentialEnvLiterals(t)
+	if len(found) < 20 {
+		t.Fatalf("the sweep found only %d env literals; it is probably not walking the tree, "+
+			"and a guard that reads nothing passes for the wrong reason", len(found))
+	}
+
+	for env, where := range found {
+		switch {
+		case registered[env]:
+		case excluded[env] != "":
+		default:
+			t.Errorf("%s (%s) is a credential-shaped env that is neither in "+
+				"fixedInternalTokenEnvs nor in this test's exclusion list. If it authenticates "+
+				"a service-to-service capability, register it — otherwise one leaked value can "+
+				"grant two capabilities with nothing detecting it. If it does not, add it to "+
+				"`excluded` with the reason.", env, where)
 		}
 	}
+
+	// The exclusion list must not rot either: an entry naming an env that no
+	// longer exists is a stale exemption someone could reuse by accident.
+	for env := range excluded {
+		if _, ok := found[env]; !ok {
+			t.Errorf("%s is excluded but no longer appears in the tree; drop the exemption", env)
+		}
+	}
+
+	// And every registered env must actually exist, so the registry cannot drift
+	// into naming envs nothing reads.
+	for _, env := range fixedInternalTokenEnvs {
+		if _, ok := found[env]; !ok {
+			t.Errorf("%s is in fixedInternalTokenEnvs but appears in no non-test source file", env)
+		}
+	}
+}
+
+// credentialEnvLiteral matches the naming convention this repository uses for
+// deployment-configured credentials. Deliberately over-broad — it also catches
+// durations and identifiers — because the cost of a false positive is one line
+// in `excluded` with a reason, and the cost of a false negative is an
+// unregistered capability credential.
+var credentialEnvLiteral = regexp.MustCompile(`"((?:TS|OCTO|DM|NOTIFY)_[A-Z0-9_]*(?:SECRET|TOKEN|KEY|HMAC)[A-Z0-9_]*)"`)
+
+// sweepCredentialEnvLiterals returns every credential-shaped env literal in
+// non-test Go source, mapped to the first file it was seen in.
+//
+// Test files are skipped: their fixtures name envs that exist only inside the
+// test (OCTO_SHARED_NOTIFY_TOKEN, OCTO_TEST_CALLBACK_SECRET, the S3 test keys),
+// and classifying those would be busywork with no security content.
+func sweepCredentialEnvLiterals(t *testing.T) map[string]string {
+	t.Helper()
+	found := map[string]string{}
+	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if name := info.Name(); name == "vendor" || name == ".git" || name == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		for _, m := range credentialEnvLiteral.FindAllStringSubmatch(string(data), -1) {
+			if _, seen := found[m[1]]; !seen {
+				found[m[1]] = path
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	return found
 }
 
 // TestModuleLocalRefusalsCoverTheCentralRegistry closes the gap between the two

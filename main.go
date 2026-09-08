@@ -843,6 +843,14 @@ const (
 // this list; recorded here so the next reader looks instead of trusting the
 // word "every".
 //
+// What this list DOES claim is every fixed, single-env, service-to-service
+// capability credential — and that claim is now checked rather than asserted.
+// TestFixedInternalTokenRegistryIsCompleteBySweep walks the tree for
+// credential-shaped env literals and requires each one to be either in this list
+// or in an annotated exclusion, so a capability that was never registered fails
+// instead of passing silently. It found three: TS_WEBHOOK_SECRET_KEY,
+// OCTO_MAIL_GATEWAY_SECRET and TS_GRPC_AUTH_TOKEN, which are now here.
+//
 // Each owning module also refuses a collision with the siblings it happens to
 // know about, but those local checks are ASYMMETRIC and always have been —
 // modules/notify checks one sibling, modules/bot_mention two,
@@ -867,6 +875,15 @@ var fixedInternalTokenEnvs = []string{
 	// peer hands the peer a credential that authenticates back to us.
 	project.ProvisionFleetSecretEnv,
 	project.ProvisionDriveSecretEnv,
+	// Three more inbound capability credentials, each a single env, each missed
+	// until the sweep test above was written: the webhook HMAC secret
+	// (modules/webhook), the mail gateway secret (modules/agentmailgateway), and
+	// the gRPC server auth token (modules/webhook). Sharing a value between any
+	// of these and, say, the membership token means one leaked value grants
+	// membership reads plus webhook forgery.
+	"TS_WEBHOOK_SECRET_KEY",
+	"OCTO_MAIL_GATEWAY_SECRET",
+	"TS_GRPC_AUTH_TOKEN",
 }
 
 // fixedInternalTokenCollisions reports every pair of fixed internal-token envs

@@ -177,6 +177,40 @@ func TestProjectEpochsExcludesInactiveProjects(t *testing.T) {
 		t.Error("ProjectEpochsInSpace must restrict to status = 1, so a disbanded project " +
 			"reads as epoch 0")
 	}
+
+	// The PARENT Space too. A ban flips space.status and touches no project row,
+	// so without this the epoch keeps saying "nothing changed" while
+	// ProjectMemberships — which does see the ban through its Space conjunction —
+	// flips its answer. The peer's only invalidation channel is the epoch, so a
+	// cached grant survives the ban and a cached denial survives the unban, both
+	// unbounded. Disband is worse: nothing disbands the projects of a disbanded
+	// Space, so their rows stay status = 1 forever.
+	if !strings.Contains(body, "space.IsActiveSpace(") {
+		t.Fatal("ProjectEpochsInSpace must fold an inactive parent Space into the absent " +
+			"answer, through space.IsActiveSpace. The two predicates in this file must not " +
+			"disagree about whether Space status is part of the answer — see this test's comment.")
+	}
+
+	// After the project rows, for the same reason ProjectMemberships reads its
+	// Space half last: this read can only REMOVE projects, so freshest-last is
+	// the fail-closed order.
+	rowsAt := strings.Index(body, "octo_project")
+	spaceAt := strings.Index(body, "space.IsActiveSpace(")
+	if spaceAt < rowsAt {
+		t.Error("the Space check must run AFTER the project query: it can only narrow the " +
+			"answer, so reading it last means a ban landing in between drops the projects " +
+			"rather than serving a live epoch for a Space that is already banned")
+	}
+
+	// Not a JOIN. octo_project pins utf8mb4_general_ci and `space` is a 2019
+	// table measured at utf8mb4_0900_ai_ci in production, so an implicit
+	// cross-schema comparison is error 1267 THERE while green in CI — and on a
+	// fail-closed endpoint that denies the peer everything.
+	if strings.Contains(body, "JOIN") {
+		t.Error("ProjectEpochsInSpace must not JOIN `space`: that comparison crosses the " +
+			"pinned and legacy collations and fails only in production. Every project in " +
+			"one call shares one space_id, so a single-row lookup answers the same question.")
+	}
 	if !strings.Contains(body, "space_id = ?") {
 		t.Error("ProjectEpochsInSpace must filter by space_id: a project in another " +
 			"Space has to be indistinguishable from one that does not exist")

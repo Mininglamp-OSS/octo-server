@@ -479,10 +479,26 @@ group_member → 恢复恢复不回来，静默且破坏性；独立列路线漏
       超时 / 5xx / 缺项 / 重复项 / 解析失败一律 fail-closed。
 - [ ] `GET /v1/internal/membership/epochs`：返回 `{"projects":{"<id>":<int>}}`；
       项目不存在或不可见返回 `0`；不返回状态字段。
-- [ ] 两个内部接口：**新增独立 token**、常量时间比较、token 长度下限、未配置时 503、
-      错误 token 401、按 IP 严格限流（新限流 tag，不与既有消费方共桶）、body 上限；
-      新 env 已加入 `main.go` 的 `ValidateNotifyTokenExclusions` 并有测试证明
-      它与 drive / docs / bot_task 的既有 token 互斥。
+      **「不可见」包含父 Space 被封禁或解散**——这两种情况都不动项目行、也不动 epoch，
+      所以必须由谓词把它们折进 `0`，否则 epoch 这条失效通道会说「什么都没变」而
+      `_verify` 的答案已经翻了（封禁后陈旧授权存活、解封后陈旧拒绝存活）。
+- [ ] 两个内部接口：**新增独立 token**、常量时间比较、token 长度下限、
+      按 IP 严格限流（新限流 tag，不与既有消费方共桶）、body 上限；
+      新 env 已加入 `main.go` 的 `ValidateNotifyTokenExclusions`。
+- [x] ~~未配置时 503、错误 token 401~~ → **改为两者都 401，需合同方签字后才算关闭。**
+      理由是反枚举：区分开来等于让未认证调用方探测部署状态。代价是对端拿到 401 时
+      分不清「凭据错，别重试」和「服务端还没配好，该重试」——如果对端把 401 当前者，
+      任何缺 env 的启动都会把集成锁死。**这是本仓单方面偏离一份对端正在实现的合同，
+      合并前必须由合同方确认并同步改 O8 接口文档**；实现细节见 `context.yaml` deviations。
+- [ ] ~~测试证明它与 drive / docs / bot_task 的既有 token 互斥~~ →
+      **drive / docs 已覆盖；bot_task 这一项本片交付不了，改为另立。**
+      bot_task 的 per-source bearer token 存在 `OCTO_BOT_TASK_SOURCES` 这个 JSON
+      registry 里而不是单个 env，只在 registry 内部去重，`main.go` 的固定 env 注册表
+      和 `ValidateNotifyTokenExclusions` 都看不见它。要覆盖必须让 bot_task 暴露它
+      配置的 token 值——那是对该模块的改动，不属于本片。本片改为把固定单 env 那一类
+      **穷尽**覆盖（由 `TestFixedInternalTokenRegistryIsCompleteBySweep` 全树扫描保证，
+      并因此补进了 `TS_WEBHOOK_SECRET_KEY` / `OCTO_MAIL_GATEWAY_SECRET` /
+      `TS_GRPC_AUTH_TOKEN` 三个漏网的），bot_task 那一维单独排期。
 - [ ] `/v1/internal` 既有消费方（drive / docs / bot_task）的现有测试全绿，
       共享中间件与限流键空间无回归。
 - [ ] 两个内部接口都不可被终端用户 token 调用（有负向测试）。

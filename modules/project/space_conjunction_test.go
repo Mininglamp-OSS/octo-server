@@ -214,3 +214,113 @@ func TestRolloutSentinelIsRefusedRatherThanServed(t *testing.T) {
 	require.NoError(t, err, "after the repair the project must be servable again")
 	assert.EqualValues(t, 1, epochs[created.ProjectID])
 }
+
+// TestSpaceBanMovesTheEpochChannelToo is the blocker two reviewers converged on,
+// and the half I broke by fixing the other half.
+//
+// Before the Space conjunction landed in ProjectMemberships, BOTH predicates
+// ignored Space status. They were wrong together, which at least kept them
+// consistent. Conjoining one and not the other put the disagreement on the one
+// channel the peer uses to invalidate an authorization cache:
+//
+//	ban   — memberships flip to member:false while the epoch stays E, so the
+//	        peer's check agrees with its own cached grant and the grant survives
+//	        the ban, unbounded;
+//	unban — a peer that re-verified during the ban cached member:false under E;
+//	        the unban restores the answer, the epoch is still E, the check agrees
+//	        again, and everyone stays denied.
+//
+// The fix folds an inactive parent Space into the absent answer, so the epoch
+// moves in BOTH directions: E -> 0 on ban, 0 -> E on unban. Both mismatches make
+// the peer re-verify, which is the only thing the contract needs.
+// The ban is staged through setSpaceStatus (api_test.go), which writes the
+// `space` row and nothing else — exactly what modules/space's updateSpaceStatus
+// does. No project row moves and no epoch bumps, which is the premise.
+func TestSpaceBanMovesTheEpochChannelToo(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "banOwner")
+	seedSpaceMember(t, spaceA, "banOwner", 0, 1)
+
+	created := createProjectVia(t, srv, spaceA, token, "space-ban")
+
+	epochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	cached := epochs[created.ProjectID]
+	require.NotZero(t, cached, "baseline: an active project in an active Space has a real epoch")
+
+	_, roles, err := projectpkg.ProjectMemberships(
+		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
+	require.NoError(t, err)
+	require.Contains(t, roles, "banOwner", "baseline: the owner is a member")
+
+	// ---- ban ----
+	setSpaceStatus(t, spaceA, 2)
+
+	row, err := testDB.queryByProjectID(created.ProjectID)
+	require.NoError(t, err)
+	require.Equal(t, StatusNormal, row.Status, "a ban must not touch the project row — that is the point")
+	require.EqualValues(t, cached, row.MemberEpoch, "and it must not bump the epoch either")
+
+	_, banRoles, err := projectpkg.ProjectMemberships(
+		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
+	require.NoError(t, err)
+	require.Empty(t, banRoles, "a banned Space must fail the authorization gate")
+
+	banEpochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	assert.NotContains(t, banEpochs, created.ProjectID,
+		"the epoch channel must report the change too; absent is what the caller turns into 0")
+	assert.NotEqual(t, cached, banEpochs[created.ProjectID],
+		"a cached grant keyed on %d must stop matching, or it survives the ban forever", cached)
+
+	// ---- unban ----
+	setSpaceStatus(t, spaceA, 1)
+
+	unbanEpochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	assert.EqualValues(t, cached, unbanEpochs[created.ProjectID],
+		"the unban must restore the epoch")
+	assert.NotEqual(t, banEpochs[created.ProjectID], unbanEpochs[created.ProjectID],
+		"a denial cached during the ban (under 0) must stop matching, or every member of "+
+			"every project in this Space stays denied after the unban")
+
+	_, backRoles, err := projectpkg.ProjectMemberships(
+		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
+	require.NoError(t, err)
+	assert.Contains(t, backRoles, "banOwner", "and the answer itself must come back")
+}
+
+// TestDisbandedSpaceProjectsReadAsAbsent covers the permanent case.
+//
+// Nothing disbands the projects of a disbanded Space — this repository says so
+// in its own words in modules/project/reconcile.go, where scanOrphanProjects
+// only LOGS the state. So octo_project.status stays 1 forever, and without the
+// parent check the endpoint would keep reporting a live epoch, the contract's
+// "exists and is visible" value, for a project whose Space is gone.
+func TestDisbandedSpaceProjectsReadAsAbsent(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "goneSpaceOwner")
+	seedSpaceMember(t, spaceA, "goneSpaceOwner", 0, 1)
+
+	created := createProjectVia(t, srv, spaceA, token, "space-disbanded")
+	setSpaceStatus(t, spaceA, 0)
+
+	row, err := testDB.queryByProjectID(created.ProjectID)
+	require.NoError(t, err)
+	require.Equal(t, StatusNormal, row.Status,
+		"nothing disbands the projects of a disbanded Space — the row stays active, which "+
+			"is exactly why the parent has to be part of the predicate")
+
+	epochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	assert.NotContains(t, epochs, created.ProjectID,
+		"a project whose Space is disbanded must read as absent, i.e. epoch 0")
+
+	epoch, roles, err := projectpkg.ProjectMemberships(
+		testCtx.DB(), spaceA, created.ProjectID, []string{"goneSpaceOwner"})
+	require.NoError(t, err)
+	assert.Zero(t, epoch)
+	assert.Empty(t, roles)
+}

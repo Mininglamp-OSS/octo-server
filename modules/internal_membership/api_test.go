@@ -86,14 +86,21 @@ func newTestModule(store membershipStore) *Module {
 	}
 }
 
-// newRouter mounts ONLY auth + handler. The production middleware order
-// (IP limiter → auth → handler, on the concrete routes) is asserted separately
-// in route_order_test.go with recording middleware, so nothing here needs Redis.
+// newRouter mounts the read deadline + auth + handler. The production order is
+// deadline → IP limiter → auth → handler on the concrete routes; only the
+// limiter is left out here, because it is the one middleware that needs Redis,
+// and route_order_test.go asserts the full order separately with recording
+// middleware.
+//
+// The deadline IS mounted, because leaving it out would make every test in this
+// file exercise a chain that cannot reproduce the hazard it exists for — and
+// that is not hypothetical: it was called from inside the handler for a round,
+// which meant it never covered a request that aborted at the limiter or at auth.
 func newRouter(m *Module) *wkhttp.WKHttp {
 	r := wkhttp.New()
 	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
-	r.GET(epochsPath, m.internalAuthMiddleware(), m.membershipEpochs)
-	r.POST(verifyPath, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	r.GET(epochsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.membershipEpochs)
+	r.POST(verifyPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.verifyProjectMemberships)
 	return r
 }
 

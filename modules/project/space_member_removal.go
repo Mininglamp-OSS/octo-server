@@ -308,7 +308,7 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		// Only when a row actually changed. The step is re-run on every job retry, so
 		// an unconditional bump would inflate the epoch on no-op reruns and break the
 		// "a no-op does not change the epoch" rule clients cache against.
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, err
 		}
 	}

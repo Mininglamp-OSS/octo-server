@@ -133,6 +133,9 @@ const (
 	siblingBotMentionTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	siblingDriveInternalToken = "OCTO_DRIVE_INTERNAL_TOKEN"
 	siblingMembershipTokenEnv = "OCTO_MEMBERSHIP_INTERNAL_TOKEN"
+	siblingWebhookSecretEnv   = "TS_WEBHOOK_SECRET_KEY"
+	siblingMailGatewaySecret  = "OCTO_MAIL_GATEWAY_SECRET"
+	siblingGRPCAuthTokenEnv   = "TS_GRPC_AUTH_TOKEN"
 )
 
 // Provisioning defaults.
@@ -396,6 +399,9 @@ func checkSecretExclusivity(getenv func(string) string, name, secret string, alr
 		siblingBotMentionTokenEnv,
 		siblingDriveInternalToken,
 		siblingMembershipTokenEnv,
+		siblingWebhookSecretEnv,
+		siblingMailGatewaySecret,
+		siblingGRPCAuthTokenEnv,
 	} {
 		if sibling := getenv(siblingEnv); sibling != "" && sibling == secret {
 			return fmt.Errorf("project provisioning: %s secret must differ from %s", name, siblingEnv)

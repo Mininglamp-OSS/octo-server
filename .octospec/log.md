@@ -2631,3 +2631,28 @@ from the consumer. See `.octospec/journal/shared/membership-epoch-absent-sentine
 - **测试的覆盖范围要按它真正能失败的理由来写** —— 「拒绝尾部内容」的用例全用内存 body，
   尾巴永远已经在缓冲里，所以它**不可能**因为真正重要的原因失败（尾巴在后续 TCP 段里到达
   是被接受的）。这一点写进了测试注释，免得下一个人把覆盖读得比实际强。
+
+## 2026-09-08 — loop-project-fleet-integration（PR #852 第五轮 review：又一个同族阻塞项）
+
+- **修好一半，比两边都错更危险** —— 上一轮我给 `ProjectMemberships` 加了 Space 合取，
+  没给 `ProjectEpochsInSpace` 加。加之前两个谓词都忽略 Space 状态，**错得一致**；
+  加完之后它们对「Space 状态算不算答案的一部分」产生了分歧，而这个分歧正好落在
+  **对端唯一的失效通道**上：封禁后 `_verify` 翻成 member:false 而 epoch 纹丝不动，
+  对端的过期检查同意自己缓存的授权；解封方向对称——封禁期间缓存的拒绝会一直存活。
+  **解封那一半是我这次改动引入的回归。**
+- **父容器的状态是答案的一部分** —— Space 封禁只写 `space` 一行，不碰项目行、不 bump
+  epoch，成员清理还刻意跳过被封禁的 Space（为了解封能恢复）。Space 解散更狠：本仓
+  没有任何东西会去解散它下面的项目，那些行的 `status` 永远是 1。行级谓词全都通过，
+  缺的是父级那一层。
+- **跨 schema 的 join 在 CI 绿、在生产 1267** —— 顺手加个 `INNER JOIN space` 是最自然的
+  写法，但 `octo_project` 钉死 `utf8mb4_general_ci` 而 `space` 是 2019 年的表，生产实测
+  是 `utf8mb4_0900_ai_ci`。而这是个 fail-closed 端点：报错就等于把对端全部拒掉。
+  改成单行查 `space.status` —— 一次调用里所有项目本来就共享同一个 space_id，join 什么都不换。
+- **读序规则可以复用**：这次读只会**缩小**答案，所以放最后才是 fail-closed 的顺序。
+  与席位/Space 那一处同一条规则。
+- **超时装错了地方等于没装** —— body 读超时原本写在 handler 里，只覆盖「跑到了 handler」的
+  请求。而 net/http 在 handler 返回后仍会**排空**声明过的 body（<256KiB，阻塞读、无超时），
+  所以拿了 401 的**未认证**调用方照样能钉住一个 goroutine 和一条连接。装到路由链第一位才覆盖。
+- **拿自己抄自己的清单当断言，等于什么都没测** —— `want` 是 `fixedInternalTokenEnvs` 的手抄，
+  两边同源，钉的是「列表等于它自己」。改成全树扫描 + 带理由的豁免表后，立刻抓出三个
+  从没登记过的凭据 env。

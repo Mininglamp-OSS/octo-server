@@ -74,9 +74,10 @@ func New(ctx *config.Context) *Module {
 // — see the handlers and pkg/project.
 func (m *Module) Route(r *wkhttp.WKHttp) {
 	ipLimit := m.ipRateLimit(r)
+	deadline := boundBodyReadTime()
 	internal := r.Group("/v1/internal")
-	internal.GET("/membership/epochs", ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 }
 
 // ipRateLimit builds the per-IP strict limiter shared by both endpoints.
@@ -472,11 +473,19 @@ func (m *Module) logLookupFailure(op string, err error, spaceID string, count in
 //     already buffered.
 //   - The FIRST decode, on an INCOMPLETE body. `{"space_id":"a` then silence
 //     parks it just as long, and decoder.Buffered does nothing about that. It is
-//     bounded here with a read deadline rather than left to the caller's
-//     goodwill: the largest legitimate body is maxRequestBodyBytes, so a peer
-//     that cannot finish sending it inside readBodyTimeout is stalled, not slow.
+//     bounded by a read deadline installed as the first handler on BOTH routes
+//     (boundBodyReadTime), not from inside this function — a deadline set here
+//     would miss every request that aborts at the limiter or at auth, which is
+//     the half an unauthenticated caller can reach.
 func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
-	boundBodyReadTime(c)
+	// The DECLARED length, before reading anything. MaxBytesReader bounds bytes
+	// READ, so a caller may declare far more than the cap, send a small complete
+	// object first, and have Decode succeed with nothing left over — the 16 KiB
+	// limit never engages, and the oversized remainder is what the post-handler
+	// drain then has to deal with. Refusing up front costs one comparison.
+	if c.Request.ContentLength > maxRequestBodyBytes {
+		return verifyRequest{}, errors.New("verify request declares a body over the limit")
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
 	decoder := json.NewDecoder(c.Request.Body)
 	decoder.DisallowUnknownFields()
@@ -494,21 +503,49 @@ func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
 	return req, nil
 }
 
-// boundBodyReadTime puts a wall clock on reading this request's body.
+// boundBodyReadTime puts a wall clock on reading a request's body.
 //
-// Best-effort by construction: SetReadDeadline reaches the connection through the
-// ResponseWriter chain, and a writer that does not support it (an
-// httptest.ResponseRecorder, or a future middleware that wraps without Unwrap)
-// returns ErrNotSupported. That is ignored rather than failed on — the deadline
-// bounds a hazard, it is not a correctness precondition, and refusing real
-// requests because a wrapper lacks a method would be the worse failure.
+// # It is the FIRST handler on both routes, and that position is the point
+//
+// An earlier version called this from inside decodeVerifyRequest, which meant the
+// deadline was only ever installed for requests that REACHED the handler — i.e.
+// after the limiter and after auth. Everything that aborts before that got none,
+// and the GET route got none at all. That gap is reachable and it is the more
+// dangerous half, because the caller does not need a token to use it:
+//
+// net/http marks every server request body doEarlyClose, and after the handler
+// returns, finishRequest closes it — which, for a declared remainder under
+// 256 KiB, drains it with a plain blocking read (net/http/transfer.go's
+// io.CopyN into io.Discard). With no ReadTimeout on the server that read has no
+// bound. So an unauthenticated caller can POST a Content-Length it never fills,
+// take its 401, and still pin a goroutine and a connection for as long as it
+// holds the socket. The strict IP bucket does not help: a 429 takes the same
+// drain path, which is exactly the "caps arrival rate, not the concurrency of
+// requests that never complete" distinction drawn on decodeVerifyRequest.
+//
+// Installed first, the deadline is already on the connection when that drain
+// runs, so the abort paths are covered too. It does not leak into the next
+// keep-alive request: net/http re-sets the per-request read deadline from
+// ReadTimeout, which is zero here, and that clears it.
+//
+// # Best-effort by construction
+//
+// SetReadDeadline reaches the connection through the ResponseWriter chain, and a
+// writer that does not support it — an httptest.ResponseRecorder, or a future
+// middleware that wraps without Unwrap — returns ErrNotSupported. That is
+// ignored rather than failed on: the deadline bounds a hazard, it is not a
+// correctness precondition, and refusing real requests because a wrapper lacks a
+// method would be the worse failure. gin's own responseWriter does implement
+// Unwrap, so it resolves in production.
 //
 // The value is generous on purpose. maxRequestBodyBytes is 16 KiB, so any real
 // peer finishes in milliseconds; readBodyTimeout is not a latency budget, it is
 // the line past which a connection is stalled rather than slow.
-func boundBodyReadTime(c *wkhttp.Context) {
-	if c.Request == nil || c.Writer == nil {
-		return
+func boundBodyReadTime() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if c.Request != nil && c.Writer != nil {
+			_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now().Add(readBodyTimeout))
+		}
+		c.Next()
 	}
-	_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now().Add(readBodyTimeout))
 }

@@ -61,6 +61,34 @@ func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[str
 	return active, nil
 }
 
+// IsActiveSpace reports whether the Space itself is active, with no reference to
+// any user.
+//
+// The `status = 1` here is byte-for-byte CheckMembership's Space half, and must
+// stay that way: a caller that answered "is this Space usable" differently from
+// the gate every authenticated route runs would be authorizing against a
+// different definition of the same word. A banned Space (status 2) and a
+// disbanded one (status 0) both answer false — see CheckMembershipForCleanup for
+// the ONE place where banned must count, and why it is a separate predicate
+// rather than a relaxation of this one.
+//
+// It exists for callers that hold no uid: a peer-facing predicate answering
+// about a project or a container, where the parent Space's state is part of the
+// answer but there is nobody whose membership to check.
+func IsActiveSpace(session *dbr.Session, spaceID string) (bool, error) {
+	if spaceID == "" {
+		return false, nil
+	}
+	var count int
+	err := session.SelectBySql(
+		"SELECT COUNT(*) FROM space WHERE space_id = ? AND status = 1", spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // CheckMembershipForCleanup answers a different question from CheckMembership:
 // "does uid still hold their seat in this Space, so removal cleanup must SKIP?"
 //

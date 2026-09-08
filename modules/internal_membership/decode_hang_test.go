@@ -243,3 +243,71 @@ func TestVerifyDoesNotWaitForeverOnAnIncompleteBody(t *testing.T) {
 		t.Fatal("an incomplete body must never reach the store")
 	}
 }
+
+// TestStalledBodyIsBoundedEvenWhenAuthRejects covers the half an UNAUTHENTICATED
+// caller can reach, which is the more dangerous one.
+//
+// The deadline used to be installed inside decodeVerifyRequest, so it only ever
+// covered requests that reached the handler. Everything that aborted at the
+// limiter or at auth got none — and aborting does not end the story: net/http
+// marks every server request body doEarlyClose, and finishRequest then DRAINS a
+// declared remainder under 256 KiB with a plain blocking read. With no
+// ReadTimeout that read is unbounded, so a caller with a wrong token could POST
+// a Content-Length it never fills, collect its 401, and still hold a goroutine
+// and a connection for as long as it liked. No credential required.
+//
+// Installing the deadline as the first handler on both routes is what covers it,
+// and this is the test that can tell the two placements apart: it presents a
+// token the server rejects, so the handler never runs.
+func TestStalledBodyIsBoundedEvenWhenAuthRejects(t *testing.T) {
+	router := newRouter(newTestModule(&stubStore{}))
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	head := "POST " + verifyPath + " HTTP/1.1\r\n" +
+		"Host: " + strings.TrimPrefix(srv.URL, "http://") + "\r\n" +
+		"Content-Type: application/json\r\n" +
+		internalTokenHeader + ": definitely-the-wrong-token-value\r\n" +
+		"Content-Length: 4096\r\n\r\n" +
+		`{"space_id":"a`
+	if _, err := io.WriteString(conn, head); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(readBodyTimeout + 10*time.Second)); err != nil {
+		t.Fatalf("set client deadline: %v", err)
+	}
+	start := time.Now()
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	elapsed := time.Since(start)
+
+	// A 401 arriving promptly is expected — auth answers without reading the
+	// body. The property under test is what happens NEXT: the connection must
+	// not stay pinned while the server drains a body the client never sends.
+	if err == nil && n > 0 {
+		t.Logf("first response after %s: %q", elapsed, strings.SplitN(string(buf[:n]), "\r\n", 2)[0])
+		if err := conn.SetReadDeadline(time.Now().Add(readBodyTimeout + 10*time.Second)); err != nil {
+			t.Fatalf("set client deadline: %v", err)
+		}
+		start = time.Now()
+		_, err = conn.Read(buf)
+		elapsed = time.Since(start)
+	}
+
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatalf("the connection was still open %s after a REJECTED request whose body never "+
+			"arrived. An abort does not end the read: net/http drains the declared remainder "+
+			"after the handler returns, unbounded without a deadline — so an unauthenticated "+
+			"caller pins a goroutine and a connection. Mount boundBodyReadTime as the FIRST "+
+			"handler, not from inside the handler.", elapsed)
+	}
+	t.Logf("connection closed after %s (%v)", elapsed, err)
+}

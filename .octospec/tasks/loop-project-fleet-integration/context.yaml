@@ -191,6 +191,56 @@ review_fixes:
       of parking forever. The comment now scopes both reads and states what the
       buffered check cannot see (a tail in a later TCP segment).
     touches: modules/internal_membership/api.go, config.go
+  - id: P1f
+    finding: >
+      Convergent blocker from two reviewers, and a regression this increment
+      introduced: adding the Space conjunction to ProjectMemberships alone made
+      the two predicates disagree about whether Space status is part of the
+      answer, and the disagreement landed on the epoch — the peer's only
+      invalidation channel. A Space ban flips space.status and touches no project
+      row and no epoch, so after a ban _verify answers member:false while epochs
+      still answers E: the peer's check agrees with its own cached grant and the
+      grant survives the ban. Unban is the mirror: a denial cached during the ban
+      survives the unban for every member of every project in that Space. Space
+      DISBAND is permanent, because nothing disbands the projects of a disbanded
+      Space and their rows stay status = 1 forever.
+    decision: >
+      ProjectEpochsInSpace folds an inactive parent Space into the absent answer,
+      through the new space.IsActiveSpace, and reads it LAST for the same
+      fail-closed reason the seat/Space order already used. Because
+      ProjectMemberships routes through it for step 1, one change closes both
+      endpoints and both directions. A single-row lookup rather than a JOIN,
+      deliberately - octo_project pins utf8mb4_general_ci while `space` is a 2019
+      table measured at utf8mb4_0900_ai_ci in production, so an implicit
+      cross-schema comparison is error 1267 THERE while green in CI, which on a
+      fail-closed endpoint denies the peer everything.
+    touches: pkg/space/membership.go, pkg/project/membership.go
+  - id: P2f
+    finding: >
+      boundBodyReadTime was called from inside decodeVerifyRequest, so the
+      deadline was only installed for requests that REACHED the handler. Requests
+      aborting at the limiter or at auth got none, and the GET route got none at
+      all - yet net/http still drains a declared body under 256 KiB after the
+      handler returns, with a plain blocking read. So an UNAUTHENTICATED caller
+      could POST a Content-Length it never fills, take its 401, and pin a
+      goroutine and a connection indefinitely.
+    decision: >
+      Mounted as the FIRST handler on both routes, ahead of the limiter, pinned
+      by the route-order guard and by a real-socket test that presents a rejected
+      token. An oversized declared Content-Length is also refused before decoding,
+      since MaxBytesReader bounds bytes read, not bytes declared.
+    touches: modules/internal_membership/api.go
+  - id: P2g
+    finding: >
+      TestFixedInternalTokenEnvsCoversEveryKnownCapability built its expectation
+      as a hand copy of the registry, so it pinned that the list equals itself
+      and a capability never registered passed silently. Three were missing.
+    decision: >
+      Replaced by a tree sweep: every credential-shaped env literal in non-test
+      source must be in the registry or in an annotated exclusion with a reason.
+      TS_WEBHOOK_SECRET_KEY, OCTO_MAIL_GATEWAY_SECRET and TS_GRPC_AUTH_TOKEN are
+      now registered and refused by both module-local lists.
+    touches: main.go, main_internaltoken_test.go, modules/internal_membership/config.go, modules/project/config_provisioning.go
   - id: P1c
     finding: >
       ProjectMemberships answered from the project seat alone. The Space to
@@ -287,6 +337,30 @@ deviations:
       second, credential-scoped quota AFTER auth, which needs a per-consumer
       identity the current one-shared-token contract does not have. Recorded in
       config.go beside the sizing rationale.
+  - what: >
+      main.go grew a fixed-internal-token collision REGISTRY, beyond the
+      acceptance item's "add the new env to the existing exclusion call".
+    why: >
+      The module-local checks are asymmetric by history (notify checks one
+      sibling, bot_mention two, internal_resolve three), so pairs existed that no
+      module compared. Adding a capability multiplies those pairs. The registry
+      is the one place that sees all of them; it reports rather than refuses, per
+      the pinned boot contract recorded above. Scope the brief does not describe,
+      recorded here so it is not re-discovered as unexplained.
+  - what: >
+      The strict IP bucket is keyed on a caller-supplied header chain
+      (X-Real-Ip, then rightmost X-Forwarded-For, then RemoteAddr), and nothing
+      in this repository calls SetTrustedProxies.
+    why: >
+      A pre-existing property of octo-lib's limiter shared by every
+      strict-limited route here, not something these endpoints introduce, so it
+      is recorded rather than fixed by forking the shared middleware for one
+      module. What is specific to these routes is the failure mode: draining the
+      bucket denies the PEER'S AUTHORIZATION PATH rather than slowing a
+      background poll. The config.go comment previously claimed the residual was
+      bounded by "the peer's egress is not shared with untrusted traffic", which
+      is not true of a key the caller supplies; it now says so. Whether an edge
+      proxy normalizes those headers on /v1/internal is on the human-verify list.
   - what: >
       role is reported without a paired capabilities field.
     why: >

@@ -364,9 +364,49 @@ var ErrLiveProjectOnAbsentSentinel = errors.New(
 // answer, for the same reason MembershipsInSpace folds them together: telling
 // them apart would let a caller probe which Space a project id lives in.
 //
-// `status = 1` is what makes disband converge without a separate event: a
-// disbanded project drops out of this result, the caller reads 0, and an
+// `status = 1` is what makes project disband converge without a separate event:
+// a disbanded project drops out of this result, the caller reads 0, and an
 // authorization snapshot taken against the old epoch stops matching.
+//
+// # The PARENT Space is part of the answer, and it is checked last
+//
+// A Space ban flips `space.status` and touches nothing else — no octo_project
+// write, no epoch bump, and the member-removal cascade deliberately skips banned
+// Spaces so an unban can restore them. A Space disband is worse: nothing
+// disbands the projects of a disbanded Space, so their rows stay `status = 1`
+// forever.
+//
+// Without the parent check these two functions DISAGREE, and the disagreement
+// lands on the channel the peer uses to invalidate:
+//
+//	ban:   ProjectMemberships flips to member:false (its Space conjunction sees
+//	       the ban) while this function keeps answering the same epoch E. The
+//	       peer re-checks, E == E, its check AGREES, and the cached grant
+//	       survives the ban — unbounded.
+//	unban: a peer that re-verified during the ban cached member:false under E.
+//	       The unban restores the answer, the epoch is still E, the check agrees
+//	       again, and every member of every project in that Space stays denied.
+//
+// The unban direction was introduced by adding the Space conjunction to
+// ProjectMemberships alone: before that both functions ignored Space status and
+// at least agreed with each other. One predicate is not allowed to know
+// something the invalidation channel does not.
+//
+// Checked LAST, after the project rows, for the same reason ProjectMemberships
+// reads its Space half last: this read can only ever REMOVE projects from the
+// answer, so the freshest data arriving here is the fail-closed direction. A ban
+// committing between the two reads yields "rows, then inactive" — everything
+// drops, the peer reads 0, re-verifies. The other order would yield "active,
+// then rows" and serve a live epoch for a Space that is already banned.
+//
+// A single-row lookup on `space` rather than a JOIN, deliberately: every project
+// in one call shares one space_id, so the join would buy nothing, and
+// `octo_project` pins utf8mb4_general_ci while `space` is a 2019 table that
+// inherits the server default — measured as utf8mb4_0900_ai_ci in production. An
+// implicit cross-schema comparison is MySQL error 1267 THERE while passing in
+// CI, which on a fail-closed endpoint means the peer is denied everything and
+// the lane that would have caught it is green. See modules/project/reconcile_p1.go
+// for the repository's full account of that trap.
 //
 // # An ACTIVE project on the sentinel is refused, not served
 //
@@ -418,6 +458,21 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 	if err != nil {
 		return nil, err
 	}
+	if len(rows) == 0 {
+		return out, nil
+	}
+
+	// The parent Space, last. See the doc comment: this read can only narrow the
+	// answer, and an inactive Space folds its projects into the same "does not
+	// exist" answer as every other absent case.
+	spaceActive, err := space.IsActiveSpace(session, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !spaceActive {
+		return out, nil
+	}
+
 	for _, r := range rows {
 		// Every row here is status = 1 by the predicate above, so an epoch on the
 		// sentinel is a live project wearing the value that means "gone".

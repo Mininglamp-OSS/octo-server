@@ -496,8 +496,23 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	// be the last statement in this transaction. This bump takes no new lock —
 	// octo_project is already held from the insert above — so it cannot affect
 	// that ordering.
-	if err := p.db.bumpMemberEpochTx(tx, model.ProjectID, now); err != nil {
+	//
+	// The affected-row count is CHECKED here and ignored everywhere else, because
+	// this is the one call site where a silent no-op is a security state rather
+	// than the intended behaviour: it would leave a fresh project on the reserved
+	// absent-epoch sentinel while the response below reports 1 — the exact state
+	// migration 20260908000001 exists to remove. It holds today because the insert
+	// above writes StatusNormal in this same transaction; it stops holding the
+	// moment a two-phase create (O6) gives a project a non-normal initial status,
+	// and this turns that from a silent wrong answer into a failed create.
+	bumped, err := p.db.bumpMemberEpochTx(tx, model.ProjectID, now)
+	if err != nil {
 		return nil, err
+	}
+	if bumped == 0 {
+		return nil, fmt.Errorf(
+			"project: create bumped no epoch row for %s; the project would ship on the "+
+				"reserved absent-epoch sentinel while reporting 1", model.ProjectID)
 	}
 	model.MemberEpoch++
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
@@ -692,7 +707,7 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	// Bump BEFORE the status flip: bumpMemberEpochTx guards on status=1 (the predicate that
 	// keeps a disbanded project's epoch frozen), and disband is exactly the write that must
 	// move the epoch — the brief lists it alongside add/remove/leave/role-change/cascade.
-	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
 	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
@@ -909,7 +924,7 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 		return false, err
 	}
 	if changed {
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, err
 		}
 	}
@@ -1246,7 +1261,7 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 		return false, "", err
 	}
 	if changed || successorPromoted != "" {
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, "", err
 		}
 	}
@@ -1405,7 +1420,7 @@ func (p *Project) beginRemovalWithCascadeTx(
 	if !changed {
 		return false, nil
 	}
-	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return false, err
 	}
 	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{

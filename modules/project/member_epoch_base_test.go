@@ -119,6 +119,15 @@ func TestCreateBumpsTheEpochRatherThanSeedingIt(t *testing.T) {
 	require.Greater(t, insertAt, -1, "createProjectOnce must insert the project row")
 	require.Greater(t, bumpAt, insertAt,
 		"the epoch bump must come AFTER the project insert, or its status guard matches no row")
+
+	// And the bump's affected-row count must be CHECKED here, not discarded. The
+	// status guard means "no error" and "it happened" are different facts, and a
+	// silent zero-row bump would ship a project on the reserved absent sentinel
+	// while the response reports 1. Every other call site may ignore the count —
+	// a no-op on a disbanded project is intended there.
+	assert.Contains(t, create, "bumped == 0",
+		"createProjectOnce must check that the epoch bump matched a row; discarding the count "+
+			"turns the one case where a no-op is a security state into a silent wrong answer")
 }
 
 // ---------- the invariant after the migration instant ----------

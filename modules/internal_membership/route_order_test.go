@@ -174,12 +174,26 @@ func routeMountProblems(body string) []string {
 		}
 		limitAt := strings.Index(rest, "ipLimit")
 		authAt := strings.Index(rest, "internalAuthMiddleware")
+		deadlineAt := strings.Index(rest, "deadline")
 		if limitAt < 0 || authAt < 0 {
 			problems = append(problems, route+" must mount both ipLimit and internalAuthMiddleware on the concrete route")
 			continue
 		}
 		if limitAt > authAt {
 			problems = append(problems, route+" mounts auth before the rate limiter; token probing would bypass the strict bucket")
+		}
+		// The read deadline must be FIRST — ahead of the limiter, and therefore
+		// ahead of auth. Anywhere later and it is not installed for a request that
+		// aborts at 429 or 401, and net/http still drains that request's declared
+		// body after the handler returns, unbounded. See boundBodyReadTime.
+		if deadlineAt < 0 {
+			problems = append(problems, route+" must mount the body read deadline")
+			continue
+		}
+		if deadlineAt > limitAt {
+			problems = append(problems, route+" mounts the read deadline after the limiter; "+
+				"a request rejected with 429 or 401 then has no deadline while net/http drains "+
+				"its unsent body, so an unauthenticated caller can pin a goroutine and a connection")
 		}
 	}
 	return problems
@@ -190,8 +204,8 @@ func routeMountProblems(body string) []string {
 func TestRouteMountGuardCatchesTheHazards(t *testing.T) {
 	clean := `
 	internal := r.Group("/v1/internal")
-	internal.GET("/membership/epochs", ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 `
 	if got := routeMountProblems(clean); len(got) != 0 {
 		t.Fatalf("the guard rejects a correct mounting: %v", got)
@@ -200,24 +214,34 @@ func TestRouteMountGuardCatchesTheHazards(t *testing.T) {
 	hazards := map[string]string{
 		"middleware on the group": `
 	internal := r.Group("/v1/internal", m.internalAuthMiddleware())
-	internal.GET("/membership/epochs", ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 `,
 		"a separate .Use() call": `
 	internal := r.Group("/v1/internal")
 	internal.Use(m.internalAuthMiddleware())
-	internal.GET("/membership/epochs", ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 `,
 		"auth ahead of the limiter on the route": `
 	internal := r.Group("/v1/internal")
-	internal.GET("/membership/epochs", m.internalAuthMiddleware(), ipLimit, m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, m.internalAuthMiddleware(), ipLimit, m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 `,
 		"the limiter dropped entirely": `
 	internal := r.Group("/v1/internal")
-	internal.GET("/membership/epochs", m.internalAuthMiddleware(), m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+`,
+		"the read deadline dropped": `
+	internal := r.Group("/v1/internal")
+	internal.GET("/membership/epochs", ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+`,
+		"the read deadline behind the limiter": `
+	internal := r.Group("/v1/internal")
+	internal.GET("/membership/epochs", ipLimit, deadline, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 `,
 	}
 	for name, src := range hazards {

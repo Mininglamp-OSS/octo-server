@@ -47,6 +47,9 @@ const (
 	driveInternalTokenEnv      = "OCTO_DRIVE_INTERNAL_TOKEN"
 	provisionFleetSecretEnv    = "OCTO_PROJECT_PROVISION_FLEET_SECRET"
 	provisionDriveSecretEnv    = "OCTO_PROJECT_PROVISION_DRIVE_SECRET"
+	webhookSecretEnv           = "TS_WEBHOOK_SECRET_KEY"
+	mailGatewaySecretEnv       = "OCTO_MAIL_GATEWAY_SECRET"
+	grpcAuthTokenEnv           = "TS_GRPC_AUTH_TOKEN"
 
 	// internalTokenHeader is the wire header carrying the credential. Same
 	// value as modules/notify, modules/bot_mention and modules/internal_resolve
@@ -117,9 +120,26 @@ const (
 	// then only has to be an abuse floor. That is not built here: it needs a
 	// per-consumer identity the current one-shared-token contract does not have,
 	// which is the same open question as per-consumer scoping (see the brief).
-	// Until then the assumption this sizing rests on is that the peer's egress is
-	// not shared with untrusted traffic, and that is a deployment property, not a
-	// code property.
+	//
+	// AND THE RESIDUAL IS WIDER THAN "the peer's egress is not shared", which is
+	// what this comment used to claim. The bucket is not keyed on the observed
+	// source address: octo-lib's limiter resolves the caller as X-Real-Ip, then
+	// the rightmost X-Forwarded-For, then RemoteAddr, and nothing in this
+	// repository calls SetTrustedProxies (see modules/qrcode/api.go, which
+	// documents the default as 0.0.0.0/0). So anyone who can reach /v1/internal
+	// can PIN X-Real-Ip to the peer's address and drain the burst — producing
+	// exactly the deny-end-users outcome — or rotate the header and skip the
+	// bucket entirely. Naming a deployment property ("their egress is clean")
+	// does not bound a risk whose key the caller supplies.
+	//
+	// This is a pre-existing property of every strict-limited route in this
+	// repository rather than something these endpoints introduce, which is why it
+	// is recorded here instead of being fixed by hand-rolling a second limiter —
+	// that would fork the shared middleware for one module. What makes it worth
+	// writing down is that on THESE routes the failure mode is denial of the
+	// peer's authorization path, not a slowed background poll. Confirming whether
+	// an edge proxy normalizes those headers on /v1/internal is a deployment
+	// question, and it is on the human-verify list.
 	envMembershipIPRPS   = "DM_MEMBERSHIP_INTERNAL_IP_RPS"
 	envMembershipIPBurst = "DM_MEMBERSHIP_INTERNAL_IP_BURST"
 	defMembershipIPRPS   = 20.0
@@ -138,6 +158,9 @@ var siblingFixedTokenEnvs = []string{
 	driveInternalTokenEnv,
 	provisionFleetSecretEnv,
 	provisionDriveSecretEnv,
+	webhookSecretEnv,
+	mailGatewaySecretEnv,
+	grpcAuthTokenEnv,
 }
 
 // resolveMembershipInternalToken loads the token and refuses to enable the
