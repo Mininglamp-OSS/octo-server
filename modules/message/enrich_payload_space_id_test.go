@@ -16,9 +16,9 @@ import (
 
 // groupSpaceLookupStub 记录调用历史，返回固定映射。
 type groupSpaceLookupStub struct {
-	spaces  map[string]string
-	errOn   map[string]error
-	calls   []string
+	spaces map[string]string
+	errOn  map[string]error
+	calls  []string
 }
 
 func (s *groupSpaceLookupStub) lookup(groupNo string) (string, error) {

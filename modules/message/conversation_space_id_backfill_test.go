@@ -27,7 +27,7 @@ func TestSpaceID_FillConversationSpaceIDs_GroupBackfill(t *testing.T) {
 	rawGroupSpaceMap := map[string]string{
 		"g_internal": "spaceA",
 		"g_external": "spaceB", // 群表权威值，未经 effective rewrite
-		"g_legacy":   "",        // 旧群无 space_id
+		"g_legacy":   "",       // 旧群无 space_id
 	}
 	externalGroupMap := map[string]string{
 		"g_external": "spaceA", // 当前 user 从 spaceA 加入了 g_external

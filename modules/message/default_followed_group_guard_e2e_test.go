@@ -205,19 +205,19 @@ func TestE2E_DefaultFollowedGroupGuard_ProductionChain(t *testing.T) {
 	cleanGuardE2ERows(t, ctx)
 
 	const (
-		uid                  = "e2e-u1"
-		spaceA               = "e2e-sA"
-		spaceB               = "e2e-sB"
-		gOK                  = "e2e-g-ok"           // member + spaceA + category → MATERIALIZE
-		gDisband             = "e2e-g-disband"      // member + spaceA + category but Disband → REJECT
-		gWrongSpace          = "e2e-g-wrong"        // member + spaceB (not request space) + category → REJECT
-		gNotMember           = "e2e-g-notmem"       // spaceA + category but uid is NOT a member → REJECT
-		gNoCategory          = "e2e-g-nocat"        // member + spaceA but no category → REJECT (Stage 1)
-		gSoftDeletedCat      = "e2e-g-softcat"      // member + spaceA + category_id but category soft-deleted → REJECT (Stage 1, H1 regression)
-		gExternal            = "e2e-g-external"     // external member in spaceB referencing spaceA + category → MATERIALIZE
-		gFake                = "e2e-g-fake"         // attacker-injected, no rows anywhere → REJECT (Stage 1)
-		catLive              = "cat-live"
-		catSoftDeleted       = "cat-deleted"
+		uid             = "e2e-u1"
+		spaceA          = "e2e-sA"
+		spaceB          = "e2e-sB"
+		gOK             = "e2e-g-ok"       // member + spaceA + category → MATERIALIZE
+		gDisband        = "e2e-g-disband"  // member + spaceA + category but Disband → REJECT
+		gWrongSpace     = "e2e-g-wrong"    // member + spaceB (not request space) + category → REJECT
+		gNotMember      = "e2e-g-notmem"   // spaceA + category but uid is NOT a member → REJECT
+		gNoCategory     = "e2e-g-nocat"    // member + spaceA but no category → REJECT (Stage 1)
+		gSoftDeletedCat = "e2e-g-softcat"  // member + spaceA + category_id but category soft-deleted → REJECT (Stage 1, H1 regression)
+		gExternal       = "e2e-g-external" // external member in spaceB referencing spaceA + category → MATERIALIZE
+		gFake           = "e2e-g-fake"     // attacker-injected, no rows anywhere → REJECT (Stage 1)
+		catLive         = "cat-live"
+		catSoftDeleted  = "cat-deleted"
 	)
 
 	// --- groups ---
@@ -241,7 +241,7 @@ func TestE2E_DefaultFollowedGroupGuard_ProductionChain(t *testing.T) {
 	seedGroupMember(t, ctx, gExternal, uid, 1, spaceA)
 
 	// --- categories ---
-	seedGroupCategory(t, ctx, catLive, uid, 1)       // status=1 normal
+	seedGroupCategory(t, ctx, catLive, uid, 1)        // status=1 normal
 	seedGroupCategory(t, ctx, catSoftDeleted, uid, 2) // status=2 soft-deleted (H1)
 
 	// --- group_setting (per-user category assignment) ---

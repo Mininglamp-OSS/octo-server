@@ -124,12 +124,26 @@ type SidebarItem struct {
 	// 与 v1 SyncUserConversationResp.MySourceSpaceID 字段口径一致
 	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
 	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
-	MySourceSpaceID string  `json:"my_source_space_id,omitempty"`
-	Timestamp       int64   `json:"timestamp"`
-	Unread          int     `json:"unread"`
-	IsPinned        bool    `json:"is_pinned"`
-	IsFollowed      bool    `json:"is_followed"`
-	CategoryID      *string `json:"category_id,omitempty"`
+	MySourceSpaceID string `json:"my_source_space_id,omitempty"`
+	// ProjectID 是该条目所属项目的 ID，口径与上面的 SpaceID 逐档对齐：
+	//   - GROUP: group 表的 project_id；
+	//   - COMMUNITY_TOPIC: 父群的 project_id（与 SpaceID 同一把 key 取，
+	//     两者不可能对不上）；
+	//   - PERSON: 留空 —— DM 不属于任何项目。
+	// 空串 = 直属 Space，与 group.project_id 的哨兵值一致；omitempty，所以老客户端
+	// 的 payload 逐字节不变。
+	//
+	// 客户端靠它在消息列表里按项目分组。P1 建立了这一列，#855 把它下发到
+	// GroupResp 和群详情，这里是同一次透出剩下的一跳。
+	//
+	// 取值不额外发查询：CollectGroupSpaceAndProjectMaps 与 SpaceID 共用同一次
+	// GetGroups，见那个函数的注释。
+	ProjectID  string  `json:"project_id,omitempty"`
+	Timestamp  int64   `json:"timestamp"`
+	Unread     int     `json:"unread"`
+	IsPinned   bool    `json:"is_pinned"`
+	IsFollowed bool    `json:"is_followed"`
+	CategoryID *string `json:"category_id,omitempty"`
 	// CategorySort 暴露给客户端的"类别之间排序权重"，来源是 group_category.sort
 	// （PR #21 review by lml2468 blocker #3）。改类别顺序会 bump follow_version
 	// 并改变这里返回的值，与 /category/sort 接口及 swagger 一致。
@@ -469,10 +483,12 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	if len(threadExtRows) > 0 {
 		extraParentGroupNos = uniqueThreadParentGroupNos(threadExtRows)
 	}
-	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, extraParentGroupNos, sb.groupService)
+	groupSpaceMap, groupProjectMap, ok := CollectGroupSpaceAndProjectMaps(
+		conversations, extraParentGroupNos, sb.groupService)
 	if !ok {
 		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
 		groupSpaceMap = map[string]string{}
+		groupProjectMap = map[string]string{}
 	}
 
 	// 2g. externalGroupMap：当前 user 作为外部成员加入的 (groupNo -> source_space_id)
@@ -495,7 +511,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
-		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, groupProjectMap, externalGroupMap, defaultSpaceID)
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -516,7 +532,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 				selfCreatedThreads[key] = struct{}{}
 			}
 		}
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID, selfCreatedThreads, threadStatusMap)
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, groupProjectMap, externalGroupMap, defaultSpaceID, selfCreatedThreads, threadStatusMap)
 
 		// GH octo-server#310：把 thread 生命周期状态回填到 thread 条目。statusMap
 		// 来自 loadThreadLastMsgAt（复用 QueryActiveByGroupShortIDs 已 SELECT 的
@@ -592,7 +608,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			cutoffs = recentCutoffs{}
 			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
 		}
-		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, groupProjectMap, externalGroupMap, defaultSpaceID)
 		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
 		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
@@ -1195,6 +1211,7 @@ func buildFollowItems(
 	groupExts map[string]*convext.Model,
 	dmCategorySorts map[string]int,
 	groupSpaceMap map[string]string,
+	groupProjectMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 ) []*SidebarItem {
@@ -1221,6 +1238,7 @@ func buildFollowItems(
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
 				SpaceID:           groupSpaceMap[conv.ChannelID],
+				ProjectID:         groupProjectMap[conv.ChannelID],
 				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID),
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
@@ -1288,7 +1306,8 @@ func buildFollowItems(
 				ChannelType: conv.ChannelType,
 				ChannelID:   conv.ChannelID,
 				// thread 继承父群 SpaceID（GH octo-server#153）。
-				SpaceID: groupSpaceMap[groupNo],
+				SpaceID:   groupSpaceMap[groupNo],
+				ProjectID: groupProjectMap[groupNo],
 				// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
 				// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
 				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
@@ -1327,6 +1346,7 @@ func buildRecentItems(
 	cutoffs recentCutoffs,
 	pinnedSet map[string]struct{},
 	groupSpaceMap map[string]string,
+	groupProjectMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 ) []*SidebarItem {
@@ -1350,16 +1370,19 @@ func buildRecentItems(
 		// Round-3 (GH#154 Round-2 Finding 2)：externalGroupMap[k]="" 时兜底到
 		// defaultSpaceID，与 decideConvKeepInSpace 同口径。
 		spaceID := ""
+		projectID := ""
 		mySourceSpaceID := ""
 		switch conv.ChannelType {
 		case common.ChannelTypeGroup.Uint8():
 			spaceID = groupSpaceMap[conv.ChannelID]
+			projectID = groupProjectMap[conv.ChannelID]
 			mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID)
 		case common.ChannelTypeCommunityTopic.Uint8():
 			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
 			if err == nil {
 				parentID = groupNo
 				spaceID = groupSpaceMap[groupNo]
+				projectID = groupProjectMap[groupNo]
 				mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID)
 			}
 		}
@@ -1369,6 +1392,7 @@ func buildRecentItems(
 			ChannelType:     conv.ChannelType,
 			ChannelID:       conv.ChannelID,
 			SpaceID:         spaceID,
+			ProjectID:       projectID,
 			MySourceSpaceID: mySourceSpaceID,
 			Timestamp:       conv.Timestamp,
 			Unread:          conv.Unread,
@@ -1426,6 +1450,7 @@ func mergeThreadEntries(
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
 	groupSpaceMap map[string]string,
+	groupProjectMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 	// selfCreatedThreads 的键是 ext.TargetID，命中表示该子区由 loginUID 本人创建
@@ -1507,7 +1532,8 @@ func mergeThreadEntries(
 			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 			ChannelID:   ext.TargetID,
 			// thread 继承父群 SpaceID（GH octo-server#153）。
-			SpaceID: groupSpaceMap[groupNo],
+			SpaceID:   groupSpaceMap[groupNo],
+			ProjectID: groupProjectMap[groupNo],
 			// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
 			// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
 			MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),

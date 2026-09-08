@@ -693,6 +693,27 @@ func CollectGroupSpaceMap(
 	extraGroupNos []string,
 	groupService group.IService,
 ) (map[string]string, bool) {
+	spaceMap, _, ok := CollectGroupSpaceAndProjectMaps(conversations, extraGroupNos, groupService)
+	return spaceMap, ok
+}
+
+// CollectGroupSpaceAndProjectMaps derives (groupNo -> spaceID) AND
+// (groupNo -> projectID) from ONE GetGroups call.
+//
+// The project map is free: GetGroups already returns whole group rows, and
+// InfoResp.ProjectID is the column P1 added and P2 started shipping. Collecting it
+// in a second pass over the same result is what keeps the sidebar at the query
+// count it had — a separate CollectGroupProjectMap would double the batch on the
+// hottest read path in the product, for a field that was already in the response.
+//
+// A group with no project is ABSENT from the project map rather than present with
+// an empty value, so a caller reading a missing key gets "" either way and the map
+// stays proportional to project groups rather than to every conversation.
+func CollectGroupSpaceAndProjectMaps(
+	conversations []*config.SyncUserConversationResp,
+	extraGroupNos []string,
+	groupService group.IService,
+) (map[string]string, map[string]string, bool) {
 	seen := make(map[string]struct{})
 	var bareGroupNos []string
 	add := func(no string) {
@@ -723,8 +744,11 @@ func CollectGroupSpaceMap(
 		add(no)
 	}
 	if len(bareGroupNos) == 0 {
-		return map[string]string{}, true
+		return map[string]string{}, map[string]string{}, true
 	}
+	// Captured from inside the closure rather than returned by it, so the project
+	// map is built from the SAME infos the space map is, in the same single call.
+	projectMap := map[string]string{}
 	m, err := spacepkg.GetGroupSpaceMap(bareGroupNos, func(nos []string) ([]spacepkg.GroupSpaceInfo, error) {
 		infos, err := groupService.GetGroups(nos)
 		if err != nil {
@@ -733,13 +757,16 @@ func CollectGroupSpaceMap(
 		result := make([]spacepkg.GroupSpaceInfo, 0, len(infos))
 		for _, g := range infos {
 			result = append(result, spacepkg.GroupSpaceInfo{GroupNo: g.GroupNo, SpaceID: g.SpaceID})
+			if g.ProjectID != "" {
+				projectMap[g.GroupNo] = g.ProjectID
+			}
 		}
 		return result, nil
 	})
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return m, true
+	return m, projectMap, true
 }
 
 // FilterRawConversationsBySpace 是 FilterConversationsBySpace 在 v2 sidebar 上的

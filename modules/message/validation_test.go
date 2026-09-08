@@ -121,9 +121,9 @@ func TestRevokeTimeout(t *testing.T) {
 
 func TestRevokeTimeoutLogic(t *testing.T) {
 	tests := []struct {
-		name           string
-		messageTime    time.Time
-		shouldTimeout  bool
+		name          string
+		messageTime   time.Time
+		shouldTimeout bool
 	}{
 		{
 			name:          "message sent 1 hour ago - should NOT timeout",

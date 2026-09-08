@@ -55,7 +55,7 @@ expressible against HEAD. That is the gap this task closes.
 Four surfaces, in the order they unblock things:
 
 1. **`GET /v1/projects/:project_id/groups`** — the caller's groups within one project (PR-1).
-2. **`project_id` on the sidebar** — the last hop of the passthrough #855 starts (PR-2).
+2. **`project_id` on the sidebar** — the last hop of the passthrough #855 starts (PR-2). SHIPPED.
 3. **`join_mode = 0` self-join** — a column P0 shipped with no writer and no reader (PR-3).
 4. **`is_official` management** (PR-4) and **per-user project pinning** (PR-5).
 
@@ -132,6 +132,11 @@ This is that brief.
   verified Space via `spacepkg.SetSpaceID` — *after* the Space membership check, never before
   (`middleware.go:315-319`). A new handler that reads `GetSpaceID` without that ordering gets a
   Space the caller has no seat in.
+- **`wire-contract` — `SidebarItem` gains a field (PR-2), and so does `group.InfoResp`.**
+  `InfoResp` is the cross-module batch read shape (`GetGroups`), and adding `project_id` there is
+  what makes the sidebar's copy free: the value was already in the row `QueryWithGroupNos`
+  selects, it was simply never mapped out. Without it the sidebar would need a second batch on
+  the hottest read path for a field already in the response.
 - **`wire-contract` — `SidebarItem` gains a field (PR-2).** `modules/message/api_sidebar.go:107-137`
   is one of the hottest read payloads in the product, and its existing `SpaceID` comment
   (`:112-119`) already fixes the per-target-type contract a new `project_id` must match. #855
@@ -476,7 +481,7 @@ golangci-lint run ./...
   with it.
 - `TestProjectNoLegacyResponseError` still green (automatic — the file list is dynamic).
 
-**PR-2 — `project_id` on the sidebar** (the rest landed in #855):
+**PR-2 — `project_id` on the sidebar** (the rest landed in #855) — SHIPPED as implemented below:
 
 - `project_id` present and correct on the `/v1/sidebar/*` payload for a project group, `""`
   (omitted) for a Space-direct group, and `""` for a DM — the same three-way split
@@ -487,7 +492,11 @@ golangci-lint run ./...
   per-group round-trip on the hot read path.
 - `project_id` still absent from the public invite-preview response (D6), pinned by a test.
 - Regression: `GroupResp.project_id` from #855 still correct on both mappers after the rebase.
-- `TestGroupNoLegacyResponseError`'s fixed file list updated if `modules/group` gains a file.
+- ~~`TestGroupNoLegacyResponseError`'s fixed file list updated~~ — **no longer applies.** That
+  guard now DISCOVERS its file list from the package directory (`modules/group/api_i18n_test.go:45`),
+  changed with the note that "a hard-coded list cannot see a new file — which is the failure mode
+  that matters, because nobody adds a handler by editing api.go". The brief's load-bearing list
+  said otherwise and was correct when written; recorded here rather than silently dropped.
 
 **PR-3 — `join_mode = 0` self-join:**
 
