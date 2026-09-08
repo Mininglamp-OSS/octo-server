@@ -2,6 +2,7 @@ package group
 
 import (
 	"os"
+	"regexp"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -195,4 +196,43 @@ func TestAllMemberGroupHooksAreRegisteredByTheModule(t *testing.T) {
 
 	require.True(t, projectmod.AllMemberGroupHooksRegisteredForTest(),
 		"module.Setup must leave all four all-member group hooks registered")
+}
+
+// TestEveryAdmissionEntryConstantIsInTheGuardLists stops the two hard-coded
+// entry lists from silently going stale.
+//
+// TestProjectGroupRefusesANonProjectMember and TestEveryAdmissionEntryLabelIsEmitted
+// each enumerate the admission entries by hand, and those enumerations ARE the
+// I2 guarantee: an entry missing from them is an admission path nobody asserts
+// refuses a non-member, and a rejection label nobody checks is ever emitted.
+// Both tests keep passing when an entry is added and not listed — the exact
+// failure mode P1's D8 gives as the reason for preferring guards that enumerate
+// over guards that match strings.
+//
+// So this reads the constants out of the source and compares. Adding an entry to
+// admission.go without adding it to both lists fails here, naming it.
+func TestEveryAdmissionEntryConstantIsInTheGuardLists(t *testing.T) {
+	src, err := os.ReadFile("admission.go")
+	require.NoError(t, err)
+
+	// AdmissionEntryXxx = "..." — the declarations, not the uses.
+	re := regexp.MustCompile(`(?m)^\s*(AdmissionEntry\w+)\s*=\s*"`)
+	var declared []string
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		declared = append(declared, m[1])
+	}
+	require.GreaterOrEqual(t, len(declared), 11,
+		"expected at least the eleven P1 entries plus P2's; found %d — the pattern "+
+			"probably stopped matching, which would make this guard vacuous", len(declared))
+
+	for _, file := range []string{"admission_i2_test.go", "project_cascade_guard_test.go"} {
+		body, err := os.ReadFile(file)
+		require.NoError(t, err)
+		for _, name := range declared {
+			require.Contains(t, string(body), name,
+				"%s does not list %s. Its enumeration IS the I2 guarantee: an entry "+
+					"missing from it is an admission path nothing asserts refuses a "+
+					"non-project-member.", file, name)
+		}
+	}
 }

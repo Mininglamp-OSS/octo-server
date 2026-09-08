@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/gin-gonic/gin"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -776,6 +777,26 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 		}
 	}
 
+	// D7 —— 项目全员群里不能踢人，这条路径也不例外。
+	//
+	// Web 侧的守卫挂在 handler 上，而这个接口**直接调服务层原语**，绕过了它。
+	// 服务层不能挡（P1 的项目级联、Space 级联、BotFather 删 bot 都从那里走），
+	// 所以每一个直调服务层的 handler 都要自己挡一次——这就是其中一个。
+	//
+	// 不挡的话，一个 bot_admin 能把普通成员从全员群里踢掉，而他的项目席位纹丝不动：
+	// I4 出现一个缺口，且没有任何东西会修复——席位没变，级联不会再看它，准入器只在
+	// 新加入时跑。
+	if protected, perr := ba.isProjectAllMemberGroup(groupNo); perr != nil {
+		// 放行并记日志，与 Web 侧守卫同一个取舍：这道守卫保护的是产品语义而不是
+		// 安全边界，fail-closed 会让一次数据库抖动变成"所有项目群都踢不了人"。
+		ba.Error("判定是否为项目全员群失败，放行本次移除", zap.Error(perr), zap.String("groupNo", groupNo))
+	} else if protected {
+		ba.Warn("拒绝 bot 从项目全员群移除成员，请走项目侧入口",
+			zap.String("groupNo", groupNo), zap.String("robotID", robotID))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIAllMemberGroupProtected, nil, nil)
+		return
+	}
+
 	removeResp, err := ba.groupService.RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
 		GroupNo:      groupNo,
 		Members:      filteredMembers,
@@ -845,4 +866,30 @@ func (ba *BotAPI) sendGroupMdNotification(groupNo string, updatedBy string, vers
 		FromUID:     updatedBy,
 		Payload:     []byte(util.ToJson(payload)),
 	})
+}
+
+// isProjectAllMemberGroup reports whether groupNo is the all-member group of the
+// project it belongs to.
+//
+// Reads group.project_id directly, as this module already reads the `group`
+// table elsewhere, and defers the judgement to pkg/project so the bot API and
+// the Web handlers cannot drift about what "the all-member group" means.
+//
+// A Space-direct group short-circuits with no project query at all: this runs on
+// a member-removal path, and a check that runs and passes is still latency on
+// every ordinary removal.
+func (ba *BotAPI) isProjectAllMemberGroup(groupNo string) (bool, error) {
+	if groupNo == "" {
+		return false, nil
+	}
+	var projectIDs []string
+	if _, err := ba.ctx.DB().SelectBySql(
+		"SELECT project_id FROM `group` WHERE group_no=?", groupNo,
+	).Load(&projectIDs); err != nil {
+		return false, err
+	}
+	if len(projectIDs) == 0 || projectIDs[0] == "" {
+		return false, nil
+	}
+	return projectpkg.IsAllMemberGroup(ba.ctx.DB(), projectIDs[0], groupNo)
 }

@@ -37,6 +37,50 @@ const (
 	allMemberGroupLease = 2 * time.Minute
 )
 
+// clearStaleAllMemberGroupPointer 把指向"已经不是本项目全员群"的指针清空，返回是否清了。
+//
+// # 为什么必须有这一步
+//
+// queryAllMemberGroupNo 会校验群侧（群还在、群的 project_id 还是本项目），所以
+// P1 把群 detach 成 Space 直属之后，那个查询正确地答"没有全员群"。但认领用的
+// CAS 谓词要求 all_member_group_no 为空串，而指针**并没有被清空**——modules/group
+// 不能写 octo_project。
+//
+// 于是两个谓词对同一件事给出不同答案，补建被卡死在中间：ensureAllMemberGroup 看到
+// "没有群"于是继续，claimAllMemberGroupProvision 看到"指针非空"于是永远认领不到，
+// 既不建群也不报错。之后每一个新成员的 admitAllMemberGroup 都空操作，I4 扫描 A
+// 报着一个谁也修不好的项目——正是补建存在的意义被静默取消。
+//
+// 这个缺口是上一轮修 queryAllMemberGroupNo 时引入的：那个修复让读侧变严，却没让
+// 写侧跟上。清指针把两侧重新对齐。
+//
+// 谓词与 queryAllMemberGroupNo 互为补集：只在"指针非空、但它指的群已经不合格"时
+// 才清。指针为空、或群仍然合格，都影响 0 行。
+func (d *DB) clearStaleAllMemberGroupPointer(projectID string) (bool, error) {
+	if projectID == "" {
+		return false, nil
+	}
+	result, err := d.session.UpdateBySql(
+		"UPDATE octo_project p "+
+			"LEFT JOIN `group` g "+
+			"  ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
+			"  AND g.status <> ? "+
+			"  AND g.project_id = p.project_id COLLATE utf8mb4_general_ci "+
+			"SET p.all_member_group_no = '', p.all_member_group_lease_until = NULL "+
+			"WHERE p.project_id = ? AND p.status = ? "+
+			"  AND p.all_member_group_no <> '' AND g.id IS NULL",
+		groupStatusDisband, projectID, StatusNormal,
+	).Exec()
+	if err != nil {
+		return false, fmt.Errorf("project: clear stale all-member group pointer: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("project: read stale pointer clear result: %w", err)
+	}
+	return affected == 1, nil
+}
+
 // claimAllMemberGroupProvisionTx 尝试认领"给这个项目建全员群"的活。
 //
 // 返回 true 表示认领成功，调用方应当去建群，并在成功后调用

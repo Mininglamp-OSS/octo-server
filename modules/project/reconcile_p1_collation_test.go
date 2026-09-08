@@ -47,6 +47,14 @@ var p1ProbeTables = []struct {
 	{"space", true},
 	{"group", true},
 	{"group_member", true},
+	// P2 adds statements that cross into these two as well (the member roster
+	// flags agents and names their owner; the agent-eligibility reads join both).
+	// Both are 2019 legacy tables, so they drift with the rest. Listed here rather
+	// than in a second probe because the P1 statements do not touch them, so a
+	// superset changes nothing for them — and one probe means one place to keep
+	// in step with production.
+	{"user", true},
+	{"robot", true},
 }
 
 // newP1CollationProbe builds an isolated database in the measured production

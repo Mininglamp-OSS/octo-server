@@ -100,6 +100,11 @@ func TestEveryAdmissionEntryLabelIsEmitted(t *testing.T) {
 		AdmissionEntryOrgEmployeeUpdate,
 		AdmissionEntryPresetGroups,
 		AdmissionEntryUnblacklist,
+		// P2 — the all-member group admitter. Added to BOTH hard-coded lists, not
+		// just this one: a new entry left out of them is an admission path outside
+		// the I2 guarantee these two exist to assert, and the lists cannot see it
+		// on their own.
+		AdmissionEntryAllMemberGroup,
 	}
 
 	for _, entry := range entries {

@@ -290,6 +290,62 @@ review_findings_fixed:
       and pushed a version bump to every member -- an idempotence check that was
       constant-false exactly on the longest names.
 
+# Second /code-review pass, after the eight fixes above. The original eight were
+# confirmed gone; six NEW findings, all real, all fixed. Recorded separately
+# because one of them was caused by a fix in the first round -- a tightened read
+# without the matching write.
+review_round_2_fixed:
+  - id: tightening-the-read-deadlocked-the-rebuild
+    severity: highest
+    caused_by: project-side-lookup-checked-only-half-the-predicate
+    what: |
+      Round 1 made queryAllMemberGroupNo verify the group side. The claim CAS was
+      left keyed on all_member_group_no being empty, and P1 leaves the pointer set
+      when it detaches a group.
+    why: |
+      The lookup then said "no group" while the claim said "already has one", so
+      ensureAllMemberGroup proceeded and the claim failed on every attempt -- with
+      no error and no metric. The rebuild never ran, every later admission
+      no-opped, and scan A reported a project nothing could repair. Two predicates
+      disagreeing about one fact: the same shape as the bug round 1 was fixing.
+    fix: "clearStaleAllMemberGroupPointer, run by ensureAllMemberGroup before the claim, with a Warn so the correction is visible."
+    test: TestRebuildRecoversAProjectWhoseGroupWasDetached
+  - id: list-route-omitted-the-group-pointer
+    severity: high
+    fix: "listVisibleInSpace selects all_member_group_no. Omitting it made every listed project report the empty sentinel, which the contract defines as 'no group provisioned' -- the list and the detail route disagreeing about the same project."
+  - id: bot-api-removal-bypassed-d7
+    severity: high
+    what: "modules/bot_api's member-remove calls the service-layer primitive directly, so the Web-side D7 guard does not cover it."
+    why: |
+      A bot admin could take an ordinary member out of an all-member group while
+      their project seat stayed active. I4 broken with nothing to repair it: the
+      seat is unchanged, so no cascade revisits it.
+    fix: "guarded there too, with its own bot_api error code; the service layer stays open, as D7 requires."
+    note: "api_manager's removeMember re-dispatches into the guarded Web handler and was already safe."
+  - id: reconcile-p2-header-claimed-coverage-it-did-not-have
+    severity: medium
+    what: "The file header said the P2 statements had been added to TestP1ScansSurviveCollationDrift. They had not."
+    fix: |
+      TestP2StatementsSurviveCollationDrift now runs the two I4 scans, the group
+      lookup, the stale-pointer clear, the seat split and both pkg/project
+      predicates against a drifted database and again after conversion. Writing it
+      immediately paid: it caught that listMembers must NOT be in that list,
+      because its pre-existing un-COLLATEd `user` join is what
+      TestCollationDriftBreaks... asserts DOES fail under drift. Two contradictory
+      contracts on one statement, avoided by running the test rather than
+      reasoning about it.
+  - id: sum-over-an-empty-roster-returned-null
+    severity: low
+    fix: "COALESCE around both SUMs in countActiveSeatsByKind. An empty active roster is reachable (P0's cascade can close the last seat) and scanning NULL into an int errored, making every detail read log a warning and fall back."
+  - id: a12-was-missing-from-the-hard-coded-entry-lists
+    severity: low
+    what: "The new admission entry was not added to the two by-hand enumerations that ARE the I2 per-entry guarantee."
+    fix: |
+      Added to both, plus TestEveryAdmissionEntryConstantIsInTheGuardLists, which
+      reads the constants out of admission.go and compares -- so the next entry
+      cannot be forgotten the same way. Exactly the failure mode P1's D8 gives as
+      the reason to prefer guards that enumerate over guards that match strings.
+
 # Cannot be verified from here; must be checked before merge.
 open_verification:
   - "The three items in the brief's 'must check before merge' section: the client

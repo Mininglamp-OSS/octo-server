@@ -1144,6 +1144,9 @@ other = "机器人不是该群管理员。"
 ["err.server.bot_api.cannot_remove_privileged"]
 other = "群主和管理员不能通过机器人 API 移除。"
 
+["err.server.bot_api.all_member_group_protected"]
+other = "这是项目的全员群，请到项目中管理成员。"
+
 ["err.server.bot_api.not_space_member"]
 other = "不是该空间成员。"
 

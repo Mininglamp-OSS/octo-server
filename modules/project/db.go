@@ -299,6 +299,12 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	_, err := d.session.SelectBySql(
 		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, "+
 			"p.discoverability, p.max_members, p.member_epoch, p.status, "+
+			// all_member_group_no on the LIST route too. The wire contract defines
+			// "" as "no group provisioned", so omitting the column here made every
+			// listed project claim it has none — the detail route and the list route
+			// disagreeing about the same project, and a client hiding the entry
+			// point to a group that exists.
+			"p.all_member_group_no, "+
 			"p.created_at, p.updated_at, "+
 			"IFNULL(pm.role, ?) AS my_role, "+
 			// D16 — humans and agents counted separately, on the LIST route too.

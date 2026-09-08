@@ -35,8 +35,15 @@ import (
 // comparison that CROSSES those two schemas carries an explicit COLLATE, and
 // every comparison BETWEEN two legacy tables deliberately does not — adding one
 // there makes the predicate non-sargable and costs a full scan. That is P1's
-// rule verbatim; TestP1ScansSurviveCollationDrift is its evidence, and the P2
-// statements are added to the same test rather than assumed to inherit it.
+// rule verbatim.
+//
+// The evidence is TestP2StatementsSurviveCollationDrift, which runs these two
+// scans and every other P2 statement that crosses the schemas against a
+// deliberately drifted database and again after the conversion. An earlier
+// version of this comment claimed the P2 statements had been added to P1's test
+// when they had not — a claim of coverage is worth nothing until something fails
+// without it, which is the same argument this module makes about gauges that
+// never publish.
 //
 // Like P1's scans these run OUTSIDE p.cfg.ReconcileEnabled: the gate exists for
 // statements that cannot survive the drift, and these can.

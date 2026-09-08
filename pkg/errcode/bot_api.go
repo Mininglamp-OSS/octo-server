@@ -141,6 +141,23 @@ var (
 	// group owner or a manager (mirrors the Web API memberRemove rule where a
 	// manager cannot kick managers/creator). The first offending uid is
 	// surfaced via Details so the adapter can pinpoint the rejected target.
+	// ErrBotAPIAllMemberGroupProtected refuses a bot-API member removal on a
+	// project's all-member group (P2 D7).
+	//
+	// A bot admin is manager-level, and this endpoint calls the service-layer
+	// removal primitive directly rather than re-dispatching into the Web handler,
+	// so the Web-side guard does not cover it. Left open, a bot could take an
+	// ordinary member out of the group while their project seat stays active —
+	// invariant I4 broken, with nothing to repair it: the seat is unchanged, so no
+	// cascade revisits it and the admitter only runs on a fresh add.
+	//
+	// A bot_api code rather than the group one because this module answers in its
+	// own namespace and its adapters branch on that prefix.
+	ErrBotAPIAllMemberGroupProtected = register(codes.Code{
+		ID:             "err.server.bot_api.all_member_group_protected",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
+	})
 	ErrBotAPICannotRemovePrivileged = register(codes.Code{
 		ID:             "err.server.bot_api.cannot_remove_privileged",
 		HTTPStatus:     http.StatusForbidden,

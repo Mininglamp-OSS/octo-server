@@ -101,6 +101,23 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
 	if groupNo != "" {
 		return
 	}
+	// The lookup says "no group", but the POINTER may still be set — that is
+	// exactly the detached/disbanded case, and the claim CAS below keys on the
+	// pointer being empty. Without clearing it first the claim can never succeed:
+	// the rebuild would silently never run, and every later member's admission
+	// would no-op, with reconcile scan A reporting a project nothing repairs.
+	//
+	// Cleared here rather than inside the claim so the claim stays a single
+	// unconditional CAS, and so this correction is visible in the log.
+	cleared, err := p.db.clearStaleAllMemberGroupPointer(projectID)
+	if err != nil {
+		p.Warn("清理失效的全员群指针失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
+		return
+	}
+	if cleared {
+		p.Warn("全员群指针已失效（群被解散或已脱离本项目），已清空，准备补建",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
+	}
 	row, err := p.db.queryByProjectID(projectID)
 	if err != nil || row == nil || row.Status != StatusNormal {
 		return

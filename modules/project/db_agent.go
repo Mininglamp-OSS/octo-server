@@ -176,9 +176,13 @@ func (d *DB) countActiveSeatsByKind(projectID string) (humans, agents int, err e
 		Agents int `db:"agents"`
 	}
 	err = d.session.SelectBySql(
+		// COALESCE around each SUM: SUM over an EMPTY set is NULL, not 0, and
+		// scanning NULL into an int errors. An empty active roster is reachable —
+		// P0's Space cascade can close the last seat — so without this a project in
+		// that state makes every detail read log a warning and fall back.
 		"SELECT "+
-			"SUM(IF(IFNULL(u.robot, 0) = 1, 0, 1)) AS humans, "+
-			"SUM(IF(IFNULL(u.robot, 0) = 1, 1, 0)) AS agents "+
+			"COALESCE(SUM(IF(IFNULL(u.robot, 0) = 1, 0, 1)), 0) AS humans, "+
+			"COALESCE(SUM(IF(IFNULL(u.robot, 0) = 1, 1, 0)), 0) AS agents "+
 			"FROM `octo_project_member` pm "+
 			"LEFT JOIN `user` u ON u.uid = pm.uid COLLATE utf8mb4_general_ci "+
 			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0",

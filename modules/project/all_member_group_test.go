@@ -875,3 +875,51 @@ func TestAnOrdinaryMemberCannotTellAnAgentFromAHuman(t *testing.T) {
 	// ErrProjectAgentNotEligible exists for: whether a uid is somebody else AI
 	// agent must not be readable from the refusal.
 }
+
+// TestRebuildRecoversAProjectWhoseGroupWasDetached pins the fix for a deadlock
+// that the previous round's own fix introduced.
+//
+// Tightening queryAllMemberGroupNo to verify the group side made the READ correct
+// and left the WRITE behind: the lookup answered "no group", so ensureAllMemberGroup
+// proceeded, while the claim CAS keys on all_member_group_no being empty and the
+// pointer was still set. The claim then failed on every attempt, silently — no
+// error, no metric — so the rebuild never ran, every later member's admission
+// no-opped, and reconcile scan A reported a project nothing could repair.
+//
+// Two predicates disagreeing about one fact, which is the same shape as the bug
+// the tightening was fixing.
+func TestRebuildRecoversAProjectWhoseGroupWasDetached(t *testing.T) {
+	_, p := setup(t)
+	stub := stubAllMemberGroup(t, "grp_detached_first")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "detached-rebuild"})
+	require.Equal(t, http.StatusOK, w.Code)
+	resp := decodeResp(t, w)
+	require.Equal(t, "grp_detached_first", resp.AllMemberGroupNo)
+
+	// P1's cascade: the group's creator left and nobody could inherit, so the
+	// group reverts to Space-direct. modules/group cannot clear the project's
+	// pointer, so it stays.
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `group` SET project_id = '' WHERE group_no = ?", "grp_detached_first").Exec()
+	require.NoError(t, err)
+
+	require.Empty(t, allMemberGroupNoOf(t, resp.ProjectID),
+		"precondition: the lookup already reports no usable group")
+
+	// The next write path must actually rebuild, not sit stuck behind a pointer
+	// the claim can never satisfy.
+	stub.groupNo = "grp_rebuilt_after_detach"
+	p.ensureAllMemberGroup(resp.ProjectID, spaceA)
+
+	require.Equal(t, "grp_rebuilt_after_detach", allMemberGroupNoOf(t, resp.ProjectID),
+		"a project whose group was detached must be able to get a new one; leaving the "+
+			"stale pointer in place makes the claim CAS fail forever, with no error and "+
+			"no metric, and reconcile scan A reports it with nothing able to fix it")
+}
