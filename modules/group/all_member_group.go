@@ -254,7 +254,15 @@ func (g *Group) renameAllMemberGroup(ctx *config.Context, groupNo, name string) 
 	if groupModel == nil || groupModel.Status == GroupStatusDisband {
 		return nil // 无事可做，重试也不会变
 	}
-	if groupModel.Name == name {
+	// 比较**截断后**的名字。
+	//
+	// 群名上限 50 rune，项目名上限 64。拿未截断的项目名去比已截断的群名，超过 50
+	// 的项目名会永远比不相等，于是每一次带 name 的项目更新都推一个新版本、给全体
+	// 群成员下发一次群信息变更——一个恒假的幂等判断，正好在名字最长的那些项目上失效。
+	//
+	// 截断规则本身仍归群侧所有（UpdateGroupInfo 会再截一次）；这里复用同一个上限
+	// 只是为了让"要不要改"这个判断问对问题。
+	if truncateGroupName(name) == groupModel.Name {
 		return nil // 幂等：名字已经对了，不推版本、不惊动客户端
 	}
 	operatorName := ""
@@ -275,3 +283,16 @@ func (g *Group) renameAllMemberGroup(ctx *config.Context, groupNo, name string) 
 // keeps the dependency a fact rather than a module, and one constant is not a
 // reason to pull the whole module into the group binary's init order.
 const projectRoleOwner = 2
+
+// truncateGroupName applies the group-name cap the way UpdateGroupInfo does, so
+// the rename hook's idempotence check compares like with like.
+//
+// Rune-based, not byte-based: MaxGroupNameLen counts characters, and a byte cut
+// would split a multi-byte rune — every project name in Chinese is multi-byte.
+func truncateGroupName(name string) string {
+	runes := []rune(name)
+	if len(runes) > MaxGroupNameLen {
+		return string(runes[:MaxGroupNameLen])
+	}
+	return name
+}

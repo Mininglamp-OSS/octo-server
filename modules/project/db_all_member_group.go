@@ -143,16 +143,40 @@ func (d *DB) clearAllMemberGroupNoTx(tx *dbr.Tx, projectID string) error {
 	return nil
 }
 
-// queryAllMemberGroupNo 读一个活跃项目的全员群号。返回 "" 表示没有（项目不存在、
-// 已解散，或尚未建成）——三者对调用方是同一个答案：这个项目现在没有全员群。
+// queryAllMemberGroupNo 读一个活跃项目**当前仍然拥有**的全员群号。
+//
+// 返回 "" 表示没有：项目不存在、已解散、尚未建成，或者那个群已经不属于本项目了。
+// 四者对调用方是同一个答案——这个项目现在没有全员群可操作。
+//
+// # 为什么必须同时校验群侧
+//
+// 只读 all_member_group_no 是不够的，而且不够的方式是**静默**的。P1 的成员移除
+// 级联在群主离开项目、且项目里没人能继任时，会把群回退成 Space 直属
+// （project_id 置空），并且**不会**清掉项目这一侧的指针——modules/group 不能写
+// octo_project。I4 扫描 A 把这种状态明确记作"指向已解散或已脱离的群"。
+//
+// 若这里不校验，那之后：
+//   - 新加入项目的人会被塞进一个已经与项目无关的群（admitAllMemberGroup）；
+//   - 项目改名会去改那个群的名字（syncAllMemberGroupName）；
+//   - 群主同步会去动那个群的群主（syncAllMemberGroupOwner）。
+//
+// 三件都是对一个"别人的群"的写入。pkg/project.IsAllMemberGroup 早就是两半都查的，
+// D7 的保护因此正确；这里当初只查了一半，两个谓词对同一个问题给出不同答案。
 func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	if projectID == "" {
 		return "", nil
 	}
 	var groupNos []string
 	_, err := d.session.SelectBySql(
-		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ? AND status = ?",
-		projectID, StatusNormal,
+		"SELECT p.all_member_group_no FROM `octo_project` p "+
+			// COLLATE 在驱动侧的值上：p.* 是 pinned 的 general_ci，`group` 是老表。
+			// 与 pkg/project.IsAllMemberGroup 的写法一致。
+			"INNER JOIN `group` g "+
+			"  ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
+			"  AND g.status <> ? "+
+			"  AND g.project_id = p.project_id COLLATE utf8mb4_general_ci "+
+			"WHERE p.project_id = ? AND p.status = ? AND p.all_member_group_no <> ''",
+		groupStatusDisband, projectID, StatusNormal,
 	).Load(&groupNos)
 	if err != nil {
 		return "", fmt.Errorf("project: query all-member group: %w", err)
@@ -161,4 +185,35 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 		return "", nil
 	}
 	return groupNos[0], nil
+}
+
+// queryActiveOwnerForProvision 返回项目里资历最老的活跃 owner，没有则返回 ""。
+//
+// 补建全员群时用来决定"谁当群主"。不能用 octo_project.creator：那一列记的是
+// 当初是谁建的项目，**永不改变**，而这个人可能早就离开了项目或 Space。用他去建群
+// 会被准入闸门当场拒掉（他不是项目活跃成员），于是一个初次建群失败过的项目
+// **永远**补建不出来——每一次写路径都认领租约、建群失败、释放租约，循环到底。
+//
+// 选人规则与 pkg/project.PickActiveOwner 一致（资历最老），刻意同源：那个是群侧
+// 群主同步用的，两边对"谁该拥有这个群"必须给出同一个答案，否则补建刚建好，
+// 群主同步就把它改掉。
+func (d *DB) queryActiveOwnerForProvision(projectID string) (string, error) {
+	if projectID == "" {
+		return "", nil
+	}
+	var uids []string
+	_, err := d.session.SelectBySql(
+		"SELECT uid FROM `octo_project_member` "+
+			"WHERE project_id = ? AND role = ? AND status = ? AND removing = 0 "+
+			// created_at 不是全序（同毫秒会并列），补 uid 让选择可测且跨副本一致。
+			"ORDER BY created_at ASC, uid ASC LIMIT 1",
+		projectID, RoleOwner, MemberStatusActive,
+	).Load(&uids)
+	if err != nil {
+		return "", fmt.Errorf("project: query active owner: %w", err)
+	}
+	if len(uids) == 0 {
+		return "", nil
+	}
+	return uids[0], nil
 }

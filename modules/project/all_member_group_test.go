@@ -82,6 +82,23 @@ func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
 		if s.provisionErr != nil {
 			return "", s.provisionErr
 		}
+		// Insert a REAL `group` row, because the real provisioner does.
+		//
+		// queryAllMemberGroupNo requires the group side to agree that it belongs to
+		// this project — without that, a group P1's cascade has detached to
+		// Space-direct would still be admitted into and renamed. A stand-in that
+		// returned a group number with no row behind it would make every caller of
+		// that lookup read "no group", which is a stand-in disagreeing with
+		// production about the thing under test.
+		_, err := testCtx.DB().InsertBySql(
+			"INSERT INTO `group` (group_no, name, creator, status, space_id, project_id) "+
+				"VALUES (?, ?, ?, 1, ?, ?) "+
+				"ON DUPLICATE KEY UPDATE project_id = VALUES(project_id), status = 1",
+			s.groupNo, seed.Name, seed.Creator, seed.SpaceID, seed.ProjectID,
+		).Exec()
+		if err != nil {
+			return "", err
+		}
 		return s.groupNo, nil
 	})
 	RegisterAllMemberGroupAdmitter(func(_ *config.Context, _, _, uid string) error {
@@ -351,7 +368,17 @@ func TestAllMemberGroupRebuildIsClaimedOnce(t *testing.T) {
 	overwritten, err := p.db.setAllMemberGroupNo(model.ProjectID, "grp_late")
 	require.NoError(t, err)
 	require.False(t, overwritten)
-	require.Equal(t, "grp_race", allMemberGroupNoOf(t, model.ProjectID))
+
+	// Read the COLUMN, not queryAllMemberGroupNo: this case drives the CAS
+	// protocol directly and never runs a provisioner, so no `group` row exists and
+	// the join-backed lookup would correctly answer "no group". What is under test
+	// here is which value the column holds.
+	var stored []string
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ?", model.ProjectID,
+	).Load(&stored)
+	require.NoError(t, err)
+	require.Equal(t, []string{"grp_race"}, stored)
 }
 
 // TestAllMemberGroupProvisioningIsSkippedWhenUnregistered pins the binary that
@@ -703,3 +730,148 @@ var (
 type errStub string
 
 func (e errStub) Error() string { return string(e) }
+
+// ---------- regressions from the code review ----------
+
+// TestRebuildUsesAnActiveOwnerNotTheOriginalCreator pins the fix for a defect
+// that made a project's group unrecoverable.
+//
+// The rebuild used octo_project.creator, which never changes. Once that uid had
+// left the project the admission gate refused them — they are not an active
+// project member — so every rebuild attempt claimed the lease, failed to create
+// the group, released the lease, and the project could NEVER get its group back.
+// Reconcile scan A would report it forever with nothing able to repair it.
+func TestRebuildUsesAnActiveOwnerNotTheOriginalCreator(t *testing.T) {
+	_, p := setup(t)
+	stub := stubAllMemberGroup(t, "grp_rebuild_owner")
+	stub.provisionErr = errStubProvision
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	founder := seedUser(t, "u_founder")
+	seedSpaceMember(t, spaceA, "u_founder", 0, 1)
+	seedUser(t, "u_successor")
+	seedSpaceMember(t, spaceA, "u_successor", 0, 1)
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", founder,
+		map[string]any{"name": "handover"})
+	require.Equal(t, http.StatusOK, w.Code)
+	resp := decodeResp(t, w)
+	require.Empty(t, resp.AllMemberGroupNo, "provisioning was made to fail")
+
+	// The founder hands the project over and leaves. octo_project.creator still
+	// names them; they are no longer a member.
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", founder,
+		map[string]any{"uids": []string{"u_successor"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/leave", founder,
+		map[string]any{"transfer_to": "u_successor"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	row, err := testDB.queryByProjectID(resp.ProjectID)
+	require.NoError(t, err)
+	require.Equal(t, "u_founder", row.Creator, "creator is immutable, which is the trap")
+
+	// Now the rebuild must succeed, seeded with the CURRENT owner.
+	stub.provisionErr = nil
+	stub.seeds = nil
+	p.ensureAllMemberGroup(resp.ProjectID, spaceA)
+
+	require.Len(t, stub.seeds, 1, "the rebuild must have run")
+	require.Equal(t, "u_successor", stub.seeds[0].Creator,
+		"the rebuild must seed the group with an ACTIVE owner; seeding the departed "+
+			"creator means the admission gate refuses and the project can never get a group")
+}
+
+// TestQueryAllMemberGroupNoIgnoresADetachedGroup pins that the project side and
+// pkg/project.IsAllMemberGroup answer the same question.
+//
+// P1's cascade reverts a group to Space-direct when its creator leaves and nobody
+// can inherit, and cannot clear the project's pointer (modules/group may not write
+// octo_project). Reading the pointer alone then makes the admitter, the rename and
+// the owner sync all write to a group that is no longer the project's.
+func TestQueryAllMemberGroupNoIgnoresADetachedGroup(t *testing.T) {
+	_, p := setup(t)
+	stubAllMemberGroup(t, "grp_detach_probe")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "detach"})
+	require.Equal(t, http.StatusOK, w.Code)
+	resp := decodeResp(t, w)
+
+	// The stand-in provisioner already inserted the real `group` row, as the real
+	// one does, so there is nothing to seed here.
+	got, err := testDB.queryAllMemberGroupNo(resp.ProjectID)
+	require.NoError(t, err)
+	require.Equal(t, "grp_detach_probe", got, "both halves agree, so the project owns it")
+
+	// P1's detach: the group goes Space-direct; the pointer stays behind.
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `group` SET project_id = '' WHERE group_no = ?", "grp_detach_probe").Exec()
+	require.NoError(t, err)
+
+	got, err = testDB.queryAllMemberGroupNo(resp.ProjectID)
+	require.NoError(t, err)
+	require.Empty(t, got,
+		"a detached group must read as absent, or the admitter would put new project "+
+			"members into a group the project no longer owns and a rename would rename it")
+}
+
+// TestAnOrdinaryMemberCannotTellAnAgentFromAHuman pins the anti-enumeration fix.
+//
+// The agent check used to run before the permission gate, so a caller with no
+// member-management right got a per-uid agent_not_eligible for somebody else's
+// live bot and an actor-level permission_denied for a human — turning members/add
+// into the oracle ErrProjectAgentNotEligible was registered to prevent, for the
+// least privileged caller there is.
+func TestAnOrdinaryMemberCannotTellAnAgentFromAHuman(t *testing.T) {
+	_, p := setup(t)
+	stubAllMemberGroup(t, "grp_oracle")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+	plain := seedUser(t, "u_plain")
+	seedSpaceMember(t, spaceA, "u_plain", 0, 1)
+	seedUser(t, "u_third")
+	seedSpaceMember(t, spaceA, "u_third", 0, 1)
+	seedUser(t, "u_human")
+	seedSpaceMember(t, spaceA, "u_human", 0, 1)
+	seedAgent(t, spaceA, "bot_of_third", "u_third", "octo_hosted")
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "oracle"})
+	require.Equal(t, http.StatusOK, w.Code)
+	resp := decodeResp(t, w)
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_plain"}})
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// An ordinary member naming somebody else's live bot, and naming a plain human.
+	// The two answers must be indistinguishable.
+	botBody := doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", plain,
+		map[string]any{"uids": []string{"bot_of_third"}}).Body.String()
+	humanBody := doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", plain,
+		map[string]any{"uids": []string{"u_human"}}).Body.String()
+	require.Equal(t, humanBody, botBody,
+		"an ordinary member must not be able to tell somebody else's bot from a human; "+
+			"bot=%s human=%s", botBody, humanBody)
+	require.Nil(t, memberRow(t, resp.ProjectID, "bot_of_third"), "and nothing was seated")
+
+	// Deliberately NOT asserting that a uid with no Space seat is indistinguishable
+	// too. That one is refused earlier, by P0's in-transaction Space seat check,
+	// which necessarily runs before any project role is read (it is first in the
+	// declared lock order). So it answers not_space_member, and it did so before
+	// this change. It is also not a leak: the caller holds a seat in that Space and
+	// can already enumerate its members through the Space roster endpoint.
+	//
+	// The contract this case pins is the one the review found broken and the one
+	// ErrProjectAgentNotEligible exists for: whether a uid is somebody else AI
+	// agent must not be readable from the refusal.
+}

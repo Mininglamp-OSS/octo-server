@@ -214,6 +214,82 @@ corrections:
       about the same hazard; this now follows it. Verified under
       `go test -race -shuffle=on`.
 
+# Findings from /code-review (high effort) on the full branch diff. All eight were
+# real; all eight are fixed on this branch. Listed because several were defects
+# the implementation's own tests could not have caught -- the stand-ins agreed
+# with the bug.
+review_findings_fixed:
+  - id: rebuild-seeded-the-immutable-creator
+    severity: highest
+    what: |
+      ensureAllMemberGroup passed octo_project.creator as the group owner.
+    why: |
+      That column never changes. Once the founder has left the project, the
+      admission gate refuses them -- they are not an active member -- so every
+      rebuild claimed the lease, failed, released it, and the project could NEVER
+      get its group back. Reconcile scan A would report it forever with nothing
+      able to repair it, which is precisely the failure the rebuild exists to
+      prevent.
+    fix: "queryActiveOwnerForProvision (senior active owner, same rule as pkg/project.PickActiveOwner); skip with a Warn when the project has no owner."
+    test: TestRebuildUsesAnActiveOwnerNotTheOriginalCreator
+  - id: project-side-lookup-checked-only-half-the-predicate
+    severity: high
+    what: |
+      queryAllMemberGroupNo read the project pointer without verifying the group
+      still carries project_id, while pkg/project.IsAllMemberGroup checks both.
+    why: |
+      After P1 detaches a group to Space-direct (creator left, no successor -- a
+      state scan A documents as unclearable), the pointer remains. The admitter
+      would then put new project members into a group the project no longer owns,
+      the rename would rename it, and the owner sync would change its creator.
+      Two predicates answering the same question differently.
+    fix: "the lookup now joins `group` and requires status <> disband AND project_id = the project."
+    test: TestQueryAllMemberGroupNoIgnoresADetachedGroup
+  - id: blacklist-was-a-fifth-unguarded-removal-path
+    severity: high
+    what: |
+      The blacklist handler flips group_member.status to Blacklist and
+      unsubscribes from IM, with no D7 guard.
+    why: |
+      For I4 that is identical to a removal -- the uid stays a project member and
+      leaves the all-member group active set -- but it does not go through
+      RemoveGroupMembers and is not called "remove", so it was missed. Nothing
+      repairs the resulting scan-B gap: the project seat is unchanged and the
+      admitter only runs on a fresh add. Same shape as P1's A11.
+    fix: "guarded on action=add only; un-blacklist stays open because it restores a member and is already under the I2 gate."
+  - id: owner-sync-missed-the-common-departure
+    severity: high
+    fix: "syncAllMemberGroupOwner now runs on every successful leave and every successful removal, not only when a successor was promoted."
+    why: |
+      A non-last owner leaving names no successor, so the sync was skipped -- but
+      P1's cascade then hands the group over by GROUP seniority, which can land on
+      an ordinary project member whom D7 forbids from transferring, leaving or
+      disbanding it. The hook is self-deciding and idempotent, so the two do not
+      race: whichever runs last converges on "the creator is an active owner".
+  - id: member-count-meant-two-things
+    severity: medium
+    fix: "the list query splits humans and agents with two bounded correlated subqueries, so list cards and the detail route agree (D16)."
+  - id: agent-check-ran-before-the-permission-gate
+    severity: medium
+    what: |
+      An ordinary member got a per-uid agent_not_eligible for somebody else's live
+      bot and an actor-level permission_denied for a human.
+    why: |
+      That is the enumeration oracle ErrProjectAgentNotEligible was registered to
+      prevent, handed to the least privileged caller there is.
+    fix: "ownership is decided first, then the permission gate; the agent-specific refusal is only reachable by a caller who already holds member-management rights."
+    test: TestAnOrdinaryMemberCannotTellAnAgentFromAHuman
+  - id: quota-refusal-reported-the-global-cap
+    severity: low
+    fix: "effectiveMaxMembers(in.MaxMembers), so a per-request max_members override is reported as the limit the refusal was measured against."
+  - id: rename-idempotence-compared-untruncated-names
+    severity: low
+    fix: |
+      Compare the truncated name. A project name over 50 runes never equalled the
+      truncated group name, so every update carrying `name` re-renamed the group
+      and pushed a version bump to every member -- an idempotence check that was
+      constant-false exactly on the longest names.
+
 # Cannot be verified from here; must be checked before merge.
 open_verification:
   - "The three items in the brief's 'must check before merge' section: the client

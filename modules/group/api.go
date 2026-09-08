@@ -3889,6 +3889,21 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
 		return
 	}
+	// D7 —— 全员群里不能拉黑。
+	//
+	// 拉黑是**第五条**改变活跃成员集合的群面路径，而且很容易被漏掉：它不叫"移除"，
+	// 也不走 RemoveGroupMembers，它把 group_member.status 翻成 Blacklist 并做 IM
+	// 退订。对 I4 来说结果与踢人完全一样——这个人还是项目成员，却不在全员群的活跃
+	// 成员集合里，于是 I4 扫描 B 报出一个缺口，而且没有任何东西会修复它：项目侧的
+	// 席位没变，准入器只在新加入时跑。
+	//
+	// 解除拉黑（A11）那半边不挡：它是把人**放回**活跃集合，方向与 I4 一致，而且
+	// 已经受 I2 准入闸门约束。挡住它反而会让一个已经被拉黑的成员永远出不来。
+	//
+	// 要把谁挡在项目之外，就把他移出项目——那条路径会连群带席位一起处理。
+	if action == "add" && g.refuseIfAllMemberGroup(c, &group.Model, allMemberGroupActionBlacklist) {
+		return
+	}
 	// #354 · Bot 跟人走：拉黑/解除拉黑级联到目标用户名下在群的 bot
 	// （robot.creator_uid 命中）。旧行为只动用户本人，其 bot 仍 status=Normal，
 	// 被拉黑用户可经自己的 bot 旁路读群/子区内容，绕过 ExistMemberActive

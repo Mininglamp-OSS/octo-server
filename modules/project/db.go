@@ -301,8 +301,25 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			"p.discoverability, p.max_members, p.member_epoch, p.status, "+
 			"p.created_at, p.updated_at, "+
 			"IFNULL(pm.role, ?) AS my_role, "+
+			// D16 — humans and agents counted separately, on the LIST route too.
+			//
+			// One aggregate for both would make member_count mean "humans" on the
+			// detail route and "every seat" here, i.e. a list card over-counting a
+			// project by exactly the agents in it — the thing D16 exists to stop.
+			// Two correlated subqueries rather than a join, because the row already
+			// carries one and the page is bounded (list limit), so this is one more
+			// bounded lookup per rendered card, not an N+1 over the table.
+			//
+			// COLLATE on the driving side's value: octo_project_member is pinned
+			// general_ci, `user` is a legacy table.
 			"(SELECT COUNT(*) FROM `octo_project_member` mc "+
-			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0) AS member_count "+
+			"  LEFT JOIN `user` mu ON mu.uid = mc.uid COLLATE utf8mb4_general_ci "+
+			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0 "+
+			"    AND IFNULL(mu.robot, 0) = 0) AS member_count, "+
+			"(SELECT COUNT(*) FROM `octo_project_member` ac "+
+			"  LEFT JOIN `user` au ON au.uid = ac.uid COLLATE utf8mb4_general_ci "+
+			"  WHERE ac.project_id = p.project_id AND ac.status = 1 AND ac.removing = 0 "+
+			"    AND IFNULL(au.robot, 0) = 1) AS agent_count "+
 			"FROM `octo_project` p "+
 			// `removing = 0` on the JOIN as well as on the count: without it a member
 			// whose seat is closing keeps my_role, and — worse — keeps
@@ -327,8 +344,12 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 // listRow carries a project plus the caller-relative fields the list computes.
 type listRow struct {
 	Model
-	MyRole      int `db:"my_role"`
+	MyRole int `db:"my_role"`
+	// MemberCount counts HUMANS only and AgentCount counts AI agents (D16), the
+	// same split the detail route reports — so one field cannot mean two things
+	// depending on which endpoint the client called.
 	MemberCount int `db:"member_count"`
+	AgentCount  int `db:"agent_count"`
 }
 
 // countActiveMembers counts active seats in a project.

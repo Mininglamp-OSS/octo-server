@@ -49,6 +49,12 @@ const (
 	allMemberGroupActionExit     = "exit"
 	allMemberGroupActionRemove   = "remove"
 	allMemberGroupActionTransfer = "transfer"
+	// allMemberGroupActionBlacklist 是第五条会改变活跃成员集合的群面路径，而且是
+	// 最容易被漏掉的一条：它不叫"移除"、不走 RemoveGroupMembers，只把
+	// group_member.status 翻成 Blacklist 并做 IM 退订。对不变量 I4 而言效果与
+	// 踢人相同。P1 把它列为准入路径 A11 时用过同样的论证——「它就是那件事，
+	// 所以按那件事对待」。
+	allMemberGroupActionBlacklist = "blacklist"
 )
 
 // refuseIfAllMemberGroup 在 groupModel 是某项目的全员群时写出拒绝响应并返回 true。

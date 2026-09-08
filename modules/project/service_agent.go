@@ -2,7 +2,6 @@ package project
 
 import (
 	"errors"
-	"fmt"
 
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
@@ -24,10 +23,6 @@ var (
 	//
 	// 与 P1 建项目群那个 ErrGroupProjectUnavailable 是同一条反探测口径。
 	errAgentNotEligible = errors.New("project: agent is not eligible for this project")
-
-	// errAgentOwnerNotMember 是 D15(a) 的拒绝：分身的主人不在这个项目里。
-	// 对外**同样**渲染成 errAgentNotEligible，分开只是为了日志和测试能说清楚。
-	errAgentOwnerNotMember = errors.New("project: agent owner is not an active project member")
 )
 
 // agentEligibility 是一次资格判定的结果，逐 uid 给出。
@@ -156,43 +151,6 @@ func ineligibleAgentReasons(uids []string, verdicts map[string]agentEligibility)
 		}
 	}
 	return reasons
-}
-
-// authorizeAgentAdmissionTx 判定「actorUID 能不能把 targetUID 这个分身加进项目」（D15）。
-//
-// 规则：
-//   - 目标不是分身 → 返回 (false, nil)，调用方按普通成员处理，本函数不表态。
-//   - 目标是分身，但主人不是 actorUID → 拒绝。管理员也不行：弹窗承诺的是"仅可带入
-//     自己的分身"，而一个管理员替别人做这件事，被代表的那个人既没同意也不知道。
-//   - 主人是 actorUID，但主人自己不是这个项目的活跃成员 → 拒绝。分身以主人的身份
-//     运作，主人不在项目里，它的席位就是一个无主的代理，而且 D13 立刻会来关掉它。
-//     （actor 加自己的分身时，actor 就是主人，所以这一条等价于"你得先在项目里"，
-//     而那是 canManageOwnAgents 的前提。）
-//
-// 返回 (isAgent, err)。err 非 nil 时调用方以 errAgentNotEligible 对外应答。
-func (p *Project) authorizeAgentAdmissionTx(
-	tx *dbr.Tx, projectID, actorUID, targetUID string,
-) (bool, error) {
-	ownerUID, err := p.db.queryAgentOwnerTx(tx, targetUID)
-	if err != nil {
-		return false, err
-	}
-	if ownerUID == "" {
-		return false, nil // 不是活跃分身：按普通成员走原有路径
-	}
-	if ownerUID != actorUID {
-		return true, fmt.Errorf("%w: owner=%s actor=%s", errAgentNotEligible, ownerUID, actorUID)
-	}
-	// 主人必须在项目里。actor 就是主人，所以这里读的是 actor 自己的席位；用
-	// actorRoleTx 而不是再查一次，是为了与同一事务里已经做过的角色解析同源。
-	role, err := p.actorRoleTx(tx, projectID, ownerUID)
-	if err != nil {
-		return true, err
-	}
-	if !isProjectMember(role) {
-		return true, errAgentOwnerNotMember
-	}
-	return true, nil
 }
 
 // canManageOwnAgents 是 D15(b) 的窄能力：任何活跃项目成员都可以带自己的分身进来、

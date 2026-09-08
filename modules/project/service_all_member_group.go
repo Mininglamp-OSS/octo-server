@@ -105,13 +105,32 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
 	if err != nil || row == nil || row.Status != StatusNormal {
 		return
 	}
+	// 群主取**当前活跃的 owner**，不是 octo_project.creator。
+	//
+	// creator 记的是当初谁建的项目，永不改变；补建发生在多久之后是不确定的，
+	// 那个人可能早已离开项目或 Space。拿他去建群会被准入闸门当场拒掉（他不是
+	// 项目活跃成员），于是一个初次建群失败过的项目**永远**补建不出来——每次写
+	// 路径都认领租约、建群失败、释放租约，无限循环，而 I4 扫描 A 会永远报着它。
+	// 这条正是补建存在的意义所在，用错人等于补建从来没生效过。
+	owner, err := p.db.queryActiveOwnerForProvision(projectID)
+	if err != nil {
+		p.Warn("查询项目 owner 失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
+		return
+	}
+	if owner == "" {
+		// 无主项目（P0 的 Space 级联可以造出这种状态并留了 Warn）。没有人能当群主，
+		// 补建只会失败；等有 owner 了再说。I4 扫描 A 继续报着它。
+		p.Warn("项目暂无活跃 owner，跳过全员群补建",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
+		return
+	}
 	// 补建时初始成员只有 owner——不是当前全体成员。
 	//
 	// 把当前全体成员塞进建群请求会让一次补建变成一次批量入群，而批量入群里任何
 	// 一个人被 I2 拒绝都会让整次建群失败（准入闸门是全或无的）。补建先建出一个
 	// 只有 owner 的群，剩下的人由 admitAllMemberGroup 逐个补进去——逐个补是可以
 	// 部分成功的，而且 I4 扫描 B 本来就在盯着"项目成员不在全员群里"。
-	p.provisionAllMemberGroup(projectID, spaceID, row.Creator, row.Name, nil)
+	p.provisionAllMemberGroup(projectID, spaceID, owner, row.Name, nil)
 }
 
 // admitAllMemberGroup 把一个 uid 放进项目的全员群（D12）。

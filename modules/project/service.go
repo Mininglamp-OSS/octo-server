@@ -1045,22 +1045,46 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	//
 	// canManageOwnAgents is what an ordinary member holds here. It is deliberately
 	// narrower than canManageMembers: it authorizes exactly "my own agents".
-	isAgent, agentErr := p.authorizeAgentAdmissionTx(tx, projectID, actorUID, uid)
-	if agentErr != nil {
-		if errors.Is(agentErr, errAgentNotEligible) || errors.Is(agentErr, errAgentOwnerNotMember) {
-			p.Warn("加成员：分身不合格",
-				zap.String("projectId", projectID), zap.String("actor", actorUID),
-				zap.String("target", uid), zap.Error(agentErr))
-			return false, errAgentNotEligible
-		}
-		return false, agentErr
+	// ORDER MATTERS, and getting it wrong builds an oracle.
+	//
+	// The first version asked "is this an agent, and may the actor seat it?" BEFORE
+	// checking permission at all. An ordinary member could then tell a live bot
+	// owned by someone else (200 with a per-uid agent_not_eligible) from a human or
+	// an unknown uid (actor-level permission_denied) — which is exactly the
+	// distinction ErrProjectAgentNotEligible was registered to hide, handed to the
+	// least privileged caller there is.
+	//
+	// So: decide OWNERSHIP first, because "my own agent" is the only thing an
+	// ordinary member may add; then apply the permission gate; and only for a
+	// caller who passed it does the agent-specific refusal become visible.
+	agentOwner, err := p.db.queryAgentOwnerTx(tx, uid)
+	if err != nil {
+		return false, err
 	}
-	if isAgent {
+	isOwnAgent := agentOwner != "" && agentOwner == actorUID
+	if isOwnAgent {
+		// D15 — the narrow capability, held by any active project member.
 		if !canManageOwnAgents(actorRole) {
 			return false, errPermissionDenied
 		}
-	} else if !canManageMembers(actorRole) {
-		return false, errPermissionDenied
+	} else {
+		// Everything else — a person, an unknown uid, or somebody else's agent —
+		// needs the ordinary member-management right. A caller without it gets the
+		// SAME answer for all three, so nothing is learned about the target.
+		if !canManageMembers(actorRole) {
+			return false, errPermissionDenied
+		}
+		if agentOwner != "" {
+			// A privileged caller naming somebody else's agent. Refused: the dialog
+			// promises "only your own agents", and an admin acting for another
+			// person is precisely what that excludes. Distinguishable from a human
+			// only by someone who could already enumerate the roster and add
+			// arbitrary members, so it is not the oracle above.
+			p.Warn("加成员：分身不属于调用方，拒绝",
+				zap.String("projectId", projectID), zap.String("actor", actorUID),
+				zap.String("target", uid), zap.String("owner", agentOwner))
+			return false, errAgentNotEligible
+		}
 	}
 
 	existing, err := p.db.queryMemberTx(tx, projectID, uid)
@@ -1286,6 +1310,17 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 		for _, agentUID := range closedAgents {
 			p.invalidateProjectMemberCache(projectID, agentUID)
 		}
+		// D6 — removing a member can remove an OWNER (an admin may not, but an
+		// owner may remove a co-owner), and if that owner held the all-member
+		// group, the group is now owned by somebody who is not a project owner.
+		// Under D7 that person can neither transfer, leave nor disband it, so the
+		// group would be stuck with an owner nobody can change.
+		//
+		// The hook is self-deciding and idempotent, so it is called on every
+		// successful removal rather than only when the target was an owner:
+		// establishing "was this an owner" here would mean re-reading a role the
+		// transaction already discarded.
+		p.syncAllMemberGroupOwner(projectID)
 	}
 	return changed, nil
 }
@@ -1299,11 +1334,20 @@ func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (stri
 		successor, e = p.leaveProjectOnce(projectID, spaceID, uid, transferTo)
 		return e
 	})
-	// Only when a successor was promoted. A plain leave by a non-owner moves no
-	// ownership, and if the LEAVER was the group creator, P1's cascade already
-	// hands the group over on its way out — running this as well would be a
-	// second, racing answer to the same question.
-	if err == nil && successor != "" {
+	// On EVERY successful leave, not only when a successor was promoted.
+	//
+	// The narrower version missed the common case: an owner who is not the last
+	// one leaves, so no transfer is needed and no successor is named — but if they
+	// held the all-member group, it is now owned by an ex-member. P1's cascade
+	// does hand the group over on its way out, and that is exactly the problem:
+	// it picks by GROUP seniority, which can land on an ordinary project member,
+	// and D7 then forbids that person from transferring, leaving or disbanding it.
+	//
+	// Running this as well is not a racing second answer, because the two do not
+	// answer the same question: the cascade picks a group member, this picks a
+	// project OWNER, and this one is idempotent and self-deciding, so whichever
+	// runs last converges on "the creator is an active project owner".
+	if err == nil {
 		p.syncAllMemberGroupOwner(projectID)
 	}
 	return successor, err

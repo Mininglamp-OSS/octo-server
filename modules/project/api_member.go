@@ -68,7 +68,7 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 	//
 	// The pre-check gets weaker, not the authorization: a member who names a
 	// PERSON is refused by addOneMemberOnce's canManageMembers check, and one who
-	// names somebody else's agent by authorizeAgentAdmissionTx. What is lost is
+	// names somebody else's agent is refused there too. What is lost is
 	// only the early exit, which was always described as a cheap pre-check.
 	if !canManageOwnAgents(requestProjectRole(c)) {
 		observeRejected(entryMemberAdd, reasonPermissionDenied)

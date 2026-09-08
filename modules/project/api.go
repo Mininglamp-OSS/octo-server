@@ -311,7 +311,7 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 
 	model, err := p.createProject(in)
 	if err != nil {
-		p.respondCreateError(c, err, spaceID, uid, in.AgentUIDs)
+		p.respondCreateError(c, err, spaceID, uid, in.AgentUIDs, in.MaxMembers)
 		return
 	}
 	p.audit(auditCreate, uid, "", model.ProjectID, spaceID, "")
@@ -326,7 +326,7 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 
 // respondCreateError maps the create sentinels onto registered codes. Kept separate
 // so the handler reads as validation-then-call and the mapping table lives once.
-func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid string, agentUIDs []string) {
+func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid string, agentUIDs []string, maxMembers int) {
 	switch {
 	case errors.Is(err, errQuotaPerSpace):
 		observeRejected(entryProjectCreate, reasonQuotaPerSpace)
@@ -372,7 +372,11 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 		// here, and without it the refusal would fall through to store_failed —
 		// an Internal 5xx for what is a caller error with a registered code.
 		observeRejected(entryProjectCreate, reasonQuotaMembers)
-		respondProjectQuota(c, errcode.ErrProjectQuotaMembers, p.cfg.MaxMembers)
+		// effectiveMaxMembers, not the global cap: the request may carry its own
+		// max_members, and that is the number the refusal was measured against.
+		// Reporting the global one tells the caller a limit their project does not
+		// have, which a client renders straight into a hint.
+		respondProjectQuota(c, errcode.ErrProjectQuotaMembers, p.cfg.effectiveMaxMembers(maxMembers))
 	default:
 		p.Error("创建项目失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))
@@ -426,11 +430,12 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 	resps := make([]*Resp, 0, len(rows))
 	for _, row := range rows {
 		model := row.Model
-		// The list route keeps ONE aggregate per row (the subquery in
-		// listVisibleInSpace) rather than splitting it: splitting would need a
-		// per-row join to `user`, turning one query into N+1 on a paged list.
-		// A list card shows a total; the detail route is where the split matters.
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, 0))
+		// The split comes from the list query itself (two bounded correlated
+		// subqueries), so a list card and the detail route agree about what
+		// member_count means. Reporting the full seat count here while the detail
+		// route reported humans only would have been D16's own bug, one endpoint
+		// away.
+		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount))
 	}
 	c.Response(resps)
 }
