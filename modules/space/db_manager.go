@@ -409,6 +409,17 @@ func (d *managerDB) updateSpaceProfile(
 // 当成「只会插入不存在的席位」，而函数名与注释本身就写着 upsert / 重新激活 —— 唯一索引
 // spacemember_spaceid_uid 让 ON DUPLICATE 分支对任何已移除行都会命中。
 //
+// 外层包 RetryOnLockConflict：见下面第 (a) 点，这条路径**会**遇到瞬时死锁，而它原先没有
+// 重试，1213 会直接变成整批回滚的 ErrSpaceStoreFailed。与同一次改动给
+// atomicReactivateMemberIfNotFull 加重试是同一个理由。
+func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
+	return dbpkg.RetryOnLockConflict(func() error {
+		return d.upsertMembersOnce(spaceId, uids)
+	})
+}
+
+// upsertMembersOnce 是一次尝试；重试语义见 upsertMembers。
+//
 // # 为什么不用 affected-rows 分流
 //
 // `ON DUPLICATE KEY UPDATE` 的 ROW_COUNT() 惯例是 1=插入 / 2=更新 / 0=无变化，看着
@@ -423,9 +434,35 @@ func (d *managerDB) updateSpaceProfile(
 // 每一次重复添加都 bump 一次 epoch，破坏「空写不动 epoch」——那是消费方缓存所依赖的
 // 规则，而且是让每个消费方白做一次复核的净损失。
 //
-// 所以先用锁定读取出**当前** status 再决定，读与写在同一事务、同一行锁下，中间没有
-// 窗口。多一次单行 PK 查询的代价，换一个不依赖 MySQL 行为细节的判定。
-func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
+// 所以要先知道那一行**当前**的 status。而「怎么读」这件事有两个反直觉的坑，都实测过：
+//
+// # (a) 逐个 uid 加锁读会自己造出死锁，而本包 320 行之上就写着别这么做
+//
+// 第一版把 `SELECT ... WHERE uid=? FOR UPDATE` 放在**循环里**。对**不存在**的行做加锁读
+// 拿到的是间隙锁，间隙锁互相兼容，于是两个并发批量添加各拿一个，随后各自的 INSERT 需要
+// 与对方间隙锁互斥的插入意向锁 —— 环成立，1213。实测（8.0.33，两个新 uid 落在同一间隙）：
+//
+//	T1 SELECT ... 'm_new1' FOR UPDATE   Empty set
+//	T2 SELECT ... 'm_new2' FOR UPDATE   Empty set
+//	T1 INSERT 'm_new1' ...              ERROR 1213
+//	对照（改动前的裸 upsert，无加锁读）：两个都 Query OK，无等待
+//
+// 这正是 atomicJoinInitialSpace 头上那段「**刻意不加 FOR UPDATE**」所禁止的形状
+// （modules/space/db.go，附一次真实事故与 20 并发只活 1 个的实测）。加回来是本轮 review
+// 抓到的回归。
+//
+// # (b) 逐圈取锁还会反转锁序，而受害者是成员移除
+//
+// 席位锁在循环里取，意味着第 i+1 圈去要 space_member 的 X 锁时，**手上已经握着**第 i 圈
+// epoch bump 留下的 octo_project X 锁。那就把每条移除路径都遵守的
+// space_member → octo_project 顺序反了过来。实测中 InnoDB 挑的受害者正是**成员移除**——
+// 而按事务内步骤的契约，那意味着一次撤销失败，恰是这一步存在的目的所要防止的状态。
+//
+// 两个坑一个解法，而且本仓已有现成形状：**一条语句锁住全部目标行**，就像
+// removeMembersForceOnce 做的那样（`... uid IN ? ... FOR UPDATE`）。循环里从此不再取任何
+// space_member 锁，(b) 消失；(a) 的间隙锁仍然存在（IN 列表里不存在的 uid 照样拿间隙锁），
+// 由外层的有界重试兜住 —— 这也是为什么两半都必须有。
+func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
@@ -434,15 +471,27 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
+
+	// 一条语句取全部目标行的锁与当前 status。放在任何写入之前：循环里就不会在持有
+	// octo_project 锁之后再去要 space_member 锁。
+	var existing []struct {
+		UID    string `db:"uid"`
+		Status int    `db:"status"`
+	}
+	if _, err = tx.SelectBySql(
+		"SELECT uid, status FROM space_member WHERE space_id=? AND uid IN ? FOR UPDATE",
+		spaceId, uids,
+	).Load(&existing); err != nil {
+		return err
+	}
+	priorStatus := make(map[string]int, len(existing))
+	for _, row := range existing {
+		priorStatus[row.UID] = row.Status
+	}
+
 	for _, uid := range uids {
-		// 锁定读，在 upsert 之前：拿到的是本事务将要改写的那一行的当前状态。
-		var existing []int
-		if _, err := tx.SelectBySql(
-			"SELECT status FROM space_member WHERE space_id=? AND uid=? FOR UPDATE", spaceId, uid,
-		).Load(&existing); err != nil {
-			return err
-		}
-		reactivating := len(existing) > 0 && existing[0] == 0
+		status, had := priorStatus[uid]
+		reactivating := had && status == 0
 
 		if _, err := tx.InsertBySql(
 			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+

@@ -1,6 +1,9 @@
 package project
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -267,4 +270,123 @@ func TestBotSeatCloseMovesTheEpoch(t *testing.T) {
 			"AGREES, and the cached grant outlives the deletion")
 	assert.Equal(t, untouchedBefore, epochOf(t, untouched.ProjectID),
 		"a project the uid never held a seat in must not be churned")
+}
+
+// ---------- upsertMembers' lock order ----------
+//
+// Round 10 found a P1 the round-9 fix introduced, and this block records how it was
+// verified and why there is no Go test asserting the deadlock itself.
+//
+// Closing the reactivation door in upsertMembers needed the row's PRIOR status, and the
+// first version read it with a per-uid `SELECT ... FOR UPDATE` INSIDE the loop. Two
+// cycles, both reproduced deterministically at the SQL level on MySQL 8.0.33:
+//
+//	(a) GAP LOCK + INSERT INTENTION, between two concurrent bulk adds of NEW members.
+//	    A locking read of a row that does not exist takes a gap lock; gap locks are
+//	    mutually compatible, so both batches get one, and each INSERT then needs an
+//	    insert-intention lock conflicting with the other's gap.
+//	      per-uid locking read: T1 -> ERROR 1213, T2 committed
+//	      control, bare upsert: both committed, no wait
+//	    This package already forbids that shape 320 lines above, in
+//	    atomicJoinInitialSpace's 「刻意不加 FOR UPDATE」 paragraph, which cites a real
+//	    incident and a measurement (20 concurrent joiners, 1 survivor).
+//
+//	(b) CROSS-ITERATION LOCK-ORDER INVERSION, with the member removal as the victim.
+//	    With the seat lock inside the loop, iteration i+1 asks for space_member X while
+//	    already holding octo_project X from iteration i's epoch bump — inverting the
+//	    space_member -> octo_project order every removal path follows.
+//	      per-uid locking read: removal -> ERROR 1213, upsert committed
+//	      hoisted (one IN (...) FOR UPDATE before any write): both committed
+//	    InnoDB picked the REMOVAL, which by the tx-step contract means a revocation
+//	    failed — the state the step exists to prevent.
+//
+// Fixed by both halves, and each covers a different cycle: hoisting the read out of the
+// loop kills (b); the bounded retry absorbs (a), which hoisting cannot, since
+// `uid IN (...) FOR UPDATE` still gap-locks the uids that have no row.
+//
+// # Why no Go test asserts the deadlock
+//
+// Two were written and both were DELETED after mutation testing showed they could not
+// see the defect they named:
+//
+//	1. Driving the retrying entry points and asserting on the outcome passed 3/3 against
+//	   the reintroduced per-uid read — the retry absorbed the 1213, which is what it is
+//	   for. An outcome assertion behind a retry cannot observe lock order at all.
+//	2. Driving the non-retrying *Once entries with a sleep-based interleaving also passed
+//	   3/3. The window is a few statements wide inside two sub-millisecond transactions;
+//	   a wall-clock sleep does not land in it, which is the same reason round 7's raced
+//	   deadlock test was replaced by an explicitly orchestrated one.
+//
+// Orchestrating it properly needs the bulk add to pause mid-loop, between its first
+// epoch bump and its next seat lock — i.e. a hook inside upsertMembersOnce whose only
+// purpose is to be paused by a test. That is a production seam for a test's benefit, on
+// a path whose ordering is already pinned structurally, so the structural guard below is
+// what ships instead. Recorded rather than silently omitted, because "there is no test"
+// and "a test exists and cannot fail" look identical in a coverage report — and the
+// second is what this branch keeps producing.
+
+// TestBulkUpsertTakesEverySeatLockInOneStatement is the structural guard for the fix.
+//
+// It cannot flake and it cannot be satisfied by a fixture, and it names the two things a
+// future edit would have to preserve: all seat locks acquired in ONE statement before any
+// write, and the bounded retry left in place.
+func TestBulkUpsertTakesEverySeatLockInOneStatement(t *testing.T) {
+	body := spaceSourceFuncBody(t, "db_manager.go", "func (d *managerDB) upsertMembersOnce(")
+	require.Contains(t, body, "space_member",
+		"the guard must be reading the right function, or it is vacuous")
+
+	// One statement, IN-list form, and it must precede the loop.
+	lockAt := strings.Index(body, "FOR UPDATE")
+	loopAt := strings.Index(body, "for _, uid := range uids")
+	require.Positive(t, lockAt,
+		"upsertMembersOnce must take the seat locks with a LOCKING read: it needs each row's "+
+			"prior status, and reading it without a lock lets a concurrent write change it "+
+			"between the read and the upsert")
+	require.Positive(t, loopAt, "the per-uid loop must still be there")
+	assert.Less(t, lockAt, loopAt,
+		"the seat lock must be taken BEFORE the loop, not inside it. Inside, iteration i+1 asks "+
+			"for space_member X while holding octo_project X from iteration i's epoch bump — "+
+			"inverting the space_member -> octo_project order every removal path follows, with "+
+			"the removal as InnoDB's victim (reproduced at the SQL level; see this file's header)")
+	assert.Contains(t, body, "uid IN ?",
+		"the locks must be taken as ONE set with a single IN predicate, the shape "+
+			"removeMembersForceOnce uses — one statement per uid is the inversion above")
+	assert.NotContains(t, body, "uid=? FOR UPDATE",
+		"a per-uid locking read is exactly the reintroduction this guard exists to catch")
+
+	// And the retry must stay: hoisting does not remove the gap locks that mechanism (a)
+	// needs, so without the retry a transient 1213 becomes a failed admin batch.
+	entry := spaceSourceFuncBody(t, "db_manager.go", "func (d *managerDB) upsertMembers(")
+	assert.Contains(t, entry, "RetryOnLockConflict",
+		"upsertMembers must keep the bounded lock-conflict retry. Hoisting the read fixes the "+
+			"cross-iteration inversion but NOT the gap-lock cycle between two concurrent bulk "+
+			"adds of new members — `uid IN (...) FOR UPDATE` still gap-locks absent uids "+
+			"(reproduced; control without the locking read does not deadlock). This route had "+
+			"no retry, so the 1213 surfaced as a whole failed batch")
+}
+
+// spaceSourceFuncBody returns one function's source from a modules/space file, comments
+// stripped so a doc comment quoting the forbidden shape cannot fail the scan — a
+// regression this branch's guards already hit once.
+func spaceSourceFuncBody(t *testing.T, file, decl string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "space", file))
+	require.NoError(t, err, "modules/space/%s must be readable; if the layout changed, "+
+		"re-point this guard rather than deleting it", file)
+	src := string(raw)
+	start := strings.Index(src, decl)
+	require.Positive(t, start, "%q not found in modules/space/%s", decl, file)
+	body := src[start:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	var kept strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = line[:idx]
+		}
+		kept.WriteString(line)
+		kept.WriteByte('\n')
+	}
+	return kept.String()
 }
