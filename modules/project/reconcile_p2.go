@@ -46,8 +46,14 @@ import (
 // without it, which is the same argument this module makes about gauges that
 // never publish.
 //
-// Like P1's scans these run OUTSIDE p.cfg.ReconcileEnabled: the gate exists for
-// statements that cannot survive the drift, and these can.
+// Unlike P1's scans these run INSIDE p.cfg.ReconcileEnabled — and not because they
+// would fail. They survive the drift; the measured plans above are why they are
+// gated anyway. "Survives 1267" answers a different question from "is affordable
+// every five minutes on every pod": under the production shape scan A is a full
+// scan of `group` with a temporary table, scan B a temporary table plus filesort,
+// and the temporary table takes the ORDER BY / LIMIT paging with it, so
+// ReconcileLimit stops bounding the work. Both are report-only, so the cost of
+// waiting is the reporting and nothing else. See runReconcile for the full note.
 
 // i4MissingRow is one active project whose all-member group is missing or unusable.
 type i4MissingRow struct {
@@ -337,13 +343,15 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 	graceCutoff := time.Now().UTC().Add(-p.admitGrace())
 	_, err := p.db.session.SelectBySql(
 		"SELECT p.id, p.project_id, pm.uid, pm.space_id, p.all_member_group_no AS group_no, "+
-			// exemption 3: a banned Space. In the violating FLAG, not the WHERE, for
-			// the reason the cost guard states — `space`.status leads no index here.
+			// exemption 3: the admit grace window. `pm.updated_at < graceCutoff` is
+			// what excludes a seat whose admission is still legitimately in flight
+			// (D12 admits AFTER the seat transaction commits). In the violating
+			// FLAG, not the WHERE, like every other exemption here — see the cost
+			// guard above.
 			//
-			// `IS NULL OR` keeps it two-valued for the same per-binary reason P1's
-			// scan documents at reconcile_p1.go:178: a binary whose migration set
-			// lacks modules/space gets a stub table, and the LEFT JOIN itself yields
-			// NULL for a project whose Space row is gone.
+			// This comment used to read "exemption 3: a banned Space", which is the
+			// wrong exemption AND the wrong number for the line it sits on: the ban
+			// is exemption 4, and its own line is below. PR #855's tenth review.
 			"  (gm.uid IS NULL AND pm.updated_at < ? "+
 			// exemption 5: the pointed-at group is not usable. Scan A already
 			// reports that project as ONE row; without this, once the disband
@@ -356,6 +364,10 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			// the pointer being the empty sentinel. PR #855s fourth review found
 			// the gap. Same join shape as scan A, so the two agree on "usable".
 			"   AND g.id IS NOT NULL "+
+			// exemption 4: a banned Space. `IS NULL OR` keeps it two-valued for the
+			// same per-binary reason P1's scan documents at reconcile_p1.go:178: a
+			// binary whose migration set lacks modules/space gets a stub table, and
+			// the LEFT JOIN itself yields NULL for a project whose Space row is gone.
 			"   AND (sp.status IS NULL OR sp.status <> 2) "+
 			// exemption 2: whitelisted system bots. In the flag rather than the
 			// WHERE like the other three. The list is tiny and the effect is the

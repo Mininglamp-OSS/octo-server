@@ -481,8 +481,17 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 // 返回受影响行数，让调用方能看出这次写有没有落地。0 行意味着谓词把它挡住了
 // （群已解散），而调用方后面还有推送：不看这个返回值就会给一个已经没了的群发一条
 // 改名通知，并对外报成功——第七轮 review 的 P2-1，上一版只关掉了落库那一半。
+//
+// expectProjectID 是可选的**归属栅栏**："只有当这个群此刻仍属于该项目时才写"。
+// 空串表示不设栅栏，人手改名走的就是这一条。
+//
+// 为什么是栅栏而不是先读一次核对：D8 的机器驱动改名里，项目侧解析 group_no 的
+// 那次读是无锁的，读到与写之间 P1 的 detach 可以把群变回 Space 直属。事务内再读
+// 一次能收窄窗口，但把条件写进这条 UPDATE 的 WHERE 就直接消掉了窗口——读与写是
+// 同一条语句。挡住时影响 0 行，与 status 谓词同一个出口：不报错，调用方按
+// errGroupGoneOrDisbanded 安静跳过。PR #855 第十轮 review 的 P2-3。
 func (d *DB) UpdateNameNoticeTx(
-	groupNo string, name, notice *string, version int64, tx *dbr.Tx,
+	groupNo string, name, notice *string, version int64, expectProjectID string, tx *dbr.Tx,
 ) (int64, error) {
 	set := map[string]interface{}{"version": version}
 	if name != nil {
@@ -491,8 +500,12 @@ func (d *DB) UpdateNameNoticeTx(
 	if notice != nil {
 		set["notice"] = *notice
 	}
-	result, err := tx.Update("group").SetMap(set).
-		Where("group_no=? AND status<>?", groupNo, GroupStatusDisband).Exec()
+	stmt := tx.Update("group").SetMap(set).
+		Where("group_no=? AND status<>?", groupNo, GroupStatusDisband)
+	if expectProjectID != "" {
+		stmt = stmt.Where("project_id=?", expectProjectID)
+	}
+	result, err := stmt.Exec()
 	if err != nil {
 		return 0, err
 	}

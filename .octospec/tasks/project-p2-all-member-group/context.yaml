@@ -1463,6 +1463,185 @@ pr_855_round_9_fixed:
       and the earliest of the three publish calls. Position, not existence.
     mutation: "the partial edit above now turns it red; a full revert was already caught."
 
+# Round 10 landed TWO independent reviews on head 221f383 within eight minutes:
+# yujiawei (2 blocking + 5 P2) and mochashanyao / Octo-Q (1 blocking + 1 P2).
+# They agree on the blocking one; everything else is disjoint.
+pr_855_round_10_fixed:
+  - id: a-third-bot-deletion-entry-point-was-outside-d14
+    severity: high
+    reported_by: "yujiawei P1-1 and mochashanyao P1 (independently, same finding)"
+    where: modules/robot/api_manager.go, modules/space/bot_deletion_census_test.go, modules/robot/api_manager_delete_seatclose_test.go
+    what: |
+      Manager.robotDelete (DELETE /v1/manager/robots/:robot_id, super-admin) removed
+      the bot from every group and flipped robot.status to 0 without touching
+      space_member and without writing a removal ticket. The residue is a DIFFERENT
+      shape from the bare UPDATE the previous two rounds fixed, and worse: the Space
+      seat stays active, so the project seat stays active, while the bot is already
+      out of the all-member group. That is exactly I4 scan B's violating state, it is
+      exempt from none of the five exemptions, and scan B is report-only. D13 cannot
+      reclaim the seat (it requires robot.status = 1) and an operator cannot repair
+      it by re-adding, because addOneMemberOnce refuses a disabled robot row.
+      The methodological error is mine and is the point: the round-7 census asked
+      "who WRITES space_member", which structurally cannot find a door that deletes
+      a bot WITHOUT writing it. The right question is "what deletes a bot".
+    fix: |
+      robotDelete routes through space.CloseAllSpaceSeats with
+      MemberRemoveReasonBotDeleted, behind the same injectable closeSeatsFn seam
+      botfather's two doors have, aborting the deletion on failure (robot.status
+      stays 1, so the admin can retry). The operator is the acting super-admin, not
+      the bot -- the attribution bug the command door already fixed once.
+    test: |
+      Two layers. Endpoint-level, matching the two doors that already had one:
+      TestManagerBotDeleteClosesSeatsThroughTheOutbox (a cleanup job per closed
+      seat), TestManagerBotDeleteAttributesTheRemovalToTheAdmin,
+      TestManagerBotDeleteAbortsWhenSeatsCannotBeClosed.
+      Set-level, which is what the review actually asked for:
+      TestEveryBotDeletionEntryPointRoutesThroughD14 in modules/space. It parses the
+      tree (go/ast, no comment text in the AST at all), finds every function that
+      turns a bot's robot row off, finds every function that calls one, and requires
+      each to call the D14 seam with the bot_deleted reason -- or to be recorded as
+      an exemption with a written reason.
+    found_by_the_census: |
+      A FOURTH call site nobody had named: botfather/command.go tryCreateBotCore
+      calls deleteRobot to compensate a half-failed CREATION. Correctly exempt (the
+      bot never got a Space seat), and recorded as such. It is also the argument for
+      why the set-level test was needed: an endpoint-level test could not have
+      surfaced it.
+    mutation: "deleting the closeSeatsFn call turns all three endpoint tests AND the census red."
+  - id: the-space-removal-path-never-converged-the-all-member-groups-owner
+    severity: high
+    reported_by: "yujiawei P1-2"
+    where: modules/space/member_removal.go, modules/project/{space_member_removal,service_all_member_group,db,api}.go
+    what: |
+      A project owner can lose their seat four ways: kicked, left, role changed, and
+      removed from the Space. The first three call syncAllMemberGroupOwner. The
+      fourth did not -- and on that path the group side still hands the group over,
+      picking the second-oldest non-bot GROUP member with no project-role filter. It
+      can land on an ordinary project member, whom D7 then forbids from
+      transferring, exiting, disbanding or blacklisting the group. Nobody can move
+      it and no scan reports it: I4 compares member SETS, never creator-versus-owner.
+    fix: |
+      A post-steps FINALIZER registry in modules/space, and modules/project
+      registers the idempotent owner sync into it.
+      Not a fifth step and not a call inside deactivateSeatForCascade: step order is
+      registration order, which is import order, declared nowhere -- and BOTH orders
+      leave the defect. Group step first: the departing owner's project seat is still
+      active, so PickActiveOwner can return the person on their way out, promoting
+      them fails (they are no longer a group member), and the non-owner stays.
+      Project step first: the group still has the departing owner as creator, so the
+      sync changes nothing and the handover installs the non-owner afterwards.
+      A finalizer runs only after every step SUCCEEDED, so its input is a settled
+      state rather than an ordering artifact. Its failure retries the job.
+    test: |
+      TestSpaceRemovalLeavesTheAllMemberGroupOwnedByAProjectOwner (e2e, real group
+      module) plus four registry-contract cases in modules/space:
+      TestFinalizerRunsAfterEveryStep (records the ORDER, which is what a fifth step
+      could not give), TestFinalizerDoesNotRunWhenAStepFailed,
+      TestFailedFinalizerRetriesTheJob, TestFinalizerPanicIsContained.
+    a-test-that-was-asserting-a-coin-flip: |
+      The first version of the e2e case passed with the fix removed.
+      group_member.created_at is second-granular, both adds land in the same second,
+      and querySecondOldestNonBotMemberTx orders by created_at with NO tie-break --
+      so the successor was whichever row the engine returned first, which happened to
+      be the right answer. Bob's group row is now backdated an hour, which makes the
+      seniority pick deterministic and the mutation red.
+    mutation: "unregistering the finalizer turns the e2e case red."
+  - id: both-i4-scans-shipped-on-by-default-with-a-measured-full-scan-plan
+    severity: medium
+    reported_by: "yujiawei P2-1 (the one point both reviewer legs agreed on)"
+    where: modules/project/{reconcile,reconcile_p2,review8_reconcile_gate_test}.go
+    what: |
+      The two I4 scans ran outside ReconcileEnabled on the argument that the gate is
+      for statements that cannot survive the collation drift, and these can. True,
+      and the wrong question: SURVIVING 1267 is not the same as being affordable.
+      Their own measured plans under the production shape are `g ALL key=NULL` plus
+      `Using temporary` for scan A and `Using temporary; Using filesort` for scan B,
+      and the temporary table takes the ORDER BY / LIMIT paging with it -- so
+      ReconcileLimit stops bounding the work. On by default is a five-minute full
+      scan of a core IM table on every pod for as long as the conversion is unscheduled.
+    fix: |
+      Both scans moved inside ReconcileEnabled, with the reason stated as cost rather
+      than failure so the next reader does not "fix" it back. Both are report-only, so
+      what waiting costs is the reporting -- and the gate's startup Warn now names all
+      five gated scans, which is what makes "we never turned it on" findable.
+    test: TestReconcileGateCoversExactlyTheGatedScans (renamed; the gated set is now five, and the reason differs per half)
+  - id: two-hooks-judged-group-attribution-from-a-stale-snapshot
+    severity: medium
+    reported_by: "yujiawei P2-3"
+    where: modules/group/{all_member_group,db,service}.go, modules/project/{all_member_group_registry,service_all_member_group}.go
+    what: |
+      admitToAllMemberGroup re-reads the group row in its own transaction so the
+      admission gate judges attribution from an authoritative snapshot (Q13). The
+      other two hooks did not: renameAllMemberGroup checked only status and then
+      updated by group_no, and ensureAllMemberGroupOwner read group_member by
+      group_no and never asked about attribution at all. The project side's
+      queryAllMemberGroupNo does verify both halves, but it is a separate unlocked
+      read -- a detach landing in that window lets a project rename, or change the
+      creator of, a group that is no longer its own.
+    fix: |
+      ensureAllMemberGroupOwner gets the same in-transaction re-read admission has.
+      The rename cannot: the transaction belongs to UpdateGroupInfo. It gets a FENCE
+      instead -- project_id in the UPDATE's own WHERE, threaded through
+      UpdateGroupInfoServiceReq.ExpectProjectID -- which is strictly stronger, since
+      read and write are one statement and there is no window to narrow. Zero rows
+      exits through the existing errGroupGoneOrDisbanded path, i.e. a quiet skip.
+      The rename hook's signature gained projectID to carry it.
+    test: TestOwnerSyncRefusesAGroupThatIsNoLongerTheProjects, TestOwnerSyncStillActsOnTheProjectsOwnGroup, TestRenameRefusesAGroupThatIsNoLongerTheProjects, TestRenameFenceIsWhatStopsTheWrite
+    mutation: "removing the re-read, the early return, or the fence each turns its own case red."
+  - id: the-list-routes-two-counts-do-not-share-a-read-view
+    severity: low
+    reported_by: "yujiawei P2-4"
+    where: modules/project/db.go
+    what: |
+      AgentCount's comment said the two counts come from one snapshot of the roster
+      so the difference cannot go negative, and fillMemberCounts' repeated it. They
+      are two statements with no enclosing transaction: SeatCount from the page
+      query's correlated subquery, MemberCount from a later statement. A concurrent
+      add between them makes MemberCount > SeatCount in normal operation -- so the
+      clamp is load-bearing, and the comment read as if it were decorative.
+    fix: |
+      Comments rewritten to say what the code does, including what the clamp does NOT
+      buy (member_count + agent_count == seat_count can be off by one, briefly).
+      Folding the classification back into the page statement was rejected on the
+      spot: it means re-adding the COLLATE'd join into `user` at one join per listed
+      project, which is exactly what round 8 removed.
+  - id: comment-drift-in-two-places
+    severity: low
+    reported_by: "yujiawei P2-5"
+    where: pkg/errcode/group.go, modules/project/reconcile_p2.go
+    fix: |
+      errcode's D7 code said it refuses "the four group operations" and omitted
+      blacklist, in the one place a client author reads to find out what the code
+      means; it now says five and names it. reconcile_p2 labelled the grace-window
+      predicate "exemption 3: a banned Space" -- wrong exemption AND wrong line; the
+      grace window is 3, the ban is 4, and both now sit on their own predicate.
+  - id: the-full-roster-rebuild-was-carried-as-unmeasured
+    severity: low
+    reported_by: "mochashanyao P2"
+    where: modules/project/all_member_group_e2e_test.go
+    what: |
+      ensureAllMemberGroup runs synchronously inside the HTTP request, and D15
+      widened the caller set from canManageMembers to canManageOwnAgents -- so an
+      ordinary member adding their own agent can trigger it. The worst case (a CAS
+      claim, a max_members+1 roster read, a batched Space read, CreateGroup inserting
+      ~500 rows with a Redis GenSeq each plus one blocking IM call, then a
+      write-back) was carried in open_verification as never measured.
+    fix: |
+      Measured instead of gated. TestRebuildAtAFullRosterStaysInsideAnHTTPBudget
+      seeds a 500-member roster, puts the project back into "provisioning never
+      succeeded", and times the request that pays for the rebuild end to end.
+      Local (MySQL 8.0.46 + Redis + WuKongIM v2.2.4-20260313, all on one box):
+      500 members admitted in 130ms. That is a floor, not a production number, but it
+      answers the question that was open -- the order of magnitude is milliseconds,
+      not seconds. The ceiling asserted is 60s, deliberately loose: a tight bound on
+      a shared runner is a flake generator, and what the assertion has to catch is
+      the difference between "fast" and "the client times out".
+    not_done: |
+      The alternative the review offered -- gate the synchronous rebuild to
+      canManageMembers callers -- was NOT taken. It trades a measured 130ms for a
+      project that stays without a group until someone with higher privilege happens
+      to write, and every admission in between is skipped with reasonAdmitSkippedNoGroup.
+
 verify:
   rules_rechecked:
     - id: space-isolation
@@ -1664,13 +1843,21 @@ open_verification:
      agent can trigger it. Worst case it reads up to max_members + 1 seats, calls
      pkg/space.ActiveMembers once over them, then CreateGroup inserts up to
      max_members member rows with one Redis GenSeq each plus one blocking IM call.
-     At the default cap of 500 that is a few hundred Redis round-trips; it has not
-     been measured. Bounded meanwhile by the fact that it is reachable only for a
-     project whose provisioning already failed and by the lease, which serialises
-     concurrent triggers. If it does not fit the request budget the answer is to
-     move the rebuild onto the reconcile worker, NOT to cap the roster -- a capped
-     rebuild is the incomplete-group defect the third round fixed.
-     PR #855's fifth review, Q3."
+     At the default cap of 500 that is a few hundred Redis round-trips.
+     MEASURED in round 10, after mochashanyao raised the same point as a P2:
+     TestRebuildAtAFullRosterStaysInsideAnHTTPBudget seeds a 500-member roster, puts
+     the project back into \"provisioning never succeeded\", and times the request that
+     pays for the rebuild end to end -- 500 members admitted in 130ms on MySQL
+     8.0.46 + Redis + WuKongIM v2.2.4-20260313, all on one box. That is a FLOOR, not
+     a production figure (no network between the three, an empty database, no
+     concurrent load), so what remains open is the same number against production
+     latencies; the order of magnitude it settles is milliseconds, not seconds.
+     Bounded meanwhile by the fact that it is reachable only for a project whose
+     provisioning already failed and by the lease, which serialises concurrent
+     triggers. If it does not fit the request budget the answer is to move the
+     rebuild onto the reconcile worker, NOT to cap the roster -- a capped rebuild is
+     the incomplete-group defect the third round fixed.
+     PR #855's fifth review Q3, measured after its tenth."
   - "NOT a gate, resolved by splitting: countActiveSeatsByKind carried the same
      shape as the fifth round's blocking finding one table over -- octo_project_member
      driving, `user` probed, COLLATE on the driving side, so under the production

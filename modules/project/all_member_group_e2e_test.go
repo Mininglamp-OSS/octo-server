@@ -3,6 +3,7 @@ package project_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -834,4 +835,203 @@ func TestRebuildSkipsAnOwnerWhoLostTheirSpaceSeat(t *testing.T) {
 	assert.Equal(t, juniorOwner, row.Creator,
 		"the senior owner has no Space seat, so CreateGroup would refuse them as creator; "+
 			"the pick must move on rather than failing the rebuild forever")
+}
+
+// putJSONE2E is postJSONE2E for PUT, which the role-change route uses.
+func putJSONE2E(t *testing.T, srv *server.Server, path, token string, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPut, path, bytes.NewReader(payload))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("token", token)
+	w := httptest.NewRecorder()
+	srv.GetRoute().ServeHTTP(w, req)
+	return w
+}
+
+// groupCreatorsE2E returns the uids currently holding role=creator in a group.
+//
+// Plural on purpose: "how many creators are there" is half of what the owner sync
+// is for, and a test that read a single row could not tell one creator from two.
+func groupCreatorsE2E(t *testing.T, ctx *config.Context, groupNo string) []string {
+	t.Helper()
+	var uids []string
+	_, err := ctx.DB().SelectBySql(
+		"SELECT uid FROM group_member WHERE group_no = ? AND role = 1 AND is_deleted = 0 ORDER BY uid",
+		groupNo,
+	).Load(&uids)
+	require.NoError(t, err)
+	return uids
+}
+
+// TestSpaceRemovalLeavesTheAllMemberGroupOwnedByAProjectOwner is the fourth departure
+// path's owner convergence — the one that was missing.
+//
+// A project owner can lose their seat four ways: kicked, left, role changed, and
+// removed from the Space. The first three call the D6 owner sync directly. This one
+// did not, and what happens instead is precisely what the leave path's own comment
+// says the sync exists to prevent: the group cascade hands the group over by GROUP
+// seniority, with no project-role filter, so it can land on an ordinary member — and
+// D7 then forbids that person from transferring, exiting, disbanding or blacklisting
+// the group. Nobody can move it, and no scan reports it: I4's scans compare member
+// SETS, never creator-versus-owner.
+//
+// The seniority order below is the point of the setup: bob joins before alice, so the
+// group-seniority handover picks BOB, who is an ordinary member — while alice, the
+// project's other owner, is the right answer. If the two orders agreed, this test
+// would pass with the convergence deleted.
+func TestSpaceRemovalLeavesTheAllMemberGroupOwnedByAProjectOwner(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID = "e2e_own_space"
+		admin   = "e2e_own_admin" // the Space's creator; never in the project
+		powner  = "e2e_own_owner" // the project's creator, and the group's creator
+		bob     = "e2e_own_bob"   // ordinary member, SENIOR in the group
+		alice   = "e2e_own_alice" // promoted to project owner, JUNIOR in the group
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, admin)
+	for _, uid := range []string{admin, powner, bob, alice} {
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, uid)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, uid, uid)
+	}
+	ownerToken := seedToken(t, ctx, powner)
+
+	resp := createProjectE2E(t, srv, spaceID, ownerToken, map[string]any{"name": "owner-converge-e2e"})
+	projectID, _ := resp["project_id"].(string)
+	allMemberGroup, _ := resp["all_member_group_no"].(string)
+	require.NotEmpty(t, allMemberGroup)
+
+	// Two adds, not one, so the group's created_at order is bob then alice.
+	w := postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{bob}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	w = postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{alice}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	// Backdate bob's group row so the seniority pick is DETERMINISTIC.
+	//
+	// group_member.created_at is second-granular and both adds land in the same
+	// second, and querySecondOldestNonBotMemberTx orders by created_at with no
+	// tie-break — so without this the successor is whichever row the storage engine
+	// hands back first, which happened to be alice. That made the first version of
+	// this test pass with the convergence deleted: it was asserting a coin flip.
+	exec(t, ctx, "UPDATE group_member SET created_at = DATE_SUB(created_at, INTERVAL 1 HOUR) "+
+		"WHERE group_no = ? AND uid = ?", allMemberGroup, bob)
+
+	// Alice becomes the project's second owner. The group's creator (powner) is still
+	// an active owner, so this sync is a no-op — which is what makes the assertion at
+	// the end about the Space-removal path and not about this call.
+	w = putJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/"+alice+"/role", ownerToken,
+		map[string]any{"role": 2})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	require.Equal(t, []string{powner}, groupCreatorsE2E(t, ctx, allMemberGroup),
+		"precondition: the project's creator owns the group")
+
+	// The group owner loses their Space seat. Everything after this is the cascade.
+	closed, err := spacemod.CloseAllSpaceSeats(ctx, powner, admin, spacemod.MemberRemoveReasonForceRemoved)
+	require.NoError(t, err)
+	require.Equal(t, []string{spaceID}, closed)
+
+	assert.Eventually(t, func() bool {
+		creators := groupCreatorsE2E(t, ctx, allMemberGroup)
+		return len(creators) == 1 && creators[0] == alice
+	}, 60*time.Second, 500*time.Millisecond, "waiting for the owner convergence")
+	// Re-read for the failure message: Eventually's message arguments are evaluated
+	// at the call site, before it waits, so a value passed there reports the state
+	// BEFORE the cascade ran — which is exactly the wrong thing to print.
+	require.Equal(t, []string{alice}, groupCreatorsE2E(t, ctx, allMemberGroup),
+		"the all-member group must end up owned by an ACTIVE PROJECT OWNER. The group cascade "+
+			"hands over by group seniority, which here picks bob — an ordinary project member "+
+			"whom D7 then forbids from transferring, exiting, disbanding or blacklisting the "+
+			"group. Nothing repairs that: it self-heals only if the project later sees a kick, "+
+			"a leave or a role change, and no scan reports it because I4 compares member sets, "+
+			"not creator-versus-owner")
+
+	assert.NotContains(t, liveGroupMembers(t, ctx, allMemberGroup), powner,
+		"and the departed owner is out of the group entirely")
+	assert.Contains(t, liveGroupMembers(t, ctx, allMemberGroup), bob,
+		"while bob stays a member — the convergence demotes, it does not evict")
+}
+
+// TestRebuildAtAFullRosterStaysInsideAnHTTPBudget measures the one thing the
+// description carried as unmeasured: what a full-roster rebuild costs the caller
+// who happens to trigger it.
+//
+// The rebuild is synchronous, inside the HTTP request, and D15 widened the caller
+// set — an ordinary project member adding their own agent now reaches it. The worst
+// case is this one: a CAS claim, a roster read of up to max_members+1 rows, a
+// batched Space-active read, then CreateGroup inserting ~500 member rows with a
+// Redis GenSeq each plus one blocking IM call, then the write-back.
+//
+// The ceiling is deliberately loose. This is not a benchmark and the runner is
+// shared, so a tight bound would be a flake generator; what it has to catch is the
+// difference between "seconds" and "the client times out". The measured number goes
+// in the log line, which is the part that answers the review.
+//
+// Reachable only while a project has no usable group, and the lease serialises
+// concurrent triggers, so exactly one caller pays this.
+func TestRebuildAtAFullRosterStaysInsideAnHTTPBudget(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID    = "e2e_perf_space"
+		owner      = "e2e_perf_owner"
+		late       = "e2e_perf_late"
+		rosterSize = 500 // the default OCTO_PROJECT_MAX_MEMBERS
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, owner)
+	for _, uid := range []string{owner, late} {
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, uid)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, uid, uid)
+	}
+
+	ownerToken := seedToken(t, ctx, owner)
+	resp := createProjectE2E(t, srv, spaceID, ownerToken, map[string]any{"name": "rebuild-perf-e2e"})
+	projectID, _ := resp["project_id"].(string)
+	firstGroup, _ := resp["all_member_group_no"].(string)
+	require.NotEmpty(t, firstGroup)
+
+	// Fill the roster by seeding rows rather than by calling the add endpoint 498
+	// times: what is being measured is the rebuild, not the adds.
+	for i := 0; i < rosterSize-2; i++ {
+		uid := fmt.Sprintf("e2e_perf_m%03d", i)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, uid, uid)
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, uid)
+		exec(t, ctx, "INSERT INTO `octo_project_member` "+
+			"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
+			"VALUES (?, ?, ?, 0, 1, 0, ?, NOW(3), NOW(3))", projectID, uid, spaceID, owner)
+	}
+
+	// Back to "provisioning never succeeded", which is where every rebuild starts.
+	exec(t, ctx, "UPDATE `group` SET status = 2 WHERE group_no = ?", firstGroup)
+	exec(t, ctx, "UPDATE `octo_project` SET all_member_group_no = '', all_member_group_lease_until = NULL "+
+		"WHERE project_id = ?", projectID)
+
+	start := time.Now()
+	w := postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{late}})
+	elapsed := time.Since(start)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	rebuilt := allMemberGroupNoE2E(t, ctx, projectID)
+	require.NotEmpty(t, rebuilt, "the request that pays for the rebuild must also produce one")
+
+	live := liveGroupMembers(t, ctx, rebuilt)
+	t.Logf("full-roster rebuild: %d members admitted in %s (request end to end)", len(live), elapsed)
+	assert.GreaterOrEqual(t, len(live), rosterSize,
+		"the rebuild must admit the whole roster — a capped rebuild is the incomplete-group "+
+			"defect the third review established, so a fast run that admitted fewer members "+
+			"would be measuring the wrong thing")
+	assert.Less(t, elapsed, 60*time.Second,
+		"a full-roster rebuild must stay well inside any sane HTTP budget. If this fires, the "+
+			"answer is not a bigger number: it is to stop doing the rebuild inside the request "+
+			"that triggered it, because the seats have already committed and the caller gets a "+
+			"timeout on an operation that half-succeeded")
 }

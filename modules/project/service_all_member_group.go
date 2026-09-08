@@ -2,6 +2,7 @@ package project
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
@@ -369,20 +370,34 @@ func (p *Project) admitAllMemberGroup(projectID, spaceID, groupNo, uid string) {
 // 既不能解散也不能退群也不能转让。兜底是 P1 的级联——原 owner 一旦离开项目，
 // detach 会按"群主离开"路径把群主移交给资深的项目成员。
 func (p *Project) syncAllMemberGroupOwner(projectID string) {
-	transfer := allMemberGroupOwnerTransfer()
-	if transfer == nil {
-		return
-	}
-	groupNo, err := p.db.queryAllMemberGroupNo(projectID)
-	if err != nil || groupNo == "" {
-		return
-	}
-	if err := transfer(p.ctx, projectID, groupNo); err != nil {
+	if err := p.syncAllMemberGroupOwnerE(projectID); err != nil {
 		p.Error("同步全员群群主失败（项目 owner 已变动，群主未跟上）",
-			zap.Error(err), zap.String("projectId", projectID),
-			zap.String("groupNo", groupNo))
+			zap.Error(err), zap.String("projectId", projectID))
 		observeAllMemberGroupSyncFailure(reasonSyncOwner)
 	}
+}
+
+// syncAllMemberGroupOwnerE 是同一次同步，但把错误交还给调用方。
+//
+// 存在的理由只有一个调用方：Space 级联的收敛动作（convergeAllMemberGroupOwners）
+// 跑在一条**有重试的**工单里，能把失败换成"稍后重跑"，而上面那三条同步路径跑在
+// 请求里，除了记日志与打点没有别的处置。两者共用同一段判定，差别只在错误的去向。
+//
+// 顺带修掉一处静默：指针查询失败以前与"没有全员群"走同一个 return，于是一次 DB
+// 故障读起来和"这个项目本来就没有群"完全一样。
+func (p *Project) syncAllMemberGroupOwnerE(projectID string) error {
+	transfer := allMemberGroupOwnerTransfer()
+	if transfer == nil {
+		return nil
+	}
+	groupNo, err := p.db.queryAllMemberGroupNo(projectID)
+	if err != nil {
+		return fmt.Errorf("project: query all-member group for owner sync: %w", err)
+	}
+	if groupNo == "" {
+		return nil
+	}
+	return transfer(p.ctx, projectID, groupNo)
 }
 
 // syncAllMemberGroupName 把全员群名改成项目名（D8）。best-effort。
@@ -400,7 +415,7 @@ func (p *Project) syncAllMemberGroupName(projectID, name string) {
 	if err != nil || groupNo == "" {
 		return
 	}
-	if err := rename(p.ctx, groupNo, name); err != nil {
+	if err := rename(p.ctx, projectID, groupNo, name); err != nil {
 		p.Error("同步全员群名失败（项目已改名，群名未变）",
 			zap.Error(err), zap.String("projectId", projectID),
 			zap.String("groupNo", groupNo))

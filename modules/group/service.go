@@ -1175,6 +1175,9 @@ type UpdateGroupInfoServiceReq struct {
 	OperatorName string  // 操作者名称
 	Name         *string // 新群名（nil 表示不更新）
 	Notice       *string // 新公告（nil 表示不更新）
+	// ExpectProjectID 可选的归属栅栏：非空时，只有当这个群仍属于该项目才写。
+	// 只有 D8 的全员群改名会设置它；人手改名留空。见 UpdateNameNoticeTx。
+	ExpectProjectID string
 }
 
 // UpdateGroupAvatarCustomServiceReq 更新自定义群头像文字/颜色（二次弹窗保存）。
@@ -2183,7 +2186,8 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	// 列级写：只动本次真正要改的列 + version。整行回写会把无锁读之后、这次提交
 	// 之前别人改掉的 status / forbidden / invite 用旧快照盖回去——其中 status 那一
 	// 项意味着一次改名可以撤销一次解散。见 UpdateNameNoticeTx 上的说明。
-	affected, err := s.db.UpdateNameNoticeTx(req.GroupNo, req.Name, req.Notice, groupModel.Version, tx)
+	affected, err := s.db.UpdateNameNoticeTx(
+		req.GroupNo, req.Name, req.Notice, groupModel.Version, req.ExpectProjectID, tx)
 	if err != nil {
 		s.Error("update group failed", zap.Error(err))
 		return errors.New("failed to update group")

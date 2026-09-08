@@ -47,7 +47,7 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 	name := "after"
 	tx, err := ctx.DB().Begin()
 	require.NoError(t, err)
-	affected, err := g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, tx)
+	affected, err := g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, "", tx)
 	require.NoError(t, err)
 	require.Zero(t, affected,
 		"the write must report that it changed nothing, so the caller can skip the "+
@@ -79,7 +79,7 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 
 	tx, err = ctx.DB().Begin()
 	require.NoError(t, err)
-	affected, err = g.db.UpdateNameNoticeTx(live, &name, nil, 42, tx)
+	affected, err = g.db.UpdateNameNoticeTx(live, &name, nil, 42, "", tx)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, affected, "a live group's rename lands, so the notifications go out")
 	require.NoError(t, tx.Commit())

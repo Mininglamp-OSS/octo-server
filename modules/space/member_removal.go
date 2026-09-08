@@ -111,6 +111,47 @@ func snapshotCleanupSteps() []namedCleanupStep {
 	return out
 }
 
+var (
+	cleanupFinalizersMu sync.RWMutex
+	cleanupFinalizers   []namedCleanupStep
+)
+
+// RegisterMemberRemovalCleanupFinalizer 注册一个**在全部清理步骤成功之后**才跑的
+// 收敛动作。签名与契约与 MemberRemovalCleanupStep 完全相同（幂等、自决、失败即重试），
+// 差别只有一条：它读到的是所有步骤都已完成的那个状态。
+//
+// 为什么需要它，而不是再注册一个步骤：步骤的执行顺序就是注册顺序，而注册顺序由
+// import 方向决定，没有任何地方声明过（见 runMemberRemovalCleanupJob 里那段注释）。
+// 有些收敛必须看见**别的步骤已经做完**的结果才能算对——例如「全员群的群主必须是
+// 项目的活跃 owner」：群侧的级联在离开时会按群资历交接群主，项目侧的级联在关席位，
+// 两者谁先谁后不确定，而正确答案只有在两件都发生之后才成立。把这样的动作写成步骤，
+// 它在一半的注册顺序下会跑在前面，算出的答案是对另一个中间态的。
+//
+// 与步骤一样：同名重复注册覆盖（latest wins），方便测试替身。
+func RegisterMemberRemovalCleanupFinalizer(name string, fn MemberRemovalCleanupStep) {
+	if name == "" || fn == nil {
+		return
+	}
+	cleanupFinalizersMu.Lock()
+	defer cleanupFinalizersMu.Unlock()
+	for i := range cleanupFinalizers {
+		if cleanupFinalizers[i].name == name {
+			cleanupFinalizers[i].fn = fn
+			return
+		}
+	}
+	cleanupFinalizers = append(cleanupFinalizers, namedCleanupStep{name: name, fn: fn})
+}
+
+// snapshotCleanupFinalizers 取注册表快照，避免执行期间持锁。
+func snapshotCleanupFinalizers() []namedCleanupStep {
+	cleanupFinalizersMu.RLock()
+	defer cleanupFinalizersMu.RUnlock()
+	out := make([]namedCleanupStep, len(cleanupFinalizers))
+	copy(out, cleanupFinalizers)
+	return out
+}
+
 // invalidateMembershipCache 清掉某个成员在某个 Space 的 SpaceMiddleware 正向缓存。
 //
 // Redis key `space:member:{spaceID}:{uid}`，TTL 60s。不清它，被移除的人还能带着
@@ -500,6 +541,48 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 			zap.Error(err))
 		if firstErr == nil {
 			firstFailedStep, firstErr = step.name, err
+		}
+	}
+	if firstErr != nil {
+		if failedSteps > 1 {
+			firstFailedStep = fmt.Sprintf("%s(+%d)", firstFailedStep, failedSteps-1)
+		}
+		s.releaseCleanupJob(job, owner, firstFailedStep, firstErr)
+		return
+	}
+
+	// 收敛动作跑在**全部步骤都成功之后**，这正是它与步骤的唯一区别：它看见的是一个
+	// 已经安定的状态，而不是某个注册顺序下的中间态。
+	//
+	// 有步骤失败就不跑：那一轮里"别的步骤已经做完"这个前提不成立，而工单会被重排，
+	// 下一轮全部成功时它自然会跑到。收敛动作自己失败也走同一条重试路径——它和步骤
+	// 一样要求幂等，所以整条工单重跑是安全的。
+	//
+	// panic 与步骤同样在**每一个**收敛动作上单独兜住，理由也一样：函数级的那个
+	// recover 会直接跳出循环，让排在后面的收敛动作本轮一次都跑不到。
+	for _, fin := range snapshotCleanupFinalizers() {
+		err := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					s.Error("成员移除收敛动作 panic",
+						zap.Any("recover", r), zap.Uint64("jobId", job.ID),
+						zap.String("finalizer", fin.name),
+						zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
+					err = fmt.Errorf("cleanup finalizer panicked: %v", r)
+				}
+			}()
+			return fin.fn(s.ctx, removal)
+		}()
+		if err == nil {
+			continue
+		}
+		failedSteps++
+		s.Warn("成员移除收敛动作失败，继续执行其余收敛动作",
+			zap.Uint64("jobId", job.ID), zap.String("finalizer", fin.name),
+			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID),
+			zap.Error(err))
+		if firstErr == nil {
+			firstFailedStep, firstErr = fin.name, err
 		}
 	}
 	if firstErr != nil {

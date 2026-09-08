@@ -419,6 +419,80 @@ Match the call, not the name. Assert the window between two landmarks, not the
 presence of a string. None of these is clever; what they have in common is that
 the assertion and the property finally have the same boundaries.
 
+### A census is only as good as the question it asks
+
+The bot-deletion census ran twice and missed the same door twice, and both times
+the reason was the question, not the effort. It was run as "who WRITES
+`space_member`" — which cannot, structurally, find a door whose entire defect is
+that it deletes a bot WITHOUT writing `space_member`. The right question is "what
+deletes a bot", and it has a different answer: three doors, not two.
+
+The correction is not "be more careful next time". It is that a census is a
+predicate over a set, and if the predicate is derived from the fix rather than
+from the rule, it enumerates the places already fixed. The rule here is "a
+deleted bot's Space seats close through the outbox"; its subject is bot deletion,
+so the enumeration has to start from deletion, not from seat writes.
+
+What made it stick is that the census is now a test over the SET, not three tests
+over three endpoints: it finds the primitives that turn a bot's account off, finds
+their callers, and requires each caller to route or to be a recorded exemption.
+Written that way it immediately produced a fourth call site nobody had named — a
+creation-rollback path that is correctly exempt. An endpoint-level test could not
+have surfaced that, because you cannot write a test for a door you do not know
+about.
+
+### When ordering is undeclared, do not compute an answer that depends on it
+
+The Space-removal cascade runs its cleanup steps in registration order, and
+registration order is import order, which is declared nowhere. That was already
+recorded as the reason a failing step must not block the others. It has a second
+consequence that this round found: some answers are only correct once every step
+has run, and computing them from inside a step gives an answer about whichever
+intermediate state the ordering happens to produce.
+
+Concretely, "the all-member group's owner must be an active project owner" needs
+both the group handover and the project seat close to have happened. Place the
+sync in the project step and the two possible orders fail differently — one lets
+`PickActiveOwner` return the person on their way out, the other syncs before the
+handover installs the wrong owner. Neither order is a bug in the ordering; the bug
+is asking a question whose answer is not yet defined.
+
+The fix is a phase, not a position: a post-steps finalizer that runs only after
+every step has succeeded. It is worth noticing that this is not "a fifth step with
+a good name" — the registry cannot promise a step's position, and a comment asking
+future maintainers to register in a particular order is not a mechanism.
+
+### A test whose fixture has a tie is asserting a coin flip
+
+The end-to-end case for the above passed with the fix removed. `created_at` on
+`group_member` is second-granular, both members were added inside the same second,
+and the successor query orders by `created_at` with no tie-break — so which member
+the handover picked was whatever the storage engine returned first, and it
+happened to be the right answer.
+
+Every previous round of this change found a guard that asserted less than it
+claimed; this one is the same failure in the fixture instead of the assertion. The
+mutation run is what caught it, again, and it is the only thing that could have:
+the test passed, its name was right, and its comment described a property the setup
+did not actually create. Backdating one row by an hour is the whole fix, and the
+lesson is that a fixture which makes the wrong answer and the right answer equally
+reachable proves nothing about which one the code picks.
+
+### "It survives" and "it is affordable" are different questions
+
+Both I4 scans were kept outside the reconcile gate on the argument that every
+cross-schema comparison in them carries an explicit `COLLATE`, so they survive the
+collation drift the gate exists for. That argument is true, was tested, and was
+beside the point: the same file already recorded their measured plans under the
+production shape — a full scan of `group` plus a temporary table, and the temporary
+table defeats the `ORDER BY`/`LIMIT` paging the scans depend on, so `ReconcileLimit`
+stops bounding the work.
+
+Surviving `1267` says the statement executes. It says nothing about executing it
+every five minutes on every pod against a core IM table. The two scans now ride the
+same switch as the three that cannot survive the drift, for a different stated
+reason, so the next reader does not "fix" the inconsistency by moving them back.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

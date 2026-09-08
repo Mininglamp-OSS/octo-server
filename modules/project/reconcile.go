@@ -235,8 +235,8 @@ func (p *Project) startReconcileWorker() {
 		// announced is worse than a broken one: the gauges sit at zero and read as "no
 		// violations". This line is what makes "we never turned it on" findable.
 		if !p.cfg.ReconcileEnabled {
-			p.Warn("项目对账的跨 Space 扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目三项无监控，"+
-				"三个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
+			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目 / I4 缺群 / I4 缺员"+
+				"五项无监控，五个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
 				zap.String("env", envReconcileEnabled))
 		}
 		p.ctx.Schedule(jitter(p.cfg.ReconcileInterval), p.runReconcile)
@@ -304,16 +304,36 @@ func (p *Project) runReconcile() {
 	// project group who is not in the project); these are the superset direction,
 	// and only for the all-member group.
 	//
-	// Outside the gate for the same reason as the P1 scans: every comparison that
-	// crosses into the legacy schema carries an explicit COLLATE, so they survive
-	// the drift the gate exists for.
+	// INSIDE the gate, but for a different reason than the three above — and the
+	// difference is worth stating, because the previous version got it wrong by
+	// answering the wrong question.
+	//
+	// These two do survive the drift: every crossing carries an explicit COLLATE,
+	// and TestP2StatementsSurviveCollationDrift proves it against a deliberately
+	// drifted database. That was the whole argument for keeping them ungated, and
+	// it is true — it is just not the question. SURVIVING 1267 is not the same as
+	// being affordable. Under the production collation shape their own measured
+	// plans are `g ALL key=NULL rows=<all groups>` plus `Using temporary` for scan
+	// A, and `Using temporary; Using filesort` for scan B; the temporary table
+	// also defeats the ORDER BY / LIMIT paging both scans depend on, so
+	// ReconcileLimit stops bounding the work. Shipping them on by default is a
+	// five-minute full scan of a core IM table on every pod, for as long as the
+	// collation conversion stays unscheduled.
+	//
+	// So they ride the same switch: off until the conversion lands, then on with
+	// the rest. Both scans are REPORT ONLY, so nothing is lost while they wait
+	// except the reporting — and the gate's startup Warn says so out loud, which
+	// is the property that makes "we never turned it on" findable.
+	// PR #855's tenth review, P2-1.
 	//
 	// REPORT ONLY, both of them. Scan A has a repair (D4's rebuild) and it lives
 	// on the write paths, not here — a reconcile worker that also writes
 	// group_member stops being the invariant's witness and becomes another thing
 	// that can break it.
-	p.scanMissingAllMemberGroups()
-	p.scanAllMemberGroupGaps()
+	if p.cfg.ReconcileEnabled {
+		p.scanMissingAllMemberGroups()
+		p.scanAllMemberGroupGaps()
+	}
 }
 
 // reconcileLogCap bounds the per-row Error lines ONE scan emits in ONE tick.

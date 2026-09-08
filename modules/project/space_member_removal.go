@@ -59,6 +59,129 @@ func (p *Project) registerSpaceMemberRemovalCleanup() {
 	spacemod.RegisterMemberRemovalCleanupStep(spaceMemberRemovalStepName, p.cleanupSpaceMemberProjects)
 }
 
+// allMemberGroupOwnerFinalizerName is the finalizer's name, which also prefixes the
+// job's last_error.
+const allMemberGroupOwnerFinalizerName = "project_all_member_group_owner"
+
+// registerAllMemberGroupOwnerFinalizer registers "make every all-member group this
+// member touched end up owned by an active project owner" as a post-steps finalizer.
+//
+// # Why this exists at all
+//
+// A project owner can lose their seat by four routes: kicked, left, role changed, and
+// this one — removed from the Space, which cascades into every project in it. The first
+// three call syncAllMemberGroupOwner directly (service.go). This one did not, and the
+// hole it left is the exact state the leave path's comment says that sync was added to
+// prevent: the group side still hands the group over on its way out
+// (handOverGroupCreator), and it picks the second-oldest non-bot GROUP member with no
+// project-role filter at all. That can land on an ordinary project member — and D7 then
+// forbids that person from transferring, leaving, disbanding or blacklisting the group.
+// Nobody can move it, and no scan reports it: I4's two scans compare MEMBER SETS, not
+// creator-versus-owner. A quiet project keeps that state forever.
+//
+// # Why a finalizer and not a step, and not a call inside deactivateSeatForCascade
+//
+// The convergence needs BOTH halves to have happened: the group cascade must have done
+// its handover, and the project cascade must have closed the departing owner's seat.
+// Steps run in registration order, and registration order is import order, which is
+// declared nowhere — so a step (or a call inside deactivateSeatForCascade) computes its
+// answer against whichever intermediate state that ordering happens to produce:
+//
+//   - Group step first: the departing owner's project seat is still ACTIVE, so
+//     PickActiveOwner can return the person who is on their way out. Promoting them
+//     fails (they are no longer a group member) and the group keeps the non-owner the
+//     handover picked.
+//   - Project step first: the group still has the departing owner as its creator, so the
+//     sync sees a creator who is still a project member and changes nothing; the handover
+//     then installs the non-owner afterwards.
+//
+// Both orders leave the defect. A finalizer runs after every step has SUCCEEDED, so it
+// is the only placement whose input is a settled state rather than an ordering artifact.
+func (p *Project) registerAllMemberGroupOwnerFinalizer() {
+	spacemod.RegisterMemberRemovalCleanupFinalizer(
+		allMemberGroupOwnerFinalizerName, p.convergeAllMemberGroupOwners)
+}
+
+// convergeAllMemberGroupOwners re-runs the idempotent D6 owner sync for every project in
+// this Space that the removed member had a row in.
+//
+// Contract compliance (modules/space/member_removal.go):
+//
+//   - Idempotent. The sync is self-deciding on the group side: it reads who the group's
+//     creators are and who the project's active owners are, and writes only when they
+//     disagree. Running it on a project that is already correct is a read and nothing else.
+//   - Decides "nothing to do" itself: no member rows, no all-member group pointer, or no
+//     active project owner all return nil rather than an error.
+//   - Assumes nothing about which steps ran — only that they all succeeded, which is the
+//     finalizer contract.
+//
+// The set is "every project in this Space with a row for this uid, any status", not
+// "every project whose seat we just closed" and not "every project where they were an
+// owner"; queryProjectIDsForSpaceMemberPage's comment carries why both of the narrower
+// sets are wrong. Paged with the cascade's own budget so one member of a thousand
+// projects cannot hold the lease for the whole walk, and a spent budget returns the same
+// retryable error the cascade uses.
+func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacemod.MemberRemoval) error {
+	if removal.SpaceID == "" || removal.UID == "" {
+		return nil
+	}
+	after := ""
+	synced, failed := 0, 0
+	var firstErr error
+	for page := 0; page < cascadeMaxPages; page++ {
+		ids, err := p.db.queryProjectIDsForSpaceMemberPage(
+			removal.SpaceID, removal.UID, after, cascadePageSize)
+		if err != nil {
+			return fmt.Errorf("project: list projects for owner convergence: %w", err)
+		}
+		for _, projectID := range ids {
+			// One failure does not stop the walk: the projects are independent, and
+			// stopping would make the first broken one starve every project after it in
+			// project_id order — the same isolation rule the step loop follows. The first
+			// error is what the job reports; each failure logs on its own.
+			if err := p.syncAllMemberGroupOwnerE(projectID); err != nil {
+				failed++
+				p.Error("全员群群主收敛失败（Space 级联路径）",
+					zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID),
+					zap.String("projectId", projectID), zap.Error(err))
+				observeAllMemberGroupSyncFailure(reasonSyncOwner)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			synced++
+		}
+		if len(ids) < cascadePageSize {
+			if firstErr != nil {
+				return fmt.Errorf("project: converge all-member group owner (%d of %d failed): %w",
+					failed, synced+failed, firstErr)
+			}
+			return nil
+		}
+		after = ids[len(ids)-1]
+	}
+	if firstErr != nil {
+		return fmt.Errorf("project: converge all-member group owner (%d of %d failed): %w",
+			failed, synced+failed, firstErr)
+	}
+	// The budget ran out on a full page. Confirm a project really remains before asking
+	// for a retry: a count that is an exact multiple of the page size lands here with
+	// nothing left, and returning an error then would re-run the whole job for no reason.
+	// Same one-row check the cascade does, for the same reason.
+	remaining, err := p.db.queryProjectIDsForSpaceMemberPage(removal.SpaceID, removal.UID, after, 1)
+	if err != nil {
+		return fmt.Errorf("project: confirm remaining projects after convergence budget: %w", err)
+	}
+	if len(remaining) == 0 {
+		return nil
+	}
+	p.Warn("全员群群主收敛达到单次页数上限，返回可重试错误以便工单重新认领",
+		zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID),
+		zap.Int("synced", synced), zap.Int("maxPages", cascadeMaxPages))
+	return errCascadeIncomplete
+}
+
 // cleanupSpaceMemberProjects closes every project seat a removed Space member still
 // holds in that Space.
 //

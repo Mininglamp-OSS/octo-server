@@ -68,17 +68,22 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Only members of this project can be added to the group.",
 	})
-	// ErrGroupAllMemberGroupProtected refuses the four group operations that
+	// ErrGroupAllMemberGroupProtected refuses the FIVE group operations that
 	// would break a project's all-member group (P2 D7): disband, exit, remove a
-	// member, and hand over the owner.
+	// member, hand over the owner, and blacklist a member.
 	//
 	// The all-member group's roster IS the project's roster (invariant I4), so
 	// each of those has a project-side equivalent that must be used instead:
 	// leave the project, remove the member from the project, transfer project
 	// ownership. Disbanding has no equivalent — the group ends when the project
-	// does.
+	// does. Blacklisting has none either: it removes the member from the roster
+	// as a side effect, which is the same I4 break by another name.
 	//
-	// details.action names which of the four was refused, so a client can render
+	// This list said "four" and omitted blacklist while the paragraph below
+	// already counted five call sites — and this is the one place a client author
+	// reads to find out what the code means. PR #855's tenth review.
+	//
+	// details.action names which of the five was refused, so a client can render
 	// the right redirection ("leave the project instead") rather than a generic
 	// refusal.
 	//

@@ -154,7 +154,7 @@ func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
 		s.ownerSyncs = append(s.ownerSyncs, projectID)
 		return nil
 	})
-	RegisterAllMemberGroupRename(func(_ *config.Context, _, name string) error {
+	RegisterAllMemberGroupRename(func(_ *config.Context, _, _, name string) error {
 		s.renames = append(s.renames, name)
 		return nil
 	})

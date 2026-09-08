@@ -135,6 +135,7 @@ func New(ctx *config.Context) *Project {
 	p.nudgeProvisioningFn = p.nudgeProvisioningWorker
 
 	p.registerSpaceMemberRemovalCleanup()
+	p.registerAllMemberGroupOwnerFinalizer()
 	// Publish the provisioning configuration verdict at CONSTRUCTION, not in Route():
 	// a rejected target must be visible even in a crash loop that never reaches Route,
 	// and a startup log line alone is lost within minutes.

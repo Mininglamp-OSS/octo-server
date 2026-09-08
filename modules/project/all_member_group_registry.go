@@ -90,7 +90,12 @@ type AllMemberGroupAdmitter func(ctx *config.Context, spaceID, groupNo, uid stri
 type AllMemberGroupOwnerTransfer func(ctx *config.Context, projectID, groupNo string) error
 
 // AllMemberGroupRename 把全员群名改成 name（D8）。best-effort。
-type AllMemberGroupRename func(ctx *config.Context, groupNo, name string) error
+//
+// projectID 传的是**发起这次改名的项目**，群侧用它给写加一道归属栅栏：
+// 项目侧解析 group_no 的那次读是无锁的，两次之间 P1 的 detach 可以把群变回
+// Space 直属，于是这次改名会落在一个已经不属于该项目的群上。见
+// renameAllMemberGroup。
+type AllMemberGroupRename func(ctx *config.Context, projectID, groupNo, name string) error
 
 var (
 	allMemberGroupMu       sync.RWMutex

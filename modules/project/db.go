@@ -363,10 +363,13 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 // neither needs a COLLATE and neither can lose an index to one — which is the
 // whole reason the join that used to do this was removed. PR #855s eighth review.
 //
-// The exactness argument the old comment made still holds, and now for a reason
-// that is actually true of the code: the roster is snapshotted once, and every
-// seat in it is either a bot or not, so humans + agents == len(seats) by
-// arithmetic rather than by two aggregates sharing a read view.
+// Within THIS function the arithmetic is exact: one roster read, and every uid in
+// it is either a bot or not, so humans + agents == len(seats) for the set these two
+// statements see. What that does not give is exactness against SeatCount, which the
+// page statement already computed under an earlier read view — see AgentCount for
+// what the difference can be and why the clamp is what handles it. The previous
+// version of this comment claimed a single snapshot across both, which is one
+// statement too many. PR #855's tenth review.
 func (d *DB) fillMemberCounts(rows []*listRow) error {
 	if len(rows) == 0 {
 		return nil
@@ -436,17 +439,28 @@ type listRow struct {
 	MemberCount int
 	// SeatCount is every active seat, humans and agents together. Agents are the
 	// DIFFERENCE rather than a third count: see the query for the measurement
-	// behind that choice.
+	// behind that choice. Computed by the page statement, i.e. under a DIFFERENT
+	// read view from MemberCount — see AgentCount.
 	SeatCount int `db:"seat_count"`
 }
 
-// AgentCount is the agent half of D16's split, derived from the two counts the
-// query returns.
+// AgentCount is the agent half of D16's split, derived from the two counts.
 //
-// Clamped at zero rather than trusted: the two counts come from one snapshot of
-// the roster, so the difference cannot go negative — but a future edit that gave
-// them different predicates would turn a wrong count into a negative one on the
-// wire, and a client rendering "-3 agents" is a worse failure than a zero.
+// The clamp is LOAD-BEARING, not a defensive flourish, and the previous version of
+// this comment said the opposite. SeatCount comes from the correlated subquery
+// inside listVisibleInSpace; MemberCount comes from fillMemberCounts, a separate
+// statement issued after that page has loaded. Two statements, no enclosing
+// transaction, two read views — so a member added between them is counted by the
+// second and not the first, and `MemberCount > SeatCount` is reachable in normal
+// operation, not only after a future edit that gave the two different predicates.
+//
+// What the clamp buys, then, is that the wire never carries a negative agent count.
+// What it does NOT buy is `member_count + agent_count == seat_count`: in that race
+// the response is internally inconsistent by one, briefly, and the next list call
+// agrees again. That is the accepted cost of not putting the classification back
+// into the statement — doing so means re-adding the COLLATE'd join into `user` at
+// one join per listed project, which is exactly what the eighth review had removed.
+// PR #855's tenth review, P2-4.
 func (r *listRow) AgentCount() int {
 	if r.SeatCount <= r.MemberCount {
 		return 0
@@ -946,6 +960,36 @@ func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int)
 	).Load(&ids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active projects of space member: %w", err)
+	}
+	return ids, nil
+}
+
+// queryProjectIDsForSpaceMemberPage returns up to limit project ids in one Space
+// where the uid has a member row, ACTIVE OR NOT, ordered by project_id and starting
+// strictly after afterProjectID.
+//
+// The status filter is deliberately absent, which is the whole difference from
+// queryActiveProjectIDsForSpaceMember. Its caller is the post-cleanup owner
+// convergence (registerAllMemberGroupOwnerFinalizer), which runs AFTER the cascade
+// has closed this member's seats — so filtering on status = active would return the
+// empty set and converge nothing. Filtering on role = owner would be wrong for a
+// second reason: the group's creator is not guaranteed to be a project owner (the
+// sync deliberately leaves a former owner in place when the project has none), so a
+// departing non-owner can still be the creator the group cascade hands over.
+//
+// Keyset paging rather than the cascade's "just take the next page" trick: that one
+// works because closing a seat removes the row from its own result set, and this
+// query has no such filter, so LIMIT alone would re-read page one forever.
+func (d *DB) queryProjectIDsForSpaceMemberPage(spaceID, uid, afterProjectID string, limit int) ([]string, error) {
+	var ids []string
+	_, err := d.session.SelectBySql(
+		"SELECT project_id FROM `octo_project_member` "+
+			"WHERE space_id = ? AND uid = ? AND project_id > ? "+
+			"ORDER BY project_id LIMIT ?",
+		spaceID, uid, afterProjectID, limit,
+	).Load(&ids)
+	if err != nil {
+		return nil, fmt.Errorf("project: query projects of space member: %w", err)
 	}
 	return ids, nil
 }
