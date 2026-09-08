@@ -60,14 +60,52 @@ func EnsureSystemSettings(ctx *config.Context) *SystemSettings {
 	return sharedSystemSettings
 }
 
-// (resetSharedSystemSettingsForTest was removed: octo-lib's
-// register.GetModules caches the moduleList with sync.Once for the lifetime
-// of a test binary, so the Manager's stored *SystemSettings is bound to
-// the first ctx. Resetting the package-level singleton produces a fresh
-// instance that the Manager does NOT see, which historically led to
-// confusing test failures. Tests should instead reuse the singleton
-// captured by NewManager and mutate state through it. See
-// TestManagerSystemSetting_BoolEmptyValueResetsToYaml for the pattern.)
+// SystemSettingsSnapshot is an opaque restore token for the process-wide
+// singleton. It is deliberately not a usable settings handle: a test holds one
+// only to put back what it displaced.
+type SystemSettingsSnapshot struct {
+	settings *SystemSettings
+}
+
+// SnapshotSystemSettingsForTest captures the current singleton so a test that
+// is about to invalidate it can put the original back.
+//
+// The hazard is latching, not mutation. EnsureSystemSettings binds the FIRST
+// caller's *config.Context — and with it that context's *sql.DB pool — then
+// returns that same instance to every later caller, ignoring the ctx passed
+// in. A test that builds its own context, lets something latch it, and then
+// closes that pool (modules/robot's TestOwnedBots_CheckMembershipDBError
+// closes one on purpose, to reach a database-error branch) leaves the
+// singleton holding a closed pool for the rest of the binary, so every later
+// Reload fails with "sql: database is closed". Under -shuffle=on that lands on
+// whichever test happens to be scheduled later, which is how it was found.
+//
+// Snapshot/restore, NOT a bare reset. An earlier resetSharedSystemSettingsForTest
+// was removed because clearing the singleton hands the next caller a brand new
+// instance that the module list — cached by octo-lib's register.GetModules
+// with sync.Once for the lifetime of the test binary — never sees, so a
+// Manager and the package-level singleton drift into two objects. Putting the
+// original instance back keeps them one. A test that only wants different
+// setting VALUES should still mutate the singleton it already shares rather
+// than swap it out; see TestManagerSystemSetting_BoolEmptyValueResetsToYaml.
+//
+// modules/project's all-member-group registry carries the same snapshot/restore
+// pair, for the same process-wide-latest-wins reason.
+func SnapshotSystemSettingsForTest() SystemSettingsSnapshot {
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	return SystemSettingsSnapshot{settings: sharedSystemSettings}
+}
+
+// RestoreSystemSettingsForTest puts a snapshot back. A snapshot taken before
+// the first EnsureSystemSettings call restores nil, which is the correct state
+// rather than a hole: the next caller then constructs the singleton from its
+// own live context.
+func RestoreSystemSettingsForTest(s SystemSettingsSnapshot) {
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	sharedSystemSettings = s.settings
+}
 
 // defaultReloadTTL is how often the background goroutine pulls a fresh
 // snapshot from system_setting. 60s is the agreed budget for multi-instance

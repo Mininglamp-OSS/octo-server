@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/stretchr/testify/assert"
@@ -432,6 +433,16 @@ func TestOwnedBots(t *testing.T) {
 func TestOwnedBots_CheckMembershipDBError(t *testing.T) {
 	s, ctx := newTestServer()
 	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	// New(ctx) below calls common.EnsureSystemSettings(ctx), which latches the
+	// FIRST caller's context — and therefore the pool this test closes a few
+	// lines down — into a process-wide singleton. When -shuffle=on puts this
+	// test ahead of every other New(...) in the binary, that singleton spends
+	// the rest of the run holding a closed *sql.DB and every later
+	// EnsureSystemSettings(...).Reload() (setupBotSettings does one per case)
+	// fails with "sql: database is closed". Restoring what we displaced keeps
+	// the closed pool local to this test.
+	settingsSnapshot := commonmodule.SnapshotSystemSettingsForTest()
+	t.Cleanup(func() { commonmodule.RestoreSystemSettingsForTest(settingsSnapshot) })
 	rb := New(ctx)
 	rb.Route(s.GetRoute())
 	require.NoError(t, ctx.GetRedisConn().Del("ratelimit:uid:"+uid))
