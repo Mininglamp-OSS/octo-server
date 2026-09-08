@@ -2728,3 +2728,41 @@ from the consumer. See `.octospec/journal/shared/membership-epoch-absent-sentine
   而同一节四行之前写着「锁的范围是整表」。两者不能同时为真：后到的那条是**当前读**，
   会阻塞在整表行锁上，到 `innodb_lock_wait_timeout` 就是 1205，而 `pkg/db/mysql.go` 对任何
   迁移错误 `panic` —— 结果是启动 panic 进 CrashLoopBackOff，不是幂等跳过。
+
+## 2026-09-09 — internal-membership（PR #852 第九轮：我自己造了一条不实的穷尽性声明）
+
+- **我一边修「披露不实」，一边在同一个提交里制造了一条新的不实声明** —— 第八轮的 B2 就是
+  「rollout doc §5 自称完整枚举却漏了 bot 轴」。我修了它，同时把 reactivation 轴写成
+  「BOTH reactivation paths 已覆盖」+ §5 的「重新加入 ✅ 同事务 +1」—— 而那条轴有**四扇门**，
+  我只关了两扇。**guard 抓不到，因为计数没变，假的是 baseline 的理由。** 一份理由为假的
+  baseline 比缺一条更糟：它读起来是绿的。
+- **按函数名枚举会漏掉一半** —— 漏掉的两个写入方签名里没有任何「reactivate」字样：
+  `approveJoinApplyAtomic`（而它恰恰是**设计好的重新加入漏斗**，`resetApprovedApplyForRejoin`
+  存在的目的就是把被移除的人送回这条路）和 `upsertMembers`（`ON DUPLICATE KEY UPDATE
+  status=1` 撞上唯一索引就是重新激活，而它自己的注释就写着 add/**reactivate**）。
+  **要按 SQL 枚举，不按名字。**
+- **review 给的 affected-rows 方案会静默破坏「空写不动 epoch」** —— 两位都建议用
+  `ON DUPLICATE` 的 1/2/0 惯例判断是否重新激活。实测：全新插入=1、重新激活=2、
+  **已活跃成员跨秒重复 upsert 也=2**（`updated_at=NOW()` 让它算「有变化」；同秒内是 0，
+  所以随手一测会以为可用）。按 affected==2 分流，每次重复添加都 bump 一次 epoch，让该项目
+  所有消费方白做一次复核。**变异验证证实：那个方案能通过四扇门的全部测试，只被新加的
+  churn 测试抓住。** 改用 upsert 前的锁定读。
+- **实测让「怎么修」换了方向，而不只是给结论加脚注** —— 两位都提「新加的 `INNER JOIN user`
+  把驱动表选择权交给了优化器」。实测（真 schema，~3400 成员，200 uid）：带 join 时
+  `u=range(uid)` 驱动、`sm=eq_ref`，也就是 space_member 的行锁按 user 主键序一条条取，
+  而不是让 InnoDB 对单条 IN 谓词按自己的扫描序取 —— 那正是这条语句的注释所依赖的性质，
+  也正是第七轮在单语句 bump 上诊断过的同一类。所以账号存活**移出**锁语句，放进
+  `lockSeatsTx` 里独立的 `ActiveAccounts` 读，与读路径同形状，顺带消掉 read view 的疑问。
+- **一个会 flake 的计划断言，等于在教人删掉计划断言** —— 我为此写了 EXPLAIN 断言测试，
+  然后**删掉了**：翻转依赖**数据分布**而不只是行数，用本套件的 fixture 播 3400 行时两种形状
+  都是 `sm` 驱动，于是 control（「被拒形状必须在这个 fixture 上表现不同」）失败 ——
+  测试无法区分它存在的目的所要比较的两条语句，而单次运行 40 秒。改成结构 guard，把性质、
+  实测数据和「存活检查该放哪」都写在失败消息里。**删掉的理由也写进代码**，否则下一个人会
+  重新加一个同样不稳的版本。
+- **我的第一版 EXPLAIN 实测本身是错的，而错因是 fixture 缺索引** —— 手写 DDL 漏了真表上的
+  `spacemember_uid` 索引，导致我一开始测出「两种基数下 user 都驱动」，比事实更严重。
+  订正后写明范围：「join **可能**夺取驱动位」而不是「总是」—— 这已经足够，因为锁序论证要求的是
+  「永远不可能」。
+- **targeted 跑绿、全量 shuffle 才抓到的自伤** —— join 移出锁语句后，collation 漂移测试里
+  「lockSpaceSeatsTx 拒绝封禁账号」这条断言就成了假的（该语句现在只回答 Space 成员资格）。
+  它在我 targeted 的那几个用例里没跑到。**改完实现要跑全量，不只跑你正在改的那几个测试。**
