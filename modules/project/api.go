@@ -64,6 +64,21 @@ type Project struct {
 	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, error)
 	disbandFn func(projectID, actorUID, spaceID string) ([]string, error)
 
+	// nudgeProvisioningFn is the post-create worker trigger, as an instance seam on the
+	// same terms as the five above: production gets the real goroutine, and a test that
+	// needs to observe the outbox BEFORE the worker touches it swaps this on its own
+	// instance. Without a seam the nudge races every assertion about a pending row —
+	// and the alternative (sleeping until it settles) would make the outbox's own
+	// timing the thing under test.
+	nudgeProvisioningFn func()
+
+	// provisionClient is the ONLY outbound path to fleet / drive, and it is reachable
+	// only from provisioning_worker.go — no handler in this module may touch it (see
+	// that file's header and TestProvisioningClientIsConfinedToTheWorker). Non-nil even
+	// when provisioning is disabled, because the worker that would use it does not start
+	// in that case and a nil check per job would be a second place to get wrong.
+	provisionClient provisionEnsurer
+
 	// i1PageFn is the page-query seam for the I1 reconcile scan, on the same terms as the
 	// two above.
 	//
@@ -116,7 +131,14 @@ func New(ctx *config.Context) *Project {
 		return p.queryI1ViolationPage(cursorProject, cursorUID, limit)
 	}
 
+	p.provisionClient = newProvisionClient()
+	p.nudgeProvisioningFn = p.nudgeProvisioningWorker
+
 	p.registerSpaceMemberRemovalCleanup()
+	// Publish the provisioning configuration verdict at CONSTRUCTION, not in Route():
+	// a rejected target must be visible even in a crash loop that never reaches Route,
+	// and a startup log line alone is lost within minutes.
+	p.publishProvisioningConfigMetrics()
 	return p
 }
 
@@ -144,6 +166,11 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 	// 扇出规模不同，且 Space 的步骤契约规定「任一步骤报错整单重跑」——挂在一起会
 	// 让项目侧的失败去重跑 Space 侧已成功的步骤。
 	p.startRemovalWorker()
+	// Inert unless a target is enabled; see startProvisioningWorker.
+	p.startProvisioningWorker()
+	// The census runs regardless, so a rollback that clears the target list does not take
+	// the gauges with it — see startProvisioningMetrics.
+	p.startProvisioningMetrics()
 
 	spaceScoped := r.Group("/v1/space",
 		p.ctx.AuthMiddleware(r),
@@ -307,6 +334,15 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 	case errors.Is(err, errNameDuplicated):
 		observeRejected(entryProjectCreate, reasonNameDuplicated)
 		httperr.ResponseErrorL(c, errcode.ErrProjectNameDuplicated, nil, nil)
+	case errors.Is(err, errProvisioningEnqueueFailed):
+		// Same wire answer as any other store failure — a client cannot act on it —
+		// but its own metric reason, so an operator can tell that create started
+		// failing because the provisioning outbox write failed rather than because the
+		// project write did. This slice is what made create depend on that write.
+		observeRejected(entryProjectCreate, reasonProvisioningEnqueue)
+		p.Error("创建项目失败：子系统预置工单写入失败", zap.Error(err),
+			zap.String("spaceId", spaceID), zap.String("uid", uid))
+		respondStoreFailed(c)
 	default:
 		p.Error("创建项目失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))

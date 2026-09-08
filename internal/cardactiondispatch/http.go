@@ -10,12 +10,16 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/octosign"
 )
 
+// Header names come from pkg/octosign so the wire contract has one definition. Kept
+// exported here because existing callers and tests reference them through this package.
 const (
-	HeaderSignature = "X-Octo-Signature"
-	HeaderTimestamp = "X-Octo-Timestamp"
-	HeaderEventID   = "X-Octo-Event-ID"
+	HeaderSignature = octosign.HeaderSignature
+	HeaderTimestamp = octosign.HeaderTimestamp
+	HeaderEventID   = octosign.HeaderEventID
 )
 
 type HTTPDeliverer struct {

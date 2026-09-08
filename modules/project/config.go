@@ -110,6 +110,10 @@ type Config struct {
 	ReconcileInterval time.Duration
 	ReconcileLimit    int
 	MetricsInterval   time.Duration
+	// Provisioning is the eager subsystem-container configuration (brief D2).
+	// Zero value = inert: no outbox row is enqueued and no worker starts, which is
+	// the default until an operator names a target. See config_provisioning.go.
+	Provisioning ProvisioningConfig
 }
 
 // loadConfig resolves the configuration from the environment once, at module
@@ -126,6 +130,7 @@ func loadConfig() Config {
 			loc = time.UTC
 		}
 	}
+	provisioning, _ := loadProvisioningConfig(os.Getenv)
 	return Config{
 		CreateEnabled:     envBool(envCreateEnabled, false),
 		ReconcileEnabled:  envBool(envReconcileEnabled, false),
@@ -138,6 +143,9 @@ func loadConfig() Config {
 		ReconcileInterval: envDuration(envReconcileEvery, defaultReconcileInterval),
 		ReconcileLimit:    envPositiveInt(envReconcileLimit, defaultReconcileLimit),
 		MetricsInterval:   envDuration(envMetricsEvery, defaultMetricsInterval),
+		// Rejected targets are dropped rather than fatal; the reasons ride along on
+		// ProvisioningConfig.Problems for New() to log. See loadProvisioningConfig.
+		Provisioning: provisioning,
 	}
 }
 
