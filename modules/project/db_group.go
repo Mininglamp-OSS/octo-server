@@ -41,6 +41,36 @@ import (
 // Stated rather than left as an absence, because "this query has no COLLATE" and
 // "this query forgot its COLLATE" look identical in a diff.
 
+// sqlListMyProjectGroups is the statement listMyProjectGroups runs.
+//
+// A named constant so the plan guard (TestTheProjectGroupListReachesItsRowsByAnIndex)
+// can EXPLAIN the string production actually executes rather than a copy of it. A
+// copy passes forever once the two drift, which is the failure mode that makes a
+// plan assertion worse than none. #855 established the shape.
+//
+
+// g.id ASC is creation order. It is the only TOTAL ordering available
+// — group_no is a UUID and name is not unique — and a non-total
+// ORDER BY under OFFSET pagination silently drops and duplicates rows
+// between pages, so that property is the reason for the choice.
+//
+// It USUALLY puts the all-member group first, because #855 provisions
+// it with the project. Usually, not always: ensureAllMemberGroup
+// rebuilds it on a later write path when the first provisioning failed
+// or the group was disbanded or detached, and the rebuilt group takes a
+// fresh, higher id. So a project that hit that path lists its 全员群
+// wherever it now sorts. Nothing here compensates: the client labels it
+// by comparing group_no against the all_member_group_no it already has
+// from the project detail, which is right in both cases. Position is a
+// convenience, never the contract.
+const sqlListMyProjectGroups = "SELECT g.group_no, g.name, g.is_named, g.avatar_text, " +
+	"g.avatar_color, g.is_upload_avatar " +
+	"FROM `group` g " +
+	"INNER JOIN `group_member` gm ON gm.group_no = g.group_no " +
+	"WHERE g.space_id = ? AND g.project_id = ? AND g.status <> ? " +
+	"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? " +
+	"ORDER BY g.id ASC LIMIT ? OFFSET ?"
+
 // projectGroupRow is one row of the project group list.
 //
 // The Go types mirror modules/group's own Model rather than being re-decided
@@ -119,27 +149,7 @@ func (d *DB) listMyProjectGroups(spaceID, projectID, uid string, offset, limit i
 		return nil, nil
 	}
 	var rows []*projectGroupRow
-	_, err := d.session.SelectBySql(
-		"SELECT g.group_no, g.name, g.is_named, g.avatar_text, g.avatar_color, g.is_upload_avatar "+
-			"FROM `group` g "+
-			"INNER JOIN `group_member` gm ON gm.group_no = g.group_no "+
-			"WHERE g.space_id = ? AND g.project_id = ? AND g.status <> ? "+
-			"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? "+
-			// g.id ASC is creation order. It is the only TOTAL ordering available
-			// — group_no is a UUID and name is not unique — and a non-total
-			// ORDER BY under OFFSET pagination silently drops and duplicates rows
-			// between pages, so that property is the reason for the choice.
-			//
-			// It USUALLY puts the all-member group first, because #855 provisions
-			// it with the project. Usually, not always: ensureAllMemberGroup
-			// rebuilds it on a later write path when the first provisioning failed
-			// or the group was disbanded or detached, and the rebuilt group takes a
-			// fresh, higher id. So a project that hit that path lists its 全员群
-			// wherever it now sorts. Nothing here compensates: the client labels it
-			// by comparing group_no against the all_member_group_no it already has
-			// from the project detail, which is right in both cases. Position is a
-			// convenience, never the contract.
-			"ORDER BY g.id ASC LIMIT ? OFFSET ?",
+	_, err := d.session.SelectBySql(sqlListMyProjectGroups,
 		spaceID, projectID, groupStatusDisband, uid, int(common.GroupMemberStatusNormal), limit, offset,
 	).Load(&rows)
 	if err != nil {

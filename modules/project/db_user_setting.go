@@ -97,6 +97,23 @@ func (d *DB) queryProjectPinned(projectID, uid string) (bool, error) {
 	return len(pinned) > 0 && pinned[0] == 1, nil
 }
 
+// sqlCountPinnedInSpace is the statement countPinnedInSpaceTx runs.
+//
+// Named for the same reason as sqlListMyProjectGroups: the plan guard EXPLAINs the
+// string production executes, not a copy that can drift into passing forever.
+//
+// The LEFT JOIN carries the membership half of the visibility rule, and removing = 0
+// for the same reason listVisibleInSpace carries it — a seat that is closing counts
+// as gone everywhere else. pm.uid IS NOT NULL is the clause that admits an unlisted
+// project the caller is actually in.
+const sqlCountPinnedInSpace = "SELECT COUNT(*) FROM octo_project_user_setting s " +
+	"INNER JOIN octo_project p ON p.project_id = s.project_id " +
+	"LEFT JOIN octo_project_member pm " +
+	"  ON pm.project_id = p.project_id AND pm.uid = s.uid " +
+	"     AND pm.status = ? AND pm.removing = 0 " +
+	"WHERE s.uid = ? AND s.pinned = 1 AND p.space_id = ? AND p.status = ? " +
+	"  AND (p.discoverability = ? OR pm.uid IS NOT NULL)"
+
 // countPinnedInSpaceTx counts how many projects uid currently has pinned inside one
 // Space, for the quota check.
 //
@@ -154,18 +171,7 @@ func (d *DB) countPinnedInSpaceTx(tx *dbr.Tx, spaceID, uid string) (int, error) 
 	if tx != nil {
 		runner = tx
 	}
-	err := runner.SelectBySql(
-		"SELECT COUNT(*) FROM octo_project_user_setting s "+
-			"INNER JOIN octo_project p ON p.project_id = s.project_id "+
-			// The membership half of the visibility rule. removing = 0 for the same
-			// reason listVisibleInSpace carries it: a seat that is closing already
-			// counts as gone everywhere else, and pm.uid IS NOT NULL is the clause
-			// that admits an unlisted project.
-			"LEFT JOIN octo_project_member pm "+
-			"  ON pm.project_id = p.project_id AND pm.uid = s.uid "+
-			"     AND pm.status = ? AND pm.removing = 0 "+
-			"WHERE s.uid = ? AND s.pinned = 1 AND p.space_id = ? AND p.status = ? "+
-			"  AND (p.discoverability = ? OR pm.uid IS NOT NULL)",
+	err := runner.SelectBySql(sqlCountPinnedInSpace,
 		MemberStatusActive, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed,
 	).LoadOne(&n)
 	if err != nil {
