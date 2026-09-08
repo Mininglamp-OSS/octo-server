@@ -554,6 +554,15 @@ increment:
 # ---------------------------------------------------------------------------
 # Increment 2 — the outbound half, on branch
 # claude/loop-project-fleet-integration-dea1yz, built on increment 1 head.
+#
+# REBUILT once: increment 1 was rebased onto newer main (its SHAs all changed),
+# so this branch's base stopped existing in that history. The seven commits were
+# replayed onto the new head with `rebase --onto`. Two conflicts, both from the
+# other lane touching the same code: an import line, and a convergent fix — both
+# lanes independently made the pkg/project source guard strip comments, for
+# opposite reasons (a comment satisfying a PRESENCE check here; a comment
+# breaking an ABSENCE check there). Kept as one named helper carrying both
+# rationales.
 # ---------------------------------------------------------------------------
 
 increment_2:
@@ -762,9 +771,13 @@ increment_2:
         missed.
       why_not_here: >
         Inherited from the O2/O3 increment, which another agent is driving.
-        Fail-closed (denies rather than grants), but it sits on the peer's
-        authorization path. Raised with the owner rather than fixed silently in a
-        branch built on top of it.
+        Raised with the owner rather than fixed silently in a branch built on top
+        of it.
+      status: >
+        FIXED UPSTREAM. The O2/O3 branch closed it in ea51fd1c — the lookup is
+        now epochs[FoldID(projectID)] and FoldID is exported from pkg/project so
+        the producing and consuming sides share one definition. Carried in by
+        this branch's rebuild onto that head.
     - id: R-lock-order
       what: >
         bumpMemberEpochForSpaceMemberTx takes octo_project_member locks before
@@ -772,9 +785,20 @@ increment_2:
         modules/project, inside a user-facing Space-removal transaction that has
         no retryOnLockConflict wrapper.
       why_not_here: same as above.
+      status: >
+        FIXED UPSTREAM, in the same commit, and the upstream diagnosis is sharper
+        than the finding: the lock order of that joined UPDATE is not a property
+        of the SQL at all, because the OPTIMIZER picks the driving table and the
+        choice flips with cardinality (measured on 8.0.33 against this schema:
+        p driving at 3 projects, pm driving at 200). The Space side also gained
+        pkg/db.RetryOnLockConflict.
     - id: R-epoch-repair-per-row
       what: scanEpochSanity repairs the absent-epoch sentinel one UPDATE per row.
       why_not_here: same as above.
+      status: >
+        STILL OPEN upstream. Performance under a rollback backlog, not
+        correctness — the CAS in each statement is what makes the repair safe, and
+        that property survives batching.
     - id: R-credential-registry-copies
       what: >
         The fixed internal-token registry is hand-copied across main.go,
