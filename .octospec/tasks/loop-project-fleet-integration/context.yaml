@@ -413,6 +413,120 @@ deviations:
       capability list is not, and inventing one here would freeze a vocabulary
       the peer has not agreed to. Open for contract review with C5.
 
+  - id: P1-round8-account-axis
+    finding: >
+      A globally banned or destroyed account was served to the peer as an active
+      project member, with its real role. pkg/space.ActiveMembers is byte-for-byte
+      CheckMembership's predicate and has no join on `user`; liftBanUser writes only
+      the user row (session revocation, device kick, IM channel ban) and
+      modules/user/api_destroy.go references none of space_member,
+      octo_project_member or member_epoch. Reproduced on the engine before fixing.
+      The ban's own session revocation cannot reach this endpoint because its
+      subject presents nothing — the same argument that put the Space half here.
+    decision: >
+      Conjoined in BOTH directions. Read path: pkg/user.ActiveAccounts (new package,
+      dbr only, mirroring pkg/space) as the LAST narrowing read in
+      ProjectMemberships. Write path: `user` joined into lockSpaceSeatsTx, plus a
+      separate single-table read in createProject. Both halves are needed — without
+      the admission gate the read gate holds only until someone re-adds the banned
+      uid, and that add bumps the epoch, so the wrong answer is served as a FRESH
+      one. Predicate is the canonical `status = 1 AND is_destroy <> 2`: teardown can
+      leave status = 1, and a cooling-off account (is_destroy = 1) can still send
+      and receive so it stays live.
+      TWO TRAPS on the same line of code, both measured, and one review
+      recommendation NOT followed as a result. (a) Collation: `user` is
+      dump-imported 0900_ai_ci while octo_project_member is migration-created
+      general_ci, so a join FROM an octo_* table is error 1267 in production and
+      green in CI — hence a separate query on the read path. A join rooted at
+      space_member is safe because all three tables drifted together, which is where
+      the write-path join went. (b) Read view: the reviews said the seat-lock join is
+      safe; that is true of lockSpaceSeatsTx but NOT of lockSpaceSeatRowTx, which is
+      JOIN-free on purpose — a table outside FOR SHARE OF is a consistency read, it
+      assigns the read view before the `space` lock, and all three creation quotas
+      are counted after it (six concurrent creates passed MaxPerSpace=1 when that
+      regressed). Re-measured: JOIN form then COUNT sees 0, current shape sees 1.
+      createProject therefore uses a separate single-table read, and
+      TestCreateQuotaStillHoldsUnderConcurrency pins the quota.
+    open: >
+      The CACHED-GRANT half is deferred and recorded as a named deviation in
+      docs/project-member-epoch-rollout.md section 5 and in the writer-guard
+      baseline. A ban does not move member_epoch, so a grant cached before the ban
+      keeps agreeing with every subsequent epochs read. Moving it would mean
+      modules/user bumping project epochs, i.e. a cross-module dependency outside
+      this slice. Mitigation the peer must apply: an independent TTL on cached
+      decisions. Bounded in practice on token-bearing paths, since the ban revokes
+      sessions and devices.
+
+  - id: P1-round8-rejoin-direction
+    finding: >
+      Reopening a Space seat moved no epoch, so a cached DENIAL rode epoch agreement
+      indefinitely — the mirror image of the removal bump shipped in round 7, and
+      reachable through the ordinary re-invite flow. Remove (epoch moves, peer caches
+      member:false at the new value) -> re-add before the async cascade arrives ->
+      the cascade deliberately PRESERVES the surviving project seats -> _verify
+      answers member:true while epochs still answers the value the denial was cached
+      under. Unbounded in a quiet project.
+    decision: >
+      A MemberReactivationTxStep registry mirroring the removal one, wired into both
+      reactivation paths (reactivateMember, atomicReactivateMemberIfNotFull) and
+      reusing the SAME enumerate-then-update statement so the lock order and the
+      non-locking-enumeration argument live in one place rather than two that can
+      drift. Fires only when a row actually changed, so a no-op re-add does not churn
+      the epoch. reactivateMember previously ran outside any transaction and now owns
+      one, under the shared bounded lock-conflict retry.
+      Since the Space conjunction landed, space_member.status is part of the answer in
+      BOTH directions, so the writer guard's "does not close a seat" exemption
+      criterion contradicted the invariant its own file states; it now reads "does not
+      change the answer in either direction".
+
+  - id: P2-round8-disclosure-and-docs
+    finding: >
+      Deferring the bot-deletion fix was defensible; recording it only in an internal
+      test file was not. Rollout doc section 5 presents itself as the exhaustive
+      enumeration of axes that move the epoch and contained the word "bot" zero times,
+      while the ops note asserted seat leakage no longer affects authorization
+      correctness. Separately, section 4 told operators concurrent pod startup was
+      safe, four lines after stating the backfill locks the whole table.
+    decision: >
+      Both unfixed axes (bot deletion, the account axis's cached-grant half) are now
+      in section 5, marked as NOT moving the epoch, each saying what the peer must do
+      (an independent TTL — epoch agreement is not sufficient on either axis). The ops
+      note is scoped to human-member removals. Section 4 is corrected: pod B's
+      identical backfill is a current read that blocks on pod A's whole-table locks and
+      becomes ERROR 1205 at innodb_lock_wait_timeout, which pkg/db/mysql.go turns into
+      a boot panic and a crash loop — the instruction is now to serialize the first
+      rollout.
+      Also closed: the sentinel refusal's recovery bound (SentinelAnomalyError carries
+      the project id, Unwrap keeps errors.Is working, and the handler repairs that one
+      row out of band off the request path so the 500 stays timing-identical to an
+      outage), and the exported removal test seams (now refuse outside a test binary
+      via testing.Testing() — a build tag would hide the file from vet and from any
+      build that forgets the tag).
+
+  - id: process-round8-mutation-verification
+    finding: >
+      Two new tests would have shipped as false coverage, and one existing guard
+      failed a correct change.
+    decision: >
+      Recorded because both are recurring shapes. (a) The collation drift test
+      exercised the two halves (ActiveAccounts, lockSpaceSeatsTx) but not the composed
+      ProjectMemberships, so a join reintroduced INSIDE it was caught by the source
+      guard and invisible to the drift test; an end-to-end entry was added and the
+      mutation now reddens both with the real 1267. (b) The drift test carries a
+      CONTROL assertion that the must-fail join really does fail on the probe database
+      — mutation-verified by un-drifting the fixture, which is exactly the state that
+      would otherwise let the whole test pass vacuously. (c) The existing log guard
+      pinned a literal m.Error count; a correctly-added third branch failed it. A guard
+      that must be edited to accept a correct change teaches people to edit guards, so
+      it now derives the count from the branch structure.
+      The new non-locking enumeration legitimately violated the existing
+      "tx-scoped reads of octo_project_member must be locking reads" guard, whose
+      REASON does not hold in another module's transaction. The rule was not widened:
+      the exception is a named-function registry with two enforced obligations (an
+      exempt reader must not write the same table, and the name must still match
+      something, so a stale exemption cannot be inherited by a same-named successor).
+      All three directions mutation-verified.
+
 security_notes:
   - Tests and fixtures use synthetic UIDs, Space IDs and Project IDs only.
   - Token values never reach logs, errors or metric labels; every message names
