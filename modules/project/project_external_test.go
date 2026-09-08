@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,10 +104,10 @@ func TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails(t *testing.T) {
 	// Substitute a project step that always fails. Registration is name-keyed and
 	// latest-wins, which is exactly what makes this possible without touching
 	// modules/space. Restored afterwards so no later case inherits a broken step.
-	failures := 0
+	var failures atomic.Int32
 	spacemod.RegisterMemberRemovalCleanupStep("project_member",
 		func(_ *config.Context, _ spacemod.MemberRemoval) error {
-			failures++
+			failures.Add(1)
 			return errAlwaysFails{}
 		})
 	t.Cleanup(func() {
@@ -130,8 +131,10 @@ func TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails(t *testing.T) {
 	srv.GetRoute().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
-	// The worker runs in a background goroutine, so wait for the job to record its first
-	// failure rather than sleeping a fixed amount.
+	// The worker runs in a background goroutine. Claiming the job increments attempts
+	// before any cleanup step runs, so attempts alone is not proof that the deliberately
+	// failing callback (or the later group cleanup) has completed. Wait for the callback
+	// and the persisted error written after every registered step has run.
 	//
 	// The budget is generous on purpose. modules/space guards its worker with a process-wide
 	// `removalCleanupRunning` flag, so if any earlier test in this binary left a batch in
@@ -140,18 +143,21 @@ func TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails(t *testing.T) {
 	// one tick of margin and produced a rare order-dependent failure in exactly the test that
 	// guards a security cascade.
 	require.Eventually(t, func() bool {
-		var attempts []int
-		if _, err := ctx.DB().SelectBySql(
-			"SELECT attempts FROM space_member_removal_cleanup WHERE space_id = ? AND uid = ?",
-			spaceID, victim,
-		).Load(&attempts); err != nil {
+		if failures.Load() == 0 {
 			return false
 		}
-		return len(attempts) == 1 && attempts[0] >= 1
+		var lastError []string
+		if _, err := ctx.DB().SelectBySql(
+			"SELECT last_error FROM space_member_removal_cleanup WHERE space_id = ? AND uid = ?",
+			spaceID, victim,
+		).Load(&lastError); err != nil {
+			return false
+		}
+		return len(lastError) == 1 && lastError[0] != ""
 	}, 40*time.Second, 200*time.Millisecond,
-		"the cleanup job should have been claimed and released after the project step failed")
+		"the cleanup job should have run every step and persisted the project failure")
 
-	require.Greater(t, failures, 0, "the deliberately failing project step must have run")
+	require.Greater(t, failures.Load(), int32(0), "the deliberately failing project step must have run")
 
 	// The assertion that matters: the group cascade still completed.
 	var deleted []int

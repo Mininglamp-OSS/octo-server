@@ -2534,3 +2534,11 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   在本仓根本没有入口（无 dbconfig、无 Makefile 目标，迁移由启动时的 `migrate.Exec` 施加）。改成
   实测走通的等价物：`DROP TABLE` 与删 `gorp_migrations` 账本行**放在同一事务**。
 - **不实的功效声称会让下一个人跳过验证** —— 详见当日前一条与 journal。
+
+## 2026-09-08 — my-ai-team-sessions（PR #848 CI 异步测试收敛）
+
+- **认领不是完成** —— `space_member_removal_cleanup.attempts` 在 worker 认领工单时就自增，早于任何
+  cleanup callback。测试等待 `attempts >= 1` 后立即断言 callback 次数，会在新增的生命周期清理拉长窗口后
+  稳定暴露竞态；而 callback 对普通 `int` 的跨 goroutine 读写本身也没有同步保证。
+- 测试改用原子计数确认失败步骤确实执行，并等待 worker 跑完所有步骤后才写入的 `last_error`，再检查群成员
+  删除结果。目标用例及完整 `modules/project` 包均在 `-race` 与 shuffle 下通过。

@@ -55,6 +55,17 @@ structurally exempts their threads. The AI migration no longer overwrites the
 operator-owned global auto-archive setting; rollout still requires the documented
 deployment check that its effective value is disabled.
 
+## CI follow-up on 2026-09-08
+
+GitHub E2E shard 2 exposed an ordering bug in the pre-existing asynchronous Space
+removal regression test: it treated the cleanup job's claim-time `attempts` increment
+as proof that every callback had finished, then read a callback-owned plain integer
+from another goroutine. The test now uses an atomic counter and waits for both the
+callback and the persisted release error that is written after all cleanup steps run.
+
+- `go test -race -count=1 ./modules/project -run '^TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails$'`: PASS.
+- `go test -race -shuffle=on -count=1 ./modules/project`: PASS (72.847s).
+
 Focused commands run on 2026-09-08 against freshly recreated test databases:
 
 - `go test -count=1 ./modules/group`: PASS.

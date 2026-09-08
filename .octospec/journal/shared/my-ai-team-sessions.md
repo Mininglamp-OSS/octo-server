@@ -95,3 +95,14 @@ source: self
   migration-time write that overwrote an operator's global auto-archive setting.
 - Re-ran all six affected module suites plus build, vet and i18n checks on isolated
   MySQL/Redis/WuKongIM test services.
+
+## CI asynchronous-test hardening
+
+- E2E shard 2 showed that `space_member_removal_cleanup.attempts` advances when a
+  worker claims a job, before registered cleanup callbacks execute. Waiting on that
+  field did not synchronize the test with the callback or the full cascade.
+- The project cascade regression now counts callback execution atomically and waits
+  for the persisted release error, which is written only after every registered step
+  has run. This removes both the ordering flake and the callback counter data race.
+- The focused regression and the complete `modules/project` package passed with the
+  CI-equivalent race detector and shuffled execution.
