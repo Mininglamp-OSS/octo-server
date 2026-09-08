@@ -106,6 +106,25 @@ decisions:
       Role encoding (0/1/2) and the batch bound (50) are already agreed by both
       documents; error codes and SLA remain for contract review.
 
+review_fixes:
+  - id: P1
+    finding: >
+      member_epoch 0 is a real value for a fresh, active project, so the
+      endpoints' documented "epoch 0 is fail-closed" property did not hold.
+      Confirmed empirically against MySQL, not inferred: a newly created project
+      reads member_epoch=0, status=1, active_members=1.
+    decision: >
+      Fixed at the source rather than on the wire — new projects insert
+      member_epoch=1 and a migration bumps existing zero rows. That is the only
+      option requiring no change from the consumer: the frozen numeric contract
+      stays exactly as written, and 0 becomes a value no real project can hold.
+      A null or negative sentinel would change the contract, and null
+      unmarshals to 0 in Go, which is the same collision on the other side.
+    touches: >
+      modules/project (insert column list, create path, one migration). This
+      gives up the property that the PR touched no modules/project files, which
+      is a scheduling cost against PR #850 rather than a correctness one.
+
 deviations:
   - what: 401 for an unset token, not 503.
     why: >

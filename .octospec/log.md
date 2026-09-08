@@ -2570,3 +2570,12 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - CI 单元 lane、E2E shard 4/4、AI Team race 测试、build、vet 与 diff 门禁均通过。
 - Review 后将分页 items 与总数统计统一到同一个 SQL 分类表达式，避免后续新增 hosting slug 时
   两套条件漂移；独立 Swagger 文档不进入 PR。
+
+## 2026-09-08 — membership-epoch-absent-sentinel
+
+PR #852 review blocker: `member_epoch` 0 was simultaneously a fresh project's real
+epoch and the integration contract's sentinel for "project does not exist", so a
+consumer could cache an authorization grant that never expired. Fixed at the
+source — creation bumps the epoch, a migration lifts existing zero rows — rather
+than by changing the wire contract, which is the only option requiring no change
+from the consumer. See `.octospec/journal/shared/membership-epoch-absent-sentinel.md`.

@@ -326,10 +326,26 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 // outside would let two concurrent creates both pass the check and both land, which
 // is the whole failure mode a quota exists to prevent.
 //
-// member_epoch stays at its default 0. The acceptance list for "the epoch strictly
-// increases" covers add / remove / leave / role change / Space cascade / disband —
-// creation is where the roster comes into existence rather than changing, so 0 is
-// its initial value and the first real membership change makes it 1.
+// member_epoch is BUMPED by creation, so a new project lands on 1 rather than on
+// the column default of 0.
+//
+// Creation used to be the one membership write exempted from the bump, on the
+// reasoning that it is where the roster comes into existence rather than
+// changes. That exemption is what put a real project on a reserved value: the
+// integration contract that consumes this column defines 0 as "the project does
+// not exist or is not visible", so a solo project nobody had yet added to was
+// active, visible, had a real member, and reported the same epoch as a project
+// that had been disbanded. A consumer caching an authorization answer under
+// epoch 0 kept it forever, because the disbanded project answers 0 too and the
+// staleness check therefore agreed. See migration 20260908000001.
+//
+// Removing the exemption is also the more honest reading of the rule: creation
+// writes the owner seat into octo_project_member, which IS a membership write,
+// and every membership write bumps the epoch. It is done with the same
+// bumpMemberEpochTx every other path uses rather than by seeding the column at
+// insert, because member_epoch may only ever be written as member_epoch + 1 —
+// a property TestIsOfficialHasNoWriter and TestMemberEpochOnlyEverIncrements
+// enforce between them, and one this change deliberately does not weaken.
 func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	now := time.Now().UTC()
 	dayFrom, dayTo := p.cfg.dayWindow(now)
@@ -471,6 +487,19 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	}); err != nil {
 		return nil, err
 	}
+	// AFTER both writes, in the same transaction: the owner seat now exists, so
+	// the roster has been written and the epoch must reflect it. It runs after
+	// the project insert rather than before because bumpMemberEpochTx is guarded
+	// on status = StatusNormal and would otherwise match no row.
+	//
+	// And BEFORE the provisioning enqueue below, which the lock order requires to
+	// be the last statement in this transaction. This bump takes no new lock —
+	// octo_project is already held from the insert above — so it cannot affect
+	// that ordering.
+	if err := p.db.bumpMemberEpochTx(tx, model.ProjectID, now); err != nil {
+		return nil, err
+	}
+	model.MemberEpoch++
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
 	// construction under which "the project exists ⟹ its provisioning jobs exist" is
 	// true; a Redis queue or a post-commit call can drop the job or orphan it.

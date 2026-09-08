@@ -118,9 +118,15 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 // project is 0, never an absent key. The distinction matters: a consumer reading
 // a missing key cannot tell "this project has no membership changes" from "my
 // id never made it into the response", and the two demand opposite reactions.
-// Zero is the sentinel the integration contract already assigns to "does not
-// exist or not visible", so it is the answer, and it is fail-closed — a
-// consumer comparing it against any real snapshot epoch gets a mismatch.
+//
+// Zero is the sentinel the integration contract assigns to "does not exist or
+// not visible", and it is fail-closed ONLY BECAUSE no real project can hold it:
+// projects are created at member_epoch 1 and the column is never written by
+// anything but an increment. That invariant is what this answer rests on, not a
+// coincidence about the numbers — while creation left the epoch at the column
+// default of 0, a fresh solo project reported the same value as a disbanded one,
+// and a consumer caching a grant under epoch 0 kept it forever. See
+// modules/project migration 20260908000001.
 type epochsResponse struct {
 	Projects map[string]int64 `json:"projects"`
 }
@@ -254,8 +260,11 @@ type verifyResponse struct {
 // An unknown project, a disbanded one and one in another Space all answer
 // member_epoch 0 with every uid member:false, rather than 404. Rejecting would
 // turn the endpoint into a probe for which Space a project lives in — the same
-// property modules/user's answerProjectMembership protects. It is also
-// fail-closed: epoch 0 matches no real snapshot.
+// property modules/user's answerProjectMembership protects.
+//
+// It is also fail-closed, and for the reason given on epochsResponse: 0 is
+// unreachable for a real project because projects start at 1, so it can never
+// equal a snapshot a consumer actually took.
 //
 // Duplicate uids are REJECTED rather than deduplicated. The consumer's stated
 // check is that every requested uid gets exactly one answer; silently collapsing

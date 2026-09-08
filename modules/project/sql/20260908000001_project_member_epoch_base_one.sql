@@ -1,0 +1,77 @@
+-- +migrate Up
+
+-- member_epoch starts at 1, so 0 can mean "no such project".
+--
+-- THE COLLISION. The integration contract this column feeds defines 0 as
+-- "project does not exist or is not visible" -- the peer reads it and refuses to
+-- renew. But 0 was also the DDL default AND the value every freshly created
+-- project carried, because creation deliberately does not bump the epoch:
+-- creation is where the roster comes into existence rather than changes. So a
+-- solo project that nobody had added to or removed from -- the common case --
+-- was an active, visible project with a real member and an epoch the contract
+-- reserved for "gone".
+--
+-- Measured, not reasoned about: a project created through the real handler reads
+-- member_epoch=0, status=1, active_members=1.
+--
+-- WHY THAT IS A SECURITY BUG AND NOT A COSMETIC ONE. The peer caches an
+-- authorization answer keyed by the epoch and re-reads the epoch to decide
+-- whether that answer is still good. Cache a positive grant for a fresh project
+-- at epoch 0, then disband the project: the epoch query filters on status, the
+-- project drops out, the endpoint answers 0 for the absent key -- and 0 equals
+-- the cached 0, so the check AGREES and the grant survives. The epoch never
+-- moves again, so it survives forever. The reverse direction is an availability
+-- bug in the same collision: a brand new project truthfully reports 0, which a
+-- consumer following the contract reads as "does not exist" and denies.
+--
+-- WHY FIX IT HERE RATHER THAN ON THE WIRE. Three wire-side alternatives were
+-- considered and rejected, all for the same reason -- they renegotiate a frozen
+-- contract, and one of them reintroduces the bug on the other side:
+--
+--   * null for absent: the contract explicitly refuses to expand the response
+--     beyond a bare number, and null unmarshals into a Go int64 as 0, so the
+--     consumer -- also Go -- lands back on the identical collision.
+--   * a negative sentinel: still a contract change, and the sentinel still lives
+--     inside the value domain, so the next value chosen carelessly collides too.
+--   * omitting absent projects: a consumer cannot tell a missing key from an
+--     entry that was dropped in transit, which is why the endpoint answers every
+--     requested id in the first place.
+--
+-- Starting real epochs at 1 is the only option that needs no change from the
+-- consumer at all. The contract stays exactly as written; 0 simply becomes
+-- unrepresentable for a real project, which is what makes its documented meaning
+-- true for the first time.
+--
+-- THE BACKFILL DIRECTION IS SAFE. It is written as an increment rather than an
+-- assignment, matching the write discipline the whole column is held to -- the
+-- only statement anywhere that touches member_epoch is member_epoch + 1, which
+-- is what makes monotonicity checkable by grep. Semantically it IS one more
+-- change to the roster from a consumer perspective: anyone holding a snapshot of
+-- 0 sees 1, mismatches, and re-verifies once. Invalidating a cached
+-- authorization is the safe direction; the unsafe direction is the one this
+-- migration removes.
+--
+-- Bounded: it touches only rows still at the initial value, so re-running it is
+-- NOT idempotent by accident -- it is idempotent because after the first run no
+-- row matches the predicate.
+UPDATE `octo_project` SET `member_epoch` = `member_epoch` + 1 WHERE `member_epoch` = 0;
+
+-- +migrate Down
+--
+-- Deliberately a no-op, and that is a choice rather than an omission.
+--
+-- Reversing it would mean setting some rows back to 0, and nothing records WHICH
+-- rows were at 0 before the Up ran -- a project that legitimately reached epoch 1
+-- through a real membership change is indistinguishable afterwards from one this
+-- migration lifted. Guessing would reintroduce the collision on exactly the rows
+-- it was meant to remove it from, and it would move an epoch BACKWARDS, which
+-- every consumer of this column is entitled to assume never happens.
+--
+-- Rolling back the binary is enough: the old code reads the column without
+-- caring that some values are one higher than it would have written.
+--
+-- No apostrophes in any comment in this file, on purpose -- the migration test in
+-- this module splits statements naively and treats a quote as a string
+-- delimiter, and the failure pairs up so an even count can pass while an odd one
+-- fails.
+SELECT 1;

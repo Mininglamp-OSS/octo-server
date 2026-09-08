@@ -483,8 +483,13 @@ func TestVerifyNonMemberOmitsRoleOnTheWire(t *testing.T) {
 }
 
 // TestVerifyUnknownProjectIsEpochZeroAndAllNonMembers pins that an unknown
-// project, a disbanded one and one in another Space are a single answer — and
-// that the answer is fail-closed, because epoch 0 matches no real snapshot.
+// project, a disbanded one and one in another Space are a single answer.
+//
+// That answer is fail-closed only because 0 is unreachable for a real project —
+// projects are created at member_epoch 1. The property lives in modules/project,
+// not here, so it is asserted there against a real row
+// (TestFreshProjectEpochIsNeverTheAbsentSentinel); this stub-backed test can
+// only pin the handler's half.
 func TestVerifyUnknownProjectIsEpochZeroAndAllNonMembers(t *testing.T) {
 	s := &stubStore{epoch: 0, roles: map[string]int{}}
 	w := doPost(t, newRouter(newTestModule(s)), testInternalToken,
