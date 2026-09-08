@@ -407,6 +407,18 @@ func (d *DB) QueryWithGroupNo(groupNo string) (*Model, error) {
 	return model, err
 }
 
+// QueryWithGroupNoTx 是 QueryWithGroupNo 的事务内版本。
+//
+// 存在的理由不是对称性：一次在事务外读到的群行，到事务里已经可能不再成立，而
+// 准入闸门按 project_id 判定 I2——用事务外的那一份，就是拿快照评判不变量。
+// 不加 FOR UPDATE：这里要的是"本事务读视图里的那一份"，不是把群行锁进
+// group_member 的锁序里。
+func (d *DB) QueryWithGroupNoTx(tx *dbr.Tx, groupNo string) (*Model, error) {
+	var model *Model
+	_, err := tx.Select("*").From("`group`").Where("group_no=?", groupNo).Load(&model)
+	return model, err
+}
+
 // QueryWithGroupNo 根据群编号查询群信息
 func (d *DB) QueryWithGroupNos(groupNos []string) ([]*Model, error) {
 	var models []*Model
@@ -450,6 +462,54 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 		"invite":    model.Invite,
 	}).Where("id=?", model.Id).Exec()
 	return err
+}
+
+// UpdateNameNoticeTx 仅更新群名 / 公告与群版本（列级写，事务内）。nil 的字段不动。
+//
+// 不能用 UpdateTx 整行回写，理由与 UpdateInviteTx / UpdateStatusTx 同一条：
+// UpdateGroupInfo 先无锁读出整行，再把这份快照写回去，于是窗口内并发提交的
+// status / forbidden / invite / notice 全部被旧值覆盖。最贵的一种是 disband：
+// 一次改名可以把刚解散的群改回正常状态。
+//
+// 这个窗口一直都在，但 P2 之前只有人手点"改群名"才会走到；D8 让它变成机器驱动的
+// ——每一次项目改名都自动跑一次全员群改名。PR #855 第五轮 review 的 Q9。
+// 带 status 谓词：解散是终态，改名不该落在一个已经解散的群上。UpdateGroupInfo 在
+// 无锁读上检查过 status，但那次检查与这次写之间有窗口，而窗口里发生的解散正是 D8
+// 的机器驱动流量会撞上的——第六轮 review 指出列级写只关掉了"改名把解散盖回去"这
+// 一半，另一半（改名照样落库、推版本、发通知）还在。谓词在 WHERE 里，所以影响 0 行
+// 就是全部效果：不报错，调用方的幂等语义不变。
+// 返回受影响行数，让调用方能看出这次写有没有落地。0 行意味着谓词把它挡住了
+// （群已解散），而调用方后面还有推送：不看这个返回值就会给一个已经没了的群发一条
+// 改名通知，并对外报成功——第七轮 review 的 P2-1，上一版只关掉了落库那一半。
+//
+// expectProjectID 是可选的**归属栅栏**："只有当这个群此刻仍属于该项目时才写"。
+// 空串表示不设栅栏，人手改名走的就是这一条。
+//
+// 为什么是栅栏而不是先读一次核对：D8 的机器驱动改名里，项目侧解析 group_no 的
+// 那次读是无锁的，读到与写之间 P1 的 detach 可以把群变回 Space 直属。事务内再读
+// 一次能收窄窗口，但把条件写进这条 UPDATE 的 WHERE 就直接消掉了窗口——读与写是
+// 同一条语句。挡住时影响 0 行，与 status 谓词同一个出口：不报错，调用方按
+// errGroupGoneOrDisbanded 安静跳过。PR #855 第十轮 review 的 P2-3。
+func (d *DB) UpdateNameNoticeTx(
+	groupNo string, name, notice *string, version int64, expectProjectID string, tx *dbr.Tx,
+) (int64, error) {
+	set := map[string]interface{}{"version": version}
+	if name != nil {
+		set["name"] = *name
+	}
+	if notice != nil {
+		set["notice"] = *notice
+	}
+	stmt := tx.Update("group").SetMap(set).
+		Where("group_no=? AND status<>?", groupNo, GroupStatusDisband)
+	if expectProjectID != "" {
+		stmt = stmt.Where("project_id=?", expectProjectID)
+	}
+	result, err := stmt.Exec()
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // UpdateInviteTx 仅更新「进群邀请开关」与群版本（列级写，事务内）。

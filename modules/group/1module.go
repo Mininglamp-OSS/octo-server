@@ -48,6 +48,10 @@ func init() {
 		// 项目解散 → 群回落 Space 直属。同样是反向注册，modules/project 不能
 		// import 本模块。
 		api.registerProjectCascadeSteps()
+
+		// P2：全员群的四个钩子（建群 / 入群 / 群主同步 / 改名），同样反向注册进
+		// modules/project。见 all_member_group.go。
+		api.registerAllMemberGroupHooks()
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {
@@ -248,6 +252,13 @@ func newChannelRespWithGroupResp(groupResp *GroupResp) *model.ChannelResp {
 	// Space 隔离：前端 channelInfo 需要 space_id 用于实时会话过滤
 	if groupResp.SpaceID != "" {
 		extraMap["space_id"] = groupResp.SpaceID
+	}
+	// 项目归属：与 space_id 同一个理由，也与 GroupResp / 群详情保持一致。P2 给
+	// GroupResp 加了 project_id，却漏了这条通道，于是读 channelInfo.orgData 的客户端
+	// 看不到一个群属于哪个项目——而同一份数据在群详情里是有的。空串（Space 直属群）
+	// 不发，与 space_id 的写法一致。PR #855 第五轮 review 的 nit。
+	if groupResp.ProjectID != "" {
+		extraMap["project_id"] = groupResp.ProjectID
 	}
 
 	// 外部群标记：前端 UI 需要根据此字段渲染「外部群」标签

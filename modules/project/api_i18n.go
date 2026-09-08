@@ -87,6 +87,20 @@ func respondProjectBatchTooLarge(c *wkhttp.Context, max int) {
 	})
 }
 
+// respondProjectAgentNotEligible is the single answer for every agent refusal
+// (D3/D15). The uids are the INELIGIBLE ones out of what the caller submitted,
+// echoed back so a picker can highlight exactly the rows to fix; the reason each
+// one failed stays in the log.
+//
+// Echoing back a subset of the caller's own input leaks nothing. Saying WHICH
+// reason applied would — it would turn the endpoint into an oracle for "does this
+// uid exist", "is it a bot" and "who owns it".
+func respondProjectAgentNotEligible(c *wkhttp.Context, uids []string) {
+	httperr.ResponseErrorL(c, errcode.ErrProjectAgentNotEligible, nil, i18n.Details{
+		"uids": uids,
+	})
+}
+
 // respondProjectQuota surfaces which quota was hit and its configured value.
 // One helper for all four so the SafeDetailKeys contract ("max") lives once.
 func respondProjectQuota(c *wkhttp.Context, code codes.Code, max int) {

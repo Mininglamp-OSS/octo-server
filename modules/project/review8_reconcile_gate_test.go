@@ -9,10 +9,13 @@ package project
 // so all three would sit at zero forever and read as "no violations" on the module whose entire
 // purpose is to be the invariant safety net.
 //
-// The gate's SCOPE is the part worth pinning, not just its existence: only the three scans that
-// JOIN legacy Space tables are gated. The two that touch this module's own tables run
-// unconditionally, because gating them would trade working observability for nothing — and
-// scanOwnerlessProjects detects a state P0 cannot repair.
+// The gate's SCOPE is the part worth pinning, not just its existence. Two of the five scans —
+// the ones that touch only this module's own tables — run unconditionally, because gating them
+// would trade working observability for nothing, and scanOwnerlessProjects detects a state P0
+// cannot repair. The other five are gated, for two different reasons that both end in "off by
+// default": the three cross-Space scans cannot survive the collation drift, and the two I4 scans
+// can but are too expensive under it (a full scan of `group` with a temporary table that defeats
+// their own LIMIT paging, every five minutes on every pod). PR #855's tenth review, P2-1.
 
 import (
 	"regexp"
@@ -49,14 +52,20 @@ func scanRuns(t *testing.T, scan string) uint64 {
 	return 0
 }
 
-func TestReconcileGateCoversExactlyTheCrossSpaceScans(t *testing.T) {
+func TestReconcileGateCoversExactlyTheGatedScans(t *testing.T) {
 	_, p := setup(t)
 
-	crossSpace := []string{"i1_violations", "abandoned", "orphan"}
+	// The gated set is no longer only "the ones that would fail". The two I4 scans
+	// survive the drift and are gated anyway, on cost: their own measured plans under
+	// the production collation shape are a full scan of `group` plus a temporary
+	// table, and the temporary table takes the ORDER BY / LIMIT paging with it, so
+	// ReconcileLimit stops bounding the work. Both are report-only, so what waiting
+	// costs is the reporting. PR #855's tenth review, P2-1.
+	gated := []string{"i1_violations", "abandoned", "orphan", "i4_missing", "i4_gap"}
 	ownTables := []string{"ownerless", "epoch"}
 
 	before := map[string]uint64{}
-	for _, s := range append(append([]string{}, crossSpace...), ownTables...) {
+	for _, s := range append(append([]string{}, gated...), ownTables...) {
 		before[s] = scanRuns(t, s)
 	}
 
@@ -65,11 +74,14 @@ func TestReconcileGateCoversExactlyTheCrossSpaceScans(t *testing.T) {
 	resetCursorsForTest()
 	p.runReconcile()
 
-	for _, s := range crossSpace {
+	for _, s := range gated {
 		assert.Equal(t, before[s], scanRuns(t, s),
-			"%s JOINs legacy Space tables and must NOT run with the gate off: on a "+
-				"collation-drifted database it fails at statement resolution every tick, and its "+
-				"gauge never publishes, so the monitor reads as healthy while never having run", s)
+			"%s must NOT run with the gate off. For the three cross-Space scans the reason is "+
+				"failure: on a collation-drifted database they fail at statement resolution every "+
+				"tick and their gauges never publish, so the monitor reads as healthy while never "+
+				"having run. For the two I4 scans the reason is cost: they survive the drift but "+
+				"their measured plans are a full scan of `group` with a temporary table that "+
+				"defeats their own paging, every five minutes on every pod", s)
 	}
 	for _, s := range ownTables {
 		assert.Greater(t, scanRuns(t, s), before[s],
@@ -80,13 +92,13 @@ func TestReconcileGateCoversExactlyTheCrossSpaceScans(t *testing.T) {
 
 	// Flag ON — everything runs.
 	mid := map[string]uint64{}
-	for _, s := range crossSpace {
+	for _, s := range gated {
 		mid[s] = scanRuns(t, s)
 	}
 	p.cfg.ReconcileEnabled = true
 	resetCursorsForTest()
 	p.runReconcile()
-	for _, s := range crossSpace {
+	for _, s := range gated {
 		assert.Greater(t, scanRuns(t, s), mid[s],
 			"%s must run once the gate is open, or the flag would be a permanent off switch", s)
 	}

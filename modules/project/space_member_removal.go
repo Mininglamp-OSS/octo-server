@@ -97,6 +97,129 @@ func (p *Project) bumpEpochsOnSpaceMemberRemoval(tx *dbr.Tx, spaceID, uid string
 	return p.db.bumpMemberEpochForSpaceMemberTx(tx, spaceID, uid)
 }
 
+// allMemberGroupOwnerFinalizerName is the finalizer's name, which also prefixes the
+// job's last_error.
+const allMemberGroupOwnerFinalizerName = "project_all_member_group_owner"
+
+// registerAllMemberGroupOwnerFinalizer registers "make every all-member group this
+// member touched end up owned by an active project owner" as a post-steps finalizer.
+//
+// # Why this exists at all
+//
+// A project owner can lose their seat by four routes: kicked, left, role changed, and
+// this one — removed from the Space, which cascades into every project in it. The first
+// three call syncAllMemberGroupOwner directly (service.go). This one did not, and the
+// hole it left is the exact state the leave path's comment says that sync was added to
+// prevent: the group side still hands the group over on its way out
+// (handOverGroupCreator), and it picks the second-oldest non-bot GROUP member with no
+// project-role filter at all. That can land on an ordinary project member — and D7 then
+// forbids that person from transferring, leaving, disbanding or blacklisting the group.
+// Nobody can move it, and no scan reports it: I4's two scans compare MEMBER SETS, not
+// creator-versus-owner. A quiet project keeps that state forever.
+//
+// # Why a finalizer and not a step, and not a call inside deactivateSeatForCascade
+//
+// The convergence needs BOTH halves to have happened: the group cascade must have done
+// its handover, and the project cascade must have closed the departing owner's seat.
+// Steps run in registration order, and registration order is import order, which is
+// declared nowhere — so a step (or a call inside deactivateSeatForCascade) computes its
+// answer against whichever intermediate state that ordering happens to produce:
+//
+//   - Group step first: the departing owner's project seat is still ACTIVE, so
+//     PickActiveOwner can return the person who is on their way out. Promoting them
+//     fails (they are no longer a group member) and the group keeps the non-owner the
+//     handover picked.
+//   - Project step first: the group still has the departing owner as its creator, so the
+//     sync sees a creator who is still a project member and changes nothing; the handover
+//     then installs the non-owner afterwards.
+//
+// Both orders leave the defect. A finalizer runs after every step has SUCCEEDED, so it
+// is the only placement whose input is a settled state rather than an ordering artifact.
+func (p *Project) registerAllMemberGroupOwnerFinalizer() {
+	spacemod.RegisterMemberRemovalCleanupFinalizer(
+		allMemberGroupOwnerFinalizerName, p.convergeAllMemberGroupOwners)
+}
+
+// convergeAllMemberGroupOwners re-runs the idempotent D6 owner sync for every project in
+// this Space that the removed member had a row in.
+//
+// Contract compliance (modules/space/member_removal.go):
+//
+//   - Idempotent. The sync is self-deciding on the group side: it reads who the group's
+//     creators are and who the project's active owners are, and writes only when they
+//     disagree. Running it on a project that is already correct is a read and nothing else.
+//   - Decides "nothing to do" itself: no member rows, no all-member group pointer, or no
+//     active project owner all return nil rather than an error.
+//   - Assumes nothing about which steps ran — only that they all succeeded, which is the
+//     finalizer contract.
+//
+// The set is "every project in this Space with a row for this uid, any status", not
+// "every project whose seat we just closed" and not "every project where they were an
+// owner"; queryProjectIDsForSpaceMemberPage's comment carries why both of the narrower
+// sets are wrong. Paged with the cascade's own budget so one member of a thousand
+// projects cannot hold the lease for the whole walk, and a spent budget returns the same
+// retryable error the cascade uses.
+func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacemod.MemberRemoval) error {
+	if removal.SpaceID == "" || removal.UID == "" {
+		return nil
+	}
+	after := ""
+	synced, failed := 0, 0
+	var firstErr error
+	for page := 0; page < cascadeMaxPages; page++ {
+		ids, err := p.db.queryProjectIDsForSpaceMemberPage(
+			removal.SpaceID, removal.UID, after, cascadePageSize)
+		if err != nil {
+			return fmt.Errorf("project: list projects for owner convergence: %w", err)
+		}
+		for _, projectID := range ids {
+			// One failure does not stop the walk: the projects are independent, and
+			// stopping would make the first broken one starve every project after it in
+			// project_id order — the same isolation rule the step loop follows. The first
+			// error is what the job reports; each failure logs on its own.
+			if err := p.syncAllMemberGroupOwnerE(projectID); err != nil {
+				failed++
+				p.Error("全员群群主收敛失败（Space 级联路径）",
+					zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID),
+					zap.String("projectId", projectID), zap.Error(err))
+				observeAllMemberGroupSyncFailure(reasonSyncOwner)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			synced++
+		}
+		if len(ids) < cascadePageSize {
+			if firstErr != nil {
+				return fmt.Errorf("project: converge all-member group owner (%d of %d failed): %w",
+					failed, synced+failed, firstErr)
+			}
+			return nil
+		}
+		after = ids[len(ids)-1]
+	}
+	if firstErr != nil {
+		return fmt.Errorf("project: converge all-member group owner (%d of %d failed): %w",
+			failed, synced+failed, firstErr)
+	}
+	// The budget ran out on a full page. Confirm a project really remains before asking
+	// for a retry: a count that is an exact multiple of the page size lands here with
+	// nothing left, and returning an error then would re-run the whole job for no reason.
+	// Same one-row check the cascade does, for the same reason.
+	remaining, err := p.db.queryProjectIDsForSpaceMemberPage(removal.SpaceID, removal.UID, after, 1)
+	if err != nil {
+		return fmt.Errorf("project: confirm remaining projects after convergence budget: %w", err)
+	}
+	if len(remaining) == 0 {
+		return nil
+	}
+	p.Warn("全员群群主收敛达到单次页数上限，返回可重试错误以便工单重新认领",
+		zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID),
+		zap.Int("synced", synced), zap.Int("maxPages", cascadeMaxPages))
+	return errCascadeIncomplete
+}
+
 // cleanupSpaceMemberProjects closes every project seat a removed Space member still
 // holds in that Space.
 //
@@ -338,14 +461,91 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		wasSoleOwner = owners <= 1
 	}
 
+	// D13 — the departing member's OWN agents lose their seats with them, read
+	// BEFORE the member's row is touched (queryOwnedAgentSeatsTx filters on
+	// status = 1 AND removing = 0, so reading after would come back short).
+	//
+	// The HUMAN's seat closes directly (status = 0) on this path, because the
+	// Space removal that drove this job also runs modules/group's
+	// cleanupSpaceMemberGroups and the group side is therefore already covered
+	// for them. THE AGENTS GET THE TWO-PHASE CLOSE INSTEAD, and the difference is
+	// the whole point.
+	//
+	// An earlier version of this comment claimed the group side covered the agents
+	// too, "because RemoveGroupMembers pulls the leaver's bots out of every group
+	// with them (#354)". That is true only of the groups the LEAVER is in:
+	// cleanupSpaceMemberGroups enumerates queryGroupsWithMemberUIDAndSpaceID for
+	// the departing person, and RemoveGroupMembers then cascades their bots WITHIN
+	// those groups. An agent sitting in a project group its owner is not a member
+	// of — which D15 makes ordinary, since any member may seat their own agent and
+	// any member may create a project group — is never visited.
+	//
+	// The end state that produced was an I2 violation nothing repairs: the agent
+	// loses its project seat and stays an active member of that group, its own
+	// space_member row was never touched so no Space cascade revisits it, no
+	// project-side job was ever enqueued, and the I2 scan is report-only. Its
+	// owner, now outside the Space, keeps a proxy reading a project group.
+	//
+	// So the agents go through beginMemberRemovalTx + enqueueRemovalJobTx exactly
+	// as the kick and leave paths do (beginRemovalWithAgentsTx), and P1's detach
+	// step then removes that uid from EVERY group of the project rather than from
+	// the subset its owner happened to share. Direct-closing them instead would
+	// also have made the job a no-op even if it were enqueued: removalCancelled
+	// retires any job whose member reads removing = 0, which a directly-closed
+	// seat does.
+	agents, err := p.db.queryOwnedAgentSeatsTx(tx, projectID, uid)
+	if err != nil {
+		return false, err
+	}
+
 	changed, err := p.db.deactivateMemberTx(tx, projectID, uid, now)
 	if err != nil {
 		return false, err
 	}
+	removingAgents := make([]string, 0, len(agents))
 	if changed {
+		for _, agentUID := range agents {
+			if agentUID == "" || agentUID == uid {
+				continue
+			}
+			agentChanged, err := p.db.beginMemberRemovalTx(tx, projectID, agentUID, now)
+			if err != nil {
+				return false, err
+			}
+			if !agentChanged {
+				continue
+			}
+			// Its own job, keyed (project_id, uid), for the reason
+			// beginRemovalWithAgentsTx gives: the worker re-reads THAT row under
+			// lock before each batch, and re-admission cancels per uid, so a job
+			// claiming to cover two uids could not be cancelled for one of them.
+			//
+			// The operator and reason are the Space removal's, not a distinct
+			// agent reason: the agent is not being removed on its own account, and
+			// a new reason would have to be taught to the group side's system
+			// message suppression before it rendered sensibly.
+			if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
+				ProjectID:   projectID,
+				UID:         agentUID,
+				SpaceID:     spaceID,
+				OperatorUID: operatorUID,
+				Reason:      reason,
+			}, now); err != nil {
+				return false, err
+			}
+			removingAgents = append(removingAgents, agentUID)
+		}
 		// Only when a row actually changed. The step is re-run on every job retry, so
 		// an unconditional bump would inflate the epoch on no-op reruns and break the
 		// "a no-op does not change the epoch" rule clients cache against.
+		//
+		// ONE bump for the member and every agent that went with them: a member
+		// leaving with their agents is one membership change, and the epoch is
+		// asserted to move by exactly +1 per write.
+		//
+		// The affected-row count is discarded here. Only createProject checks it, where a
+		// silent no-op would ship a project on the reserved absent-epoch sentinel; on this
+		// path the seat writes above already established the project row exists.
 		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, err
 		}
@@ -359,6 +559,19 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		// isolation boundary — but leaving a stale positive role cached would make the
 		// project's own membership answer disagree with the database for a full TTL.
 		p.invalidateProjectMemberCache(projectID, uid)
+		// removing = 1 already makes the agent a non-member for every authorization
+		// read, so the cached role is stale from this commit, not from the worker's
+		// later close.
+		//
+		// Audited here rather than by the caller, which sees only a bool and audits
+		// the human alone: an agent losing its seat is a membership write and the
+		// trail has to carry it. Same split, and the same reason, as the kick and
+		// leave paths.
+		for _, agentUID := range removingAgents {
+			p.invalidateProjectMemberCache(projectID, agentUID)
+			p.audit(auditCascade, operatorUID, agentUID, projectID, spaceID,
+				auditReasonAgentFollowsOwner)
+		}
 	}
 	if changed && wasSoleOwner {
 		p.Warn("项目唯一 owner 已被移出 Space，项目暂时无人可管理（P0 已知终局，处置待产品决策）",

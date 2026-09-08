@@ -942,12 +942,21 @@ type GroupResp struct {
 	CanEditGroupMd           bool      `json:"can_edit_group_md"`           // 是否可编辑GROUP.md
 	CanManageBotAdmin        bool      `json:"can_manage_bot_admin"`        // 是否可管理Bot管理员
 	SpaceID                  string    `json:"space_id"`                    // Space ID
-	IsExternalGroup          int       `json:"is_external_group"`           // 是否外部群 0.否 1.是
-	AllowExternal            int       `json:"allow_external"`              // 是否允许外部成员 1.允许(默认) 0.禁止
-	AllowNoMention           int       `json:"allow_no_mention"`            // 群级是否允许免@生效 1.允许(默认) 0.禁止
-	CreatedAt                string    `json:"created_at"`
-	UpdatedAt                string    `json:"updated_at"`
-	Version                  int64     `json:"version"` // 群数据版本
+	// ProjectID 群所属项目；空串 = 直属 Space。P2 开始下发。
+	//
+	// 客户端要靠它把项目群归到项目名下展示，也要靠它知道这个群的成员是由项目
+	// 决定的（全员群还会被 D7 的四道保护挡住若干操作，客户端最好别把那些按钮
+	// 画出来）。P1 建立了这一列并让 I2 依赖它，但刻意没有下发——那是留给 P2 的
+	// 第一项透出工作。
+	//
+	// 只加字段、不改任何既有字段：老客户端读不到它，行为与今天完全一致。
+	ProjectID       string `json:"project_id"`        // 所属项目 ID（空串=直属 Space）
+	IsExternalGroup int    `json:"is_external_group"` // 是否外部群 0.否 1.是
+	AllowExternal   int    `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention  int    `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+	Version         int64  `json:"version"` // 群数据版本
 }
 
 func (g *GroupResp) from(model *DetailModel) *GroupResp {
@@ -982,6 +991,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
 		SpaceID:                  model.SpaceID,
+		ProjectID:                model.ProjectID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
 		AllowNoMention:           model.AllowNoMention,
@@ -1016,6 +1026,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
 		SpaceID:                  model.SpaceID,
+		ProjectID:                model.ProjectID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
 		AllowNoMention:           model.AllowNoMention,
@@ -1164,6 +1175,9 @@ type UpdateGroupInfoServiceReq struct {
 	OperatorName string  // 操作者名称
 	Name         *string // 新群名（nil 表示不更新）
 	Notice       *string // 新公告（nil 表示不更新）
+	// ExpectProjectID 可选的归属栅栏：非空时，只有当这个群仍属于该项目才写。
+	// 只有 D8 的全员群改名会设置它；人手改名留空。见 UpdateNameNoticeTx。
+	ExpectProjectID string
 }
 
 // UpdateGroupAvatarCustomServiceReq 更新自定义群头像文字/颜色（二次弹窗保存）。
@@ -1188,9 +1202,19 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	if req.Creator == "" {
 		return nil, errors.New("creator is required")
 	}
-	if len(req.Members) == 0 {
-		return nil, errors.New("members is required")
-	}
+	// Members MAY be empty — a group of just its creator is a legitimate group.
+	//
+	// This used to be rejected here, and the rejection has to go for P2: a project
+	// created with no agents picked needs an all-member group whose only initial
+	// member is the project owner. Refusing that would make "create a project"
+	// silently produce a project with no group in the most common case there is.
+	//
+	// The HTTP handler's own check is UNCHANGED (groupReq.Check still requires at
+	// least one member), so a user creating a group by hand still cannot create an
+	// empty one. What is relaxed is the SERVICE contract, for callers that are not
+	// a person filling in a form. The distinction matters: the handler rule is a
+	// product rule about a form, this one was a guard against an empty insert, and
+	// the insert below is not empty — the creator is always added.
 
 	var skippedMembers []string
 	// 跨 Space 外部成员标识：key=uid, value=source_space_id（uid 的默认 Space）
@@ -1223,13 +1247,19 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		// 行为与 scanjoin / AddGroupMembers 路径对齐，保证 YUJ-53 消息头来源 tag 在
 		// 建群初始成员路径也能被正确渲染。建群暂不做 allow_external 门禁，默认允许（与
 		// 新群 allow_external=1 一致）；若未来需要拒绝，应由 API 层提前校验。
+		//
+		// 一条批量查询，不是逐个 CheckMembership。ActiveMembers 的谓词与
+		// CheckMembership 逐字节相同，它的文档写明存在的理由就是"别让一个拿着很多
+		// uid 的调用方发 N 次往返"。P2 的补建把整份项目名册当作建群初始成员，于是
+		// 这个循环第一次真的会拿到几百个 uid——PR #855 第二轮 review 的 Q1 量到的
+		// 就是这里。
+		spaceActive, err := spacepkg.ActiveMembers(s.ctx.DB(), req.SpaceID, req.Members)
+		if err != nil {
+			s.Error("check member space membership failed", zap.Error(err))
+			return nil, errors.New("failed to check space membership")
+		}
 		for _, uid := range req.Members {
-			ok, err := spacepkg.CheckMembership(s.ctx.DB(), req.SpaceID, uid)
-			if err != nil {
-				s.Error("check member space membership failed", zap.Error(err), zap.String("uid", uid))
-				return nil, errors.New("failed to check space membership")
-			}
-			if ok {
+			if spaceActive[uid] {
 				continue
 			}
 			externalMap[uid] = true
@@ -2098,6 +2128,12 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 }
 
 // UpdateGroupInfo 更新群信息
+// errGroupGoneOrDisbanded 是"这个群已经不在了"的统一答案。
+//
+// 消息文本与之前的字面量逐字相同，因为 api.go 有两处 strings.Contains 依赖它；
+// 收成哨兵是为了让调用方能用 errors.Is 分辨，而不是继续比字符串。
+var errGroupGoneOrDisbanded = errors.New("group not found or disbanded")
+
 func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	if req.GroupNo == "" {
 		return errors.New("group_no is required")
@@ -2113,7 +2149,7 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 		return errors.New("failed to query group")
 	}
 	if groupModel == nil || groupModel.Status == GroupStatusDisband {
-		return errors.New("group not found or disbanded")
+		return errGroupGoneOrDisbanded
 	}
 
 	// 生成新版本号
@@ -2147,7 +2183,11 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	err = s.db.UpdateTx(groupModel, tx)
+	// 列级写：只动本次真正要改的列 + version。整行回写会把无锁读之后、这次提交
+	// 之前别人改掉的 status / forbidden / invite 用旧快照盖回去——其中 status 那一
+	// 项意味着一次改名可以撤销一次解散。见 UpdateNameNoticeTx 上的说明。
+	affected, err := s.db.UpdateNameNoticeTx(
+		req.GroupNo, req.Name, req.Notice, groupModel.Version, req.ExpectProjectID, tx)
 	if err != nil {
 		s.Error("update group failed", zap.Error(err))
 		return errors.New("failed to update group")
@@ -2156,6 +2196,28 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	if err := tx.Commit(); err != nil {
 		s.Error("commit transaction failed", zap.Error(err))
 		return errors.New("failed to commit transaction")
+	}
+
+	// 0 行 = 上面那条谓词把写挡住了，也就是 status 检查（无锁读）之后、这次写之前
+	// 群被解散了。数据库这时是干净的，但下面三步不是数据库：失效推送缓存、给群里
+	// 发 GroupUpdate、通知客户端刷频道。照发就等于给一个已经不存在的群推一条改名，
+	// 而接口还报成功。返回 nil 而不是错误——什么都没发生不是失败，调用方（D8 的
+	// 项目改名同步）该做的也只是安静地跳过。PR #855 第七轮 review 的 P2-1。
+	if affected == 0 {
+		// 0 行 = 状态检查（无锁读）之后、这次写之前群被解散了。
+		//
+		// 返回与"读的时候就已经解散"完全相同的错误，而不是 nil：这是同一件事，
+		// 只是发现得晚了一点。上一版返回 nil，于是人点"改群名"会拿到 200 OK，
+		// 而同一个文件里 updateAvatarCustom 对**同一个** TOCTOU 明确返回
+		// "group not found or disbanded"，理由就写在它旁边——不要对一行已经死掉的
+		// 数据报成功。一个文件里两套约定，新的那套更松。第八轮 review。
+		//
+		// D8 的项目改名同步不需要这个错误：它由 renameAllMemberGroup 吞掉
+		// （errors.Is），保持"安静跳过"。人工入口与机器入口的处置不同，而这个
+		// 差别属于调用方，不属于这里。
+		s.Warn("群信息更新未落库（群已解散），跳过全部通知",
+			zap.String("group_no", req.GroupNo))
+		return errGroupGoneOrDisbanded
 	}
 
 	// 发布群更新事件（name 和 notice 分开发送）

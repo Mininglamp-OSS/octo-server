@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
@@ -27,6 +28,13 @@ const (
 	MemberRemoveReasonForceRemoved = "force_removed"
 	// MemberRemoveReasonSpaceDisbanded 空间被强制解散，全员一并移除
 	MemberRemoveReasonSpaceDisbanded = "space_disbanded"
+	// MemberRemoveReasonBotDeleted Bot 被其所有者删除，账号整体消失，
+	// 因此它在**所有** Space 的席位一并关闭（见 CloseAllSpaceSeats）。
+	//
+	// 它与 force_removed 分开，是因为群侧级联要按 Reason 决定发不发
+	// 「X 被 Y 移出群聊」。对一个整体消失的账号，那句话是错的——没有人把它
+	// 移出这个群。复用 force_removed 会让这句话出现在它待过的每个群里。
+	MemberRemoveReasonBotDeleted = "bot_deleted"
 )
 
 var memberRemoveReasons = map[string]bool{
@@ -34,6 +42,7 @@ var memberRemoveReasons = map[string]bool{
 	MemberRemoveReasonLeft:           true,
 	MemberRemoveReasonForceRemoved:   true,
 	MemberRemoveReasonSpaceDisbanded: true,
+	MemberRemoveReasonBotDeleted:     true,
 }
 
 // IsMemberRemoveReason 校验原因取值。写库前拦住拼错的字面量，避免出现
@@ -229,6 +238,47 @@ func snapshotCleanupSteps() []namedCleanupStep {
 	return out
 }
 
+var (
+	cleanupFinalizersMu sync.RWMutex
+	cleanupFinalizers   []namedCleanupStep
+)
+
+// RegisterMemberRemovalCleanupFinalizer 注册一个**在全部清理步骤成功之后**才跑的
+// 收敛动作。签名与契约与 MemberRemovalCleanupStep 完全相同（幂等、自决、失败即重试），
+// 差别只有一条：它读到的是所有步骤都已完成的那个状态。
+//
+// 为什么需要它，而不是再注册一个步骤：步骤的执行顺序就是注册顺序，而注册顺序由
+// import 方向决定，没有任何地方声明过（见 runMemberRemovalCleanupJob 里那段注释）。
+// 有些收敛必须看见**别的步骤已经做完**的结果才能算对——例如「全员群的群主必须是
+// 项目的活跃 owner」：群侧的级联在离开时会按群资历交接群主，项目侧的级联在关席位，
+// 两者谁先谁后不确定，而正确答案只有在两件都发生之后才成立。把这样的动作写成步骤，
+// 它在一半的注册顺序下会跑在前面，算出的答案是对另一个中间态的。
+//
+// 与步骤一样：同名重复注册覆盖（latest wins），方便测试替身。
+func RegisterMemberRemovalCleanupFinalizer(name string, fn MemberRemovalCleanupStep) {
+	if name == "" || fn == nil {
+		return
+	}
+	cleanupFinalizersMu.Lock()
+	defer cleanupFinalizersMu.Unlock()
+	for i := range cleanupFinalizers {
+		if cleanupFinalizers[i].name == name {
+			cleanupFinalizers[i].fn = fn
+			return
+		}
+	}
+	cleanupFinalizers = append(cleanupFinalizers, namedCleanupStep{name: name, fn: fn})
+}
+
+// snapshotCleanupFinalizers 取注册表快照，避免执行期间持锁。
+func snapshotCleanupFinalizers() []namedCleanupStep {
+	cleanupFinalizersMu.RLock()
+	defer cleanupFinalizersMu.RUnlock()
+	out := make([]namedCleanupStep, len(cleanupFinalizers))
+	copy(out, cleanupFinalizers)
+	return out
+}
+
 // invalidateMembershipCache 清掉某个成员在某个 Space 的 SpaceMiddleware 正向缓存。
 //
 // Redis key `space:member:{spaceID}:{uid}`，TTL 60s。不清它，被移除的人还能带着
@@ -271,6 +321,12 @@ func (s *Space) invalidateMembershipCache(spaceID, uid string) {
 // 只清本进程那一份，其它副本要等自己的 TTL（60s）到期；这一层只影响卡片/通知的
 // 投递目标，不是隔离手段，故接受最终一致。
 func (s *Space) invalidateSpaceMemberCache(spaceID string) {
+	invalidateSpaceMemberCacheOf(spaceID)
+}
+
+// invalidateSpaceMemberCacheOf 是上面那个方法的包级形式，给不持有 *Space 的调用方
+// 用（CloseAllSpaceSeats 是包级函数，只拿得到 *config.Context）。一份实现，两个入口。
+func invalidateSpaceMemberCacheOf(spaceID string) {
 	if spaceID == "" {
 		return
 	}
@@ -286,7 +342,14 @@ func (s *Space) invalidateSpaceMemberCache(spaceID string) {
 // 调用方必须用 `go` 发出：handleEvent 的 listener 分支会在调用者 goroutine 上
 // 同步跑完所有监听方，直接调用会把 HTTP handler 阻塞在别的模块的逻辑上。
 func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason string) {
-	if s.ctx.Event == nil {
+	fireSpaceMemberRemoveEventOn(s.ctx, spaceID, uid, operatorUID, reason)
+}
+
+// fireSpaceMemberRemoveEventOn 是上面那个方法的包级形式，理由同
+// invalidateSpaceMemberCacheOf：CloseAllSpaceSeats 拿不到 *Space。
+func fireSpaceMemberRemoveEventOn(ctx *config.Context, spaceID, uid, operatorUID, reason string) {
+	logger := log.NewTLog("Space")
+	if ctx.Event == nil {
 		return
 	}
 	// 没有任何监听方时不落库。事件行的代价是一次事务 + 后续 QueryWithID 与一条
@@ -294,15 +357,15 @@ func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason str
 	// 解散一个几千人的空间就是上万次纯浪费的 DB 操作，还会持续撑大 event 表。
 	// 保留这条事件是为了给下游留扩展点：一旦有人 AddEventListener，这里自动开始投递。
 	// 会话面清理的可靠投递由 space_member_removal_cleanup 工单承担，不依赖本事件。
-	if len(s.ctx.GetEventListeners(event.SpaceMemberRemove)) == 0 {
+	if len(ctx.GetEventListeners(event.SpaceMemberRemove)) == 0 {
 		return
 	}
-	tx, err := s.ctx.DB().Begin()
+	tx, err := ctx.DB().Begin()
 	if err != nil {
-		s.Error("开启SpaceMemberRemove事件事务失败", zap.Error(err))
+		logger.Error("开启SpaceMemberRemove事件事务失败", zap.Error(err))
 		return
 	}
-	eventID, err := s.ctx.EventBegin(&wkevent.Data{
+	eventID, err := ctx.EventBegin(&wkevent.Data{
 		Event: event.SpaceMemberRemove,
 		Type:  wkevent.Message,
 		Data: map[string]interface{}{
@@ -314,15 +377,15 @@ func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason str
 	}, tx)
 	if err != nil {
 		tx.Rollback()
-		s.Error("开启SpaceMemberRemove事件失败", zap.Error(err),
+		logger.Error("开启SpaceMemberRemove事件失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		s.Error("提交SpaceMemberRemove事件事务失败", zap.Error(err))
+		logger.Error("提交SpaceMemberRemove事件事务失败", zap.Error(err))
 		return
 	}
-	s.ctx.EventCommit(eventID)
+	ctx.EventCommit(eventID)
 }
 
 // afterMembersRemoved 成员行提交之后的收尾。清理工单本身已经在移除事务里写好了
@@ -408,6 +471,18 @@ func (s *Space) startMemberRemovalCleanupWorker() {
 		// 指标单独一个更稀疏的节奏：那条查询是全表聚合，而这几个 gauge 是给
 		// 分钟级以上的趋势看的，没有必要每分钟扫一次表。
 		s.ctx.Schedule(removalMetricsInterval, s.refreshMemberRemovalCleanupMetrics)
+		// 让 CloseAllSpaceSeats 这类拿不到 *Space 的包外调用方也能在入队后
+		// 立刻推一轮，而不必干等一个 10s tick。见 member_removal_all_spaces.go。
+		setRemovalWorkerKick(func() {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.Error("worker kick panic", zap.Any("recover", r))
+					}
+				}()
+				s.processMemberRemovalCleanups()
+			}()
+		})
 	})
 }
 
@@ -593,6 +668,48 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 			zap.Error(err))
 		if firstErr == nil {
 			firstFailedStep, firstErr = step.name, err
+		}
+	}
+	if firstErr != nil {
+		if failedSteps > 1 {
+			firstFailedStep = fmt.Sprintf("%s(+%d)", firstFailedStep, failedSteps-1)
+		}
+		s.releaseCleanupJob(job, owner, firstFailedStep, firstErr)
+		return
+	}
+
+	// 收敛动作跑在**全部步骤都成功之后**，这正是它与步骤的唯一区别：它看见的是一个
+	// 已经安定的状态，而不是某个注册顺序下的中间态。
+	//
+	// 有步骤失败就不跑：那一轮里"别的步骤已经做完"这个前提不成立，而工单会被重排，
+	// 下一轮全部成功时它自然会跑到。收敛动作自己失败也走同一条重试路径——它和步骤
+	// 一样要求幂等，所以整条工单重跑是安全的。
+	//
+	// panic 与步骤同样在**每一个**收敛动作上单独兜住，理由也一样：函数级的那个
+	// recover 会直接跳出循环，让排在后面的收敛动作本轮一次都跑不到。
+	for _, fin := range snapshotCleanupFinalizers() {
+		err := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					s.Error("成员移除收敛动作 panic",
+						zap.Any("recover", r), zap.Uint64("jobId", job.ID),
+						zap.String("finalizer", fin.name),
+						zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
+					err = fmt.Errorf("cleanup finalizer panicked: %v", r)
+				}
+			}()
+			return fin.fn(s.ctx, removal)
+		}()
+		if err == nil {
+			continue
+		}
+		failedSteps++
+		s.Warn("成员移除收敛动作失败，继续执行其余收敛动作",
+			zap.Uint64("jobId", job.ID), zap.String("finalizer", fin.name),
+			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID),
+			zap.Error(err))
+		if firstErr == nil {
+			firstFailedStep, firstErr = fin.name, err
 		}
 	}
 	if firstErr != nil {

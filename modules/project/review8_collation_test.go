@@ -45,6 +45,11 @@ var collationProbeTables = []struct {
 	{"space", true},
 	{"space_member", true},
 	{"user", true},
+	// P2 — the member roster now LEFT JOINs `robot` so it can flag AI agents and
+	// name their owner (D16). `robot` is a 2019 legacy table like the three above,
+	// so it drifts with them, and without it here every probe statement fails with
+	// "table doesn't exist" instead of the 1267 this test is asserting.
+	{"robot", true},
 }
 
 // newCollationProbe builds an isolated database whose legacy tables are utf8mb4_0900_ai_ci and

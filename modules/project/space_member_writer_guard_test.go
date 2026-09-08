@@ -152,17 +152,28 @@ var spaceMemberWriterBaseline = map[string]struct {
 			"changes (role is not part of the project membership answer).",
 	},
 	"modules/botfather/api_user.go": {
-		writes: 2,
-		why: "ONE INSERT (grants a bot a Space seat — admission needs no bump, see " +
-			"mint_obo.go) plus ONE KNOWN GAP: `UPDATE space_member SET status=0 WHERE " +
-			"uid=?` on bot deletion (api_user.go:529), outside any transaction, so it " +
-			"moves no epoch and enqueues no cleanup. A bot CAN hold an " +
-			"octo_project_member seat — project admission applies no bot filter — so on " +
-			"this axis a peer's cached grant is permanent rather than bounded. Both " +
-			"available fixes change user-visible behaviour (refuse bots into projects, " +
-			"or route bot deletion through removeMemberLocked, which enqueues group " +
-			"cleanup and therefore emits Tip messages bot deletion does not emit today), " +
-			"so this needs a product decision. Tracked, not fixed.",
+		writes: 1,
+		why: "INSERT only now. The bare `UPDATE space_member SET status=0 WHERE uid=?` on " +
+			"bot deletion that this entry used to record as a KNOWN GAP was removed by PR " +
+			"#855, which routes all three deletion entries (botfather command, botfather " +
+			"REST, manager REST) through modules/space.CloseAllSpaceSeats instead. That " +
+			"path now runs the removal tx steps, so the epoch moves — see the " +
+			"member_removal_all_spaces.go entry. The remaining write grants a bot a Space " +
+			"seat; admission needs no bump, see mint_obo.go.",
+	},
+	"modules/space/member_removal_all_spaces.go": {
+		writes: 3,
+		why: "SANCTIONED. PR #855's \"close this uid's seats in EVERY Space\" path, which " +
+			"replaced botfather's bare cross-Space UPDATE. closeSeatAllSpacesOne runs " +
+			"runMemberRemovalTxSteps in the same transaction beside the outbox enqueue. It " +
+			"enqueued the outbox but NOT the steps when it landed, so member_epoch did not " +
+			"move and a peer's cached grant outlived a bot deletion for as long as the " +
+			"async cleanup took — unbounded once that job is abandoned. Same registry and " +
+			"same statement as the other two closing paths, because consistency here is " +
+			"correctness rather than tidiness: any path that skips it makes epoch " +
+			"agreement insufficient for that class of uid. TestBotSeatCloseMovesTheEpoch " +
+			"pins it. The other two matches are the doc comment's quoted SQL and the " +
+			"locking read.",
 	},
 	"modules/botfather/command.go": {
 		writes: 1,

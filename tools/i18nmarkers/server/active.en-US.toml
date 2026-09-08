@@ -78,6 +78,9 @@ other = "The token was rotated by another request; please retry."
 ["err.server.bot.occupied"]
 other = "Bot is already occupied by another agent."
 
+["err.server.bot_api.all_member_group_protected"]
+other = "This is a project's all-member group; manage its members from the project instead."
+
 ["err.server.bot_api.app_bot_dm_only"]
 other = "App bots can only operate on direct message channels."
 
@@ -407,6 +410,9 @@ other = "The extension list is too long (max {{.max_bytes}} bytes)."
 
 ["err.server.file.upload_too_large"]
 other = "The file exceeds the maximum allowed size of {{.max_size}}."
+
+["err.server.group.all_member_group_protected"]
+other = "This is a project's all-member group; manage its members from the project instead."
 
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
@@ -801,6 +807,9 @@ other = "Invalid analytics request."
 ["err.server.project.actor_not_space_member"]
 other = "You are no longer an active member of this space."
 
+["err.server.project.agent_not_eligible"]
+other = "One or more selected AI agents cannot join this project."
+
 ["err.server.project.batch_too_large"]
 other = "Too many members in a single request."
 
@@ -839,6 +848,9 @@ other = "Failed to query project data."
 
 ["err.server.project.quota_daily_create"]
 other = "You have created too many projects today."
+
+["err.server.project.quota_members"]
+other = "This project has reached its member limit."
 
 ["err.server.project.quota_per_creator"]
 other = "You have reached your project limit in this space."

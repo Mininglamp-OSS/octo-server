@@ -46,6 +46,10 @@ const (
 	// Separate from a generic store failure because this slice is what made create
 	// depend on that write at all; see errProvisioningEnqueueFailed.
 	reasonProvisioningEnqueue = "provisioning_enqueue"
+	// reasonAgentNotEligible covers every way an AI agent may be refused a seat
+	// (D3/D15). One reason label, matching the single error code: splitting it
+	// here would put on a dashboard the distinctions the wire deliberately hides.
+	reasonAgentNotEligible = "agent_not_eligible"
 )
 
 var (

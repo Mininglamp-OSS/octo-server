@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
@@ -31,12 +32,20 @@ type commandHandler struct {
 	appService    app.IService
 	apiKeyService UserAPIKeyService
 	langSvc       *user.LanguageService // resolves recipient language for replyL
+	// closeSeatsFn 是删除 Bot 时关闭其全部 Space 席位的入口，可注入。
+	//
+	// 存在的唯一理由是让"关席位失败必须中止删除"这条规则可被测试**看见**。
+	// PR #855 第五轮 review 用变异测试证明了它的必要性：把那条中止改回
+	// log-and-continue，整个 modules/botfather 套件仍然全绿——也就是说上一轮
+	// 阻塞掉的缺陷可以在没有任何测试变红的情况下被改回去。
+	closeSeatsFn func(ctx *config.Context, uid, operatorUID, reason string) ([]string, error)
 	log.Log
 }
 
 func newCommandHandler(ctx *config.Context) *commandHandler {
 	return &commandHandler{
 		ctx:           ctx,
+		closeSeatsFn:  spacemod.CloseAllSpaceSeats,
 		db:            newBotfatherDB(ctx),
 		sm:            newStateMachine(ctx),
 		userService:   user.NewService(ctx),
@@ -647,12 +656,67 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	// 无声删掉。
 	h.removeBotFromGroups(botID)
 
-	// Remove bot from all Spaces
-	_, err = h.ctx.DB().UpdateBySql(
-		"UPDATE space_member SET status=0 WHERE uid=? AND status=1", botID,
-	).Exec()
-	if err != nil {
-		h.Error("移除Bot的Space成员记录失败", zap.Error(err))
+	// 关闭 Bot 在所有 Space 的席位，走 modules/space 的事务性工单入口。
+	//
+	// 原先这里是一条裸 `UPDATE space_member SET status=0 WHERE uid=? AND status=1`：
+	// 一条语句改掉所有 Space 的席位，不写任何清理工单。在 Bot 只能进群的年代那只是
+	// 「少跑一遍上面刚手工跑过的群清理」，没有可见后果。
+	//
+	// 项目层把 space_member 变成了授权链的根，于是它成了真实缺陷：
+	//
+	//	space_member.status=1 →（P0 级联）octo_project_member.status=1
+	//	                      →（P1 准入闸门）可以留在项目群里
+	//
+	// 裸 UPDATE 关掉根，却不通知链上任何一环——被删除的 Bot 的**项目席位**会永远
+	// 停在 status=1，I1 对账扫描从此每一轮都报一条谁也修不好的违规，而这个已经不
+	// 存在的账号还挂在项目成员名单里，凭那个席位继续满足项目群的准入谓词。
+	//
+	// CloseAllSpaceSeats 在关席位的同一个事务里写出清理工单，剩下的交给已有的
+	// worker 和已注册的步骤（关项目席位、退项目群、退 Space 下的群、清会话扩展）。
+	// 这里不再自己补一段项目清理：那是第二次重新实现级联，而重新实现级联正是本仓库
+	// 反复付过学费的事。
+	//
+	// **上面那段群移除循环保留不动**，不是冗余。它按 GetGroupsWithMemberUID 枚举
+	// Bot 所在的**全部**群，而工单是按 (space_id, uid) 键的、其群步骤只查该 Space
+	// 下的群（queryGroupsWithMemberUIDAndSpaceID）。把循环换成工单会静默丢掉
+	// space_id 为空的那些群。两者并存是安全的：群步骤先重读成员行，人已经不在群里
+	// 就直接返回 nil。
+	//
+	// 席位关闭本身仍是同步的——函数返回时 space_member 已经提交，异步的只有工单
+	// 驱动的清理步骤。
+	//
+	// operatorUID 是**发起删除的主人**，不是 Bot 自己。它会流进
+	// deactivateSeatForCascade 的审计与日志归因，前一版两个参数都传 botID，于是
+	// 审计记录读作"这个 Bot 把自己从每个项目里移除了"——一个不存在的行为者。
+	if closed, closeErr := h.closeSeatsFn(
+		h.ctx, botID, fromUID, spacemod.MemberRemoveReasonBotDeleted,
+	); closeErr != nil {
+		// 关不掉席位就**不往下走**，尤其不能走到 deleteRobot。
+		//
+		// 前一版是记日志继续，理由写的两条现在都不成立，PR #855 第四轮 review 把它们
+		// 拆穿了：
+		//
+		//  1. 「失败的那些会被 I1 对账扫描报出来」——不会。I1 找的是"项目席位还活着
+		//     但 Space 席位没了"，而这次失败的形态恰恰相反：Space 席位**还是活的**
+		//     （UPDATE 没执行，或事务回滚了）。本仓库十个扫描没有一个在找"space_member
+		//     还活着、而它的 robot 行已经 status=0"。这个状态没有任何东西看得见。
+		//  2. 「重试整个删除流程是幂等的」——重试根本进不来。下面的 deleteRobot 会把
+		//     robot.status 置 0，而选 bot 的查询要求 status=1，于是主人再也选不到这个
+		//     bot。所谓幂等只对还能走到这一步的调用方成立。
+		//
+		// 两条加起来的终态：一个用户已经删掉的 bot，在失败的那个 Space 里保留活跃席位，
+		// 于是保留项目席位，于是继续满足 I2，继续留在那个项目的群里读消息——永久，
+		// 没有扫描、没有用户可达的修复。这正是 D14 要消灭的终态。
+		//
+		// 在这里返回时 robot 行仍是 status=1，所以提示里说的"重试"是真的能重试。
+		// 已经成功关闭的那些 Space 不回滚，也不需要：它们的清理工单已经入队，而重跑
+		// 整个删除流程对它们是幂等的（席位已关，affected=0，不重复入队）。
+		h.Error("关闭Bot的Space席位失败，中止删除（robot 行保持可选，用户可重试）",
+			zap.String("botId", botID), zap.Strings("closedSpaces", closed),
+			zap.Error(closeErr))
+		h.replyL(fromUID, MsgDeleteFailedRetry, nil)
+		h.sm.Clear(fromUID, h.spaceID(fromUID))
+		return
 	}
 
 	// Remove bot from friend records with version for client sync (both directions)

@@ -240,6 +240,14 @@ func (g *Group) disband(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	// D7 —— 全员群不能被解散。它随项目结束而结束，没有别的等价物。
+	//
+	// 放在群主判定**之后**：先回答"你有没有权限做这件事"，再回答"这件事对这个群
+	// 允不允许"。反过来会让一个普通成员通过一条错误消息知道这个群是某项目的全员群。
+	if loginMember != nil && loginMember.Role == MemberRoleCreator &&
+		g.refuseIfAllMemberGroup(c, group, allMemberGroupActionDisband) {
+		return
+	}
 	if loginMember == nil || loginMember.Role != MemberRoleCreator {
 		g.Error("用户无权执行此操作", zap.Error(err))
 		respondGroupForbidden(c)
@@ -2956,6 +2964,21 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 		return
 	}
 
+	// D7 —— 全员群的群主不能手动转让。它始终跟着项目 owner 走（D6），由项目侧
+	// 在 owner 变动时驱动同步。
+	//
+	// 放在群主判定之后：只有群主本人会看到这条拒绝，别人先拿到 creator_only。
+	// 这一路仍在任何写入之前——下面才开始改成员角色。
+	//
+	// 放在 getGroupInfo **之后**并复用它读到的群行，而不是用按群号的那个版本。
+	// 前一版用了 refuseIfAllMemberGroupByNo，它自己发一次 QueryWithGroupNo，而紧
+	// 接着的 getGroupInfo 就是同一条查询：Space 直属群多 1 次、普通项目群多 2 次，
+	// 而 C1 纪律给的额度是 0 和 1。守卫注释里把这条写成硬要求，这里却是四个调用点
+	// 里唯一违反它的。TestAllMemberGroupGuardAddsNoQueryOnANonProjectGroup 现在钉住它。
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionTransfer) {
+		return
+	}
+
 	version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {
 		g.Error("生成序列号失败", zap.Error(err))
@@ -3169,9 +3192,17 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 判断群是否存在
-	_, err := g.getGroupInfo(groupNo)
+	removeGroupInfo, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
+		return
+	}
+	// D7 —— 全员群里不能踢人。要把谁移出这个群，就是要把他移出这个项目。
+	//
+	// 放在这里而不是等操作者身份查完：这个 handler 后面会走 RemoveGroupMembers，
+	// 那条路径带 IM 退订、系统消息、bot 连带移除等一串副作用，守卫必须在任何副作用
+	// 之前。存在性已经由上面那次 getGroupInfo 回答过，所以这条拒绝不多说什么。
+	if g.refuseIfAllMemberGroup(c, removeGroupInfo, allMemberGroupActionRemove) {
 		return
 	}
 	var loginMember *MemberModel
@@ -3533,6 +3564,20 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
+	// D7 —— 全员群不能退。要离开这个群，就是要离开这个项目。
+	//
+	// 位置是被这个 handler 的既有顺序决定的，不是随便挑的：**下面那次
+	// IMRemoveSubscriber 发生在成员校验之前**。守卫若放在成员校验旁边，一次被拒的
+	// 退群会先把人从 IM 频道上摘掉——人还在群里，却再也收不到消息，而且没有任何
+	// 路径会把订阅加回来。那是一个比这里的取舍严重得多的缺陷。
+	//
+	// 代价是这条拒绝先于"你是不是群成员"给出，于是一个非成员能从中读出这个群是
+	// 某项目的全员群。这个泄露是有界的：上面那次 getGroupInfo 已经用 404 与否
+	// 回答了"这个群存不存在"，而下面的 not_in_group 也一样——群的存在性在这个
+	// handler 上本来就不是秘密，多出来的只是"它属于某个项目"。
+	if g.refuseIfAllMemberGroup(c, groupInfo, allMemberGroupActionExit) {
+		return
+	}
 	// 调用IM的移除订阅者
 	err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
 		ChannelID:   groupNo,
@@ -3848,6 +3893,21 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 	}
 	if !isManager {
 		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
+		return
+	}
+	// D7 —— 全员群里不能拉黑。
+	//
+	// 拉黑是**第五条**改变活跃成员集合的群面路径，而且很容易被漏掉：它不叫"移除"，
+	// 也不走 RemoveGroupMembers，它把 group_member.status 翻成 Blacklist 并做 IM
+	// 退订。对 I4 来说结果与踢人完全一样——这个人还是项目成员，却不在全员群的活跃
+	// 成员集合里，于是 I4 扫描 B 报出一个缺口，而且没有任何东西会修复它：项目侧的
+	// 席位没变，准入器只在新加入时跑。
+	//
+	// 解除拉黑（A11）那半边不挡：它是把人**放回**活跃集合，方向与 I4 一致，而且
+	// 已经受 I2 准入闸门约束。挡住它反而会让一个已经被拉黑的成员永远出不来。
+	//
+	// 要把谁挡在项目之外，就把他移出项目——那条路径会连群带席位一起处理。
+	if action == "add" && g.refuseIfAllMemberGroup(c, &group.Model, allMemberGroupActionBlacklist) {
 		return
 	}
 	// #354 · Bot 跟人走：拉黑/解除拉黑级联到目标用户名下在群的 bot

@@ -207,3 +207,64 @@ func TestRepeatedUpsertOfAnActiveMemberDoesNotChurnTheEpoch(t *testing.T) {
 			"reactivation reports, so every repeated admin add would churn the epoch and cost "+
 			"every consumer of this project a re-verify")
 }
+
+// TestBotSeatCloseMovesTheEpoch covers the axis PR #855 built a path for.
+//
+// #855 replaced botfather's bare `UPDATE space_member SET status=0 WHERE uid=?`
+// with modules/space.CloseAllSpaceSeats, which closes each seat in its own
+// transaction and enqueues the cleanup outbox — the half its own header calls the
+// authorization root. All three deletion entries (botfather command, botfather
+// REST, manager REST) route through it.
+//
+// It enqueues the outbox but does NOT run the registered removal tx steps, so
+// member_epoch does not move. That is the same defect shape this branch closed for
+// the ordinary removal and rejoin paths, re-appearing on the axis both of us were
+// treating as the disclosed one: `_verify` flips to member:false (the Space
+// conjunction sees the closed seat) while `epochs` keeps answering the pre-deletion
+// value, so a peer's cached positive grant never invalidates. And because the
+// project seat is only closed by the async cascade, the window is a backoff at best
+// and unbounded once the job is abandoned.
+//
+// Bots can hold project seats: admission applies no blanket bot filter (#855 added
+// eligibility rules, not exclusion), and #855 itself seats the creator's agents.
+func TestBotSeatCloseMovesTheEpoch(t *testing.T) {
+	srv, p := setup(t)
+	p.registerSpaceMemberRemovalCleanup()
+
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "bscOwner")
+	seedSpaceMember(t, spaceA, "bscOwner", 2, 1)
+	seedUser(t, "bscBot")
+	seedSpaceMember(t, spaceA, "bscBot", 0, 1)
+
+	inProject := createProjectVia(t, srv, spaceA, ownerToken, "bot-seat-close")
+	untouched := createProjectVia(t, srv, spaceA, ownerToken, "bot-seat-close-none")
+	admitted, err := p.addOneMember(inProject.ProjectID, spaceA, "bscOwner", "bscBot")
+	require.NoError(t, err)
+	require.True(t, admitted)
+
+	before := epochOf(t, inProject.ProjectID)
+	untouchedBefore := epochOf(t, untouched.ProjectID)
+
+	closed, err := spacemod.CloseAllSpaceSeats(testCtx, "bscBot", "bscOwner",
+		spacemod.MemberRemoveReasonForceRemoved)
+	require.NoError(t, err)
+	require.Contains(t, closed, spaceA, "the fixture seat must actually have been closed")
+
+	// The project seat is still open: closing it is the async cascade's job, which is
+	// exactly the window the epoch has to cover.
+	seat, err := testDB.queryMember(inProject.ProjectID, "bscBot")
+	require.NoError(t, err)
+	require.NotNil(t, seat)
+	require.Equal(t, MemberStatusActive, seat.Status)
+
+	assert.Greater(t, epochOf(t, inProject.ProjectID), before,
+		"closing a Space seat through CloseAllSpaceSeats must move member_epoch in the same "+
+			"transaction, exactly as the ordinary removal paths do. It enqueues the cleanup "+
+			"outbox but the outbox is asynchronous and terminal after its retry cap — until it "+
+			"runs, `_verify` already answers member:false while `epochs` answers the "+
+			"pre-deletion value, so a peer re-reads the same number, its staleness check "+
+			"AGREES, and the cached grant outlives the deletion")
+	assert.Equal(t, untouchedBefore, epochOf(t, untouched.ProjectID),
+		"a project the uid never held a seat in must not be churned")
+}

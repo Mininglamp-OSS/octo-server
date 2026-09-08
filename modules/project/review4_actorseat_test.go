@@ -22,6 +22,14 @@ import (
 // The count in the name of the guarantee matters: round 1 wired five of the six and the
 // omission was recorded nowhere, so keep this list exhaustive against the callers of
 // requireSpaceSeatsTx.
+//
+// P2 added a SEVENTH, which is why the list no longer stops at the requireSpaceSeatsTx
+// callers: creating a project with agent_uids takes its own seat locks
+// (lockSpaceSeatRowTx for the creator, lockSpaceSeatRowsTx for the agents) rather than
+// going through requireSpaceSeatsTx, so a guard scoped to that function's callers could
+// not see it. The brief lists the create-with-agents path as load-bearing here for that
+// reason. Keep the list exhaustive against every write that takes a space_member lock,
+// not just the ones that take it through one helper.
 func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "admin9")
@@ -79,6 +87,20 @@ func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	freshSeat, fErr := p.db.queryMember(created.ProjectID, "fresh1")
 	require.NoError(t, fErr)
 	assert.Nil(t, freshSeat, "the target must not have gained a project seat")
+
+	// createProject — the seventh path, and the one whose seat lock is taken directly.
+	// A seatless actor must not be able to create a project at all, and specifically not
+	// one carrying agent seats: the agents' own locks are taken in the same statement
+	// position, so a create that got past the creator's check would write member rows for
+	// an actor the Space no longer knows.
+	_, cpErr := p.createProject(createInput{
+		SpaceID:   spaceID,
+		Creator:   "admin9",
+		Name:      "should not exist",
+		AgentUIDs: []string{"fresh1"},
+	})
+	assert.ErrorIs(t, cpErr, errNotSpaceMember,
+		"createProject must refuse an actor without a Space seat")
 
 	// Nothing may have changed.
 	row, err := p.db.queryByProjectID(created.ProjectID)

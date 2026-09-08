@@ -82,7 +82,8 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	var models []*Model
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, status, created_at, updated_at "+
+			"discoverability, max_members, member_epoch, status, all_member_group_no, "+
+			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
 	if err != nil {
@@ -104,7 +105,8 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	var models []*Model
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, status, created_at, updated_at "+
+			"discoverability, max_members, member_epoch, status, all_member_group_no, "+
+			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
 	).Load(&models)
@@ -496,10 +498,38 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	_, err := d.session.SelectBySql(
 		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, "+
 			"p.discoverability, p.max_members, p.member_epoch, p.status, "+
+			// all_member_group_no on the LIST route too. The wire contract defines
+			// "" as "no group provisioned", so omitting the column here made every
+			// listed project claim it has none — the detail route and the list route
+			// disagreeing about the same project, and a client hiding the entry
+			// point to a group that exists.
+			"p.all_member_group_no, "+
 			"p.created_at, p.updated_at, "+
 			"IFNULL(pm.role, ?) AS my_role, "+
-			"(SELECT COUNT(*) FROM `octo_project_member` mc "+
-			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0) AS member_count "+
+			// D16 — humans and agents counted separately, on the LIST route too.
+			//
+			// One aggregate for both would make member_count mean "humans" on the
+			// detail route and "every seat" here, i.e. a list card over-counting a
+			// project by exactly the agents in it — the thing D16 exists to stop.
+			//
+			// The statement counts SEATS only. Humans are classified afterwards, by
+			// fillMemberCounts, in two single-table reads.
+			//
+			// This subquery used to carry a second one beside it that joined `user`
+			// with a COLLATE on the driving side — the shape PR #855 was blocked on
+			// twice and removed twice, and this was its third and worst instance:
+			// correlated on p.project_id, so a page of 20 projects paid up to twenty
+			// `user` probes that the production collation shape turns into twenty
+			// scans, on a route that is NOT behind the create gate. The eighth review
+			// found it; the comment that used to sit here argued for keeping it, on
+			// an assumption ("each subquery dives into `user` once per member row")
+			// that the shape itself invalidates.
+			//
+			// Seats are index-only on (project_id, status, removing), so this one
+			// stays in the statement.
+			"(SELECT COUNT(*) FROM `octo_project_member` sc "+
+			"  WHERE sc.project_id = p.project_id AND sc.status = 1 AND sc.removing = 0"+
+			"  ) AS seat_count "+
 			"FROM `octo_project` p "+
 			// `removing = 0` on the JOIN as well as on the count: without it a member
 			// whose seat is closing keeps my_role, and — worse — keeps
@@ -518,14 +548,123 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	if err != nil {
 		return nil, fmt.Errorf("project: list projects in space: %w", err)
 	}
+	if err := d.fillMemberCounts(rows); err != nil {
+		return nil, err
+	}
 	return rows, nil
+}
+
+// fillMemberCounts sets MemberCount (humans) on each listed project.
+//
+// Two single-table reads for the whole page, not one join per card: read the
+// active seat uids for the listed projects, then ask `user` which of those uids
+// are bots. Neither statement crosses the pinned/legacy schema boundary, so
+// neither needs a COLLATE and neither can lose an index to one — which is the
+// whole reason the join that used to do this was removed. PR #855s eighth review.
+//
+// Within THIS function the arithmetic is exact: one roster read, and every uid in
+// it is either a bot or not, so humans + agents == len(seats) for the set these two
+// statements see. What that does not give is exactness against SeatCount, which the
+// page statement already computed under an earlier read view — see AgentCount for
+// what the difference can be and why the clamp is what handles it. The previous
+// version of this comment claimed a single snapshot across both, which is one
+// statement too many. PR #855's tenth review.
+func (d *DB) fillMemberCounts(rows []*listRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	projectIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		projectIDs = append(projectIDs, row.ProjectID)
+	}
+
+	var seats []struct {
+		ProjectID string `db:"project_id"`
+		UID       string `db:"uid"`
+	}
+	if _, err := d.session.SelectBySql(
+		"SELECT project_id, uid FROM `octo_project_member` "+
+			"WHERE project_id IN ? AND status = ? AND removing = 0",
+		projectIDs, MemberStatusActive,
+	).Load(&seats); err != nil {
+		return fmt.Errorf("project: read seats for list counts: %w", err)
+	}
+	if len(seats) == 0 {
+		return nil
+	}
+
+	uidSet := make(map[string]struct{}, len(seats))
+	for _, seat := range seats {
+		uidSet[seat.UID] = struct{}{}
+	}
+	uids := make([]string, 0, len(uidSet))
+	for uid := range uidSet {
+		uids = append(uids, uid)
+	}
+	var botUIDs []string
+	if _, err := d.session.SelectBySql(
+		"SELECT uid FROM `user` WHERE uid IN ? AND robot = 1", uids,
+	).Load(&botUIDs); err != nil {
+		return fmt.Errorf("project: classify seats for list counts: %w", err)
+	}
+	bots := make(map[string]struct{}, len(botUIDs))
+	for _, uid := range botUIDs {
+		bots[uid] = struct{}{}
+	}
+
+	humans := make(map[string]int, len(rows))
+	for _, seat := range seats {
+		if _, isBot := bots[seat.UID]; !isBot {
+			humans[seat.ProjectID]++
+		}
+	}
+	for _, row := range rows {
+		row.MemberCount = humans[row.ProjectID]
+	}
+	return nil
 }
 
 // listRow carries a project plus the caller-relative fields the list computes.
 type listRow struct {
 	Model
-	MyRole      int `db:"my_role"`
-	MemberCount int `db:"member_count"`
+	MyRole int `db:"my_role"`
+	// MemberCount counts HUMANS only (D16), the same split the detail route
+	// reports — so one field cannot mean two things depending on which endpoint
+	// the client called.
+	//
+	// Filled by fillMemberCounts after the page loads, not by the statement: the
+	// join that used to produce it crossed into `user` with a COLLATE, once per
+	// listed project.
+	MemberCount int
+	// SeatCount is every active seat, humans and agents together. Agents are the
+	// DIFFERENCE rather than a third count: see the query for the measurement
+	// behind that choice. Computed by the page statement, i.e. under a DIFFERENT
+	// read view from MemberCount — see AgentCount.
+	SeatCount int `db:"seat_count"`
+}
+
+// AgentCount is the agent half of D16's split, derived from the two counts.
+//
+// The clamp is LOAD-BEARING, not a defensive flourish, and the previous version of
+// this comment said the opposite. SeatCount comes from the correlated subquery
+// inside listVisibleInSpace; MemberCount comes from fillMemberCounts, a separate
+// statement issued after that page has loaded. Two statements, no enclosing
+// transaction, two read views — so a member added between them is counted by the
+// second and not the first, and `MemberCount > SeatCount` is reachable in normal
+// operation, not only after a future edit that gave the two different predicates.
+//
+// What the clamp buys, then, is that the wire never carries a negative agent count.
+// What it does NOT buy is `member_count + agent_count == seat_count`: in that race
+// the response is internally inconsistent by one, briefly, and the next list call
+// agrees again. That is the accepted cost of not putting the classification back
+// into the statement — doing so means re-adding the COLLATE'd join into `user` at
+// one join per listed project, which is exactly what the eighth review had removed.
+// PR #855's tenth review, P2-4.
+func (r *listRow) AgentCount() int {
+	if r.SeatCount <= r.MemberCount {
+		return 0
+	}
+	return r.SeatCount - r.MemberCount
 }
 
 // countActiveMembers counts active seats in a project.
@@ -667,6 +806,57 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 //
 // Returns the set of uids that DO hold a seat. Callers decide which absence means what, since
 // actor and target absences carry different sentinels.
+// lockSpaceSeatRowsTx is lockSpaceSeatRowTx for a SET of uids: a shared lock on
+// each one's space_member row, taken in ONE statement, WITHOUT joining `space`.
+//
+// # Why not lockSpaceSeatsTx
+//
+// Because that one JOINs `space`, and createProject cannot afford it. A table
+// outside the `FOR SHARE OF` list is read as a CONSISTENT read, which OPENS the
+// transaction's read view — and in createProject this is the first statement, so
+// every creation quota counted after it would be answered from a snapshot taken
+// before the `space` row lock. That is not hypothetical: six concurrent creates
+// all passed MaxPerSpace=1 when the single-uid path had this shape, which is why
+// lockSpaceSeatRowTx exists at all and why
+// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin pins it. That guard caught
+// this function's absence — the agent seats were being locked through the
+// JOINing helper, reopening exactly the defect P0 closed.
+//
+// Nothing is lost by dropping the JOIN: createProject re-checks the Space's
+// activeness under the exclusive `space` lock immediately afterwards, which is
+// the authoritative check anyway.
+//
+// One statement rather than one per uid: the round-trips inside the transaction
+// then do not grow with the number of agents, and the rows are taken as a single
+// deterministic set instead of one at a time in caller-controlled order, which is
+// a deadlock shape.
+func (d *DB) lockSpaceSeatRowsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+	held := make(map[string]bool, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return held, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(uids)), ",")
+	args := make([]interface{}, 0, len(uids)+1)
+	args = append(args, spaceID)
+	for _, uid := range uids {
+		args = append(args, uid)
+	}
+	var found []string
+	_, err := tx.SelectBySql(
+		"SELECT uid FROM `space_member` "+
+			"WHERE space_id = ? AND uid IN ("+placeholders+") AND status = 1 "+
+			"ORDER BY uid FOR SHARE",
+		args...,
+	).Load(&found)
+	if err != nil {
+		return nil, fmt.Errorf("project: lock space seat rows: %w", err)
+	}
+	for _, uid := range found {
+		held[uid] = true
+	}
+	return held, nil
+}
+
 func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
 	held := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {
@@ -957,9 +1147,28 @@ func (d *DB) listMembers(projectID string, offset, limit int) ([]*memberRosterMo
 	var rows []*memberRosterModel
 	_, err := d.session.SelectBySql(
 		"SELECT pm.project_id, pm.uid, pm.space_id, pm.role, pm.status, pm.invite_uid, "+
-			"pm.created_at, pm.updated_at, IFNULL(u.name, '') AS name "+
+			"pm.created_at, pm.updated_at, IFNULL(u.name, '') AS name, "+
+			// D16 — 名册要能区分人和分身，并给出分身的所有者，客户端才能像通讯录
+			// 那样把分身挂在人下面。两个 JOIN 都是 LEFT：没有 user 行的成员必须仍
+			// 然出现（见下面的注释），而 robot 行对每一个真人都不存在。
+			//
+			// robot 的 COLLATE 是必须的：`robot` 与 `user` 都是未声明 COLLATE 的
+			// 老表（生产库 utf8mb4_0900_ai_ci），octo_project_member 明确是
+			// general_ci，隐式比较在生产上报 1267 而在 CI 上一路绿灯。
+			// u.uid 那个 JOIN 是既有代码，未加 COLLATE。上一版这里写着"它比较的是
+			// 两张老表（user / octo_project_member）"——**这句是错的**，而且与上面
+			// 两行自相矛盾：octo_project_member 由它自己的迁移 pin 成 general_ci。
+			// 所以那个比较是 general_ci ⟷ 0900_ai_ci，在生产上会报 1267，本函数
+			// 在转换落地之前根本执行不了（PR #855 第五轮 review 实测确认）。
+			//
+			// 不在本次改它：那是 P0 留下的、跟着排序规则转换一起走的既有账，
+			// 改它等于顺带改动一条已在生产跑着的查询计划。但它是 D16 的名册接口，
+			// 开关一开就是用户可见的，所以"转换已落地（或这个 JOIN 已 pin）"是
+			// 上线前的硬门槛，记在 open_verification 里。
+			"IFNULL(u.robot, 0) AS robot, IFNULL(r.creator_uid, '') AS owner_uid "+
 			"FROM `octo_project_member` pm "+
 			"LEFT JOIN `user` u ON u.uid = pm.uid "+
+			"LEFT JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci AND r.status = 1 "+
 			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 "+
 			"ORDER BY pm.role DESC, pm.created_at ASC LIMIT ? OFFSET ?",
 		projectID, MemberStatusActive, limit, offset,
@@ -984,6 +1193,36 @@ func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int)
 	).Load(&ids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active projects of space member: %w", err)
+	}
+	return ids, nil
+}
+
+// queryProjectIDsForSpaceMemberPage returns up to limit project ids in one Space
+// where the uid has a member row, ACTIVE OR NOT, ordered by project_id and starting
+// strictly after afterProjectID.
+//
+// The status filter is deliberately absent, which is the whole difference from
+// queryActiveProjectIDsForSpaceMember. Its caller is the post-cleanup owner
+// convergence (registerAllMemberGroupOwnerFinalizer), which runs AFTER the cascade
+// has closed this member's seats — so filtering on status = active would return the
+// empty set and converge nothing. Filtering on role = owner would be wrong for a
+// second reason: the group's creator is not guaranteed to be a project owner (the
+// sync deliberately leaves a former owner in place when the project has none), so a
+// departing non-owner can still be the creator the group cascade hands over.
+//
+// Keyset paging rather than the cascade's "just take the next page" trick: that one
+// works because closing a seat removes the row from its own result set, and this
+// query has no such filter, so LIMIT alone would re-read page one forever.
+func (d *DB) queryProjectIDsForSpaceMemberPage(spaceID, uid, afterProjectID string, limit int) ([]string, error) {
+	var ids []string
+	_, err := d.session.SelectBySql(
+		"SELECT project_id FROM `octo_project_member` "+
+			"WHERE space_id = ? AND uid = ? AND project_id > ? "+
+			"ORDER BY project_id LIMIT ?",
+		spaceID, uid, afterProjectID, limit,
+	).Load(&ids)
+	if err != nil {
+		return nil, fmt.Errorf("project: query projects of space member: %w", err)
 	}
 	return ids, nil
 }

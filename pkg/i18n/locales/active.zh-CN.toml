@@ -1144,6 +1144,9 @@ other = "机器人不是该群管理员。"
 ["err.server.bot_api.cannot_remove_privileged"]
 other = "群主和管理员不能通过机器人 API 移除。"
 
+["err.server.bot_api.all_member_group_protected"]
+other = "这是项目的全员群，请到项目中管理成员。"
+
 ["err.server.bot_api.not_space_member"]
 other = "不是该空间成员。"
 
@@ -1455,6 +1458,9 @@ other = "该字段超出长度上限。"
 ["err.server.project.batch_too_large"]
 other = "单次请求的成员数量过多。"
 
+["err.server.project.agent_not_eligible"]
+other = "所选的 AI 分身中有无法加入本项目的，请调整后重试。"
+
 ["err.server.project.role_invalid"]
 other = "项目成员角色无效。"
 
@@ -1478,6 +1484,9 @@ other = "该空间的项目数量已达上限。"
 
 ["err.server.project.quota_per_creator"]
 other = "你在该空间创建的项目数量已达上限。"
+
+["err.server.project.quota_members"]
+other = "该项目的成员数量已达上限。"
 
 ["err.server.project.quota_daily_create"]
 other = "你今天创建的项目数量已达上限。"
@@ -1528,6 +1537,9 @@ other = "AI 会话尚未就绪，请稍后重试。"
 
 ["err.server.group.project_member_required"]
 other = "只有该项目的成员才能被加入这个群聊。"
+
+["err.server.group.all_member_group_protected"]
+other = "这是项目的全员群，请到项目中管理成员。"
 
 ["err.server.group.project_unavailable"]
 other = "该项目不可用。"

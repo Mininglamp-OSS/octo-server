@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -25,6 +26,12 @@ type Manager struct {
 	log.Log
 	db           *robotDB
 	groupService group.IService
+	// closeSeatsFn 关闭被删除 Bot 在**全部** Space 的席位（D14），可注入。
+	//
+	// 与 botfather 两个删除入口同一个座位（同名字段、同签名）：这三处是本仓库
+	// 全部的 Bot 删除入口（另有一条创建失败的补偿路径，已登记豁免）。
+	// 普查见 modules/space/bot_deletion_census_test.go。
+	closeSeatsFn func(ctx *config.Context, uid, operatorUID, reason string) ([]string, error)
 }
 
 func NewManager(ctx *config.Context) *Manager {
@@ -33,6 +40,7 @@ func NewManager(ctx *config.Context) *Manager {
 		Log:          log.NewTLog("robotManager"),
 		db:           newBotDB(ctx),
 		groupService: group.NewService(ctx),
+		closeSeatsFn: spacemod.CloseAllSpaceSeats,
 	}
 }
 
@@ -355,6 +363,42 @@ func (m *Manager) robotDelete(c *wkhttp.Context) {
 	// 先清理 IM 连接和缓存，再做软删除
 	if err := m.cleanupBotConnection(robotID); err != nil {
 		m.Error("清理机器人连接失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
+		return
+	}
+
+	// Space 席位走**移除工单**，不是裸 UPDATE，也不是什么都不做。D14。
+	//
+	// 这是 Bot 的第三个删除入口，也是第十轮 review 才被数出来的那一个。
+	// 第七轮补上了 REST 的 /v1/user/bots/:bot_id，靠的是一次「谁**写**
+	// space_member」的普查——那个问法结构上就找不到「删 Bot 却**不写**
+	// space_member」的入口，于是这一条又漏了一轮。正确的问法是「什么能删 Bot」，
+	// 答案是三处，普查现在钉在 bot_deletion_census_test.go 上。
+	//
+	// 不关席位留下的终态，与另外两个入口的裸 UPDATE 不同、而且更糟：
+	// space_member.status 仍是 1 → octo_project_member.status 仍是 1，可上面
+	// RemoveUserFromGroupsForLifecycleCleanup 已经把它从**每一个**群里摘掉了，
+	// 包括全员群。这正好是 I4 扫描 B 的违规形态（有项目席位、不在全员群里），
+	// 而扫描 B 只报不修；D13 也回收不了它（要求 robot.status=1，这里马上变 0）；
+	// 管理员想靠重新添加来修复也不行——addOneMemberOnce 会以 agent_not_eligible
+	// 拒绝一个已停用的 robot 行。一个可达的管理动作造出一个永久且修不了的
+	// 不变量违规。
+	//
+	// operatorUID 传**发起删除的超管**，不是 Bot 自己：它会流进
+	// deactivateSeatForCascade 的审计与日志归因，传 botID 会让审计记录读作
+	// "这个 Bot 把自己从每个项目里移除了"——一个不存在的行为者。命令入口
+	// （botfather/command.go）已经改过同一处归因错误。
+	//
+	// 失败就**中止删除**，与另外两个入口同一条规则：此刻 robot 行还是 status=1，
+	// 超管可以重试；再往下一步（deleteRobotSoft）之后就再也选不到这个 bot 了。
+	// 中止时的残留是「已被移出所有群、但席位还在」，与上面那个终态同形，
+	// 区别在于它是可修的：重试这次删除就会把席位关掉。
+	if closed, closeErr := m.closeSeatsFn(
+		m.ctx, robotID, c.GetLoginUID(), spacemod.MemberRemoveReasonBotDeleted,
+	); closeErr != nil {
+		m.Error("关闭机器人的Space席位失败，中止删除（robot 行保持可选，可重试）",
+			zap.String("robotID", robotID), zap.Strings("closedSpaces", closed),
+			zap.Error(closeErr))
 		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}

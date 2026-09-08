@@ -35,6 +35,13 @@ const (
 	outcomeForbidden      = reasonPermissionDenied
 	outcomeLastOwner      = reasonLastOwner
 	outcomeStoreFailed    = "store_failed"
+	// outcomeAgentNotEligible is the single per-uid reason for every way an AI
+	// agent may be refused a seat (D15): it is not yours, its owner is not in
+	// this project, it is self-hosted, it has no Space seat, it is a system bot,
+	// or it does not exist. One string for all of them, matching the single
+	// error code the create path uses — splitting them here would leak on the
+	// wire exactly what that code hides.
+	outcomeAgentNotEligible = reasonAgentNotEligible
 	// outcomeNotAttempted marks targets the handler stopped before reaching, after an
 	// actor-level failure mid-batch. It exists so a partially-applied batch can be reported
 	// accurately instead of being flattened into one status code.
@@ -53,7 +60,17 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 	}
 	// Cheap pre-check off the middleware's cached role; addOneMember re-reads it under the
 	// project lock, which is where the decision actually binds.
-	if !canManageMembers(requestProjectRole(c)) {
+	//
+	// D15 widened who may reach this endpoint: an ordinary member may seat THEIR
+	// OWN agents, holding can_manage_own_agents rather than can_manage_member. So
+	// the pre-check now admits any active member and the per-target decision — the
+	// one that binds — distinguishes a person from an agent under the project lock.
+	//
+	// The pre-check gets weaker, not the authorization: a member who names a
+	// PERSON is refused by addOneMemberOnce's canManageMembers check, and one who
+	// names somebody else's agent is refused there too. What is lost is
+	// only the early exit, which was always described as a cheap pre-check.
+	if !canManageOwnAgents(requestProjectRole(c)) {
 		observeRejected(entryMemberAdd, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 		return
@@ -96,6 +113,14 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 		case errors.Is(res.Err, errQuotaMembers):
 			observeRejected(entryMemberAdd, reasonQuotaMembers)
 			outcomes = append(outcomes, memberOutcome{UID: res.UID, Reason: outcomeQuotaMembers})
+		case errors.Is(res.Err, errAgentNotEligible):
+			// TARGET-level, so the batch continues: this uid is not admissible,
+			// but the next one may be. That is the same treatment the other
+			// target-level refusals get, and it is why the agent rule does NOT
+			// use the actor-level branch below — an admin adding a mixed batch of
+			// people and somebody else's agent should still get the people in.
+			observeRejected(entryMemberAdd, reasonAgentNotEligible)
+			outcomes = append(outcomes, memberOutcome{UID: res.UID, Reason: outcomeAgentNotEligible})
 		case errors.Is(res.Err, errPermissionDenied), errors.Is(res.Err, errProjectGone),
 			errors.Is(res.Err, errActorNotSpaceMember):
 			// ACTOR-level or project-level: nothing after this point can succeed, so stop.
@@ -173,7 +198,13 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 	// is refused without opening a transaction per uid. It is NOT the authorization
 	// decision: removeMember re-reads the actor's role under the project lock, because this
 	// one was resolved from cache before any transaction existed.
-	if !canManageMembers(requestProjectRole(c)) {
+	//
+	// D15 widened it the same way the add path was widened, and symmetrically on
+	// purpose: a member who may bring their own agent in must be able to take it
+	// back out, or undoing their own action requires an admin. removeMemberOnce
+	// makes the real decision — canManageMembers for a person, ownership for an
+	// agent — under the project lock.
+	if !canManageOwnAgents(requestProjectRole(c)) {
 		observeRejected(entryMemberRemove, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 		return
