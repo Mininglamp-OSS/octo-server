@@ -713,6 +713,15 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// exist, which defeats the only purpose the comment has.)
 		os.Getenv(project.ProvisionFleetSecretEnv),
 		os.Getenv(project.ProvisionDriveSecretEnv),
+		// NOT covered here, stated because the absence is otherwise invisible:
+		// modules/bot_task's per-source bearer tokens live inside the
+		// OCTO_BOT_TASK_SOURCES JSON registry rather than in a single env, so no
+		// os.Getenv can reach them and they cannot be passed to this call. They are
+		// deduped only WITHIN that registry, which means a value shared between a
+		// bot_task source and any credential named here is detected by nothing.
+		// Closing it needs that module to expose its configured token values — a
+		// change there, not here. Recorded at the call site because this is where a
+		// reader counts the arguments and concludes the set is complete.
 	); err != nil {
 		return nil, err
 	}

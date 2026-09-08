@@ -1620,6 +1620,27 @@ func TestLoadProvisioningConfig(t *testing.T) {
 			"the retired global switch must not authorize purging any target")
 	})
 
+	// A-4 at the LOADER, not only at ValidateTarget. The acceptance item is about
+	// what happens at config load — the target is dropped, recorded in
+	// Misconfigured, and reported through Problems — and that consequence was
+	// covered only by the generic bad-target case below.
+	t.Run("a whitespace-wrapped secret is dropped at config load", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:     "fleet",
+			envProvisionFleetURL:    "https://fleet.internal/ensure",
+			ProvisionFleetSecretEnv: okSecretA + "\n", // the file-mounted shape
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "whitespace",
+			"the reason must survive to the boot log; zap.Error prints this verbatim")
+		assert.Empty(t, cfg.Targets,
+			"a secret the peer will reject must not produce a live target: every request "+
+				"would 401 for the whole retry budget and the row would land in abandoned")
+		assert.Equal(t, []string{TargetFleet}, cfg.Misconfigured,
+			"and the gauge must be able to name it")
+		assert.False(t, cfg.Enabled())
+	})
+
 	t.Run("a bad target is dropped, not fatal", func(t *testing.T) {
 		cfg, problems := loadProvisioningConfig(env(map[string]string{
 			envProvisionTargets:     "fleet,drive",

@@ -694,6 +694,12 @@ func provisioningDocFiles(t *testing.T) []string {
 		"pkg/octosign/*.go",
 		".octospec/tasks/project-p2-subsystem-integration/*.md",
 		".octospec/tasks/project-p2-subsystem-integration/*.yaml",
+		// The follow-up handover brief is the same file class both historical
+		// defects occurred in — a document an operator is told to read before
+		// enabling a target, carrying file:line pins into this slice's code. It is
+		// enrolled here so those pins are checked mechanically rather than by
+		// whoever happens to follow one.
+		".octospec/tasks/project-provisioning-followups/*.md",
 	} {
 		matched, err := filepath.Glob(filepath.Join(root, pattern))
 		if err != nil {
@@ -703,10 +709,11 @@ func provisioningDocFiles(t *testing.T) []string {
 	}
 	// The floor has to sit ABOVE the count that survives losing the task documents, which
 	// are the file class both historical defects occurred in. At 12 it did not: the globs
-	// match 15, three of them are the handover documents, and deleting that directory left
+	// matched 15, three of them the handover documents, and deleting that directory left
 	// the floor passing while the guard silently stopped covering its own subject. A floor
-	// that survives the loss of the subject is not a floor.
-	const minDocFiles = 15
+	// that survives the loss of the subject is not a floor. Raised to 16 with the
+	// follow-up brief, on the same reasoning.
+	const minDocFiles = 16
 	if len(files) < minDocFiles {
 		t.Fatalf("only %d slice text files found, want at least %d; the doc-truth guards would "+
 			"stop covering the handover documents. If files moved, update provisioningDocFiles.",
@@ -1034,4 +1041,31 @@ func someDeclaredNameStartsWith(declared map[string]bool, prefix string) bool {
 		}
 	}
 	return false
+}
+
+// TestInvalidResponseStaysRetryable pins A-3's other half, in the package where
+// the permanence decision actually lives.
+//
+// internal/projectprovision decides the CATEGORY; modules/project decides whether
+// that category is terminal, through permanentProvisioningOutcomes. The client
+// test asserts only the category, so adding "invalid_response" to that map would
+// leave every "retryable" test green — which is the exact regression the client
+// test's name promises to prevent.
+//
+// Why it must stay retryable: an absent container_id is the shape a peer serves
+// while its ensure endpoint is still rolling out, and a 2xx that is not 200 is a
+// peer mid-rollout answering asynchronously. Terminal means abandoned on the
+// first attempt, and abandoned has no automatic re-drive — a human requeue, at
+// exactly the moment the first target is being enabled.
+func TestInvalidResponseStaysRetryable(t *testing.T) {
+	if isPermanentProvisioningOutcome("invalid_response") {
+		t.Fatal("invalid_response must NOT be permanent: it covers a peer whose ensure " +
+			"endpoint is still rolling out, and terminal means abandoned on the first " +
+			"attempt with no automatic re-drive")
+	}
+	// Not vacuous: the map does classify something as permanent.
+	if !isPermanentProvisioningOutcome("container_id_mismatch") {
+		t.Fatal("container_id_mismatch must be permanent; if this fails the guard above " +
+			"is passing because the map is empty")
+	}
 }

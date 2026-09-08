@@ -311,6 +311,14 @@ func ValidateTarget(t Target) error {
 	// burns as 401s that look exactly like a rotated secret, and the row lands in
 	// abandoned, which has no automatic re-drive.
 	//
+	// What refusing COSTS, stated because this comment is what the next person
+	// consults: the target is dropped from cfg.Targets, and if it was the only one
+	// then Enabled() goes false and the claim, sweep and purge timers are never
+	// mounted — so rows already `pending` stop being claimed until a valid target
+	// is configured again. The census keeps the backlog visible throughout. That is
+	// still the better trade than 23 minutes of ambiguous 401s, but it is a
+	// different one from "the process refuses to start", which this does not do.
+	//
 	// No value in the message, on the same principle as the length check below.
 	if strings.TrimSpace(t.Secret) != t.Secret {
 		return fmt.Errorf("projectprovision: %s secret has leading or trailing whitespace; "+
@@ -333,6 +341,18 @@ func ValidateTarget(t Target) error {
 		// package treats secret material, not because a timing signal would matter: the
 		// values being compared against are already public.
 		return fmt.Errorf("projectprovision: %s secret is a published conformance vector secret; generate a real one", t.Name)
+	}
+	// The same rule as the secret above, and it belongs here for the same reason
+	// the sibling validator applies it (internal/cardactiondispatch/registry.go
+	// refuses an untrimmed raw value before parsing): "reject, do not trim" applied
+	// to one of the two configured values is a principle with a hole in it. The
+	// loader happens to trim this one today, so the gap is reachable only through a
+	// hand-built Target — and there a trailing space is not a control byte,
+	// url.Parse accepts it, it survives into EscapedPath() as %20, the signature
+	// and the wire path agree, and the peer answers 404, which retries to abandoned.
+	if strings.TrimSpace(t.EnsureURL) != t.EnsureURL || t.EnsureURL == "" {
+		return fmt.Errorf("projectprovision: %s ensure url must not be empty or carry "+
+			"leading or trailing whitespace", t.Name)
 	}
 	parsed, err := url.Parse(t.EnsureURL)
 	if err != nil {
@@ -482,10 +502,32 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		}
 	}
 	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+	if response.StatusCode != http.StatusOK {
+		// STRICTLY 200, not any 2xx, because the published contract
+		// (.octospec/tasks/project-p2-subsystem-integration/brief.md §"接口契约")
+		// specifies a SYNCHRONOUS 200 carrying container_id, and the difference
+		// between 200 and 202 is exactly the thing this call has to know: 202 means
+		// the peer accepted the request and will act on it later, so treating it as
+		// success writes status=ready — "we successfully created the container" —
+		// against a container that may not exist yet. Every later decision that
+		// reads ready would be reading a promise as a fact.
+		//
+		// A 2xx that is not 200 is therefore a contract violation on the peer's
+		// side, not a success, and it retries: the peer may be mid-rollout, and
+		// unlike a 4xx there is nothing here that says it will answer the same way
+		// forever. statusCategory maps 2xx to the generic bucket, so the category
+		// is set explicitly for the one an operator needs to recognise.
+		//
 		// Drain a bounded prefix so the connection can be reused, and discard it:
 		// an error body from an unnarrowed target is not something we want in a log.
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
+		if response.StatusCode > http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			return EnsureResponse{}, &EnsureError{
+				Category: "invalid_response",
+				Status:   response.StatusCode,
+				Detail:   "contract requires a synchronous 200",
+			}
+		}
 		return EnsureResponse{}, &EnsureError{
 			Category: statusCategory(response.StatusCode),
 			Status:   response.StatusCode,
@@ -494,7 +536,12 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	var out EnsureResponse
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes))
 	if err := decoder.Decode(&out); err != nil {
-		return EnsureResponse{}, &EnsureError{Category: "invalid_response", cause: err}
+		// Status is recorded even though the body did not parse: a 200 carrying an
+		// HTML error page and a 500 carrying the same page are different problems,
+		// and last_error is the only durable per-row evidence there is.
+		return EnsureResponse{}, &EnsureError{
+			Category: "invalid_response", Status: response.StatusCode, cause: err,
+		}
 	}
 	if out.ContainerID == "" {
 		// A MISSING id is a malformed response, not evidence the peer owns a
@@ -502,12 +549,29 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		// retryable and the other is terminal on the first attempt.
 		//
 		// This is the shape a peer serves while its ensure endpoint is still being
-		// rolled out: a stub answering {} , a proxy returning an empty body with a
-		// 200. Classifying it as a mismatch abandons the row immediately, and
+		// rolled out. The REACHABLE set is exactly `{}`, `{"container_id":""}` and
+		// `null` — an empty or whitespace-only body does NOT arrive here, because
+		// Decode returns io.EOF on it and the branch above catches that with a
+		// different error shape. An earlier version of this comment offered "a proxy
+		// returning an empty body with a 200" as an example, which cannot happen;
+		// it is corrected rather than deleted because A-1, one of the findings this
+		// commit closes, is a comment that described a path the code did not take.
+		//
+		// Classifying any of them as a mismatch abandons the row immediately, and
 		// abandoned has no automatic re-drive — so a transient state on the other
 		// side would need a human to requeue, at exactly the moment the first
 		// target is being enabled.
-		return EnsureResponse{}, &EnsureError{Category: "invalid_response", Status: response.StatusCode}
+		//
+		// Detail rather than status alone: Summary() falls back to "status %d" when
+		// Detail is empty, so this row used to write `invalid_response: status 200`
+		// into last_error — a failure category paired with a success status, in the
+		// 255-byte column the runbook sends a human to read. The constant carries no
+		// request data, which is what that field's invariant requires.
+		return EnsureResponse{}, &EnsureError{
+			Category: "invalid_response",
+			Status:   response.StatusCode,
+			Detail:   "response carried no container_id",
+		}
 	}
 	if out.ContainerID != req.ContainerID {
 		// A DIFFERENT id is terminal. Our mapping row now points at a container

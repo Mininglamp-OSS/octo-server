@@ -165,8 +165,14 @@ func (p *Project) startProvisioningWorker() {
 		// first claim tick rather than waiting a full interval.
 		p.requeueAbandonedProvisioningAtBoot()
 		// Jittered, like reconcile.go's two timers. Without it every replica wakes on
-		// the same tick, so the claim query, sweep, and purge contend at once across
-		// the fleet.
+		// the same tick, so the three timers scheduled HERE — the claim query, the
+		// sweep and the purge — contend at once across the fleet.
+		//
+		// The census is a fourth timer and it is NOT one of these: it lives in
+		// startProvisioningMetrics, outside the enablement gate, and that function
+		// carries its own account of why. An earlier version of this comment named
+		// the census here instead of the purge, which put a true sentence on the
+		// wrong function.
 		p.ctx.Schedule(jitter(p.cfg.Provisioning.Interval), p.processProvisioningJobs)
 		p.ctx.Schedule(jitter(provisioningSweepInterval), p.sweepExhaustedProvisioningJobs)
 		p.ctx.Schedule(jitter(provisioningPurgeInterval), p.purgeProvisioningJobs)
