@@ -3,9 +3,9 @@ package message
 // =============================================================================
 // 不活跃窗口的豁免规则（task inactive-hiding-user-control / P2）
 //
-// 窗口是「这个会话安静了，从我眼前淡出」的每人视图投影。三类东西不得被它淡出：
-// 未读、置顶、系统 Bot。前两者是「把窗口交给用户自己设」（Batch 2）的安全前提 ——
-// 一个能吞掉未读的窗口不能交到用户手里；第三类保证系统 Bot 在每个 Space 可达。
+// 窗口是「这个会话安静了，从我眼前淡出」的每人视图投影。四类东西不得被它淡出：
+// 真实未读、人工未读、置顶、系统 Bot。前三者是「把窗口交给用户自己设」（Batch 2）的安全前提 ——
+// 一个能吞掉未读的窗口不能交到用户手里；第四类保证系统 Bot 在每个 Space 可达。
 //
 // 纯逻辑测试：keepDespiteRecentWindow 与两个端点的过滤函数，无需 DB / IM。
 // =============================================================================
@@ -85,6 +85,16 @@ func TestFilterRecentConversations_StaleButPinnedKept(t *testing.T) {
 	assert.Equal(t, []string{"g-stale-pinned"}, channelIDs(got))
 }
 
+func TestFilterRecentConversations_StaleButManualUnreadKept(t *testing.T) {
+	manual := makeSyncResp("g-stale-manual", common.ChannelTypeGroup.Uint8(), now3DaysAgo())
+	manual.Extra = &conversationExtraResp{ManualUnread: true}
+	plain := makeSyncResp("g-stale-plain", common.ChannelTypeGroup.Uint8(), now3DaysAgo())
+
+	got := filterRecentConversations([]*SyncUserConversationResp{manual, plain}, defaultRecentCutoffs(), nil)
+
+	assert.Equal(t, []string{"g-stale-manual"}, channelIDs(got))
+}
+
 // 置顶集合为空（例如置顶查询失败降级）时不得 panic，且未读豁免仍然生效 ——
 // 两个端点的降级方向必须一致。
 func TestFilterRecentConversations_NilPinnedSetStillHonoursUnread(t *testing.T) {
@@ -134,7 +144,7 @@ func TestBuildRecentItems_PinnedSurvivesWindow(t *testing.T) {
 	pinned := map[string]struct{}{
 		channelKey("g-stale-pinned", common.ChannelTypeGroup.Uint8()): {},
 	}
-	items := buildRecentItems(convs, defaultRecentCutoffs(), pinned, nil, nil, "")
+	items := buildRecentItems(convs, defaultRecentCutoffs(), pinned, nil, nil, nil, "")
 
 	require.Len(t, items, 1, "置顶条目必须存活，未置顶的陈旧群应被过滤")
 	assert.Equal(t, "g-stale-pinned", items[0].TargetID)
@@ -147,11 +157,27 @@ func TestBuildRecentItems_UnreadSurvivesWindow(t *testing.T) {
 		makeRawConv("g-stale-unread", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 3),
 		makeRawConv("g-stale-read", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0),
 	}
-	items := buildRecentItems(convs, defaultRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, defaultRecentCutoffs(), nil, nil, nil, nil, "")
 
 	require.Len(t, items, 1)
 	assert.Equal(t, "g-stale-unread", items[0].TargetID)
 	assert.Equal(t, 3, items[0].Unread, "未读数必须原样透出，不能因豁免路径丢字段")
+}
+
+func TestRecentWindowBuildItems_ManualUnreadSurvivesWindow(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		makeRawConv("g-stale-manual", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0),
+		makeRawConv("g-stale-plain", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0),
+	}
+	manualUnreadSet := map[string]struct{}{
+		channelKey("g-stale-manual", common.ChannelTypeGroup.Uint8()): {},
+	}
+
+	items := buildRecentItems(convs, defaultRecentCutoffs(), nil, manualUnreadSet, nil, nil, "")
+
+	require.Len(t, items, 1)
+	assert.Equal(t, "g-stale-manual", items[0].TargetID)
+	assert.True(t, items[0].ManualUnread)
 }
 
 // 两个端点在同一输入上必须给出同一可见集合 —— 本 task 的核心不变量。
@@ -174,8 +200,16 @@ func TestRecentWindow_BothEndpointsAgree(t *testing.T) {
 		makeSyncRespUnread("g-stale-unread", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 2),
 		makeSyncRespUnread(pinnedID, common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0),
 	}
+	manualID := "g-stale-manual"
+	rawConvs = append(rawConvs, makeRawConv(manualID, common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0))
+	manualResp := makeSyncRespUnread(manualID, common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0)
+	manualResp.Extra = &conversationExtraResp{ManualUnread: true}
+	respConvs = append(respConvs, manualResp)
+	manualUnreadSet := map[string]struct{}{
+		channelKey(manualID, common.ChannelTypeGroup.Uint8()): {},
+	}
 
-	items := buildRecentItems(rawConvs, cutoffs, pinned, nil, nil, "")
+	items := buildRecentItems(rawConvs, cutoffs, pinned, manualUnreadSet, nil, nil, "")
 	sidebarIDs := make([]string, 0, len(items))
 	for _, it := range items {
 		sidebarIDs = append(sidebarIDs, it.TargetID)

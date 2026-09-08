@@ -29,48 +29,17 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-const masterKeyEnvConvE2E = "OCTO_MASTER_KEY"
-
-// One long-lived fake WuKongIM server for the whole file. Per-test httptest
-// servers proved fragile: testutil.NewTestServer binds the registered handler's
-// ctx to the FIRST server's config, so a per-test APIURL (whose server is then
-// closed) leaves later tests dialling a dead port. A single never-closed server
-// with a mutable response slice keeps the URL stable and alive across all tests.
-// Tests run sequentially (no t.Parallel), so the shared slice needs no lock.
-var (
-	fakeIMOnce  sync.Once
-	fakeIMSrv   *httptest.Server
-	fakeIMConvs []*config.SyncUserConversationResp
-)
-
-func sharedFakeIM() *httptest.Server {
-	fakeIMOnce.Do(func() {
-		fakeIMSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if strings.HasSuffix(r.URL.Path, "/conversation/sync") {
-				_, _ = w.Write([]byte(util.ToJson(fakeIMConvs)))
-				return
-			}
-			_, _ = w.Write([]byte("{}"))
-		}))
-	})
-	return fakeIMSrv
-}
 
 // dmIMConv builds a DM conversation as IMSyncUserConversation would return it,
 // with a single non-deleted recent message so the handler keeps it (the build
@@ -97,47 +66,6 @@ func dmIMConv(channelID string, ts, version int64, seq uint32) *config.SyncUserC
 			},
 		},
 	}
-}
-
-// setupConvSyncE2E wires a test server whose IM is the shared fake (returning
-// the given conversation slice), with a SuperAdmin token (needed for the
-// system_setting write) that also authenticates the conversation/sync call. It
-// resets the per-uid rate-limit bucket and the cursor Redis keys so each test
-// starts clean, and pins MessageSaveAcrossDevice off so the syncack
-// cursor-persist path is exercised deterministically.
-func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*server.Server, *config.Context) {
-	t.Helper()
-	t.Setenv(masterKeyEnvConvE2E, "0123456789abcdef0123456789abcdef")
-
-	// Point the IM at the shared fake and load this test's conversation slice
-	// before any NewTestServer so the very first ctx already sees the live URL.
-	fakeIMConvs = convs
-	imURL := sharedFakeIM().URL
-
-	s, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
-
-	cfg := ctx.GetConfig()
-	cfg.MessageSaveAcrossDevice = false
-	cfg.WuKongIM.APIURL = imURL
-
-	// SuperAdmin token: authenticates /v1/conversation/sync AND authorizes the
-	// /v1/manager/common/system_setting write. Format uid@name@role (token_parser).
-	require.NoError(t, ctx.Cache().Set(
-		cfg.Cache.TokenCachePrefix+testutil.Token,
-		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
-	))
-
-	// Clean per-uid rate-limit bucket + cursor keys (persist in Redis across runs,
-	// not cleared by CleanAllTables).
-	_ = ctx.GetRedisConn().Del("ratelimit:uid:" + testutil.UID)
-	_ = ctx.GetRedisConn().Del("userMaxVersion:" + testutil.UID)
-
-	// Start from a known settings snapshot (the singleton may hold sidebar.* rows
-	// from a prior test within the ~60s auto-reload TTL).
-	require.NoError(t, commonapi.EnsureSystemSettings(ctx).Reload())
-
-	return s, ctx
 }
 
 // writePersonWindowDays sets sidebar.recent_filter_person_days via the admin HTTP
