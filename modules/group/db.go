@@ -473,6 +473,11 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 //
 // 这个窗口一直都在，但 P2 之前只有人手点"改群名"才会走到；D8 让它变成机器驱动的
 // ——每一次项目改名都自动跑一次全员群改名。PR #855 第五轮 review 的 Q9。
+// 带 status 谓词：解散是终态，改名不该落在一个已经解散的群上。UpdateGroupInfo 在
+// 无锁读上检查过 status，但那次检查与这次写之间有窗口，而窗口里发生的解散正是 D8
+// 的机器驱动流量会撞上的——第六轮 review 指出列级写只关掉了"改名把解散盖回去"这
+// 一半，另一半（改名照样落库、推版本、发通知）还在。谓词在 WHERE 里，所以影响 0 行
+// 就是全部效果：不报错，调用方的幂等语义不变。
 func (d *DB) UpdateNameNoticeTx(groupNo string, name, notice *string, version int64, tx *dbr.Tx) error {
 	set := map[string]interface{}{"version": version}
 	if name != nil {
@@ -481,7 +486,8 @@ func (d *DB) UpdateNameNoticeTx(groupNo string, name, notice *string, version in
 	if notice != nil {
 		set["notice"] = *notice
 	}
-	_, err := tx.Update("group").SetMap(set).Where("group_no=?", groupNo).Exec()
+	_, err := tx.Update("group").SetMap(set).
+		Where("group_no=? AND status<>?", groupNo, GroupStatusDisband).Exec()
 	return err
 }
 

@@ -259,9 +259,11 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 		}
 		switch {
 		case successor == "" || successor == keeper:
-			// 无可交接（项目没有活跃 owner），或目标就是现任。群主留在原处——
-			// 交给一个非 owner 比留着一个前 owner 更糟。多群主仍要收敛，所以
-			// 这里不 return。
+			// 项目没有活跃 owner（或目标就是现任）。群主留在原处——交给一个非
+			// owner 比留着一个前 owner 更糟。多群主仍要收敛，所以这里不 return。
+			//
+			// 不必再在 creators 里找 owner：PickActiveOwner 与下面那次查找读的是
+			// 同一张表、同一个事务，它返回空就意味着这个项目一个活跃 owner 都没有。
 		case containsUID(creators, successor):
 			// 继任者**已经**是 creator 行之一，即群里此刻有多个群主而目标就在
 			// 其中。不能再提升一次：updateMemberRoleIfLiveTx 对一行本就是 creator
@@ -280,10 +282,27 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 				// 全员群的成员集合等于项目成员集合，所以一个项目 owner 正常总是在群里；
 				// 不在，说明 D12 的那次入群失败了（I4 扫描 B 正盯着这件事）。这种情况下
 				// 不把群主交给他——一个不在群里的群主客户端渲染不出来，而且下一次入群成功时
-				// 他会以普通成员身份被写回，角色就丢了。留在原处，等扫描报出来。
-				g.Warn("全员群群主同步：目标 owner 不在群内，保持原群主不变（I4 扫描 B 会报出缺口）",
+				// 他会以普通成员身份被写回，角色就丢了。
+				//
+				// 但也**不能**就这么留着 creators[0]：它已经被判定为非 owner，而下面的
+				// 收敛会把其余每一行 creator 降级——其中可能正有一个仍然是项目 owner 的人
+				// （PickActiveOwner 只返回最元老的那一个，更年轻的 owner 它不返回）。
+				// 那样这一次同步会**亲手**把群里唯一合法的群主降掉，只留下一个非 owner；
+				// 而 D7 禁止对全员群转让/退群/解散，没有任何扫描盯着"群主是不是项目
+				// owner"这条关系，于是这个状态既修不了也看不见。
+				//
+				// 上一版就是这么写的，第六轮 review 逐行推出了这条路径。规则改成：
+				// 留任者从"仍是项目 owner 的 creator"里选，选不出来才退回 creators[0]。
+				fallback, ferr := firstActiveProjectOwner(tx, projectID, creators)
+				if ferr != nil {
+					return ferr
+				}
+				if fallback != "" {
+					keeper = fallback
+				}
+				g.Warn("全员群群主同步：目标 owner 不在群内，保持群内已有的项目 owner 或原群主（I4 扫描 B 会报出缺口）",
 					zap.String("projectId", projectID), zap.String("groupNo", groupNo),
-					zap.String("successor", successor))
+					zap.String("successor", successor), zap.String("keeper", keeper))
 			}
 		}
 	}
@@ -325,6 +344,26 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 			zap.String("keeper", keeper), zap.Strings("demoted", demoted))
 	}
 	return nil
+}
+
+// firstActiveProjectOwner 返回 uids 里第一个仍是项目活跃 owner 的 uid，都不是则 ""。
+//
+// 只在"目标 owner 不在群里"那条分支上调用，也就是收敛即将把其余 creator 全部降级、
+// 而留任者本身不是 owner 的时候。uids 是这个群的 creator 行，正常是一行、异常是两行，
+// 所以这里的逐个查询是有界的，而且这条分支本身就已经是异常路径。
+//
+// 走 tx，与本函数其余的项目侧查询同一个理由：答案必须来自会落盘的那个快照。
+func firstActiveProjectOwner(tx *dbr.Tx, projectID string, uids []string) (string, error) {
+	for _, uid := range uids {
+		role, ok, err := projectpkg.MemberRole(tx, projectID, uid)
+		if err != nil {
+			return "", fmt.Errorf("group: read project role of creator candidate: %w", err)
+		}
+		if ok && role == projectRoleOwner {
+			return uid, nil
+		}
+	}
+	return "", nil
 }
 
 // containsUID 报告 uid 是否在 uids 里。

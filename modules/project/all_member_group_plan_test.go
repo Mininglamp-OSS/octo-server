@@ -2,6 +2,8 @@ package project
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
@@ -111,6 +113,45 @@ func splitPredicateStatements(projectID, groupNo string) map[string]planStatemen
 		"queryAllMemberGroupNo group read": {
 			sql: sqlProjectAllMemberGroupRow, args: []interface{}{groupNo, groupStatusDisband, projectID},
 		},
+		// The repair write. It was the last statement on a write path still carrying
+		// the joined-with-COLLATE shape; a project with no active owner pays it on
+		// every members/add and buys nothing. PR #855s sixth review, P2-1.
+		"clearStaleAllMemberGroupPointer write": {
+			sql:  sqlProjectClearStaleAllMemberGroup,
+			args: []interface{}{projectID, StatusNormal, groupNo},
+		},
+	}
+}
+
+// TestTheSplitPredicatesAreWhatProductionRuns closes the gap the plan guard has on
+// its own: it EXPLAINs constants, and a constant stays referenced by this test even
+// if the production function stops using it.
+//
+// So somebody could re-inline a joined query into IsAllMemberGroup, leave the
+// constant in place, and the plan guard would stay green while production
+// regressed to the shape the fifth review blocked on. PR #855s sixth review, P2-4.
+func TestTheSplitPredicatesAreWhatProductionRuns(t *testing.T) {
+	for path, wanted := range map[string][]string{
+		"../../pkg/project/all_member_group.go": {
+			"sqlAllMemberGroupPointer", "sqlAllMemberGroupRow",
+		},
+		"db_all_member_group.go": {
+			"sqlProjectAllMemberGroupPointer",
+			"sqlProjectAllMemberGroupRow",
+			"sqlProjectClearStaleAllMemberGroup",
+		},
+	} {
+		raw, err := os.ReadFile(path)
+		require.NoError(t, err)
+		src := string(raw)
+		for _, name := range wanted {
+			// Twice: the declaration and at least one use. A constant declared and
+			// never executed is exactly the state this guard exists to catch.
+			require.GreaterOrEqual(t, strings.Count(src, name), 2,
+				"%s must both declare and USE %s — the plan guard EXPLAINs that constant, "+
+					"so a production function that stopped running it would regress silently "+
+					"with every plan assertion still green", path, name)
+		}
 	}
 }
 

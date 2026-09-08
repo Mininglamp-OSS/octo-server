@@ -274,6 +274,47 @@ still produce the bug is part of the test — and the same pair of assertions is
 argument for why the join was split rather than re-collated, held in CI instead of
 in a comment.
 
+### A step that removes alternatives has to be able to defend the one it keeps
+
+The fifth round made "two `role=creator` rows" a state to repair: pick a keeper,
+demote everyone else. The demote loop was correct. The keeper choice had an arm
+where it was not — the pool-picked successor is the *senior* project owner, and
+when that person is not in the group the promotion falls through and the keeper
+stayed the senior creator, who had already been established as a non-owner. If a
+*junior* owner held one of the other creator rows, the convergence then demoted
+the only valid owner the group had.
+
+The state it produced was worse than the state it was fixing. Before, the input
+wrote nothing and left two creators, one of them valid. After, one creator, not
+valid — and unreachable: D7 refuses transfer, exit and disband, the sync only
+re-fires on a project owner change, and no scan asks whether a group's creator is
+a project owner.
+
+The lesson is not about owners. Adding a step that *deletes* alternatives changes
+what every earlier branch is responsible for: each one now has to justify the
+survivor, not merely name a default. The two tests written with the fix both
+exercised arms where the default happened to be right, which is the ordinary way
+this gets missed — the arm with no case was the arm that misbehaved.
+
+### A guard whose subject is named in the prose beside it is not a guard
+
+Fourth variation on the same theme in this change, and the sharpest. The
+thread-subscription fix was pinned by a source guard matching the token
+`addUsersToGroupThreads` in the function body. The doc comment two lines above the
+call names the function, so the reviewer deleted the call — nothing else — and the
+guard stayed green.
+
+The earlier variations were about the guard's *file list* (a guard that names its
+subject file cannot see the file added beside it) and its *inputs* (an enumeration
+guard is only as good as the paths it drives). This one is about its *haystack*:
+source text contains both the code and the writing about the code, and a match
+against the raw bytes cannot tell them apart. Strip comments, and match a call —
+receiver and open paren — not a name.
+
+Worth noting what did work. Two other source guards in the same commit were
+mutated by the same reviewer and both went red, because both matched call shapes.
+The technique is fine; the haystack was not.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

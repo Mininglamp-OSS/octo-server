@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
+
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -30,48 +32,76 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 	defer testutil.CleanAllTables(ctx)
 	g := New(ctx)
 
-	const groupNo = "g_column_write"
+	// Case 1 — the group was disbanded and locked down after the caller's snapshot.
+	const disbanded = "g_column_write"
 	_, err := ctx.DB().InsertBySql(
 		"INSERT INTO `group` (group_no, name, creator, status, `version`, notice, forbidden, invite) "+
 			"VALUES (?, 'before', 'u_c', 1, 1, 'notice text', 1, 1)",
-		groupNo).Exec()
+		disbanded).Exec()
 	require.NoError(t, err)
-
-	// Somebody else disbands and locks the group down after the caller's snapshot
-	// was taken. A full-row write-back would restore all three.
 	_, err = ctx.DB().UpdateBySql(
 		"UPDATE `group` SET status = ?, forbidden = 0, invite = 0 WHERE group_no = ?",
-		GroupStatusDisband, groupNo).Exec()
+		GroupStatusDisband, disbanded).Exec()
 	require.NoError(t, err)
 
 	name := "after"
 	tx, err := ctx.DB().Begin()
 	require.NoError(t, err)
-	require.NoError(t, g.db.UpdateNameNoticeTx(groupNo, &name, nil, 99, tx))
+	require.NoError(t, g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, tx))
 	require.NoError(t, tx.Commit())
 
-	var rows []struct {
-		Name      string `db:"name"`
-		Version   int64  `db:"version"`
-		Status    int    `db:"status"`
-		Notice    string `db:"notice"`
-		Forbidden int    `db:"forbidden"`
-		Invite    int    `db:"invite"`
-	}
-	_, err = ctx.DB().SelectBySql(
+	row := readGroupColumns(t, ctx, disbanded)
+	require.Equal(t, GroupStatusDisband, row.Status,
+		"a rename must not resurrect a disbanded group")
+	require.Equal(t, 0, row.Forbidden, "a rename must not touch the mute flag")
+	require.Equal(t, 0, row.Invite, "a rename must not touch the invite switch")
+	require.Equal(t, "notice text", row.Notice,
+		"and a name-only update must leave the notice alone")
+	require.Equal(t, "before", row.Name,
+		"the rename must not LAND either: the service checked status on a pooled read, "+
+			"and a disband committing in that window would otherwise still get a new name, "+
+			"a bumped version and an update notification pushed to a group that is gone")
+	require.EqualValues(t, 1, row.Version, "and no version bump for a write that did nothing")
+
+	// Case 2 — a live group, so the status predicate cannot pass by refusing everything.
+	const live = "g_column_write_live"
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, `version`, notice, forbidden, invite) "+
+			"VALUES (?, 'before', 'u_c', 1, 1, 'notice text', 1, 1)",
+		live).Exec()
+	require.NoError(t, err)
+
+	tx, err = ctx.DB().Begin()
+	require.NoError(t, err)
+	require.NoError(t, g.db.UpdateNameNoticeTx(live, &name, nil, 42, tx))
+	require.NoError(t, tx.Commit())
+
+	row = readGroupColumns(t, ctx, live)
+	require.Equal(t, "after", row.Name, "a live group still gets renamed")
+	require.EqualValues(t, 42, row.Version)
+	require.Equal(t, "notice text", row.Notice, "name-only leaves the notice")
+	require.Equal(t, 1, row.Forbidden, "and leaves the mute flag")
+	require.Equal(t, 1, row.Invite, "and the invite switch")
+}
+
+type groupColumns struct {
+	Name      string `db:"name"`
+	Version   int64  `db:"version"`
+	Status    int    `db:"status"`
+	Notice    string `db:"notice"`
+	Forbidden int    `db:"forbidden"`
+	Invite    int    `db:"invite"`
+}
+
+func readGroupColumns(t *testing.T, tctx *config.Context, groupNo string) groupColumns {
+	t.Helper()
+	var rows []groupColumns
+	_, err := tctx.DB().SelectBySql(
 		"SELECT name, `version`, status, notice, forbidden, invite FROM `group` WHERE group_no = ?",
 		groupNo).Load(&rows)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
-
-	require.Equal(t, "after", rows[0].Name)
-	require.EqualValues(t, 99, rows[0].Version)
-	require.Equal(t, GroupStatusDisband, rows[0].Status,
-		"a rename must not resurrect a disbanded group")
-	require.Equal(t, 0, rows[0].Forbidden, "a rename must not touch the mute flag")
-	require.Equal(t, 0, rows[0].Invite, "a rename must not touch the invite switch")
-	require.Equal(t, "notice text", rows[0].Notice,
-		"and a name-only update must leave the notice alone")
+	return rows[0]
 }
 
 // TestUpdateGroupInfoDoesNotWriteTheWholeRow is the half the case above cannot

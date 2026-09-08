@@ -282,11 +282,18 @@ func TestAllMemberAdmissionPairsThreadSubscriptionWithTheParent(t *testing.T) {
 	require.Positive(t, i, "admitToAllMemberGroup not found")
 	end := strings.Index(body[i:], "\n}\n")
 	require.Positive(t, end, "could not delimit admitToAllMemberGroup")
-	fn := body[i : i+end]
 
-	require.Contains(t, fn, "IMAddSubscriber",
+	// Comments stripped, and the assertions match CALLS rather than bare tokens.
+	//
+	// The first version of this guard did neither, and the doc comment two lines
+	// above the call names the function — so deleting the CALL left this test green.
+	// PR #855s sixth review executed exactly that mutation. A guard whose subject
+	// also appears in the prose beside its subject is not a guard.
+	fn := stripLineComments(body[i : i+end])
+
+	require.Contains(t, fn, "ctx.IMAddSubscriber(",
 		"precondition: the admitter subscribes to the parent channel")
-	require.Contains(t, fn, "addUsersToGroupThreads",
+	require.Contains(t, fn, "g.addUsersToGroupThreads(",
 		"the admitter must ALSO subscribe the new member to the group's threads. A thread "+
 			"is its own WuKongIM channel and its own subscriber list, so the parent "+
 			"subscription does not carry into it: without this the member cannot post in "+
@@ -295,8 +302,25 @@ func TestAllMemberAdmissionPairsThreadSubscriptionWithTheParent(t *testing.T) {
 			"rows, not subscriptions). Every other admission path in this module pairs the "+
 			"two, and removal is symmetric.")
 
-	require.Less(t, strings.Index(fn, "IMAddSubscriber"), strings.Index(fn, "addUsersToGroupThreads"),
+	require.Less(t,
+		strings.Index(fn, "ctx.IMAddSubscriber("), strings.Index(fn, "g.addUsersToGroupThreads("),
 		"the parent subscription comes first, matching every sibling path")
+}
+
+// stripLineComments blanks out // comments so a source guard matches code rather
+// than prose about the code.
+//
+// Over-stripping is the safe direction for a guard: removing text can only make an
+// assertion harder to satisfy, never easier. (It would also cut a // inside a
+// string literal, which the functions guarded here do not contain.)
+func stripLineComments(src string) string {
+	lines := strings.Split(src, "\n")
+	for i, line := range lines {
+		if at := strings.Index(line, "//"); at >= 0 {
+			lines[i] = line[:at]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // seedGroupMemberRole writes one group_member row with an explicit role and age.
@@ -442,4 +466,58 @@ func TestOwnerSyncAsksTheProjectInsideItsOwnTransaction(t *testing.T) {
 			"the writes land in")
 	require.NotContains(t, fn, "ctx.DB()."+"Select",
 		"no pooled read may reappear inside the sync's transaction")
+}
+
+// TestOwnerSyncKeepsTheOwnerInTheGroupWhenTheSeniorOwnerIsMissing covers the one
+// arm of the convergence that misbehaved: the pool-picked successor cannot be
+// promoted, and another creator IS still a project owner.
+//
+// PickActiveOwner returns the SENIOR active owner and only that one. When that
+// person is not in the group — the D12 admission gap I4 scan B exists to report —
+// the promotion falls through, and the previous version kept creators[0] and then
+// demoted everyone else. If a junior owner held one of those creator rows, this
+// sync DEMOTED the only valid owner the group had and left a non-owner in charge:
+// unrepairable from the group side (D7 refuses transfer, exit and disband), not
+// retried (the sync only re-fires on a project owner change), and invisible (no
+// scan asks whether a group's creator is a project owner).
+//
+// Worse than the state it replaced, which was "two creators, one of them valid".
+// PR #855s sixth review traced it line by line.
+func TestOwnerSyncKeepsTheOwnerInTheGroupWhenTheSeniorOwnerIsMissing(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer testutil.CleanAllTables(ctx)
+	g := New(ctx)
+
+	const projectID, spaceID, groupNo = "p_conv3", "s_conv3", "grp_conv3"
+	// u_a is the senior project owner and is deliberately NOT in the group.
+	seedProjectForGroupTest(t, ctx, projectID, spaceID, "u_a")
+	// u_b is a junior project owner, written a second later so seniority is not a tie.
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
+			"VALUES (?, ?, ?, 2, 1, 0, ?, DATE_ADD(NOW(3), INTERVAL 1 SECOND), NOW(3))",
+		projectID, "u_b", spaceID, "u_a").Exec()
+	require.NoError(t, err)
+
+	seedAllMemberGroupRow(t, ctx, groupNo, projectID, spaceID, "u_stale")
+	// The senior creator is not a project member at all; the junior one is the
+	// project owner who is actually in the group.
+	seedGroupMemberRole(t, ctx, groupNo, "u_stale", MemberRoleCreator, 10)
+	seedGroupMemberRole(t, ctx, groupNo, "u_b", MemberRoleCreator, 5)
+
+	require.Equal(t, "u_a", mustPickActiveOwner(t, ctx, projectID),
+		"precondition: the pool pick is the senior owner, who is NOT in the group")
+
+	require.NoError(t, g.ensureAllMemberGroupOwner(ctx, projectID, groupNo))
+
+	require.Equal(t, []string{"u_b"}, creatorsOf(t, ctx, groupNo),
+		"the convergence must keep the creator who is still a project owner. Demoting "+
+			"them because the SENIOR owner could not be promoted leaves the group owned by "+
+			"a non-owner, with no group-face path to repair it and no scan reporting it")
+}
+
+func mustPickActiveOwner(t *testing.T, tctx *config.Context, projectID string) string {
+	t.Helper()
+	got, err := projectpkg.PickActiveOwner(tctx.DB(), projectID)
+	require.NoError(t, err)
+	return got
 }

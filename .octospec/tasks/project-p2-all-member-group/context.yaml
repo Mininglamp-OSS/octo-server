@@ -1146,6 +1146,99 @@ pr_855_round_5_fixed:
       cap the roster (a capped rebuild is the defect the third round fixed).
       open_verification carries the measurement.
 
+# PR #855 sixth pass. One reviewer (yujiawei) on 3db5f9c, two blocking findings,
+# BOTH against the fifth round's own fixes -- one a behavioural regression the fix
+# introduced, one a guard that passed with its subject deleted.
+pr_855_round_6_fixed:
+  - id: the-convergence-could-demote-the-only-valid-owner
+    severity: blocking
+    where: modules/group/all_member_group.go ensureAllMemberGroupOwner
+    what: |
+      The keeper was chosen before it was known whether the pool-picked successor
+      could be promoted, and was never reconsidered when the promotion fell
+      through. Reachable: creators = [S, B] where S is senior and no longer an
+      owner and B IS an active project owner; PickActiveOwner returns A, the
+      SENIOR owner, who is not in the group (the D12 gap scan B reports); the
+      promotion finds no live member row; the keeper stays S; and the new
+      convergence loop then demotes B.
+    why: |
+      Strictly worse than the state the convergence replaced. Before, this input
+      wrote nothing and left {S, B} -- unconverged, but with a valid owner still in
+      control. After, the group's only creator is a non-owner: D7 refuses transfer,
+      exit and disband so no group-face path repairs it, the sync only re-fires on
+      a project owner change, and NO scan asks whether a group's creator is a
+      project owner. Two independent external events are needed to escape it.
+    fix: |
+      The keeper is chosen from "creators who are still active project owners"
+      before falling back to creators[0], via firstActiveProjectOwner on the same
+      transaction. Skipped entirely when PickActiveOwner returned "" -- that answer
+      already means the project has no active owner at all, so no creator can be
+      one either.
+    test: TestOwnerSyncKeepsTheOwnerInTheGroupWhenTheSeniorOwnerIsMissing
+    mutation: "reverting to keeping creators[0] leaves it red."
+    note: |
+      Neither round-5 test could see this: one had the senior creator BE the owner,
+      the other had the picked owner already in creators. The arm that misbehaved
+      was the only one with no case.
+  - id: the-thread-guard-passed-with-its-subject-deleted
+    severity: blocking
+    where: modules/group/all_member_group_test.go
+    what: |
+      The guard matched the bare token addUsersToGroupThreads against the raw
+      function source. The doc comment two lines above the call names the function,
+      so deleting the CALL left the guard green -- the reviewer executed exactly
+      that mutation and reported ok.
+    why: |
+      The fifth round asked for this fix to be pinned and this test was the pin
+      offered. A guard whose subject also appears in the prose beside its subject
+      is not a guard, and the absence being pinned had already shipped once
+      undetected.
+    fix: |
+      Comments are stripped from the function body before searching, and both
+      assertions now match CALLS (ctx.IMAddSubscriber( / g.addUsersToGroupThreads()
+      rather than tokens. Over-stripping is the safe direction: removing text can
+      only make an assertion harder to satisfy.
+    mutation: "deleting the call now turns it red; verified with the reviewers exact mutation."
+  - id: the-last-joined-write-path-statement
+    severity: medium
+    where: modules/project/db_all_member_group.go clearStaleAllMemberGroupPointer
+    what: |
+      The one statement on a write path still shaped as a JOIN UPDATE with COLLATE
+      on the driving side, i.e. one full scan of `group` per call under the
+      production collation shape.
+    why: |
+      Exposure is small but not zero and not once-only: a project with no active
+      owner returns before provisioning, so every members/add on it pays the scan
+      and buys nothing.
+    fix: |
+      Three single-table statements -- read the pointer, check the group row, then
+      a clear fenced on the pointer value that was read. The fence is a guarantee
+      the joined form did not have: a concurrently written new pointer is not
+      cleared. Atomicity is not lost in any reachable way, because a group cannot
+      go from unusable back to usable (disband is terminal, project_id is immutable
+      by I3). The plan guard now covers this statement too.
+  - id: a-rename-could-still-land-on-a-disbanded-group
+    severity: medium
+    where: modules/group/db.go UpdateNameNoticeTx
+    what: |
+      The column-level write closed the expensive half (a rename could no longer
+      resurrect a disband) and left the other half: UpdateGroupInfo checks status on
+      a pooled read, and the write carried no status predicate, so a rename landing
+      after a concurrent disband still wrote the name, bumped the version and
+      pushed an update notification for a group that is gone.
+    why: "D8 drives this path machine-side on every project rename, so the window is no longer a human-click rarity."
+    fix: "AND status <> disband in the WHERE. Zero rows affected is the whole effect; no error, no change to the caller's idempotence."
+    test: "TestUpdateGroupInfoWritesColumnsNotTheWholeRow, now with both a disbanded case (nothing lands) and a live case (so the predicate cannot pass by refusing everything). The previous version of this test CODIFIED the residue -- it disbanded the group and expected the rename to succeed."
+  - id: the-plan-guard-could-not-see-a-re-inlined-query
+    severity: low
+    where: modules/project/all_member_group_plan_test.go
+    what: |
+      The plan guard EXPLAINs statement constants. A constant stays referenced by
+      the test itself, so re-inlining a joined query into IsAllMemberGroup while
+      leaving the constant declared would regress production with every plan
+      assertion still green.
+    fix: "TestTheSplitPredicatesAreWhatProductionRuns requires each constant to appear at least twice in its own file -- declared AND used."
+
 verify:
   rules_rechecked:
     - id: space-isolation

@@ -56,20 +56,50 @@ const (
 //
 // 谓词与 queryAllMemberGroupNo 互为补集：只在"指针非空、但它指的群已经不合格"时
 // 才清。指针为空、或群仍然合格，都影响 0 行。
+//
+// # 三条单表语句，不是一条 JOIN UPDATE
+//
+// 上一版是 `UPDATE octo_project p LEFT JOIN group g ...`，COLLATE 写在驱动侧——
+// 与 IsAllMemberGroup 当初一样的形状，也就是同一个代价：生产里 `group` 是
+// 0900_ai_ci，显式 COLLATE 让比较落在 general_ci，group_groupNo 用不上，每调用一次
+// 就是一次 `group` 全表扫。这是本改动里最后一条留着那个形状的**写路径**语句，
+// 第六轮 review 点了名。
+//
+// 暴露面确实小：ensureAllMemberGroup 只在 queryAllMemberGroupNo 返回空之后才走到
+// 这里，健康项目根本不会调用。但有一种会**反复**踩到的状态——一个没有活跃 owner
+// 的项目在补建前就返回了，于是它的每一次 members/add 都付这次全表扫而什么都换不到。
+//
+// 拆成三步之后没有任何跨 schema 比较：读指针（走 uk_octo_project_project_id）、
+// 单表核对群行（走 group_groupNo）、按**读到的那个指针值**做栅栏的单表 UPDATE。
+// 栅栏是拆分带来的、原来没有的保障：如果这中间别人写回了一个新群号，UPDATE 影响
+// 0 行，不会把新指针误清掉。
+//
+// 原子性上的差别可以忽略：一个群从"不合格"回到"合格"是不可能的——解散是终态，
+// group.project_id 由 I3 定为不可变，detach 之后不会再指回来。
 func (d *DB) clearStaleAllMemberGroupPointer(projectID string) (bool, error) {
 	if projectID == "" {
 		return false, nil
 	}
+	var pointers []string
+	if _, err := d.session.SelectBySql(
+		sqlProjectAllMemberGroupPointer, projectID, StatusNormal,
+	).Load(&pointers); err != nil {
+		return false, fmt.Errorf("project: read pointer before stale clear: %w", err)
+	}
+	if len(pointers) == 0 || pointers[0] == "" {
+		return false, nil // 指针本来就是空的，没有陈旧可言
+	}
+	var alive []int
+	if _, err := d.session.SelectBySql(
+		sqlProjectAllMemberGroupRow, pointers[0], groupStatusDisband, projectID,
+	).Load(&alive); err != nil {
+		return false, fmt.Errorf("project: check group before stale clear: %w", err)
+	}
+	if len(alive) > 0 {
+		return false, nil // 群仍然合格，指针不陈旧
+	}
 	result, err := d.session.UpdateBySql(
-		"UPDATE octo_project p "+
-			"LEFT JOIN `group` g "+
-			"  ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
-			"  AND g.status <> ? "+
-			"  AND g.project_id = p.project_id COLLATE utf8mb4_general_ci "+
-			"SET p.all_member_group_no = '', p.all_member_group_lease_until = NULL "+
-			"WHERE p.project_id = ? AND p.status = ? "+
-			"  AND p.all_member_group_no <> '' AND g.id IS NULL",
-		groupStatusDisband, projectID, StatusNormal,
+		sqlProjectClearStaleAllMemberGroup, projectID, StatusNormal, pointers[0],
 	).Exec()
 	if err != nil {
 		return false, fmt.Errorf("project: clear stale all-member group pointer: %w", err)
@@ -243,6 +273,11 @@ const (
 		"WHERE project_id = ? AND status = ? AND all_member_group_no <> ''"
 	sqlProjectAllMemberGroupRow = "SELECT 1 FROM `group` " +
 		"WHERE group_no = ? AND status <> ? AND project_id = ?"
+
+	// 清陈旧指针的写，按读到的指针值做栅栏。单表，无跨 schema 比较。
+	sqlProjectClearStaleAllMemberGroup = "UPDATE `octo_project` " +
+		"SET all_member_group_no = '', all_member_group_lease_until = NULL " +
+		"WHERE project_id = ? AND status = ? AND all_member_group_no = ?"
 )
 
 // queryAllMemberGroupNo 读一个活跃项目**当前仍然拥有**的全员群号。
