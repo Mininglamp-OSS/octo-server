@@ -465,3 +465,107 @@ func TestDisbandedProjectsDoNotSpendThePinBudget(t *testing.T) {
 	assert.Equal(t, http.StatusOK, setPinned(t, srv, created[max].ProjectID, tok, true).Code,
 		"a pin on a disbanded project must not hold a slot the caller can no longer free")
 }
+
+// TestUnlistedProjectsDoNotSpendThePinBudget is the sibling of
+// TestDisbandedProjectsDoNotSpendThePinBudget, and PR #861's review found it
+// missing: the disband trap was handled, the unlisted trap produced the identical
+// unreachable state while status stayed normal.
+//
+// The sequence is all ordinary actions. A common Space member pins a space_listed
+// project they never joined (explicitly allowed — see
+// TestASpaceAdminCanPinAProjectTheyNeverJoined). Its owner flips discoverability to
+// unlisted, which is a routine owner action. The project now leaves the pinner's
+// list, and projectMiddleware answers not_found on PUT /:project_id/setting — the
+// ONLY unpin path — so the pin is unreachable through every API surface. If it
+// still counted, each flip would permanently burn one of six slots with no
+// self-service remedy, and the refusal would say "you have pinned 6" to someone
+// whose own list shows 5.
+func TestUnlistedProjectsDoNotSpendThePinBudget(t *testing.T) {
+	srv, p := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	pinnerTok := seedUser(t, "pinner")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	seedSpaceMember(t, spaceA, "pinner", 0, 1) // ordinary member, NOT a Space admin
+
+	max := p.cfg.MaxPinned
+	trapped := createProjectVia(t, srv, spaceA, ownerTok, "unlisted-trap")
+	require.Equal(t, http.StatusOK, setPinned(t, srv, trapped.ProjectID, pinnerTok, true).Code,
+		"a space_listed project is pinnable by any Space member")
+
+	// A routine owner action.
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+trapped.ProjectID, ownerTok,
+		map[string]any{"discoverability": DiscoverabilityUnlisted}).Code)
+
+	// The pin is now unreachable: gone from the list, and unpin is refused.
+	assert.NotContains(t, pinnedFlags(t, srv, spaceA, pinnerTok), trapped.ProjectID,
+		"an unlisted project leaves a non-member's list")
+	assertProjectErrorCode(t, setPinned(t, srv, trapped.ProjectID, pinnerTok, false),
+		"err.server.project.not_found")
+
+	// So it must not hold a slot. The full budget stays available.
+	for i := 0; i < max; i++ {
+		visible := createProjectVia(t, srv, spaceA, ownerTok, fmt.Sprintf("unlisted-ok-%d", i))
+		require.Equal(t, http.StatusOK, setPinned(t, srv, visible.ProjectID, pinnerTok, true).Code,
+			"pin %d of %d must succeed: a pin the caller can neither see nor remove must "+
+				"not consume their budget", i+1, max)
+	}
+	assert.Len(t, pinnedFlagsPinnedOnly(t, srv, spaceA, pinnerTok), max,
+		"and the count the quota enforces equals what the list shows")
+}
+
+// TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget is the same trap by the
+// other door: the pin was legitimate while the caller was a member, and closing
+// their seat makes an unlisted project invisible to them without touching the row.
+func TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	mateTok := seedUser(t, "mate")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	seedSpaceMember(t, spaceA, "mate", 0, 1)
+
+	created := createProjectVia(t, srv, spaceA, ownerTok, "removed-member-pin")
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		map[string]any{"uids": []string{"mate"}}).Code)
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, mateTok, true).Code)
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID, ownerTok,
+		map[string]any{"discoverability": DiscoverabilityUnlisted}).Code)
+
+	// Removing the seat is what makes it invisible; the pin row is untouched.
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/remove", ownerTok,
+		map[string]any{"uids": []string{"mate"}}).Code)
+	flushProjectCache(t, testCtx)
+
+	assert.Zero(t, countPinnedForTest(t, spaceA, "mate"),
+		"a pin the caller can no longer reach must stop counting, whichever of the two "+
+			"doors made it unreachable")
+}
+
+// pinnedFlagsPinnedOnly is pinnedFlags narrowed to the projects actually pinned,
+// which is the number a user compares against the cap when the refusal arrives.
+func pinnedFlagsPinnedOnly(t *testing.T, srv *server.Server, spaceID, token string) []string {
+	t.Helper()
+	out := []string{}
+	for id, pinned := range pinnedFlags(t, srv, spaceID, token) {
+		if pinned {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// countPinnedForTest reaches the quota predicate directly, so the assertion is about
+// what the CAP counts rather than about what a particular endpoint answers.
+func countPinnedForTest(t *testing.T, spaceID, uid string) int {
+	t.Helper()
+	n, err := testDB.countPinnedInSpaceTx(nil, spaceID, uid)
+	require.NoError(t, err)
+	return n
+}

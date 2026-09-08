@@ -446,9 +446,11 @@ func TestListProjectGroupsIsOnTheAuthenticatedGroup(t *testing.T) {
 // all-member group with the project and seats the creator in it, and this endpoint
 // must return it without knowing anything about it.
 //
-// It also pins the ordering. g.id ASC is creation order and the all-member group is
-// by construction the project's first group, so it leads the list. That is the only
-// reason the client can render 全员群 at the top without a dedicated flag.
+// It also exercises the ordering for the FRESH-provisioning case this test seeds,
+// which is the common one. Not a guarantee: the DAO documents that position is a
+// convenience and never the contract, because ensureAllMemberGroup rebuilds the
+// group on a later write path with a fresh, higher id. The client labels 全员群 by
+// comparing against all_member_group_no, which is right in both cases.
 func TestListProjectGroupsIncludesTheAllMemberGroup(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -467,7 +469,8 @@ func TestListProjectGroupsIncludesTheAllMemberGroup(t *testing.T) {
 	list := decodeGroupList(t, w)
 	require.Len(t, list, 2)
 	assert.Equal(t, created.AllMemberGroupNo, list[0].GroupNo,
-		"the all-member group is the project's oldest group, so creation order puts it first — "+
-			"which is what lets the client label it by comparing against all_member_group_no")
+		"provisioned with the project, so in THIS scenario creation order puts it first; "+
+			"a rebuilt group sorts wherever its new id falls, which is why the client "+
+			"labels it by comparing against all_member_group_no rather than by position")
 	assert.Equal(t, later, list[1].GroupNo)
 }

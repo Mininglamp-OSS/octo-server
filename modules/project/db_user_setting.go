@@ -110,12 +110,41 @@ func (d *DB) queryProjectPinned(projectID, uid string) (bool, error) {
 // outbox made for a different reason (a worker touching every row of a large fan-out
 // per job) that does not apply to one probe per pin.
 //
-// Disbanded projects do not count. Their name is released and every read path treats
-// them as nonexistent, so a stale pin on one must not consume a live budget the
-// caller cannot free — they cannot even see the project to unpin it.
+// # It counts exactly the pins the caller's own list shows, and that is the contract
 //
-// Both tables are octo_project*, i.e. both general_ci, so no COLLATE: an explicit
-// one has coercibility 0 and would cost octo_project its primary key on this join.
+// Not "every pinned row". The quota predicate MIRRORS listVisibleInSpace, because a
+// quota that counts rows the list does not show produces a refusal the user cannot
+// act on: "you have pinned 6" while their screen shows 5, with no sixth to remove.
+//
+// Two states reach that, and PR #861s review found the second after the first was
+// already handled:
+//
+//   - A DISBANDED project. Its name is released and every read path treats it as
+//     nonexistent. Covered by p.status.
+//   - An UNLISTED project the caller is not a member of. projectMiddleware answers
+//     not_found for exactly that caller, and PUT /:project_id/setting is the only
+//     unpin path — so the pin becomes unreachable through every API surface while
+//     still consuming a slot. An owner flipping discoverability is an ordinary
+//     action, and it permanently burned one of the victims six slots. The
+//     membership half is the same trap by the other door: a member who pins an
+//     unlisted project and is then removed from it lands in the identical state.
+//
+// So the visibility half of listVisibleInSpace comes along:
+// (space_listed OR an active member row). A caller whose project becomes visible
+// again while they are over the cap converges through unpin, which is never
+// refused — the same situation the code already accepts for a cap lowered by
+// configuration.
+//
+// Note what this does NOT do: a Space admin can point-read an unlisted project they
+// never joined (projectMiddleware allows it) but that project is absent from their
+// LIST too, so a pin on it is invisible to both this count and their screen. They
+// can therefore hold more pinned rows than the cap. That is the safe direction of
+// the error — an undercount can never trap anyone — and keeping the count equal to
+// what the list shows is worth more than making the cap exact for one role.
+//
+// All three tables are octo_project*, i.e. all general_ci, so no COLLATE: an
+// explicit one has coercibility 0 and would cost octo_project its primary key on
+// this join.
 func (d *DB) countPinnedInSpaceTx(tx *dbr.Tx, spaceID, uid string) (int, error) {
 	if spaceID == "" || uid == "" {
 		return 0, nil
@@ -128,8 +157,16 @@ func (d *DB) countPinnedInSpaceTx(tx *dbr.Tx, spaceID, uid string) (int, error) 
 	err := runner.SelectBySql(
 		"SELECT COUNT(*) FROM octo_project_user_setting s "+
 			"INNER JOIN octo_project p ON p.project_id = s.project_id "+
-			"WHERE s.uid = ? AND s.pinned = 1 AND p.space_id = ? AND p.status = ?",
-		uid, spaceID, StatusNormal,
+			// The membership half of the visibility rule. removing = 0 for the same
+			// reason listVisibleInSpace carries it: a seat that is closing already
+			// counts as gone everywhere else, and pm.uid IS NOT NULL is the clause
+			// that admits an unlisted project.
+			"LEFT JOIN octo_project_member pm "+
+			"  ON pm.project_id = p.project_id AND pm.uid = s.uid "+
+			"     AND pm.status = ? AND pm.removing = 0 "+
+			"WHERE s.uid = ? AND s.pinned = 1 AND p.space_id = ? AND p.status = ? "+
+			"  AND (p.discoverability = ? OR pm.uid IS NOT NULL)",
+		MemberStatusActive, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed,
 	).LoadOne(&n)
 	if err != nil {
 		return 0, fmt.Errorf("project: count pinned in space: %w", err)
