@@ -128,9 +128,6 @@ func TestProjectNoLegacyResponseError(t *testing.T) {
 // member_epoch + 1` — and this test is what keeps that true. reconcile.go's
 // best-effort anomaly counter is a diagnostic, not the guarantee.
 func TestMemberEpochOnlyEverIncrements(t *testing.T) {
-	setCall := regexp.MustCompile(`Set\(\s*"member_epoch"`)
-	setMap := regexp.MustCompile(`"member_epoch"\s*:`)
-
 	// Both packages that write this column, not just this one.
 	//
 	// pkg/project was OUTSIDE this scan while carrying a comment on
@@ -142,17 +139,53 @@ func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 	// tripping over. Widened rather than deleting the claim, because that duplicate is
 	// deliberate: the read layer has to be able to repair a row it refuses to serve, and
 	// modules/project's copy is a private method it cannot reach.
-	//
-	// The per-file counts below are what keep the widening honest: pointing the scan at a
-	// directory that has moved or emptied fails instead of passing with nothing to check.
-	roots := []struct {
-		label string
-		dir   string
-		min   int
-	}{
+	assertOnlyEverIncrements(t, "member_epoch", []epochScanRoot{
 		{"modules/project", ".", 1},
 		{"pkg/project", filepath.Join("..", "..", "pkg", "project"), 1},
-	}
+	})
+}
+
+// TestLifecycleVersionOnlyEverIncrements holds lifecycle_version to the identical
+// discipline, and the stake is sharper than for member_epoch.
+//
+// A consumer discards any lifecycle statement not NEWER than what it holds. So a
+// version that can move backwards does not merely lose ordering — it makes the
+// consumer throw away the CURRENT state and keep a superseded one, silently. An
+// absolute assignment is exactly what lets two writers race it backwards.
+//
+// One root, not two: pkg/project reads this column and never writes it. Listing a
+// root with no increment in it would fail the per-root minimum below, which is the
+// point of that minimum — a scan pointed somewhere empty must not pass.
+func TestLifecycleVersionOnlyEverIncrements(t *testing.T) {
+	assertOnlyEverIncrements(t, "lifecycle_version", []epochScanRoot{
+		{"modules/project", ".", 1},
+	})
+}
+
+// epochScanRoot is one package the write-discipline guard walks, with the minimum
+// number of increment statements it must contain.
+//
+// The minimum is what keeps a widening honest: pointing the scan at a directory
+// that has moved or emptied fails instead of passing with nothing to check.
+type epochScanRoot struct {
+	label string
+	dir   string
+	min   int
+}
+
+// assertOnlyEverIncrements is the shared body, parameterised over BOTH the column
+// and the roots.
+//
+// Both axes arrived from different directions and both are load-bearing: the
+// column axis because a second hand-written copy of these patterns is how two
+// columns' guards drift, and the root axis because member_epoch has a second
+// writer in pkg/project that this scan did not used to see. Merging them into one
+// function is what stops the next widening on either axis from having to be done
+// twice.
+func assertOnlyEverIncrements(t *testing.T, column string, roots []epochScanRoot) {
+	t.Helper()
+	setCall := regexp.MustCompile(`Set\(\s*"` + column + `"`)
+	setMap := regexp.MustCompile(`"` + column + `"\s*:`)
 
 	total := 0
 	for _, root := range roots {
@@ -162,28 +195,28 @@ func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 			// `SET " + "member_epoch = 0` or a SetMap entry cannot slip between the lines.
 			cleaned := stripComments(mustReadFrom(t, root.dir, f))
 			if setCall.MatchString(cleaned) || setMap.MatchString(cleaned) {
-				t.Errorf("%s/%s writes member_epoch through a dbr Set()/SetMap; "+
-					"only `member_epoch = member_epoch + 1` is allowed, because monotonicity is "+
-					"guaranteed by the write shape rather than observed by the reconcile scan",
-					root.label, f)
+				t.Errorf("%s/%s writes %s through a dbr Set()/SetMap; "+
+					"only `%s = %s + 1` is allowed, because monotonicity is "+
+					"guaranteed by the write shape rather than observed by any scan",
+					root.label, f, column, column, column)
 				continue
 			}
-			for _, bad := range nonIncrementEpochWrites(cleaned) {
-				t.Errorf("%s/%s assigns member_epoch to something other than "+
-					"member_epoch + 1: %q", root.label, f, bad)
+			for _, bad := range nonIncrementWrites(cleaned, column) {
+				t.Errorf("%s/%s assigns %s to something other than "+
+					"%s + 1: %q", root.label, f, column, column, bad)
 			}
-			if strings.Contains(cleaned, "member_epoch = member_epoch + 1") {
+			if strings.Contains(cleaned, column+" = "+column+" + 1") {
 				matched++
 			}
 		}
 		assert.GreaterOrEqual(t, matched, root.min,
-			"%s must contain at least %d `member_epoch = member_epoch + 1` statement(s); found "+
+			"%s must contain at least %d `%s = %s + 1` statement(s); found "+
 				"%d. Either the increment moved out of that package or this scan stopped seeing "+
 				"it — and a scan that sees nothing reports the invariant as held",
-			root.label, root.min, matched)
+			root.label, root.min, column, column, matched)
 		total += matched
 	}
-	assert.Positive(t, total, "no increment statement found in either package")
+	assert.Positive(t, total, "no `%s` increment statement found in any scanned package", column)
 }
 
 // epochScanFiles lists the non-test .go files of one directory for the guard above.
@@ -211,56 +244,67 @@ func mustReadFrom(t *testing.T, dir, name string) string {
 	return string(data)
 }
 
-var (
-	// Each pattern tolerates an optional table alias, because a multi-table UPDATE
-	// has to qualify the column: `UPDATE octo_project p INNER JOIN ... SET
-	// p.member_epoch = p.member_epoch + 1`. That form is a real increment and the
-	// guard used to reject it.
-	//
-	// Tolerating the alias must not tolerate a CROSS-alias assignment
-	// (`p.member_epoch = q.member_epoch + 1`), which reads one table's column and
-	// writes another's. RE2 has no backreferences, so the two aliases are captured
-	// and compared in Go below rather than in the pattern.
-	//
-	// The \b word boundaries come from main (#871), which added a SIBLING epoch column
-	// (collaboration_role_epoch) with its own parallel guard in collaboration_role_test.go
-	// and tightened this one to match. There is no identifier in the tree today that the
-	// unbounded form would falsely match — the boundaries are defensive symmetry with
-	// that sibling, not a fix for an observed miss. Carried across the merge deliberately:
-	// this branch replaced the two inline regexes main tightened, so taking "ours" whole
-	// would have dropped the tightening silently, which is the shape of merge loss that
-	// leaves both sides looking correct.
-	epochAssignment = regexp.MustCompile(`(?:\w+\.)?\bmember_epoch\b\s*=`)
-	epochIncrement  = regexp.MustCompile(`(?:(\w+)\.)?\bmember_epoch\b\s*=\s*(?:(\w+)\.)?\bmember_epoch\b\s*\+\s*1`)
-	// epochPredicate matches the SQL read positions a column name can appear in
-	// with an `=` after it: `WHERE member_epoch = ?`, `AND p.member_epoch = 0`.
-	// Those are comparisons, not writes, and this guard is about the write shape.
-	//
-	// Excluding them is a sharpening rather than a relaxation: `SET member_epoch =`
-	// and `, member_epoch =` (a second assignment inside one SET list) are both
-	// still caught, which TestEpochGuardStillCatchesRealWrites pins with the exact
-	// mutations that motivated the exclusion. The alternative — spelling the repair
-	// predicate some other way to dodge a regex — would have hidden a real
-	// comparison from every future reader instead.
-	epochPredicate = regexp.MustCompile(`(?i)\b(?:where|and|or)\s+(?:\w+\.)?\bmember_epoch\b\s*=`)
-)
-
-// columnAt returns where "member_epoch" starts inside a match, so every pattern
-// here identifies an occurrence by the COLUMN's position rather than by its own
-// match start — which differ once an optional alias is in play.
-func columnAt(cleaned string, m []int) int {
-	return strings.Index(cleaned[m[0]:m[1]], "member_epoch") + m[0]
+// Each pattern tolerates an optional table alias, because a multi-table UPDATE
+// has to qualify the column: `UPDATE octo_project p INNER JOIN ... SET
+// p.member_epoch = p.member_epoch + 1`. That form is a real increment and the
+// guard used to reject it.
+//
+// Tolerating the alias must not tolerate a CROSS-alias assignment
+// (`p.col = q.col + 1`), which reads one table's column and writes another's.
+// RE2 has no backreferences, so the two aliases are captured and compared in Go
+// below rather than in the pattern.
+//
+// Built per column rather than as package vars: two columns are held to this
+// discipline now, and a second hand-written copy of these three patterns is how
+// they drift. (modules/project/collaboration_role_test.go still carries its own
+// hand-written pair for collaboration_role_epoch — main's, predating these
+// builders. Left alone here because folding it in is a change to that guard
+// rather than to this one; it is the drift this comment warns about, so it is
+// worth closing next time that file is touched.)
+//
+// The \b word boundaries come from main (#871), which added a SIBLING epoch column
+// and tightened the two inline regexes these builders replaced. Carried across
+// deliberately: taking this branch's version whole would have dropped the
+// tightening silently, which is the shape of merge loss that leaves both sides
+// looking correct. No identifier in the tree today would falsely match the
+// unbounded form — this is defensive symmetry with that sibling, not a fix for an
+// observed miss.
+func assignmentPattern(col string) *regexp.Regexp {
+	return regexp.MustCompile(`(?:\w+\.)?\b` + col + `\b\s*=`)
 }
 
-// nonIncrementEpochWrites returns every member_epoch assignment in `cleaned`
-// that is not the increment, as printable windows. Empty means the file is clean.
-func nonIncrementEpochWrites(cleaned string) []string {
+func incrementPattern(col string) *regexp.Regexp {
+	return regexp.MustCompile(`(?:(\w+)\.)?\b` + col + `\b\s*=\s*(?:(\w+)\.)?\b` + col + `\b\s*\+\s*1`)
+}
+
+// predicatePattern matches the SQL read positions a column name can appear in
+// with an `=` after it: `WHERE member_epoch = ?`, `AND p.member_epoch = 0`.
+// Those are comparisons, not writes, and this guard is about the write shape.
+//
+// Excluding them is a sharpening rather than a relaxation: `SET col =` and
+// `, col =` (a second assignment inside one SET list) are both still caught,
+// which TestEpochGuardStillCatchesRealWrites pins with the exact mutations that
+// motivated the exclusion.
+func predicatePattern(col string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)\b(?:where|and|or)\s+(?:\w+\.)?\b` + col + `\b\s*=`)
+}
+
+// columnAt returns where the column name starts inside a match, so every pattern
+// here identifies an occurrence by the COLUMN's position rather than by its own
+// match start — which differ once an optional alias is in play.
+func columnAt(cleaned, col string, m []int) int {
+	return strings.Index(cleaned[m[0]:m[1]], col) + m[0]
+}
+
+// nonIncrementWrites returns every assignment to `col` in `cleaned` that is not
+// the increment, as printable windows. Empty means the file is clean.
+func nonIncrementWrites(cleaned, col string) []string {
 	predicates := make(map[int]bool)
-	for _, m := range epochPredicate.FindAllStringIndex(cleaned, -1) {
-		predicates[columnAt(cleaned, m)] = true
+	for _, m := range predicatePattern(col).FindAllStringIndex(cleaned, -1) {
+		predicates[columnAt(cleaned, col, m)] = true
 	}
 	increments := make(map[int]bool)
-	for _, m := range epochIncrement.FindAllStringSubmatchIndex(cleaned, -1) {
+	for _, m := range incrementPattern(col).FindAllStringSubmatchIndex(cleaned, -1) {
 		// Groups 1 and 2 are the aliases on the written and read sides. Absent
 		// (-1) on both is the unqualified form; present on both they must match,
 		// or this is one table's column being written from another's.
@@ -274,11 +318,11 @@ func nonIncrementEpochWrites(cleaned string) []string {
 		if lhs != rhs {
 			continue
 		}
-		increments[columnAt(cleaned, m[0:2])] = true
+		increments[columnAt(cleaned, col, m[0:2])] = true
 	}
 	var bad []string
-	for _, m := range epochAssignment.FindAllStringIndex(cleaned, -1) {
-		at := columnAt(cleaned, m)
+	for _, m := range assignmentPattern(col).FindAllStringIndex(cleaned, -1) {
+		at := columnAt(cleaned, col, m)
 		if predicates[at] || increments[at] {
 			continue
 		}
@@ -307,7 +351,7 @@ func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
 		`UPDATE octo_project p SET p.member_epoch = p.member_epoch - 1 WHERE p.space_id = ?`,
 	}
 	for _, src := range caught {
-		if got := nonIncrementEpochWrites(src); len(got) == 0 {
+		if got := nonIncrementWrites(src, "member_epoch"); len(got) == 0 {
 			t.Errorf("guard no longer catches a non-increment write: %q", src)
 		}
 	}
@@ -321,7 +365,7 @@ func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
 		`SELECT id FROM octo_project p WHERE p.member_epoch = 0`,
 	}
 	for _, src := range allowed {
-		if got := nonIncrementEpochWrites(src); len(got) != 0 {
+		if got := nonIncrementWrites(src, "member_epoch"); len(got) != 0 {
 			t.Errorf("guard rejects a legitimate statement %q: %v", src, got)
 		}
 	}
@@ -340,10 +384,13 @@ func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
 // in an error string is fine; that is why this does not simply ban the identifier.
 func TestIsOfficialHasNoWriter(t *testing.T) {
 	for _, col := range projectInsertColumns {
-		if col == "is_official" || col == "active_name" || col == "member_epoch" || col == "collaboration_role_epoch" {
+		if col == "is_official" || col == "active_name" || col == "member_epoch" ||
+			col == "collaboration_role_epoch" || col == "lifecycle_version" {
 			t.Errorf("projectInsertColumns contains %q; is_official has no P0 writer (D6), "+
-				"active_name is a generated column (MySQL 3105), and epochs may only be "+
-				"written through their atomic increment statements", col)
+				"active_name is a generated column (MySQL 3105), and member_epoch / "+
+				"collaboration_role_epoch / lifecycle_version may only be written as "+
+				"`col = col + 1` — seeding any of them in the insert list is an absolute "+
+				"write, which is what lets two writers race the value backwards", col)
 		}
 	}
 

@@ -135,8 +135,8 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	var models []*Model
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, collaboration_role_epoch, status, all_member_group_no, "+
-			"created_at, updated_at "+
+			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
+			"lifecycle_version, status, all_member_group_no, created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
 	if err != nil {
@@ -158,8 +158,8 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	var models []*Model
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, collaboration_role_epoch, status, all_member_group_no, "+
-			"created_at, updated_at "+
+			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
+			"lifecycle_version, status, all_member_group_no, created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
 	).Load(&models)
@@ -484,6 +484,39 @@ func (d *DB) bumpMemberEpochForSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) er
 		}
 	}
 	return nil
+}
+
+// bumpLifecycleVersionTx increments lifecycle_version in the caller's transaction.
+//
+// The statement is `lifecycle_version = lifecycle_version + 1` and never an
+// absolute assignment, for the same reason bumpMemberEpochTx is: two writers
+// racing an absolute value can move it BACKWARDS, and a version that goes
+// backwards is worse than none — a consumer discards the NEW state as stale,
+// keeping a superseded one, silently. A source guard greps this package for any
+// other shape of write.
+//
+// Guarded on status = StatusNormal, which means a caller that changes status must
+// bump BEFORE the flip — disband does exactly that, mirroring how it already
+// orders bumpMemberEpochTx.
+//
+// Returns the affected-row count for the same reason bumpMemberEpochTx does: the
+// status guard makes "no error" and "it happened" different facts, and creation
+// is the one call site where a silent no-op would ship a project at version 0 —
+// the value that predates this column and cannot be ordered against anything.
+func (d *DB) bumpLifecycleVersionTx(tx *dbr.Tx, projectID string, now time.Time) (int64, error) {
+	result, err := tx.UpdateBySql(
+		"UPDATE octo_project SET lifecycle_version = lifecycle_version + 1, updated_at = ? "+
+			"WHERE project_id = ? AND status = ?",
+		now, projectID, StatusNormal,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: bump lifecycle version: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: bump lifecycle version rows: %w", err)
+	}
+	return affected, nil
 }
 
 // countActiveInSpaceTx counts a Space's active projects inside the create transaction.

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
@@ -487,8 +486,16 @@ func (p *Project) createProjectTxWithSeatRefs(
 		return nil, errQuotaDailyCreate
 	}
 
+	// Minted here rather than inline below because it can fail: see newProjectID
+	// for why the canonical hyphenated form, and why a failure refuses one create
+	// instead of panicking the process.
+	projectID, err := newProjectID()
+	if err != nil {
+		return nil, err
+	}
+
 	model := &Model{
-		ProjectID:       util.GenerUUID(),
+		ProjectID:       projectID,
 		SpaceID:         in.SpaceID,
 		Name:            in.Name,
 		Description:     in.Description,
@@ -613,6 +620,27 @@ func (p *Project) createProjectTxWithSeatRefs(
 				"reserved absent-epoch sentinel while reporting 1", model.ProjectID)
 	}
 	model.MemberEpoch++
+
+	// And the LIFECYCLE version, by the same mechanism and for the same reason:
+	// creation is itself a lifecycle statement, so a consumer must be able to order
+	// it against everything that follows. Bumped rather than seeded in the insert
+	// column list — seeding is an absolute write, the one shape this column's write
+	// discipline forbids, and the epoch above already had to be redone for exactly
+	// that (PR #852 round 1).
+	//
+	// Checked for the same reason too: at version 0 the project is
+	// indistinguishable from a row that predates the column, which a consumer
+	// cannot order at all.
+	versioned, err := p.db.bumpLifecycleVersionTx(tx, model.ProjectID, now)
+	if err != nil {
+		return nil, err
+	}
+	if versioned == 0 {
+		return nil, fmt.Errorf(
+			"project: create bumped no lifecycle_version row for %s; the project would ship "+
+				"at version 0, which a consumer cannot order against anything", model.ProjectID)
+	}
+	model.LifecycleVersion++
 
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
 	// construction under which "the project exists ⟹ its provisioning jobs exist" is
@@ -740,6 +768,15 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	if err := p.db.updateProfileTx(tx, projectID, set, now); err != nil {
 		return nil, err
 	}
+	// Bump on ANY profile change, not only the fields a consumer is told about.
+	// Bumping selectively would let two distinct project states share a version,
+	// and a consumer that discards anything not newer than what it holds would
+	// then drop the second one. Versions must be monotonic; they need not be
+	// gap-free, so an unreported change simply advances the counter.
+	if _, err := p.db.bumpLifecycleVersionTx(tx, projectID, now); err != nil {
+		return nil, err
+	}
+	row.LifecycleVersion++
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit update: %w", err)
 	}
@@ -824,6 +861,14 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	// keeps a disbanded project's epoch frozen), and disband is exactly the write that must
 	// move the epoch — the brief lists it alongside add/remove/leave/role-change/cascade.
 	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		return nil, err
+	}
+	// The lifecycle version too, and for the same ordering reason: disband is a
+	// lifecycle statement, and its guard is the same status = 1 predicate, so it
+	// must also run BEFORE the flip. After it, the bump matches no rows and the
+	// disband statement a consumer receives carries the version of the state
+	// BEFORE it — indistinguishable from a replay it should discard.
+	if _, err := p.db.bumpLifecycleVersionTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
 	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {

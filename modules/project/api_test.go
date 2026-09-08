@@ -582,8 +582,8 @@ func TestProjectMigrationFilesCoverTheDirectory(t *testing.T) {
 		}
 	}
 	require.Equal(t, want, projectMigrationFiles)
-	require.GreaterOrEqual(t, len(projectMigrationFiles), 4,
-		"the module shipped four migrations when this was written; a shorter list means the "+
+	require.GreaterOrEqual(t, len(projectMigrationFiles), 5,
+		"the module shipped five migrations when this was written; a shorter list means the "+
 			"derivation stopped seeing files, which is how the Down/Up lap rebuilds a stale schema")
 	require.Contains(t, projectMigrationFiles, "sql/20260908000002_project_member_epoch_base_one.sql")
 }

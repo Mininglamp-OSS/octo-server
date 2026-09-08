@@ -87,18 +87,27 @@ const (
 // It likewise has no IsOfficial field: no P0 code path writes that column, and
 // leaving it out of the model is what makes that checkable rather than aspirational.
 type Model struct {
-	ID                     int64  `db:"id"`
-	ProjectID              string `db:"project_id"`
-	SpaceID                string `db:"space_id"`
-	Name                   string `db:"name"`
-	Description            string `db:"description"`
-	Logo                   string `db:"logo"`
-	Creator                string `db:"creator"`
-	Discoverability        int    `db:"discoverability"`
-	MaxMembers             int    `db:"max_members"`
-	MemberEpoch            int64  `db:"member_epoch"`
-	CollaborationRoleEpoch int64  `db:"collaboration_role_epoch"`
-	Status                 int    `db:"status"`
+	ID              int64  `db:"id"`
+	ProjectID       string `db:"project_id"`
+	SpaceID         string `db:"space_id"`
+	Name            string `db:"name"`
+	Description     string `db:"description"`
+	Logo            string `db:"logo"`
+	Creator         string `db:"creator"`
+	Discoverability int    `db:"discoverability"`
+	MaxMembers      int    `db:"max_members"`
+	MemberEpoch     int64  `db:"member_epoch"`
+	// CollaborationRoleEpoch orders statements about the project's collaboration-role
+	// catalog. Third counter on this row, same increment-only discipline (from #871).
+	CollaborationRoleEpoch int64 `db:"collaboration_role_epoch"`
+	// LifecycleVersion orders statements about the PROJECT — its name, its
+	// description, whether it is active. Deliberately separate from MemberEpoch,
+	// which orders statements about the ROSTER: one shared counter would make
+	// every rename invalidate every cached authorization decision downstream, and
+	// every membership change look like a lifecycle statement. They move at
+	// different rates for different reasons.
+	LifecycleVersion int64 `db:"lifecycle_version"`
+	Status           int   `db:"status"`
 	// AllMemberGroupNo is this project's all-member group, or "" when it has
 	// none yet. "" is the sentinel and the column is NOT NULL, so every
 	// predicate in the feature is written `= ''` / `!= ''` (see D5).
