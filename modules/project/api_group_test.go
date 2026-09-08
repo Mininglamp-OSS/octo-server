@@ -152,7 +152,8 @@ func TestListProjectGroupsExcludesInactiveMembership(t *testing.T) {
 // divergence is a decision with a test behind it rather than a side effect.
 //
 // Blacklisting sets group_member.status = GroupMemberStatusBlacklist and leaves
-// is_deleted = 0 (modules/group/db.go:260). GET /v1/group/my filters is_deleted
+// is_deleted = 0 — the blacklist branch of modules/group's
+// ExistMemberActiveInternal spells that out. GET /v1/group/my filters is_deleted
 // alone, so it still shows the group; this endpoint requires status = Normal, so
 // it does not. That is deliberate: blacklisting is how a group denies access, and
 // ExistMemberActive is the hardening line in front of group and thread reads for

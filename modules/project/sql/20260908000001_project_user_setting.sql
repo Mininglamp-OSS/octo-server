@@ -22,10 +22,13 @@
 -- octo_project_member_removal_cleanup 的表头相同：MySQL 的 CURRENT_TIMESTAMP 取
 -- 会话时区，本仓已经因此发过一个读出 -28799 秒的指标。一个时钟，在 Go 里，UTC。
 --
--- 本文件不含任何撇号，与 P1 那张迁移表同样的原因：本模块的迁移测试按朴素规则切分
--- 语句，会把撇号当成字符串定界符，于是注释里一个所有格撇号就能让它把下一个分号读
--- 成在字面量内部。且撇号是成对抵消的，文件里撇号数为偶数时能侥幸通过、为奇数时才
--- 失败，所以不要靠数个数。
+-- 注释里不要出现单引号（撇号），与 P1 那张迁移表同样的原因。真正被强制的是
+-- applyOneProjectMigrationFile 里的两条检查：一是全文不得出现 sql-migrate 的显式
+-- 语句块标记（连注释里提一下那个词都不行，本段就踩过一次），二是把全文按单引号成对
+-- 切出来的每一段字面量里都不能有分号。DDL 的 COMMENT 字面量本身成对，不受影响；
+-- 坏事的是注释里一个所有格撇号——它是单只的，会让它之后所有单引号的配对整体错位，
+-- 于是本来无分号的一段被判成有分号，或者真的带分号的字面量反而检不出来。所以规则
+-- 不是数单引号的个数，而是注释里一个都不写。
 CREATE TABLE `octo_project_user_setting` (
   `id`         BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
   `project_id` VARCHAR(40)      NOT NULL DEFAULT ''  COMMENT '项目ID（宽度/字符集对齐 octo_project.project_id）',

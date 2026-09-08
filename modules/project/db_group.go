@@ -123,9 +123,10 @@ type projectGroupRow struct {
 // Spelled out because the abstract argument above hides the only case that
 // reaches it. Removal sets is_deleted = 1, so the two predicates agree there. The
 // one reachable state where they disagree is the group blacklist, which sets
-// status = GroupMemberStatusBlacklist and deliberately LEAVES is_deleted = 0
-// (modules/group/db.go:260). So this endpoint hides a project group from a member
-// that group has blacklisted, and two older surfaces still show it to them:
+// status = GroupMemberStatusBlacklist and deliberately LEAVES is_deleted = 0 —
+// the blacklist branch of modules/group's ExistMemberActiveInternal spells that
+// out. So this endpoint hides a project group from a member that group has
+// blacklisted, and two older surfaces still show it to them:
 // GET /v1/group/my (queryGroupsWithMemberUIDAndSpaceID filters is_deleted alone)
 // and the group detail.
 //
@@ -171,9 +172,9 @@ func (d *DB) listMyProjectGroups(spaceID, projectID, uid string, offset, limit i
 //
 // # This number can differ from modules/group's member_count for the same group
 //
-// modules/group's QueryMemberCount (db.go:737) filters is_deleted alone, so it
-// counts blacklisted members; this one does not. A group holding one blacklisted
-// member therefore reads N here and N+1 on the group header.
+// modules/group's own QueryMemberCount filters is_deleted alone, so it counts
+// blacklisted members; this one does not. A group holding one blacklisted member
+// therefore reads N here and N+1 on the group header.
 //
 // Matching QueryMemberCount instead was the alternative and is worse: the count
 // would then include people the list beside it treats as non-members, so the
