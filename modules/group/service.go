@@ -13,9 +13,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	workspace "github.com/Mininglamp-OSS/octo-server/modules/workspace"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
@@ -1097,10 +1099,14 @@ type CreateGroupServiceReq struct {
 	// ProjectID 群的项目归属（可为空=直属 Space）。非空时群成员受 I2 约束，
 	// 包括创建者自己——他不是该项目成员的话，建群会在准入闸门处被拒。
 	ProjectID   string // 所属项目 ID（可为空）
-	BotUID      string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
-	CategoryID  string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText  string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
+	WorkspaceID string // Workspace ID（可为空；非空时快照成员并建立关联）
+	// expectedSpaceID is the optional X-Space-ID assertion supplied by the HTTP layer.
+	// It is deliberately private so non-HTTP callers retain the existing request API.
+	expectedSpaceID string
+	BotUID          string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
+	CategoryID      string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
+	AvatarText      string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor     *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
 // CreateGroupServiceResp 创建群响应
@@ -1344,6 +1350,135 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		return nil, errors.New("failed to begin transaction")
 	}
 	defer tx.RollbackUnlessCommitted()
+	groupSpaceID := req.SpaceID
+	var workspaceIDPtr *string
+	var workspaceLinkedByPtr *string
+	if workspaceID := strings.TrimSpace(req.WorkspaceID); workspaceID != "" {
+		accesses, lockErr := workspace.NewService(s.ctx).LockAccessesTx(
+			tx, req.Creator, []string{workspaceID}, strings.TrimSpace(req.expectedSpaceID), true,
+		)
+		if lockErr != nil {
+			s.Error("lock workspace access for group creation failed", zap.Error(lockErr), zap.String("workspace_id", workspaceID))
+			return nil, lockErr
+		}
+		access, ok := accesses[workspaceID]
+		if !ok || access.SpaceID == "" {
+			return nil, workspace.ErrNotFound
+		}
+		if groupSpaceID != "" && groupSpaceID != access.SpaceID {
+			return nil, errGroupWorkspaceConflict
+		}
+		groupSpaceID = access.SpaceID
+		workspaceIDPtr = &workspaceID
+		linkedBy := req.Creator
+		workspaceLinkedByPtr = &linkedBy
+
+		// The Workspace is authoritative for the new group's Space. Re-run
+		// the legacy explicit-member checks after the Workspace/Space locks,
+		// so bot and explicit-member eligibility cannot race a membership
+		// change between the preflight and this transaction.
+		if req.BotUID != "" {
+			botOK, checkErr := spacepkg.CheckMembership(s.ctx.DB(), groupSpaceID, req.BotUID)
+			if checkErr != nil {
+				s.Error("check bot space membership failed", zap.Error(checkErr))
+				return nil, errors.New("failed to check space membership")
+			}
+			if !botOK {
+				return nil, errors.New("bot is not a member of this space")
+			}
+		}
+
+		for _, uid := range access.MemberUIDs {
+			uid = strings.TrimSpace(uid)
+			if uid != "" && !seen[uid] {
+				seen[uid] = true
+				allUIDs = append(allUIDs, uid)
+			}
+		}
+		var queryErr error
+		// Re-read and lock every member in the complete explicit+snapshot union.
+		// The preflight user query is only for display data; this transaction
+		// check is authoritative and prevents missing or newly ineligible users
+		// from being silently omitted or inserted.
+		userArgs := make([]interface{}, len(allUIDs))
+		for i, uid := range allUIDs {
+			userArgs[i] = uid
+		}
+		lockedUsers := make([]*user.Model, 0, len(allUIDs))
+		if _, queryErr = tx.SelectBySql(
+			"SELECT * FROM `user` WHERE uid IN ("+strings.TrimSuffix(strings.Repeat("?,", len(allUIDs)), ",")+") ORDER BY uid FOR SHARE",
+			userArgs...,
+		).Load(&lockedUsers); queryErr != nil {
+			s.Error("lock workspace group users failed", zap.Error(queryErr))
+			return nil, errors.New("failed to query member info")
+		}
+		if len(lockedUsers) != len(allUIDs) {
+			return nil, workspace.ErrCandidateIneligible
+		}
+		lockedByUID := make(map[string]*user.Model, len(lockedUsers))
+		for _, memberUser := range lockedUsers {
+			if memberUser != nil {
+				lockedByUID[memberUser.UID] = memberUser
+			}
+		}
+		for _, uid := range allUIDs {
+			memberUser := lockedByUID[uid]
+			if memberUser == nil || memberUser.Status != 1 || memberUser.IsDestroy == user.IsDestroyDone {
+				return nil, workspace.ErrCandidateIneligible
+			}
+		}
+		memberUsers = lockedUsers
+
+		// Workspace space membership is authoritative for the complete union.
+		// Clear preflight marks before recomputing so a user who moved into the
+		// target Space cannot retain a stale external/source-space projection.
+		for _, uid := range allUIDs {
+			inSpace, checkErr := spacepkg.CheckMembership(s.ctx.DB(), groupSpaceID, uid)
+			if checkErr != nil {
+				s.Error("check member space membership failed", zap.Error(checkErr), zap.String("uid", uid))
+				return nil, errors.New("failed to check space membership")
+			}
+			if inSpace {
+				delete(externalMap, uid)
+				delete(sourceSpaceMap, uid)
+				continue
+			}
+			externalMap[uid] = true
+			sourceSpaceMap[uid] = spacemod.GetUserDefaultSpaceID(s.ctx, uid)
+		}
+		// The HTTP layer checks explicit UIDs before entering the Service.
+		// Snapshot members are discovered here, so apply the same system
+		// account policy to the complete union before writing any rows.
+		appConfig, configErr := common2.NewService(s.ctx).GetAppConfig()
+		if configErr != nil {
+			s.Error("query application settings for workspace group failed", zap.Error(configErr))
+			return nil, errors.New("failed to query application settings")
+		}
+		if appConfig != nil && appConfig.InviteSystemAccountJoinGroupOn == 0 {
+			if req.BotUID == s.ctx.GetConfig().Account.FileHelperUID {
+				return nil, errors.New("system account is not allowed in this group")
+			}
+			for _, memberUser := range memberUsers {
+				if memberUser == nil {
+					continue
+				}
+				if memberUser.UID == s.ctx.GetConfig().Account.FileHelperUID {
+					return nil, errors.New("system account is not allowed in this group")
+				}
+			}
+		}
+
+		if strings.TrimSpace(req.Name) == "" {
+			names := make([]string, 0, len(memberUsers))
+			for _, u := range memberUsers {
+				names = append(names, u.Name)
+			}
+			groupName = strings.Join(names, "、")
+			if nameRunes := []rune(groupName); len(nameRunes) > MaxGroupNameLen {
+				groupName = string(nameRunes[:MaxGroupNameLen])
+			}
+		}
+	}
 
 	// 插入群记录
 	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
@@ -1376,8 +1511,10 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Status:              GroupStatusNormal,
 		Version:             version,
 		AllowViewHistoryMsg: int(common.GroupAllowViewHistoryMsgEnabled),
-		SpaceID:             req.SpaceID,
+		SpaceID:             groupSpaceID,
 		ProjectID:           req.ProjectID,
+		WorkspaceID:         workspaceIDPtr,
+		WorkspaceLinkedBy:   workspaceLinkedByPtr,
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
 		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,
@@ -1521,14 +1658,10 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	})
 	if err != nil {
 		s.Error("create IM channel failed, performing compensating rollback", zap.Error(err), zap.String("groupNo", groupNo))
-		// Compensating delete: remove group_member and group records that were
-		// already committed. Use s.ctx.DB() (not tx) because the transaction
-		// has already been committed.
-		if _, delErr := s.ctx.DB().DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); delErr != nil {
-			s.Error("compensating delete group_member failed", zap.Error(delErr), zap.String("groupNo", groupNo))
-		}
-		if _, delErr := s.ctx.DB().DeleteFrom("group").Where("group_no=?", groupNo).Exec(); delErr != nil {
-			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
+		cleanupErr := s.compensateCreateGroup(groupNo)
+		if cleanupErr != nil {
+			s.Error("compensating group cleanup failed", zap.Error(cleanupErr), zap.String("groupNo", groupNo))
+			return nil, fmt.Errorf("failed to create IM channel: %v; compensating cleanup failed: %w", err, cleanupErr)
 		}
 		return nil, errors.New("failed to create IM channel, group has been rolled back")
 	}
@@ -1547,6 +1680,38 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Name:           groupName,
 		SkippedMembers: skippedMembers,
 	}, nil
+}
+
+// compensateCreateGroup removes all local rows committed before an IM channel
+// creation failure. The cleanup is one transaction so a failed delete cannot
+// leave a relation or a partial member set while the caller is told rollback
+// succeeded.
+func (s *Service) compensateCreateGroup(groupNo string) error {
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return fmt.Errorf("begin compensating cleanup transaction: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// Match the lock order used by group writes: serialize on the parent row
+	// before touching child rows.
+	var lockedGroupNo string
+	if err = tx.SelectBySql("SELECT group_no FROM `group` WHERE group_no=? FOR UPDATE", groupNo).LoadOne(&lockedGroupNo); err != nil {
+		return fmt.Errorf("lock group for compensating cleanup: %w", err)
+	}
+	if _, err = tx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); err != nil {
+		return fmt.Errorf("delete group members: %w", err)
+	}
+	if _, err = tx.DeleteFrom("group_setting").Where("group_no=?", groupNo).Exec(); err != nil {
+		return fmt.Errorf("delete group settings: %w", err)
+	}
+	if _, err = tx.DeleteFrom("group").Where("group_no=?", groupNo).Exec(); err != nil {
+		return fmt.Errorf("delete group: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit compensating cleanup: %w", err)
+	}
+	return nil
 }
 
 // AddGroupMembers 添加群成员

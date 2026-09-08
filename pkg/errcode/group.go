@@ -321,4 +321,11 @@ var (
 		DefaultMessage: "Failed to send group notification.",
 		Internal:       true,
 	})
+	// ErrGroupWorkspaceConflict covers an occupied relation, a cross-Space
+	// target, or any other atomic Group↔Workspace association conflict.
+	ErrGroupWorkspaceConflict = register(codes.Code{
+		ID:             "err.server.group.workspace_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The group and Workspace association conflicts with the current state.",
+	})
 )

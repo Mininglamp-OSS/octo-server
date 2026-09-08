@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	workspace "github.com/Mininglamp-OSS/octo-server/modules/workspace"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
@@ -193,6 +194,7 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	// 邀请详情需要认证
 	group.GET("/invites/:invite_no", g.groupMemberInviteDetail) // 获取邀请详情
+	g.routeWorkspace(r)
 	go g.CheckForbiddenLoop()
 }
 
@@ -974,41 +976,162 @@ func (g *Group) groupDetailGet(c *wkhttp.Context) {
 // list 我保存的群聊
 func (g *Group) list(c *wkhttp.Context) {
 	loginUID := c.MustGet("uid").(string)
-	spaceID := c.Query("space_id")
+	rawSpaceID := c.Query("space_id")
+	spaceID := strings.TrimSpace(rawSpaceID)
+	roles, hasRole, validRole := parseGroupMyRoles(c.Query("role"))
+	if !validRole {
+		respondGroupRequestInvalid(c, "role")
+		return
+	}
 
-	if spaceID != "" {
-		// Space 模式：返回该 Space 下用户加入的所有群
-		groups, err := g.db.queryGroupsWithMemberUIDAndSpaceID(loginUID, spaceID)
+	if hasRole && spaceID != "" {
+		inSpace, err := spacepkg.CheckMembership(g.ctx.DB(), spaceID, loginUID)
+		if err != nil {
+			g.Error("检查 Space 成员失败", zap.Error(err), zap.String("uid", loginUID), zap.String("space_id", spaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !inSpace {
+			respondGroupForbidden(c)
+			return
+		}
+	}
+	if hasRole {
+		models, err := g.db.queryGroupsWithMemberUIDAndRoles(loginUID, spaceID, roles)
+		if err != nil {
+			g.Error("查询角色群列表失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		g.respondGroupMyModels(c, loginUID, models, true, true)
+		return
+	}
+
+	if rawSpaceID != "" {
+		// Space mode keeps the legacy query value unchanged for callers that
+		// historically relied on the stored-space lookup semantics.
+		models, err := g.db.queryGroupsWithMemberUIDAndSpaceID(loginUID, rawSpaceID)
 		if err != nil {
 			g.Error("查询Space群列表失败", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 			return
 		}
-		resps := make([]*GroupResp, 0)
-		for _, model := range groups {
-			groupResp := &GroupResp{}
-			resp := groupResp.fromModel(model)
-			// 查询成员数
-			memberCount, err := g.db.QueryMemberCount(model.GroupNo)
-			if err == nil {
-				resp.MemberCount = int(memberCount)
-			}
-			resps = append(resps, resp)
-		}
-		c.Response(resps)
+		g.respondGroupMyModels(c, loginUID, models, true, false)
 		return
 	}
 
-	models, err := g.db.querySavedGroups(loginUID)
+	// No query parameters deliberately remains the saved-groups mode.
+	detailModels, err := g.db.querySavedGroups(loginUID)
 	if err != nil {
 		g.Error("查询我保存的群聊失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
-	resps := make([]*GroupResp, 0)
+	g.respondGroupMyDetails(c, loginUID, detailModels)
+}
+
+func parseGroupMyRoles(raw string) (roles []int, hasRole, valid bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false, true
+	}
+	seen := make(map[int]struct{}, 2)
+	for _, part := range strings.Split(raw, ",") {
+		switch strings.TrimSpace(part) {
+		case "owner":
+			seen[MemberRoleCreator] = struct{}{}
+		case "admin":
+			seen[MemberRoleManager] = struct{}{}
+		default:
+			return nil, true, false
+		}
+	}
+	for _, role := range []int{MemberRoleCreator, MemberRoleManager} {
+		if _, ok := seen[role]; ok {
+			roles = append(roles, role)
+		}
+	}
+	if len(roles) == 0 {
+		return nil, true, false
+	}
+	return roles, true, true
+}
+
+func (g *Group) groupMyExternalMap(loginUID string) map[string]string {
+	externalMap, err := g.db.QueryExternalGroupNosForUser(loginUID)
+	if err != nil {
+		g.Warn("查询外部群来源Space失败", zap.Error(err), zap.String("uid", loginUID))
+		return nil
+	}
+	return externalMap
+}
+
+func (g *Group) respondGroupMyModels(c *wkhttp.Context, loginUID string, models []*Model, includeMemberCount, rewriteExternalSpace bool) {
+	groupNos := make([]string, 0, len(models))
 	for _, model := range models {
-		groupResp := &GroupResp{}
-		resps = append(resps, groupResp.from(model))
+		if model != nil {
+			groupNos = append(groupNos, model.GroupNo)
+		}
+	}
+	roleMap, err := g.db.queryGroupMyRoles(loginUID, groupNos)
+	if err != nil {
+		g.Error("查询群角色失败", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
+	var externalMap map[string]string
+	if rewriteExternalSpace {
+		externalMap = g.groupMyExternalMap(loginUID)
+	}
+	memberCounts := make(map[string]int64, len(groupNos))
+	if includeMemberCount && len(groupNos) > 0 {
+		var countErr error
+		memberCounts, countErr = g.db.queryGroupMemberCounts(groupNos)
+		if countErr != nil {
+			g.Error("查询群成员数量失败", zap.Error(countErr), zap.String("uid", loginUID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+	}
+	resps := make([]*GroupResp, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		resp := (&GroupResp{}).fromModel(model)
+		resp.Role = roleMap[model.GroupNo]
+		if rewriteExternalSpace {
+			resp.SetEffectiveSpaceIDFromMap(externalMap)
+		}
+		if includeMemberCount {
+			resp.MemberCount = int(memberCounts[model.GroupNo])
+		}
+		resps = append(resps, resp)
+	}
+	c.Response(resps)
+}
+
+func (g *Group) respondGroupMyDetails(c *wkhttp.Context, loginUID string, models []*DetailModel) {
+	groupNos := make([]string, 0, len(models))
+	for _, model := range models {
+		if model != nil {
+			groupNos = append(groupNos, model.GroupNo)
+		}
+	}
+	roleMap, err := g.db.queryGroupMyRoles(loginUID, groupNos)
+	if err != nil {
+		g.Error("查询群角色失败", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
+	resps := make([]*GroupResp, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		resp := (&GroupResp{}).from(model)
+		resp.Role = roleMap[model.GroupNo]
+		resps = append(resps, resp)
 	}
 	c.Response(resps)
 }
@@ -1139,7 +1262,7 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	}
 	realUids := make([]string, 0)
 	// 好友验证（Web 特有逻辑，Space 校验已移入 Service）
-	if req.SpaceID == "" && g.ctx.GetConfig().Group.CreateGroupVerifyFriendOn {
+	if req.SpaceID == "" && g.ctx.GetConfig().Group.CreateGroupVerifyFriendOn && strings.TrimSpace(req.WorkspaceID) == "" {
 		friends := make([]*model.FriendResp, 0)
 		modules := register.GetModules(g.ctx)
 		for _, m := range modules {
@@ -1170,7 +1293,7 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	} else {
 		realUids = req.Members
 	}
-	if len(realUids) == 0 {
+	if len(realUids) == 0 && strings.TrimSpace(req.WorkspaceID) == "" {
 		httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotFriend, nil, nil)
 		return
 	}
@@ -1197,30 +1320,44 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 
 	// 调用 Service 创建群
 	createResp, err := g.groupService.CreateGroup(&CreateGroupServiceReq{
-		Creator:     creator,
-		Members:     realUids,
-		Name:        req.Name,
-		SpaceID:     req.SpaceID,
-		ProjectID:   req.ProjectID,
-		CategoryID:  req.CategoryID,
-		AvatarText:  req.AvatarText,
-		AvatarColor: req.AvatarColor,
+		Creator:         creator,
+		Members:         realUids,
+		Name:            req.Name,
+		SpaceID:         req.SpaceID,
+		ProjectID:       req.ProjectID,
+		WorkspaceID:     strings.TrimSpace(req.WorkspaceID),
+		expectedSpaceID: strings.TrimSpace(c.GetHeader("X-Space-ID")),
+		CategoryID:      req.CategoryID,
+		AvatarText:      req.AvatarText,
+		AvatarColor:     req.AvatarColor,
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
-		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
-		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
-		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
-		// 变成 5xx，把本功能最常见的一次拒绝变成一条 on-call 告警；而 P1 专为
-		// 这次拒绝注册的错误码从此不可达，本地化文案永远不会出现。
 		if errors.Is(err, ErrAdmissionRefused) {
 			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
 			return
 		}
+		if strings.TrimSpace(req.WorkspaceID) != "" {
+			if errors.Is(err, errGroupWorkspaceConflict) {
+				respondGroupWorkspaceError(c, err)
+				return
+			}
+			switch {
+			case errors.Is(err, workspace.ErrRequestInvalid),
+				errors.Is(err, workspace.ErrSpaceRequired),
+				errors.Is(err, workspace.ErrForbidden),
+				errors.Is(err, workspace.ErrNotFound),
+				errors.Is(err, workspace.ErrOwnerProtected),
+				errors.Is(err, workspace.ErrRoleInvalid),
+				errors.Is(err, workspace.ErrCandidateIneligible),
+				errors.Is(err, workspace.ErrDependencyUnavailable):
+				workspace.RespondError(c, err)
+				return
+			}
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-
 	// 消息自动删除（Web 特有逻辑）
 	creatorUser, err := g.userDB.QueryByUID(creator)
 	if err == nil && creatorUser != nil && creatorUser.MsgExpireSecond > 0 {
@@ -4963,19 +5100,16 @@ type groupReq struct {
 	Members []string `json:"members"`  // 成员uid
 	SpaceID string   `json:"space_id"` // Space ID（可选）
 	// ProjectID 把新群挂到某个项目下（可选，必须与 space_id 同时传）。
-	//
-	// 一旦设置就不可更改（不变量 I3）：没有任何接口能改群的项目归属，源码守卫
-	// 也禁止在创建路径和 detach 步骤之外写这一列。要换项目只能新建群。
-	//
-	// 非空时，群的成员集合从此受不变量 I2 约束——加人时必须是该项目的活跃成员。
-	ProjectID   string `json:"project_id"`   // 所属项目 ID（可选，需配合 space_id）
+	// 一旦设置就不可更改；非空时群成员集合受项目成员准入约束。
+	ProjectID   string `json:"project_id"`
+	WorkspaceID string `json:"workspace_id"` // Workspace ID（可选；非空时快照成员并建立关联）
 	CategoryID  string `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
 	AvatarText  string `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
 	AvatarColor *int   `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
 }
 
 func (g groupReq) Check() error {
-	if len(g.Members) <= 0 {
+	if len(g.Members) <= 0 && strings.TrimSpace(g.WorkspaceID) == "" {
 		return errors.New("群成员不能为空！")
 	}
 	return nil

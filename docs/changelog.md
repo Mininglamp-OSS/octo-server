@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### 新功能
+- Workspace 元数据、成员与生命周期 API — 支持组织限定的列表/详情、创建、部分更新、归档、成员管理、Owner 转让和成员自助退出。
+- Group↔Workspace 关联与查询 API — 支持群关联的绑定、换绑、解绑、单群查询、Workspace 反查，以及 `GET /v1/group/my` 的组织和群角色筛选。
+- Workspace 群创建快照 — `POST /v1/group/create` 可在同一事务中写入 Workspace 关联、显式成员与 active Workspace 成员快照，并保留外部 IM 失败补偿语义。
+
 ## [v1.1.2] - 2026-03-05
 
 ### 新功能
