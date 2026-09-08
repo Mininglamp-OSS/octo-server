@@ -1,0 +1,142 @@
+# octospec Implement-phase record for task project-p2-product-surfaces, PR-1.
+#
+# Scope of this record: PR-1 only — GET /v1/projects/:project_id/groups. PR-2
+# (project_id on the sidebar) and PR-3..PR-5 are not implemented and are not
+# covered here.
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
+# tier available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml). The
+# brief's tags are: space, isolation, acl, wire-contract, error-response, i18n,
+# rate-limit, testing, commit, migration. All six repo rules match.
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go matches every file touched; brief tags carry
+      space / isolation / acl. Drives: the route mounts the existing
+      projectScoped group, so AuthMiddleware -> SharedUIDRateLimiter ->
+      projectMiddleware all apply unchanged, and the handler reads space_id
+      from the project row projectMiddleware already verified the caller's
+      Space membership against rather than from any request input. The query
+      filters on that space_id as well as project_id, so a project id cannot
+      reach across a Space even if one were guessed. The route is /v1/-prefixed
+      and no new module is added, so internal/modules.go is untouched.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tags error-response / i18n / wire-contract.
+      Drives: the handler's only failures are wiring bugs and query failures,
+      both answered through respondQueryFailed (httperr.ResponseErrorL +
+      errcode.ErrProjectQueryFailed). No new error code is registered and no
+      new user-facing message is introduced, so active.zh-CN.toml needs no
+      entry - make i18n-extract-check and make i18n-lint both pass unchanged.
+      The refusal path is projectMiddleware's existing folded not-found, which
+      the new route inherits rather than restates.
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tag rate-limit. Drives: no new middleware and
+      no hand-rolled counter - the route is added INSIDE the projectScoped group
+      that already mounts SharedUIDRateLimiter after AuthMiddleware. The rule's
+      testing note (buckets are not cleared by CleanAllTables) is why the
+      coverage here is structural: see the testing entry below.
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by the brief's wire-contract tag, not by paths - this is not an
+      adapter and carries no external content. The one clause that transfers is
+      "bound the payload": the endpoint reuses pageParams, so limit is capped at
+      200 and page at 100000, and the member-count lookup is one grouped query
+      over the page rather than one query per row. Nothing here renders
+      caller-supplied text, emits a markdown destination, or crosses an adapter
+      boundary, so the escaping and parity clauses do not apply.
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go; brief tag testing. Drives: cases use the package's
+      setup() (CleanAllTables + resetUIDRateLimit + flushProjectCache) and its
+      existing fixtures. Deliberate divergence from the brief's acceptance
+      list: the brief asked for TestListProjectGroupsIsUIDRateLimited, and a
+      request-hammering test is what TestAuthChainOrder (api_i18n_test.go)
+      explicitly argues against - SharedUIDRateLimiter fails open without a uid,
+      so such a test passes whether or not the ordering is right. The chain is
+      therefore checked where it is declared, and this PR adds only the part
+      TestAuthChainOrder cannot see: that the new route went onto the
+      authenticated group rather than a new bare one.
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: |
+      paths ** matches everything; brief tag commit. English Conventional
+      Commits.
+
+brief: .octospec/tasks/project-p2-product-surfaces/brief.md
+
+# Decisions applied from the brief, and what changed while implementing.
+implementation_notes:
+  - |
+    D1 (membership-scoped) is implemented as the query predicate, not as a
+    filter over a wider result: listMyProjectGroups joins group_member on the
+    caller's uid. Q3 was confirmed by the requester on 2026-09-08.
+  - |
+    D2 (handler in modules/project, direct SQL on `group`) held up. The import
+    ban is pinned by pkg/project/import_guard_test.go and reading the table is
+    not importing the package - reconcile_p1.go and db_all_member_group.go
+    already do it. A reverse-registered read hook was rejected: an unregistered
+    provider would answer an empty list, indistinguishable from "no groups".
+  - |
+    Membership predicate is is_deleted = 0 AND status = 1, the repo's canonical
+    one (ExistMemberActive, both reconcile scans). This is STRICTER than
+    modules/group's queryProjectGroupNosWithActiveMember, which checks
+    is_deleted alone - correct for a cascade that removes rows, wrong for a
+    read. TestListProjectGroupsExcludesInactiveMembership is what keeps the two
+    apart.
+  - |
+    ORDER BY g.id ASC. It is the only total ordering available (group_no is a
+    UUID, name is not unique) and a non-total ORDER BY under OFFSET pagination
+    drops and duplicates rows between pages. It also puts #855's all-member
+    group first for free, since that group is provisioned with the project.
+  - |
+    No COLLATE in either statement, and that is deliberate rather than an
+    omission: `group` join `group_member` is legacy-to-legacy, and space_id /
+    project_id / uid arrive as bind parameters, not as octo_project* columns.
+    Written into db_group.go because "has no COLLATE" and "forgot its COLLATE"
+    look identical in a diff.
+  - |
+    No permission gate beyond projectMiddleware. The roster needs canViewMembers
+    because it is a fact about other people; this list returns only rows the
+    caller is already in, so a Space admin who never joined gets [] - the true
+    answer. A 403 there would make project non-membership observable on a route
+    that currently discloses nothing.
+  - |
+    A census note was added to pkg/authtree/authtree.go. The blanket entry
+    already covers /v1/projects/*, but this is the first Project route to return
+    another module's resource and a reader could take it for Project becoming a
+    read boundary. It is not, and the file's stated purpose is to record that as
+    a decision rather than an absence.
+
+open_verification:
+  - |
+    go test ./modules/project/ was NOT run: this environment has no MySQL, Redis
+    or WuKongIM (ports 3306/6379 refused), and testutil.NewTestServer needs all
+    three. Compile-level checks all pass - go build ./..., go vet, golangci-lint
+    (0 issues), gofmt, make i18n-extract-check, make i18n-lint. The ten new
+    cases have never executed anywhere; CI is the first run.
+  - |
+    No EXPLAIN was taken. The query is written to drive off group_space_project
+    (space_id, project_id), whose leading column is space_id, but that plan is
+    unverified and `group` is empty in CI - the same caveat the index's own
+    migration header carries.

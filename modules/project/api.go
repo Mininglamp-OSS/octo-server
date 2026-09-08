@@ -193,6 +193,10 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		projectScoped.PUT("/:project_id", p.updateProjectHandler)
 		projectScoped.DELETE("/:project_id", p.disbandProjectHandler)
 
+		// Read-only, and gated by the caller's own group membership rather than by
+		// a role check — see listProjectGroupsHandler.
+		projectScoped.GET("/:project_id/groups", p.listProjectGroupsHandler)
+
 		projectScoped.GET("/:project_id/members", p.listMembersHandler)
 		projectScoped.POST("/:project_id/members/add", p.addMembersHandler)
 		projectScoped.POST("/:project_id/members/remove", p.removeMembersHandler)

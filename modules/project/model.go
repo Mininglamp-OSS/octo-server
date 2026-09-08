@@ -277,6 +277,41 @@ type MemberResp struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// GroupResp is one row of the project group list.
+//
+// Deliberately NARROW, and not a copy of modules/group's GroupResp. That struct
+// is forty-odd fields of per-user group state, and it is served by the routes a
+// client already calls for exactly that (GET /v1/group/my, GET /v1/groups/:group_no).
+// Restating it here would create a second wire contract for one piece of state,
+// and the two would drift the first time either changed — while this module,
+// which cannot import modules/group, would have no compiler to notice.
+//
+// So this answers one question — which groups in this project am I in — with the
+// fields the tree renders, and the client fetches everything else where it
+// already does. The avatar fields travel together because they are one decision
+// on the client: avatar_text/avatar_color override, is_upload_avatar wins over
+// both, and is_named decides the fallback when none is set. Shipping a subset
+// would make the list render group avatars differently from every other surface.
+type GroupResp struct {
+	GroupNo string `json:"group_no"`
+	Name    string `json:"name"`
+	// IsNamed is 1 for a user-chosen group name, 0 for an auto-generated one
+	// ("张三、李四、王五"). Only 1 renders the name into the default avatar.
+	IsNamed int `json:"is_named"`
+	// AvatarText is the custom avatar text; "" falls back per IsNamed.
+	AvatarText string `json:"avatar_text"`
+	// AvatarColor is the custom palette index; null derives it from group_no.
+	// A pointer because the column is nullable and null is NOT index 0.
+	AvatarColor    *int `json:"avatar_color"`
+	IsUploadAvatar int  `json:"is_upload_avatar"`
+	// MemberCount counts active members (is_deleted = 0 AND status = 1),
+	// everyone in the group — unlike the project's own member_count, which #855
+	// narrowed to humans. These are different populations, so the same name
+	// meaning different things is a hazard the client teams need to know about:
+	// a project group's count includes the agents seated in it.
+	MemberCount int `json:"member_count"`
+}
+
 // memberRosterModel is the member roster joined to `user` for display names.
 type memberRosterModel struct {
 	MemberModel

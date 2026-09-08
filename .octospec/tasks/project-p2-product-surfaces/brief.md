@@ -370,9 +370,11 @@ admission transaction」, which P1 called a separate task and nobody has opened.
   prove the columns exist — `modules/project`'s existing tests already insert full `group` rows
   (`reconcile_i2_test.go:36`) and pass. Leave `reconcile_p1.go`'s defensive predicate alone;
   it is harmless and removing it is not this task's business.
-- **Q3 — Does the prototype's 群聊 tab need groups the caller is not in?** D1 says no and is
-  reversible. Confirm with product before PR-1 merges, because widening later is additive while
-  narrowing later is a breaking change.
+- ~~**Q3 — Does the prototype's 群聊 tab need groups the caller is not in?**~~ **RESOLVED
+  2026-09-08: no — the list is the caller's own groups.** D1 stands as written and is
+  implemented as the query predicate rather than as a filter over a wider result. Still
+  reversible in the additive direction only: a `?scope=all` variant can be argued later on its
+  own merits; narrowing after shipping the wider set could not.
 
 ## Out of scope
 
