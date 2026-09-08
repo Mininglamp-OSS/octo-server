@@ -28,6 +28,7 @@ import (
 // reason that has nothing to do with the code under test.
 
 type outboxRow struct {
+	ID             int64   `db:"id"`
 	EventID        string  `db:"event_id"`
 	EventType      string  `db:"event_type"`
 	ProjectID      string  `db:"project_id"`
@@ -44,7 +45,7 @@ func outboxRows(t *testing.T, projectID string) []outboxRow {
 	t.Helper()
 	var rows []outboxRow
 	_, err := testCtx.DB().SelectBySql(
-		"SELECT event_id, event_type, project_id, space_id, project_version, payload, "+
+		"SELECT id, event_id, event_type, project_id, space_id, project_version, payload, "+
 			"status, attempts, last_error, lease_until "+
 			"FROM `octo_project_lifecycle_event` WHERE project_id = ? ORDER BY id", projectID,
 	).Load(&rows)

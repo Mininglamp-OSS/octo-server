@@ -22,8 +22,12 @@ import (
 // what a latch on the project row says more directly and without the read
 // crossing into job state.
 
-// twoPhaseCreateApplies reports whether a new project must wait for a
-// confirmation before the peer may see it.
+// twoPhaseCreateApplies decides, AT INSERT, whether a new project must wait for
+// a confirmation before the peer may see it. It is the only remaining caller of
+// this question, and that is deliberate: at insert there is no row to read yet,
+// so this pod's configuration is the only thing there is to ask. Everywhere the
+// row already exists — both reconcile repairs — the question is answered from
+// the row instead, because the answer is per project and this is not.
 //
 // It is a question about whether anything will ever ANSWER, not about whether
 // the feature is desirable. The fleet target is the confirming step, so with it
@@ -105,40 +109,6 @@ func (d *DB) activateProject(projectID string, now time.Time) (bool, error) {
 		return false, fmt.Errorf("project: activate %s rows: %w", projectID, err)
 	}
 	return affected > 0, nil
-}
-
-// latchUnconfirmableProjects sets the latch on projects nothing will ever
-// confirm.
-//
-// Only ever called when twoPhaseCreateApplies() is false — the caller checks,
-// and the check cannot move into this statement, because the answer lives in
-// configuration rather than in a column. Bounded by limit and ordered oldest
-// first so a large backlog drains deterministically across ticks.
-func (d *DB) latchUnconfirmableProjects(now time.Time, limit int) (int64, error) {
-	var ids []string
-	if _, err := d.session.SelectBySql(
-		"SELECT project_id FROM `octo_project` "+
-			"WHERE activated_at IS NULL AND status = ? ORDER BY created_at LIMIT ?",
-		StatusNormal, limit,
-	).Load(&ids); err != nil {
-		return 0, fmt.Errorf("project: find unconfirmable projects: %w", err)
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	res, err := d.session.UpdateBySql(
-		"UPDATE `octo_project` SET activated_at = ? "+
-			"WHERE project_id IN ? AND activated_at IS NULL AND status = ?",
-		now, ids, StatusNormal,
-	).Exec()
-	if err != nil {
-		return 0, fmt.Errorf("project: latch unconfirmable projects: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("project: latch unconfirmable projects rows: %w", err)
-	}
-	return affected, nil
 }
 
 // countAwaitingActivation is the census behind the stuck-in-provisioning gauge.
@@ -239,37 +209,33 @@ func (p *Project) confirmProjectActive(projectID, target string) {
 func (p *Project) scanUnlatchedActivations() {
 	now := time.Now().UTC()
 
-	// FIRST, the case no confirmation will ever reach: the fleet target is off,
-	// so nothing runs the confirming step for these rows at all.
+	// BOTH repairs run, every tick, and neither is gated on this pod's
+	// configuration.
 	//
-	// They exist because the latch is a COLUMN with a one-shot backfill. Between
-	// the first pod applying migration 0004 and the last old pod draining, old
-	// binaries insert through the previous column list — which does not name
-	// activated_at — so those rows land NULL *after* the backfill has already run,
-	// and both inbound endpoints then hide them from the peer. Forever: the
-	// confirmation repair below needs a ready fleet provisioning row, and with the
-	// target off no such row is ever written. The same shape recurs whenever an
-	// operator enables the fleet target and later disables it.
+	// The gating was the bug. Asking twoPhaseCreateApplies() here answered a
+	// per-PROJECT question ("will anything ever confirm THIS row?") from a
+	// per-PROCESS fact ("is fleet in this pod's config?"), while the latch it
+	// drives is per row and irreversible. During a rolling enablement an old pod
+	// latched a new pod's freshly created projects; during a rejected-config
+	// window, projects created with no fleet job were skipped by this repair and
+	// unreachable by the other one, so they were invisible to the peer forever.
 	//
-	// The predicate is exactly the one createProjectOnce already uses at insert
-	// time, applied a second time to rows that missed it. Latching here is not a
-	// weakening of the gate: with nothing to confirm them, the alternative is not
-	// "confirmed later", it is "invisible to the peer permanently".
-	if !p.twoPhaseCreateApplies() {
-		latched, err := p.db.latchUnconfirmableProjects(now, p.cfg.ReconcileLimit)
-		if err != nil {
-			p.Warn("补置无人确认的项目激活闩锁失败", zap.Error(err))
-			return
-		}
-		if latched > 0 {
-			// Warn, not Error: with the target off this is the expected repair for
-			// a rolling upgrade, not a malfunction. It is still logged, because a
-			// count that keeps growing after the rollout window means old pods are
-			// still inserting.
-			p.Warn("补置了滚动升级期间遗留的项目激活闩锁（fleet target 未开启，无人会确认它们）",
-				zap.Int64("latched", latched))
-		}
+	// Both predicates now read the row instead: latch what has no fleet job at
+	// all, repair what has one that reached ready. A project whose job exists and
+	// is still working is matched by neither, which is exactly the state that
+	// should keep waiting.
+	latched, err := p.db.latchUnconfirmableProjects(now, p.cfg.ReconcileLimit)
+	if err != nil {
+		p.Warn("补置无人确认的项目激活闩锁失败", zap.Error(err))
 		return
+	}
+	if latched > 0 {
+		// Warn, not Error: a project with no fleet job is the expected shape after
+		// a rolling upgrade, or on any deployment that never enabled the target.
+		// It is still logged, because a count that keeps growing after the rollout
+		// window means old pods are still inserting.
+		p.Warn("补置了无 fleet 工单的项目激活闩锁（没有任何东西会去确认它们）",
+			zap.Int64("latched", latched))
 	}
 
 	repaired, err := p.db.repairConfirmedButUnlatched(now, p.cfg.ReconcileLimit)

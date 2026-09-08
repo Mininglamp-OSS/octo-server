@@ -372,16 +372,23 @@ func TestNoLogFieldCarriesTheContainerID(t *testing.T) {
 	}
 }
 
-// TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions pins the boot-time
+// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions pins the boot-time
 // wiring, which no test in this package can reach at runtime.
 //
 // TestLoadProvisioningConfig's collision cases build their own argument list, so they
 // would still pass with the production arguments deleted. Only the central call in
 // main.go sees the DYNAMIC route-scoped notify tokens and callback secrets loaded from
-// OCTO_CARD_ACTION_ROUTES; without these arguments a provisioning credential set equal
-// to a route's notify token would pass every local check, and one leaked value would
-// authorize both provisioning and minting that route's card action.
-func TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions(t *testing.T) {
+// OCTO_CARD_ACTION_ROUTES; without these arguments a provisioning secret set equal to
+// a route's notify token would pass every local check, and one leaked value would
+// authorize both provisioning a container and minting that route's card action.
+// It covers the lifecycle event secret too, and that entry is why the list is a
+// list rather than two named checks: the lifecycle secret was added to
+// fixedInternalTokenEnvs and to both module-local refusal lists and NOT to this
+// call, which is the one collision no local check can see. modules/project
+// compares it against the fixed envs; nothing compared it against the dynamic
+// route-scoped credentials. Adding an outbound secret without adding it here is
+// evidently an easy thing to do, so the guard names every one.
+func TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions(t *testing.T) {
 	root := repoRootForGuard(t)
 	src, err := os.ReadFile(filepath.Join(root, "main.go"))
 	if err != nil {
@@ -400,6 +407,7 @@ func TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions(t *te
 	for _, want := range []string{
 		"os.Getenv(project.ProvisionFleetSecretEnv)",
 		"os.Getenv(project.DriveInternalTokenEnv)",
+		"os.Getenv(project.LifecycleEventSecretEnv)",
 	} {
 		if !strings.Contains(strings.Join(strings.Fields(args), ""), strings.ReplaceAll(want, " ", "")) {
 			t.Errorf("main.go: ValidateNotifyTokenExclusions(...) no longer includes %s "+

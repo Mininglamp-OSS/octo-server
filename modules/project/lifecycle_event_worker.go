@@ -156,10 +156,12 @@ func (p *Project) runLifecycleEventDelivery() {
 	}
 
 	ids := make([]int64, 0, len(rows))
+	held := &leaseSet{}
 	for _, r := range rows {
 		ids = append(ids, r.ID)
+		held.add(r.ID)
 	}
-	stopHeartbeat := p.startLifecycleLeaseHeartbeat(owner)
+	stopHeartbeat := p.startLifecycleLeaseHeartbeat(held, owner)
 	defer stopHeartbeat()
 
 	sender, err := p.lifecycleSenderOrDefault()
@@ -193,7 +195,7 @@ func (p *Project) runLifecycleEventDelivery() {
 	// by the ones behind it. Bounded so one busy project cannot starve the others
 	// in this batch, and so a tick cannot run unboundedly long.
 	for _, row := range rows {
-		p.drainProject(sender, row, owner)
+		p.drainProject(sender, row, owner, held)
 	}
 }
 
@@ -202,7 +204,7 @@ func (p *Project) runLifecycleEventDelivery() {
 //
 // Returns nothing: every outcome is already recorded by deliverLifecycleEvent,
 // and the caller has no decision left to make.
-func (p *Project) drainProject(sender lifecycleSender, head lifecycleEventRow, owner string) {
+func (p *Project) drainProject(sender lifecycleSender, head lifecycleEventRow, owner string, held *leaseSet) {
 	if !p.deliverLifecycleEvent(sender, head, owner) {
 		return
 	}
@@ -216,6 +218,9 @@ func (p *Project) drainProject(sender lifecycleSender, head lifecycleEventRow, o
 		if next == nil {
 			return // this project is drained
 		}
+		// Into the heartbeat's set BEFORE it is delivered: a row claimed mid-tick
+		// and not renewed is exactly the tail the heartbeat exists to protect.
+		held.add(next.ID)
 		if !p.deliverLifecycleEvent(sender, *next, owner) {
 			return
 		}
@@ -290,16 +295,42 @@ func (p *Project) sweepOnce(now time.Time) bool {
 	return len(rows) < lifecycleEventBatch
 }
 
-// startLifecycleLeaseHeartbeat keeps everything this worker holds leased while it
-// walks the batch.
+// leaseSet is the set of rows THIS TICK is walking.
 //
-// Keyed on the OWNER rather than on the ids claimed at the start, because the
-// per-project drain claims more rows as it goes and an id list fixed at claim
-// time would leave exactly those unrenewed. The reason renewal is needed at all
-// is unchanged: the tail of a slow batch would otherwise expire while this worker
-// still intends to send it, and another pod would claim and deliver those rows
-// concurrently.
-func (p *Project) startLifecycleLeaseHeartbeat(owner string) func() {
+// It grows: the batch claim seeds it, and the per-project drain adds each row it
+// claims. The heartbeat reads it, so it has to be safe to read from another
+// goroutine — hence the mutex rather than a plain slice.
+//
+// A growing set is the whole reason this type exists. Renewing by owner instead
+// would be simpler and is wrong: lease_owner is per PROCESS, not per claim, so
+// it also renews orphaned rows left leased by a failed completion write, and an
+// orphan that never loses its lease is invisible to both the sweep and the
+// claim for the life of the pod.
+type leaseSet struct {
+	mu  sync.Mutex
+	ids []int64
+}
+
+func (l *leaseSet) add(id int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ids = append(l.ids, id)
+}
+
+func (l *leaseSet) snapshot() []int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]int64(nil), l.ids...)
+}
+
+// startLifecycleLeaseHeartbeat keeps the rows this tick is walking leased.
+//
+// Renewal is needed because the tail of a slow batch would otherwise expire
+// while this worker still intends to send it, and another pod would claim and
+// deliver those rows concurrently. It is scoped to a growing id set rather than
+// to the owner for the reason on heartbeatLifecycleEventLeases: the owner is per
+// process, so an owner-scoped renewal keeps orphaned rows alive forever.
+func (p *Project) startLifecycleLeaseHeartbeat(held *leaseSet, owner string) func() {
 	stop := make(chan struct{})
 	var once sync.Once
 	go func() {
@@ -311,7 +342,7 @@ func (p *Project) startLifecycleLeaseHeartbeat(owner string) func() {
 				return
 			case <-ticker.C:
 				until := time.Now().UTC().Add(lifecycleEventLease)
-				if err := p.db.heartbeatLifecycleEventLeases(owner, until); err != nil {
+				if err := p.db.heartbeatLifecycleEventLeases(held.snapshot(), owner, until); err != nil {
 					p.Warn("续租项目生命周期事件失败", zap.Error(err))
 				}
 			}

@@ -647,3 +647,65 @@ func (d *DB) repairConfirmedButUnlatched(now time.Time, limit int) ([]string, er
 	}
 	return ids, nil
 }
+
+// latchUnconfirmableProjects sets the latch on projects that NOTHING WILL EVER
+// CONFIRM, decided per project rather than from this pod's configuration.
+//
+// The predicate is "no fleet provisioning job exists for this project". That is
+// a fact about the row, and it is the fact the question actually turns on —
+// where twoPhaseCreateApplies() answers from cfg, which is per PROCESS while the
+// latch is per row and irreversible. Two states broke that, in opposite
+// directions:
+//
+//	ROLLING ENABLEMENT. An operator adds the fleet target; pods restart one at a
+//	time. Pod A (new config) creates a project with activated_at NULL and a
+//	pending fleet job. Pod B still has the old config, so its reconcile tick
+//	answered "nothing will confirm" for EVERY unlatched row and latched Pod A's
+//	project — visible to the peer before its container exists, permanently. The
+//	reconcile interval is five minutes; any rolling restart outlasts it.
+//
+//	THE REJECTED-CONFIG WINDOW. A project created while the fleet target was
+//	rejected at load gets no fleet job at all, because provisioning is enqueued
+//	from cfg.Targets and fleet is not in it. Neither repair could reach such a
+//	row: this one skipped it while fleet was "requested", and the confirmation
+//	repair needs a job in ready state. It was invisible to the peer forever, and
+//	fixing the env did not recover it.
+//
+// The join answers both. Pod B now sees Pod A's job and declines; the
+// rejected-window project has no job and is latched — which is the MILDER
+// failure of the two (the peer sees a project whose container is not there yet,
+// the same window that exists today) rather than the permanent one.
+//
+// It lives in this file for the reason the repair above does: the provisioning
+// table is named in exactly one non-test file, and this query reads project_id
+// only, never container_id.
+func (d *DB) latchUnconfirmableProjects(now time.Time, limit int) (int64, error) {
+	var ids []string
+	if _, err := d.session.SelectBySql(
+		"SELECT p.project_id FROM `octo_project` p "+
+			"WHERE p.activated_at IS NULL AND p.status = ? "+
+			"  AND NOT EXISTS ("+
+			"    SELECT 1 FROM `octo_project_provisioning` pr "+
+			"    WHERE pr.project_id = p.project_id AND pr.target = ?) "+
+			"ORDER BY p.created_at LIMIT ?",
+		StatusNormal, TargetFleet, limit,
+	).Load(&ids); err != nil {
+		return 0, fmt.Errorf("project: find unconfirmable projects: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res, err := d.session.UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = ? "+
+			"WHERE project_id IN ? AND activated_at IS NULL AND status = ?",
+		now, ids, StatusNormal,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: latch unconfirmable projects: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: latch unconfirmable projects rows: %w", err)
+	}
+	return affected, nil
+}

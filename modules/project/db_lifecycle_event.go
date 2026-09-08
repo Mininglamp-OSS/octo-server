@@ -163,16 +163,34 @@ func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease 
 // consumer would deduplicate on event_id, but the two workers would race each
 // other for the same lease on completion and one would log a false ownership
 // loss on every batch.
-func (d *DB) heartbeatLifecycleEventLeases(owner string, until time.Time) error {
-	// By OWNER, not by a list of ids captured when the batch was claimed. The
-	// per-project drain claims MORE rows after the heartbeat has started, and an
-	// id list fixed at claim time would leave exactly those rows unrenewed — the
-	// ones this worker is actively walking. lease_owner is unique per claim
-	// (workerIdentity), so this can only touch rows this worker holds.
+func (d *DB) heartbeatLifecycleEventLeases(ids []int64, owner string, until time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	// BY ID, and the owner is only a fence on top of it.
+	//
+	// An owner-scoped statement was tried and is wrong, because lease_owner is
+	// NOT per claim: workerIdentity() is project-removal-<host>-<pid> memoized
+	// under a sync.Once, so it is stable for the whole life of the process.
+	// Renewing "every pending row stamped with this owner" therefore also renews
+	// rows no goroutine is working on — and those exist, because a completion
+	// write that fails (the 1366 and 1205 shapes this module has already met)
+	// leaves its row pending AND leased.
+	//
+	// Such an orphan is then unreachable in both directions for as long as the
+	// process lives: the sweep deliberately skips leased rows, and the claim
+	// requires an expired lease. It also blocks its own project's queue through
+	// the claim's older-pending-sibling predicate, so an undelivered
+	// member_revoked behind it stays undelivered until the pod restarts. With an
+	// id-scoped renewal the orphan's lease simply expires and the next tick
+	// re-claims or sweeps it.
+	//
+	// The caller passes a growing set, because the per-project drain claims more
+	// rows after the heartbeat has started; see leaseSet.
 	_, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_lifecycle_event` SET lease_until = ? "+
-			"WHERE lease_owner = ? AND status = ?",
-		until, owner, lifecycleEventPending,
+			"WHERE id IN ? AND lease_owner = ? AND status = ?",
+		until, ids, owner, lifecycleEventPending,
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("project: heartbeat lifecycle event leases: %w", err)
@@ -271,8 +289,24 @@ func (d *DB) releaseUnattemptedLifecycleEvents(ids []int64, owner string) error 
 // pending set; running that repeatedly to drain one project would multiply the
 // expensive query rather than the cheap one.
 //
-// No NOT EXISTS needed: ORDER BY id ASC LIMIT 1 IS the oldest pending sibling,
-// so the ordering property is the same one the batch claim spells out.
+// It carries the SAME NOT EXISTS predicate as the batch claim, and the first
+// version of this function did not — on the grounds that ORDER BY id ASC LIMIT 1
+// is the oldest pending sibling. It is not. It is the oldest sibling that also
+// satisfies the due, unleased, unlocked and in-budget predicates, which is a
+// different row: if another replica claimed this project's next event between
+// this worker's completion write and this SELECT, that row is excluded by the
+// lease predicate and the one AFTER it is returned instead. Two workers then
+// deliver consecutive events for one project concurrently, in undefined order.
+//
+// The window is the gap between completeLifecycleEvent committing and this
+// statement running, which is narrow — and "narrow" plus per-process reasoning
+// is exactly what the batch claim's NOT EXISTS was added to replace, because a
+// predicate in the claim holds ACROSS REPLICAS where in-process state cannot.
+// Reintroducing the assumption in a second claim would have undone that.
+//
+// With the predicate, an older pending sibling makes this return NO row rather
+// than skipping past it: the drain stops, and the next tick picks the project up
+// in order. Cost is one index lookup on (project_id, id), which this table has.
 func (d *DB) claimNextForProject(owner, projectID string, now time.Time, lease time.Duration) (*lifecycleEventRow, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -282,13 +316,17 @@ func (d *DB) claimNextForProject(owner, projectID string, now time.Time, lease t
 
 	var rows []lifecycleEventRow
 	if _, err := tx.SelectBySql(
-		"SELECT id, event_id, event_type, project_id, space_id, project_version, "+
-			"payload, occurred_at, attempts "+
-			"FROM `octo_project_lifecycle_event` "+
-			"WHERE project_id = ? AND status = ? AND next_attempt_at <= ? "+
-			"  AND (lease_until IS NULL OR lease_until <= ?) AND attempts < ? "+
-			"ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+		"SELECT e.id, e.event_id, e.event_type, e.project_id, e.space_id, e.project_version, "+
+			"e.payload, e.occurred_at, e.attempts "+
+			"FROM `octo_project_lifecycle_event` e "+
+			"WHERE e.project_id = ? AND e.status = ? AND e.next_attempt_at <= ? "+
+			"  AND (e.lease_until IS NULL OR e.lease_until <= ?) AND e.attempts < ? "+
+			"  AND NOT EXISTS ("+
+			"    SELECT 1 FROM `octo_project_lifecycle_event` older "+
+			"    WHERE older.project_id = e.project_id AND older.status = ? AND older.id < e.id) "+
+			"ORDER BY e.id ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
 		projectID, lifecycleEventPending, now, now, lifecycleEventMaxAttempts,
+		lifecycleEventPending,
 	).Load(&rows); err != nil {
 		return nil, fmt.Errorf("project: claim next lifecycle event select: %w", err)
 	}

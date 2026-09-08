@@ -408,3 +408,72 @@ func TestNeverConfiguredFleetStillLatches(t *testing.T) {
 		"with fleet in neither Targets nor Misconfigured, nothing will ever confirm — the "+
 			"repair must still latch, or B-4 is back")
 }
+
+// TestAnOldPodDoesNotLatchANewPodsInFlightProject is P1-C case (a), the rolling
+// ENABLEMENT of the fleet target.
+//
+// Pods restart one at a time, so a pod with the new config creates a project
+// with a pending fleet job while a pod with the old config is still running.
+// Deciding "will anything confirm this?" from the old pod's configuration
+// answered yes-nothing-will for every unlatched row, so it latched the new pod's
+// project — visible to the peer before its container exists, permanently, since
+// the latch is one-way. The reconcile interval is five minutes; any rolling
+// restart outlasts it.
+func TestAnOldPodDoesNotLatchANewPodsInFlightProject(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.setStatus(500) // the job stays pending, i.e. still able to confirm later
+	newPod, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "rolling-enable")
+	newPod.processProvisioningJobs()
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition: awaiting confirmation")
+
+	// The OLD pod: same database, fleet in neither list, because its process
+	// started before the operator added the target. Constructed directly rather
+	// than through setup(), which truncates the tables the new pod just wrote.
+	oldPod := New(testCtx)
+	require.False(t, oldPod.twoPhaseCreateApplies(),
+		"precondition: this pod's config knows nothing about fleet")
+
+	oldPod.scanUnlatchedActivations()
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"a pod whose config predates the fleet enablement must not latch a project whose "+
+			"fleet job already exists. The question is per project — does THIS row have a "+
+			"job — and the answer is in the database, not in this pod's environment")
+}
+
+// TestAProjectWithNoFleetJobIsLatchedEvenWhileFleetIsEnabled is P1-C case (b).
+//
+// A project created during a rejected-config window gets no fleet job at all,
+// because provisioning is enqueued from cfg.Targets and the rejection dropped
+// fleet from it. Skipping such a row while fleet is "requested" left it
+// unreachable by BOTH repairs — the other one needs a job in ready state — so it
+// was invisible to the peer forever, and fixing the env did not recover it.
+//
+// Latching it is the milder of the two failures: the peer sees a project whose
+// container is not there yet, which is the window that exists today anyway.
+func TestAProjectWithNoFleetJobIsLatchedEvenWhileFleetIsEnabled(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+
+	// Reproduce the rejected window: fleet requested but not live, so create
+	// writes no provisioning row.
+	p.cfg.Provisioning.Targets = nil
+	p.cfg.Provisioning.Misconfigured = []string{TargetFleet}
+	created := createVia(t, r, token, "no-job")
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition: gated at insert")
+	require.Empty(t, readProvisioningRows(t, created.ProjectID),
+		"precondition: the rejection means no fleet job was ever written")
+
+	// The operator fixes the env; this pod now has a working fleet target.
+	p.cfg.Provisioning.Targets = []provisionTarget{fleetTargetOn(fleet)}
+	p.cfg.Provisioning.Misconfigured = nil
+	require.True(t, p.twoPhaseCreateApplies())
+
+	p.scanUnlatchedActivations()
+
+	assert.NotNil(t, activatedAtOf(t, created.ProjectID),
+		"a project with NO fleet job must be latched even while fleet is enabled: nothing "+
+			"will ever confirm it, the confirmation repair needs a ready job it does not have, "+
+			"and the alternative is invisible to the peer forever")
+}

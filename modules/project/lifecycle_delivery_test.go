@@ -424,3 +424,112 @@ func TestTheSweepDrainsAcrossPasses(t *testing.T) {
 				"pod produces exactly that burst", i, lifecycleEventBatch)
 	}
 }
+
+// TestTheDrainRefusesToSkipALeasedOlderSibling is P1-D.
+//
+// The per-project drain's first version relied on ORDER BY id ASC LIMIT 1 being
+// "the oldest pending sibling". It is not: it is the oldest sibling that also
+// satisfies the due, unleased, unlocked and in-budget predicates. So a row
+// another replica had just claimed was excluded by the lease predicate and the
+// one AFTER it was returned instead — two workers delivering consecutive events
+// for one project concurrently, in undefined order.
+//
+// That is the same per-process assumption the batch claim's NOT EXISTS was added
+// to replace, reintroduced in a second claim.
+func TestTheDrainRefusesToSkipALeasedOlderSibling(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "skipOwner")
+	seedSpaceMember(t, spaceA, "skipOwner", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "no-skip")
+	enqueueDirect(t, created.ProjectID, spaceA, 2)
+	rows := outboxRows(t, created.ProjectID)
+	require.Len(t, rows, 3, "created + two revocations")
+
+	// Row 1 (the creation event) is finished; row 2 is held by ANOTHER replica.
+	exec := func(stmt string, args ...interface{}) {
+		_, e := testCtx.DB().UpdateBySql(stmt, args...).Exec()
+		require.NoError(t, e)
+	}
+	exec("UPDATE `octo_project_lifecycle_event` SET status = ? WHERE event_id = ?",
+		lifecycleEventDelivered, rows[0].EventID)
+	exec("UPDATE `octo_project_lifecycle_event` "+
+		"SET lease_owner = 'another-pod', lease_until = ? WHERE event_id = ?",
+		time.Now().UTC().Add(time.Minute), rows[1].EventID)
+
+	next, err := p.db.claimNextForProject(
+		p.workerIdentity(), created.ProjectID, time.Now().UTC(), lifecycleEventLease)
+	require.NoError(t, err)
+	assert.Nil(t, next,
+		"an older pending sibling held by another replica must make this return NO row. "+
+			"Skipping past it delivers this project's events out of order across pods, which "+
+			"is exactly what the batch claim's NOT EXISTS exists to prevent")
+
+	// And once that sibling is finished, the drain resumes with the next one.
+	exec("UPDATE `octo_project_lifecycle_event` SET status = ?, lease_owner = '', lease_until = NULL "+
+		"WHERE event_id = ?", lifecycleEventDelivered, rows[1].EventID)
+	next, err = p.db.claimNextForProject(
+		p.workerIdentity(), created.ProjectID, time.Now().UTC(), lifecycleEventLease)
+	require.NoError(t, err)
+	require.NotNil(t, next, "with nothing older pending, the drain must advance")
+	assert.Equal(t, rows[2].EventID, next.EventID)
+}
+
+// TestTheHeartbeatDoesNotRenewOrphanedRows is P1-A.
+//
+// The heartbeat was briefly scoped to lease_owner, on the belief that the owner
+// is unique per claim. It is not: workerIdentity() is memoized under a sync.Once
+// and is stable for the whole life of the process. So the statement also renewed
+// rows no goroutine was working on — and those exist, because a completion write
+// that fails leaves its row pending AND leased.
+//
+// An orphan whose lease never expires is unreachable in BOTH directions: the
+// sweep skips leased rows and the claim requires an expired lease. It also
+// blocks its own project's queue through the older-pending-sibling predicate, so
+// a member_revoked behind it stays undelivered until the pod restarts. With an
+// id-scoped renewal the lease simply expires and the next tick recovers it.
+func TestTheHeartbeatDoesNotRenewOrphanedRows(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "hbOwner")
+	seedSpaceMember(t, spaceA, "hbOwner", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "heartbeat")
+	enqueueDirect(t, created.ProjectID, spaceA, 1)
+	rows := outboxRows(t, created.ProjectID)
+	require.Len(t, rows, 2)
+
+	// The orphan: pending, leased by THIS process's owner, nobody working on it.
+	// This is what a failed completeLifecycleEvent leaves behind.
+	owner := p.workerIdentity()
+	stale := time.Now().UTC().Add(30 * time.Second)
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project_lifecycle_event` SET lease_owner = ?, lease_until = ? WHERE event_id = ?",
+		owner, stale, rows[0].EventID).Exec()
+	require.NoError(t, err)
+
+	// A tick renewing an UNRELATED row must not touch the orphan.
+	held := &leaseSet{}
+	held.add(rows[1].ID)
+	require.NoError(t, p.db.heartbeatLifecycleEventLeases(
+		held.snapshot(), owner, time.Now().UTC().Add(lifecycleEventLease)))
+
+	var after []struct {
+		LeaseUntil *time.Time `db:"lease_until"`
+	}
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT lease_until FROM `octo_project_lifecycle_event` WHERE event_id = ?",
+		rows[0].EventID).Load(&after)
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	require.NotNil(t, after[0].LeaseUntil)
+	assert.WithinDuration(t, stale, *after[0].LeaseUntil, time.Second,
+		"the orphan's lease must NOT move: an owner-scoped renewal keeps it alive for the "+
+			"life of the process, and a row that is pending-but-never-expiring is invisible "+
+			"to the sweep AND to the claim, blocking its whole project's queue")
+}
