@@ -1976,22 +1976,24 @@ func (rb *Robot) ownedBots(c *wkhttp.Context) {
 	}
 
 	// creator_uid=loginUID 与 space_id 双重过滤即 space 隔离点，均为占位符，不可绕过。
-	// 仅暴露 uid/name/description/bot_commands，绝不返回 token/凭据。
+	// 托管类型是通用 Bot 事实；由消费方决定用途，绝不返回 token/凭据。
 	type ownedBotRow struct {
-		UID         string `db:"uid"`
-		Name        string `db:"name"`
-		Description string `db:"description"`
-		BotCommands string `db:"bot_commands"`
+		UID          string `db:"uid"`
+		Name         string `db:"name"`
+		Description  string `db:"description"`
+		BotCommands  string `db:"bot_commands"`
+		AgentHosting string `db:"agent_hosting"`
 	}
 	var bots []ownedBotRow
 	_, err = rb.ctx.DB().SelectBySql(`
 		SELECT r.robot_id as uid, IFNULL(u.name,'') as name,
 			IFNULL(r.description,'') as description,
-			IFNULL(r.bot_commands,'') as bot_commands
+			IFNULL(r.bot_commands,'') as bot_commands,
+			IFNULL(r.agent_hosting,'') as agent_hosting
 		FROM robot r
 		INNER JOIN user u ON u.uid = r.robot_id AND u.robot = 1
 		INNER JOIN space_member sm ON sm.uid = r.robot_id AND sm.space_id = ? AND sm.status = 1
-		WHERE r.creator_uid = ? AND r.status = 1
+		WHERE r.creator_uid = ? AND r.status = 1 AND u.status = 1
 		ORDER BY r.created_at DESC
 	`, spaceID, loginUID).Load(&bots)
 	if err != nil {
@@ -2002,12 +2004,14 @@ func (rb *Robot) ownedBots(c *wkhttp.Context) {
 
 	results := make([]map[string]interface{}, 0, len(bots))
 	for _, b := range bots {
-		results = append(results, map[string]interface{}{
-			"uid":          b.UID,
-			"name":         b.Name,
-			"description":  b.Description,
-			"bot_commands": b.BotCommands,
-		})
+		item := map[string]interface{}{
+			"uid":           b.UID,
+			"name":          b.Name,
+			"description":   b.Description,
+			"bot_commands":  b.BotCommands,
+			"agent_hosting": b.AgentHosting,
+		}
+		results = append(results, item)
 	}
 	c.Response(results)
 }
