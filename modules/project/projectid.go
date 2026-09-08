@@ -41,9 +41,26 @@ import (
 // request handler that already returns an error, so it returns one: a failure to
 // read entropy should refuse one create, not take down the process.
 func newProjectID() (string, error) {
-	u, err := uuid.NewRandom()
+	id, err := newCanonicalUUID()
 	if err != nil {
 		return "", fmt.Errorf("project: generate project_id: %w", err)
+	}
+	return id, nil
+}
+
+// newCanonicalUUID mints a lowercase hyphenated v4 UUID.
+//
+// Shared by project ids and outbox event ids. Both cross the service boundary as
+// strings the peer compares or keys on, so both need the canonical spelling, and
+// one generator means a future caller cannot pick the wrong one.
+//
+// Returns an error rather than panicking for the reason given above: this runs on
+// request paths and inside a database transaction, where a failed entropy read
+// should refuse one operation instead of taking down the process.
+func newCanonicalUUID() (string, error) {
+	u, err := uuid.NewRandom()
+	if err != nil {
+		return "", fmt.Errorf("generate uuid: %w", err)
 	}
 	return u.String(), nil
 }

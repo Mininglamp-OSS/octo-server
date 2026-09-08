@@ -71,6 +71,41 @@ const (
 	// beside the other reconcile knobs rather than in a constant.
 	envAllMemberGroupAdmitGrace = "OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE"
 	envMetricsEvery             = "OCTO_PROJECT_METRICS_INTERVAL"
+
+	// envLifecycleEventsEnabled gates the project lifecycle outbox — BOTH the
+	// enqueue side and the delivery worker, on the same switch.
+	//
+	// One switch for both, deliberately. Queueing while delivery is off produces a
+	// backlog the consumer can never accept: it never saw the project.created that
+	// should have preceded those events, so each one refers to something it does
+	// not know about. Enabling the integration on a deployment that already has
+	// projects therefore needs a deliberate backfill, and making that obvious is
+	// worth more than the events a split switch would have preserved.
+	//
+	// Default OFF, like every other switch in this module.
+	envLifecycleEventsEnabled = "OCTO_PROJECT_LIFECYCLE_EVENTS_ENABLED"
+	// envLifecycleEventURL is the absolute POST endpoint events are delivered to,
+	// path included. Absolute rather than a base URL with a path appended here,
+	// for the reason internal/projectprovision gives: the signature covers the
+	// PATH, so a path this side assembles and a path the peer serves must be the
+	// same string, and the only way to be sure is to configure the whole thing.
+	envLifecycleEventURL = "OCTO_PROJECT_LIFECYCLE_EVENT_URL"
+	// LifecycleEventSecretEnv is the HMAC secret for outbound lifecycle events.
+	//
+	// A shared secret rather than a bearer token, matching the provisioning
+	// channel (pkg/octosign) rather than inventing a second scheme. Two reasons,
+	// and the first is the one main.go's credential registry states: a bearer
+	// token we SEND is a credential the peer could send back to us, while an HMAC
+	// secret proves possession without ever crossing the wire. The second is that
+	// the signature covers method, path, timestamp, event id and body, so it binds
+	// the request; a bearer authenticates the caller and says nothing about what
+	// was sent.
+	//
+	// Exported so main.go can include it in the cross-capability exclusion checks
+	// without a second copy of the literal drifting out of sync.
+	LifecycleEventSecretEnv = "OCTO_PROJECT_LIFECYCLE_EVENT_SECRET"
+	// envLifecycleEventTimeout bounds ONE delivery attempt.
+	envLifecycleEventTimeout = "OCTO_PROJECT_LIFECYCLE_EVENT_TIMEOUT"
 )
 
 // Defaults. The three project/member caps come from the brief; the batch cap and
@@ -113,6 +148,14 @@ const (
 	// whole tables, and those aggregates get slowest exactly when the numbers
 	// matter most (after a backlog).
 	defaultMetricsInterval = 15 * time.Minute
+
+	// defaultLifecycleEventTimeout bounds ONE delivery attempt to the peer.
+	//
+	// Short on purpose. A delivery that hangs holds a worker slot and its lease for
+	// the whole duration, and the queue behind it is where an unsent member
+	// revocation waits. Failing fast and retrying with backoff drains a temporarily
+	// slow peer better than waiting on each attempt does.
+	defaultLifecycleEventTimeout = 10 * time.Second
 )
 
 // Field length caps follow the Project contract. Name is measured in Unicode
@@ -146,6 +189,12 @@ type Config struct {
 	// from I4 scan B, because the admitter runs after the seat transaction commits.
 	AllMemberGroupAdmitGrace time.Duration
 	MetricsInterval          time.Duration
+
+	// Project lifecycle outbox.
+	LifecycleEventsEnabled bool
+	LifecycleEventURL      string
+	LifecycleEventSecret   string
+	LifecycleEventTimeout  time.Duration
 	// Provisioning is the eager subsystem-container configuration (brief D2).
 	// Zero value = inert: no outbox row is enqueued and no worker starts, which is
 	// the default until an operator names a target. See config_provisioning.go.
@@ -185,6 +234,11 @@ func loadConfig() Config {
 		AllMemberGroupAdmitGrace: envDuration(
 			envAllMemberGroupAdmitGrace, defaultAllMemberGroupAdmitGrace),
 		MetricsInterval: envDuration(envMetricsEvery, defaultMetricsInterval),
+
+		LifecycleEventsEnabled: envBool(envLifecycleEventsEnabled, false),
+		LifecycleEventURL:      strings.TrimSpace(envString(envLifecycleEventURL, "")),
+		LifecycleEventSecret:   envString(LifecycleEventSecretEnv, ""),
+		LifecycleEventTimeout:  envDuration(envLifecycleEventTimeout, defaultLifecycleEventTimeout),
 		// Rejected targets are dropped rather than fatal; the reasons ride along on
 		// ProvisioningConfig.Problems for New() to log. See loadProvisioningConfig.
 		Provisioning: provisioning,
@@ -208,6 +262,19 @@ func (c Config) dayWindow(now time.Time) (time.Time, time.Time) {
 	local := now.In(c.DayBoundary)
 	start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, c.DayBoundary)
 	return start.UTC(), start.AddDate(0, 0, 1).UTC()
+}
+
+// lifecycleEventsEnabled reports whether the outbox may enqueue and deliver.
+//
+// Fail-closed on INCOMPLETE configuration, not just on the switch: an enabled
+// integration with no URL or no secret cannot deliver anything, so letting it
+// ENQUEUE would build a backlog that only grows and whose head keeps failing on
+// the same misconfiguration. Refusing at the enqueue side keeps the outbox empty
+// and leaves the misconfiguration visible in the startup log instead.
+func (p *Project) lifecycleEventsEnabled() bool {
+	return p.cfg.LifecycleEventsEnabled &&
+		p.cfg.LifecycleEventURL != "" &&
+		p.cfg.LifecycleEventSecret != ""
 }
 
 func envString(key, fallback string) string {
