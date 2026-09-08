@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
@@ -67,47 +68,21 @@ import (
 // on no-op reruns and break the "a no-op write does not change the epoch" rule that
 // clients cache against.
 
-// txRetryAttempts bounds the retry budget for transient lock conflicts. Three: enough for the
-// pathological interleaving to have passed, few enough that a genuine hot spot surfaces as an
-// error rather than as latency.
-const txRetryAttempts = 3
+// txRetryAttempts and the two helpers below are thin aliases over pkg/db, which now
+// owns the canonical copy. Kept as package-local names because every call site in this
+// file reads `retryOnLockConflict(...)` and the tests assert on `txRetryAttempts`; the
+// reasoning that justifies retrying at all moved with the implementation.
+const txRetryAttempts = dbpkg.LockRetryAttempts
 
 // retryOnLockConflict re-runs fn while it fails with a TRANSIENT lock conflict.
 //
-// Why this exists even though the seat locks are now taken in one statement: three consecutive
-// review rounds each found a lock-order cycle that careful reasoning had missed — table order
-// vs. modules/space, then row order within space_member. "We reasoned about the order" is
-// demonstrably not sufficient on its own, and the cost of being wrong is not a retry, it is
-// store_failed (Internal, HTTP 500) — and when InnoDB picks the Space disband as its victim, a
-// failed step of the member-removal security cascade.
-//
-// Only 1213 (deadlock) and 1205 (lock wait timeout) are retried, matching
-// modules/common's isRetryableTxErr. Everything else — 1062, every service sentinel — is
-// returned verbatim on the first attempt, so callers' errors.Is checks are untouched. fn must
-// own its whole transaction: a retry re-runs it from BEGIN, which is only sound because a
-// deadlock has already rolled the failed attempt back.
-func retryOnLockConflict(fn func() error) error {
-	var lastErr error
-	for attempt := 0; attempt < txRetryAttempts; attempt++ {
-		err := fn()
-		if err == nil || !isRetryableTxErr(err) {
-			return err
-		}
-		lastErr = err
-	}
-	return fmt.Errorf("project: transaction retries exhausted: %w", lastErr)
-}
+// See pkg/db.RetryOnLockConflict. fn must own its whole transaction: a retry re-runs it
+// from BEGIN, which is only sound because a deadlock has already rolled the failed
+// attempt back.
+func retryOnLockConflict(fn func() error) error { return dbpkg.RetryOnLockConflict(fn) }
 
-// isRetryableTxErr reports whether err is a transient InnoDB lock conflict. Spelled out here
-// rather than imported from modules/common, whose copy is unexported; the predicate is
-// deliberately identical.
-func isRetryableTxErr(err error) bool {
-	var myErr *mysql.MySQLError
-	if errors.As(err, &myErr) {
-		return myErr.Number == 1213 || myErr.Number == 1205
-	}
-	return false
-}
+// isRetryableTxErr reports whether err is a transient InnoDB lock conflict (1213/1205).
+func isRetryableTxErr(err error) bool { return dbpkg.IsRetryableLockErr(err) }
 
 // Sentinel errors the API layer maps onto registered error codes. Returning typed
 // errors rather than responding from the service keeps the transaction boundary and

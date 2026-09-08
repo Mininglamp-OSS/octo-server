@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -435,7 +436,24 @@ var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer owner
 // 反向窗口（先本事务删除 → 再被并发 transfer 提升为 owner）由 transferOwnerAdmin 内部的
 // `AND status=1` 守卫关掉：本事务 commit 后该 uid 的 status=0，后续 transfer 的 UPDATE 影响 0 行。
 // 返回本次真正被移除的 uid，供调用方精确地做失效缓存与事件广播。
+// removeMembersForce 是 removeMembersForceOnce 加上有界的 1213/1205 重试，
+// 见 pkg/db.RetryOnLockConflict。事务型步骤（runMemberRemovalTxSteps）的失败会
+// 回滚整次移除，而死锁是**瞬时**失败：不重试就等于把「这次踢人失败」的 500 甩给
+// 管理端，而它无法区分「重试就好」和「永久失败」。
+//
+// 从 BEGIN 重跑是安全的：失败的那次已被 InnoDB 回滚，包括 outbox 工单，所以
+// 重试不会留下重复的清理工单。
 func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUID string) ([]string, error) {
+	var removed []string
+	err := dbpkg.RetryOnLockConflict(func() error {
+		var e error
+		removed, e = d.removeMembersForceOnce(spaceId, uids, operatorUID)
+		return e
+	})
+	return removed, err
+}
+
+func (d *managerDB) removeMembersForceOnce(spaceId string, uids []string, operatorUID string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
@@ -445,15 +463,35 @@ func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUI
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	var ownerCount int
+	// 锁定**全部**目标行，而不只是 role=2 的那些，然后在 Go 侧判 owner。
+	//
+	// 两个理由，第二个是本次改动的原因：
+	//
+	//  1. 原来的 `... AND role=2 AND status=1 FOR UPDATE` 只保证 owner 行被锁；
+	//     非 owner 目标行是否被锁取决于 index condition pushdown 是否把 role
+	//     下推到存储引擎（下推则不加锁）。TOCTOU 防护不该依赖优化器行为。
+	//
+	//  2. 批量路径的**事务内步骤**依赖「目标的 space_member 行已被本事务 X 锁」
+	//     这个前提：project 侧的 epoch bump 用一次非锁定读枚举席位，其正确性靠
+	//     的就是「未提交的席位准入被 space_member 锁挡住、已提交的早于本事务
+	//     read view」（见 modules/project.bumpMemberEpochForSpaceMemberTx）。
+	//     逐圈才锁下一个 uid 的话，read view 在第一个 uid 的步骤里就固定了，
+	//     而第二个 uid 的席位可能在那之后才被并发准入提交——枚举读看不到，
+	//     epoch 就不动。一条语句锁住全部目标行，read view 才晚于所有 X 锁。
+	var locked []struct {
+		UID  string `db:"uid"`
+		Role int    `db:"role"`
+	}
 	if _, err = tx.SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid IN ? AND role=2 AND status=1 FOR UPDATE",
+		"SELECT uid, role FROM space_member WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE",
 		spaceId, uids,
-	).Load(&ownerCount); err != nil {
+	).Load(&locked); err != nil {
 		return nil, err
 	}
-	if ownerCount > 0 {
-		return nil, ErrCannotRemoveOwner
+	for _, row := range locked {
+		if row.Role == 2 {
+			return nil, ErrCannotRemoveOwner
+		}
 	}
 
 	now := time.Now()
@@ -564,6 +602,21 @@ var ErrRemoveHierarchy = errors.New("operator does not outrank removal target")
 // 清理任务落库同生共死，进程在两者之间崩溃也不会留下"已移除但没清理"的成员。
 // 提前返回的三条分支（行不存在 / owner / 角色不够）都没有改动成员行，因此不入队。
 func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) (bool, error) {
+	var removed bool
+	err := dbpkg.RetryOnLockConflict(func() error {
+		var e error
+		removed, e = removeMemberLockedOnce(sess, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
+		return e
+	})
+	return removed, err
+}
+
+// removeMemberLockedOnce 是一次尝试；重试语义见 removeMemberLocked。
+//
+// 单独一层而不是在调用方各自重试：踢出（api.go）、自助退出（api.go）与
+// DB.removeMemberLocked（db.go）三个入口共用同一条事务，重试放在事务边界上
+// 才不会漏掉将来新增的第四个入口。
+func removeMemberLockedOnce(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) (bool, error) {
 	tx, err := sess.Begin()
 	if err != nil {
 		return false, err

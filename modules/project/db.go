@@ -294,6 +294,15 @@ func (d *DB) repairAbsentSentinelEpoch(projectID string) (int64, error) {
 	return affected, nil
 }
 
+// spaceMemberEpochBumpChunk bounds ONE bump statement's IN list.
+//
+// The enumerated set is bounded by the per-Space project quota (1000 today), so a
+// single statement would work — but the quota is a config value and this runs in a
+// user-facing transaction, so the statement width is pinned here rather than left
+// to whatever the quota becomes. Chunks accumulate locks in the same transaction,
+// which is what the correctness argument below requires.
+const spaceMemberEpochBumpChunk = 500
+
 // bumpMemberEpochForSpaceMemberTx raises member_epoch on every ACTIVE project in
 // spaceID where uid still holds an active seat, in the caller's transaction.
 //
@@ -310,34 +319,114 @@ func (d *DB) repairAbsentSentinelEpoch(projectID string) (int64, error) {
 // is abandoned. Bumping here closes that: the epoch moves at the same instant the
 // answer does.
 //
-// ONE statement, not one per project. A user can hold seats in up to the
-// per-Space project quota, and this runs in a user-facing transaction — paging it
-// the way the cascade does would be wrong here (the cascade pages because it
-// shares a 10-minute lease, a constraint that does not apply inside a
-// transaction) and a loop of N updates would be a real cost on removal. The join
-// is between two octo_project* tables, both pinned to utf8mb4_general_ci, so it
-// carries no cross-schema collation hazard — unlike a join to `space`, see
-// pkg/project.ProjectEpochsInSpace.
+// # TWO statements, and the split is the whole point
+//
+// The first version of this was ONE statement:
+//
+//	UPDATE octo_project p INNER JOIN octo_project_member pm ON ... SET p.member_epoch = ...
+//
+// which is a lock-order bug that no amount of reading the SQL reveals, because the
+// order is not in the SQL — the OPTIMIZER picks the driving table, and it flips
+// with cardinality. Measured on MySQL 8.0.33 against this schema:
+//
+//	3 active projects / 3 seats     -> p driving (ref), pm eq_ref   => project -> member
+//	200 active projects / 3 seats   -> pm driving (index_merge)     => member -> project
+//
+// The second shape is the production one (a Space has many projects; one user sits
+// in a few), and it inverts the order this module documents at the top of
+// service.go. Both deadlock directions were then reproduced, including the one
+// where InnoDB picks the SPACE REMOVAL as its victim:
+//
+//	(1) HOLDS   octo_project_member PRIMARY  S  (p1,u1) (p2,u1)
+//	(1) WAITING octo_project uk_..._project_id X -> p2
+//	(2) HOLDS   octo_project uk_..._project_id X -> p2
+//	(2) WAITING octo_project_member (p2,u1) X
+//	ERROR 1213
+//
+// A 1213 here rolls the member removal back (that is this step's contract), so
+// under contention the REVOCATION FAILS — the exact outcome the step exists to
+// prevent.
+//
+// So: enumerate first, then update. The UPDATE touches only octo_project, which
+// takes this step out of the p <-> pm cycle entirely rather than betting on a join
+// order. It is not an optimization and must not be folded back into one statement.
+//
+// # Why the enumeration may be a NON-LOCKING read
+//
+// Taking S locks on octo_project_member here would re-create the inversion, so the
+// enumeration is a plain consistency read. Under REPEATABLE READ that reads the
+// transaction's snapshot, and the snapshot can be older than the statement — which
+// would matter if a project seat could be created for this uid after the snapshot
+// and still be live after this transaction commits. It cannot, and the argument has
+// exactly two legs:
+//
+//  1. Every seat admission locks the target's space_member row FIRST — one
+//     statement, `FOR SHARE OF sm` (lockSpaceSeatsTx), before it touches
+//     octo_project or octo_project_member. The removal transaction holds that row
+//     under FOR UPDATE by the time this step runs. So an admission that has not
+//     committed is BLOCKED, and when it unblocks it finds status = 0 and is
+//     refused.
+//  2. An admission that HAS committed did so before the removal took that X lock,
+//     therefore before this transaction's read view was assigned (RR assigns it at
+//     the first CONSISTENCY read, and every statement before this one on the
+//     removal path is a locking read or a DML). So it is visible here.
+//
+// Verified, not assumed: with the two transactions interleaved so the admission
+// commits while the removal is blocked on space_member, this read returns the seat
+// the admission just inserted.
+//
+// Leg 1 is a property of the OTHER module's write paths, so it is pinned by a test
+// rather than by this comment — see TestSpaceMemberEpochBumpSeesConcurrentAdmission
+// and the source guard over octo_project_member writers.
 //
 // Increment-only, like every other writer of this column, so the write-discipline
 // guard holds. Idempotent in the sense that matters: a retried removal finds the
-// seats already closed by the cascade and matches no row. A retry that lands
+// seats already closed by the cascade and enumerates nothing. A retry that lands
 // BEFORE the cascade bumps a second time, which costs the peer one extra
 // re-verify — the safe direction.
 func (d *DB) bumpMemberEpochForSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) error {
 	if spaceID == "" || uid == "" {
 		return nil
 	}
-	_, err := tx.UpdateBySql(
-		"UPDATE octo_project p "+
-			"INNER JOIN octo_project_member pm ON pm.project_id = p.project_id "+
-			"SET p.member_epoch = p.member_epoch + 1 "+
-			"WHERE p.space_id = ? AND p.status = ? "+
-			"  AND pm.space_id = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0",
-		spaceID, StatusNormal, spaceID, uid, MemberStatusActive,
-	).Exec()
-	if err != nil {
-		return fmt.Errorf("project: bump member epoch for space member removal: %w", err)
+
+	// Step 1 — enumerate. Non-locking on purpose; see the doc comment.
+	var ids []string
+	if _, err := tx.SelectBySql(
+		"SELECT project_id FROM `octo_project_member` "+
+			"WHERE space_id = ? AND uid = ? AND status = ? AND removing = 0 "+
+			"ORDER BY project_id",
+		spaceID, uid, MemberStatusActive,
+	).Load(&ids); err != nil {
+		return fmt.Errorf("project: enumerate seats for space member removal: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Step 2 — bump, touching octo_project ONLY. space_id and status are kept in
+	// the predicate even though project_id is unique: a seat row whose
+	// denormalized space_id has drifted must not be able to move another Space's
+	// epoch, and a disbanded project's epoch must not move (its answer is already
+	// the absent sentinel).
+	for start := 0; start < len(ids); start += spaceMemberEpochBumpChunk {
+		end := start + spaceMemberEpochBumpChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]interface{}, 0, len(chunk)+2)
+		args = append(args, spaceID, StatusNormal)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		if _, err := tx.UpdateBySql(
+			"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
+				"WHERE space_id = ? AND status = ? AND project_id IN ("+placeholders+")",
+			args...,
+		).Exec(); err != nil {
+			return fmt.Errorf("project: bump member epoch for space member removal: %w", err)
+		}
 	}
 	return nil
 }

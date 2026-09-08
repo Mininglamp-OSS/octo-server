@@ -356,8 +356,66 @@ const AbsentEpochSentinel = 0
 var ErrLiveProjectOnAbsentSentinel = errors.New(
 	"project: an active project holds the reserved absent-epoch sentinel")
 
+// FoldID normalizes an identifier for MATCHING, and it is the only fold in this
+// package — the read functions below key their answers by it so no caller has to
+// re-derive the rule.
+//
+// # Why a fold is needed at all
+//
+// octo_project and octo_project_member are pinned to utf8mb4_general_ci, which is
+// case-INSENSITIVE. `project_id IN (?)` therefore matches a stored `abc` when the
+// caller sends `ABC`, and the row comes back spelled `abc`. Keying an answer off
+// the spelling the DATABASE returned means a caller looking up its own `ABC`
+// finds nothing — and an absent key is the "does not exist" / member:false
+// sentinel, so a real member of a live project would read as denied while the SQL
+// had matched perfectly.
+//
+// # ASCII-only, and this time actually
+//
+// This was strings.ToLower, described in a comment as "ASCII-only folding" and as
+// "the STRICTER of the two, so the disagreement costs an answer of absent rather
+// than a wrong positive". All three claims were false: strings.ToLower is UNICODE
+// case mapping, and it is LOOSER than utf8mb4_general_ci. Measured on MySQL 8.0.33:
+//
+//	Go: strings.ToLower("\u212A") == "k"  -> true   (KELVIN SIGN)
+//	Go: strings.ToLower("\u212B") == "å"  -> true   (ANGSTROM SIGN)
+//	MySQL: (_utf8mb4 0xE284AA) COLLATE utf8mb4_general_ci = 'k'  -> 0
+//	MySQL: (_utf8mb4 0xE284AB) COLLATE utf8mb4_general_ci = 'å'  -> 0
+//
+// So the fold merged identifiers the database keeps apart, and on _verify that is
+// fail-OPEN: send uids ["k", "\u212A"], SQL matches only the real row `k`, both
+// requested ids fold to "k", and the id the database never matched is served as a
+// member WITH a role.
+//
+// A byte-level ASCII fold instead. Non-ASCII bytes are left untouched, which makes
+// this strictly COARSER-than-nothing and strictly FINER than either collation
+// (general_ci also folds accents; 0900_ai_ci folds accents and the compatibility
+// characters above). Finer means a disagreement can only cost an "absent" answer,
+// never a wrong positive — the direction the comment always claimed.
+//
+// Two spellings cannot collide into one wrong answer either: project_id and
+// (project_id, uid) are UNIQUE under general_ci, whose equivalence classes are a
+// superset of this fold's, so the database cannot hold two rows that this folds
+// together.
+//
+// Rejecting non-canonical case at the boundary was the alternative and it is
+// worse: it would break a caller holding a legitimately re-cased id, and nothing
+// here has the standing to declare one spelling canonical — existing ids predate
+// the UUID format and nothing validates their shape.
+func FoldID(id string) string {
+	b := []byte(id)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
 // ProjectEpochsInSpace returns member_epoch for each named ACTIVE project in
-// spaceID, keyed by project_id.
+// spaceID, keyed by FoldID(project_id) — NOT by the spelling the caller sent and
+// NOT by the spelling the database returned. Callers look up with FoldID too; see
+// FoldID for why neither raw spelling works.
 //
 // Absent from the map means the project does not exist, is disbanded, or lives
 // in another Space. The caller maps all three to epoch 0 — one indistinguishable
@@ -479,7 +537,7 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 		if r.MemberEpoch == AbsentEpochSentinel {
 			return nil, fmt.Errorf("%w: %s", ErrLiveProjectOnAbsentSentinel, r.ProjectID)
 		}
-		out[r.ProjectID] = r.MemberEpoch
+		out[FoldID(r.ProjectID)] = r.MemberEpoch
 	}
 	return out, nil
 }
@@ -489,7 +547,8 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 // across many projects.
 //
 // Returns epoch 0 and an empty map when the project is not an active project of
-// spaceID. Same folded answer as ProjectEpochsInSpace, same reason.
+// spaceID. The roles map is keyed by FoldID(uid), like ProjectEpochsInSpace keys
+// its own answer and for the same reason — see FoldID.
 //
 // # Read order is load-bearing
 //
@@ -565,7 +624,12 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	if err != nil {
 		return 0, nil, err
 	}
-	epoch, active := epochs[projectID]
+	// Folded lookup, because that is how ProjectEpochsInSpace keys its answer. This
+	// was `epochs[projectID]` against a map keyed by the DATABASE's spelling, so a
+	// caller sending `P-ABC` for a stored `p-abc` matched in SQL, missed here, and
+	// got served member_epoch 0 with every uid member:false. Fail-closed, but the
+	// handler-level fold could not reach it — the function returned first.
+	epoch, active := epochs[FoldID(projectID)]
 	if !active {
 		return 0, roles, nil
 	}
@@ -614,11 +678,30 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	if err != nil {
 		return 0, nil, err
 	}
+	// Two maps keyed by TWO DIFFERENT databases' spellings, joined here in Go:
+	// octo_project_member pins utf8mb4_general_ci while space / space_member are
+	// 2019 tables inheriting the server default — measured as utf8mb4_0900_ai_ci in
+	// production. An exact-match lookup across that seam drops a real member whose
+	// two rows differ in case. Folding both sides closes the case half.
+	//
+	// It does NOT close the accent half: 0900_ai_ci is accent-INSENSITIVE, so
+	// space_member could match a uid whose accents differ, and this fold will not.
+	// That residue is fail-closed (a member reads as absent and re-verifies) and it
+	// is not reachable for generated uids, which are ASCII. Closing it properly
+	// would mean carrying a collation table in Go, which this package deliberately
+	// does not do — see FoldID.
+	inSpaceFolded := make(map[string]bool, len(inSpace))
+	for uid, active := range inSpace {
+		if active {
+			inSpaceFolded[FoldID(uid)] = true
+		}
+	}
 	for _, r := range rows {
-		if !inSpace[r.UID] {
+		folded := FoldID(r.UID)
+		if !inSpaceFolded[folded] {
 			continue
 		}
-		roles[r.UID] = r.Role
+		roles[folded] = r.Role
 	}
 	return epoch, roles, nil
 }

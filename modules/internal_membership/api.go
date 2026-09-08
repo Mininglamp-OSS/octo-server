@@ -47,6 +47,16 @@ func New(ctx *config.Context) *Module {
 		token = ""
 		logger.Error(tokenErr.Error())
 	}
+	// Published beside the log line, not instead of it. The endpoints answer 401
+	// for "unset" and for "wrong" alike (see respondUnauthorized), so this gauge is
+	// where an operator gets the distinction the wire deliberately withholds — and
+	// unlike the log line it survives log rotation and a ConfigMap restart. See
+	// metrics.go.
+	if token == "" {
+		configured.Set(0)
+	} else {
+		configured.Set(1)
+	}
 	return &Module{ctx: ctx, store: dbStore{ctx: ctx}, internalToken: token, Log: logger}
 }
 
@@ -221,14 +231,10 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 	}
 
 	out := make(map[string]int64, len(projectIDs))
-	byFold := foldKeys(len(found))
-	for id, epoch := range found {
-		byFold[foldID(id)] = epoch
-	}
 	for _, id := range projectIDs {
-		// Keyed by what the CALLER asked, matched case-insensitively — see foldID.
-		// Absent -> 0, which is the contract's sentinel.
-		out[id] = byFold[foldID(id)]
+		// Keyed by what the CALLER asked, matched through the package's own fold —
+		// see projectpkg.FoldID. Absent -> 0, which is the contract's sentinel.
+		out[id] = found[projectpkg.FoldID(id)]
 	}
 	c.Response(epochsResponse{Projects: out})
 }
@@ -296,41 +302,19 @@ func parseIDList(raw []string, limit int) (ids []string, overLimit bool) {
 	return out, false
 }
 
-// foldID normalizes an identifier for matching, and foldKeys builds the map it
-// keys.
+// Identifier folding lives in pkg/project (FoldID), not here.
 //
-// # Why the answers cannot be keyed by what the DATABASE returned
+// It was local, spelled strings.ToLower, and documented as an ASCII-only fold that
+// was strictly stricter than the database's collation. It was none of those: it is
+// Unicode case mapping and it is LOOSER than utf8mb4_general_ci, which made the
+// two endpoints fail-OPEN — a uid the database never matched could be served as a
+// member with a role. The correct fold, the measurements, and the reason it must
+// live next to the queries it has to agree with are in projectpkg.FoldID.
 //
-// octo_project and octo_project_member are pinned to utf8mb4_general_ci, which is
-// case-INSENSITIVE. So `project_id IN (?)` matches a stored `abc` when the caller
-// sends `ABC`, and the row comes back spelled `abc`. Keying the response off that
-// returned spelling means a caller looking up its own `ABC` finds nothing — and
-// an absent key is the contract's "does not exist" / member:false sentinel. A real
-// member of a live project would read as denied, and a whole project as absent,
-// while the SQL had matched perfectly.
-//
-// That contradicts what this module promises for itself: every answer carries the
-// identifier the caller sent, so a consumer keying by its own strings always finds
-// it. The peer persists project_id in a different engine and reads it back; there
-// is no guarantee the spelling survives that round trip unchanged, and it is not
-// this endpoint's business to require that it does.
-//
-// So the answer is keyed by the caller's string and MATCHED by the folded form.
-//
-// Fold, not reject. Rejecting non-canonical case was the alternative and it is
-// worse: it would break a caller holding a legitimately re-cased id, and the
-// endpoint has no basis to declare one spelling canonical — existing project ids
-// predate the UUID format and nothing validates their shape.
-//
-// ASCII-only folding, deliberately. It is not a reimplementation of
-// utf8mb4_general_ci — matching that exactly would mean tracking a MySQL collation
-// table in Go. Identifiers here are hex UUIDs and generated uids, where the two
-// agree. Where they could disagree, this fold is the STRICTER of the two, so the
-// disagreement costs an answer of "absent" rather than a wrong positive: the
-// fail-closed direction.
-func foldID(id string) string { return strings.ToLower(id) }
-
-func foldKeys(n int) map[string]int64 { return make(map[string]int64, n) }
+// Next to the queries matters: the handler-level copy could only fold the two
+// seams it could see. Two more were inside pkg/project (the epoch lookup in
+// ProjectMemberships, and the octo_project_member <-> space_member join), and they
+// stayed unfolded for as long as the fold lived up here.
 
 // ---------- POST /v1/internal/project-memberships/_verify ----------
 
@@ -439,14 +423,12 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 		return
 	}
 
-	byFold := foldKeys(len(roles))
-	for uid, role := range roles {
-		byFold[foldID(uid)] = int64(role)
-	}
+	// roles arrives keyed by projectpkg.FoldID(uid); the answer is keyed by what the
+	// CALLER sent. No local re-keying and no int64 round trip — both were an
+	// indirection over this one lookup.
 	answers := make([]verifyMemberAnswer, 0, len(uids))
 	for _, uid := range uids {
-		folded, ok := byFold[foldID(uid)]
-		role := int(folded)
+		role, ok := roles[projectpkg.FoldID(uid)]
 		if !ok {
 			answers = append(answers, verifyMemberAnswer{UID: uid, Member: false})
 			continue
