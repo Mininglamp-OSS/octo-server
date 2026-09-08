@@ -67,6 +67,14 @@ ALTER TABLE `octo_project`
 -- 3. 索引
 -- ---------------------------------------------------------------------------
 --
+-- 下面两条 CREATE INDEX **不是** INSTANT。上面那两条 ADD COLUMN 是（与表大小
+-- 无关），而建索引是独立的 ONLINE / INPLACE 操作，耗时与行数成正比，需要按生产
+-- 的 octo_project 行数单独估一次上线窗口。两者放在同一个文件里，容易让人把前者
+-- 的结论顺手套到后者身上——PR #855 的 review 指出了这一点。
+--
+-- ONLINE 意味着期间读写不被阻塞，所以这不是停机窗口，是"这条语句要跑多久、
+-- 什么时候能确认跑完"的问题。
+--
 -- I4 的对账扫描 A 要找"活跃项目里 all_member_group_no 为空的"，谓词是
 -- (status, all_member_group_no)。已有的 idx_octo_project_space_status 首列是
 -- space_id，扫描 A 不按 Space 过滤，用不上它。

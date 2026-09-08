@@ -729,7 +729,10 @@ open_verification:
      reason the plan cannot be produced from CI."
   - "Index build time for the two new indexes on octo_project at production row
      counts. Both ADD COLUMNs are INSTANT on MySQL 8.0; the indexes are separate
-     online INPLACE statements whose duration is proportional to row count."
+     online INPLACE statements whose duration is proportional to row count.
+     PR #855's review noted that the migration comment stated the INSTANT half and
+     said nothing about the indexes, which invites a reader to carry the first
+     conclusion onto the second; the file now says so explicitly."
   - "RESOLVED. A WuKongIM broker (the pinned v2.2.4-20260313, WK_TOKENAUTHON=false)
      was installed alongside MySQL 8.0.46 and Redis, and every suite was re-run.
      modules/project (including -race -shuffle=on), group, space, thread, message,
