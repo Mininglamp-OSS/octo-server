@@ -521,7 +521,13 @@ const (
 var projectMigrationFiles = []string{
 	"sql/20260904000001_project_core.sql",
 	"sql/20260906000001_project_group_binding.sql",
-	"sql/20260907000001_project_all_member_group.sql",
+	// Same day, next sequence: PR #850 landed 20260907000001_project_provisioning
+	// on main first, so this one is 000002. Two files sharing a sequence still
+	// apply (sql-migrate breaks the tie on the full filename), but the sequence is
+	// what the convention uses to express apply order, and a silent lexical
+	// tiebreak is not an order anybody chose.
+	"sql/20260907000001_project_provisioning.sql",
+	"sql/20260907000002_project_all_member_group.sql",
 }
 
 // applyProjectMigration executes one section of every migration file this module

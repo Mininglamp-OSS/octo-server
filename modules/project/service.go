@@ -839,6 +839,15 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	// disbanded project still pointing at a group would be a state that both the
 	// D7 protection predicate and the rebuild predicate would have to reason
 	// about; clearing it here means that state does not exist.
+	//
+	// LOCK ORDER: this runs AFTER disbandProjectTx, whose last statement writes
+	// octo_project_provisioning — the final lock in the declared order. Writing
+	// octo_project after that would normally be an inversion; it is not one here
+	// because disbandProjectTx's FIRST statement already took the X lock on this
+	// exact octo_project row, so this UPDATE acquires nothing new. That is a real
+	// dependency on a statement in another function, so it is written down: if the
+	// status flip ever moves out of disbandProjectTx, this call has to move above
+	// it rather than stay where it reads naturally.
 	if err := p.db.clearAllMemberGroupNoTx(tx, projectID); err != nil {
 		return nil, err
 	}
