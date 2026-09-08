@@ -2638,6 +2638,41 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   实测走通的等价物：`DROP TABLE` 与删 `gorp_migrations` 账本行**放在同一事务**。
 - **不实的功效声称会让下一个人跳过验证** —— 详见当日前一条与 journal。
 
+## 2026-09-08 — project-p2-product-surfaces（PR-1：项目视角群聊列表）
+
+`GET /v1/projects/:project_id/groups`。此前树上没有任何接口能回答「这个项目有哪些群」：
+`modules/project` 注册九条路由无一返回群，`GET /v1/group/my` 只按 space_id 过滤，而能答这
+个问题的查询早就存在、未导出，只有成员移除级联 worker 调它。
+
+- **访问控制就是 WHERE 子句，因此这个接口刻意没有角色门。** 旁边的 `listMembersHandler` 需要
+  `canViewMembers`，因为名册是「关于别人的事实」；这个接口只返回调用者已经在的行，没有可扣的
+  东西。没加入项目的 Space 管理员拿到 `[]`。**在这里加 403 比冗余更糟**——它会对一个正确答案
+  是空列表的调用者答拒绝，从而让「你不是本项目成员」在一条本来什么都不透露的路由上变得可观测，
+  等于在新路由上重新打开 `projectMiddleware` 三合一拒绝所要关掉的那个枚举通道。
+- **仓库里两个成员谓词，只在一个可达状态上分歧，而两边注释都没写。** `is_deleted = 0` 与
+  `is_deleted = 0 AND status = Normal`：移除置 `is_deleted = 1`，两者一致；**唯一**分歧是群
+  黑名单——只置 status、保留 `is_deleted = 0`。于是选谓词这件事实际上只有一个问题：*把你拉黑
+  的群还要不要出现在你的列表里*。这么问答案是自明的（`ExistMemberActive` 就是挡这个 uid 读群/
+  子区的加固线），但在 review 之前没人提出过这个问题。现已写进源码，并用**同时断言两半**的测试
+  钉住：既断言这里看不到，也断言 `/v1/group/my` 还看得到。
+- **一个什么都不 gate 的配置开关，被我信了三个 commit。** 为了结掉「group 桩表」那个悬问，我读到
+  `testutil` 里 `cfg.DB.Migration = false` 就断言「测试不跑迁移」。错：`module.Setup` 是无条件
+  调 `executeSQL` 的（octo-lib `module/module.go:29`）。它能活下来是因为**当时还不承重**——这个
+  断言只需要在有人依据它行动的那天为真。跑一遍套件一分钟就推翻了，而且推翻方式最直接：
+  `./modules/group/` 打在 `./modules/project/` 刚迁移过的库上，启动即死于
+  `unknown migration in database`（project 的测试二进制注册全部 40 个模块，group 的更少）。
+  **每个包要各自的干净 `test` 库。**
+- **两处只有客户端团队才会踩到的文档缺陷。** `is_named` 我写的是这一列**曾经**的含义
+  （`20260629000002` 已把「用户显式起名」改成「改版前老群」，且新群恒为 0，所以这个接口上它恒为
+  0）；排序注释写了「全员群**永远**最老」，而 `ensureAllMemberGroup` 会在补建时给它一个更大的
+  id。**文档描述一个已废弃的含义，比没有文档更糟：它是自信地错。**
+- **分页边界测试不是分页测试。** 第一版只有 `?page=<int64max>` 和一个越界空页。`LIMIT ? OFFSET ?`
+  两个参数写反——相邻 int、编译器不管——**第 1 页照样正确**，只有第 2 页起才崩，所有既有断言都会
+  通过。溢出回归和正确性是两个测试。
+- **模块自己的守卫压过了 brief 的验收清单。** brief 要求 `TestListProjectGroupsIsUIDRateLimited`；
+  同模块的 `TestAuthChainOrder` 恰恰论证了这种测试没用（`SharedUIDRateLimiter` 无 uid 时 fail
+  open，挂错顺序的路由两种情况都通过）。**在读模块自身守卫之前写下的验收项是假设，不是要求。**
+
 ## 2026-09-08 — my-ai-team-sessions（PR #848 CI 异步测试收敛）
 
 - **认领不是完成** —— `space_member_removal_cleanup.attempts` 在 worker 认领工单时就自增，早于任何
