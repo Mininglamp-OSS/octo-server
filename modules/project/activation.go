@@ -1,6 +1,7 @@
 package project
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -33,9 +34,46 @@ import (
 // Deliberately not its own env switch. A switch could be turned on while the
 // target stayed off, which is exactly the state that strands projects, and
 // there is no operational reason to want the wait without the thing waited on.
+//
+// # A REQUESTED-BUT-REJECTED target still counts as "something will answer"
+//
+// Absent from cfg.Targets has two causes and they want opposite behaviour:
+//
+//	never configured  -> nothing will ever confirm    -> latch, or projects are
+//	                                                     invisible forever
+//	configured and REJECTED at load -> one env fix away from confirming
+//
+// A rejected target — ValidateTarget failed, or checkSecretExclusivity found a
+// collision — is DROPPED from Targets and recorded in Misconfigured, and the
+// process boots anyway (a loud gauge rather than a refusal to start). Asking
+// only TargetByName conflated the two, and the conflation was not academic:
+// the latch is IRREVERSIBLE, so on the next reconcile tick every project
+// genuinely awaiting confirmation — jobs in flight, jobs in backoff — became
+// permanently visible to the peer, and fixing the env afterwards could not undo
+// it. It also contradicted the rule pinned one function below, that the
+// straggler repair must not run while a confirmation is still possible.
+//
+// The sharpest path was this module's own fail-closed credential guard:
+// setting OCTO_PROJECT_LIFECYCLE_EVENT_SECRET equal to the fleet provisioning
+// secret makes checkSecretExclusivity drop the fleet target — so a secret-reuse
+// mistake, which that guard exists to REFUSE, converted into a permanent
+// fail-open of the visibility gate.
+//
+// Misconfigured therefore counts as requested. The cost of being wrong in this
+// direction is bounded and visible: projects wait, the awaiting-activation
+// gauges climb, and an operator has both a gauge and a boot-time Error naming
+// the rejected target. The cost of being wrong the other way is silent and
+// permanent.
 func (p *Project) twoPhaseCreateApplies() bool {
-	_, ok := p.cfg.Provisioning.TargetByName(TargetFleet)
-	return ok
+	if _, ok := p.cfg.Provisioning.TargetByName(TargetFleet); ok {
+		return true
+	}
+	for _, name := range p.cfg.Provisioning.Misconfigured {
+		if name == TargetFleet {
+			return true
+		}
+	}
+	return false
 }
 
 // activateProject sets the latch, once.
@@ -124,7 +162,12 @@ func (d *DB) countAwaitingActivation() (int64, error) {
 // burst of fresh creates or a queue that stopped moving. Age is what an alert
 // should watch.
 func (d *DB) oldestAwaitingActivationAge(now time.Time) (time.Duration, error) {
-	var oldest []time.Time
+	// sql.NullTime, never []time.Time, and reinterpreted rather than converted —
+	// see utcread.go. Written the obvious way this read returned the ZERO time
+	// with no error, so the gauge published about 2.5 million hours on every
+	// deployment; and even once it scanned, a loc=Local DSN would have shifted it
+	// by the process offset in whichever direction breaks the alert.
+	var oldest []sql.NullTime
 	_, err := d.session.SelectBySql(
 		"SELECT created_at FROM `octo_project` "+
 			"WHERE activated_at IS NULL AND status = ? ORDER BY created_at LIMIT 1",
@@ -133,10 +176,11 @@ func (d *DB) oldestAwaitingActivationAge(now time.Time) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("project: oldest awaiting activation: %w", err)
 	}
-	if len(oldest) == 0 {
+	oldestUTC, ok := firstUTCFromColumn(oldest)
+	if !ok {
 		return 0, nil
 	}
-	if age := now.Sub(oldest[0]); age > 0 {
+	if age := now.UTC().Sub(oldestUTC); age > 0 {
 		return age, nil
 	}
 	return 0, nil

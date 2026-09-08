@@ -188,6 +188,10 @@ func (p *Project) sweepExhaustedLifecycleEvents() {
 		}
 	}()
 	now := time.Now().UTC()
+	// Only rows this pod actually transitioned: two pods sweeping the same window
+	// would otherwise both emit the abandoned counter and the Error alert for the
+	// same event, and a row claimed between the SELECT and the guarded UPDATE
+	// would be logged as abandoned while its new owner is mid-delivery.
 	rows, err := p.db.abandonExhaustedLifecycleEvents(now,
 		"exhausted: attempts spent without a terminal outcome", lifecycleEventBatch)
 	if err != nil {
@@ -238,12 +242,22 @@ func (p *Project) startLifecycleLeaseHeartbeat(ids []int64, owner string) func()
 
 // deliverLifecycleEvent sends one event and records the outcome.
 //
-// Returns whether this event is DONE — delivered, or terminally abandoned. A
-// false answer means the same event is still owed to the peer, which is what
-// makes the caller hold back everything queued behind it for the same project.
-// Abandoned counts as done on purpose: nothing will retry it, so holding the
-// project's queue behind a row that will never move would convert one lost event
-// into a permanently stalled project.
+// Returns whether this event is DONE — delivered, or terminally abandoned.
+//
+// Production ORDERING DOES NOT REST ON THIS VALUE: runLifecycleEventDelivery
+// discards it, because the claim's NOT EXISTS predicate already guarantees at
+// most one pending row per project per batch, and that guarantee holds across
+// replicas where a per-process decision could not. The return exists for the
+// tests that drive outcomes directly. An earlier version of this comment said a
+// false answer "makes the caller hold back everything queued behind it", which
+// described a contract no caller implements — on a path that carries
+// revocations, that is an invitation for a second call site to rely on it.
+//
+// Abandoned still counts as done, and that distinction is real rather than
+// bookkeeping: `abandoned` is not pending, so the claim predicate stops
+// declining the project and its tail becomes claimable. Nothing retries an
+// abandoned row, so treating it as not-done would convert one lost event into a
+// project that never receives another.
 func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEventRow, owner string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.LifecycleEventTimeout)
 	defer cancel()

@@ -177,6 +177,13 @@ func TestAwaitingActivationCensusCountsOnlyLiveProjects(t *testing.T) {
 	age, err := p.db.oldestAwaitingActivationAge(time.Now().UTC())
 	require.NoError(t, err)
 	assert.Positive(t, age.Seconds(), "the age gauge is what an alert watches")
+	// BOUNDED, and the bound is the assertion that matters. "Positive" was the
+	// original check and it passed while the query scanned into []time.Time and
+	// got back the ZERO time — now.Sub(year zero) is about 2.5 million hours,
+	// which is very positive. A project created seconds ago cannot be an hour old.
+	assert.Less(t, age, time.Hour,
+		"the age must be the row's actual age; an unbounded assertion passes on the "+
+			"garbage a failed scan produces, which is how this shipped once already")
 
 	_, err = testCtx.DB().UpdateBySql(
 		"UPDATE `octo_project` SET status = ? WHERE project_id = ?",
@@ -322,4 +329,82 @@ func TestStragglerRepairDoesNotFireWhileSomethingCanStillConfirm(t *testing.T) {
 	assert.Nil(t, activatedAtOf(t, created.ProjectID),
 		"while the fleet target is enabled the straggler repair must NOT run: a confirmation "+
 			"is still possible, and latching here would make the gate a delay")
+}
+
+// TestARejectedFleetConfigDoesNotDemolishTheGate is B-6.
+//
+// A target absent from cfg.Targets has two causes that want opposite behaviour:
+// never configured (nothing will confirm — latch, or the project is invisible
+// forever) and configured-but-REJECTED at load (one env fix away from
+// confirming). The latch is irreversible, so conflating them made every project
+// genuinely awaiting confirmation permanently visible to the peer on the next
+// reconcile tick, and fixing the env afterwards could not undo it.
+func TestARejectedFleetConfigDoesNotDemolishTheGate(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.setStatus(500)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "rejected-config")
+
+	p.processProvisioningJobs()
+	require.Nil(t, activatedAtOf(t, created.ProjectID),
+		"precondition: the ensure failed, so the project is awaiting confirmation")
+
+	// Exactly the cfg shape boot produces when ValidateTarget or
+	// checkSecretExclusivity rejects the fleet target: dropped from Targets,
+	// recorded in Misconfigured, process boots anyway.
+	p.cfg.Provisioning.Targets = nil
+	p.cfg.Provisioning.Misconfigured = []string{TargetFleet}
+
+	require.True(t, p.twoPhaseCreateApplies(),
+		"a REQUESTED target that was rejected at load is still something that can confirm "+
+			"once the env is fixed; only a target that was never configured is not")
+
+	p.scanUnlatchedActivations()
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"a rejected fleet configuration must NOT latch projects awaiting confirmation. The "+
+			"latch is irreversible, so one boot-time typo would make them visible to the peer "+
+			"forever — and the sharpest trigger is this module's own credential guard, which "+
+			"drops the fleet target on a secret collision it exists to refuse")
+}
+
+// TestARejectedFleetConfigStillGatesNewProjects covers the same conflation on
+// the insert path, which shares the predicate. Without it, new projects created
+// during the misconfiguration window skip the gate entirely.
+func TestARejectedFleetConfigStillGatesNewProjects(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	p.cfg.Provisioning.Targets = nil
+	p.cfg.Provisioning.Misconfigured = []string{TargetFleet}
+
+	created := createVia(t, r, token, "rejected-config-create")
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"while fleet is requested-but-rejected, a new project must still wait: the operator "+
+			"is one env fix from a working confirmation, and the latch cannot be taken back")
+}
+
+// TestNeverConfiguredFleetStillLatches is the other side, and it is what stops
+// the B-6 fix from re-opening B-4: with fleet absent from BOTH lists, nothing
+// will ever confirm and the straggler repair must still run.
+func TestNeverConfiguredFleetStillLatches(t *testing.T) {
+	_, p := setup(t)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "neverFleet")
+	seedSpaceMember(t, spaceA, "neverFleet", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "never-configured")
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = NULL WHERE project_id = ?",
+		created.ProjectID).Exec()
+	require.NoError(t, err)
+
+	require.Empty(t, p.cfg.Provisioning.Misconfigured, "precondition: not merely rejected")
+	require.False(t, p.twoPhaseCreateApplies())
+
+	p.scanUnlatchedActivations()
+	assert.NotNil(t, activatedAtOf(t, created.ProjectID),
+		"with fleet in neither Targets nor Misconfigured, nothing will ever confirm — the "+
+			"repair must still latch, or B-4 is back")
 }

@@ -200,8 +200,14 @@ func (r lifecycleEventRow) envelope() lifecycleEventEnvelope {
 		ProjectID:      r.ProjectID,
 		SpaceID:        r.SpaceID,
 		ProjectVersion: r.ProjectVersion,
-		OccurredAt:     r.OccurredAt.UTC().Format(lifecycleTimeLayout),
-		Payload:        r.Payload,
+		// utcFromColumn, not .UTC(): OccurredAt was scanned from a DATETIME, and
+		// under a loc=Local DSN the driver has tagged the correct UTC wall clock
+		// with the process location — so .UTC() would shift the business fact by
+		// the full offset on every event, including member_revoked. Measured at
+		// 8 hours on TZ=Asia/Shanghai. The contract freezes occurred_at as the
+		// UTC time the fact happened; see utcread.go.
+		OccurredAt: utcFromColumn(r.OccurredAt).Format(lifecycleTimeLayout),
+		Payload:    r.Payload,
 	}
 }
 

@@ -1,11 +1,11 @@
 package project
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 
 	"github.com/gocraft/dbr/v2"
-	"unicode/utf8"
 )
 
 // SQL for the project lifecycle outbox (O4).
@@ -264,17 +264,46 @@ func (d *DB) abandonExhaustedLifecycleEvents(now time.Time, reason string, limit
 	}
 	// The status and lease predicates are repeated so a row claimed between the
 	// two statements is left to the worker that now owns it.
-	if _, err := d.session.UpdateBySql(
+	res, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_lifecycle_event` "+
 			"SET status = ?, last_error = ?, finished_at = ?, lease_owner = '', lease_until = NULL "+
 			"WHERE id IN ? AND status = ? AND attempts >= ? "+
 			"  AND (lease_until IS NULL OR lease_until <= ?)",
 		lifecycleEventAbandoned, truncateError(reason), now,
 		ids, lifecycleEventPending, lifecycleEventMaxAttempts, now,
-	).Exec(); err != nil {
+	).Exec()
+	if err != nil {
 		return nil, fmt.Errorf("project: abandon exhausted lifecycle events: %w", err)
 	}
-	return rows, nil
+	// Re-read to report only what this pod actually transitioned.
+	//
+	// Returning the SELECTed rows would make the caller's counter and Error alert
+	// fire on every pod that swept the same window, and on rows a concurrent
+	// claimer took between the two statements — which are logged as abandoned
+	// while their new owner is mid-delivery. The UPDATE is CAS-guarded so the
+	// TRANSITION is already correct; this is about not alerting on someone else's.
+	//
+	// A count would be cheaper but not enough: the alert names the event id and
+	// the project, which is what makes it actionable, and RowsAffected cannot say
+	// WHICH rows won.
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("project: abandon exhausted lifecycle events rows: %w", err)
+	}
+	if affected == 0 {
+		return nil, nil
+	}
+	var mine []lifecycleEventRow
+	if _, err := d.session.SelectBySql(
+		"SELECT id, event_id, event_type, project_id, space_id, project_version, "+
+			"payload, occurred_at, attempts "+
+			"FROM `octo_project_lifecycle_event` "+
+			"WHERE id IN ? AND status = ? AND last_error = ? AND finished_at = ?",
+		ids, lifecycleEventAbandoned, truncateError(reason), now,
+	).Load(&mine); err != nil {
+		return nil, fmt.Errorf("project: read swept lifecycle events: %w", err)
+	}
+	return mine, nil
 }
 
 // countPendingLifecycleEvents backs the backlog gauge.
@@ -301,8 +330,15 @@ func (d *DB) countPendingLifecycleEvents() (int, error) {
 // TIMESTAMPDIFF, because this repository has already shipped a gauge that
 // compared a Go UTC clock against a session-timezone column and read minus
 // 28799 seconds.
+//
+// That reasoning was right about the hazard and wrong about which half of it
+// this code was exposed to. Computing in Go defends the SQL side; the Go-side
+// READ-BACK is where a loc=Local DSN bites, and this function had both halves of
+// that wrong — see utcread.go. It scanned into []time.Time, which dbr silently
+// fills with the zero time, so the gauge reported about 2.5 million hours on
+// every deployment regardless of timezone.
 func (d *DB) oldestPendingLifecycleEventAge(now time.Time) (time.Duration, error) {
-	var oldest []time.Time
+	var oldest []sql.NullTime
 	_, err := d.session.SelectBySql(
 		"SELECT created_at FROM `octo_project_lifecycle_event` "+
 			"WHERE status = ? ORDER BY created_at ASC LIMIT 1", lifecycleEventPending,
@@ -310,10 +346,11 @@ func (d *DB) oldestPendingLifecycleEventAge(now time.Time) (time.Duration, error
 	if err != nil {
 		return 0, fmt.Errorf("project: oldest pending lifecycle event: %w", err)
 	}
-	if len(oldest) == 0 {
+	oldestUTC, ok := firstUTCFromColumn(oldest)
+	if !ok {
 		return 0, nil
 	}
-	age := now.UTC().Sub(oldest[0].UTC())
+	age := now.UTC().Sub(oldestUTC)
 	if age < 0 {
 		// Clock skew between pods, not a negative age. Report zero rather than a
 		// nonsense negative on a dashboard.
@@ -343,35 +380,21 @@ func (d *DB) purgeFinishedLifecycleEvents(before time.Time, batch int) (int64, e
 	return affected, nil
 }
 
-// truncateError bounds what reaches last_error.
+// truncateError bounds last_error for the lifecycle outbox.
 //
-// The column is VARCHAR(255) and the value is written from a failure path that
-// can carry a peer response body. Truncating here rather than at each call site
-// means no call site can forget, and the migration's rule that this column holds
-// a low-cardinality summary stays enforceable.
-func truncateError(s string) string {
-	const max = 255
-	if len(s) <= max {
-		return s
-	}
-	// Cut back to a RUNE boundary, not just to 255 bytes.
-	//
-	// last_error is utf8mb4 VARCHAR(255) and this string can carry peer output —
-	// the error code lifted from a refusal body, which is whatever the peer put
-	// there and may well not be ASCII. A byte slice through the middle of a
-	// multi-byte rune produces invalid UTF-8, MySQL in strict mode rejects the
-	// write with 1366, and the caller is completeLifecycleEvent /
-	// rescheduleLifecycleEvent: the row never reaches a terminal state, the lease
-	// expires, and the SAME event is delivered to the peer again on every tick,
-	// forever. A garbled tail is a cosmetic problem; an undeliverable row that
-	// cannot be marked is not.
-	//
-	// 255 BYTES is the bound rather than 255 characters, which is what the column
-	// actually allows — deliberately conservative, and it costs nothing: this is
-	// a low-cardinality failure summary, not content.
-	cut := max
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
+// It is truncateProvisioningError — the same 255-byte column, the same package,
+// one implementation. This started as a second copy that repaired only its own
+// cut, which was the weaker half on the path that carries revocations: a string
+// arriving with invalid bytes ALREADY IN IT passed through untouched whenever it
+// was under the limit, MySQL strict mode rejects it with 1366, and the write it
+// fails is the one marking the event delivered or abandoned — so the row stays
+// pending, the lease expires, and the same event is redelivered every tick
+// forever. That is the exact loop the rune-boundary fix was made for, reachable
+// through the other door.
+//
+// The duplicate was not reachable today, but only through an invariant nothing
+// stated: every current input is either a literal or a code that came through
+// json.Unmarshal, which replaces invalid UTF-8 with U+FFFD. One future caller
+// passing a raw err.Error() would have reopened it. Sharing the sibling means
+// whole-string sanitization cannot be forgotten per call site.
+func truncateError(s string) string { return truncateProvisioningError(s) }

@@ -188,6 +188,23 @@ func TestTruncateErrorBoundsTheColumn(t *testing.T) {
 // rejected by MySQL in strict mode (1366), and the write it fails is the one
 // that marks the event delivered or abandoned. So the row stays pending, the
 // lease expires, and the same event is redelivered on every tick forever.
+// TestTruncateErrorSanitizesTheWholeString is the half a cut-only repair misses.
+//
+// Invalid bytes anywhere in the input — not just in a truncated tail — reach the
+// utf8mb4 column and are rejected with 1366, and the write that fails is the one
+// marking the event terminal, so the same event redelivers every tick forever.
+// A short string was previously returned untouched.
+func TestTruncateErrorSanitizesTheWholeString(t *testing.T) {
+	dirty := "conflict: \xff\xfe code"
+	got := truncateError(dirty)
+	if !utf8.ValidString(got) {
+		t.Fatalf("a SHORT string with invalid bytes must still be sanitized, got %q", got)
+	}
+	if !strings.Contains(got, "conflict") || !strings.Contains(got, "code") {
+		t.Errorf("sanitizing must not destroy the legible parts, got %q", got)
+	}
+}
+
 func TestTruncateErrorNeverSplitsARune(t *testing.T) {
 	// 3 bytes per rune: some offset near 255 necessarily lands mid-rune.
 	for pad := 0; pad < 3; pad++ {
