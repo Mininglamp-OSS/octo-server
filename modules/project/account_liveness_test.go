@@ -365,3 +365,74 @@ func TestRepairAbsentSentinelEpochLeavesDisbandedRowsAlone(t *testing.T) {
 		"a DISBANDED project on 0 is not an anomaly — 0 is what it must answer. Repairing it "+
 			"would hand a consumer a live-looking epoch for a project that is gone")
 }
+
+// TestAdmissionPathsFoldTheLivenessLookup covers the P2 round 10 raised: the three
+// places where the admission path intersects two maps keyed by two databases'
+// spellings, all of which were exact-match.
+//
+// pkg/user.ActiveAccounts' own comment prescribes folding ("a row can come back
+// spelled differently from the uid that was asked for … fold both sides — see
+// pkg/project.FoldID"), the two batch READERS do it, and these three write-path sites
+// did not. The direction is fail-closed, so the cost is a live, seated caller being
+// REFUSED — the same shape this branch treated as a blocker when it appeared on the
+// read path.
+//
+// Driven through the real entry points with a case-variant uid, so it fails if any of
+// the three reverts to an exact lookup.
+func TestAdmissionPathsFoldTheLivenessLookup(t *testing.T) {
+	_, p := setup(t)
+	seedSpace(t, spaceA, 1)
+
+	// Stored lower-case; every call below uses the UPPER-case spelling, which the
+	// collation matches in SQL and an exact Go lookup does not.
+	seedUser(t, "foldowner")
+	seedSpaceMember(t, spaceA, "foldowner", 2, 1)
+	seedUser(t, "foldtarget")
+	seedSpaceMember(t, spaceA, "foldtarget", 0, 1)
+
+	// 1) createProjectOnce's creator check.
+	created, err := p.createProject(createInput{
+		SpaceID: spaceA, Creator: "FOLDOWNER", Name: "fold-liveness",
+	})
+	require.NoError(t, err,
+		"a re-cased creator must be able to create: space_member and user both match it "+
+			"under the case-insensitive collation, so refusing it means the Go-side liveness "+
+			"lookup is exact-match")
+	require.NotNil(t, created)
+
+	// 2) lockSeatsTx's actor check and 3) addOneMemberOnce's target check, both in one
+	// call: the actor is re-cased AND the target is re-cased.
+	admitted, err := p.addOneMember(created.ProjectID, spaceA, "FOLDOWNER", "FOLDTARGET")
+	require.NoError(t, err,
+		"a re-cased actor and target must both be accepted; a refusal here means either the "+
+			"actor intersection in lockSeatsTx or the target check in addOneMemberOnce is "+
+			"exact-match against a map keyed by the database's spelling")
+	assert.True(t, admitted)
+
+	// The seat really exists, keyed however the database stored it.
+	_, roles, err := projectpkg.ProjectMemberships(
+		testCtx.DB(), spaceA, created.ProjectID, []string{"FOLDTARGET"})
+	require.NoError(t, err)
+	assert.Contains(t, roles, projectpkg.FoldID("FOLDTARGET"))
+
+	// And the gate still REFUSES a banned account when the spelling varies — folding must
+	// not have turned the check into a no-op, which is the way this fix could go wrong.
+	seedUser(t, "foldbanned")
+	seedSpaceMember(t, spaceA, "foldbanned", 0, 1)
+	setUserLiveness(t, "foldbanned", 0, 0)
+	admitted, err = p.addOneMember(created.ProjectID, spaceA, "FOLDOWNER", "FOLDBANNED")
+	assert.Error(t, err,
+		"a banned account must still be refused through a re-cased spelling: folding is "+
+			"about finding the row, not about accepting it")
+	assert.False(t, admitted)
+
+	// Unit-level: FoldedHas must not match a key that is merely a prefix or a different
+	// uid, which a sloppy fold would.
+	set := map[string]bool{"abc": true, "zzz": false}
+	assert.True(t, projectpkg.FoldedHas(set, "ABC"))
+	assert.True(t, projectpkg.FoldedHas(set, "abc"))
+	assert.False(t, projectpkg.FoldedHas(set, "ab"), "a prefix is not a match")
+	assert.False(t, projectpkg.FoldedHas(set, "abcd"), "a longer uid is not a match")
+	assert.False(t, projectpkg.FoldedHas(set, "ZZZ"),
+		"a key present but false must not count as live")
+}

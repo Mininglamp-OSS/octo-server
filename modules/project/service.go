@@ -8,6 +8,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	userpkg "github.com/Mininglamp-OSS/octo-server/pkg/user"
 	"github.com/go-sql-driver/mysql"
@@ -296,9 +297,24 @@ func (p *Project) lockSeatsTx(
 	// Enforcing it for everyone here looked like the tighter choice and was the wrong one: it
 	// pre-empted a more specific refusal with a less specific one, and it duplicated a
 	// predicate that already exists — which is how two copies of one fact drift.
-	liveActor, err := userpkg.ActiveAccounts(p.db.session, []string{actorUID})
+	// FOLDED on both sides — and that includes `held`, which was exact-match before this
+	// and is the half a review looking only at the new liveness code would miss. `held` is
+	// keyed by
+	// the spelling `space_member` returned and `liveActor` by the spelling `user`
+	// returned, and `uid` compares case-insensitively under either collation — so an
+	// exact-string intersection can drop a live, seated actor whose two rows differ in
+	// case. Fail-closed, but a real caller refused: the same shape this branch treated as
+	// a blocker on the read path. pkg/user.ActiveAccounts' own comment prescribes exactly
+	// this, and this path was not doing it.
+	liveAccounts, err := userpkg.ActiveAccounts(p.db.session, []string{actorUID})
 	if err != nil {
 		return nil, fmt.Errorf("project: check actor account liveness: %w", err)
+	}
+	liveActor := make(map[string]bool, len(liveAccounts))
+	for uid, ok := range liveAccounts {
+		if ok {
+			liveActor[projectpkg.FoldID(uid)] = true
+		}
 	}
 
 	// The ACTOR is checked first, so a caller who has lost their own seat is told that rather
@@ -308,11 +324,11 @@ func (p *Project) lockSeatsTx(
 	// A banned actor lands in the same answer rather than a distinct sentinel: a caller learning
 	// "your account is banned" from a project endpoint is an enumeration answer, and the ban is
 	// already reported on the paths that own it.
-	if !held[actorUID] || !liveActor[actorUID] {
+	if !projectpkg.FoldedHas(held, actorUID) || !liveActor[projectpkg.FoldID(actorUID)] {
 		return nil, errActorNotSpaceMember
 	}
 	for _, uid := range required {
-		if uid != "" && uid != actorUID && !held[uid] {
+		if uid != "" && uid != actorUID && !projectpkg.FoldedHas(held, uid) {
 			return nil, errNotSpaceMember
 		}
 	}
@@ -513,7 +529,9 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	if err != nil {
 		return nil, fmt.Errorf("project: check creator account liveness: %w", err)
 	}
-	if !liveCreator[in.Creator] {
+	// Folded: the map is keyed by the spelling `user` returned, which the
+	// case-insensitive collation lets differ from the one the caller sent.
+	if !projectpkg.FoldedHas(liveCreator, in.Creator) {
 		return nil, errNotSpaceMember
 	}
 
@@ -1298,7 +1316,8 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	if err != nil {
 		return false, fmt.Errorf("project: check target account liveness: %w", err)
 	}
-	if !liveTarget[uid] {
+	// Folded, same reason as the actor check in lockSeatsTx.
+	if !projectpkg.FoldedHas(liveTarget, uid) {
 		p.Warn("加成员：目标账号不可用（已禁用 / 已注销），拒绝",
 			zap.String("projectId", projectID), zap.String("actor", actorUID),
 			zap.String("target", uid))
@@ -1646,7 +1665,7 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 			// the transfer is established as necessary. The seat was already locked up front
 			// (one statement, ahead of the project row), so this is a map lookup rather than a
 			// second lock.
-			if transferTo != "" && !heldSeats[transferTo] {
+			if transferTo != "" && !projectpkg.FoldedHas(heldSeats, transferTo) {
 				return "", errNotSpaceMember
 			}
 			if err := p.promoteSuccessorTx(tx, projectID, transferTo, uid, now); err != nil {
@@ -1785,7 +1804,7 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 		if owners <= 1 {
 			// The successor's Space seat becomes relevant exactly here — see leaveProjectOnce.
 			// Already locked in the single up-front statement, so this is a map lookup.
-			if transferTo != "" && !heldSeats[transferTo] {
+			if transferTo != "" && !projectpkg.FoldedHas(heldSeats, transferTo) {
 				return false, "", errNotSpaceMember
 			}
 			if err := p.promoteSuccessorTx(tx, projectID, transferTo, targetUID, now); err != nil {

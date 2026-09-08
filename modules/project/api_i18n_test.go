@@ -14,6 +14,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // projectCodes returns every registered err.server.project.* code.
@@ -126,32 +128,87 @@ func TestProjectNoLegacyResponseError(t *testing.T) {
 // member_epoch + 1` — and this test is what keeps that true. reconcile.go's
 // best-effort anomaly counter is a diagnostic, not the guarantee.
 func TestMemberEpochOnlyEverIncrements(t *testing.T) {
-	found := false
 	setCall := regexp.MustCompile(`Set\(\s*"member_epoch"`)
 	setMap := regexp.MustCompile(`"member_epoch"\s*:`)
 
-	for _, f := range moduleSourceFiles(t) {
-		// joined: continuation lines and backticks are flattened, so
-		// `SET " + "member_epoch = 0` or a SetMap entry cannot slip between the lines.
-		cleaned := readStripped(t, f)
-		if setCall.MatchString(cleaned) || setMap.MatchString(cleaned) {
-			t.Errorf("modules/project/%s writes member_epoch through a dbr Set()/SetMap; "+
-				"only `member_epoch = member_epoch + 1` is allowed, because monotonicity is "+
-				"guaranteed by the write shape rather than observed by the reconcile scan", f)
+	// Both packages that write this column, not just this one.
+	//
+	// pkg/project was OUTSIDE this scan while carrying a comment on
+	// RepairAbsentSentinelEpoch saying "the shared statement shape is pinned by the
+	// write-discipline guard". It was not: this scans os.ReadDir(".") in
+	// modules/project, and pkg/project holds only a read-order guard. So the invariant
+	// had two writers, one unguarded and asserting the opposite — the exact
+	// green-instrument-that-cannot-express-the-case shape this file's other guards keep
+	// tripping over. Widened rather than deleting the claim, because that duplicate is
+	// deliberate: the read layer has to be able to repair a row it refuses to serve, and
+	// modules/project's copy is a private method it cannot reach.
+	//
+	// The per-file counts below are what keep the widening honest: pointing the scan at a
+	// directory that has moved or emptied fails instead of passing with nothing to check.
+	roots := []struct {
+		label string
+		dir   string
+		min   int
+	}{
+		{"modules/project", ".", 1},
+		{"pkg/project", filepath.Join("..", "..", "pkg", "project"), 1},
+	}
+
+	total := 0
+	for _, root := range roots {
+		matched := 0
+		for _, f := range epochScanFiles(t, root.dir) {
+			// joined: continuation lines and backticks are flattened, so
+			// `SET " + "member_epoch = 0` or a SetMap entry cannot slip between the lines.
+			cleaned := stripComments(mustReadFrom(t, root.dir, f))
+			if setCall.MatchString(cleaned) || setMap.MatchString(cleaned) {
+				t.Errorf("%s/%s writes member_epoch through a dbr Set()/SetMap; "+
+					"only `member_epoch = member_epoch + 1` is allowed, because monotonicity is "+
+					"guaranteed by the write shape rather than observed by the reconcile scan",
+					root.label, f)
+				continue
+			}
+			for _, bad := range nonIncrementEpochWrites(cleaned) {
+				t.Errorf("%s/%s assigns member_epoch to something other than "+
+					"member_epoch + 1: %q", root.label, f, bad)
+			}
+			if strings.Contains(cleaned, "member_epoch = member_epoch + 1") {
+				matched++
+			}
+		}
+		assert.GreaterOrEqual(t, matched, root.min,
+			"%s must contain at least %d `member_epoch = member_epoch + 1` statement(s); found "+
+				"%d. Either the increment moved out of that package or this scan stopped seeing "+
+				"it — and a scan that sees nothing reports the invariant as held",
+			root.label, root.min, matched)
+		total += matched
+	}
+	assert.Positive(t, total, "no increment statement found in either package")
+}
+
+// epochScanFiles lists the non-test .go files of one directory for the guard above.
+func epochScanFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err, "read %s: if the layout changed, re-point this guard rather than "+
+		"narrowing it back to one package", dir)
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		for _, bad := range nonIncrementEpochWrites(cleaned) {
-			t.Errorf("modules/project/%s assigns member_epoch to something other than "+
-				"member_epoch + 1: %q", f, bad)
-		}
-		if strings.Contains(cleaned, "member_epoch = member_epoch + 1") {
-			found = true
-		}
+		files = append(files, name)
 	}
-	if !found {
-		t.Error("no `member_epoch = member_epoch + 1` statement found; either the increment " +
-			"moved out of this package or the guard stopped matching it")
-	}
+	return files
+}
+
+// mustReadFrom reads one file from a scan root.
+func mustReadFrom(t *testing.T, dir, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	require.NoError(t, err)
+	return string(data)
 }
 
 var (

@@ -477,6 +477,31 @@ func FoldID(id string) string {
 	return string(b)
 }
 
+// FoldedHas reports whether want is present in a set keyed by the spelling the
+// DATABASE returned.
+//
+// Every caller that intersects two of those sets needs this, and open-coding it is how
+// one of the sites ends up exact-match: `space_member`, `user` and `octo_project_member`
+// all compare `uid` case-insensitively, so a row can come back spelled differently from
+// the uid that was asked for, and an exact lookup then drops a live, seated member. The
+// direction is fail-closed — a real caller refused — which is the shape this package
+// already treats as a defect on the read path.
+//
+// Folding the SET rather than the needle, because the set is the side with the
+// database's spelling and there may be many of them.
+func FoldedHas(set map[string]bool, want string) bool {
+	if set[want] {
+		return true
+	}
+	folded := FoldID(want)
+	for key, ok := range set {
+		if ok && FoldID(key) == folded {
+			return true
+		}
+	}
+	return false
+}
+
 // ProjectEpochsInSpace returns member_epoch for each named ACTIVE project in
 // spaceID, keyed by FoldID(project_id) — NOT by the spelling the caller sent and
 // NOT by the spelling the database returned. Callers look up with FoldID too; see
