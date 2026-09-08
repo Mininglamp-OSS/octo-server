@@ -102,6 +102,52 @@ func (d *DB) queryAgentRowsTx(tx *dbr.Tx, uids []string) (map[string]agentRow, e
 	return out, nil
 }
 
+// sqlOwnedAgentSeats 是 queryOwnedAgentSeatsTx 执行的语句，提成常量，好让漂移库上的
+// 执行计划守卫 EXPLAIN 生产真正跑的那一份（与 pkg/project 的两条同一条纪律）。
+const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
+	// COLLATE 在 pm.uid 上：pm 是 pinned 的 general_ci，robot 是老表，跨 schema
+	// 必须显式，否则生产上 1267。
+	//
+	// 上一版这里写着"写在 pm.uid 上让 robot 的主键仍然可用"。那句是错的，理由
+	// 与第五轮拦下的 D7 谓词一样：显式 COLLATE 的 coercibility 是 0，比较落在
+	// general_ci，robot_id（生产 0900_ai_ci）的主键**服务不了**它。第八轮 review
+	// 提出了这一点。
+	//
+	// 实测（MySQL 8.0.46，robot 2000 行分布在 200 个 creator 上，
+	// octo_project_member 20000 行，生产排序规则形态）：
+	//
+	//   r  ref idx_robot_creator_uid  rows=3   ← 入口是 creator_uid 这个字面量
+	//   pm eq_ref PRIMARY             rows=1   ← 比较落在 general_ci，而 pm 自己
+	//                                            就是 general_ci，主键可用
+	//
+	// 救它的不是 robot 的主键，是下面那条 creator_uid 字面量谓词给了优化器一个
+	// 有选择性的入口。所以这条语句不必等排序规则转换，但它的代价随"一个主人
+	// 名下的分身数"增长，而不是随项目席位数增长。计划由
+	// TestAgentSeatJoinKeepsAnIndexUnderCollationDrift 钉住。
+	"INNER JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci " +
+	"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 " +
+	// creator_uid 比的是一个**字面量**，不是另一张表的列。字面量是可强制
+	// 转换的，不会报 1267，所以这里不加 COLLATE——加了只会让 idx_robot_creator_uid
+	// 失效，换不到任何安全性。
+	"  AND r.creator_uid = ? AND r.status = 1 " +
+	// 稳定顺序：级联会逐个开事务处理，固定顺序让并发的两次移除以同样的
+	// 顺序碰这些行，少一种死锁形状。
+	"ORDER BY pm.uid " +
+	// **加锁读，且只锁 pm。**
+	//
+	// 这次读直接授权紧随其后的写（把这些席位置为 removing=1）。非加锁读
+	// answers from the snapshot：本事务的读视图在第一条语句就打开了，于是
+	// 一个在那之后提交的新分身席位对这次读不可见，它会被漏掉——人走了、
+	// 他的分身席位还活着，正是 D13 要防的那个终局，而且没有任何东西会回来
+	// 补上。TestNoWriteAuthorisingAggregateIsANonLockingRead 钉住这条规则，
+	// 并且是它先发现了这里的漏洞。
+	//
+	// FOR UPDATE OF pm 而不是裸 FOR UPDATE：不锁 `robot`。robot 不在本模块
+	// 声明的锁序里（space_member → space → project → group → group_member →
+	// octo_project_member），锁它等于凭空加一条没人分析过的边。
+	// lockSpaceSeatsTx 用 FOR SHARE OF sm 是同一个手法。
+	"FOR UPDATE OF pm"
+
 // queryOwnedAgentSeatsTx 读出 ownerUID 名下、当前在这个项目里有活跃席位的分身。
 //
 // D13「分身跟人走」的输入：一个人的项目席位关闭时，他名下的分身席位一并关闭。
@@ -120,33 +166,7 @@ func (d *DB) queryOwnedAgentSeatsTx(tx *dbr.Tx, projectID, ownerUID string) ([]s
 	}
 	var uids []string
 	_, err := tx.SelectBySql(
-		"SELECT pm.uid FROM `octo_project_member` pm "+
-			// COLLATE 在**驱动侧的值**上：pm 是 pinned 的 general_ci，robot 是老表，
-			// 两者跨 schema，必须显式。写在 pm.uid 上让 robot 的主键仍然可用——
-			// 与 P1 对账扫描同一条规则。
-			"INNER JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci "+
-			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 "+
-			// creator_uid 比的是一个**字面量**，不是另一张表的列。字面量是可强制
-			// 转换的，不会报 1267，所以这里不加 COLLATE——加了只会让 idx_robot_creator_uid
-			// 失效，换不到任何安全性。
-			"  AND r.creator_uid = ? AND r.status = 1 "+
-			// 稳定顺序：级联会逐个开事务处理，固定顺序让并发的两次移除以同样的
-			// 顺序碰这些行，少一种死锁形状。
-			"ORDER BY pm.uid "+
-			// **加锁读，且只锁 pm。**
-			//
-			// 这次读直接授权紧随其后的写（把这些席位置为 removing=1）。非加锁读
-			// answers from the snapshot：本事务的读视图在第一条语句就打开了，于是
-			// 一个在那之后提交的新分身席位对这次读不可见，它会被漏掉——人走了、
-			// 他的分身席位还活着，正是 D13 要防的那个终局，而且没有任何东西会回来
-			// 补上。TestNoWriteAuthorisingAggregateIsANonLockingRead 钉住这条规则，
-			// 并且是它先发现了这里的漏洞。
-			//
-			// FOR UPDATE OF pm 而不是裸 FOR UPDATE：不锁 `robot`。robot 不在本模块
-			// 声明的锁序里（space_member → space → project → group → group_member →
-			// octo_project_member），锁它等于凭空加一条没人分析过的边。
-			// lockSpaceSeatsTx 用 FOR SHARE OF sm 是同一个手法。
-			"FOR UPDATE OF pm",
+		sqlOwnedAgentSeats,
 		projectID, MemberStatusActive, ownerUID,
 	).Load(&uids)
 	if err != nil {
@@ -229,16 +249,18 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 
 // countActiveSeatsByKind 分别数活跃席位里的人和分身（D16）。
 //
-// 一条语句而不是两条：两条 COUNT 之间可以插进一次成员变化，于是
-// member_count + agent_count 会不等于配额所数的席位总数，而客户端会拿这两个数去
-// 减。条件聚合让两个数出自同一次扫描、同一个读视图。
+// 两个数必须自洽：member_count + agent_count 要等于配额所数的席位总数，否则客户端
+// 拿这两个数去减就会得到负值。上一版靠"条件聚合，同一次扫描、同一个读视图"做到这
+// 一点；现在靠的是**同一份名册快照**——席位 uid 只读一次，其中每一个要么是 bot 要么
+// 不是，所以两个数按算术相加就等于 len(uids)。性质没变，理由变了（第八轮 review：
+// 注释还在描述已经不存在的那条语句）。
 //
 // 只有会话版，没有事务版。它服务的是**响应渲染**，不授权任何写入；一个事务内的
 // 版本会被 TestNoWriteAuthorisingAggregateIsANonLockingRead 要求成为加锁读，
 // 而为一个纯展示用的计数在成员表上取锁是没有理由的。
 //
-// LEFT JOIN `user`：没有 user 行的成员必须仍被计入（与 listMembers 的 LEFT JOIN
-// 同一个理由——名册和计数不能各说各话），此时 robot 读作 0，计为人。
+// 没有 user 行的成员仍然计为人：他不会出现在 bot 那一批里。这与 listMembers 的
+// LEFT JOIN 是同一个口径——名册和计数不能各说各话。
 // # 两条单表读，不是一条跨 schema 的 JOIN
 //
 // 上一版是 `octo_project_member pm LEFT JOIN user u ON u.uid = pm.uid COLLATE

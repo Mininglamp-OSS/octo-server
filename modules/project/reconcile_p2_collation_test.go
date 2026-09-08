@@ -79,6 +79,26 @@ func TestP2StatementsSurviveCollationDrift(t *testing.T) {
 			_, _, err := p.db.countActiveSeatsByKind(probeProject)
 			return err
 		},
+		// D13's departure cascade: the one cross-schema join left on a write path.
+		// Its PLAN is pinned separately by
+		// TestAgentSeatJoinKeepsAnIndexUnderCollationDrift; this entry covers the
+		// other half — that it executes at all under the drift.
+		"queryOwnedAgentSeatsTx": func() error {
+			tx, err := p.db.session.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.RollbackUnlessCommitted()
+			_, err = p.db.queryOwnedAgentSeatsTx(tx, probeProject, "probe_owner")
+			return err
+		},
+		// The list route. It carried a correlated `user` join until PR #855s eighth
+		// review; it is now two single-table reads, and this entry is what would
+		// notice a join coming back.
+		"listVisibleInSpace": func() error {
+			_, err := p.db.listVisibleInSpace("p2_collation_space", "probe_owner", 0, 20)
+			return err
+		},
 		// D7's predicate, in pkg/project rather than this module — it runs on four
 		// user-facing group endpoints, so a 1267 there is a user-visible 500 on
 		// every exit, disband, removal and transfer in a project group.

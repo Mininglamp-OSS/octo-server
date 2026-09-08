@@ -467,12 +467,18 @@ func (g *Group) renameAllMemberGroup(ctx *config.Context, groupNo, name string) 
 	if creator, err := g.userDB.QueryByUID(groupModel.Creator); err == nil && creator != nil {
 		operatorName = creator.Name
 	}
-	return g.groupService.UpdateGroupInfo(&UpdateGroupInfoServiceReq{
+	// 群在这中间被解散是正常终局，不是改名失败：D8 的同步是机器驱动的，安静跳过。
+	// 人工改名走的是同一个服务方法，那一路会拿到这个错误并回一个 not-found——
+	// 处置的差别属于调用方。第八轮 review。
+	if err := g.groupService.UpdateGroupInfo(&UpdateGroupInfoServiceReq{
 		GroupNo:      groupNo,
 		OperatorUID:  groupModel.Creator,
 		OperatorName: operatorName,
 		Name:         &name,
-	})
+	}); err != nil && !errors.Is(err, errGroupGoneOrDisbanded) {
+		return err
+	}
+	return nil
 }
 
 // projectRoleOwner mirrors modules/project.RoleOwner. modules/group MAY import

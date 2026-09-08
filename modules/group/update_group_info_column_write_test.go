@@ -145,6 +145,12 @@ func TestUpdateGroupInfoDoesNotWriteTheWholeRow(t *testing.T) {
 	// write, the three publish steps must not run. Asserted at the source because
 	// reproducing it needs a hook between the service's pooled status read and its
 	// write, which does not exist. PR #855s seventh review, P2-1.
+	require.True(t, strings.Contains(fn, "return errGroupGoneOrDisbanded"),
+		"and it must REPORT it: a rename that did not land is the same fact as a rename "+
+			"refused at the status check, and updateAvatarCustom one screen away already "+
+			"answers not-found for the identical TOCTOU. D8s sync swallows it with errors.Is; "+
+			"the human handler should not answer 200 OK for a group that is gone")
+
 	zero := strings.Index(fn, "if affected == 0")
 	require.Positive(t, zero,
 		"UpdateGroupInfo must inspect the rows affected: 0 means the group was "+

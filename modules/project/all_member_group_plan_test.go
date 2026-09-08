@@ -165,6 +165,11 @@ func TestTheSplitPredicatesAreWhatProductionRuns(t *testing.T) {
 			constants: []string{"sqlProjectAllMemberGroupPointer", "sqlProjectAllMemberGroupRow"},
 		},
 		{
+			path:      "db_agent.go",
+			signature: "func (d *DB) queryOwnedAgentSeatsTx(",
+			constants: []string{"sqlOwnedAgentSeats"},
+		},
+		{
 			// The repair path reads the same two and then writes its own.
 			path:      "db_all_member_group.go",
 			signature: "func (d *DB) clearStaleAllMemberGroupPointer(",
@@ -206,6 +211,21 @@ func functionBodyOf(t *testing.T, path, signature string) string {
 // Over-stripping is the safe direction: removing text can only make an assertion
 // harder to satisfy, never easier.
 func stripSourceComments(src string) string {
+	// Block comments first, so a /* … */ spanning lines cannot leave a constant
+	// name behind for Contains to find. Narrow, but this guard's whole history is
+	// haystacks larger than their subject. PR #855s eighth review.
+	for {
+		open := strings.Index(src, "/*")
+		if open < 0 {
+			break
+		}
+		close := strings.Index(src[open:], "*/")
+		if close < 0 {
+			src = src[:open]
+			break
+		}
+		src = src[:open] + src[open+close+2:]
+	}
 	lines := strings.Split(src, "\n")
 	for i, line := range lines {
 		if cut := strings.Index(line, "//"); cut >= 0 {
@@ -213,6 +233,66 @@ func stripSourceComments(src string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestAgentSeatJoinKeepsAnIndexUnderCollationDrift pins the plan of the one
+// remaining cross-schema join on a write path.
+//
+// D13's departure cascade runs it as a FOR UPDATE read, so a scan here is paid
+// while holding project-member row locks — lock-hold time, not just latency. The
+// comment above the statement used to claim the COLLATE placement kept `robot`'s
+// primary key usable; it does not, and what actually carries the join is the
+// literal creator_uid predicate. The eighth review asked for the plan to be
+// measured rather than assumed, so it is asserted here.
+func TestAgentSeatJoinKeepsAnIndexUnderCollationDrift(t *testing.T) {
+	setup(t)
+	p, converge := newP1CollationProbe(t)
+	sess := p.db.session
+
+	const projectID, spaceID, owner = "p_seatplan", "s_seatplan", "u_seatplan_owner"
+	seedAgentSeatProbeRows(t, sess, projectID, spaceID, owner)
+
+	assertIndexed := func(when string) {
+		t.Helper()
+		for _, row := range explainRows(t, sess, sqlOwnedAgentSeats,
+			projectID, MemberStatusActive, owner) {
+			require.NotEqual(t, "ALL", derefOr(row.Type, ""),
+				"%s: neither side of the agent-seat join may be read by full scan — this "+
+					"statement runs under FOR UPDATE on the departure cascade, so the cost is "+
+					"lock-hold time (table %q)", when, derefOr(row.Table, ""))
+		}
+	}
+	assertIndexed("under the production collation shape")
+	converge()
+	assertIndexed("and after the conversion")
+}
+
+// seedAgentSeatProbeRows gives the optimizer a realistic shape: a handful of bots
+// for the owner under test, and enough other owners that creator_uid is selective.
+func seedAgentSeatProbeRows(t *testing.T, sess *dbr.Session, projectID, spaceID, owner string) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		uid := fmt.Sprintf("seatplan_bot_%03d", i)
+		creator := fmt.Sprintf("seatplan_owner_%02d", i%40)
+		if i < 3 {
+			creator = owner
+		}
+		_, err := sess.InsertBySql(
+			"INSERT INTO `robot` (robot_id, token, status, creator_uid, agent_hosting) "+
+				"VALUES (?, ?, 1, ?, 'octo_hosted')",
+			uid, "tok-"+uid, creator).Exec()
+		require.NoError(t, err)
+		_, err = sess.InsertBySql(
+			"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, removing, "+
+				"invite_uid, created_at, updated_at) VALUES (?, ?, ?, 0, 1, 0, ?, NOW(3), NOW(3))",
+			projectID, uid, spaceID, owner).Exec()
+		require.NoError(t, err)
+	}
+	var analyzed []struct {
+		Table string `db:"Table"`
+	}
+	_, err := sess.SelectBySql("ANALYZE TABLE `robot`, `octo_project_member`").Load(&analyzed)
+	require.NoError(t, err)
 }
 
 // explainRow is the subset of EXPLAIN this test reads. Pointers because MySQL

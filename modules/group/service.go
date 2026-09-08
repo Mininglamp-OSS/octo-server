@@ -2125,6 +2125,12 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 }
 
 // UpdateGroupInfo 更新群信息
+// errGroupGoneOrDisbanded 是"这个群已经不在了"的统一答案。
+//
+// 消息文本与之前的字面量逐字相同，因为 api.go 有两处 strings.Contains 依赖它；
+// 收成哨兵是为了让调用方能用 errors.Is 分辨，而不是继续比字符串。
+var errGroupGoneOrDisbanded = errors.New("group not found or disbanded")
+
 func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	if req.GroupNo == "" {
 		return errors.New("group_no is required")
@@ -2140,7 +2146,7 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 		return errors.New("failed to query group")
 	}
 	if groupModel == nil || groupModel.Status == GroupStatusDisband {
-		return errors.New("group not found or disbanded")
+		return errGroupGoneOrDisbanded
 	}
 
 	// 生成新版本号
@@ -2194,9 +2200,20 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	// 而接口还报成功。返回 nil 而不是错误——什么都没发生不是失败，调用方（D8 的
 	// 项目改名同步）该做的也只是安静地跳过。PR #855 第七轮 review 的 P2-1。
 	if affected == 0 {
+		// 0 行 = 状态检查（无锁读）之后、这次写之前群被解散了。
+		//
+		// 返回与"读的时候就已经解散"完全相同的错误，而不是 nil：这是同一件事，
+		// 只是发现得晚了一点。上一版返回 nil，于是人点"改群名"会拿到 200 OK，
+		// 而同一个文件里 updateAvatarCustom 对**同一个** TOCTOU 明确返回
+		// "group not found or disbanded"，理由就写在它旁边——不要对一行已经死掉的
+		// 数据报成功。一个文件里两套约定，新的那套更松。第八轮 review。
+		//
+		// D8 的项目改名同步不需要这个错误：它由 renameAllMemberGroup 吞掉
+		// （errors.Is），保持"安静跳过"。人工入口与机器入口的处置不同，而这个
+		// 差别属于调用方，不属于这里。
 		s.Warn("群信息更新未落库（群已解散），跳过全部通知",
 			zap.String("group_no", req.GroupNo))
-		return nil
+		return errGroupGoneOrDisbanded
 	}
 
 	// 发布群更新事件（name 和 notice 分开发送）

@@ -359,6 +359,46 @@ subject of D14 itself. When a decision names a behaviour ("deletion must…"),
 the first artifact is the list of code paths that perform it — and that list
 belongs in the acceptance criteria, not in someone's head.
 
+### Fixing the instance you were shown is not fixing the defect
+
+One shape — an explicit `COLLATE` written on the pinned side of a comparison
+against a legacy table — was found and fixed three times in this change, in three
+different statements, across three review rounds. Each round fixed the instance it
+was handed. Nobody enumerated the others, so the third and worst instance was
+still there after two rounds of "fixed": a correlated subquery on the project LIST
+route, paying the cost once per listed project, on a route with no feature gate in
+front of it.
+
+The reviewer's process note is the lesson, and it generalises past collations:
+after the second instance of anything, the next move is a census, not a fix. Two
+of them were owed here — every statement in the diff comparing a pinned column
+against a legacy table, and every entry point that can close a `space_member` row
+or delete a bot — and both are mechanical enough to be tests rather than reviewer
+attention. The second one had already cost a blocking finding a round earlier, for
+exactly the same reason.
+
+The countermeasure that stuck is not a rule, it is coverage: the statements now
+live in the drift suite (do they execute) and in the plan guard (do they keep an
+index), so the *class* is watched rather than the instances someone happened to
+notice.
+
+### Measuring beats arguing, and the fixture is part of the measurement
+
+The last cross-schema join on a write path drew a plausible argument that it
+degrades — it runs under `FOR UPDATE`, so a scan there costs lock-hold time, not
+just latency. Measured, it does not degrade: the entry point is a literal
+`creator_uid` predicate, and the join lands on an index at both ends.
+
+The first measurement said the opposite, and the difference was the fixture: a
+probe where one user owned every robot made `idx_robot_creator_uid` perfectly
+unselective, and the plan degraded exactly as feared. Redistributing the same 2000
+rows over 200 owners flipped it. Both numbers were real; only one was about
+production.
+
+So the comment was still wrong — it credited `robot`'s primary key, which the
+COLLATE does make unusable — and the honest fix was to say what carries the join
+and pin the plan, rather than to restructure a locking read on an argument.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

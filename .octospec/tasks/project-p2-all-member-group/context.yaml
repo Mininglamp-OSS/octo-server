@@ -1351,6 +1351,79 @@ pr_855_round_7b_fixed:
       (D7's guard placement across handlers, the admission-entry constant lists)
       was never applied to the thing D14 is about.
 
+# PR #855 eighth pass (yujiawei on a00a721). Its P0 -- the REST bot deletion --
+# was already fixed in fc218b1, pushed before the review landed. The rest is here.
+pr_855_round_8_fixed:
+  - id: the-list-route-carried-the-collation-shape-at-n-fanout
+    severity: high
+    where: modules/project/db.go listVisibleInSpace
+    what: |
+      The member_count subquery joined `user` with a COLLATE on the driving side --
+      the third instance of the shape this PR was blocked on twice -- and the worst
+      placed of the three: correlated on p.project_id, so a page of 20 projects
+      paid up to twenty `user` probes that the production shape turns into scans,
+      on a route with no create gate in front of it. It was in neither the drift
+      suite nor the plan guard, and the comment above it argued for keeping the
+      join on an assumption ("each subquery dives into `user` once per member row")
+      that the shape invalidates.
+    fix: |
+      Seats stay in the statement (index-only). Humans are classified afterwards by
+      fillMemberCounts in two single-table reads for the whole page: the seat uids
+      of the listed projects, then which of those uids are bots. No COLLATE
+      anywhere. The exactness argument survives, and now for a reason true of the
+      code -- one roster snapshot, so humans + agents == len(seats) by arithmetic.
+  - id: the-agent-seat-join-was-argued-not-measured
+    severity: medium
+    where: modules/project/db_agent.go queryOwnedAgentSeatsTx
+    what: |
+      The last cross-schema join on a write path, run under FOR UPDATE by D13's
+      cascade, so its cost is lock-hold time. Its comment claimed the COLLATE
+      placement kept robot's primary key usable.
+    fix: |
+      Measured instead of argued (MySQL 8.0.46, drifted shape, 2000 robots over 200
+      creators): r ref idx_robot_creator_uid rows=3, then pm eq_ref PRIMARY rows=1.
+      No scan on either side -- but the reason is the literal creator_uid predicate,
+      not robot's primary key, which the COLLATE does make unusable. The comment now
+      says that, the statement is a constant, and its plan is asserted under both
+      collation shapes by TestAgentSeatJoinKeepsAnIndexUnderCollationDrift.
+      A first measurement said otherwise (r ref rows=2000, filtering per row) and
+      was an artifact of a probe where one user owned every robot; recorded because
+      the fixture, not the engine, was what changed the answer.
+  - id: a-rename-that-did-not-land-answered-success
+    severity: medium
+    where: modules/group/service.go
+    what: |
+      The 0-rows path returned nil, so the human rename handler answered 200 OK for
+      a group disbanded inside the window -- while updateAvatarCustom, one screen
+      away in the same file, returns not-found for the identical TOCTOU. Two
+      conventions for one situation, and the new one was the looser.
+    fix: |
+      One sentinel (errGroupGoneOrDisbanded, same message text so the two
+      strings.Contains callers in api.go keep working) returned by both the
+      status-check path and the 0-rows path. D8's rename sync swallows it with
+      errors.Is; the human handler reports it. The difference belongs to the
+      callers.
+  - id: two-comments-described-a-statement-that-no-longer-existed
+    severity: low
+    where: modules/project/db_agent.go
+    what: |
+      The round-7 split left countActiveSeatsByKind's comments describing the
+      conditional aggregate and the `user` LEFT JOIN it had replaced. The property
+      they defended still held, by a different mechanism.
+    fix: "Rewritten to the mechanism that actually holds it: one roster snapshot, so the two counts sum by arithmetic."
+  - id: the-plan-guard-matched-block-comments
+    severity: low
+    where: modules/project/all_member_group_plan_test.go
+    what: "stripSourceComments stripped // only, so a constant name inside a /* */ block would satisfy Contains."
+    fix: "Block comments stripped first. Narrow, but this guard's history is haystacks larger than their subject."
+  - id: the-drift-suite-covered-seven-statements-not-every-one
+    severity: low
+    what: |
+      The PR description claimed the drift suite covers EVERY P2 statement crossing
+      the schema boundary. It covered seven, and two crossing statements were absent
+      from it and from the plan guard.
+    fix: "queryOwnedAgentSeatsTx and listVisibleInSpace added to the drift suite; the former also to the plan guard. The PR description claim is corrected."
+
 verify:
   rules_rechecked:
     - id: space-isolation
@@ -1569,6 +1642,21 @@ open_verification:
      no collation opinion. The file header's driving-side rule was corrected too --
      it holds only when octo_project* is the PROBED side, and it had been applied to
      a statement where octo_project* drives."
+  - "The pre-launch collation gate is a LIST, and it is this one: listMembers
+     (cannot execute at all -- see the next entry), and, now measured rather than
+     assumed, queryOwnedAgentSeatsTx (executes and keeps an index; the entry point
+     is the literal creator_uid predicate, NOT robot's primary key as its comment
+     used to claim -- measured r ref idx_robot_creator_uid rows=3, pm eq_ref
+     PRIMARY rows=1, and pinned by
+     TestAgentSeatJoinKeepsAnIndexUnderCollationDrift). countActiveSeatsByKind and
+     listVisibleInSpace were on this list in earlier rounds and are off it because
+     they were split into single-table reads; they cross no schema now. The two I4
+     scans keep the shape deliberately and are covered by their own item above.
+     Also on the list, and needing an operator rather than an engineer: check
+     `group`'s LIVE collation in production -- the whole gate assumes 0900_ai_ci
+     there, and if it is already general_ci no conversion window is needed at all.
+     PR #855's eighth review asked for the gate to name every statement rather
+     than one."
   - "GATING: modules/project listMembers cannot execute under the production
      collation shape at all -- its pre-existing `LEFT JOIN user u ON u.uid = pm.uid`
      compares 0900_ai_ci (`user`) with pinned general_ci (octo_project_member) and

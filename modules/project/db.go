@@ -313,29 +313,24 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			// detail route and "every seat" here, i.e. a list card over-counting a
 			// project by exactly the agents in it — the thing D16 exists to stop.
 			//
-			// TOTAL and HUMANS, with agents derived as the difference, rather than
-			// humans and agents counted separately. PR #855's review measured what
-			// the two-join version cost: each subquery dives into `user` once per
-			// member row, so a page of 20 projects averaging 200 members did ~8000
-			// `user` lookups where the pre-P2 query did two index-range counts. The
-			// total needs no join at all — it is index-only on
-			// (project_id, status, removing) — so this halves the dives and leaves
-			// exactly one join per card.
+			// The statement counts SEATS only. Humans are classified afterwards, by
+			// fillMemberCounts, in two single-table reads.
 			//
-			// The difference is exact rather than approximate: every seat is either
-			// robot = 1 or not, the two counts share one read view inside a single
-			// statement, and the same argument is why countActiveSeatsByKind uses one
-			// conditional aggregate instead of two statements.
+			// This subquery used to carry a second one beside it that joined `user`
+			// with a COLLATE on the driving side — the shape PR #855 was blocked on
+			// twice and removed twice, and this was its third and worst instance:
+			// correlated on p.project_id, so a page of 20 projects paid up to twenty
+			// `user` probes that the production collation shape turns into twenty
+			// scans, on a route that is NOT behind the create gate. The eighth review
+			// found it; the comment that used to sit here argued for keeping it, on
+			// an assumption ("each subquery dives into `user` once per member row")
+			// that the shape itself invalidates.
 			//
-			// COLLATE on the driving side's value: octo_project_member is pinned
-			// general_ci, `user` is a legacy table.
+			// Seats are index-only on (project_id, status, removing), so this one
+			// stays in the statement.
 			"(SELECT COUNT(*) FROM `octo_project_member` sc "+
 			"  WHERE sc.project_id = p.project_id AND sc.status = 1 AND sc.removing = 0"+
-			"  ) AS seat_count, "+
-			"(SELECT COUNT(*) FROM `octo_project_member` mc "+
-			"  LEFT JOIN `user` mu ON mu.uid = mc.uid COLLATE utf8mb4_general_ci "+
-			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0 "+
-			"    AND IFNULL(mu.robot, 0) = 0) AS member_count "+
+			"  ) AS seat_count "+
 			"FROM `octo_project` p "+
 			// `removing = 0` on the JOIN as well as on the count: without it a member
 			// whose seat is closing keeps my_role, and — worse — keeps
@@ -354,7 +349,77 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	if err != nil {
 		return nil, fmt.Errorf("project: list projects in space: %w", err)
 	}
+	if err := d.fillMemberCounts(rows); err != nil {
+		return nil, err
+	}
 	return rows, nil
+}
+
+// fillMemberCounts sets MemberCount (humans) on each listed project.
+//
+// Two single-table reads for the whole page, not one join per card: read the
+// active seat uids for the listed projects, then ask `user` which of those uids
+// are bots. Neither statement crosses the pinned/legacy schema boundary, so
+// neither needs a COLLATE and neither can lose an index to one — which is the
+// whole reason the join that used to do this was removed. PR #855s eighth review.
+//
+// The exactness argument the old comment made still holds, and now for a reason
+// that is actually true of the code: the roster is snapshotted once, and every
+// seat in it is either a bot or not, so humans + agents == len(seats) by
+// arithmetic rather than by two aggregates sharing a read view.
+func (d *DB) fillMemberCounts(rows []*listRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	projectIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		projectIDs = append(projectIDs, row.ProjectID)
+	}
+
+	var seats []struct {
+		ProjectID string `db:"project_id"`
+		UID       string `db:"uid"`
+	}
+	if _, err := d.session.SelectBySql(
+		"SELECT project_id, uid FROM `octo_project_member` "+
+			"WHERE project_id IN ? AND status = ? AND removing = 0",
+		projectIDs, MemberStatusActive,
+	).Load(&seats); err != nil {
+		return fmt.Errorf("project: read seats for list counts: %w", err)
+	}
+	if len(seats) == 0 {
+		return nil
+	}
+
+	uidSet := make(map[string]struct{}, len(seats))
+	for _, seat := range seats {
+		uidSet[seat.UID] = struct{}{}
+	}
+	uids := make([]string, 0, len(uidSet))
+	for uid := range uidSet {
+		uids = append(uids, uid)
+	}
+	var botUIDs []string
+	if _, err := d.session.SelectBySql(
+		"SELECT uid FROM `user` WHERE uid IN ? AND robot = 1", uids,
+	).Load(&botUIDs); err != nil {
+		return fmt.Errorf("project: classify seats for list counts: %w", err)
+	}
+	bots := make(map[string]struct{}, len(botUIDs))
+	for _, uid := range botUIDs {
+		bots[uid] = struct{}{}
+	}
+
+	humans := make(map[string]int, len(rows))
+	for _, seat := range seats {
+		if _, isBot := bots[seat.UID]; !isBot {
+			humans[seat.ProjectID]++
+		}
+	}
+	for _, row := range rows {
+		row.MemberCount = humans[row.ProjectID]
+	}
+	return nil
 }
 
 // listRow carries a project plus the caller-relative fields the list computes.
@@ -364,7 +429,11 @@ type listRow struct {
 	// MemberCount counts HUMANS only (D16), the same split the detail route
 	// reports — so one field cannot mean two things depending on which endpoint
 	// the client called.
-	MemberCount int `db:"member_count"`
+	//
+	// Filled by fillMemberCounts after the page loads, not by the statement: the
+	// join that used to produce it crossed into `user` with a COLLATE, once per
+	// listed project.
+	MemberCount int
 	// SeatCount is every active seat, humans and agents together. Agents are the
 	// DIFFERENCE rather than a third count: see the query for the measurement
 	// behind that choice.
@@ -374,10 +443,10 @@ type listRow struct {
 // AgentCount is the agent half of D16's split, derived from the two counts the
 // query returns.
 //
-// Clamped at zero rather than trusted: the two aggregates come from one statement
-// and one read view, so the difference cannot go negative — but a future edit that
-// gave them different predicates would turn a wrong count into a negative one on
-// the wire, and a client rendering "-3 agents" is a worse failure than a zero.
+// Clamped at zero rather than trusted: the two counts come from one snapshot of
+// the roster, so the difference cannot go negative — but a future edit that gave
+// them different predicates would turn a wrong count into a negative one on the
+// wire, and a client rendering "-3 agents" is a worse failure than a zero.
 func (r *listRow) AgentCount() int {
 	if r.SeatCount <= r.MemberCount {
 		return 0
