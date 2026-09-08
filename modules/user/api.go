@@ -5090,15 +5090,22 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 }
 
 type authVerifyBotReq struct {
-	BotToken string `json:"bot_token"`
+	BotToken   string   `json:"bot_token"`
+	SpaceID    string   `json:"space_id"`
+	ProjectIDs []string `json:"project_ids"`
+	OwnerUID   string   `json:"owner_uid"` // Rejected on the opt-in path; never an authority.
 }
 
 type authVerifyBotResp struct {
-	BotUID    string `json:"bot_uid"`
-	BotName   string `json:"bot_name"`
-	OwnerUID  string `json:"owner_uid"`
-	OwnerName string `json:"owner_name"`
-	SpaceID   string `json:"space_id"`
+	BotUID          string                 `json:"bot_uid"`
+	BotName         string                 `json:"bot_name"`
+	OwnerUID        string                 `json:"owner_uid"`
+	OwnerName       string                 `json:"owner_name"`
+	SpaceID         string                 `json:"space_id"`
+	ContextIncluded bool                   `json:"context_included,omitempty"`
+	ContextError    bool                   `json:"context_error,omitempty"`
+	BotContext      *verifyBotContext      `json:"bot_context,omitempty"`
+	OwnerContext    *verifyBotOwnerContext `json:"owner_context,omitempty"`
 }
 
 // authVerifyBot validates a Bot token (BotFather Bearer token) and returns bot + owner info.
@@ -5111,6 +5118,11 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 	}
 	if req.BotToken == "" {
 		respondUserTokenRequired(c, "bot_token")
+		return
+	}
+	if c.Query("include") == "owner_context" &&
+		(req.SpaceID == "" || req.OwnerUID != "" || len(req.ProjectIDs) > maxVerifyProjectIDs) {
+		respondUserRequestInvalid(c, "owner_context")
 		return
 	}
 
@@ -5152,13 +5164,26 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 		Limit(1).
 		LoadOne(&spaceID)
 
-	c.Response(authVerifyBotResp{
+	resp := authVerifyBotResp{
 		BotUID:    botInfo.RobotID,
 		BotName:   botName,
 		OwnerUID:  botInfo.CreatorUID,
 		OwnerName: ownerName,
 		SpaceID:   spaceID,
-	})
+	}
+	if c.Query("include") == "owner_context" {
+		if err := u.fillBotProjectContext(&resp, req); err != nil {
+			if errors.Is(err, errTooManyProjectIDs) {
+				respondUserRequestInvalid(c, "project_ids")
+				return
+			}
+			u.Warn("authVerifyBot context lookup failed", zap.Error(err))
+			resp.ContextError = true
+			resp.BotContext = nil
+			resp.OwnerContext = nil
+		}
+	}
+	c.Response(resp)
 }
 
 type authVerifyAPIKeyReq struct {

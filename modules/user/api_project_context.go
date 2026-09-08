@@ -62,7 +62,7 @@ func (u *User) answerProjectMembership(uid, spaceID string, projectIDs []string)
 
 	// One bounded query for the whole batch, not one per id (C9: this endpoint
 	// runs on every request of every subsystem that fronts octo-server).
-	rows, err := projectpkg.MembershipsInSpace(u.ctx.DB(), spaceID, uid, projectIDs)
+	rows, err := projectpkg.MembershipsInSpace(u.db.session, spaceID, uid, projectIDs)
 	if err != nil {
 		return nil, fmt.Errorf("user: project membership lookup: %w", err)
 	}
