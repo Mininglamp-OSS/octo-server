@@ -3,7 +3,6 @@ package project
 import (
 	"fmt"
 
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -134,28 +133,67 @@ func (d *DB) queryOwnedAgentSeatsTx(tx *dbr.Tx, projectID, ownerUID string) ([]s
 	return uids, nil
 }
 
-// queryAgentOwnerTx 读一个 uid 的分身所有者。返回 "" 表示它不是一个活跃的分身
-// （不是 bot、没有 robot 行、robot 已禁用）。
+// agentClass 是加人路径判定一个 uid 时需要知道的全部事实。
+type agentClass struct {
+	// IsBot 来自 `user`.robot，与 robot 行是否存在、是否被禁用无关。
+	//
+	// 这一位是 D15 判断"该走人类分支还是分身分支"的依据，而不是"这是不是一个
+	// 可用的分身"。两者分开是本结构存在的原因，见 queryAgentClassTx。
+	IsBot bool
+	// OwnerUID 仅在 robot 行存在且 status = 1 时非空。
+	OwnerUID string
+	// Hosting 是自报的托管方式；self_hosted 与通讯录选择器同口径被排除。
+	Hosting string
+}
+
+// queryAgentClassTx 读一个 uid 的分身事实（D2 / D15）。
 //
-// D15 用它回答"这个加人请求的目标是不是调用方自己的分身"。
-func (d *DB) queryAgentOwnerTx(tx *dbr.Tx, uid string) (string, error) {
-	if uid == "" || spacepkg.IsSystemBot(uid) {
-		return "", nil
+// # 为什么不是"读它的主人"
+//
+// 前一版是 queryAgentOwnerTx，只返回 creator_uid，空串表示"不是一个活跃分身"。
+// 加人路径据此分支：空串就走人类分支。于是一个**被禁用或没有 robot 行的 bot**
+// （user.robot = 1，robot.status = 0 或行不存在）被当成人，一个持有 canManageMembers
+// 的管理员可以把它当普通成员加进项目——而同一个 uid 在建项目那条路上会以
+// no_active_robot_row 被拒。
+//
+// 更糟的是它进来之后出不去：queryOwnedAgentSeatsTx 要求 r.status = 1，所以
+// D13 永远不会因为它主人的离开把它带走，而活跃席位不会被任何级联重新访问。
+// 一个谁也收不回的席位。
+//
+// 所以这里把两件事分开读：**它是不是 bot**（user.robot，决定走哪个分支），
+// 和**它是不是一个可用的分身**（robot 行活着、归谁、托管方式）。
+//
+// LEFT JOIN 而不是 INNER：孤儿 bot 必须能被读出来，它正是要拦的那一类。
+// 不带 COLLATE：`user` 与 `robot` 同为 2019 老表，同一套排序规则，加了反而
+// 让谓词失去索引（见 db.go 里那条 COLLATE 纪律）。
+func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
+	if uid == "" {
+		return agentClass{}, nil
 	}
-	var owners []string
+	var rows []*struct {
+		Robot      int    `db:"robot"`
+		CreatorUID string `db:"creator_uid"`
+		Hosting    string `db:"hosting"`
+	}
 	_, err := tx.SelectBySql(
-		"SELECT IFNULL(r.creator_uid, '') FROM `robot` r "+
-			"INNER JOIN `user` u ON u.uid = r.robot_id AND u.robot = 1 "+
-			"WHERE r.robot_id = ? AND r.status = 1",
+		"SELECT u.robot AS robot, IFNULL(r.creator_uid, '') AS creator_uid, "+
+			"  IFNULL(r.agent_hosting, '') AS hosting "+
+			"FROM `user` u "+
+			"LEFT JOIN `robot` r ON r.robot_id = u.uid AND r.status = 1 "+
+			"WHERE u.uid = ?",
 		uid,
-	).Load(&owners)
+	).Load(&rows)
 	if err != nil {
-		return "", fmt.Errorf("project: query agent owner: %w", err)
+		return agentClass{}, fmt.Errorf("project: query agent class: %w", err)
 	}
-	if len(owners) == 0 {
-		return "", nil
+	if len(rows) == 0 {
+		return agentClass{}, nil
 	}
-	return owners[0], nil
+	return agentClass{
+		IsBot:    rows[0].Robot == 1,
+		OwnerUID: rows[0].CreatorUID,
+		Hosting:  rows[0].Hosting,
+	}, nil
 }
 
 // countActiveSeatsByKind 分别数活跃席位里的人和分身（D16）。

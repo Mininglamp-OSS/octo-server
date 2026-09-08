@@ -304,18 +304,34 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 	// BEFORE the member's row is touched (queryOwnedAgentSeatsTx filters on
 	// status = 1 AND removing = 0, so reading after would come back short).
 	//
-	// This path closes seats DIRECTLY (status = 0) rather than through D4's
-	// two-phase close, and the agents follow the same shape for the same reason:
-	// the group-side work is already covered here. The Space removal that drove
-	// this job also runs modules/group's cleanupSpaceMemberGroups, and
-	// RemoveGroupMembers pulls the leaver's bots out of every group with them
-	// (#354, matched on the same robot.creator_uid this reads). So there is
-	// nothing left for a project-side cascade job to do, and enqueuing one would
-	// only add a job that finds an empty group set.
+	// The HUMAN's seat closes directly (status = 0) on this path, because the
+	// Space removal that drove this job also runs modules/group's
+	// cleanupSpaceMemberGroups and the group side is therefore already covered
+	// for them. THE AGENTS GET THE TWO-PHASE CLOSE INSTEAD, and the difference is
+	// the whole point.
 	//
-	// Without this the agent would keep an ACTIVE project seat while sitting in
-	// none of the project's groups: I4 broken, and broken permanently, because an
-	// active seat is never revisited by any cascade.
+	// An earlier version of this comment claimed the group side covered the agents
+	// too, "because RemoveGroupMembers pulls the leaver's bots out of every group
+	// with them (#354)". That is true only of the groups the LEAVER is in:
+	// cleanupSpaceMemberGroups enumerates queryGroupsWithMemberUIDAndSpaceID for
+	// the departing person, and RemoveGroupMembers then cascades their bots WITHIN
+	// those groups. An agent sitting in a project group its owner is not a member
+	// of — which D15 makes ordinary, since any member may seat their own agent and
+	// any member may create a project group — is never visited.
+	//
+	// The end state that produced was an I2 violation nothing repairs: the agent
+	// loses its project seat and stays an active member of that group, its own
+	// space_member row was never touched so no Space cascade revisits it, no
+	// project-side job was ever enqueued, and the I2 scan is report-only. Its
+	// owner, now outside the Space, keeps a proxy reading a project group.
+	//
+	// So the agents go through beginMemberRemovalTx + enqueueRemovalJobTx exactly
+	// as the kick and leave paths do (beginRemovalWithAgentsTx), and P1's detach
+	// step then removes that uid from EVERY group of the project rather than from
+	// the subset its owner happened to share. Direct-closing them instead would
+	// also have made the job a no-op even if it were enqueued: removalCancelled
+	// retires any job whose member reads removing = 0, which a directly-closed
+	// seat does.
 	agents, err := p.db.queryOwnedAgentSeatsTx(tx, projectID, uid)
 	if err != nil {
 		return false, err
@@ -325,19 +341,38 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 	if err != nil {
 		return false, err
 	}
-	closedAgents := make([]string, 0, len(agents))
+	removingAgents := make([]string, 0, len(agents))
 	if changed {
 		for _, agentUID := range agents {
 			if agentUID == "" || agentUID == uid {
 				continue
 			}
-			agentChanged, err := p.db.deactivateMemberTx(tx, projectID, agentUID, now)
+			agentChanged, err := p.db.beginMemberRemovalTx(tx, projectID, agentUID, now)
 			if err != nil {
 				return false, err
 			}
-			if agentChanged {
-				closedAgents = append(closedAgents, agentUID)
+			if !agentChanged {
+				continue
 			}
+			// Its own job, keyed (project_id, uid), for the reason
+			// beginRemovalWithAgentsTx gives: the worker re-reads THAT row under
+			// lock before each batch, and re-admission cancels per uid, so a job
+			// claiming to cover two uids could not be cancelled for one of them.
+			//
+			// The operator and reason are the Space removal's, not a distinct
+			// agent reason: the agent is not being removed on its own account, and
+			// a new reason would have to be taught to the group side's system
+			// message suppression before it rendered sensibly.
+			if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
+				ProjectID:   projectID,
+				UID:         agentUID,
+				SpaceID:     spaceID,
+				OperatorUID: operatorUID,
+				Reason:      reason,
+			}, now); err != nil {
+				return false, err
+			}
+			removingAgents = append(removingAgents, agentUID)
 		}
 		// Only when a row actually changed. The step is re-run on every job retry, so
 		// an unconditional bump would inflate the epoch on no-op reruns and break the
@@ -359,8 +394,18 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		// isolation boundary — but leaving a stale positive role cached would make the
 		// project's own membership answer disagree with the database for a full TTL.
 		p.invalidateProjectMemberCache(projectID, uid)
-		for _, agentUID := range closedAgents {
+		// removing = 1 already makes the agent a non-member for every authorization
+		// read, so the cached role is stale from this commit, not from the worker's
+		// later close.
+		//
+		// Audited here rather than by the caller, which sees only a bool and audits
+		// the human alone: an agent losing its seat is a membership write and the
+		// trail has to carry it. Same split, and the same reason, as the kick and
+		// leave paths.
+		for _, agentUID := range removingAgents {
 			p.invalidateProjectMemberCache(projectID, agentUID)
+			p.audit(auditCascade, operatorUID, agentUID, projectID, spaceID,
+				auditReasonAgentFollowsOwner)
 		}
 	}
 	if changed && wasSoleOwner {

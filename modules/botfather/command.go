@@ -676,8 +676,12 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	//
 	// 席位关闭本身仍是同步的——函数返回时 space_member 已经提交，异步的只有工单
 	// 驱动的清理步骤。
+	//
+	// operatorUID 是**发起删除的主人**，不是 Bot 自己。它会流进
+	// deactivateSeatForCascade 的审计与日志归因，前一版两个参数都传 botID，于是
+	// 审计记录读作"这个 Bot 把自己从每个项目里移除了"——一个不存在的行为者。
 	if _, closeErr := spacemod.CloseAllSpaceSeats(
-		h.ctx, botID, botID, spacemod.MemberRemoveReasonBotDeleted,
+		h.ctx, botID, fromUID, spacemod.MemberRemoveReasonBotDeleted,
 	); closeErr != nil {
 		// 部分 Space 可能已经成功关闭并入队，失败的那些会被 I1 对账扫描报出来。
 		// 不回滚：没有什么可回滚的，而重试整个删除流程是幂等的。

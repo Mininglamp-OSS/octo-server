@@ -946,7 +946,7 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 	// Before the loop, so that the members added below have a group to be admitted
 	// into. It is best-effort — a batch add must not fail because the group could
 	// not be built — so the admissions below tolerate its absence.
-	p.ensureAllMemberGroup(projectID, spaceID)
+	allMemberGroupNo := p.ensureAllMemberGroup(projectID, spaceID)
 
 	results := make([]addMemberResult, 0, len(uids))
 	for _, uid := range uids {
@@ -978,7 +978,7 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 			// The cost is one idempotent admitter round-trip per already-member in
 			// a batch. That is the price of the projection being self-healing, and
 			// it is paid only on a roster that overlaps what is already there.
-			p.admitAllMemberGroup(projectID, spaceID, uid)
+			p.admitAllMemberGroup(projectID, spaceID, allMemberGroupNo, uid)
 		}
 		// An ACTOR-level or project-level failure ends the batch HERE, not in the handler.
 		//
@@ -1081,32 +1081,63 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	// So: decide OWNERSHIP first, because "my own agent" is the only thing an
 	// ordinary member may add; then apply the permission gate; and only for a
 	// caller who passed it does the agent-specific refusal become visible.
-	agentOwner, err := p.db.queryAgentOwnerTx(tx, uid)
+	// The predicate is D2's, not a looser one. PR #855's review found that this
+	// path decided on creator_uid alone while create ran the full rule, and the two
+	// disagreements were not symmetric:
+	//
+	//   - a SELF-HOSTED agent that create refuses was accepted here, from the same
+	//     user. Product inconsistency: the brief's reason for excluding it is that a
+	//     user cannot see it in the picker, and "cannot see it but can name it in a
+	//     request" is the gap that sentence is about.
+	//   - a DISABLED or ORPHANED bot (user.robot = 1 with robot.status = 0, or no
+	//     robot row) read as "not an agent" and fell through to the HUMAN branch, so
+	//     an admin could seat it as an ordinary member. That one is not cosmetic: it
+	//     is then permanently outside D13, because queryOwnedAgentSeatsTx requires
+	//     r.status = 1, so no owner's departure ever reclaims the seat and no cascade
+	//     revisits an active one.
+	//
+	// So: `IsBot` decides WHICH BRANCH (it is the `user`.robot bit, independent of
+	// the robot row), and the full eligibility rule decides whether the own-agent
+	// branch applies.
+	class, err := p.db.queryAgentClassTx(tx, uid)
 	if err != nil {
 		return false, err
 	}
-	isOwnAgent := agentOwner != "" && agentOwner == actorUID
+	isAgentTarget := class.IsBot || spacepkg.IsSystemBot(uid)
+	isOwnAgent := class.IsBot &&
+		!spacepkg.IsSystemBot(uid) &&
+		class.OwnerUID != "" &&
+		class.OwnerUID == actorUID &&
+		class.Hosting != agentHostingSelfHosted
 	if isOwnAgent {
 		// D15 — the narrow capability, held by any active project member.
 		if !canManageOwnAgents(actorRole) {
 			return false, errPermissionDenied
 		}
 	} else {
-		// Everything else — a person, an unknown uid, or somebody else's agent —
-		// needs the ordinary member-management right. A caller without it gets the
-		// SAME answer for all three, so nothing is learned about the target.
+		// Everything else — a person, an unknown uid, somebody else's agent, or an
+		// agent of the actor's that D2 refuses — needs the ordinary
+		// member-management right. A caller without it gets the SAME answer for all
+		// of them, so nothing is learned about the target. That uniformity is why
+		// the ineligible-own-agent case lands here rather than getting its own
+		// refusal above the gate.
 		if !canManageMembers(actorRole) {
 			return false, errPermissionDenied
 		}
-		if agentOwner != "" {
-			// A privileged caller naming somebody else's agent. Refused: the dialog
-			// promises "only your own agents", and an admin acting for another
-			// person is precisely what that excludes. Distinguishable from a human
-			// only by someone who could already enumerate the roster and add
-			// arbitrary members, so it is not the oracle above.
-			p.Warn("加成员：分身不属于调用方，拒绝",
+		if isAgentTarget {
+			// A privileged caller naming a bot that is not their own eligible agent:
+			// somebody else's, a disabled or orphaned one, a self-hosted one, or a
+			// system bot (exempt from project membership by design, so a seat for it
+			// is meaningless and collides with that exemption).
+			//
+			// One refusal for all of them, matching create. Distinguishable from a
+			// human only by someone who could already enumerate the roster and add
+			// arbitrary members, so it is not the oracle the ordering above avoids.
+			p.Warn("加成员：目标不是调用方的合格分身，拒绝",
 				zap.String("projectId", projectID), zap.String("actor", actorUID),
-				zap.String("target", uid), zap.String("owner", agentOwner))
+				zap.String("target", uid), zap.String("owner", class.OwnerUID),
+				zap.String("hosting", class.Hosting),
+				zap.Bool("systemBot", spacepkg.IsSystemBot(uid)))
 			return false, errAgentNotEligible
 		}
 	}
@@ -1257,13 +1288,19 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	// power — they may remove ANY agent, exactly as they may remove any member —
 	// so this only ever widens, never narrows.
 	//
-	// queryAgentOwnerTx returns "" for a person, so a human target falls through
-	// to the unchanged canManageMembers gate below.
-	agentOwner, err := p.db.queryAgentOwnerTx(tx, targetUID)
+	// Only the WIDENING half is asked here, so the predicate is deliberately the
+	// narrow one: an active robot row owned by the actor. A person, an unknown uid
+	// and a disabled bot all read as "not the actor's agent" and fall through to
+	// the unchanged canManageMembers gate — which is the right answer for removal.
+	// Widening on a disabled bot would let an ordinary member act on a seat D2 says
+	// they could never have created; leaving it to an admin costs nothing, because
+	// removal is always available to one.
+	class, err := p.db.queryAgentClassTx(tx, targetUID)
 	if err != nil {
 		return false, err
 	}
-	ownsTargetAgent := agentOwner != "" && agentOwner == actorUID
+	ownsTargetAgent := class.IsBot && class.OwnerUID != "" && class.OwnerUID == actorUID &&
+		!spacepkg.IsSystemBot(targetUID)
 	if ownsTargetAgent {
 		if !canManageOwnAgents(actorRole) {
 			return false, errPermissionDenied

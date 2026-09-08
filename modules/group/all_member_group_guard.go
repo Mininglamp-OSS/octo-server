@@ -73,6 +73,11 @@ func (g *Group) refuseIfAllMemberGroup(c *wkhttp.Context, groupModel *Model, act
 	}
 	isAllMember, err := projectpkg.IsAllMemberGroup(g.ctx.DB(), groupModel.ProjectID, groupModel.GroupNo)
 	if err != nil {
+		// 计数，不只是记日志：fail-open 只有在**响亮**的时候才是对的取舍。注释里
+		// 的论证假设这是一次抖动，而真正要命的形状（表结构变更、排序规则漂移）
+		// 每一次调用都会失败，等于把 D7 整个关掉，而关掉这件事在仪表盘上必须看
+		// 得见。见 AllMemberGroupGuardFailures。
+		projectpkg.AllMemberGroupGuardFailures.WithLabelValues(action).Inc()
 		g.Error("判定是否为项目全员群失败，放行本次操作（见 all_member_group_guard.go 的 fail-open 论证）",
 			zap.Error(err), zap.String("groupNo", groupModel.GroupNo),
 			zap.String("projectId", groupModel.ProjectID), zap.String("action", action))
@@ -89,22 +94,17 @@ func (g *Group) refuseIfAllMemberGroup(c *wkhttp.Context, groupModel *Model, act
 	return true
 }
 
-// refuseIfAllMemberGroupByNo 是 refuseIfAllMemberGroup 的按群号版本，供还没有
-// 群行在手的调用点使用。
+// 按群号的变体曾经存在，现在没有了，而这是 C1 纪律的结果而不是清理顺手删的。
 //
-// 读群行失败同样放行，理由同上。
-func (g *Group) refuseIfAllMemberGroupByNo(c *wkhttp.Context, groupNo, action string) bool {
-	if groupNo == "" {
-		return false
-	}
-	groupModel, err := g.db.QueryWithGroupNo(groupNo)
-	if err != nil {
-		g.Error("查询群资料失败，放行全员群守卫",
-			zap.Error(err), zap.String("groupNo", groupNo), zap.String("action", action))
-		return false
-	}
-	return g.refuseIfAllMemberGroup(c, groupModel, action)
-}
+// 它自己发一次 QueryWithGroupNo。transferGrouper 是唯一的调用点，而它下一行就是
+// getGroupInfo —— 同一条查询。于是 Space 直属群多 1 次、普通项目群多 2 次，额度
+// 分别是 0 和 1。四个调用点里三个传现成的群行，第四个只是因为"有个按群号的重载
+// 用起来方便"就没传。
+//
+// 不留这个变体，是因为守卫比重载更强：现在**没有**一个能自己发查询的入口，C1 就
+// 不是靠每个调用点记得遵守，而是没得违反。将来真有只拿到群号的调用点，把它加回来
+// 的同时要说清楚为什么那里读不到群行——那才是它该有的代价。
+// TestAllMemberGroupGuardTakesTheGroupRowFromItsCaller 钉住这一条。
 
 // respondAllMemberGroupProtected 写出 D7 的拒绝。
 //

@@ -789,6 +789,9 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	if protected, perr := ba.isProjectAllMemberGroup(groupNo); perr != nil {
 		// 放行并记日志，与 Web 侧守卫同一个取舍：这道守卫保护的是产品语义而不是
 		// 安全边界，fail-closed 会让一次数据库抖动变成"所有项目群都踢不了人"。
+		//
+		// 与 Web 侧共用同一个计数器：仪表盘上"D7 还在判定吗"这个问题应该只问一次。
+		projectpkg.AllMemberGroupGuardFailures.WithLabelValues("remove").Inc()
 		ba.Error("判定是否为项目全员群失败，放行本次移除", zap.Error(perr), zap.String("groupNo", groupNo))
 	} else if protected {
 		ba.Warn("拒绝 bot 从项目全员群移除成员，请走项目侧入口",

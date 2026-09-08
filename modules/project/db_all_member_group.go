@@ -94,40 +94,65 @@ func (d *DB) clearStaleAllMemberGroupPointer(projectID string) (bool, error) {
 //
 // 用 tx 而不是 session：调用方（建项目、加成员）此时已经提交了自己的业务事务，
 // 这里开的是一个只包含这条 UPDATE 的短事务，不与任何别的锁同时持有。
-func (d *DB) claimAllMemberGroupProvision(projectID string, now time.Time) (bool, error) {
+//
+// 返回认领时写下的 deadline，它就是这次认领的**凭据**：释放和写回都拿它当围栏
+// （见 releaseAllMemberGroupProvision）。没有它，一次超时的认领在退出时会清掉
+// 后继者正握着的租约。
+func (d *DB) claimAllMemberGroupProvision(projectID string, now time.Time) (bool, time.Time, error) {
 	if projectID == "" {
-		return false, nil
+		return false, time.Time{}, nil
 	}
+	// 截到毫秒，因为围栏是**等值**比较而列是 DATETIME(3)。
+	//
+	// 不截的话写进去的是被库截过的值，手里留的是纳秒精度的原值，两者永远不相等：
+	// 释放和写回的围栏会静默影响 0 行，租约只能等自然到期——而"围栏永远不匹配"
+	// 与"没有围栏"在日志上长得一模一样。是 TestReleasingAStaleClaimDoesNotClear...
+	// 的最后一条断言发现的，不是想出来的。
+	deadline := now.Add(allMemberGroupLease).Truncate(time.Millisecond)
 	result, err := d.session.UpdateBySql(
 		"UPDATE octo_project SET all_member_group_lease_until = ? "+
 			"WHERE project_id = ? AND status = ? AND all_member_group_no = '' "+
 			"  AND (all_member_group_lease_until IS NULL OR all_member_group_lease_until < ?)",
-		now.Add(allMemberGroupLease), projectID, StatusNormal, now,
+		deadline, projectID, StatusNormal, now,
 	).Exec()
 	if err != nil {
-		return false, fmt.Errorf("project: claim all-member group provision: %w", err)
+		return false, time.Time{}, fmt.Errorf("project: claim all-member group provision: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("project: read all-member group claim result: %w", err)
+		return false, time.Time{}, fmt.Errorf("project: read all-member group claim result: %w", err)
 	}
-	return affected == 1, nil
+	if affected != 1 {
+		return false, time.Time{}, nil
+	}
+	return true, deadline, nil
 }
 
 // releaseAllMemberGroupProvision 主动放弃认领（建群失败时），把租约清空让下一个
 // 写路径立刻可以重试，而不必等满一个租约周期。
 //
-// 只在 all_member_group_no 仍为空时清：如果这中间有别人建成了，那一列已经非空，
-// 清租约就成了对别人成果的干扰（虽然实际无害，但让语义变模糊）。
+// # 必须围栏在自己认领的那个 deadline 上
+//
+// 前一版的 WHERE 只有「project_id 且 all_member_group_no 仍为空」，也就是**谁的
+// 租约都清**。一次跑得比 allMemberGroupLease 还久的建群尝试，在失败退出时会清掉
+// 一个后继者刚刚认领、正在使用的租约——于是第三个写路径立刻认领成功，两个建群
+// 并发跑起来，而这正是租约存在的全部理由。（对称的另一半由 setAllMemberGroupNo
+// 的 CAS 兜住：晚到的那次写回落空，多出来的群留成普通项目群。）
+//
+// 加上 deadline 之后，超时者的释放影响 0 行：它手里的凭据已经不是行上的那个值。
+// 这与 completeRemovalJob 用 lease owner 做围栏是同一个手法——那里是"这个工单
+// 还归我吗"，这里是"这一列上的租约还是我写的那个吗"。
+//
 // best-effort：失败不影响正确性，租约到期同样会释放。
-func (d *DB) releaseAllMemberGroupProvision(projectID string) error {
-	if projectID == "" {
+func (d *DB) releaseAllMemberGroupProvision(projectID string, deadline time.Time) error {
+	if projectID == "" || deadline.IsZero() {
 		return nil
 	}
 	_, err := d.session.UpdateBySql(
 		"UPDATE octo_project SET all_member_group_lease_until = NULL "+
-			"WHERE project_id = ? AND all_member_group_no = ''",
-		projectID,
+			"WHERE project_id = ? AND all_member_group_no = '' "+
+			"  AND all_member_group_lease_until = ?",
+		projectID, deadline,
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("project: release all-member group provision: %w", err)
@@ -260,4 +285,33 @@ func (d *DB) queryActiveOwnerForProvision(projectID string) (string, error) {
 		return "", nil
 	}
 	return uids[0], nil
+}
+
+// queryActiveMemberUIDsForRebuild 读一个项目当前的活跃成员 uid，供 D4 补建把整份
+// 名册当作建群的初始成员（见 ensureAllMemberGroup）。
+//
+// 排除 removing = 1：那些席位正在关闭，级联马上会把他们从项目的每个群里移走，
+// 把他们放进新群等于建出来就要再拆掉一次。
+//
+// 不排除系统 bot：它们本来就不持有项目席位（I2/I4 都豁免它们），所以这条查询
+// 读不到它们，不需要额外的谓词。
+//
+// limit 由调用方按 max_members 传入。名册不可能超过配额——每一条加人路径都在
+// 事务里数过——所以取满 limit 意味着配额被调小过或数据异常，调用方据此记日志。
+// 有界是硬要求而不是防御：这条语句在一次 HTTP 请求里同步执行。
+func (d *DB) queryActiveMemberUIDsForRebuild(projectID string, limit int) ([]string, error) {
+	var uids []string
+	_, err := d.session.SelectBySql(
+		// 按 created_at, uid 排序而不是随便什么顺序：建群时的成员顺序会决定
+		// group_member 的写入顺序，稳定的顺序让两次补建产生一样的结果，测试
+		// 才断言得了。
+		"SELECT uid FROM `octo_project_member` "+
+			"WHERE project_id = ? AND status = ? AND removing = 0 "+
+			"ORDER BY created_at, uid LIMIT ?",
+		projectID, MemberStatusActive, limit,
+	).Load(&uids)
+	if err != nil {
+		return nil, fmt.Errorf("project: query active member uids for rebuild: %w", err)
+	}
+	return uids, nil
 }

@@ -91,6 +91,8 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, spaceID, groupNo, uid
 		return fmt.Errorf("group: all-member admission GenSeq: %w", err)
 	}
 
+	// 事务外先看一眼，只为在"没活干"的时候不开事务。判定用的那一份在事务里重读，
+	// 见下面的 QueryWithGroupNoTx——这一份的 project_id / creator 一律不参与写入。
 	groupModel, err := g.db.QueryWithGroupNo(groupNo)
 	if err != nil {
 		return fmt.Errorf("group: all-member admission query group: %w", err)
@@ -112,7 +114,26 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, spaceID, groupNo, uid
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, groupModel.SpaceID, groupModel.ProjectID,
+	// 群行在**事务内**重读一次，准入闸门用的是这一份。
+	//
+	// 上面那次读发生在事务之外，用来决定"要不要干活"；把它的 project_id 直接喂给
+	// 闸门就是拿一个事务外的快照去评判 I2。这两次读之间 P1 的 detach 可以把群
+	// 变回 Space 直属，于是闸门会按一个**已经不成立**的项目归属放行——虽然结果
+	// 是"写进一个刚刚不再属于该项目的群"而不是越权，但闸门的整个意义就是它读的
+	// 那一份归属是权威的。PR #855 review 的 Q13。
+	txGroup, err := g.db.QueryWithGroupNoTx(tx, groupNo)
+	if err != nil {
+		return fmt.Errorf("group: all-member admission re-read group: %w", err)
+	}
+	if txGroup == nil || txGroup.Status == GroupStatusDisband {
+		// 事务外读到时还在，现在没了或已解散。与上面同一个判断，同一个处置：
+		// 无事可做，不是错误。
+		g.Warn("全员群在准入事务内已不可用，跳过入群",
+			zap.String("groupNo", groupNo), zap.String("uid", uid))
+		return nil
+	}
+
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, txGroup.SpaceID, txGroup.ProjectID,
 		[]MemberAdmission{{
 			UID:     uid,
 			Version: version,
@@ -121,7 +142,7 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, spaceID, groupNo, uid
 			// 记本人则谎称是自助加入。记群主——他是这个群在群面上的负责人，也是
 			// 这个群存在的原因。这与 admitToPresetGroup 选择记本人是不同的答案，
 			// 因为那里确实没有人邀请，而这里有：项目把他带进来的。
-			InviteUID: groupModel.Creator,
+			InviteUID: txGroup.Creator,
 		}}, AdmissionEntryAllMemberGroup); err != nil {
 		return err
 	}

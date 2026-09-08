@@ -324,7 +324,12 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 	// Emitted here, after createProject returned nil, and only then: the create is
 	// whole-request (D3), so success means every uid in the list was seated. Emitting
 	// inside the transaction would log seats a rollback then discarded.
-	for _, agentUID := range in.AgentUIDs {
+	//
+	// Filtered through withoutUID for the same reason createProjectOnce filters the
+	// list before seating anything: a caller who names THEMSELVES in agent_uids has
+	// that uid dropped, so auditing the raw request list would record a membership
+	// write that never happened.
+	for _, agentUID := range withoutUID(in.AgentUIDs, uid) {
 		p.audit(auditMemberAdd, uid, agentUID, model.ProjectID, spaceID, auditReasonAgentOnCreate)
 	}
 	// The Space role is passed as MemberRoleCommon rather than read from the database:
@@ -332,7 +337,7 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 	// project they just created, so every capability is already determined. The Space role
 	// only ever widens READ visibility, which does not apply to a response about a project
 	// the caller owns.
-	humans, agents := p.splitSeatCounts(model.ProjectID, 1+len(in.AgentUIDs))
+	humans, agents := p.splitSeatCounts(model.ProjectID)
 	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, humans, agents))
 }
 
@@ -461,7 +466,7 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 		// member_count means. Reporting the full seat count here while the detail
 		// route reported humans only would have been D16's own bug, one endpoint
 		// away.
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount))
+		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount()))
 	}
 	c.Response(resps)
 }
@@ -473,13 +478,7 @@ func (p *Project) getProjectHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
-	count, err := p.db.countActiveMembers(row.ProjectID)
-	if err != nil {
-		p.Error("统计项目成员数失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	humans, agents := p.splitSeatCounts(row.ProjectID, count)
+	humans, agents := p.splitSeatCounts(row.ProjectID)
 	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents))
 }
 
@@ -606,13 +605,11 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	}
 
 	p.audit(auditUpdate, uid, "", row.ProjectID, row.SpaceID, "")
-	count, err := p.db.countActiveMembers(row.ProjectID)
-	if err != nil {
-		p.Error("统计项目成员数失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	humans, agents := p.splitSeatCounts(updated.ProjectID, count)
+	// The count no longer fails the response. It never should have: the update
+	// COMMITTED, and answering 500 because a display aggregate hiccuped tells the
+	// caller their write failed when it did not, which is the one thing a response
+	// after a successful write must not do.
+	humans, agents := p.splitSeatCounts(updated.ProjectID)
 	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents))
 }
 
@@ -692,14 +689,37 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount in
 // join to `user` hiccuped is a worse answer than one whose agent badge is
 // missing. The total is unaffected either way — humans+agents always equals the
 // seat count the quota uses.
-func (p *Project) splitSeatCounts(projectID string, total int) (humans, agents int) {
+//
+// # The fallback total is read HERE, not by the caller
+//
+// Every caller used to run countActiveMembers first and hand the result in, so
+// the happy path paid for two aggregates and used one — the second existed
+// purely to feed a branch that does not run. PR #855's review measured it as one
+// full aggregate per project detail, update and create response.
+//
+// Reading it inside the failure branch keeps the degrade and makes the happy path
+// a single query. It also fixes the create path's fallback, which passed
+// `1 + len(agent_uids)` — a number computed from the REQUEST, and therefore wrong
+// by one whenever the caller named themselves in agent_uids (createProjectOnce
+// strips the creator before seating anything).
+//
+// If the fallback count fails too, report zeros: two aggregates over the same
+// table both failing is not a display hiccup, and inventing a total from the
+// request is what produced the off-by-one above.
+func (p *Project) splitSeatCounts(projectID string) (humans, agents int) {
 	humans, agents, err := p.db.countActiveSeatsByKind(projectID)
-	if err != nil {
-		p.Warn("统计项目成员构成失败，按全部为真人回退",
-			zap.Error(err), zap.String("projectId", projectID))
-		return total, 0
+	if err == nil {
+		return humans, agents
 	}
-	return humans, agents
+	p.Warn("统计项目成员构成失败，回退到只数总席位",
+		zap.Error(err), zap.String("projectId", projectID))
+	total, countErr := p.db.countActiveMembers(projectID)
+	if countErr != nil {
+		p.Warn("回退统计项目成员数也失败，成员数按 0 下发",
+			zap.Error(countErr), zap.String("projectId", projectID))
+		return 0, 0
+	}
+	return total, 0
 }
 
 // pageParams parses offset/limit with bounds. An unbounded limit on a roster or a project

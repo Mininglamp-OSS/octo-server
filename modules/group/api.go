@@ -2958,18 +2958,24 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 		return
 	}
 
+	groupModel, err := g.getGroupInfo(groupNo)
+	if err != nil {
+		respondGroupInfoError(c, err)
+		return
+	}
+
 	// D7 —— 全员群的群主不能手动转让。它始终跟着项目 owner 走（D6），由项目侧
 	// 在 owner 变动时驱动同步。
 	//
 	// 放在群主判定之后：只有群主本人会看到这条拒绝，别人先拿到 creator_only。
 	// 这一路仍在任何写入之前——下面才开始改成员角色。
-	if g.refuseIfAllMemberGroupByNo(c, groupNo, allMemberGroupActionTransfer) {
-		return
-	}
-
-	groupModel, err := g.getGroupInfo(groupNo)
-	if err != nil {
-		respondGroupInfoError(c, err)
+	//
+	// 放在 getGroupInfo **之后**并复用它读到的群行，而不是用按群号的那个版本。
+	// 前一版用了 refuseIfAllMemberGroupByNo，它自己发一次 QueryWithGroupNo，而紧
+	// 接着的 getGroupInfo 就是同一条查询：Space 直属群多 1 次、普通项目群多 2 次，
+	// 而 C1 纪律给的额度是 0 和 1。守卫注释里把这条写成硬要求，这里却是四个调用点
+	// 里唯一违反它的。TestAllMemberGroupGuardAddsNoQueryOnANonProjectGroup 现在钉住它。
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionTransfer) {
 		return
 	}
 

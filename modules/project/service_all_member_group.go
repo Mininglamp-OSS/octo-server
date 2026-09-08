@@ -31,7 +31,7 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 		return
 	}
 
-	claimed, err := p.db.claimAllMemberGroupProvision(projectID, time.Now().UTC())
+	claimed, lease, err := p.db.claimAllMemberGroupProvision(projectID, time.Now().UTC())
 	if err != nil {
 		p.Error("认领全员群建群失败", zap.Error(err), zap.String("projectId", projectID))
 		observeAllMemberGroupProvisionFailure(reasonProvisionClaimFailed)
@@ -55,7 +55,8 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 			zap.Error(err), zap.String("projectId", projectID), zap.String("spaceId", spaceID))
 		observeAllMemberGroupProvisionFailure(reasonProvisionCallFailed)
 		// 主动放弃租约，让下一次写路径立刻能重试，而不是干等满一个租约周期。
-		if relErr := p.db.releaseAllMemberGroupProvision(projectID); relErr != nil {
+		// 围栏在本次认领的 deadline 上：一次超时的尝试不得清掉后继者的租约。
+		if relErr := p.db.releaseAllMemberGroupProvision(projectID, lease); relErr != nil {
 			p.Warn("释放全员群建群租约失败（租约到期后仍会自动释放）",
 				zap.Error(relErr), zap.String("projectId", projectID))
 		}
@@ -92,14 +93,20 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 //
 // 挂在写路径上还有一个好处：补建发生在用户正在操作这个项目的时刻，失败对他是可见
 // 的（下一次加人还会再试），而不是在一个没人看的后台里反复失败。
-func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
+// 返回补建之后这个项目的全员群号（""=仍然没有）。调用方据此把群号带进批量入群，
+// 而不是每个 uid 再查一次——见 admitAllMemberGroupTo。
+func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
 	groupNo, err := p.db.queryAllMemberGroupNo(projectID)
 	if err != nil {
 		p.Warn("查询全员群失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
-		return
+		// 这一次查询同时服务两件事：决定要不要补建，以及给随后的批量入群提供群号。
+		// 它失败时整批入群都会静默空转，所以入群失败的指标要在这里记——否则把
+		// 查询提到循环外面这个优化就顺手吃掉了一个信号。
+		observeAllMemberGroupAdmitFailure(reasonAdmitLookupFailed)
+		return ""
 	}
 	if groupNo != "" {
-		return
+		return groupNo
 	}
 	// The lookup says "no group", but the POINTER may still be set — that is
 	// exactly the detached/disbanded case, and the claim CAS below keys on the
@@ -112,7 +119,7 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
 	cleared, err := p.db.clearStaleAllMemberGroupPointer(projectID)
 	if err != nil {
 		p.Warn("清理失效的全员群指针失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
-		return
+		return ""
 	}
 	if cleared {
 		p.Warn("全员群指针已失效（群被解散或已脱离本项目），已清空，准备补建",
@@ -120,7 +127,7 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
 	}
 	row, err := p.db.queryByProjectID(projectID)
 	if err != nil || row == nil || row.Status != StatusNormal {
-		return
+		return ""
 	}
 	// 群主取**当前活跃的 owner**，不是 octo_project.creator。
 	//
@@ -132,22 +139,53 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
 	owner, err := p.db.queryActiveOwnerForProvision(projectID)
 	if err != nil {
 		p.Warn("查询项目 owner 失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
-		return
+		return ""
 	}
 	if owner == "" {
 		// 无主项目（P0 的 Space 级联可以造出这种状态并留了 Warn）。没有人能当群主，
 		// 补建只会失败；等有 owner 了再说。I4 扫描 A 继续报着它。
 		p.Warn("项目暂无活跃 owner，跳过全员群补建",
 			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
-		return
+		return ""
 	}
-	// 补建时初始成员只有 owner——不是当前全体成员。
+	// 补建的初始成员是**当前全体活跃成员**，不是只有 owner。
 	//
-	// 把当前全体成员塞进建群请求会让一次补建变成一次批量入群，而批量入群里任何
-	// 一个人被 I2 拒绝都会让整次建群失败（准入闸门是全或无的）。补建先建出一个
-	// 只有 owner 的群，剩下的人由 admitAllMemberGroup 逐个补进去——逐个补是可以
-	// 部分成功的，而且 I4 扫描 B 本来就在盯着"项目成员不在全员群里"。
-	p.provisionAllMemberGroup(projectID, spaceID, owner, row.Name, nil)
+	// 前一版传 nil，并写着"剩下的人由 admitAllMemberGroup 逐个补进去"。没有任何
+	// 东西会那么做：admitAllMemberGroup 只对触发这次补建的那个请求里的 uid 调用。
+	// 于是一个已经有 A、B 的项目在加 C 的时候补建，建出来的群是 {owner, C}——
+	// A 和 B 谁也不会把他们放进去，扫描 B 报出缺口而按决策不自动修复，唯一的
+	// 补救是管理员一个一个重新加。那句注释描述的是一个不存在的机制。
+	//
+	// 那一版给的理由是"批量入群是全或无的，一个人被 I2 拒绝就整次建群失败"。
+	// 理由成立但结论反了：这里读的就是项目的活跃成员，按定义全部通过 I2；唯一
+	// 会失败的情况是读名册和建群之间有人被移除，而那种失败是**自愈**的——租约
+	// 释放，下一个写路径带着新名册重试。用一次偶发重试换掉一个静默不完整的群，
+	// 这笔交易是划算的。
+	//
+	// 有界：名册不可能超过项目的 max_members（每条加人路径都在事务里数过），
+	// 取满即数据异常，记一条 Warn。
+	maxMembers := p.cfg.effectiveMaxMembers(row.MaxMembers)
+	roster, err := p.db.queryActiveMemberUIDsForRebuild(projectID, maxMembers)
+	if err != nil {
+		p.Warn("读取项目名册失败，跳过全员群补建", zap.Error(err), zap.String("projectId", projectID))
+		return ""
+	}
+	if len(roster) >= maxMembers {
+		p.Warn("补建全员群：名册取满上限，可能有成员未被带入新群（由 I4 扫描 B 报出）",
+			zap.String("projectId", projectID), zap.Int("limit", maxMembers))
+	}
+	// owner 由 CreateGroup 自己作为群主加入，出现在 Members 里会变成重复插入。
+	p.provisionAllMemberGroup(projectID, spaceID, owner, row.Name, withoutUID(roster, owner))
+
+	// 再读一次而不是让 provisionAllMemberGroup 返回群号：补建可能因为任何一种
+	// 原因没成（钩子没注册、认领失败、建群失败、写回落空），而这些分支各自的
+	// 处置不同，唯一统一的答案是"现在这个项目到底有没有全员群"。
+	groupNo, err = p.db.queryAllMemberGroupNo(projectID)
+	if err != nil {
+		p.Warn("补建后复查全员群失败", zap.Error(err), zap.String("projectId", projectID))
+		return ""
+	}
+	return groupNo
 }
 
 // admitAllMemberGroup 把一个 uid 放进项目的全员群（D12）。
@@ -157,19 +195,20 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) {
 // 事（给项目加一个人）明明已经做成了。
 //
 // 漏网的人由 I4 扫描 B 报出，且**不自动修复**：修复要写群表，理由同 ensureAllMemberGroup。
-func (p *Project) admitAllMemberGroup(projectID, spaceID, uid string) {
+// 群号由调用方传入，不在这里查。前一版每个 uid 都重跑一次 queryAllMemberGroupNo
+// ——那是一条 octo_project ⨝ group 的连接查询——所以一次 200 人的加人会发 200 次
+// 同样的查询，而 addMembers 在循环之前就已经调过 ensureAllMemberGroup 拿到了答案。
+//
+// 群号在批次中途变化（被 detach、被解散）不需要靠逐个重查来防：群侧的准入器自己
+// 会重读群行并拒绝已解散的群，而重查读到的同样只是一个更晚一点的快照，挡不住
+// 同一件事。
+func (p *Project) admitAllMemberGroup(projectID, spaceID, groupNo, uid string) {
 	if uid == "" {
 		return
 	}
 	admit := allMemberGroupAdmitter()
 	if admit == nil {
 		observeAllMemberGroupAdmitFailure(reasonAdmitterMissing)
-		return
-	}
-	groupNo, err := p.db.queryAllMemberGroupNo(projectID)
-	if err != nil {
-		p.Warn("查询全员群失败，跳过入群", zap.Error(err), zap.String("projectId", projectID))
-		observeAllMemberGroupAdmitFailure(reasonAdmitLookupFailed)
 		return
 	}
 	if groupNo == "" {

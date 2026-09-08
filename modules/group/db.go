@@ -407,6 +407,18 @@ func (d *DB) QueryWithGroupNo(groupNo string) (*Model, error) {
 	return model, err
 }
 
+// QueryWithGroupNoTx 是 QueryWithGroupNo 的事务内版本。
+//
+// 存在的理由不是对称性：一次在事务外读到的群行，到事务里已经可能不再成立，而
+// 准入闸门按 project_id 判定 I2——用事务外的那一份，就是拿快照评判不变量。
+// 不加 FOR UPDATE：这里要的是"本事务读视图里的那一份"，不是把群行锁进
+// group_member 的锁序里。
+func (d *DB) QueryWithGroupNoTx(tx *dbr.Tx, groupNo string) (*Model, error) {
+	var model *Model
+	_, err := tx.Select("*").From("`group`").Where("group_no=?", groupNo).Load(&model)
+	return model, err
+}
+
 // QueryWithGroupNo 根据群编号查询群信息
 func (d *DB) QueryWithGroupNos(groupNos []string) ([]*Model, error) {
 	var models []*Model

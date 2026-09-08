@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -211,7 +212,7 @@ type i4GapRow struct {
 //     the group rows are the cascade's to remove.
 //  2. whitelisted system bots — exempt from project membership by design, so
 //     they are neither required in the group nor counted as members of it.
-//  3. a seat written within allMemberGroupAdmitGrace — the admitter runs AFTER
+//  3. a seat written within the admit grace window — the admitter runs AFTER
 //     the seat transaction commits (D12), so there is a real window in which the
 //     seat exists and the group row does not. Without this the scan would report
 //     every single add for as long as that window lasts, i.e. it would report
@@ -277,7 +278,7 @@ func (p *Project) scanAllMemberGroupGaps() {
 // has no gap to measure, and scan A already reports it.
 func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID string, limit int) ([]*i4GapRow, error) {
 	var rows []*i4GapRow
-	graceCutoff := time.Now().UTC().Add(-allMemberGroupAdmitGrace)
+	graceCutoff := time.Now().UTC().Add(-p.admitGrace())
 	_, err := p.db.session.SelectBySql(
 		"SELECT p.id, p.project_id, pm.uid, pm.space_id, p.all_member_group_no AS group_no, "+
 			"  (gm.uid IS NULL AND pm.updated_at < ?) AS violating "+
@@ -308,8 +309,7 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 	return rows, nil
 }
 
-// allMemberGroupAdmitGrace is how long a freshly written project seat is exempt
-// from scan B.
+// admitGrace is how long a freshly written project seat is exempt from scan B.
 //
 // The admitter runs after the seat transaction commits and makes its own
 // transaction plus a blocking IM call (D12), so the seat legitimately exists
@@ -317,18 +317,33 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 // scan would flag every add in flight — reporting the design as a violation, and
 // training whoever reads the gauge to ignore it.
 //
-// Five minutes is generous against a path measured in hundreds of milliseconds,
-// and short relative to how long a real gap would persist: nothing retries the
-// admission, so a genuine failure stays until an admin re-adds the member.
-const allMemberGroupAdmitGrace = 5 * time.Minute
-
-// groupStatusDisband mirrors modules/group.GroupStatusDisband.
+// Configurable (OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE), as the brief asks: the
+// right value depends on how slow the admitter's IM call is in a given deployment,
+// which is not something a constant in this file can know. Default five minutes —
+// generous against a path measured in hundreds of milliseconds, and short relative
+// to how long a real gap persists, since nothing retries the admission.
 //
-// Spelled out rather than imported: modules/project must never import
-// modules/group (pkg/project/import_guard_test.go pins it at zero), and this
-// scan reads the `group` table directly — which it may, exactly as modules/space
-// does, because reading a column is not a module dependency.
-const groupStatusDisband = 2
+// A zero or negative configured value falls back to the default rather than
+// disabling the exemption: "no grace" makes the scan report every add in flight,
+// i.e. it reports the design, and a gauge that is always red is a gauge nobody
+// reads. Someone who genuinely wants that can set one second.
+func (p *Project) admitGrace() time.Duration {
+	if p.cfg.AllMemberGroupAdmitGrace > 0 {
+		return p.cfg.AllMemberGroupAdmitGrace
+	}
+	return defaultAllMemberGroupAdmitGrace
+}
+
+// groupStatusDisband is modules/group.GroupStatusDisband, reached through
+// pkg/project rather than restated here.
+//
+// modules/project must never import modules/group (pkg/project/import_guard_test.go
+// pins it at zero), and this scan reads the `group` table directly — which it may,
+// exactly as modules/space does, because reading a column is not a module
+// dependency. What it must not do is keep its own copy of the number: this file
+// and pkg/project both compare against it, and two literals for one fact is the
+// shape this change has already paid for twice.
+const groupStatusDisband = projectpkg.GroupStatusDisband
 
 // systemBotExemptForScan reports whether uid is exempt from I4 for the same
 // reason it is exempt from I2: the platform adds these accounts to groups itself

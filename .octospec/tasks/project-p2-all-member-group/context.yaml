@@ -431,6 +431,176 @@ review_round_3_fixed:
       SafeDetailKeys. Declaration moved back under its own comment, and the new code
       now says explicitly why it carries no detail keys.
 
+# PR #855 human review (yujiawei, MEMBER) on head 153a8a9: one blocking finding,
+# four spec items, thirteen non-blocking. All fixed except two, recorded below.
+pr_855_review_fixed:
+  - id: space-cascade-never-removed-an-agent-from-groups-its-owner-was-not-in
+    severity: blocking
+    where: modules/project/space_member_removal.go deactivateSeatForCascade
+    what: |
+      The path closed a departing member's agents' project seats DIRECTLY and
+      enqueued nothing, on a comment claiming modules/group's
+      cleanupSpaceMemberGroups already covered them because RemoveGroupMembers
+      pulls a leaver's bots out with them (#354).
+    why_that_was_wrong: |
+      That covers only the groups THE LEAVER IS IN: cleanupSpaceMemberGroups
+      enumerates the departing person's groups and cascades their bots within
+      those. An agent sitting in a project group its owner never joined is never
+      visited -- and D15 makes that arrangement ordinary, since any member may
+      seat their own agent and any member may create a project group.
+    consequence: |
+      An I2 violation nothing repairs: the agent holds no project seat and stays
+      an active member of that group; its own space_member row was never touched
+      so no Space cascade revisits it; no project-side job was ever enqueued; the
+      I2 scan is report-only. The owner, now outside the Space, keeps a proxy
+      reading a project group.
+    fix: |
+      The agents get the TWO-PHASE close plus a job each, exactly as the kick and
+      leave paths do, so P1's detach removes them from EVERY group of the project.
+      Direct-closing them would also have made an enqueued job useless:
+      removalCancelled retires any job whose member reads removing = 0.
+    test: |
+      TestSpaceRemovalTakesTheAgentOutOfEVERYProjectGroup (end to end, through the
+      real group side, with the all-member group as the control since the old code
+      DID handle that one) and TestSpaceCascadeBeginsATwoPhaseCloseForTheDepartingMembersAgents
+      (the mechanism). The e2e case was confirmed to fail on the unfixed code.
+  - id: members-add-ran-a-looser-agent-predicate-than-create
+    severity: high
+    brief_ref: S4 / D2 / D15(c)
+    what: |
+      create ran the full D2 rule; members/add decided on robot.creator_uid alone.
+      A self-hosted agent create refuses was accepted here, and -- the half that
+      bites -- a DISABLED or ORPHANED bot (user.robot = 1 with robot.status = 0 or
+      no robot row) read as "not an agent" and fell through to the HUMAN branch, so
+      an admin could seat it as an ordinary member.
+    why_it_matters: |
+      That seat is unreclaimable. queryOwnedAgentSeatsTx requires robot.status = 1,
+      so D13 never takes it when its owner leaves, and no cascade revisits an
+      active seat.
+    fix: |
+      queryAgentOwnerTx replaced by queryAgentClassTx, which reads the two facts
+      separately: `user`.robot decides WHICH BRANCH, the full eligibility rule
+      decides whether the own-agent branch applies. The round-1 ordering (ownership
+      first, then the permission gate, then the agent-specific refusal only for a
+      privileged caller) is preserved, so no oracle is reintroduced.
+    test: TestMembersAddAppliesTheSameAgentPredicateAsCreate
+  - id: transfer-route-paid-two-queries-against-a-budget-of-one
+    severity: medium
+    brief_ref: S3 / C1
+    what: |
+      transferGrouper used refuseIfAllMemberGroupByNo, which issues its own
+      QueryWithGroupNo, and the very next statement called getGroupInfo -- the same
+      query. Space-direct groups paid +1 and project groups +2, against a budget of
+      0 and 1 that the guard's own comment states as a hard requirement.
+    fix: |
+      The guard moved below getGroupInfo and takes the row it already read. The
+      by-number variant was DELETED rather than left available: with no entry point
+      that can read the group row itself, C1 holds by construction instead of by
+      every call site remembering. TestAllMemberGroupGuardTakesTheGroupRowFromItsCaller
+      pins that, and also pins the five call sites.
+  - id: rebuild-left-the-existing-roster-out-of-the-new-group
+    severity: medium
+    brief_ref: Q11
+    what: |
+      The rebuild seeded the new group with nil members and a comment saying
+      admitAllMemberGroup would fill the rest in one by one. Nothing did -- it runs
+      only for the uids of the triggering request. A project holding A and B,
+      rebuilt while adding C, came out as {owner, C}.
+    fix: |
+      The rebuild seeds the CURRENT active roster. The old comment's argument (a
+      batch admission is all-or-nothing) is true but pointed the wrong way: these
+      uids are the project's active members, so they pass I2 by definition, and the
+      only failure mode -- a removal landing between the roster read and the create
+      -- is self-healing, since the lease releases and the next write path retries.
+    test: TestRebuildBringsTheWHOLERosterIntoTheNewGroup
+  - id: lease-release-cleared-whoever-s-lease-was-there
+    severity: medium
+    brief_ref: Q1
+    what: |
+      releaseAllMemberGroupProvision keyed on the project alone, so a provisioning
+      attempt outliving allMemberGroupLease cleared, on its way out, the lease a
+      successor was actively holding -- and a third writer claimed immediately.
+    fix: |
+      The claim returns its deadline and the release is fenced on it, the way
+      completeRemovalJob fences on the lease owner. Writing that fence surfaced a
+      second defect the test caught rather than the reasoning: the deadline has to
+      be TRUNCATED to milliseconds, because the column is DATETIME(3) and an
+      equality fence against a nanosecond-precision Go time never matches -- a
+      fence that never matches looks exactly like no fence in the logs.
+    test: TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease
+  - id: assorted-non-blocking
+    severity: low
+    fixes: |
+      Q3: splitSeatCounts reads its own fallback total, so the happy path is one
+      aggregate instead of two -- and the create path stops deriving a fallback
+      from the REQUEST, which was wrong by one whenever the caller named
+      themselves in agent_uids (Q9's other half).
+      Q4: the list route counts TOTAL (index-only, no join) and HUMANS, deriving
+      agents as the difference -- halving the per-card `user` dives the two-join
+      version cost.
+      Q5: the group number is read once per batch instead of once per uid; the
+      admit-lookup metric moved to where that single read now fails, so hoisting
+      it did not eat a signal.
+      Q7: bot deletion attributes the seat closures to the OWNER who issued the
+      delete, not to the bot itself.
+      Q8: the blacklist refusal has tests, both halves -- refused on add, still
+      open on remove, since un-blacklisting moves WITH I4.
+      Q9: the create audit loop filters through withoutUID, so naming yourself in
+      agent_uids no longer logs a membership write that did not happen.
+      Q10: IsAllMemberGroup excludes a disbanded group, and the literal it compares
+      against is now one exported constant (pkg/project.GroupStatusDisband) that
+      both readers share, with TestGroupStatusDisbandMatchesPkgProject keeping it
+      in step with modules/group.
+      Q12: AllMemberGroupGuardFailures counts every fail-open. The choice is only
+      right if a fail-open is loud, and the shapes that matter (schema change,
+      collation drift) fail on EVERY call rather than once.
+      Q13: the admitter re-reads the group row INSIDE its transaction, so the
+      admission gate evaluates I2 against the transaction's own view of
+      project_id rather than a snapshot taken before it.
+      S2: the scan-B grace window is configurable
+      (OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE), defaulting to the old constant.
+
+# Raised in the review, deliberately not changed. Each has an answer, not a shrug.
+pr_855_review_not_changed:
+  - id: i4-scan-b-banned-space-exemption
+    brief_ref: S1
+    answer: |
+      Not added, and now with evidence rather than an argument.
+      TestI4ScanBStaysQuietWhenTheSpaceIsBanned bans the Space under a healthy
+      project and the gauge stays at zero, then breaks the invariant under the same
+      ban and the gauge reports 1. P1's I2 scan needs the exemption because it is
+      the SUBSET direction and a banned Space's group rows are expected to remain;
+      scan B is the SUPERSET direction and the cascade leaves both sides alone, so
+      there is nothing to suppress. The exemption would be a `space` lookup per
+      examined row that can never fire, and it would silence a real admitter
+      failure that happened to occur in a Space banned afterwards.
+    note: |
+      The review's stated impact -- "a banned Space will drive the gauge up with
+      rows nobody can act on" -- is what the first assertion checks. It does not.
+  - id: ensureAllMemberGroupOwner-holds-a-tx-while-reading-the-pool
+    brief_ref: Q6
+    answer: |
+      Left as the review itself suggests ("worth noting rather than doing here").
+      Fixing it properly needs *dbr.Tx variants of pkg/project's MemberRole and
+      PickActiveOwner, which changes a package modules/group, modules/space and
+      modules/project all depend on -- a change that wants its own review, not a
+      rider on this one. No lock-order violation today: both are non-locking reads
+      on octo_project_member.
+
+# Also fixed, found while fixing the above rather than reported.
+pr_855_found_while_fixing:
+  - id: two-i4-scans-had-no-behavioural-test
+    what: |
+      Both scans existed only behind source guards -- the bounds rules and the
+      collation drift probe -- so nothing had ever run either one and looked at
+      what it reported.
+    fix: |
+      reconcile_p2_scan_test.go: scan A's three unusable states plus the healthy
+      and disbanded-project cases, and scan B's gap, its grace-window exemption,
+      its removing = 1 exemption, and the banned-Space evidence above.
+  - id: space-cascade-agent-removals-were-unaudited
+    fix: "auditCascade with reason agent_follows_owner, in the post-commit loop that already invalidates their caches -- closedAgents does not leave the service, so the caller cannot do it."
+
 # octospec Verify phase. Each injected rule re-read and checked against the diff,
 # then the brief's Acceptance walked line by line.
 verify:

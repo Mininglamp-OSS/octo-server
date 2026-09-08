@@ -236,3 +236,19 @@ func TestEveryAdmissionEntryConstantIsInTheGuardLists(t *testing.T) {
 		}
 	}
 }
+
+// TestGroupStatusDisbandMatchesPkgProject keeps the one literal that crosses the
+// module boundary in step.
+//
+// pkg/project cannot import modules/group — modules/group imports IT — so the
+// disbanded-group status is spelled out on that side. Both of its readers
+// (IsAllMemberGroup here, and modules/project's I4 scan A through it) now compare
+// against that single constant, and this is what stops the two definitions
+// drifting: a change to GroupStatusDisband that did not reach pkg/project would
+// make every "is this group disbanded" predicate outside modules/group answer
+// about the wrong number, silently and in the permissive direction.
+func TestGroupStatusDisbandMatchesPkgProject(t *testing.T) {
+	require.Equal(t, GroupStatusDisband, projectpkg.GroupStatusDisband,
+		"pkg/project.GroupStatusDisband mirrors this module's constant by hand; update it "+
+			"in the same commit that changes this one")
+}

@@ -312,20 +312,30 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			// One aggregate for both would make member_count mean "humans" on the
 			// detail route and "every seat" here, i.e. a list card over-counting a
 			// project by exactly the agents in it — the thing D16 exists to stop.
-			// Two correlated subqueries rather than a join, because the row already
-			// carries one and the page is bounded (list limit), so this is one more
-			// bounded lookup per rendered card, not an N+1 over the table.
+			//
+			// TOTAL and HUMANS, with agents derived as the difference, rather than
+			// humans and agents counted separately. PR #855's review measured what
+			// the two-join version cost: each subquery dives into `user` once per
+			// member row, so a page of 20 projects averaging 200 members did ~8000
+			// `user` lookups where the pre-P2 query did two index-range counts. The
+			// total needs no join at all — it is index-only on
+			// (project_id, status, removing) — so this halves the dives and leaves
+			// exactly one join per card.
+			//
+			// The difference is exact rather than approximate: every seat is either
+			// robot = 1 or not, the two counts share one read view inside a single
+			// statement, and the same argument is why countActiveSeatsByKind uses one
+			// conditional aggregate instead of two statements.
 			//
 			// COLLATE on the driving side's value: octo_project_member is pinned
 			// general_ci, `user` is a legacy table.
+			"(SELECT COUNT(*) FROM `octo_project_member` sc "+
+			"  WHERE sc.project_id = p.project_id AND sc.status = 1 AND sc.removing = 0"+
+			"  ) AS seat_count, "+
 			"(SELECT COUNT(*) FROM `octo_project_member` mc "+
 			"  LEFT JOIN `user` mu ON mu.uid = mc.uid COLLATE utf8mb4_general_ci "+
 			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0 "+
-			"    AND IFNULL(mu.robot, 0) = 0) AS member_count, "+
-			"(SELECT COUNT(*) FROM `octo_project_member` ac "+
-			"  LEFT JOIN `user` au ON au.uid = ac.uid COLLATE utf8mb4_general_ci "+
-			"  WHERE ac.project_id = p.project_id AND ac.status = 1 AND ac.removing = 0 "+
-			"    AND IFNULL(au.robot, 0) = 1) AS agent_count "+
+			"    AND IFNULL(mu.robot, 0) = 0) AS member_count "+
 			"FROM `octo_project` p "+
 			// `removing = 0` on the JOIN as well as on the count: without it a member
 			// whose seat is closing keeps my_role, and — worse — keeps
@@ -351,11 +361,28 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 type listRow struct {
 	Model
 	MyRole int `db:"my_role"`
-	// MemberCount counts HUMANS only and AgentCount counts AI agents (D16), the
-	// same split the detail route reports — so one field cannot mean two things
-	// depending on which endpoint the client called.
+	// MemberCount counts HUMANS only (D16), the same split the detail route
+	// reports — so one field cannot mean two things depending on which endpoint
+	// the client called.
 	MemberCount int `db:"member_count"`
-	AgentCount  int `db:"agent_count"`
+	// SeatCount is every active seat, humans and agents together. Agents are the
+	// DIFFERENCE rather than a third count: see the query for the measurement
+	// behind that choice.
+	SeatCount int `db:"seat_count"`
+}
+
+// AgentCount is the agent half of D16's split, derived from the two counts the
+// query returns.
+//
+// Clamped at zero rather than trusted: the two aggregates come from one statement
+// and one read view, so the difference cannot go negative — but a future edit that
+// gave them different predicates would turn a wrong count into a negative one on
+// the wire, and a client rendering "-3 agents" is a worse failure than a zero.
+func (r *listRow) AgentCount() int {
+	if r.SeatCount <= r.MemberCount {
+		return 0
+	}
+	return r.SeatCount - r.MemberCount
 }
 
 // countActiveMembers counts active seats in a project.

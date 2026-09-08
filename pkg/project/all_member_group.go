@@ -2,6 +2,8 @@ package project
 
 import (
 	"github.com/gocraft/dbr/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // 全员群相关的谓词（P2 的 D5 / D6 / D7）。
@@ -56,14 +58,33 @@ func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, er
 			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
 			"WHERE p.project_id = ? AND p.status = 1 "+
 			"  AND p.all_member_group_no = ? "+
+			// A disbanded group is not the project's all-member group any more,
+			// and the two other predicates over this same fact —
+			// queryAllMemberGroupNo and I4 scan A — both say so. Leaving it out
+			// here made three readers of one fact answer with two different
+			// answers, which is the shape that already cost a review round
+			// (clearStaleAllMemberGroupPointer exists because the read side got
+			// stricter than the write side and nobody noticed until the rebuild
+			// silently stopped happening).
+			//
+			"  AND g.status <> ? "+
 			"  AND g.project_id = ? COLLATE utf8mb4_general_ci",
-		projectID, groupNo, projectID,
+		projectID, groupNo, GroupStatusDisband, projectID,
 	).LoadOne(&count)
 	if err != nil {
 		return false, err
 	}
 	return count > 0, nil
 }
+
+// GroupStatusDisband mirrors modules/group.GroupStatusDisband.
+//
+// Spelled out rather than imported: pkg/project is a leaf that modules/group
+// imports, so importing back would be a cycle. Everything on this side of the
+// boundary that has to reason about a disbanded group reads THIS constant rather
+// than writing 2 again, so there is exactly one literal to keep in step —
+// modules/group's TestGroupStatusDisbandMatchesPkgProject is what keeps it there.
+const GroupStatusDisband = 2
 
 // PickActiveOwner returns an active owner of projectID, preferring the
 // longest-standing one, or "" when the project has none.
@@ -128,3 +149,29 @@ func AllMemberGroupNo(session *dbr.Session, projectID string) (string, error) {
 	}
 	return groupNos[0], nil
 }
+
+// AllMemberGroupGuardFailures counts D7 guard evaluations that could not be
+// decided and were therefore let through.
+//
+// The guards on both sides — modules/group's five handlers and modules/bot_api's
+// member removal — fail OPEN when the predicate query errors, and that choice is
+// right: fail-closed turns one database hiccup into "nobody can leave any project
+// group", which a user cannot route around, while fail-open leaves an I4 gap that
+// reconcile scan B reports and an admin can repair.
+//
+// It is only right if a fail-open is LOUD. The argument in those comments assumes
+// a transient error, but the failure shapes that actually matter — a schema
+// change, a collation mismatch — fail deterministically on EVERY call, which turns
+// D7 off wholesale with nothing behind it but log lines. This counter is what
+// separates "one hiccup on Tuesday" from "the guard has been off since Tuesday".
+// Raised as Q12 in PR #855's review.
+//
+// Here rather than in either module because three call sites across two modules
+// share it, and a per-module copy would make the dashboard question ("is D7
+// deciding?") need to be asked twice.
+var AllMemberGroupGuardFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "octo_project",
+	Name:      "all_member_group_guard_failures_total",
+	Help: "D7 all-member-group guard evaluations that failed and were let through, " +
+		"by the action that was allowed.",
+}, []string{"action"})

@@ -550,3 +550,120 @@ func TestAllMemberGroupDoesNotConsumeTheDailyGroupQuota(t *testing.T) {
 		"the all-member group must be built even with the daily manual-create cap at zero: %v", resp)
 	require.NotNil(t, groupRowE2E(t, ctx, groupNo), "and the group must really exist")
 }
+
+// TestSpaceRemovalTakesTheAgentOutOfEVERYProjectGroup is the P1 finding from PR
+// #855's review, end to end.
+//
+// The Space-removal cascade closed a departing member's agents' project seats but
+// enqueued nothing, on the reasoning that modules/group's cleanupSpaceMemberGroups
+// already pulled the leaver's bots out with them (#354). That covers only the
+// groups THE LEAVER IS IN: cleanupSpaceMemberGroups enumerates the departing
+// person's groups and RemoveGroupMembers cascades their bots within those. An
+// agent sitting in a project group its owner is not a member of was never visited.
+//
+// D15 makes that arrangement ordinary rather than exotic — any member may seat
+// their own agent, and any member may create a project group — so this is the
+// shape below: alice's agent is in a group bob created and alice never joined.
+//
+// The end state before the fix was an I2 violation nothing repairs: the agent
+// holds no project seat and is still an active member of that group, its own
+// space_member row was never touched so no Space cascade revisits it, and the I2
+// scan is report-only. Alice, now outside the Space, keeps a proxy reading a
+// project group.
+//
+// The all-member group is the CONTROL here: alice is in it, so the old code
+// removed the agent from that one. Only the second group discriminates.
+func TestSpaceRemovalTakesTheAgentOutOfEVERYProjectGroup(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID = "e2e_sr_space"
+		owner   = "e2e_sr_owner"
+		alice   = "e2e_sr_alice"
+		bob     = "e2e_sr_bob"
+		agent   = "e2e_sr_bot"
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, owner)
+	for _, uid := range []string{owner, alice, bob} {
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, uid)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, uid, uid)
+	}
+	seedE2EAgent(t, ctx, spaceID, agent, alice)
+
+	ownerToken := seedToken(t, ctx, owner)
+	aliceToken := seedToken(t, ctx, alice)
+	bobToken := seedToken(t, ctx, bob)
+
+	resp := createProjectE2E(t, srv, spaceID, ownerToken, map[string]any{"name": "space-removal-e2e"})
+	projectID, _ := resp["project_id"].(string)
+	allMemberGroup, _ := resp["all_member_group_no"].(string)
+	require.NotEmpty(t, allMemberGroup)
+
+	w := postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{alice, bob}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	w = postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", aliceToken,
+		map[string]any{"uids": []string{agent}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	// Bob creates an ordinary project group whose only member is alice's agent.
+	// Through the real endpoint, so the I2 admission gate is what makes this state
+	// legal: the agent is an active project member, therefore admissible. Seeding
+	// the rows directly would prove the removal works on a state nothing can reach.
+	w = postJSONE2E(t, srv, "/v1/group/create", bobToken, map[string]any{
+		"space_id":   spaceID,
+		"project_id": projectID,
+		"members":    []string{agent},
+	})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var created struct {
+		GroupNo string `json:"group_no"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created), "body: %s", w.Body.String())
+	otherGroup := created.GroupNo
+	require.NotEmpty(t, otherGroup)
+
+	require.Contains(t, liveGroupMembers(t, ctx, otherGroup), agent,
+		"precondition: the agent is in a project group of its own")
+	require.NotContains(t, liveGroupMembers(t, ctx, otherGroup), alice,
+		"precondition: and its OWNER is not — that is what the old cascade could not see")
+
+	// Alice loses her Space seat. Everything below is what the cascade must do.
+	closed, err := spacemod.CloseAllSpaceSeats(ctx, alice, owner, spacemod.MemberRemoveReasonForceRemoved)
+	require.NoError(t, err)
+	require.Equal(t, []string{spaceID}, closed)
+
+	require.Eventually(t, func() bool {
+		var statuses []int
+		if _, err := ctx.DB().SelectBySql(
+			"SELECT status FROM `octo_project_member` WHERE project_id = ? AND uid = ?", projectID, agent,
+		).Load(&statuses); err != nil {
+			return false
+		}
+		return len(statuses) == 1 && statuses[0] == 0
+	}, 60*time.Second, 500*time.Millisecond,
+		"D13 — the agent's project seat must close when its owner loses their Space seat")
+
+	require.Eventually(t, func() bool {
+		return !contains(liveGroupMembers(t, ctx, otherGroup), agent)
+	}, 60*time.Second, 500*time.Millisecond,
+		"the agent must be out of a project group ITS OWNER WAS NEVER IN. This is the whole "+
+			"finding: without a project-side removal job the group side only ever walks the "+
+			"departing person's groups, so this one is missed and the agent keeps an active "+
+			"membership with no project seat behind it — I2 broken, and nothing repairs it. "+
+			"current members: %v", liveGroupMembers(t, ctx, otherGroup))
+
+	assert.NotContains(t, liveGroupMembers(t, ctx, allMemberGroup), agent,
+		"and out of the all-member group, which the old code did handle because alice was in it")
+	assert.NotContains(t, liveGroupMembers(t, ctx, allMemberGroup), alice)
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}

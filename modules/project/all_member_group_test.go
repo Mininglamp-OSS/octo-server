@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -395,11 +396,12 @@ func TestAllMemberGroupRebuildIsClaimedOnce(t *testing.T) {
 	require.Empty(t, model.AllMemberGroupNo)
 
 	now := time.Now().UTC()
-	first, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now)
+	first, firstLease, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now)
 	require.NoError(t, err)
 	require.True(t, first, "the first claim must win")
+	require.False(t, firstLease.IsZero(), "a winning claim must hand back its deadline")
 
-	second, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now)
+	second, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now)
 	require.NoError(t, err)
 	require.False(t, second, "a second claim inside the lease must lose")
 
@@ -409,7 +411,7 @@ func TestAllMemberGroupRebuildIsClaimedOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	third, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now.Add(time.Hour))
+	third, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now.Add(time.Hour))
 	require.NoError(t, err)
 	require.False(t, third, "a project that already has a group has no work to claim")
 
@@ -1096,4 +1098,254 @@ func TestAgentSeatsAreAudited(t *testing.T) {
 		"the leaver is the actor: they closed their own seat and the agent followed")
 	require.Equal(t, resp.ProjectID, followed.ProjectID)
 	require.Equal(t, spaceA, followed.SpaceID)
+}
+
+// ---------- D13 on the Space-removal path ----------
+
+// TestSpaceCascadeBeginsATwoPhaseCloseForTheDepartingMembersAgents pins the
+// mechanism the end-to-end case exercises: the HUMAN's seat closes directly on
+// this path, the AGENTS get the two-phase close plus a job each.
+//
+// The distinction is the finding. modules/group's cleanupSpaceMemberGroups covers
+// the human because it walks THEIR groups; it cannot cover an agent sitting in a
+// group its owner never joined. Only a project-side removal job reaches those,
+// because P1's detach step removes a uid from EVERY group of the project.
+//
+// Direct-closing the agents would not merely skip the job — it would make one
+// useless if it were enqueued anyway: removalCancelled retires any job whose
+// member reads removing = 0, which a directly-closed seat does. So "close the seat
+// and also enqueue" is not a fix; the two-phase close is the fix.
+func TestSpaceCascadeBeginsATwoPhaseCloseForTheDepartingMembersAgents(t *testing.T) {
+	srv, p := setup(t)
+	stubAllMemberGroup(t, "grp_space_d13")
+	_, _, created := projectWithMembers(t, srv, "member1")
+
+	seedAgent(t, spaceA, "bot_of_member1", "member1", "octo_hosted")
+	// Seated by SQL rather than through members/add: the epoch assertion below is
+	// about the removal, and an add would move it first.
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO `octo_project_member` "+
+			"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
+			"VALUES (?, ?, ?, 0, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+		created.ProjectID, "bot_of_member1", spaceA, "member1",
+	).Exec()
+	require.NoError(t, err)
+
+	before := epochOf(t, created.ProjectID)
+
+	// The member loses their Space seat; the cascade runs for this project.
+	removeSpaceMember(t, spaceA, "member1")
+	changed, err := p.deactivateSeatForCascade(created.ProjectID, spaceA, "member1", "op", "force_removed")
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	humanStatus, humanRemoving := seatState(t, created.ProjectID, "member1")
+	assert.Equal(t, MemberStatusRemoved, humanStatus,
+		"the human still closes directly: the group side already covers their groups")
+	assert.Equal(t, 0, humanRemoving)
+
+	agentStatus, agentRemoving := seatState(t, created.ProjectID, "bot_of_member1")
+	assert.Equal(t, MemberStatusActive, agentStatus,
+		"the agent must NOT be closed directly — a closed seat makes its own removal job "+
+			"read as cancelled, so the group-side detach would never run")
+	assert.Equal(t, 1, agentRemoving,
+		"removing = 1 is what makes the seat stop authorizing while the cascade runs")
+
+	assert.Equal(t, 1, pendingJobsFor(t, created.ProjectID, "bot_of_member1"),
+		"one job per agent, keyed (project_id, uid): P1's detach then takes the agent out "+
+			"of EVERY group of the project, including the ones its owner was never in")
+
+	assert.Equal(t, before+1, epochOf(t, created.ProjectID),
+		"a member leaving with their agents is ONE membership change, so exactly one bump")
+}
+
+// ---------- D2 on members/add (PR #855 review, S4) ----------
+
+// TestMembersAddAppliesTheSameAgentPredicateAsCreate pins that the two entry
+// points agree about what an eligible agent is.
+//
+// They did not. `create` ran the full D2 rule; `members/add` decided on
+// robot.creator_uid alone. Two consequences, and the second is the one that bites:
+//
+//   - a self-hosted agent that create refuses was accepted here from the same
+//     user, which is exactly the hole D2's self-hosted clause is written about
+//     ("a user cannot see it in the picker, so it should not be nameable in a
+//     request");
+//   - a DISABLED or ORPHANED bot read as "not an agent" at all and fell through to
+//     the human branch, so an admin could seat it as an ordinary member. That seat
+//     is then unreclaimable: queryOwnedAgentSeatsTx requires robot.status = 1, so
+//     D13 never takes it when its owner leaves, and no cascade revisits an active
+//     seat.
+//
+// Every refusal is the SAME code, matching create — the six reasons are not
+// distinguishable on the wire.
+func TestMembersAddAppliesTheSameAgentPredicateAsCreate(t *testing.T) {
+	_, p := setup(t)
+	stubAllMemberGroup(t, "grp_s4")
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+
+	// Self-hosted, owned by the caller: create refuses it, so this must too.
+	seedAgent(t, spaceA, "bot_selfhosted", "u_owner", "self_hosted")
+	// robot.status = 0 — disabled. Seeded by hand because seedAgent only makes live ones.
+	seedUser(t, "bot_disabled")
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `user` SET robot = 1 WHERE uid = ?", "bot_disabled").Exec()
+	require.NoError(t, err)
+	_, err = testCtx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, token, status, creator_uid, agent_hosting) "+
+			"VALUES (?, ?, 0, ?, 'octo_hosted')",
+		"bot_disabled", "tok-bot_disabled", "u_owner").Exec()
+	require.NoError(t, err)
+	seedSpaceMember(t, spaceA, "bot_disabled", 0, 1)
+	// robot = 1 on `user` with NO robot row at all — an orphan.
+	seedUser(t, "bot_orphan")
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `user` SET robot = 1 WHERE uid = ?", "bot_orphan").Exec()
+	require.NoError(t, err)
+	seedSpaceMember(t, spaceA, "bot_orphan", 0, 1)
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "s4"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decodeResp(t, w)
+
+	for _, bad := range []string{"bot_selfhosted", "bot_disabled", "bot_orphan"} {
+		w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+			map[string]any{"uids": []string{bad}})
+		require.Equal(t, http.StatusOK, w.Code, "case %s body: %s", bad, w.Body.String())
+
+		var outcomes []memberOutcome
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
+		require.Len(t, outcomes, 1)
+		assert.False(t, outcomes[0].OK, "case %s must be refused", bad)
+		assert.Equal(t, reasonAgentNotEligible, outcomes[0].Reason,
+			"case %s must render as the single agent refusal, like create", bad)
+
+		assert.Nil(t, memberRow(t, resp.ProjectID, bad),
+			"case %s must not have gained a project seat. For the disabled and orphan cases "+
+				"that seat would be unreclaimable: D13 reads robot.status = 1, so no owner "+
+				"departure would ever take it back", bad)
+	}
+
+	// The control: the same owner's live, octo-hosted agent still goes in.
+	seedAgent(t, spaceA, "bot_good", "u_owner", "octo_hosted")
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"bot_good"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.NotNil(t, memberRow(t, resp.ProjectID, "bot_good"),
+		"the predicate must still admit an eligible agent — a guard that refuses everything "+
+			"would pass every assertion above")
+}
+
+// TestRebuildBringsTheWHOLERosterIntoTheNewGroup is PR #855's review, Q11.
+//
+// The rebuild used to seed the new group with nil members, on a comment claiming
+// admitAllMemberGroup would fill the rest in one by one. Nothing did:
+// admitAllMemberGroup runs only for the uids of the request that triggered the
+// rebuild. A project already holding A and B, rebuilt while adding C, came out as
+// {owner, C} — and A and B were then reachable only by an admin re-adding each of
+// them, because scan B reports the gap and by decision does not repair it.
+func TestRebuildBringsTheWHOLERosterIntoTheNewGroup(t *testing.T) {
+	_, p := setup(t)
+	stub := stubAllMemberGroup(t, "grp_rebuild_roster")
+	stub.provisionErr = errStubProvision
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+	for _, uid := range []string{"u_a", "u_b", "u_c"} {
+		seedUser(t, uid)
+		seedSpaceMember(t, spaceA, uid, 0, 1)
+	}
+
+	// Provisioning fails, so the project is created with no group.
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "roster"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decodeResp(t, w)
+	require.Empty(t, allMemberGroupNoOf(t, resp.ProjectID))
+
+	// A and B join while there is still no group. Their admissions no-op — there is
+	// nothing to admit them into — which is the state this case is about.
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_a", "u_b"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.Empty(t, allMemberGroupNoOf(t, resp.ProjectID), "still no group")
+
+	// Now provisioning works again and C is added, triggering the rebuild.
+	stub.provisionErr = nil
+	stub.seeds = nil
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_c"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.Equal(t, "grp_rebuild_roster", allMemberGroupNoOf(t, resp.ProjectID))
+
+	require.Len(t, stub.seeds, 1, "the rebuild must have run exactly once")
+	require.Equal(t, "u_owner", stub.seeds[0].Creator, "the group owner is the project's active owner")
+	assert.ElementsMatch(t, []string{"u_a", "u_b"}, stub.seeds[0].Members,
+		"the rebuild must carry the members who joined BEFORE it. The owner is not in "+
+			"Members — CreateGroup adds them as creator — and u_c is not either, because "+
+			"the seat that triggered this rebuild had not committed when the roster was "+
+			"read; admitAllMemberGroup puts them in right after. Seeding nil here is what "+
+			"left A and B out of their own project's group with no path back in")
+
+	// And C really does land, so the two mechanisms together cover everyone.
+	assert.Contains(t, stub.admitted, "u_c",
+		"the triggering add still goes through the admitter")
+}
+
+// TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease is PR #855's review, Q1.
+//
+// The release used to key on the project alone, so ANY claimant's lease was
+// cleared. A provisioning attempt that outlives allMemberGroupLease then wipes,
+// on its way out, the lease a successor is actively holding — and a third writer
+// claims immediately, so two rebuilds run concurrently. That is the one thing the
+// lease exists to prevent, defeated by the failure path of the attempt it was
+// meant to fence.
+func TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease(t *testing.T) {
+	_, p := setup(t)
+	stubAllMemberGroup(t, "grp_lease_fence")
+
+	seedSpace(t, spaceA, 1)
+	seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+
+	model, err := p.createProjectOnce(createInput{
+		SpaceID: spaceA, Creator: "u_owner", Name: "lease-fence",
+		Discoverability: DiscoverabilitySpaceListed,
+	})
+	require.NoError(t, err)
+
+	now := time.Now().UTC()
+	stale, staleLease, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now)
+	require.NoError(t, err)
+	require.True(t, stale)
+
+	// The stale attempt runs past its lease; a successor claims.
+	after := now.Add(allMemberGroupLease + time.Minute)
+	successor, successorLease, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
+	require.NoError(t, err)
+	require.True(t, successor, "an expired lease must be re-claimable")
+	require.NotEqual(t, staleLease, successorLease)
+
+	// Now the stale attempt fails and releases. It must not touch the successor's lease.
+	require.NoError(t, p.db.releaseAllMemberGroupProvision(model.ProjectID, staleLease))
+
+	third, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
+	require.NoError(t, err)
+	require.False(t, third,
+		"the successor still holds the lease, so nobody else may claim. Without the "+
+			"deadline fence the stale release cleared it and this claim succeeded — two "+
+			"rebuilds running at once, which is exactly what the lease is for")
+
+	// And the successor's own release still works.
+	require.NoError(t, p.db.releaseAllMemberGroupProvision(model.ProjectID, successorLease))
+	fourth, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
+	require.NoError(t, err)
+	require.True(t, fourth, "a released lease must be immediately re-claimable")
 }
