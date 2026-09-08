@@ -470,6 +470,29 @@ admission transaction」, which P1 called a separate task and nobody has opened.
   they all filter within a Space the caller already holds a seat in.
 - **Any change to `group.project_id`'s two writers**, to the I2 admission entry, or to the
   cascade.
+- **Swagger for `modules/project`, and with it the client-facing contract notes.** Raised in
+  review and worth its own task: 20+ modules carry a `swagger/api.yaml` and this one carries
+  none across all twelve routes. The consequence is not tidiness — the two things client teams
+  actually need are written only in Go doc comments they will never read: that `member_count`
+  counts humans on the project row (#855's D16) and humans **plus agents** on this PR's group
+  list, differing by one for a group holding a blacklisted member; and that the sidebar's
+  `project_id` is withheld entirely on the no-`X-Space-ID` path. `sidebar.yaml`'s `sidebarItem`
+  is three fields behind as well (`project_id`, `space_id`, `my_source_space_id`) — declined
+  here as pre-existing drift from #153, which is a scoping call in favour of that task rather
+  than against it.
+- **`SidebarItem.ProjectID` as `*string` — considered and declined, recorded so it is not
+  re-litigated by accident.** The suggestion was to copy `CategoryID *string` two lines below
+  it, so `nil` means "not evaluated" and a pointer to `""` means 直属 Space, removing the
+  ambiguity the Space-scope gate creates. Declined for two reasons. First, the disambiguator
+  already exists and is not in the payload: a client knows whether it sent `X-Space-ID`, and on
+  the path where it did, an absent field is unambiguous. Second, the ambiguity is temporary by
+  construction — it exists only because that path lacks a membership predicate, and
+  `project-p2-read-path-hardening` removes the gate along with the hole. A pointer is a
+  permanent wire shape; emitting `"project_id": ""` on every Space-direct group of the hottest
+  read path is a real cost to describe a state that is meant to stop existing. The reviewer is
+  right that this is the cheap moment to decide, which is why the decision is written here
+  rather than left implicit — if hardening slips or a client ships against the ambiguity, the
+  trade changes and this is where to reopen it.
 
 ## Acceptance
 

@@ -63,9 +63,17 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 		respondProjectRequestInvalid(c, "body")
 		return
 	}
-	// An empty body is a no-op rather than a reset: a pointer field distinguishes
-	// "not mentioned" from "set to false", so a client sending only the key it
-	// changed cannot clear the ones it did not.
+	// A body that NAMES NO PREFERENCE is a no-op rather than a reset: a pointer
+	// field distinguishes "not mentioned" from "set to false", so a client sending
+	// only the key it changed cannot clear the ones it did not.
+	//
+	// "A body that names no preference", not "an empty body", and the difference is
+	// one case wide: `{}` reaches here and no-ops, a ZERO-BYTE body does not — it
+	// makes ShouldBindJSON return io.EOF and takes the 400 branch above. Unlike
+	// leaveProjectHandler, which exempts io.EOF because an empty body is its normal
+	// case, this route has no such case: a settings PUT that mentions nothing is a
+	// client bug worth reporting, not a shape to accept silently. Stated because the
+	// previous wording claimed the wider behaviour and the test sends `{}`.
 	if req.Pinned != nil {
 		if err := p.applyPin(row, uid, *req.Pinned); err != nil {
 			if errors.Is(err, errPinQuotaExceeded) {

@@ -327,6 +327,28 @@ func TestEmptySettingBodyIsANoOp(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.True(t, decodeResp(t, w).Pinned,
 		"a body that mentions no preference must change none of them")
+
+	// And the case one wider than that one, which the handler comment used to
+	// claim and nothing pinned: a ZERO-BYTE body is not `{}`. It makes
+	// ShouldBindJSON return io.EOF and takes the request_invalid branch.
+	//
+	// Asserted rather than left to the comment because the two are one word apart
+	// in prose and a whole branch apart in code — and because leaveProjectHandler,
+	// in the same module, deliberately exempts io.EOF, so "this module treats an
+	// empty body as fine" is a live and wrong generalisation to make here.
+	// Reviewer yujiawei, PR #861.
+	empty := doRaw(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/setting", tok, "")
+	require.Equal(t, http.StatusBadRequest, empty.Code,
+		"a zero-byte body must be refused, not treated as {}: body=%s", empty.Body.String())
+	assert.Contains(t, empty.Body.String(), "err.server.project.request_invalid",
+		"and refused as a malformed request rather than any other code")
+
+	stillPinned := doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/setting", tok, map[string]any{})
+	require.Equal(t, http.StatusOK, stillPinned.Code)
+	assert.True(t, decodeResp(t, stillPinned).Pinned,
+		"and the refusal must not have written anything on its way out")
 }
 
 // TestSettingIsOnTheAuthenticatedGroup — same argument as the group list route:

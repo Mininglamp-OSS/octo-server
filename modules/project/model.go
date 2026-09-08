@@ -182,7 +182,8 @@ type updateReq struct {
 //
 // A pointer distinguishes "not mentioned" from "set to false", so a client that
 // learns about a future preference does not have to send every field to change
-// one. An empty body is a no-op, not a reset.
+// one. A body that names no preference (`{}`) is a no-op, not a reset — a
+// zero-byte body is a 400, see updateSettingHandler.
 type settingReq struct {
 	Pinned *bool `json:"pinned"`
 }
