@@ -746,27 +746,31 @@ func CollectGroupSpaceAndProjectMaps(
 	if len(bareGroupNos) == 0 {
 		return map[string]string{}, map[string]string{}, true
 	}
-	// Captured from inside the closure rather than returned by it, so the project
-	// map is built from the SAME infos the space map is, in the same single call.
-	projectMap := map[string]string{}
-	m, err := spacepkg.GetGroupSpaceMap(bareGroupNos, func(nos []string) ([]spacepkg.GroupSpaceInfo, error) {
-		infos, err := groupService.GetGroups(nos)
-		if err != nil {
-			return nil, err
-		}
-		result := make([]spacepkg.GroupSpaceInfo, 0, len(infos))
-		for _, g := range infos {
-			result = append(result, spacepkg.GroupSpaceInfo{GroupNo: g.GroupNo, SpaceID: g.SpaceID})
-			if g.ProjectID != "" {
-				projectMap[g.GroupNo] = g.ProjectID
-			}
-		}
-		return result, nil
-	})
+	// One call, both maps built from its result — deliberately NOT by capturing a
+	// map inside the closure handed to spacepkg.GetGroupSpaceMap.
+	//
+	// That version worked, and only because pkg/space happens to invoke the callback
+	// exactly once, synchronously, with the whole slice. Nothing in pkg/space
+	// documents that as a contract, and it is a natural place to grow a cache or a
+	// batch loop later — at which point the space map would stay complete while the
+	// project map silently went partial, or two goroutines would write one map. A
+	// dependency on another package's undocumented invocation shape is not worth
+	// five lines. PR #861's review flagged it.
+	infos, err := groupService.GetGroups(bareGroupNos)
 	if err != nil {
 		return nil, nil, false
 	}
-	return m, projectMap, true
+	spaceMap := make(map[string]string, len(infos))
+	// A group with no project is ABSENT rather than present with an empty value, so
+	// the map stays proportional to project groups rather than to conversations.
+	projectMap := map[string]string{}
+	for _, g := range infos {
+		spaceMap[g.GroupNo] = g.SpaceID
+		if g.ProjectID != "" {
+			projectMap[g.GroupNo] = g.ProjectID
+		}
+	}
+	return spaceMap, projectMap, true
 }
 
 // FilterRawConversationsBySpace 是 FilterConversationsBySpace 在 v2 sidebar 上的

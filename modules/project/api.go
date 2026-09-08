@@ -491,13 +491,8 @@ func (p *Project) getProjectHandler(c *wkhttp.Context) {
 		return
 	}
 	humans, agents := p.splitSeatCounts(row.ProjectID)
-	pinned, err := p.db.queryProjectPinned(row.ProjectID, c.GetLoginUID())
-	if err != nil {
-		p.Error("查询项目置顶状态失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents, pinned))
+	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents,
+		p.pinnedOrFalse(row.ProjectID, c.GetLoginUID())))
 }
 
 func (p *Project) listMembersHandler(c *wkhttp.Context) {
@@ -630,14 +625,11 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	humans, agents := p.splitSeatCounts(updated.ProjectID)
 	// The pin survives a rename, so it has to be re-read rather than defaulted:
 	// reporting false here would make the caller watch their own card leave the
-	// pinned section until the next list fetch.
-	pinned, err := p.db.queryProjectPinned(updated.ProjectID, c.GetLoginUID())
-	if err != nil {
-		p.Error("查询项目置顶状态失败", zap.Error(err), zap.String("projectId", updated.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents, pinned))
+	// pinned section until the next list fetch. Read the SAME way the counts above
+	// are — fail-soft — because the sentence directly above applies to it word for
+	// word, and the first cut of this line did exactly what that sentence forbids.
+	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents,
+		p.pinnedOrFalse(updated.ProjectID, uid)))
 }
 
 func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
@@ -756,6 +748,27 @@ func (p *Project) splitSeatCounts(projectID string) (humans, agents int) {
 		return 0, 0
 	}
 	return total, 0
+}
+
+// pinnedOrFalse reads the caller's pin, degrading to false rather than failing.
+//
+// Same contract as splitSeatCounts, and for the same reason stated at the update
+// handler: a display field must never turn a COMMITTED write into a 500. The first
+// cut of the pin work put a hard failure directly beneath the comment that forbids
+// it, so a transient read error made a successful rename answer "your write
+// failed". PR #861's review caught it.
+//
+// Degrading to false is the right default, not merely the convenient one: an
+// unpinned card is the state every project starts in and the one every client can
+// already render, and the next list fetch corrects it.
+func (p *Project) pinnedOrFalse(projectID, uid string) bool {
+	pinned, err := p.db.queryProjectPinned(projectID, uid)
+	if err != nil {
+		p.Warn("查询项目置顶状态失败，按未置顶下发",
+			zap.Error(err), zap.String("projectId", projectID))
+		return false
+	}
+	return pinned
 }
 
 // pageParams parses offset/limit with bounds. An unbounded limit on a roster or a project

@@ -363,6 +363,13 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			//     order however the first two tie. OFFSET pagination silently drops
 			//     and duplicates rows across pages under a non-total ORDER BY, and
 			//     this list is paginated.
+			//
+			//     Totality is not stability, and the two are easy to conflate. pinned
+			//     and pinned_at are MUTABLE between page requests, so a pin from
+			//     another device between page 1 and page 2 still moves rows across the
+			//     offset boundary — the same exposure every OFFSET-paginated list in
+			//     this module has. Totality only rules out the ordering ITSELF being
+			//     the cause.
 			//   - IFNULL rather than relying on NULL ordering. An unpinned project
 			//     has no row here, so s.pinned is NULL; MySQL sorts NULL lowest, so
 			//     plain DESC would happen to be right today. Writing it out means a

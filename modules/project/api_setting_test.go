@@ -569,3 +569,81 @@ func countPinnedForTest(t *testing.T, spaceID, uid string) int {
 	require.NoError(t, err)
 	return n
 }
+
+// TestUnpinningSomethingNeverPinnedWritesNoRow pins the tombstone fix.
+//
+// The unpin path used to run the same upsert with pinned = 0, so unpinning
+// something that was never pinned INSERTED a row, and nothing anywhere deletes
+// those. One read now serves both directions, so an operation that changes nothing
+// writes nothing.
+func TestUnpinningSomethingNeverPinnedWritesNoRow(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	tok := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, tok, "unpin-noop")
+
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, tok, false).Code,
+		"unpinning something never pinned is a no-op, not an error")
+
+	var n int
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		created.ProjectID, "owner1").LoadOne(&n))
+	assert.Zero(t, n, "no row may be written for a preference that was already at its "+
+		"default; nothing in the tree cleans such rows up")
+}
+
+// TestACommittedPinIsNotReportedAsAFailure is the regression for the defect PR
+// #861's review found: a display read that fails must not turn a COMMITTED write
+// into a 500.
+//
+// Driven by breaking the read rather than by hoping it fails: the pin lands, then
+// the settings table is dropped out from under the response's own re-read. What the
+// caller must see is 200 with the write intact — telling them their pin failed when
+// it did not is the one thing a response after a successful write must not do.
+func TestACommittedPinIsNotReportedAsAFailure(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	tok := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, tok, "pin-failsoft")
+
+	// Make every read of the settings table fail, leaving the write path intact by
+	// restoring the table before the assertions that need it.
+	_, err := testCtx.DB().Exec("ALTER TABLE octo_project_user_setting RENAME TO octo_project_user_setting_hidden")
+	require.NoError(t, err)
+	restored := false
+	defer func() {
+		if !restored {
+			_, _ = testCtx.DB().Exec("ALTER TABLE octo_project_user_setting_hidden RENAME TO octo_project_user_setting")
+		}
+	}()
+
+	// With the table gone the write fails too, which is a legitimate 5xx — so this
+	// half asserts the OTHER handler, where the write has already committed
+	// elsewhere and only the display read is broken.
+	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, tok, nil)
+	assert.Equal(t, http.StatusOK, w.Code,
+		"the detail route must degrade to pinned=false rather than 500 when the "+
+			"settings read fails: body %s", w.Body.String())
+	assert.False(t, decodeResp(t, w).Pinned)
+
+	upd := doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID, tok,
+		map[string]any{"name": "pin-failsoft-renamed"})
+	assert.Equal(t, http.StatusOK, upd.Code,
+		"a rename COMMITS before the pin is read back; a broken read must not report "+
+			"that committed write as a failure: body %s", upd.Body.String())
+
+	_, err = testCtx.DB().Exec("ALTER TABLE octo_project_user_setting_hidden RENAME TO octo_project_user_setting")
+	require.NoError(t, err)
+	restored = true
+
+	// And the rename really did land, which is what makes the 200 honest.
+	row, err := testDB.queryByProjectID(created.ProjectID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "pin-failsoft-renamed", row.Name)
+}

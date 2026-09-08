@@ -56,15 +56,15 @@ func TestSidebarProjectIDMatchesTheSpaceIDSplit(t *testing.T) {
 	}
 	require.Contains(t, byID, "g_project")
 	require.Contains(t, byID, "g_direct")
+	require.Contains(t, byID, "u_friend",
+		"the DM must be emitted, or the isolation assertion below covers nothing")
 
 	assert.Equal(t, "p_1", byID["g_project"].ProjectID,
 		"a project group carries its own project_id")
 	assert.Empty(t, byID["g_direct"].ProjectID,
 		"a Space-direct group carries none; '' is group.project_id's own sentinel")
-	if dm, ok := byID["u_friend"]; ok {
-		assert.Empty(t, dm.ProjectID,
-			"a DM belongs to no project, the same way it carries no space_id")
-	}
+	assert.Empty(t, byID["u_friend"].ProjectID,
+		"a DM belongs to no project, the same way it carries no space_id")
 }
 
 // TestSidebarTopicInheritsTheParentProjectID is the case a naive implementation

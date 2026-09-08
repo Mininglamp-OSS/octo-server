@@ -486,7 +486,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	groupSpaceMap, groupProjectMap, ok := CollectGroupSpaceAndProjectMaps(
 		conversations, extraParentGroupNos, sb.groupService)
 	if !ok {
-		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
+		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID / ProjectID will be empty)")
 		groupSpaceMap = map[string]string{}
 		groupProjectMap = map[string]string{}
 	}

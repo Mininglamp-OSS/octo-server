@@ -77,19 +77,14 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 
 	// Respond with the project as the caller now sees it, so the client can render
 	// from the response instead of refetching the list to learn the new order.
-	pinned, err := p.db.queryProjectPinned(row.ProjectID, uid)
-	if err != nil {
-		p.Error("查询项目置顶状态失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	memberCount, agentCount, err := p.db.countActiveSeatsByKind(row.ProjectID)
-	if err != nil {
-		p.Error("统计项目成员数失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), memberCount, agentCount, pinned))
+	//
+	// Both reads are fail-soft, and both go through the same helpers every other
+	// route uses. applyPin has already COMMITTED by this point, so a display
+	// aggregate that hiccups must not turn a successful pin into a 500 — the same
+	// rule the update handler states in full.
+	humans, agents := p.splitSeatCounts(row.ProjectID)
+	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents,
+		p.pinnedOrFalse(row.ProjectID, uid)))
 }
 
 // applyPin writes the pin, enforcing the per-Space cap.
@@ -97,12 +92,19 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 // # Why the count and the write share a transaction
 //
 // So the check reads the same snapshot the write lands in. It does NOT make the
-// pair atomic against a concurrent pin by the same user: two requests that both
-// count 5 will both insert, leaving 7. That window is a double-click — the same
-// uid, inside the 2 rps shared bucket — and its worst outcome is one extra pinned
-// row that the user can remove, so it does not justify serialising every pin behind
-// a lock on a table this hot. Written down rather than left for a reader to
-// rediscover, because "there is a transaction here" reads like "this is atomic".
+// pair atomic against concurrent pins by the same user: every request that reads
+// n < cap inserts, so the overshoot is the concurrency degree, not one.
+//
+// An earlier version of this comment called that "a double-click ... one extra
+// pinned row", and PR #861's review corrected it with the number: SharedUIDRateLimiter
+// is 2 rps with a BURST OF 60 (pkg/wkhttp/ratelimit_helper.go), so ~60 in-flight
+// pins of distinct projects can each read 5 and each insert, landing ~65 rows
+// against a cap of 6. The trade is still the one taken, on grounds that survive the
+// correction — the overshoot is confined to the caller's own pin list, every row is
+// self-removable because unpin is never refused, and the PUT response re-reads the
+// state so the wire never reports a false success — but it is taken with the real
+// number rather than a comfortable one. A cap that ever becomes billing- or
+// audit-bearing needs SELECT ... FOR UPDATE on the caller's rows instead.
 //
 // # Why unpinning is never refused
 //
@@ -117,15 +119,18 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 // operation that changes nothing — the shape of bug where turning a toggle on
 // twice fails the second time.
 func (p *Project) applyPin(row *Model, uid string, pinned bool) error {
-	if !pinned {
-		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
-	}
+	// One read serves both directions, and it is what keeps either direction from
+	// writing a row that changes nothing: unpinning something never pinned used to
+	// INSERT a pinned = 0 tombstone, and nothing anywhere deletes those.
 	already, err := p.db.queryProjectPinned(row.ProjectID, uid)
 	if err != nil {
 		return err
 	}
-	if already {
+	if already == pinned {
 		return nil
+	}
+	if !pinned {
+		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
 	}
 
 	tx, err := p.db.session.Begin()

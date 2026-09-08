@@ -250,14 +250,14 @@ type Resp struct {
 	// none yet (provisioning failed and has not been retried; see D4). A client
 	// showing an entry point to the group must handle "" rather than assuming.
 	AllMemberGroupNo string `json:"all_member_group_no"`
-	// MyRole is the caller's project role, or -1 when the caller is not a member
-	// (a Space admin reading a project they have not joined).
 	// Pinned is the CALLER's own pin, not a property of the project: the same
 	// project reads true for one user and false for the next. It is on the list
 	// AND the detail route, because a field present on one and absent on the other
 	// makes the two disagree about the same project — the defect
 	// all_member_group_no already had to be fixed for once.
-	Pinned       bool         `json:"pinned"`
+	Pinned bool `json:"pinned"`
+	// MyRole is the caller's project role, or -1 when the caller is not a member
+	// (a Space admin reading a project they have not joined).
 	MyRole       int          `json:"my_role"`
 	Capabilities Capabilities `json:"capabilities"`
 	CreatedAt    string       `json:"created_at"`
