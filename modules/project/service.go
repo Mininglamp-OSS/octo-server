@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	userpkg "github.com/Mininglamp-OSS/octo-server/pkg/user"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -367,6 +368,34 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 		return nil, err
 	}
 	if !creatorIsMember {
+		return nil, errNotSpaceMember
+	}
+
+	// The ACCOUNT half, as a SEPARATE single-table read rather than a join added to the
+	// statement above.
+	//
+	// A Space seat does not imply a live account: a super-admin ban writes only the `user`
+	// row (modules/user.liftBanUser) and account destroy cascades no membership removal, so
+	// a banned or destroyed uid keeps its seat and could create projects indefinitely.
+	//
+	// Why not just join `user` into lockSpaceSeatRowTx, which is what the other write paths
+	// do (lockSpaceSeatsTx): that helper is JOIN-FREE on purpose. A table outside
+	// `FOR SHARE OF` is a consistency read, it would assign this transaction's read view
+	// here, and all three quota counts below would then run against a snapshot older than
+	// the `space` lock — six concurrent creates all passed MaxPerSpace=1 when that
+	// regressed. This read is a plain single-table SELECT on `user`, which opens the read
+	// view too — but it does so at the same point the seat lock already did, and it adds no
+	// table to the locking statement. TestCreateQuotaStillHoldsUnderConcurrency is the
+	// regression net for exactly this.
+	//
+	// Refused as errNotSpaceMember, not a distinct sentinel: a caller learning "your account
+	// is banned" from a project endpoint is an enumeration answer, and the ban is already
+	// reported on the paths that own it.
+	liveCreator, err := userpkg.ActiveAccounts(p.db.session, []string{in.Creator})
+	if err != nil {
+		return nil, fmt.Errorf("project: check creator account liveness: %w", err)
+	}
+	if !liveCreator[in.Creator] {
 		return nil, errNotSpaceMember
 	}
 

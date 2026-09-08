@@ -723,10 +723,35 @@ func TestLookupFailureLoggingSeparatesTheAnomaly(t *testing.T) {
 			"operator can act on, and with the reconcile loop disabled it is the only signal that " +
 			"the endpoint is refusing rather than the database being down")
 	}
-	// Both branches must reach a logger. A silent return would make the endpoint
+	// The anomaly branch must extract WHICH project tripped it, or the out-of-band
+	// repair has nothing to act on and the operator waits for the reconcile cursor
+	// to come around — hours on a large table, during which every request naming
+	// that id is a 500.
+	if !strings.Contains(body, "SentinelAnomalyError") {
+		t.Error("the anomaly branch must match the typed error that carries the project id, " +
+			"not just the sentinel value: naming the row is what makes the fast-path repair " +
+			"possible")
+	}
+	if !strings.Contains(body, "repairSentinelOutOfBand(") {
+		t.Error("a named anomalous project must be repaired out of band; leaving it to the " +
+			"reconcile scan means a bounded page budget behind a persisted cursor, and the " +
+			"anomalous row has the highest id so it is reached last")
+	}
+
+	// EVERY branch must reach a logger. A silent return would make the endpoint
 	// answer 500 with nothing anywhere saying why.
-	if strings.Count(body, "m.Error(") != 2 {
-		t.Error("both failure branches must log; found a different number of m.Error calls")
+	//
+	// Counted against the number of returns rather than pinned to a literal, because
+	// pinning it to a literal is what made this assertion fail when a third branch
+	// was added correctly — a guard that has to be edited to accept a correct change
+	// teaches people to edit guards. There are three branches now (typed anomaly,
+	// sentinel without an id, generic failure) and the invariant is one log call per
+	// branch, whatever the count becomes.
+	branches := strings.Count(body, "\n\t\treturn\n") + 1 // early returns + the fall-through
+	if got := strings.Count(body, "m.Error("); got != branches {
+		t.Errorf("every failure branch must log: found %d m.Error call(s) for %d branch(es). "+
+			"A branch that returns without logging makes a 500 with no explanation anywhere",
+			got, branches)
 	}
 }
 

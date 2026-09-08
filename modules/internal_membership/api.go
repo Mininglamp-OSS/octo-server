@@ -457,14 +457,68 @@ func (m *Module) logLookupFailure(op string, err error, spaceID string, count in
 	fields := append([]zap.Field{
 		zap.Error(err), zap.String("space_id", spaceID), zap.Int("count", count),
 	}, extra...)
-	if errors.Is(err, projectpkg.ErrLiveProjectOnAbsentSentinel) {
+	var anomaly *projectpkg.SentinelAnomalyError
+	if errors.As(err, &anomaly) {
 		m.Error(op+": refused — an ACTIVE project holds the contract's absent-epoch sentinel; "+
-			"serving it would let a consumer cache a grant that never expires. This clears itself "+
+			"serving it would let a consumer cache a grant that never expires. Repairing the row "+
+			"out of band; the peer's retry should succeed.",
+			append(fields, zap.String("anomalous_project_id", anomaly.ProjectID))...)
+		m.repairSentinelOutOfBand(anomaly.ProjectID)
+		return
+	}
+	if errors.Is(err, projectpkg.ErrLiveProjectOnAbsentSentinel) {
+		// A sentinel refusal that did not carry a project id: nothing to repair, so
+		// the reconcile scan is the only recovery. Kept as a distinct branch rather
+		// than folded into the generic one, because the operator action differs.
+		m.Error(op+": refused — an ACTIVE project holds the contract's absent-epoch sentinel, "+
+			"but the refusal did not name it, so it cannot be repaired here. This clears itself "+
 			"once the project reconcile scan repairs the row; if that loop is disabled, enable it.",
 			fields...)
 		return
 	}
 	m.Error(op+": lookup failed", fields...)
+}
+
+// repairSentinelOutOfBand lifts ONE project off the reserved sentinel, off the
+// request's critical path.
+//
+// Why this exists rather than leaving it to the reconcile scan: the scan walks a
+// bounded page budget per tick behind a PERSISTED cursor, and a row inserted by a
+// not-yet-upgraded pod gets the HIGHEST id — so it is reached only once the cursor
+// completes its current pass. On a large octo_project that is hours, and for that
+// whole window EVERY request naming that id returns 500, because one anomalous row
+// deliberately poisons the batch. The endpoint that hit the anomaly is the earliest
+// possible detector, so it repairs it.
+//
+// In a goroutine, and deliberately: the response is already decided — a 500,
+// wire-identical to a database outage — and the peer must not be able to tell a data
+// anomaly from an outage by TIMING either. It also must not wait on our repair.
+//
+// Not idempotency-guarded here because the statement is: `member_epoch = 0` is its
+// own CAS, so concurrent requests hitting the same row produce exactly one
+// increment. Failure is logged and dropped — the reconcile scan remains the
+// backstop, which is why this is a fast path rather than the mechanism.
+func (m *Module) repairSentinelOutOfBand(projectID string) {
+	if projectID == "" {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.Error("sentinel out-of-band repair panicked", zap.Any("recover", r))
+			}
+		}()
+		repaired, err := projectpkg.RepairAbsentSentinelEpoch(m.ctx.DB(), projectID)
+		if err != nil {
+			m.Error("sentinel out-of-band repair failed; the reconcile scan remains the backstop",
+				zap.Error(err), zap.String("project_id", projectID))
+			return
+		}
+		if repaired {
+			m.Info("sentinel out-of-band repair lifted an active project off the absent-epoch "+
+				"sentinel", zap.String("project_id", projectID))
+		}
+	}()
 }
 
 // decodeVerifyRequest reads and strictly parses the JSON body: bounded size,

@@ -609,11 +609,30 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 // lets it acquire the rows in ITS scan order, which is the same order the disband scan uses —
 // there is then no "second row" being waited for while the first is held.
 //
-// The predicate is CheckMembership's (space_member.status = 1 AND space.status = 1), and it keeps
-// the JOIN onto `space` because callers here do not lock the `space` row, so the JOIN is their
-// only activeness check. Deliberately NOT CheckMembershipForCleanup's relaxed variant: this is an
-// authorization decision and a banned Space must never pass one. (The reconcile scans ask the
-// opposite question and correctly use the relaxed form — see queryI1ViolationPage.)
+// The predicate is CheckMembership's (space_member.status = 1 AND space.status = 1) PLUS the
+// account-liveness half (user.status = 1 AND user.is_destroy <> 2), and it keeps the JOIN onto
+// `space` because callers here do not lock the `space` row, so the JOIN is their only activeness
+// check. Deliberately NOT CheckMembershipForCleanup's relaxed variant: this is an authorization
+// decision and a banned Space must never pass one. (The reconcile scans ask the opposite question
+// and correctly use the relaxed form — see queryI1ViolationPage.)
+//
+// The `user` join closes the ADMISSION direction of the account axis: a super-admin ban writes
+// only the `user` row, so without it a globally banned account could be admitted to a project
+// seat — and since the admission bumps member_epoch, a peer would re-verify and be served that
+// wrong answer as a FRESH one. Two existing precedents have this exact shape
+// (modules/user.authVerifyAPIKey, modules/bot_provision.assertSpaceMember).
+//
+// Joining `user` is safe HERE and only here: this statement is rooted at space_member, and
+// space_member / space / user are all dump-imported tables sitting at the same collation
+// (utf8mb4_0900_ai_ci in production), so no cross-collation comparison arises. A statement rooted
+// at an octo_* table must NOT join `user` — that is error 1267 in production while passing in CI.
+// See pkg/user.ActiveAccounts, which is what the READ path uses for the same reason.
+//
+// It also must not be copied into lockSpaceSeatRowTx, whose whole point is having no JOIN at all:
+// a table outside `FOR SHARE OF` is a consistency read, which opens the read view before the
+// `space` lock and un-does createProject's three quota counts. That helper gets the liveness check
+// as a separate single-table read instead, and TestCreateQuotaStillHoldsUnderConcurrency is the
+// regression net.
 //
 // The read view that JOIN opens is no longer load-bearing, because every aggregate that authorises
 // a write is now a locking read (see countActiveOwnersTx).
@@ -648,6 +667,7 @@ func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[st
 	_, err := tx.SelectBySql(
 		"SELECT sm.uid FROM `space_member` sm "+
 			"INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"INNER JOIN `user` u ON u.uid = sm.uid AND u.status = 1 AND u.is_destroy <> 2 "+
 			"WHERE sm.space_id = ? AND sm.uid IN ("+placeholders+") AND sm.status = 1 "+
 			"FOR SHARE OF sm",
 		args...,

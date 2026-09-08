@@ -22,10 +22,10 @@ package project
 
 import (
 	"errors"
-	"fmt"
 	"sort"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/user"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -356,6 +356,62 @@ const AbsentEpochSentinel = 0
 var ErrLiveProjectOnAbsentSentinel = errors.New(
 	"project: an active project holds the reserved absent-epoch sentinel")
 
+// SentinelAnomalyError carries WHICH project tripped the refusal, so a caller can
+// repair that one row instead of waiting for the reconcile cursor to reach it.
+//
+// The wait is the reason this type exists. The rollout document told operators the
+// scan repairs such a row "within one rotation", but scanEpochSanity walks a bounded
+// page budget per tick behind a PERSISTED cursor — and a row inserted by a
+// not-yet-upgraded pod gets the highest id, so it is reached only when the cursor
+// completes its current pass. On a large octo_project that is hours, and every
+// request naming that id returns 500 for the whole window because the refusal is
+// per-batch. RepairAbsentSentinelEpoch closes that to one indexed UPDATE.
+type SentinelAnomalyError struct {
+	ProjectID string
+}
+
+func (e *SentinelAnomalyError) Error() string {
+	return ErrLiveProjectOnAbsentSentinel.Error() + ": " + e.ProjectID
+}
+
+// Unwrap keeps errors.Is(err, ErrLiveProjectOnAbsentSentinel) true, which is what
+// every existing caller branches on.
+func (e *SentinelAnomalyError) Unwrap() error { return ErrLiveProjectOnAbsentSentinel }
+
+// RepairAbsentSentinelEpoch lifts ONE active project off the reserved sentinel.
+//
+// The `member_epoch = 0` predicate is its own CAS, so N replicas racing to repair
+// the same row produce exactly one increment; and `status = 1` keeps it off
+// disbanded rows, whose 0 is the correct answer. Increment-only, like every other
+// writer of this column.
+//
+// Reports whether a row was changed, so a caller can tell "repaired, retry is worth
+// it" from "someone else already did, or the row is not actually anomalous".
+//
+// This is a duplicate of modules/project's own repair statement, deliberately: that
+// one is a private method on a module the read layer's consumers do not import, and
+// the whole point here is that the endpoint that HIT the anomaly can fix it. The
+// shared statement shape is pinned by the write-discipline guard, which scans for
+// exactly this increment form.
+func RepairAbsentSentinelEpoch(session *dbr.Session, projectID string) (bool, error) {
+	if projectID == "" {
+		return false, nil
+	}
+	result, err := session.UpdateBySql(
+		"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
+			"WHERE project_id = ? AND status = 1 AND member_epoch = ?",
+		projectID, AbsentEpochSentinel,
+	).Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 // FoldID normalizes an identifier for MATCHING, and it is the only fold in this
 // package — the read functions below key their answers by it so no caller has to
 // re-derive the rule.
@@ -535,7 +591,7 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 		// Every row here is status = 1 by the predicate above, so an epoch on the
 		// sentinel is a live project wearing the value that means "gone".
 		if r.MemberEpoch == AbsentEpochSentinel {
-			return nil, fmt.Errorf("%w: %s", ErrLiveProjectOnAbsentSentinel, r.ProjectID)
+			return nil, &SentinelAnomalyError{ProjectID: r.ProjectID}
 		}
 		out[FoldID(r.ProjectID)] = r.MemberEpoch
 	}
@@ -678,27 +734,68 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	if err != nil {
 		return 0, nil, err
 	}
-	// Two maps keyed by TWO DIFFERENT databases' spellings, joined here in Go:
-	// octo_project_member pins utf8mb4_general_ci while space / space_member are
-	// 2019 tables inheriting the server default — measured as utf8mb4_0900_ai_ci in
-	// production. An exact-match lookup across that seam drops a real member whose
-	// two rows differ in case. Folding both sides closes the case half.
-	//
-	// It does NOT close the accent half: 0900_ai_ci is accent-INSENSITIVE, so
-	// space_member could match a uid whose accents differ, and this fold will not.
-	// That residue is fail-closed (a member reads as absent and re-verifies) and it
-	// is not reachable for generated uids, which are ASCII. Closing it properly
-	// would mean carrying a collation table in Go, which this package deliberately
-	// does not do — see FoldID.
+	// The accent half stays open, deliberately: 0900_ai_ci is accent-INSENSITIVE, so
+	// a legacy table could match a uid whose accents differ where this fold will not.
+	// That residue is fail-closed (a member reads as absent and re-verifies) and is
+	// unreachable for generated uids, which are ASCII. Closing it properly would mean
+	// carrying a collation table in Go — see FoldID.
 	inSpaceFolded := make(map[string]bool, len(inSpace))
 	for uid, active := range inSpace {
 		if active {
 			inSpaceFolded[FoldID(uid)] = true
 		}
 	}
+
+	// Step 4 — the ACCOUNT half. Last, for the third time and the same reason: it
+	// can only ever REMOVE uids, so the freshest data arriving here is the
+	// fail-closed direction.
+	//
+	// A Space seat is not the whole answer either. A super-admin ban writes ONLY the
+	// `user` row — modules/user.liftBanUser revokes sessions, kicks devices and bans
+	// the IM channel, and touches neither space_member nor octo_project_member — and
+	// account destroy cascades no membership removal at all. So a banned or destroyed
+	// uid keeps both membership rows at status = 1, and without this step it was
+	// served to the peer as a member WITH its real role.
+	//
+	// The ban's own session revocation cannot close that, because this endpoint's
+	// subject presents NOTHING: it is a peer control plane asking about a third party
+	// it holds no token for, which is the same argument that put the Space half here.
+	// The repository has fixed this identical class twice on other tokenless paths
+	// (modules/user.authVerifyAPIKey, modules/bot_provision.assertSpaceMember).
+	//
+	// A SEPARATE query, not a JOIN onto step 2's SQL, and that is not a preference:
+	// `user` is one of the dump-imported tables sitting at utf8mb4_0900_ai_ci in
+	// production while octo_project_member is migration-created general_ci, so
+	// `JOIN user u ON u.uid = pm.uid` is error 1267 THERE and green in CI. Measured.
+	// See pkg/user.ActiveAccounts.
+	//
+	// Only the uids that survived the Space half are asked about, so the batch keeps
+	// shrinking rather than being re-derived from the request.
+	stillSeated := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if inSpaceFolded[FoldID(r.UID)] {
+			stillSeated = append(stillSeated, r.UID)
+		}
+	}
+	liveAccounts, err := user.ActiveAccounts(session, stillSeated)
+	if err != nil {
+		return 0, nil, err
+	}
+	liveFolded := make(map[string]bool, len(liveAccounts))
+	for uid, live := range liveAccounts {
+		if live {
+			liveFolded[FoldID(uid)] = true
+		}
+	}
+
+	// Two maps keyed by TWO DIFFERENT databases' spellings, joined here in Go:
+	// octo_project_member pins utf8mb4_general_ci while space / space_member / user
+	// are 2019 tables inheriting the server default — measured as utf8mb4_0900_ai_ci
+	// in production. An exact-match lookup across that seam drops a real member whose
+	// rows differ in case, so both sides are folded.
 	for _, r := range rows {
 		folded := FoldID(r.UID)
-		if !inSpaceFolded[folded] {
+		if !inSpaceFolded[folded] || !liveFolded[folded] {
 			continue
 		}
 		roles[folded] = r.Role

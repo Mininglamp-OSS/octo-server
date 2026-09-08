@@ -161,6 +161,65 @@ func runMemberRemovalTxSteps(tx *dbr.Tx, spaceID, uid string) error {
 	return nil
 }
 
+// MemberReactivationTxStep 是在成员**重新加入**事务内同步执行的一步。
+//
+// 与 MemberRemovalTxStep 完全对称，理由也对称：下游把「这个人是不是成员」发布给了
+// 消费方，而消费方缓存的是**判定**，不只是肯定的授权。关席位要发失效信号，开席位
+// 同样要——否则消费方缓存的那条**拒绝**会一直和自己的 epoch 对得上：
+//
+//	移除提交 → epoch E→E+1 → 消费方复核，把 member:false 缓存在 E+1
+//	移除的异步级联还没跑到 → 此人被重新拉回 → 级联发现他回来了，于是**保留**其项目席位
+//	`_verify` 已经答 member:true，而 epoch 仍是 E+1 → 消费方的过期检查同意自己那条拒绝
+//
+// 于是一个合法回归的成员被一直拒绝，直到该项目里恰好发生别的成员写入。安静的项目里
+// 这个窗口没有上界。
+//
+// 契约与 MemberRemovalTxStep 逐字相同：一条语句量级、幂等、返回 error 会让整次
+// 重新加入回滚（宁可这次失败让调用方重试，也不要提交一次没发失效信号的加入）。
+type MemberReactivationTxStep func(tx *dbr.Tx, spaceID, uid string) error
+
+var (
+	rejoinStepsMu sync.RWMutex
+	rejoinSteps   []namedRejoinStep
+)
+
+type namedRejoinStep struct {
+	name string
+	fn   MemberReactivationTxStep
+}
+
+// RegisterMemberReactivationTxStep 由下游模块在 init 中反向注册重新加入的事务内步骤。
+// 反向注册与同名覆盖的理由同 RegisterMemberRemovalTxStep。
+func RegisterMemberReactivationTxStep(name string, fn MemberReactivationTxStep) {
+	if name == "" || fn == nil {
+		return
+	}
+	rejoinStepsMu.Lock()
+	defer rejoinStepsMu.Unlock()
+	for i := range rejoinSteps {
+		if rejoinSteps[i].name == name {
+			rejoinSteps[i].fn = fn
+			return
+		}
+	}
+	rejoinSteps = append(rejoinSteps, namedRejoinStep{name: name, fn: fn})
+}
+
+// runMemberReactivationTxSteps 在重新加入事务内依次执行已注册的同步步骤。
+// 第一个失败即返回，理由同 runMemberRemovalTxSteps。
+func runMemberReactivationTxSteps(tx *dbr.Tx, spaceID, uid string) error {
+	rejoinStepsMu.RLock()
+	steps := make([]namedRejoinStep, len(rejoinSteps))
+	copy(steps, rejoinSteps)
+	rejoinStepsMu.RUnlock()
+	for _, step := range steps {
+		if err := step.fn(tx, spaceID, uid); err != nil {
+			return fmt.Errorf("space: member reactivation tx step %s: %w", step.name, err)
+		}
+	}
+	return nil
+}
+
 // snapshotCleanupSteps 取注册表快照，避免执行期间持锁。
 func snapshotCleanupSteps() []namedCleanupStep {
 	cleanupStepsMu.RLock()

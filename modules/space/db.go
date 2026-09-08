@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -428,12 +429,46 @@ func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, op
 	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
 }
 
+// reactivateMember 重新打开一个已被移除的成员席位。
+//
+// 现在跑在事务里，且事务内执行已注册的 reactivation 步骤——理由见
+// MemberReactivationTxStep：重新打开席位和关闭席位一样会翻转下游发布出去的成员判定，
+// 所以失效信号必须在同一次提交里发出，否则消费方缓存的那条**拒绝**会一直和自己的
+// epoch 对得上，一个合法回归的成员被无上界地拒绝。
+//
+// 步骤失败会回滚整次重新加入。与移除方向同样刻意：宁可这次加入失败让调用方重试，
+// 也不要提交一次没有失效信号的加入。
+//
+// 只在**真的改动了行**时跑步骤。对已经是 status=1 的成员重复调用不该动 epoch——
+// 每一次 bump 都让该项目的所有消费方多做一次复核，而「空写不动 epoch」是消费方
+// 缓存所依赖的规则（见 modules/project 的 bumpMemberEpochTx）。
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
-	_, err := d.session.Update("space_member").
-		Set("status", 1).Set("role", role).
-		Set("updated_at", time.Now()).
-		Where("space_id=? and uid=?", spaceId, uid).Exec()
-	return err
+	return dbpkg.RetryOnLockConflict(func() error {
+		tx, err := d.session.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.RollbackUnlessCommitted()
+
+		result, err := tx.Update("space_member").
+			Set("status", 1).Set("role", role).
+			Set("updated_at", time.Now()).
+			Where("space_id=? and uid=? and status=0", spaceId, uid).Exec()
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return tx.Commit()
+		}
+		if err = runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 // updateMemberRole 更新成员角色，仅用于非 owner 角色（0/1）的变更。
@@ -846,12 +881,22 @@ func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUser
 	}
 
 	// Reactivate member
-	_, err = tx.Update("space_member").
+	result, err := tx.Update("space_member").
 		Set("status", 1).Set("role", 0).
 		Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=?", spaceId, uid).Exec()
+		Where("space_id=? AND uid=? AND status=0", spaceId, uid).Exec()
 	if err != nil {
 		return err
+	}
+	// 同 reactivateMember：只在真的改动了行时发失效信号，空写不动 epoch。
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		if err = runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit()

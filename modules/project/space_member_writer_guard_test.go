@@ -26,10 +26,35 @@ import (
 //     time (pkg/project.ProjectEpochsInSpace), so the answer and the invalidation
 //     channel move together without a write.
 //
-// What is left is the third axis: a single member's space_member row being closed
-// while the Space stays active. That flips _verify (its Space conjunction sees it)
-// without touching any octo_project row, so unless the writer moves the epoch, a
-// peer re-reads the same number and its staleness check AGREES.
+// What is left is the third axis: a single member's space_member row being CLOSED OR
+// REOPENED while the Space stays active. Either transition flips _verify (its Space
+// conjunction sees both) without touching any octo_project row, so unless the writer
+// moves the epoch, a peer re-reads the same number and its staleness check AGREES.
+//
+// Both directions matter, and only assuming otherwise is how round 8 found the
+// reopening half still open. A consumer caches the DECISION, not only positive
+// grants: a stuck cached DENIAL locks a valid returning member out for as long as a
+// stuck cached grant leaks access. So "does not close a seat" is NOT a sufficient
+// reason to exempt a writer — "does not change the answer in either direction" is.
+//
+// # This sweep can only express ONE of the four axes
+//
+// Stated here because a guard that looks complete is worse than one that admits its
+// scope. The facts that can change _verify's answer, and what moves the epoch today:
+//
+//	octo_project_member.status/.removing -> same-tx bump on every project-side write
+//	space_member.status (both directions) -> same-tx bump via the removal/rejoin steps,
+//	                                        EXCEPT the bot writers (see the baseline)
+//	space.status                          -> read-time fold through IsActiveSpace
+//	user.status / user.is_destroy         -> read-time conjunction (pkg/user.ActiveAccounts)
+//	                                        plus an admission gate; a ban does NOT move
+//	                                        the epoch — recorded deviation, see
+//	                                        docs/project-member-epoch-rollout.md
+//
+// Four axes, four different mechanisms, one table this sweep can scan. Rounds 5-8
+// each found a different writer for exactly that reason: an instrument cannot fail
+// on what it cannot express. A new axis needs its own guard, not a wider regexp
+// here.
 //
 // This sweep is the structural half. It cannot verify that a writer bumps — that
 // needs execution — but it CAN make a new writer impossible to add silently, which
@@ -78,16 +103,26 @@ var spaceMemberWriterBaseline = map[string]struct {
 		why: "SANCTIONED. The two seat-CLOSING paths — removeMemberLockedOnce and " +
 			"removeMembersForceOnce — run runMemberRemovalTxSteps in the same " +
 			"transaction, which is where bumpMemberEpochForSpaceMemberTx is registered. " +
-			"The rest are the admin disband (covered by the read-time fold), an " +
-			"admin re-admission and two role writes, none of which close a seat.",
+			"Of the rest: the admin disband is covered by the read-time Space fold; the " +
+			"admin re-admission is an INSERT of a seat that did not exist, so no project " +
+			"seat can have survived for it to reopen (a fresh member is admitted to " +
+			"projects by a project-side write, which bumps on its own); the two role " +
+			"writes change space_member.role, which is not part of the project " +
+			"membership answer.",
 	},
 	"modules/space/db.go": {
 		writes: 11,
-		why: "SANCTIONED / disband / admission. Single-member removal delegates to " +
-			"removeMemberLocked. The disband paths close every member at once and need " +
-			"no bump: an inactive Space folds all of its projects into the absent " +
-			"answer at read time (pkg/project.ProjectEpochsInSpace). The inserts and " +
-			"role writes do not close a seat.",
+		why: "SANCTIONED. Single-member removal delegates to removeMemberLocked. BOTH " +
+			"reactivation paths (reactivateMember, atomicReactivateMemberIfNotFull) now " +
+			"run runMemberReactivationTxSteps in the same transaction — reopening a seat " +
+			"makes a SURVIVING project seat reachable again through the Space " +
+			"conjunction with no project-side write, so nothing else would move the " +
+			"epoch and a consumer's cached denial would keep agreeing with it. The " +
+			"disband paths close every member at once and need no bump: an inactive " +
+			"Space folds all of its projects into the absent answer at read time " +
+			"(pkg/project.ProjectEpochsInSpace). The remaining writes are INSERTs of " +
+			"seats that did not exist (no surviving project seat to reopen) and role " +
+			"changes (role is not part of the project membership answer).",
 	},
 	"modules/botfather/api_user.go": {
 		writes: 2,
@@ -114,8 +149,13 @@ var spaceMemberWriterBaseline = map[string]struct {
 	},
 	"modules/botfather/mint_obo.go": {
 		writes: 1,
-		why: "INSERT only — grants a bot a Space seat. Admission does not invalidate a " +
-			"cached DENIAL (the peer re-verifies on use), so it needs no bump.",
+		why: "INSERT IGNORE of a bot's Space seat. On its own this needs no bump: an " +
+			"INSERT creates a seat that did not exist, so no surviving project seat is " +
+			"reopened by it. It becomes reachable ONLY in combination with the bot-" +
+			"deletion gap below (deletion leaves the project seat active forever, so a " +
+			"re-minted Space seat reopens the answer over it with nothing bumping) — " +
+			"i.e. it is a consequence of that gap, closed when that gap is, and tracked " +
+			"with it rather than separately.",
 	},
 }
 

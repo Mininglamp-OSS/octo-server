@@ -63,6 +63,26 @@ func (p *Project) registerSpaceMemberRemovalCleanup() {
 	// decide a cached authorization is stale, and an async signal with a terminal
 	// abandoned state is not a bound at all. See bumpMemberEpochForSpaceMemberTx.
 	spacemod.RegisterMemberRemovalTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSpaceMemberRemoval)
+	// And the same signal for the OPPOSITE transition. Reopening a Space seat flips
+	// the membership answer exactly as closing one does — the surviving project seat
+	// becomes reachable again through the Space conjunction with no project-side
+	// write, so nothing else would move the epoch. Without this, a consumer's cached
+	// DENIAL keeps agreeing with the epoch and a valid returning member stays denied
+	// until some unrelated write in that project happens to bump. See
+	// spacemod.MemberReactivationTxStep.
+	spacemod.RegisterMemberReactivationTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSpaceMemberRejoin)
+}
+
+// bumpEpochsOnSpaceMemberRejoin moves member_epoch for every project the returning
+// member still holds a seat in, inside the Space-REACTIVATION transaction.
+//
+// The same statement as the removal direction, and deliberately so: both transitions
+// change which projects answer differently for this uid, and the set of affected
+// projects is identical — the seats that survived the removal window. Sharing
+// bumpMemberEpochForSpaceMemberTx keeps the lock order, the chunking and the
+// non-locking-enumeration argument in one place rather than in two that can drift.
+func (p *Project) bumpEpochsOnSpaceMemberRejoin(tx *dbr.Tx, spaceID, uid string) error {
+	return p.db.bumpMemberEpochForSpaceMemberTx(tx, spaceID, uid)
 }
 
 // bumpEpochsOnSpaceMemberRemoval moves member_epoch for every project the removed
