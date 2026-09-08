@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/messages_search"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
@@ -44,6 +45,13 @@ type BotFather struct {
 	// 鉴权、principal=uk（subjectUID=keyModel.UID，spaceID=api_key_space_id）。与 web、
 	// bot 入口共用同一实例，共享限流桶与 sender 缓存。
 	searchHandler *messages_search.Handler
+	// closeSeatsFn 是删除 Bot 时关闭其全部 Space 席位的入口，可注入。
+	//
+	// 与 commandHandler 上那个同名字段同一份实现、同一个理由：D14 要求删 Bot 走
+	// Space 移除工单而不是裸 UPDATE，而"关席位失败必须中止删除"这条规则只有可注入
+	// 才测得到。这里之所以也需要一份，是因为 Bot 有**两个**删除入口——聊天命令和
+	// 这个 REST 端点——而上一轮只改了前者。PR #855 第七轮 review 的 1b。
+	closeSeatsFn func(ctx *config.Context, uid, operatorUID, reason string) ([]string, error)
 	log.Log
 }
 
@@ -62,6 +70,7 @@ func New(ctx *config.Context) *BotFather {
 		threadService: thread.NewService(ctx),
 		msgSem:        make(chan struct{}, 100),
 		searchHandler: messages_search.Shared(ctx),
+		closeSeatsFn:  spacemod.CloseAllSpaceSeats,
 		Log:           log.NewTLog("BotFather"),
 	}
 

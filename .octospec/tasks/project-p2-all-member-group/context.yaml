@@ -1314,6 +1314,43 @@ pr_855_round_7_fixed:
       so the role can still change before the commit.
     fix: "Corrected in place, with why the trade is right (the no-escalation invariant, and FOR SHARE would add an unanalysed edge to the declared lock order) rather than deleting the paragraph."
 
+# PR #855 seventh pass, second half. Jerry-Xin re-posted his round-7 review as a
+# merged revision with a SECOND blocking finding the first version (and every
+# earlier round, mine included) had missed.
+pr_855_round_7b_fixed:
+  - id: the-rest-bot-deletion-never-went-through-d14
+    severity: blocking
+    where: modules/botfather/api_user.go deleteUserBot, modules/botfather/api.go
+    what: |
+      Bots have TWO deletion entry points. This PR routed the chat command through
+      modules/space.CloseAllSpaceSeats and left DELETE /v1/user/bots/:bot_id doing
+      the bare `UPDATE space_member SET status=0` that D14 exists to forbid --
+      zero diff bytes on that file between merge-base and head.
+    why: |
+      The bare update skips the whole chain: no cleanup job, so no P0 project-seat
+      cascade and no P1 group detach. The residue is a disabled bot still holding
+      an active octo_project_member row and an active group_member row, and it has
+      no witness -- I1's reconcile is default-off and gated on the collation
+      conversion, I4 scan B looks for a member MISSING from the group while this
+      ghost has both rows, and D13 cannot reclaim a seat whose robot row is
+      disabled. Retry is impossible too: deleteRobot has already flipped
+      robot.status, and the endpoint's own lookup requires status = 1.
+      In scope for this PR rather than pre-existing hygiene: D14 is this PR's own
+      deliverable, and the brief, the acceptance line and the PR description all
+      claimed it was done.
+    fix: |
+      The REST path closes seats through CloseAllSpaceSeats with the same
+      abort-on-failure semantics as the command path (the robot row is still
+      selectable at that point, so the retry it offers is real), behind the same
+      injectable closeSeatsFn seam.
+    test: TestRESTBotDeleteClosesSeatsThroughTheOutbox
+    mutation: "putting the bare UPDATE back turns it red."
+    note: |
+      Nobody ran the census -- "which entry points can delete a bot" -- through
+      seven rounds. The same parity discipline this change applied well elsewhere
+      (D7's guard placement across handlers, the admission-entry constant lists)
+      was never applied to the thing D14 is about.
+
 verify:
   rules_rechecked:
     - id: space-isolation

@@ -336,6 +336,29 @@ satisfy it. Same move as the round-6 comment-stripping fix, one level up — and
 is the fifth time in this change that a guard turned out to be matching a haystack
 larger than its subject.
 
+### A rule is only as done as its entry-point census
+
+D14 says bot deletion must go through the Space removal outbox rather than a bare
+`UPDATE`. It was implemented, tested, mutation-pinned, blocked on once and fixed —
+on the chat-command path. Bots have two deletion entry points. The REST endpoint
+kept doing exactly the bare update the decision forbids, through seven review
+rounds and every self-review, because nobody asked "what else can delete a bot".
+
+The residue it leaves is the worst kind: a disabled bot still holding an active
+project seat and an active group membership, with no witness. I1's scan is
+default-off and waiting on the collation conversion; I4's scan B looks for a member
+*missing* from the group and this ghost has both rows; D13 cannot reclaim a seat
+whose robot row is disabled; and the deletion cannot even be retried, because the
+endpoint's own lookup requires the row it just disabled.
+
+The discipline that would have caught it is one this change applied well in three
+other places — D7's refusal placed across every handler that mutates membership,
+the admission-entry constants compared against the guard lists, the five removal
+shapes enumerated by effect rather than by name. It was never applied to the
+subject of D14 itself. When a decision names a behaviour ("deletion must…"),
+the first artifact is the list of code paths that perform it — and that list
+belongs in the acceptance criteria, not in someone's head.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

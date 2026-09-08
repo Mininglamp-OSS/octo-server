@@ -264,7 +264,9 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 `modules/space` 导出一个"关闭 uid 在所有 Space 的席位并入队清理"的入口（内部就是
 `enqueueMemberRemovalCleanupTx`，理由 `MemberRemoveReasonForceRemoved` 或新增一个
 `bot_deleted`），botfather 改调它。这样 P0 的级联关闭项目席位、P1 的级联从项目群移除，
-一条链全部复用。这是本任务的**前置修复**（PR-0），改动在 `modules/botfather` 与
+一条链全部复用。**两个删除入口都要改**：聊天命令 `/deletebot` 与 REST
+`DELETE /v1/user/bots/:bot_id`——本段原来只写"botfather 改调它"，实现时也只改了前者，
+第七轮 review 做了一次"哪些入口能删 Bot"的普查才发现后者仍在裸 UPDATE。这是本任务的**前置修复**（PR-0），改动在 `modules/botfather` 与
 `modules/space`，很小；不做的话 I1 对账会在第一个被删的分身上永久报警。
 
 **D15 — 分身进项目的资格规则，以及谁能操作。** 今天 `members/add` 对 bot 零规则，改为：
@@ -436,6 +438,7 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
       级联跑完后，人和分身都不在全员群里，I4 扫描 B 报 0。
 - [ ] **D14**：通过 botfather 删除一个已是项目成员的分身，`space_member_removal_cleanup`
       有工单，P0 步骤关闭其项目席位，P1 步骤把它从全员群移除；I1 与 I4 扫描都报 0。
+      **两个入口分别验**：`/deletebot` 命令与 `DELETE /v1/user/bots/:bot_id`。
 - [ ] **D15**：普通成员可加/移自己的分身（`can_manage_own_agents = true`）；管理员加别人的
       分身、加主人不在项目里的分身，均以 `err.server.project.agent_not_eligible` 拒绝；
       管理员可移除任何分身。
