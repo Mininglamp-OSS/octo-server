@@ -76,8 +76,11 @@ func resolveExitShowName(groupRemark string, globalName func() string) string {
 //
 // 不可信输入（trust-boundary）：showName 来自成员备注 / 登录名，是用户可控的。
 // 这里**不做**任何字符串插值 —— content 保持模板原样，名字放进结构化的
-// `extra[].name`，由客户端按 `{0}` 占位符填充。因此不存在把不可信文本拼进
-// 渲染敏感串的路径。
+// `extra[].name`，由客户端按 `{0}` 占位符填充。因此不存在 JSON 注入面。
+//
+// 但那只挡住了一半：客户端逐次替换 `{N}` 且会重新扫描替换后的文本，所以名字里的
+// 字面量花括号仍可能被当成占位符展开；bidi 控制符还能视觉反转整句。这两条由
+// sanitizeSystemMessageName 在名字进入 extra 前掐掉。
 //
 // 返回 error 供调用方按各自策略处理；两个调用点都是 best-effort（只记日志，
 // 不让提示发不出去影响退群/清理本身的成败）。
@@ -95,8 +98,10 @@ func sendGroupExitNotice(ctx *config.Context, groupNo, uid, showName string) err
 			"type":    common.GroupMemberQuit,
 			"extra": []config.UserBaseVo{
 				{
-					UID:  uid,
-					Name: showName,
+					UID: uid,
+					// 与交接通告同源的渲染面，同样在入口净化，
+					// 见 sanitizeSystemMessageName。
+					Name: sanitizeSystemMessageName(showName),
 				},
 			},
 		})),

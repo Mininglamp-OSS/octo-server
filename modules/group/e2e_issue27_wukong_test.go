@@ -39,8 +39,8 @@ func TestE2E_Issue27_RemovedBotStopsReceivingThreadMessages(t *testing.T) {
 		groupNo = "e2e_g27"
 		shortID = "e2eth01"
 		spaceID = "e2e_space"
-		botUID  = "e2e_bot"   // 入群但从不 JoinThread —— #27 的典型 bot
-		usrUID  = "e2e_user"  // 普通成员，对照组
+		botUID  = "e2e_bot"  // 入群但从不 JoinThread —— #27 的典型 bot
+		usrUID  = "e2e_user" // 普通成员，对照组
 		sender  = "e2e_sender"
 	)
 	channelID := groupNo + "____" + shortID
