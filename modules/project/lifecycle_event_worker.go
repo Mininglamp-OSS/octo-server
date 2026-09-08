@@ -31,6 +31,19 @@ const (
 	lifecycleEventLease = 2 * time.Minute
 	// lifecycleEventHeartbeatEvery must be comfortably shorter than the lease.
 	lifecycleEventHeartbeatEvery = 30 * time.Second
+	// lifecycleEventPerProjectDrain bounds how many of ONE project's events a
+	// single tick will deliver.
+	//
+	// It exists because the claim returns at most one row per project, which is
+	// right for ordering and wrong for throughput: a members/remove request
+	// enqueues one revocation per uid on the same project, up to MemberBatchMax
+	// (200 by default). At one per five-second tick that is ~1000 seconds.
+	//
+	// Bounded rather than unlimited so one project with a large burst cannot
+	// starve the other projects in the same batch, and so a tick's worst case
+	// stays predictable: batch x drain sequential round trips, each capped by
+	// LifecycleEventTimeout.
+	lifecycleEventPerProjectDrain = 20
 	// lifecycleEventBatch is how many events one tick claims.
 	//
 	// Smaller than the removal batch: these are delivered SEQUENTIALLY and each
@@ -54,6 +67,8 @@ const (
 	lifecycleEventPurgeEvery = time.Hour
 	// lifecycleEventSweepEvery is how often exhausted-but-pending rows are retired.
 	lifecycleEventSweepEvery = 5 * time.Minute
+	// lifecycleEventSweepPasses bounds one sweep tick. See sweepExhaustedLifecycleEvents.
+	lifecycleEventSweepPasses = 20
 )
 
 var (
@@ -144,7 +159,7 @@ func (p *Project) runLifecycleEventDelivery() {
 	for _, r := range rows {
 		ids = append(ids, r.ID)
 	}
-	stopHeartbeat := p.startLifecycleLeaseHeartbeat(ids, owner)
+	stopHeartbeat := p.startLifecycleLeaseHeartbeat(owner)
 	defer stopHeartbeat()
 
 	sender, err := p.lifecycleSenderOrDefault()
@@ -162,15 +177,48 @@ func (p *Project) runLifecycleEventDelivery() {
 		return
 	}
 
-	// No per-project bookkeeping here, deliberately: the CLAIM guarantees at most
-	// one pending event per project (see claimLifecycleEvents), so a batch cannot
-	// contain two rows of the same project and there is nothing for this loop to
-	// order. An earlier version tracked a `blocked` map here instead, which held
-	// inside one batch and inverted on the very next tick — the full account is on
-	// the claim query, along with why a per-process map could not have worked
-	// across replicas anyway.
+	// One project at a time, IN SEQUENCE — and after each success, keep draining
+	// THAT project before moving on.
+	//
+	// The batch claim returns at most one pending row per project (its NOT EXISTS
+	// predicate), which is what makes ordering correct and correct across
+	// replicas. On its own it also made throughput exactly one event per project
+	// per poll interval, which is a different property and a bad one: a single
+	// members/remove request enqueues up to MemberBatchMax revocations on ONE
+	// project, so draining took ~1000 seconds against a healthy peer and drove the
+	// age gauge past any threshold. Ordering needs sequence, not one per tick.
+	//
+	// The drain stops on the first failure, which is the same rule the claim
+	// enforces across ticks: an event still owed to the peer must not be overtaken
+	// by the ones behind it. Bounded so one busy project cannot starve the others
+	// in this batch, and so a tick cannot run unboundedly long.
 	for _, row := range rows {
-		p.deliverLifecycleEvent(sender, row, owner)
+		p.drainProject(sender, row, owner)
+	}
+}
+
+// drainProject delivers one project's queue in order, stopping at the first
+// event that is still owed afterwards.
+//
+// Returns nothing: every outcome is already recorded by deliverLifecycleEvent,
+// and the caller has no decision left to make.
+func (p *Project) drainProject(sender lifecycleSender, head lifecycleEventRow, owner string) {
+	if !p.deliverLifecycleEvent(sender, head, owner) {
+		return
+	}
+	for i := 1; i < lifecycleEventPerProjectDrain; i++ {
+		next, err := p.db.claimNextForProject(
+			owner, head.ProjectID, time.Now().UTC(), lifecycleEventLease)
+		if err != nil {
+			p.Warn("续取项目生命周期事件失败", zap.String("project_id", head.ProjectID), zap.Error(err))
+			return
+		}
+		if next == nil {
+			return // this project is drained
+		}
+		if !p.deliverLifecycleEvent(sender, *next, owner) {
+			return
+		}
 	}
 }
 
@@ -188,6 +236,27 @@ func (p *Project) sweepExhaustedLifecycleEvents() {
 		}
 	}()
 	now := time.Now().UTC()
+	// Loops until a pass comes back short, for the reason purgeLifecycleEvents
+	// gives and with more force: a fixed cap below the arrival rate is not a
+	// slower sweep, it is no sweep — and every row left unswept blocks its OWN
+	// project's queue, because the claim declines any project with an older
+	// pending sibling. A crash-looping pod produces exactly the burst this has to
+	// keep up with.
+	//
+	// Bounded, unlike the purge, because this loop competes with delivery for the
+	// same rows and a pathological table should not hold the worker for a whole
+	// tick.
+	for pass := 0; pass < lifecycleEventSweepPasses; pass++ {
+		if p.sweepOnce(now) {
+			return
+		}
+	}
+}
+
+// sweepOnce retires one bounded batch, and reports whether this tick is done —
+// true when the pass came back short, i.e. there is nothing more this pod can
+// claim.
+func (p *Project) sweepOnce(now time.Time) bool {
 	// Only rows this pod actually transitioned: two pods sweeping the same window
 	// would otherwise both emit the abandoned counter and the Error alert for the
 	// same event, and a row claimed between the SELECT and the guarded UPDATE
@@ -196,10 +265,10 @@ func (p *Project) sweepExhaustedLifecycleEvents() {
 		"exhausted: attempts spent without a terminal outcome", lifecycleEventBatch)
 	if err != nil {
 		p.Error("清扫预算耗尽的项目生命周期事件失败", zap.Error(err))
-		return
+		return true
 	}
 	for _, row := range rows {
-		lifecycleEventOutcome.WithLabelValues(row.EventType, "abandoned", "exhausted").Inc()
+		lifecycleEventOutcome.WithLabelValues(row.EventType, "abandoned", lifecycleErrExhausted).Inc()
 		// Same severity and the same fields as the delivery-path abandon: this is
 		// not a tidier outcome for having been reached by a sweep. For a member
 		// revocation it still means the peer will never be told.
@@ -211,15 +280,26 @@ func (p *Project) sweepExhaustedLifecycleEvents() {
 			zap.Int("attempts", row.Attempts),
 			zap.Error(errFleetTerminal))
 	}
+	// Done when this pass WON fewer rows than a full batch.
+	//
+	// Not quite the same question as "was the pass short", and the difference is
+	// the pathological case: if a concurrent sweeper keeps winning every row, this
+	// pod wins none and would otherwise loop its full pass budget doing nothing.
+	// Stopping when it wins less than a batch means a genuinely large backlog
+	// still drains — whoever is winning is draining it.
+	return len(rows) < lifecycleEventBatch
 }
 
-// startLifecycleLeaseHeartbeat keeps the WHOLE claimed batch leased while the worker
-// walks it.
+// startLifecycleLeaseHeartbeat keeps everything this worker holds leased while it
+// walks the batch.
 //
-// The whole batch, for the reason spelled out on heartbeatLifecycleEventLeases: the
-// tail of a slow batch would otherwise expire while this worker still intends to
-// send it, and another pod would claim and deliver those rows concurrently.
-func (p *Project) startLifecycleLeaseHeartbeat(ids []int64, owner string) func() {
+// Keyed on the OWNER rather than on the ids claimed at the start, because the
+// per-project drain claims more rows as it goes and an id list fixed at claim
+// time would leave exactly those unrenewed. The reason renewal is needed at all
+// is unchanged: the tail of a slow batch would otherwise expire while this worker
+// still intends to send it, and another pod would claim and deliver those rows
+// concurrently.
+func (p *Project) startLifecycleLeaseHeartbeat(owner string) func() {
 	stop := make(chan struct{})
 	var once sync.Once
 	go func() {
@@ -231,7 +311,7 @@ func (p *Project) startLifecycleLeaseHeartbeat(ids []int64, owner string) func()
 				return
 			case <-ticker.C:
 				until := time.Now().UTC().Add(lifecycleEventLease)
-				if err := p.db.heartbeatLifecycleEventLeases(ids, owner, until); err != nil {
+				if err := p.db.heartbeatLifecycleEventLeases(owner, until); err != nil {
 					p.Warn("续租项目生命周期事件失败", zap.Error(err))
 				}
 			}

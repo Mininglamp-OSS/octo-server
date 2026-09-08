@@ -59,6 +59,13 @@ const (
 	lifecycleErrRejected = "rejected"
 	// lifecycleErrRedirect is a 3xx, which this client refuses to follow.
 	lifecycleErrRedirect = "redirect"
+	// lifecycleErrExhausted is not a response class at all: it is what the sweep
+	// records for a row whose attempt budget was spent without any attempt ever
+	// reaching a terminal outcome — a worker killed between claim and completion.
+	// It lives in this enum because it reaches the same error_class metric label,
+	// and a label value defined outside the enum the metric's help text names is
+	// how a closed set stops being closed.
+	lifecycleErrExhausted = "exhausted"
 )
 
 // lifecycleDeliveryResult is what one attempt produced.

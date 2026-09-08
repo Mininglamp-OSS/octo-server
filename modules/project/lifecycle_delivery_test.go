@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"github.com/google/uuid"
 	"net/http"
 	"strings"
 	"sync"
@@ -298,4 +299,134 @@ func TestExhaustedRowsAreSweptRatherThanBlockingTheirProject(t *testing.T) {
 	p.runLifecycleEventDelivery()
 	assert.Equal(t, []string{created.ProjectID + "/" + LifecycleEventMetadataUpdated},
 		sender.snapshot(), "once the head is terminal the tail is claimable")
+}
+
+// enqueueDirect writes n pending events for one project without going through a
+// write path, so a burst can be built without 200 HTTP requests.
+func enqueueDirect(t *testing.T, projectID, spaceID string, n int) {
+	t.Helper()
+	now := time.Now().UTC()
+	for i := 0; i < n; i++ {
+		_, err := testCtx.DB().InsertBySql(
+			"INSERT INTO `octo_project_lifecycle_event` "+
+				"(event_id, event_type, project_id, space_id, payload, occurred_at, "+
+				" next_attempt_at, created_at) "+
+				"VALUES (?, ?, ?, ?, '{}', ?, ?, ?)",
+			uuid.NewString(), LifecycleEventMemberRevoked, projectID, spaceID,
+			now, now, now,
+		).Exec()
+		require.NoError(t, err)
+	}
+}
+
+// TestOneTickDrainsAProjectsBurst is P2-2: ordering requires a project's events
+// go in SEQUENCE, not one per poll interval.
+//
+// The claim returns at most one row per project, which is what makes ordering
+// correct and correct across replicas. Left at that, throughput was exactly one
+// event per five-second tick — and POST /:project_id/members/remove enqueues one
+// revocation per uid on the SAME project, up to 200 by default. That is ~1000
+// seconds to drain against a perfectly healthy peer, on the event class this
+// module treats as a security failure to lose, and it drives the age gauge past
+// any threshold after every bulk removal.
+func TestOneTickDrainsAProjectsBurst(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "burstOwner")
+	seedSpaceMember(t, spaceA, "burstOwner", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "burst")
+	enqueueDirect(t, created.ProjectID, spaceA, 6)
+
+	sender := &scriptedSender{}
+	p.lifecycleEventSender = sender
+	p.runLifecycleEventDelivery()
+
+	rows := outboxRows(t, created.ProjectID)
+	require.Len(t, rows, 7, "creation event plus the burst")
+	for i, row := range rows {
+		assert.EqualValues(t, lifecycleEventDelivered, row.Status,
+			"row %d must be delivered in the SAME tick: one event per tick per project "+
+				"is a throughput rule the ordering rule does not need", i)
+	}
+	assert.Len(t, sender.snapshot(), 7, "all seven reached the wire in one tick")
+}
+
+// TestTheDrainStillStopsAtTheFirstFailure: draining faster must not weaken the
+// property the drain sits inside. An event still owed to the peer must not be
+// overtaken by the ones behind it, whether the overtaking would happen on a
+// later tick or inside this one.
+func TestTheDrainStillStopsAtTheFirstFailure(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "drainStop")
+	seedSpaceMember(t, spaceA, "drainStop", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "drain-stop")
+	enqueueDirect(t, created.ProjectID, spaceA, 4)
+
+	// The creation event succeeds; the FIRST revocation behind it fails.
+	failed := 0
+	p.lifecycleEventSender = &scriptedSender{
+		fail: func(env lifecycleEventEnvelope) (lifecycleDeliveryResult, bool) {
+			if env.EventType == LifecycleEventMemberRevoked {
+				failed++
+				if failed == 1 {
+					return lifecycleDeliveryResult{
+						Retryable: true, Class: lifecycleErrServer, Detail: "503"}, true
+				}
+			}
+			return lifecycleDeliveryResult{}, false
+		},
+	}
+	p.runLifecycleEventDelivery()
+
+	assert.Equal(t, 1, failed,
+		"the drain must stop at the first event still owed: the ones behind it would "+
+			"reach the peer out of order, and a peer answering 'unknown' gives a plain "+
+			"4xx, which is terminal here")
+
+	rows := outboxRows(t, created.ProjectID)
+	require.Len(t, rows, 5)
+	assert.EqualValues(t, lifecycleEventDelivered, rows[0].Status, "the head succeeded")
+	assert.EqualValues(t, lifecycleEventPending, rows[1].Status, "the failure is rescheduled")
+	for i := 2; i < len(rows); i++ {
+		assert.EqualValues(t, lifecycleEventPending, rows[i].Status,
+			"row %d must not overtake the still-owed row above it", i)
+		assert.Zero(t, rows[i].Attempts, "and must not be charged for a send that never happened")
+	}
+}
+
+// TestTheSweepDrainsAcrossPasses is P2-5. purgeLifecycleEvents loops until a
+// batch comes back short — "a fixed cap below the arrival rate is not a slower
+// purge, it is no purge" — and the argument is stronger here, because every
+// unswept row blocks its OWN project's queue.
+func TestTheSweepDrainsAcrossPasses(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "sweepDrain")
+	seedSpaceMember(t, spaceA, "sweepDrain", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "sweep-drain")
+	// More than one batch of rows that spent their budget without a terminal outcome.
+	enqueueDirect(t, created.ProjectID, spaceA, lifecycleEventBatch+5)
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project_lifecycle_event` SET attempts = ? WHERE project_id = ?",
+		lifecycleEventMaxAttempts, created.ProjectID).Exec()
+	require.NoError(t, err)
+
+	p.sweepExhaustedLifecycleEvents()
+
+	for i, row := range outboxRows(t, created.ProjectID) {
+		assert.EqualValues(t, lifecycleEventAbandoned, row.Status,
+			"row %d must be swept in one tick: a fixed cap of %d per pass leaves the rest "+
+				"blocking their own project's queue until the next tick, and a crash-looping "+
+				"pod produces exactly that burst", i, lifecycleEventBatch)
+	}
 }

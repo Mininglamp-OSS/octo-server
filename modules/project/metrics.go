@@ -314,11 +314,17 @@ var lifecycleEventEnqueued = promauto.NewCounterVec(prometheus.CounterOpts{
 
 // lifecycleEventOutcome counts terminal delivery outcomes.
 //
-// result is delivered | abandoned. error_class is the classification from
-// lifecycle_client.go for anything that is not a success, and empty on success --
-// it is what tells an operator whether the peer is down (retryable, transient)
-// or whether this deployment is misconfigured or in conflict (terminal), which
-// need completely different responses.
+// result is delivered | abandoned. error_class is the lifecycleErr* enum in
+// lifecycle_client.go, empty on success -- it is what tells an operator whether
+// the peer is down (retryable, transient) or whether this deployment is
+// misconfigured or in conflict (terminal), which need completely different
+// responses.
+//
+// Every value comes from that enum, including the one that is not a response
+// class: `exhausted`, which the sweep records for a row whose budget was spent
+// without any attempt reaching a terminal outcome. It is declared there rather
+// than written as a literal here, because a label value defined outside the enum
+// this help text names is how a closed set stops being closed.
 var lifecycleEventOutcome = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: metricNamespace,
 	Name:      "lifecycle_event_delivery_total",

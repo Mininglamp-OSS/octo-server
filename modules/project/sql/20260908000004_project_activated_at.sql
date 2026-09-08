@@ -63,6 +63,30 @@ ALTER TABLE `octo_project`
 
 -- Backfill, deliberately before anything can read the column: rows that predate
 -- the gate were confirmed by the absence of the gate.
+--
+-- ONE UNBOUNDED UPDATE, and that is a decision rather than an oversight — it was
+-- raised twice in review, so the reasoning belongs here instead of in a thread.
+--
+-- Every other bulk operation in this module is batched, including this feature
+-- own purge, and the argument there is about a table that grows without bound
+-- from traffic. This one is different in the way that matters: it runs ONCE, in
+-- the migration, against a table whose row count is the number of projects that
+-- exist. That is bounded by the per-Space and per-creator quotas rather than by
+-- traffic, and octo_project was created days before this column.
+--
+-- The real limit is what a migration can express: sql-migrate applies each file
+-- as one unit with no loop construct, so chunking means either a stored
+-- procedure or moving the backfill out of the migration into application code
+-- that has to be idempotent and observable on its own. Both are more machinery
+-- than a single UPDATE over a table this size deserves, and both add a way for
+-- the backfill to be half-done — which is the state the reconcile repair exists
+-- to clean up, so it would be repairing a mess this file created.
+--
+-- What to check before deploying to an installation where octo_project is
+-- large: SELECT COUNT(*) FROM octo_project. This statement holds row locks on
+-- every matching row for its duration and runs inside the startup path, so a
+-- count in the millions wants a maintenance window and the chunked rewrite; at
+-- the thousands this repository actually has, it is milliseconds.
 UPDATE `octo_project` SET `activated_at` = `created_at` WHERE `activated_at` IS NULL;
 
 -- +migrate Down

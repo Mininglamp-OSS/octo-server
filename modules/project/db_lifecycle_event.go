@@ -76,9 +76,36 @@ func (d *DB) insertLifecycleEventTx(tx *dbr.Tx, row lifecycleEventRow, now time.
 // from claiming that project's tail, and no amount of per-process state can see
 // that.
 //
-// Cost: the subquery runs per candidate row over
-// idx_octo_project_lifecycle_event_pending, and the batch is ten rows. The
-// alternative — a window function — cannot be combined with FOR UPDATE.
+// # Cost, measured rather than assumed
+//
+// An earlier version of this comment said the cost was bounded by the batch
+// size. It is bounded by the BACKLOG size, and the difference is what someone
+// will rely on when deciding whether a five-second poll is safe. EXPLAIN ANALYZE
+// against this migration's DDL with 50,000 terminal and 505 pending rows: the
+// optimizer does not use idx_..._pending, the LIMIT cannot bound the sort input
+// because the antijoin sits above it, and all 505 pending rows are read, fully
+// sorted, and the subquery evaluated 505 times to return 6. Cost 6871 against
+// 71.3 for the same query without the NOT EXISTS — roughly 96x, growing linearly
+// with the backlog, and the backlog is the one state in which this runs hot.
+//
+// The lock footprint is the part that reaches other writers, and it is NOT
+// introduced by the predicate: FOR UPDATE combined with a sort locks every row
+// the scan reads, not the ones it returns, so the pre-predicate shape holds the
+// same ~1000 record locks. performance_schema.data_locks during an open claim at
+// that size shows ~1012 locks to claim 6 rows, and a concurrent INSERT for an
+// UNRELATED project can hit lock wait timeout — that insert is
+// insertLifecycleEventTx, which runs inside the user-facing business
+// transaction. What bounds it is that this transaction commits before any HTTP
+// call, so the window is the query, milliseconds at this size.
+//
+// Left as it is rather than optimised, deliberately: the feed is not enabled
+// anywhere, the correct shape is a cheap candidate read followed by a narrow
+// FOR UPDATE on those ids, and doing that here would rewrite the claim in the
+// same commit that is fixing two blockers. Recorded so the next person has the
+// numbers instead of the reassurance. An EXPLAIN under a synthetic backlog is
+// worth doing before this feed is enabled anywhere.
+//
+// The alternative — a window function — cannot be combined with FOR UPDATE.
 func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease time.Duration) ([]lifecycleEventRow, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -136,14 +163,16 @@ func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease 
 // consumer would deduplicate on event_id, but the two workers would race each
 // other for the same lease on completion and one would log a false ownership
 // loss on every batch.
-func (d *DB) heartbeatLifecycleEventLeases(ids []int64, owner string, until time.Time) error {
-	if len(ids) == 0 {
-		return nil
-	}
+func (d *DB) heartbeatLifecycleEventLeases(owner string, until time.Time) error {
+	// By OWNER, not by a list of ids captured when the batch was claimed. The
+	// per-project drain claims MORE rows after the heartbeat has started, and an
+	// id list fixed at claim time would leave exactly those rows unrenewed — the
+	// ones this worker is actively walking. lease_owner is unique per claim
+	// (workerIdentity), so this can only touch rows this worker holds.
 	_, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_lifecycle_event` SET lease_until = ? "+
-			"WHERE id IN ? AND lease_owner = ? AND status = ?",
-		until, ids, owner, lifecycleEventPending,
+			"WHERE lease_owner = ? AND status = ?",
+		until, owner, lifecycleEventPending,
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("project: heartbeat lifecycle event leases: %w", err)
@@ -225,6 +254,61 @@ func (d *DB) releaseUnattemptedLifecycleEvents(ids []int64, owner string) error 
 	return nil
 }
 
+// claimNextForProject leases this project's next pending event, if there is one.
+//
+// The per-project drain (see runLifecycleEventDelivery) is what stops the
+// ordering rule from also being a throughput rule. Ordering requires a project's
+// events go in SEQUENCE; it does not require one per poll interval, and the
+// difference is 200x on the one operation that produces a burst:
+// POST /:project_id/members/remove takes up to MemberBatchMax uids and enqueues
+// one member_revoked per uid on the SAME project, so a single authorized request
+// used to need ~1000 seconds to drain against a perfectly healthy peer — on the
+// event class this module treats as a security failure to lose, and past any
+// threshold on the age gauge that exists to report exactly that.
+//
+// Deliberately NOT the batch claim with a bigger limit. This is an index lookup
+// on (project_id, id), where the batch claim sorts and antijoins the whole
+// pending set; running that repeatedly to drain one project would multiply the
+// expensive query rather than the cheap one.
+//
+// No NOT EXISTS needed: ORDER BY id ASC LIMIT 1 IS the oldest pending sibling,
+// so the ordering property is the same one the batch claim spells out.
+func (d *DB) claimNextForProject(owner, projectID string, now time.Time, lease time.Duration) (*lifecycleEventRow, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("project: claim next lifecycle event begin: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var rows []lifecycleEventRow
+	if _, err := tx.SelectBySql(
+		"SELECT id, event_id, event_type, project_id, space_id, project_version, "+
+			"payload, occurred_at, attempts "+
+			"FROM `octo_project_lifecycle_event` "+
+			"WHERE project_id = ? AND status = ? AND next_attempt_at <= ? "+
+			"  AND (lease_until IS NULL OR lease_until <= ?) AND attempts < ? "+
+			"ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+		projectID, lifecycleEventPending, now, now, lifecycleEventMaxAttempts,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("project: claim next lifecycle event select: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, tx.Commit()
+	}
+	rows[0].Attempts++
+	if _, err := tx.UpdateBySql(
+		"UPDATE `octo_project_lifecycle_event` "+
+			"SET lease_owner = ?, lease_until = ?, attempts = attempts + 1 WHERE id = ?",
+		owner, now.Add(lease), rows[0].ID,
+	).Exec(); err != nil {
+		return nil, fmt.Errorf("project: claim next lifecycle event lease: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("project: claim next lifecycle event commit: %w", err)
+	}
+	return &rows[0], nil
+}
+
 // abandonExhaustedLifecycleEvents retires pending rows whose attempt budget is
 // already gone.
 //
@@ -258,50 +342,42 @@ func (d *DB) abandonExhaustedLifecycleEvents(now time.Time, reason string, limit
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	ids := make([]int64, 0, len(rows))
-	for _, r := range rows {
-		ids = append(ids, r.ID)
-	}
-	// The status and lease predicates are repeated so a row claimed between the
-	// two statements is left to the worker that now owns it.
-	res, err := d.session.UpdateBySql(
-		"UPDATE `octo_project_lifecycle_event` "+
-			"SET status = ?, last_error = ?, finished_at = ?, lease_owner = '', lease_until = NULL "+
-			"WHERE id IN ? AND status = ? AND attempts >= ? "+
-			"  AND (lease_until IS NULL OR lease_until <= ?)",
-		lifecycleEventAbandoned, truncateError(reason), now,
-		ids, lifecycleEventPending, lifecycleEventMaxAttempts, now,
-	).Exec()
-	if err != nil {
-		return nil, fmt.Errorf("project: abandon exhausted lifecycle events: %w", err)
-	}
-	// Re-read to report only what this pod actually transitioned.
+	// One guarded UPDATE PER ROW, and the row count of each is the answer to "did
+	// this pod win this row".
 	//
-	// Returning the SELECTed rows would make the caller's counter and Error alert
-	// fire on every pod that swept the same window, and on rows a concurrent
-	// claimer took between the two statements — which are logged as abandoned
-	// while their new owner is mid-delivery. The UPDATE is CAS-guarded so the
-	// TRANSITION is already correct; this is about not alerting on someone else's.
+	// A single UPDATE ... WHERE id IN (...) cannot answer that: RowsAffected is a
+	// total, and re-reading the rows afterwards cannot separate the ones this pod
+	// transitioned from the ones a concurrent sweep did — both write the same
+	// terminal state and the same fixed reason. Ten statements per pass at a
+	// five-minute cadence is not a cost worth trading that certainty for.
 	//
-	// A count would be cheaper but not enough: the alert names the event id and
-	// the project, which is what makes it actionable, and RowsAffected cannot say
-	// WHICH rows won.
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return nil, fmt.Errorf("project: abandon exhausted lifecycle events rows: %w", err)
-	}
-	if affected == 0 {
-		return nil, nil
-	}
+	// It matters because of what the caller does with the answer: it increments
+	// the abandoned counter and logs "the peer will never be told" per row. Two
+	// replicas whose jittered sweeps overlap would otherwise both alert on the
+	// same event, and a row claimed by a delivery worker between the SELECT and
+	// the UPDATE would be alerted on while its new owner is mid-send.
 	var mine []lifecycleEventRow
-	if _, err := d.session.SelectBySql(
-		"SELECT id, event_id, event_type, project_id, space_id, project_version, "+
-			"payload, occurred_at, attempts "+
-			"FROM `octo_project_lifecycle_event` "+
-			"WHERE id IN ? AND status = ? AND last_error = ? AND finished_at = ?",
-		ids, lifecycleEventAbandoned, truncateError(reason), now,
-	).Load(&mine); err != nil {
-		return nil, fmt.Errorf("project: read swept lifecycle events: %w", err)
+	for _, row := range rows {
+		// The status, budget and lease predicates are repeated from the SELECT so a
+		// row claimed in between is left to the worker that now owns it.
+		res, err := d.session.UpdateBySql(
+			"UPDATE `octo_project_lifecycle_event` "+
+				"SET status = ?, last_error = ?, finished_at = ?, lease_owner = '', lease_until = NULL "+
+				"WHERE id = ? AND status = ? AND attempts >= ? "+
+				"  AND (lease_until IS NULL OR lease_until <= ?)",
+			lifecycleEventAbandoned, truncateError(reason), now,
+			row.ID, lifecycleEventPending, lifecycleEventMaxAttempts, now,
+		).Exec()
+		if err != nil {
+			return nil, fmt.Errorf("project: abandon exhausted lifecycle event %d: %w", row.ID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("project: abandon exhausted lifecycle event rows: %w", err)
+		}
+		if affected > 0 {
+			mine = append(mine, row)
+		}
 	}
 	return mine, nil
 }
