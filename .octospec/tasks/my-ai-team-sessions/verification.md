@@ -14,7 +14,7 @@ Date: 2026-09-07
 | E2E shard 4 | `OCTO_MASTER_KEY=<32-byte-test-key> MYSQL_CID=octo-ai-team-mysql REDIS_CID=octo-ai-team-redis ci/run-e2e-shard.sh 4 4` | PASS |
 | Focused AI/message regression | `go test ./modules/ai_team ./modules/message` | PASS |
 | Upstream admission compatibility | `go test -count=1 ./modules/group` and `go test -count=1 ./modules/space` on fresh databases | PASS — AI container creation and preset-group protection coexist with #846's single group admission funnel |
-| Fresh DB AI API controls | `go test -count=1 ./modules/ai_team` | PASS — rename, pin ordering, mute, per-user clear, soft delete, ownership and scan-join guard |
+| Fresh DB AI API controls | `go test -count=1 ./modules/ai_team` | PASS — rename, pin ordering, mute, per-user clear, soft delete, ownership, scan-join guard, and migration preservation of operator settings |
 | Production-shape collation regression | `go test -count=1 ./modules/ai_team -run TestAITeamQueriesSurviveProductionCollationShape` | PASS — real MySQL with 0900 legacy identity tables joined to general-ci AI/thread tables |
 | Static analysis | `go vet ./...` | PASS |
 | i18n extraction | `make i18n-extract` | PASS |
@@ -42,11 +42,28 @@ parent plus all retained thread subscribers in WuKongIM. Provision failures no
 longer downgrade already-ready sessions, and rename follows the agent -> session ->
 thread lock order used by creation.
 
-Bot deletion now uses a lifecycle-only group lookup that includes hidden AI
-containers and opts into protected removal only for those containers. Focused
-`modules/group` and `modules/botfather` tests verify that product-facing group
-lists still hide the parent while the deletion cascade sees and removes it;
-`go build ./...` and `go vet ./...` pass after the interface change.
+Bot deletion now uses one lifecycle-cleanup service from all three deletion
+surfaces. It includes hidden AI containers and opts into protected removal only
+for those containers. Focused `modules/group` and `modules/botfather` tests verify
+that product-facing group lists still hide the parent while the REST deletion
+cascade sees and removes it; `go build ./...` and `go vet ./...` pass after the
+interface change.
+
+The final follow-up also verifies that org-employee exit events do not mutate AI
+containers, category reads/writes exclude or reject them, and the archive worker
+structurally exempts their threads. The AI migration no longer overwrites the
+operator-owned global auto-archive setting; rollout still requires the documented
+deployment check that its effective value is disabled.
+
+Focused commands run on 2026-09-08 against freshly recreated test databases:
+
+- `go test -count=1 ./modules/group`: PASS.
+- `go test -count=1 ./modules/category`: PASS.
+- `go test -count=1 ./modules/thread`: PASS.
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/botfather`: PASS.
+- `go test -count=1 ./modules/robot`: PASS.
+- `OCTO_MASTER_KEY=<32-byte-test-key> DM_AI_TEAM_ON=true DM_THREAD_ON=true go test -count=1 ./modules/ai_team`: PASS.
+- `go build ./...`, focused `go vet`, `make i18n-extract-check`, `make i18n-lint`, and `git diff --check`: PASS.
 
 The E2E/API coverage includes add/remove/re-add, replay and idempotency conflicts,
 concurrent single-parent creation, the exact two-member invariant, missing Space and
@@ -70,17 +87,19 @@ The test database was dropped and recreated before running the module migration:
 docker exec -e MYSQL_PWD=demo octo-ai-team-mysql mysql -uroot \
   -e "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
 go test -count=1 ./modules/ai_team \
-  -run '^TestAITeamMigrationDisablesGlobalThreadAutoArchive$'
-docker exec -e MYSQL_PWD=demo octo-ai-team-mysql mysql -uroot -Nse \
-  "SELECT category,key_name,value FROM test.system_setting WHERE category='thread' AND key_name='auto_archive_enabled';"
+  -run '^TestAITeamMigrationPreservesGlobalThreadAutoArchive$'
 ```
 
 Result:
 
 ```text
 ok  github.com/Mininglamp-OSS/octo-server/modules/ai_team
-thread  auto_archive_enabled  0
 ```
+
+The fixture seeds `thread.auto_archive_enabled=1`; both migration up and down leave
+that value unchanged. AI session threads are protected independently by the
+`ArchiveStaleBatch` purpose predicate, while deployment policy remains responsible
+for keeping the global effective setting false during rollout.
 
 ## Known external/baseline limitation
 

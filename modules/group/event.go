@@ -802,6 +802,13 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 	for _, groupNo := range req.GroupNos {
 		for _, group := range groups {
 			if groupNo == group.GroupNo {
+				// Directory-sync events are ordinary membership mutations. AI
+				// containers may only change through explicit lifecycle cleanup;
+				// otherwise an HR event can remove the owner or Bot and break the
+				// two-member confidentiality boundary.
+				if group.Purpose == aiteampkg.GroupPurpose {
+					break
+				}
 				realGroups = append(realGroups, groupNo)
 				spaceIDByGroupNo[groupNo] = group.SpaceID
 				break

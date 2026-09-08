@@ -85,6 +85,35 @@ func TestArchiveStaleBatch(t *testing.T) {
 	assert.Equal(t, int64(9999), m.Version)
 }
 
+func TestArchiveStaleBatch_SkipsAITeamContainers(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	old := time.Now().Add(-10 * 24 * time.Hour)
+	threshold := time.Now().Add(-3 * 24 * time.Hour)
+	insertThread(t, db, "ai_archive_exempt", ThreadStatusActive, &old)
+	insertThread(t, db, "ordinary_archive", ThreadStatusActive, &old)
+	_, err := db.session.InsertBySql(
+		"INSERT INTO `group` (group_no,name,status,purpose) VALUES (?,?,1,?),(?,?,1,'')",
+		"g_ai_archive_exempt", "AI container", "ai_session_container",
+		"g_ordinary_archive", "ordinary",
+	).Exec()
+	require.NoError(t, err)
+
+	rows, err := db.ArchiveStaleBatch(threshold, 100, 9999, common.ChannelTypeCommunityTopic.Uint8())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rows)
+
+	aiThread, err := db.QueryByShortID("ai_archive_exempt")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusActive, aiThread.Status, "AI session threads must never be auto-archived")
+	ordinary, err := db.QueryByShortID("ordinary_archive")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusArchived, ordinary.Status)
+}
+
 func TestArchiveStaleBatch_RespectsBatchSize(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))

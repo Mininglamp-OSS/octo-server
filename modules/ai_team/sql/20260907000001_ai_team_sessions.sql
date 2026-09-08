@@ -33,34 +33,6 @@ CREATE TABLE `ai_team_session` (
   KEY `idx_ai_team_session_agent` (`agent_id`, `state`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- The AI-session rollout requires global thread auto-archive to be off. A DB
--- row is authoritative over any stale deployment environment variable.
-CREATE TABLE `ai_team_setting_backup` (
-  `category` VARCHAR(64) NOT NULL,
-  `key_name` VARCHAR(128) NOT NULL,
-  `value` TEXT NOT NULL,
-  `value_type` VARCHAR(16) NOT NULL,
-  `description` VARCHAR(255) NOT NULL,
-  PRIMARY KEY (`category`, `key_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
-
-INSERT INTO `ai_team_setting_backup` (`category`, `key_name`, `value`, `value_type`, `description`)
-SELECT `category`, `key_name`, `value`, `value_type`, `description`
-FROM `system_setting`
-WHERE `category`='thread' AND `key_name`='auto_archive_enabled';
-
-INSERT INTO `system_setting` (`category`, `key_name`, `value`, `value_type`, `description`)
-VALUES ('thread', 'auto_archive_enabled', '0', 'bool', '是否开启子区不活跃自动归档')
-ON DUPLICATE KEY UPDATE `value`='0', `value_type`='bool';
-
 -- +migrate Down
-DELETE FROM `system_setting`
-WHERE `category`='thread' AND `key_name`='auto_archive_enabled';
-
-INSERT INTO `system_setting` (`category`, `key_name`, `value`, `value_type`, `description`)
-SELECT `category`, `key_name`, `value`, `value_type`, `description`
-FROM `ai_team_setting_backup`;
-
-DROP TABLE IF EXISTS `ai_team_setting_backup`;
 DROP TABLE IF EXISTS `ai_team_session`;
 DROP TABLE IF EXISTS `ai_team_agent`;

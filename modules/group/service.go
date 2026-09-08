@@ -2,6 +2,7 @@ package group
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -111,6 +112,11 @@ type IService interface {
 	// GetGroupsWithMemberUIDForLifecycleCleanup returns every active membership,
 	// including server-managed containers hidden from product-facing lists.
 	GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*InfoResp, error)
+	// RemoveUserFromGroupsForLifecycleCleanup removes a deprovisioned account
+	// from every active group, including hidden server-managed containers.
+	// Product-facing deletion routes must use this single entry point so a new
+	// account lifecycle path cannot accidentally strand protected membership.
+	RemoveUserFromGroupsForLifecycleCleanup(uid string) error
 	// 获取指定群的群成员的最大数据版本
 	GetGroupMemberMaxVersion(groupNo string) (int64, error)
 	// 获取用户所有超级群信息
@@ -239,6 +245,51 @@ func (s *Service) GetGroupsWithMemberUID(uid string) ([]*InfoResp, error) {
 func (s *Service) GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*InfoResp, error) {
 	groups, err := s.db.queryAllGroupsWithMemberUID(uid)
 	return groupModelsToInfo(groups, err)
+}
+
+// RemoveUserFromGroupsForLifecycleCleanup is the authoritative account-teardown
+// path for group membership. It deliberately sees AI containers that ordinary
+// product lists hide, and only enables protected removal for rows whose persisted
+// purpose proves they are lifecycle-managed containers.
+func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
+	groups, err := s.GetGroupsWithMemberUIDForLifecycleCleanup(uid)
+	if err != nil {
+		return fmt.Errorf("query lifecycle groups for %s: %w", uid, err)
+	}
+
+	var cleanupErrs []error
+	for _, group := range groups {
+		// Disbanded groups retain member rows by existing lifecycle semantics.
+		if group.Status == GroupStatusDisband {
+			continue
+		}
+		result, removeErr := s.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+			GroupNo:              group.GroupNo,
+			Members:              []string{uid},
+			OperatorUID:          uid,
+			SuppressRemoveNotice: true,
+			AllowProtected:       group.Purpose == aiteampkg.GroupPurpose,
+		})
+		if removeErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: %w", uid, group.GroupNo, removeErr))
+			continue
+		}
+		if result == nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: empty cleanup result", uid, group.GroupNo))
+			continue
+		}
+		removed := false
+		for _, removedUID := range result.RemovedUIDs {
+			if removedUID == uid {
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: membership was not removed", uid, group.GroupNo))
+		}
+	}
+	return errors.Join(cleanupErrs...)
 }
 
 func groupModelsToInfo(groups []*Model, err error) ([]*InfoResp, error) {

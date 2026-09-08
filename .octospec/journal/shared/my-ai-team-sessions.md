@@ -22,7 +22,8 @@ source: self
   mutations, while preserving authoritative Space-member lifecycle cleanup.
 - Filters both the dedicated parent and its topic channels from ordinary group,
   recent-conversation and follow/sidebar results.
-- Persists the rollout-wide `thread.auto_archive_enabled=0` system setting.
+- Keeps the operator-owned global auto-archive setting unchanged and structurally
+  exempts AI-session threads from the stale-thread archive worker.
 
 ## Structural learnings
 
@@ -44,8 +45,8 @@ source: self
 - Build, unit suite, four E2E/API shards, focused AI/message tests, `go vet`, i18n
   checks and direct WuKongIM type-17 persistence passed. Exact evidence is in
   `.octospec/tasks/my-ai-team-sessions/verification.md`.
-- A blank-database migration was queried directly and returned
-  `thread / auto_archive_enabled / 0`.
+- A migration round-trip test proves the feature does not overwrite an existing
+  operator-owned `thread.auto_archive_enabled` value.
 - The full pilote2e package still has an unrelated existing card-template catalog
   fixture failure; its direct WuKongIM persistence test passes.
 - Client and external adapter E1-E5 remain deployment-level handoff checks; this PR
@@ -83,3 +84,14 @@ source: self
   remove the protected Bot membership through the normal removal funnel.
 - Re-ran build, vet, 52 unit packages, all four API/E2E shards, i18n checks and the
   focused WuKongIM persistence test successfully.
+
+## Review convergence follow-up
+
+- Added one group lifecycle-cleanup service and routed all three Bot deletion
+  surfaces through it, including protected AI-container membership removal.
+- Closed the remaining org-directory and category mutation/read bypasses with
+  DB-backed regression coverage.
+- Made AI session retention structural in `ArchiveStaleBatch`; removed the
+  migration-time write that overwrote an operator's global auto-archive setting.
+- Re-ran all six affected module suites plus build, vet and i18n checks on isolated
+  MySQL/Redis/WuKongIM test services.

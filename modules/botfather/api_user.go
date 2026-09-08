@@ -462,6 +462,15 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 		}
 	}
 
+	// Account lifecycle cleanup must happen while the Bot still exists. The
+	// shared group entry point includes hidden AI containers and is the only
+	// place allowed to opt into protected membership removal.
+	if err := bf.groupService.RemoveUserFromGroupsForLifecycleCleanup(botID); err != nil {
+		bf.Error("清理Bot群成员失败", zap.String("botID", botID), zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
+		return
+	}
+
 	// Clean up IM connection: invalidate token to kick existing WS sessions
 	newIMToken := util.GenerUUID()
 	_, imErr := bf.ctx.UpdateIMToken(config.UpdateIMTokenReq{

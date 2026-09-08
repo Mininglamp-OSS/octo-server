@@ -81,3 +81,43 @@ func TestHandleOrgEmployeeExit_AlsoCleansThreads(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, existInGroup, "组织退出必须删除 group_member")
 }
+
+func TestHandleOrgEmployeeExit_SkipsAITeamContainerMutations(t *testing.T) {
+	svc, userDB := setupServiceTest(t)
+	s := svc.(*Service)
+	f := New(s.ctx)
+
+	insertTestUsers(t, userDB, "orgexit_ai_owner", "orgexit_ai_bot")
+	const groupNo = "g_orgexit_ai_container"
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: groupNo, Name: "AI container", Creator: "orgexit_ai_owner",
+		SpaceID: "space_orgexit_ai", Status: GroupStatusNormal,
+		Purpose: "ai_session_container",
+	}))
+	for _, member := range []*MemberModel{
+		{GroupNo: groupNo, UID: "orgexit_ai_owner", Role: MemberRoleCreator, Status: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID())},
+		{GroupNo: groupNo, UID: "orgexit_ai_bot", Role: MemberRoleCommon, Status: 1, Robot: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID())},
+	} {
+		require.NoError(t, f.db.InsertMember(member))
+	}
+
+	payload := config.OrgEmployeeExitReq{
+		Operator: "orgexit_ai_owner",
+		GroupNos: []string{groupNo},
+	}
+	var commitErr error
+	committed := false
+	f.handleOrgEmployeeExit([]byte(util.ToJson(payload)), func(err error) {
+		committed = true
+		commitErr = err
+	})
+	require.True(t, committed)
+	require.NoError(t, commitErr)
+
+	var activeUIDs []string
+	_, err := f.ctx.DB().Select("uid").From("group_member").
+		Where("group_no=? AND is_deleted=0", groupNo).OrderBy("uid").Load(&activeUIDs)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orgexit_ai_bot", "orgexit_ai_owner"}, activeUIDs,
+		"org employee exit must leave the two-member AI container unchanged")
+}

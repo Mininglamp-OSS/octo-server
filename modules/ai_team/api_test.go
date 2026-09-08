@@ -491,7 +491,7 @@ func TestAITeamRejectsMissingSpaceForeignBotAndOrdinaryMutation(t *testing.T) {
 	assert.Equal(t, 2, memberCount)
 }
 
-func TestAITeamMigrationDisablesGlobalThreadAutoArchive(t *testing.T) {
+func TestAITeamMigrationPreservesGlobalThreadAutoArchive(t *testing.T) {
 	dbName := "octo_ai_team_migration_" + strings.ReplaceAll(util.GenerUUID(), "-", "")
 	admin, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/?charset=utf8mb4&parseTime=true")
 	require.NoError(t, err)
@@ -521,7 +521,7 @@ func TestAITeamMigrationDisablesGlobalThreadAutoArchive(t *testing.T) {
 	require.NoError(t, err)
 	var value string
 	require.NoError(t, db.QueryRow("SELECT value FROM system_setting WHERE category='thread' AND key_name='auto_archive_enabled'").Scan(&value))
-	assert.Equal(t, "0", value)
+	assert.Equal(t, "1", value, "feature migration must not overwrite the operator's global setting")
 	var collation string
 	require.NoError(t, db.QueryRow("SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME='ai_team_session' AND COLUMN_NAME='idempotency_key'", dbName).Scan(&collation))
 	assert.Equal(t, "utf8mb4_bin", collation)
@@ -529,7 +529,7 @@ func TestAITeamMigrationDisablesGlobalThreadAutoArchive(t *testing.T) {
 	_, err = migrate.Exec(db, "mysql", source, migrate.Down)
 	require.NoError(t, err)
 	require.NoError(t, db.QueryRow("SELECT value FROM system_setting WHERE category='thread' AND key_name='auto_archive_enabled'").Scan(&value))
-	assert.Equal(t, "1", value, "rollback must restore the operator's prior setting")
+	assert.Equal(t, "1", value, "rollback must leave the operator's setting unchanged")
 }
 
 func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {

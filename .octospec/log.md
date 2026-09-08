@@ -2436,3 +2436,13 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   AI-container membership or its WuKongIM subscription.
 - Hardened provisioning state transitions and session rename lock ordering.
 - Re-ran build, vet, unit, all four API/E2E shards, i18n and focused WuKongIM gates.
+
+## 2026-09-08 — my-ai-team-sessions (review convergence)
+
+- Centralized Bot group-membership teardown and applied it to command, User API,
+  and super-admin deletion paths so hidden AI containers cannot be stranded.
+- Guarded org-exit and category paths, filtered category reads, and excluded AI
+  session threads from automatic archival without overwriting global operator
+  settings during migration.
+- Added DB-backed regressions and passed all affected module suites, build, vet,
+  i18n extraction/lint, and diff checks on the isolated task test stack.

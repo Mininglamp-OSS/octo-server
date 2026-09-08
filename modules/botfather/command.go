@@ -16,7 +16,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"go.uber.org/zap"
@@ -694,25 +693,8 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 }
 
 func (h *commandHandler) removeBotFromGroups(botID string) {
-	groups, err := h.groupService.GetGroupsWithMemberUIDForLifecycleCleanup(botID)
-	if err != nil {
-		h.Error("查询Bot所在群失败", zap.Error(err))
-		return
-	}
-	for _, g := range groups {
-		// 已解散的群跳过，不进漏斗。成员行与人类成员保持一致地保留。
-		if g.Status == group.GroupStatusDisband {
-			continue
-		}
-		if _, rmErr := h.groupService.RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
-			GroupNo:              g.GroupNo,
-			Members:              []string{botID},
-			OperatorUID:          botID,
-			SuppressRemoveNotice: true,
-			AllowProtected:       g.Purpose == aiteampkg.GroupPurpose,
-		}); rmErr != nil {
-			h.Error("从群移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(rmErr))
-		}
+	if err := h.groupService.RemoveUserFromGroupsForLifecycleCleanup(botID); err != nil {
+		h.Error("从群清理Bot失败", zap.String("botID", botID), zap.Error(err))
 	}
 }
 

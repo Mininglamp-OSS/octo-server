@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -22,14 +23,16 @@ import (
 type Manager struct {
 	ctx *config.Context
 	log.Log
-	db *robotDB
+	db           *robotDB
+	groupService group.IService
 }
 
 func NewManager(ctx *config.Context) *Manager {
 	return &Manager{
-		ctx: ctx,
-		Log: log.NewTLog("robotManager"),
-		db:  newBotDB(ctx),
+		ctx:          ctx,
+		Log:          log.NewTLog("robotManager"),
+		db:           newBotDB(ctx),
+		groupService: group.NewService(ctx),
 	}
 }
 
@@ -331,6 +334,11 @@ func (m *Manager) robotDelete(c *wkhttp.Context) {
 	robotID := c.Param("robot_id")
 	if robotID == "" {
 		respondRobotRequestInvalid(c, "robot_id")
+		return
+	}
+	if err := m.groupService.RemoveUserFromGroupsForLifecycleCleanup(robotID); err != nil {
+		m.Error("清理机器人群成员失败", zap.String("robotID", robotID), zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 
