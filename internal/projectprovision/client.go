@@ -299,6 +299,23 @@ func ValidateTarget(t Target) error {
 	if strings.TrimSpace(t.Name) == "" {
 		return errors.New("projectprovision: target name required")
 	}
+	// Surrounding whitespace is REFUSED, not trimmed, and the difference is the
+	// whole point. A secret mounted from a file carries a trailing newline; trimming
+	// it would let a subtly wrong mount work, so nobody learns the mount is wrong
+	// until the day something stops trimming. Refusing surfaces it at boot, in the
+	// one place an operator is already reading — while trimming silently would have
+	// been indistinguishable from a correct deployment.
+	//
+	// The alternative failure, if this check is absent, is not a clean error either:
+	// every request signs with a value the peer rejects, so the whole retry budget
+	// burns as 401s that look exactly like a rotated secret, and the row lands in
+	// abandoned, which has no automatic re-drive.
+	//
+	// No value in the message, on the same principle as the length check below.
+	if strings.TrimSpace(t.Secret) != t.Secret {
+		return fmt.Errorf("projectprovision: %s secret has leading or trailing whitespace; "+
+			"a file-mounted secret usually needs its trailing newline removed", t.Name)
+	}
 	if len(t.Secret) < minSecretBytes {
 		// No secret value in the message, and no length either — an error string
 		// that reports the observed length is a (small) oracle in a log.
@@ -348,7 +365,14 @@ func ValidateTarget(t Target) error {
 	}
 	// A fragment is never sent, so one in configuration means the value was pasted from
 	// somewhere it did not belong.
-	if parsed.Fragment != "" {
+	//
+	// Checked on the RAW string, not on parsed.Fragment. url.Parse leaves Fragment
+	// empty for a bare trailing "#", so "https://host/ensure#" passes a
+	// parsed.Fragment check while still carrying the separator. cardactiondispatch
+	// documents this exact case and uses ContainsRune for it; this package claimed
+	// alignment with that validator and had the weaker check — the same defect its
+	// sibling had already found and fixed.
+	if strings.ContainsRune(t.EnsureURL, '#') {
 		return fmt.Errorf("projectprovision: %s ensure url must not contain a fragment", t.Name)
 	}
 	return nil
@@ -472,11 +496,23 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	if err := decoder.Decode(&out); err != nil {
 		return EnsureResponse{}, &EnsureError{Category: "invalid_response", cause: err}
 	}
+	if out.ContainerID == "" {
+		// A MISSING id is a malformed response, not evidence the peer owns a
+		// different container — the two must not share a category, because one is
+		// retryable and the other is terminal on the first attempt.
+		//
+		// This is the shape a peer serves while its ensure endpoint is still being
+		// rolled out: a stub answering {} , a proxy returning an empty body with a
+		// 200. Classifying it as a mismatch abandons the row immediately, and
+		// abandoned has no automatic re-drive — so a transient state on the other
+		// side would need a human to requeue, at exactly the moment the first
+		// target is being enabled.
+		return EnsureResponse{}, &EnsureError{Category: "invalid_response", Status: response.StatusCode}
+	}
 	if out.ContainerID != req.ContainerID {
-		// Fail loudly and permanently. A target that answers with a different id
-		// means our mapping row now points at a container nobody owns, and
-		// retrying cannot repair that — it needs a human to look at which side
-		// generated the id.
+		// A DIFFERENT id is terminal. Our mapping row now points at a container
+		// nobody owns, and retrying cannot repair that — it needs a human to look
+		// at which side generated the id.
 		return EnsureResponse{}, &EnsureError{Category: "container_id_mismatch", Status: response.StatusCode}
 	}
 	return out, nil

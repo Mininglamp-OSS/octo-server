@@ -111,6 +111,37 @@ func TestContainerEventIDIsAOneWayStableDerivation(t *testing.T) {
 	}
 }
 
+// TestEnsureTreatsAnAbsentContainerIDAsRetryable separates the two shapes that
+// used to share one category.
+//
+// A MISSING id is a malformed response; a DIFFERENT id is evidence the peer owns
+// a container we do not know about. Only the second is terminal, and the
+// difference is not cosmetic: container_id_mismatch is abandoned on the FIRST
+// attempt, and abandoned has no automatic re-drive.
+//
+// The missing shape is what a peer serves while its ensure endpoint is still
+// rolling out — a stub answering {}, a proxy returning an empty 200 body. That
+// is precisely the window in which the first target gets enabled, so filing it
+// as terminal would need a human to requeue every row created during it.
+func TestEnsureTreatsAnAbsentContainerIDAsRetryable(t *testing.T) {
+	for _, body := range []string{`{}`, `{"container_id":""}`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			_, err := NewClient(nil, nil).Ensure(context.Background(), testTarget(server.URL+"/ensure"), EnsureRequest{
+				ContainerID: "octows-deadbeef", ProjectID: "p1", OctoSpaceID: "s1",
+			})
+			if got := Category(err); got != "invalid_response" {
+				t.Fatalf("category = %q, want invalid_response — an absent id is a malformed "+
+					"response, not proof the peer owns a different container (err=%v)", got, err)
+			}
+		})
+	}
+}
+
 // TestEnsureRejectsAMismatchedContainerID pins the fail-loud-and-permanent branch.
 // A target that answers with a different id means our mapping row points at a
 // container nobody owns, and no number of retries repairs that.
@@ -281,6 +312,18 @@ func TestValidateTarget(t *testing.T) {
 		// the wire, so ForceQuery has to be checked too.
 		{"force_query", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure?", Secret: testSecret}, true},
 		{"fragment", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure#frag", Secret: testSecret}, true},
+		// The EMPTY fragment. url.Parse leaves Fragment == "" for a bare trailing
+		// "#", so a parsed.Fragment check passes it while the separator is still in
+		// the configured value. cardactiondispatch documents this case and checks the
+		// raw string; this package claimed alignment and had the weaker check.
+		{"empty_fragment", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure#", Secret: testSecret}, true},
+		// A secret mounted from a file carries a trailing newline. Refused rather
+		// than trimmed: trimming lets a subtly wrong mount work, and the failure it
+		// otherwise produces is a whole retry budget of 401s indistinguishable from a
+		// rotated secret, ending in abandoned, which has no automatic re-drive.
+		{"secret_trailing_newline", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure", Secret: testSecret + "\n"}, true},
+		{"secret_leading_space", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure", Secret: " " + testSecret}, true},
+		{"secret_trailing_space", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure", Secret: testSecret + " "}, true},
 		// Host alone keeps the ":port", so a host-less URL with a port would pass a
 		// `Host != ""` check; Hostname() is what actually rejects it.
 		{"port_without_host", Target{Name: "fleet", EnsureURL: "http://:8080/ensure", Secret: testSecret}, true},

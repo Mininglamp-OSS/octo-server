@@ -257,8 +257,16 @@ type ProvisioningConfig struct {
 }
 
 // Enabled reports whether any target is live. When false, createProjectOnce
-// enqueues nothing and the worker does not start, so the provisioning slice is
-// completely inert — which is its default state.
+// enqueues nothing and the worker does not start.
+//
+// NOT completely inert, and the exception is deliberate rather than an
+// oversight: markProvisioningDisbandPendingTx runs UNCONDITIONALLY on the
+// disband path. Gating that on Enabled() would mean a target that was enabled,
+// produced rows, and was later disabled stops marking its containers
+// reclaimable — a real leak, with no local record that anything was left behind.
+//
+// This comment is what a future reader consults immediately before "tidying up"
+// by adding that gate, so it says so here rather than only in the runbook.
 func (c ProvisioningConfig) Enabled() bool { return len(c.Targets) > 0 }
 
 // TargetByName returns the resolved target, or false when it is not enabled.

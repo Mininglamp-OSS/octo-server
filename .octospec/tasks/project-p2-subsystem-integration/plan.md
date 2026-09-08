@@ -427,8 +427,8 @@ SELECT p.project_id, p.space_id, 'fleet',
    >   target 就再也不会把自己的容器标成可回收，那是真泄漏。代价是：只要还有一个旧二进制
    >   在服务，表一旦不存在，**每一次项目解散**都会拿到 `Error 1146` →
    >   `disbandProjectOnce` 报错 → **500**，而且是在一条与被回滚功能毫无关系的路径上。
-   > - **手工 drop 不会自愈。** 迁移在启动时由 `pkg/db/mysql.go` 的
-   >   `migrate.Exec(..., migrate.Up)` 应用，手工 drop 会把 `gorp_migrations` 里
+   > - **手工 drop 不会自愈。** 模块迁移在启动时由 `module.Setup` 应用（octo-lib
+   >   `module/module.go:88` 的 `migrate.Exec(..., migrate.Up)`），手工 drop 会把 `gorp_migrations` 里
    >   `20260907000001` 那条账本行留在原地 —— sql-migrate 认为它已应用，**重启不会重建
    >   表**。解散会一直坏着，直到有人再手工删账本行。
    >
@@ -449,8 +449,12 @@ SELECT p.project_id, p.space_id, 'fleet',
    >    行都消失，再启动一次进程，两者都按预期回来。
    >
    >    > ⚠️ 本仓**没有** `dbconfig.yml`，也没有 Makefile 的迁移目标：迁移是由
-   >    > `pkg/db/mysql.go` 的 `migrate.Exec(..., migrate.Up)` 在**进程启动时**对各模块
-   >    > `go:embed` 的 SQL 目录施加的，没有可用的 `sql-migrate` 命令行入口。本文件早期
+   >    > `module.Setup` → octo-lib `module/module.go:88` 的 `migrate.Exec(..., migrate.Up)` 在**进程启动时**对各模块
+   >    > `go:embed` 的 SQL 目录施加的，没有可用的 `sql-migrate` 命令行入口。
+   >    > （本文件早先指向 `pkg/db/mysql.go`。那个文件**确实**有 `migrate.Exec`，但它在
+   >    > `Migration()` 里，而 `Migration()` 在本仓**没有任何非测试调用方**，`testutil`
+   >    > 还显式设 `cfg.DB.Migration = false` —— 所以那不是引用不精确，是指向了一条根本
+   >    > 不执行的路径。回滚步骤本身是对的，错的是它让人去看哪段代码。）本文件早期
    >    > 版本写的 `sql-migrate down -limit=1 -env=<env>` **在本仓根本跑不起来** —— 而一个
    >    > 跑不通的补救步骤，恰恰会把操作者推回同一段落禁止的手工 DDL。如果将来引入了
    >    > dbconfig，再换回 Down 段调用；在那之前，上面那个事务就是等价物。

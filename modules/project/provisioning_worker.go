@@ -164,9 +164,12 @@ func (p *Project) startProvisioningWorker() {
 		// Before the timers, so rows this moves back to `pending` are visible to the
 		// first claim tick rather than waiting a full interval.
 		p.requeueAbandonedProvisioningAtBoot()
-		p.ctx.Schedule(p.cfg.Provisioning.Interval, p.processProvisioningJobs)
-		p.ctx.Schedule(provisioningSweepInterval, p.sweepExhaustedProvisioningJobs)
-		p.ctx.Schedule(provisioningPurgeInterval, p.purgeProvisioningJobs)
+		// Jittered, like reconcile.go's two timers. Without it every replica wakes on
+		// the same tick, so the claim query, sweep, and purge contend at once across
+		// the fleet.
+		p.ctx.Schedule(jitter(p.cfg.Provisioning.Interval), p.processProvisioningJobs)
+		p.ctx.Schedule(jitter(provisioningSweepInterval), p.sweepExhaustedProvisioningJobs)
+		p.ctx.Schedule(jitter(provisioningPurgeInterval), p.purgeProvisioningJobs)
 	})
 }
 
@@ -225,7 +228,7 @@ func (p *Project) requeueAbandonedProvisioningAtBoot() {
 // over a table that is empty in the default state.
 func (p *Project) startProvisioningMetrics() {
 	provisioningMetricsOnce.Do(func() {
-		p.ctx.Schedule(p.cfg.MetricsInterval, p.refreshProvisioningMetrics)
+		p.ctx.Schedule(jitter(p.cfg.MetricsInterval), p.refreshProvisioningMetrics)
 	})
 }
 

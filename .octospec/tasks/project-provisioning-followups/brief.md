@@ -14,7 +14,8 @@ source: user
 
 ## Goal
 
-Keep two categories of knowledge from being lost, and make them actionable.
+Fix the six review findings that survived PR #850's squash, and record the one
+thing that cannot be fixed because it is a decision about future work.
 
 PR #850 landed as **one squashed commit whose message describes the slice, not
 the review**. Eleven commits and seven review rounds collapsed into it. Two
@@ -153,19 +154,22 @@ pointer sends whoever follows them to dead code.
 
 ## Acceptance
 
-- [ ] A-4: whitespace around a provisioning secret is REJECTED at config load
+All six are FIXED in this task rather than filed. The boxes below were the
+acceptance criteria and are checked against the implementation.
+
+- [x] A-4: whitespace around a provisioning secret is REJECTED at config load
       with a message naming the env, and a test covers a trailing newline.
-- [ ] A-5: `https://host/ensure#` is refused, by the same mechanism
+- [x] A-5: `https://host/ensure#` is refused, by the same mechanism
       `internal/cardactiondispatch` uses; a test pins the empty-fragment case.
-- [ ] A-3: an empty or absent `container_id` in the echo classifies as
+- [x] A-3: an empty or absent `container_id` in the echo classifies as
       `invalid_response` (retryable); a genuinely different id stays
       `container_id_mismatch` (permanent). Both pinned.
-- [ ] A-1: the `Enabled()` comment states that the disband write is
+- [x] A-1: the `Enabled()` comment states that the disband write is
       unconditional and why, so "add a gate here" fails review rather than
       passing it.
-- [ ] A-6: all four provisioning timers are jittered, matching `reconcile.go`.
-- [ ] P2-5: `plan.md` §3.5 names `module.Setup` / octo-lib `module/module.go`,
+- [x] A-6: all four provisioning timers are jittered, matching `reconcile.go`.
+- [x] P2-5: `plan.md` §3.5 names `module.Setup` / octo-lib `module/module.go`,
       and says the rollback ordering it already gets right.
-- [ ] D-1 is discoverable from the merged tree: a reader of
+- [x] D-1 is discoverable from the merged tree: a reader of
       `modules/project/provisioning.go` finds the pointer without reading a
       closed PR thread.
