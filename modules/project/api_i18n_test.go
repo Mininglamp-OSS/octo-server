@@ -127,8 +127,6 @@ func TestProjectNoLegacyResponseError(t *testing.T) {
 // best-effort anomaly counter is a diagnostic, not the guarantee.
 func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 	found := false
-	assignment := regexp.MustCompile(`member_epoch\s*=`)
-	increment := regexp.MustCompile(`member_epoch\s*=\s*member_epoch\s*\+\s*1`)
 	setCall := regexp.MustCompile(`Set\(\s*"member_epoch"`)
 	setMap := regexp.MustCompile(`"member_epoch"\s*:`)
 
@@ -142,18 +140,85 @@ func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 				"guaranteed by the write shape rather than observed by the reconcile scan", f)
 			continue
 		}
-		for _, m := range assignment.FindAllStringIndex(cleaned, -1) {
-			window := cleaned[m[0]:min(m[1]+60, len(cleaned))]
-			if !increment.MatchString(window) {
-				t.Errorf("modules/project/%s assigns member_epoch to something other than "+
-					"member_epoch + 1: %q", f, strings.TrimSpace(window))
-			}
+		for _, bad := range nonIncrementEpochWrites(cleaned) {
+			t.Errorf("modules/project/%s assigns member_epoch to something other than "+
+				"member_epoch + 1: %q", f, bad)
+		}
+		if strings.Contains(cleaned, "member_epoch = member_epoch + 1") {
 			found = true
 		}
 	}
 	if !found {
 		t.Error("no `member_epoch = member_epoch + 1` statement found; either the increment " +
 			"moved out of this package or the guard stopped matching it")
+	}
+}
+
+var (
+	epochAssignment = regexp.MustCompile(`member_epoch\s*=`)
+	epochIncrement  = regexp.MustCompile(`member_epoch\s*=\s*member_epoch\s*\+\s*1`)
+	// epochPredicate matches the SQL read positions a column name can appear in
+	// with an `=` after it: `WHERE member_epoch = ?`, `AND member_epoch = 0`.
+	// Those are comparisons, not writes, and this guard is about the write shape.
+	//
+	// Excluding them is a sharpening rather than a relaxation: `SET member_epoch =`
+	// and `, member_epoch =` (a second assignment inside one SET list) are both
+	// still caught, which TestEpochGuardStillCatchesRealWrites pins with the exact
+	// mutations that motivated the exclusion. The alternative — spelling the repair
+	// predicate some other way to dodge a regex — would have hidden a real
+	// comparison from every future reader instead.
+	epochPredicate = regexp.MustCompile(`(?i)\b(?:where|and|or)\s+member_epoch\s*=`)
+)
+
+// nonIncrementEpochWrites returns every member_epoch assignment in `cleaned`
+// that is not the increment, as printable windows. Empty means the file is clean.
+func nonIncrementEpochWrites(cleaned string) []string {
+	predicates := make(map[int]bool)
+	for _, m := range epochPredicate.FindAllStringIndex(cleaned, -1) {
+		// Key on where the column name starts, so the two regexes agree on identity.
+		predicates[strings.Index(cleaned[m[0]:m[1]], "member_epoch")+m[0]] = true
+	}
+	var bad []string
+	for _, m := range epochAssignment.FindAllStringIndex(cleaned, -1) {
+		if predicates[m[0]] {
+			continue
+		}
+		window := cleaned[m[0]:min(m[1]+60, len(cleaned))]
+		if !epochIncrement.MatchString(window) {
+			bad = append(bad, strings.TrimSpace(window))
+		}
+	}
+	return bad
+}
+
+// TestEpochGuardStillCatchesRealWrites pins the exclusion above against the
+// mutations it must never let through.
+//
+// Without this, narrowing the guard to ignore predicate position is unfalsifiable:
+// the narrowing and a hole in the guard look identical from the passing side.
+func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
+	caught := []string{
+		`UPDATE octo_project SET member_epoch = 0 WHERE project_id = ?`,
+		`UPDATE octo_project SET updated_at = ?, member_epoch = 1 WHERE project_id = ?`,
+		`UPDATE octo_project SET member_epoch = member_epoch - 1 WHERE project_id = ?`,
+		// The repair statement's own shape, mutated back to an absolute assignment.
+		`UPDATE octo_project SET member_epoch = 1 WHERE project_id = ? AND member_epoch = ?`,
+	}
+	for _, src := range caught {
+		if got := nonIncrementEpochWrites(src); len(got) == 0 {
+			t.Errorf("guard no longer catches a non-increment write: %q", src)
+		}
+	}
+
+	allowed := []string{
+		`UPDATE octo_project SET member_epoch = member_epoch + 1 WHERE project_id = ? AND status = ?`,
+		`UPDATE octo_project SET member_epoch = member_epoch + 1 WHERE project_id = ? AND member_epoch = ?`,
+		`SELECT id FROM octo_project WHERE member_epoch = 0`,
+	}
+	for _, src := range allowed {
+		if got := nonIncrementEpochWrites(src); len(got) != 0 {
+			t.Errorf("guard rejects a legitimate statement %q: %v", src, got)
+		}
 	}
 }
 

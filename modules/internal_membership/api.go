@@ -120,13 +120,27 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 // id never made it into the response", and the two demand opposite reactions.
 //
 // Zero is the sentinel the integration contract assigns to "does not exist or
-// not visible", and it is fail-closed ONLY BECAUSE no real project can hold it:
-// projects are created at member_epoch 1 and the column is never written by
+// not visible", and it is fail-closed ONLY BECAUSE an active project is kept off
+// it: projects are created at member_epoch 1 and the column is never written by
 // anything but an increment. That invariant is what this answer rests on, not a
 // coincidence about the numbers — while creation left the epoch at the column
 // default of 0, a fresh solo project reported the same value as a disbanded one,
 // and a consumer caching a grant under epoch 0 kept it forever. See
 // modules/project migration 20260908000001.
+//
+// "Kept off it" rather than "cannot reach it", deliberately. Three writers keep
+// the invariant, and only the first two are synchronous:
+//
+//   - the create path bumps the epoch, so new projects start at 1;
+//   - the migration lifted every row that was already at 0;
+//   - modules/project's reconcile scan repairs any row that lands back on 0
+//     afterwards — a not-yet-upgraded pod mid-rollout, or a rolled-back binary,
+//     both of which restore the zero-inserting create path.
+//
+// So the window is bounded by the scan interval, not closed outright, and the
+// direction of the residue is the availability one (a brand new project reads as
+// "does not exist" until the scan passes) rather than the stale-grant one. See
+// modules/project.repairAbsentSentinelEpoch.
 type epochsResponse struct {
 	Projects map[string]int64 `json:"projects"`
 }

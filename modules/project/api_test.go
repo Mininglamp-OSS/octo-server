@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -518,9 +519,49 @@ const (
 //
 // Down is applied in REVERSE order for the usual reason: the later file's Down
 // drops objects the earlier file's Down would otherwise pull out from under it.
-var projectMigrationFiles = []string{
-	"sql/20260904000001_project_core.sql",
-	"sql/20260906000001_project_group_binding.sql",
+//
+// EDITED AGAIN. A hand-maintained list re-arms the same trap the paragraph above
+// describes every time a migration is added and the list is not: two more files
+// (#850's provisioning tables and this module's member_epoch backfill) were on
+// disk and absent from the list before this changed. The list is now DERIVED from
+// the embedded directory, which is the same set `migrate.Exec` applies at boot, so
+// the two cannot drift. Filename order is apply order — the `<yyyyMMdd>-<seq>`
+// convention exists for exactly that — and ReadDir returns entries sorted by name.
+var projectMigrationFiles = discoverProjectMigrations()
+
+func discoverProjectMigrations() []string {
+	entries, err := sqlFS.ReadDir("sql")
+	if err != nil {
+		panic("project: read embedded migrations: " + err.Error())
+	}
+	files := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		files = append(files, "sql/"+e.Name())
+	}
+	return files
+}
+
+// TestProjectMigrationFilesCoverTheDirectory keeps the derivation honest: it must
+// find every .sql file the module embeds, and it must find at least the ones that
+// existed when this was written, so a broken glob cannot make the migration lap
+// pass vacuously.
+func TestProjectMigrationFilesCoverTheDirectory(t *testing.T) {
+	entries, err := sqlFS.ReadDir("sql")
+	require.NoError(t, err)
+	var want []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			want = append(want, "sql/"+e.Name())
+		}
+	}
+	require.Equal(t, want, projectMigrationFiles)
+	require.GreaterOrEqual(t, len(projectMigrationFiles), 4,
+		"the module shipped four migrations when this was written; a shorter list means the "+
+			"derivation stopped seeing files, which is how the Down/Up lap rebuilds a stale schema")
+	require.Contains(t, projectMigrationFiles, "sql/20260908000001_project_member_epoch_base_one.sql")
 }
 
 // applyProjectMigration executes one section of every migration file this module

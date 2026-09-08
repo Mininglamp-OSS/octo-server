@@ -232,6 +232,57 @@ func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) erro
 	return nil
 }
 
+// absentEpochSentinel is the value the membership integration contract reserves
+// for "project does not exist or is not visible".
+//
+// It is spelled out here rather than written as a bare 0 because the whole point
+// of migration 20260908000001 is that this value must never be reachable by a
+// real, active project. Naming it makes the two places that care — the repair
+// predicate below and the reconcile scan that drives it — obviously the same
+// value as the contract's.
+const absentEpochSentinel = 0
+
+// repairAbsentSentinelEpoch lifts ONE active project off the absent-sentinel
+// value, and reports whether it actually had to.
+//
+// Why this exists even though migration 20260908000001 already backfilled every
+// row: the migration enforces the invariant at ONE INSTANT — the boot that runs
+// it. Two windows re-open it afterwards, and neither is hypothetical:
+//
+//   - Rolling deploy. The first upgraded pod applies the backfill while pods on
+//     the old image keep inserting projects at the column default. Those rows
+//     hold the sentinel until some unrelated roster write moves them.
+//   - Rollback. The migration's Down is a no-op and its ledger row stays, so
+//     rolling the binary back restores the zero-inserting create path
+//     indefinitely and rolling forward again never re-runs the backfill.
+//
+// A one-instant invariant is not one the endpoint's fail-closed reasoning can
+// rest on, so the scheduled scan turns it into a continuously enforced one. The
+// statement is `member_epoch + 1`, the same increment-only shape as every other
+// write to this column, so monotonicity survives the repair — this raises an
+// epoch, it never assigns one.
+//
+// The predicate is repeated in full rather than trusting the row the scan read:
+// the scan reads outside a transaction, so between the read and this statement
+// the project may have been disbanded or had its epoch moved by a real roster
+// write. Both cases match no row, and the caller learns that from the returned
+// count rather than logging a repair that did not happen.
+func (d *DB) repairAbsentSentinelEpoch(projectID string) (int64, error) {
+	result, err := d.session.UpdateBySql(
+		"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
+			"WHERE project_id = ? AND status = ? AND member_epoch = ?",
+		projectID, StatusNormal, absentEpochSentinel,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: repair absent-sentinel epoch: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: repair absent-sentinel epoch rows: %w", err)
+	}
+	return affected, nil
+}
+
 // countActiveInSpaceTx counts a Space's active projects inside the create transaction.
 // The quota must be counted in the same transaction that inserts, or two
 // concurrent creates both pass the check and both land.

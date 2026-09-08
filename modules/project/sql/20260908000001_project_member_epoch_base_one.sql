@@ -38,9 +38,19 @@
 --     requested id in the first place.
 --
 -- Starting real epochs at 1 is the only option that needs no change from the
--- consumer at all. The contract stays exactly as written; 0 simply becomes
--- unrepresentable for a real project, which is what makes its documented meaning
--- true for the first time.
+-- consumer at all. The contract stays exactly as written; 0 stops being a value
+-- an active project rests on, which is what makes its documented meaning true.
+--
+-- THIS STATEMENT ALONE DOES NOT MAKE 0 UNREACHABLE, and the comment used to say
+-- it did. It enforces the invariant at ONE INSTANT -- the boot that applies it.
+-- A rolling deploy has old pods still inserting at the column default while the
+-- backfill has already run, and a rollback (see the Down section) restores that
+-- create path indefinitely while the ledger row keeps this migration from ever
+-- re-running. Continuous enforcement is the reconcile scan
+-- (modules/project.repairAbsentSentinelEpoch), which lifts an ACTIVE project off
+-- 0 on every rotation and counts it as an anomaly. This migration is the
+-- one-shot that clears the existing backlog cheaply; the scan is what the
+-- endpoint fail-closed reasoning actually rests on.
 --
 -- THE BACKFILL DIRECTION IS SAFE. It is written as an increment rather than an
 -- assignment, matching the write discipline the whole column is held to -- the
@@ -67,8 +77,19 @@ UPDATE `octo_project` SET `member_epoch` = `member_epoch` + 1 WHERE `member_epoc
 -- it was meant to remove it from, and it would move an epoch BACKWARDS, which
 -- every consumer of this column is entitled to assume never happens.
 --
--- Rolling back the binary is enough: the old code reads the column without
--- caring that some values are one higher than it would have written.
+-- Rolling back the binary is safe for READERS: the old code reads the column
+-- without caring that some values are one higher than it would have written.
+--
+-- It is NOT safe for writers, and an operator acting on the sentence this
+-- comment used to carry would have been misled. The old create path inserts at
+-- the column default 0 again, this migration stays recorded as applied so
+-- rolling forward never re-runs it, and every project created in between sits on
+-- the value the integration contract reserves for "does not exist". The
+-- reconcile scan repairs those rows within one rotation -- that is why the
+-- rollback direction is survivable at all -- so a rollback MUST keep the
+-- reconcile loop running, and an operator should expect one epoch bump (hence
+-- one consumer re-verify) per affected project. See
+-- docs/project-member-epoch-rollout.md.
 --
 -- No apostrophes in any comment in this file, on purpose -- the migration test in
 -- this module splits statements naively and treats a quote as a string
