@@ -2,11 +2,13 @@ package project
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -143,6 +145,94 @@ func TestListProjectGroupsExcludesInactiveMembership(t *testing.T) {
 	assert.Empty(t, decodeGroupList(t, w),
 		"is_deleted = 0 AND status = 1 is the canonical active-member predicate; a read that "+
 			"checks only is_deleted returns groups the caller has left")
+}
+
+// TestListProjectGroupsHidesAGroupThatBlacklistedMe pins the one case where this
+// endpoint's membership predicate DIVERGES from the older group surfaces, so the
+// divergence is a decision with a test behind it rather than a side effect.
+//
+// Blacklisting sets group_member.status = GroupMemberStatusBlacklist and leaves
+// is_deleted = 0 (modules/group/db.go:260). GET /v1/group/my filters is_deleted
+// alone, so it still shows the group; this endpoint requires status = Normal, so
+// it does not. That is deliberate: blacklisting is how a group denies access, and
+// ExistMemberActive is the hardening line in front of group and thread reads for
+// exactly this uid, so listing the group here would advertise a room the caller
+// cannot open.
+//
+// The assertion covers both halves. Asserting only the absence would let a future
+// change that ALSO broke /v1/group/my pass while destroying the property that
+// makes this divergence deliberate rather than a bug.
+func TestListProjectGroupsHidesAGroupThatBlacklistedMe(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-blacklist")
+
+	banned := util.GenerUUID()
+	seedProjectGroup(t, banned, spaceA, created.ProjectID)
+	seedInactiveGroupMemberRow(t, banned, "owner1", 0, int(common.GroupMemberStatusBlacklist))
+
+	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Empty(t, decodeGroupList(t, w),
+		"a group that blacklisted the caller must not appear in their project tree: the "+
+			"access gates already refuse them, so listing it advertises a room they cannot open")
+
+	// The other half of the divergence, asserted so it cannot drift silently.
+	mine := doJSON(t, srv, http.MethodGet, "/v1/group/my?space_id="+spaceA, ownerTok, nil)
+	require.Equal(t, http.StatusOK, mine.Code, "body: %s", mine.Body.String())
+	assert.Contains(t, mine.Body.String(), banned,
+		"GET /v1/group/my filters is_deleted alone and still shows the group - if THIS "+
+			"stops being true the divergence documented in listMyProjectGroups is gone and "+
+			"its comment is now wrong")
+}
+
+// TestListProjectGroupsPagesInCreationOrder is the pagination CORRECTNESS case, as
+// distinct from the bounds case below.
+//
+// Without it a swapped LIMIT/OFFSET pair ships green: they are adjacent ints with
+// no compiler check, and page 1 (offset 0) reads correctly either way. It is also
+// the only case that exercises the ORDER BY the module leans on for not dropping
+// or duplicating rows between pages.
+func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-paging")
+
+	// Seeded in order, so `group`.id ascends with the slice index.
+	want := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		groupNo := util.GenerUUID()
+		seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
+		seedGroupMemberRow(t, groupNo, "owner1")
+		want = append(want, groupNo)
+	}
+
+	base := "/v1/projects/" + created.ProjectID + "/groups"
+	all := doJSON(t, srv, http.MethodGet, base, ownerTok, nil)
+	require.Equal(t, http.StatusOK, all.Code, "body: %s", all.Body.String())
+	require.Equal(t, want, groupNosOf(decodeGroupList(t, all)), "unpaged order must be by group id")
+
+	// Page through one at a time: each page must be exactly the next element, and
+	// the union must be the whole set with nothing dropped or repeated.
+	var seen []string
+	for page := 1; page <= 3; page++ {
+		w := doJSON(t, srv, http.MethodGet,
+			fmt.Sprintf("%s?page=%d&limit=1", base, page), ownerTok, nil)
+		require.Equal(t, http.StatusOK, w.Code, "page %d body: %s", page, w.Body.String())
+		got := groupNosOf(decodeGroupList(t, w))
+		require.Len(t, got, 1, "page %d must hold exactly one row", page)
+		assert.Equal(t, want[page-1], got[0],
+			"page %d must be the %d-th group by creation order; a swapped LIMIT/OFFSET "+
+				"pair reads correctly on page 1 and only breaks from page 2 on", page, page)
+		seen = append(seen, got...)
+	}
+	assert.Equal(t, want, seen, "paging must cover every row exactly once")
 }
 
 // TestListProjectGroupsExcludesGroupsOutsideTheProject covers the two ways a group

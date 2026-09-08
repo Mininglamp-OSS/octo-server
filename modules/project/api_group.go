@@ -45,14 +45,11 @@ func (p *Project) listProjectGroupsHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	// No empty-uid check: projectMiddleware already reads GetLoginUID and aborts
+	// with respondNotLoggedIn when it is empty, so a second one here would be
+	// unreachable AND would answer a different envelope than the middleware does
+	// if it ever fired. listMembersHandler omits it for the same reason.
 	uid := c.GetLoginUID()
-	if uid == "" {
-		// Unreachable behind AuthMiddleware; treated as a wiring bug rather than
-		// a request error, exactly as the nil project row above is.
-		p.Error("已认证路由上取不到登录 uid", zap.String("path", c.FullPath()))
-		respondQueryFailed(c)
-		return
-	}
 
 	offset, limit := pageParams(c)
 	rows, err := p.db.listMyProjectGroups(row.SpaceID, row.ProjectID, uid, offset, limit)

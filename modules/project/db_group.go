@@ -1,6 +1,10 @@
 package project
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+)
 
 // The project-scoped group read view.
 //
@@ -77,13 +81,31 @@ type projectGroupRow struct {
 // queryProjectGroupNosWithActiveMember carries the same filter for the same
 // reason, as does the I2 scan.
 //
-// # Active member means is_deleted = 0 AND status = 1
+// # Active member means is_deleted = 0 AND status = GroupMemberStatusNormal
 //
 // That is the repo's canonical predicate (modules/group's ExistMemberActive, and
-// both I2 and I4 reconcile scans). Note it is STRICTER than
+// both I2 and I4 reconcile scans). It is STRICTER than
 // queryProjectGroupNosWithActiveMember, which checks is_deleted alone: that one
 // feeds a cascade whose job is to remove rows, where over-selecting is harmless.
-// A read must not over-select.
+//
+// # What the strictness actually decides: BLACKLISTED members
+//
+// Spelled out because the abstract argument above hides the only case that
+// reaches it. Removal sets is_deleted = 1, so the two predicates agree there. The
+// one reachable state where they disagree is the group blacklist, which sets
+// status = GroupMemberStatusBlacklist and deliberately LEAVES is_deleted = 0
+// (modules/group/db.go:260). So this endpoint hides a project group from a member
+// that group has blacklisted, and two older surfaces still show it to them:
+// GET /v1/group/my (queryGroupsWithMemberUIDAndSpaceID filters is_deleted alone)
+// and the group detail.
+//
+// That divergence is chosen, not inherited. Blacklisting is how a group denies
+// someone access: ExistMemberActive is the hardening line #343/#345 put in front
+// of group and thread reads for exactly this uid, so listing the group here would
+// advertise a room they cannot open. The two looser surfaces are the ones behind —
+// both are named in P1's "read-path hardening" out-of-scope list, which is a
+// separate task. Pinned by TestListProjectGroupsHidesAGroupThatBlacklistedMe, so
+// a later change to the predicate has to argue with a test rather than a comment.
 //
 // # Index
 //
@@ -102,15 +124,23 @@ func (d *DB) listMyProjectGroups(spaceID, projectID, uid string, offset, limit i
 			"FROM `group` g "+
 			"INNER JOIN `group_member` gm ON gm.group_no = g.group_no "+
 			"WHERE g.space_id = ? AND g.project_id = ? AND g.status <> ? "+
-			"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = 1 "+
-			// g.id ASC is creation order, which puts the all-member group first
-			// for free: #855 provisions it with the project, so it is always the
-			// project's oldest group. It is also the only ordering available that
-			// is total — group_no is a UUID and name is not unique — and a
-			// non-total ORDER BY under OFFSET pagination silently drops and
-			// duplicates rows between pages.
+			"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? "+
+			// g.id ASC is creation order. It is the only TOTAL ordering available
+			// — group_no is a UUID and name is not unique — and a non-total
+			// ORDER BY under OFFSET pagination silently drops and duplicates rows
+			// between pages, so that property is the reason for the choice.
+			//
+			// It USUALLY puts the all-member group first, because #855 provisions
+			// it with the project. Usually, not always: ensureAllMemberGroup
+			// rebuilds it on a later write path when the first provisioning failed
+			// or the group was disbanded or detached, and the rebuilt group takes a
+			// fresh, higher id. So a project that hit that path lists its 全员群
+			// wherever it now sorts. Nothing here compensates: the client labels it
+			// by comparing group_no against the all_member_group_no it already has
+			// from the project detail, which is right in both cases. Position is a
+			// convenience, never the contract.
 			"ORDER BY g.id ASC LIMIT ? OFFSET ?",
-		spaceID, projectID, groupStatusDisband, uid, limit, offset,
+		spaceID, projectID, groupStatusDisband, uid, int(common.GroupMemberStatusNormal), limit, offset,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: list my project groups: %w", err)
@@ -128,6 +158,19 @@ func (d *DB) listMyProjectGroups(spaceID, projectID, uid string, offset, limit i
 // Groups with no active members are simply absent from the map; the caller reads
 // a missing key as 0. That state is reachable in principle (every member left)
 // and is not worth a second query to distinguish from "count is zero".
+//
+// # This number can differ from modules/group's member_count for the same group
+//
+// modules/group's QueryMemberCount (db.go:737) filters is_deleted alone, so it
+// counts blacklisted members; this one does not. A group holding one blacklisted
+// member therefore reads N here and N+1 on the group header.
+//
+// Matching QueryMemberCount instead was the alternative and is worse: the count
+// would then include people the list beside it treats as non-members, so the
+// endpoint would contradict ITSELF rather than contradict another endpoint. A
+// count that means the same thing as the list it sits in is the one property
+// worth keeping; the cross-surface difference is bounded by how rare blacklisting
+// is, and it disappears when the older surfaces are hardened.
 func (d *DB) countActiveGroupMembers(groupNos []string) (map[string]int, error) {
 	if len(groupNos) == 0 {
 		return map[string]int{}, nil
@@ -138,9 +181,9 @@ func (d *DB) countActiveGroupMembers(groupNos []string) (map[string]int, error) 
 	}
 	_, err := d.session.SelectBySql(
 		"SELECT group_no, COUNT(*) AS member_count FROM `group_member` "+
-			"WHERE group_no IN ? AND is_deleted = 0 AND status = 1 "+
+			"WHERE group_no IN ? AND is_deleted = 0 AND status = ? "+
 			"GROUP BY group_no",
-		groupNos,
+		groupNos, int(common.GroupMemberStatusNormal),
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: count active group members: %w", err)

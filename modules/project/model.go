@@ -295,8 +295,18 @@ type MemberResp struct {
 type GroupResp struct {
 	GroupNo string `json:"group_no"`
 	Name    string `json:"name"`
-	// IsNamed is 1 for a user-chosen group name, 0 for an auto-generated one
-	// ("张三、李四、王五"). Only 1 renders the name into the default avatar.
+	// IsNamed is 1 for a group created BEFORE the 2026-06-29 avatar revamp and 0
+	// for one created after: legacy groups render the group name's first two
+	// characters into the default avatar, new ones fall back to the two-person
+	// icon. NOT "the user chose this name" — that was the column's original
+	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
+	//
+	// On THIS endpoint the value is therefore always 0: modules/group hardcodes
+	// IsNamed: 0 on every create (service.go:223, :1278) and 1 exists only where
+	// the #500 migration backfilled it, which no project group can be. It is
+	// shipped anyway so the avatar fallback chain is evaluated by the same code
+	// on every surface rather than special-cased here — a client that hardcodes
+	// the fallback for this list is the drift the field exists to prevent.
 	IsNamed int `json:"is_named"`
 	// AvatarText is the custom avatar text; "" falls back per IsNamed.
 	AvatarText string `json:"avatar_text"`
