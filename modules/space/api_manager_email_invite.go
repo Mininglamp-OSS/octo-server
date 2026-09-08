@@ -58,11 +58,17 @@ func (m *Manager) createSpaceOwnerEmailInvite(c *wkhttp.Context) {
 		respondSpaceRequestInvalid(c, "")
 		return
 	}
-	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
+	expiresResult, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
 		respondSpaceRequestInvalid(c, "expires_at")
 		return
 	}
+	// email invite 不提供"永久"选项；若客户端显式传 "never"，拒绝请求（恢复旧 400 行为）。
+	if !expiresResult.notProvided && expiresResult.expiresAt == nil {
+		respondSpaceRequestInvalid(c, "expires_at")
+		return
+	}
+	expiresAt := expiresResult.expiresAt
 
 	rawToken, tokenHash, err := generateEmailInviteToken()
 	if err != nil {

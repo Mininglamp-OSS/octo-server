@@ -838,7 +838,7 @@ func (m *Manager) listInvites(c *wkhttp.Context) {
 	}
 	resp := make([]*managerInviteResp, 0, len(list))
 	for _, inv := range list {
-		expiresAt := ""
+		expiresAt := inviteExpiresAtNeverSentinel // 永久邀请
 		if inv.ExpiresAt != nil {
 			expiresAt = inv.ExpiresAt.String()
 		}
@@ -905,7 +905,7 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 			return
 		}
 	}
-	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
+	expiresResult, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
 		respondSpaceRequestInvalid(c, "expires_at")
 		return
@@ -929,10 +929,15 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 	} else {
 		model.MaxUses = defMaxUses
 	}
-	if expiresAt != nil {
-		t := db.Time(*expiresAt)
-		model.ExpiresAt = &t
+	if !expiresResult.notProvided {
+		// 客户端显式传了 expires_at（含 "never" 永久）：直接使用，不套默认。
+		if expiresResult.expiresAt != nil {
+			t := db.Time(*expiresResult.expiresAt)
+			model.ExpiresAt = &t
+		}
+		// expiresResult.expiresAt == nil 即永久：model.ExpiresAt 保持 nil，落库为 NULL。
 	} else if defExpiresAt != nil {
+		// 未传 expires_at：套环境变量默认值。
 		t := db.Time(*defExpiresAt)
 		model.ExpiresAt = &t
 	}
@@ -950,9 +955,8 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 		zap.String("operator", operator),
 	)
 
-	// 显式 Format 保证响应格式与 parseInviteExpiresAt 接受的输入格式一致，
-	// 避免客户端拿到响应后回传被 parse 拒绝。
-	expiresStr := ""
+	// 序列化 expires_at：永久（NULL）返回 "never" 哨兵，与输入格式对称，客户端可安全回传。
+	expiresStr := inviteExpiresAtNeverSentinel // 永久邀请
 	if model.ExpiresAt != nil {
 		expiresStr = time.Time(*model.ExpiresAt).Format(inviteTimeLayout)
 	}
@@ -996,13 +1000,13 @@ func (m *Manager) updateInvite(c *wkhttp.Context) {
 		respondSpaceRequestInvalid(c, "status")
 		return
 	}
-	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
+	expiresResult, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
 		respondSpaceRequestInvalid(c, "expires_at")
 		return
 	}
-
-	affected, err := m.managerDB.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
+	updateExpiresAt, clearExpires := expiresResult.updateArgs()
+	affected, err := m.managerDB.updateInvitationAdmin(spaceId, code, req.MaxUses, updateExpiresAt, clearExpires, req.Status)
 	if err != nil {
 		m.Error("修改邀请码失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("code", code))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
@@ -1025,18 +1029,45 @@ func (m *Manager) updateInvite(c *wkhttp.Context) {
 // 用户侧 updateInvite 与管理端 create/updateInvite 共用此常量，避免双写路径漂移。
 const inviteTimeLayout = "2006-01-02 15:04:05"
 
-// parseInviteExpiresAt 解析 expires_at 字符串，空字符串视为未传。
+// inviteExpiresAtNeverSentinel 客户端传此值表示「显式永久」。
+// 空字符串 / nil 表示「未传，由服务端套默认值」；"never" 表示「明确不要过期时间」。
+const inviteExpiresAtNeverSentinel = "never"
+
+// inviteExpiresResult 解析结果，三态：
+//   - notProvided=true : 客户端未传 expires_at（nil 或空字符串），走默认值
+//   - notProvided=false, expiresAt=nil : 客户端显式要求永久（"never"）
+//   - notProvided=false, expiresAt!=nil : 客户端给定具体时间
+type inviteExpiresResult struct {
+	notProvided bool
+	expiresAt   *time.Time
+}
+
+// updateArgs 从三态解析结果中派生 updateInvitationAdmin 所需参数，
+// 避免 Manager.updateInvite 与 Space.updateInvite 各自重复同一段逻辑导致实现漂移。
+func (r inviteExpiresResult) updateArgs() (expiresAt *time.Time, clearExpiresAt bool) {
+	clearExpiresAt = !r.notProvided && r.expiresAt == nil
+	if !r.notProvided {
+		expiresAt = r.expiresAt
+	}
+	return
+}
+
+// parseInviteExpiresAt 解析 expires_at 字符串，三态处理。
 // 时区采用服务器 time.Local——管理端与用户侧统一共用本函数。
 // 部署环境应显式设置 TZ，确保客户端发送的"服务器本地时间"解释一致。
-func parseInviteExpiresAt(raw *string) (*time.Time, error) {
+func parseInviteExpiresAt(raw *string) (inviteExpiresResult, error) {
 	if raw == nil || *raw == "" {
-		return nil, nil
+		return inviteExpiresResult{notProvided: true}, nil
+	}
+	if strings.ToLower(strings.TrimSpace(*raw)) == inviteExpiresAtNeverSentinel {
+		// 显式永久：expiresAt = nil，notProvided = false
+		return inviteExpiresResult{notProvided: false, expiresAt: nil}, nil
 	}
 	t, err := time.ParseInLocation(inviteTimeLayout, *raw, time.Local)
 	if err != nil {
-		return nil, errors.New("过期时间格式错误，请使用 2006-01-02 15:04:05 格式")
+		return inviteExpiresResult{}, errors.New(`过期时间格式错误，请使用 2006-01-02 15:04:05 格式或 "never" 表示永久`)
 	}
-	return &t, nil
+	return inviteExpiresResult{notProvided: false, expiresAt: &t}, nil
 }
 
 // disableInvite 禁用邀请码
