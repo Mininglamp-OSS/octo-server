@@ -15,6 +15,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Pin every SQL predicate that gates owner Project facts. The tests below also
+// inject each computed boolean to exercise the Go-level fail-closed logic.
+const botContextQueryPattern = `(?s)SELECT IFNULL.*` +
+	`bu.status = 1 AND bu.robot = 1 AND COALESCE\(bu.is_destroy, 0\) <> 2.*` +
+	`ou.status = 1 AND ou.robot = 0 AND COALESCE\(ou.is_destroy, 0\) <> 2.*` +
+	`s.space_id = 'space' AND s.status = 1.*` +
+	`bm.uid = bu.uid AND bm.status = 1.*` +
+	`om.uid = ou.uid AND om.status = 1.*` +
+	`WHERE r.robot_id = 'bot' AND r.creator_uid = 'owner' AND r.bot_token = 'bf_test' AND r.status = 1`
+
 type botContextUserNames struct{ IService }
 
 func (botContextUserNames) GetUser(uid string) (*Resp, error) {
@@ -43,11 +53,11 @@ func TestBotOwnerContextHTTPContract(t *testing.T) {
 				mock.ExpectQuery("SELECT.*FROM robot.*bot_token = 'bf_test'").WillReturnRows(sqlmock.NewRows([]string{"robot_id", "creator_uid"}).AddRow("bot", "owner"))
 				mock.ExpectQuery("SELECT.*FROM space_member.*uid = 'bot'").WillReturnRows(sqlmock.NewRows([]string{"space_id"}).AddRow("first-space"))
 				if tc.extended {
-					q := mock.ExpectQuery("SELECT IFNULL.*WHERE r.robot_id = 'bot' AND r.creator_uid = 'owner' AND r.bot_token = 'bf_test'")
+					q := mock.ExpectQuery(botContextQueryPattern)
 					if tc.dbError {
 						q.WillReturnError(errors.New("database unavailable"))
 					} else {
-						q.WillReturnRows(sqlmock.NewRows([]string{"hosting", "bot_active", "owner_active", "bot_member", "owner_member"}).AddRow("self_hosted", true, true, true, true))
+						q.WillReturnRows(sqlmock.NewRows([]string{"hosting", "hosting_reported_at", "bot_active", "owner_active", "bot_member", "owner_member"}).AddRow("self_hosted", nil, true, true, true, true))
 						mock.ExpectQuery("SELECT pm.project_id.*WHERE pm.uid = 'owner'.*pm.space_id = 'space'").WillReturnRows(sqlmock.NewRows([]string{"project_id", "role", "member_epoch"}).AddRow("p", 2, 7))
 					}
 				}
@@ -72,6 +82,7 @@ func TestBotOwnerContextHTTPContract(t *testing.T) {
 				if !tc.extended {
 					require.Len(t, response, 5)
 				} else if tc.dbError {
+					require.Equal(t, true, response["context_included"])
 					require.Equal(t, true, response["context_error"])
 					require.NotContains(t, response, "bot_context")
 					require.NotContains(t, response, "owner_context")
@@ -80,7 +91,10 @@ func TestBotOwnerContextHTTPContract(t *testing.T) {
 					require.Contains(t, response, "bot_context")
 					require.Contains(t, response, "owner_context")
 					require.NotContains(t, response["bot_context"], "agent_platform")
-					require.Equal(t, "self_hosted", response["bot_context"].(map[string]any)["agent_hosting"])
+					botContext := response["bot_context"].(map[string]any)
+					require.Equal(t, "self_hosted", botContext["agent_hosting"])
+					require.Contains(t, botContext, "agent_reported_hosting_at")
+					require.Nil(t, botContext["agent_reported_hosting_at"])
 				}
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -117,8 +131,8 @@ func TestBotOwnerContextPlatformNeutralAndSpaceScoped(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, mock := newPhoneLookupMock(t)
-			mock.ExpectQuery("SELECT IFNULL.*WHERE r.robot_id = 'bot' AND r.creator_uid = 'owner' AND r.bot_token = 'bf_test' AND r.status = 1").
-				WillReturnRows(sqlmock.NewRows([]string{"hosting", "bot_active", "owner_active", "bot_member", "owner_member"}).AddRow(tc.hosting, tc.botActive, tc.ownerActive, tc.botMember, tc.ownerMember))
+			mock.ExpectQuery(botContextQueryPattern).
+				WillReturnRows(sqlmock.NewRows([]string{"hosting", "hosting_reported_at", "bot_active", "owner_active", "bot_member", "owner_member"}).AddRow(tc.hosting, nil, tc.botActive, tc.ownerActive, tc.botMember, tc.ownerMember))
 			allowed := tc.botActive && tc.ownerActive && tc.botMember && tc.ownerMember
 			if allowed {
 				mock.ExpectQuery("SELECT pm.project_id.*WHERE pm.uid = 'owner'.*pm.space_id = 'space'").
@@ -129,6 +143,8 @@ func TestBotOwnerContextPlatformNeutralAndSpaceScoped(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "legacy-first-space", resp.SpaceID)
 			require.True(t, resp.ContextIncluded)
+			require.Equal(t, tc.botMember, resp.BotContext.SpaceMember)
+			require.Equal(t, tc.ownerMember, resp.OwnerContext.SpaceMember)
 			require.Len(t, resp.OwnerContext.Projects, 2)
 			require.Equal(t, allowed, resp.OwnerContext.Projects[0].Member)
 			require.False(t, resp.OwnerContext.Projects[1].Member)
@@ -145,7 +161,7 @@ func TestBotOwnerContextPlatformNeutralAndSpaceScoped(t *testing.T) {
 
 func TestBotOwnerContextFailsClosed(t *testing.T) {
 	db, mock := newPhoneLookupMock(t)
-	mock.ExpectQuery("SELECT IFNULL").WillReturnError(errors.New("database unavailable"))
+	mock.ExpectQuery(botContextQueryPattern).WillReturnError(errors.New("database unavailable"))
 	resp := authVerifyBotResp{BotUID: "bot", OwnerUID: "owner", SpaceID: "legacy"}
 	err := (&User{db: db}).fillBotProjectContext(&resp, authVerifyBotReq{BotToken: "bf_test", SpaceID: "space", ProjectIDs: []string{"p"}})
 	require.Error(t, err)
@@ -155,4 +171,17 @@ func TestBotOwnerContextFailsClosed(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 	err = (&User{}).fillBotProjectContext(&resp, authVerifyBotReq{ProjectIDs: make([]string, maxVerifyProjectIDs+1)})
 	require.ErrorIs(t, err, errTooManyProjectIDs)
+}
+
+func TestBotOwnerContextMissingFactsIsAnError(t *testing.T) {
+	db, mock := newPhoneLookupMock(t)
+	mock.ExpectQuery(botContextQueryPattern).
+		WillReturnRows(sqlmock.NewRows([]string{"hosting", "hosting_reported_at", "bot_active", "owner_active", "bot_member", "owner_member"}))
+	resp := authVerifyBotResp{BotUID: "bot", OwnerUID: "owner"}
+	err := (&User{db: db}).fillBotProjectContext(&resp, authVerifyBotReq{
+		BotToken: "bf_test", SpaceID: "space", ProjectIDs: []string{"p"},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "disappeared after credential verification")
+	require.NoError(t, mock.ExpectationsWereMet())
 }

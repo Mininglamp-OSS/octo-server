@@ -291,10 +291,10 @@ func TestRobotProxyFileNewPath(t *testing.T) {
 }
 
 // TestOwnedBots verifies /robot/owned_bots only returns bots created by the
-// login user, with robot.status=1 and an active space_member row in the given
-// Space. It must not leak bots from other spaces, bots created by others (even
-// if befriended), soft-deleted bots, or removed space members. Missing
-// space_id must be a request-invalid error.
+// login user, with active robot/user rows and an active space_member row in the
+// given Space. It must not leak bots from other spaces, bots created by others
+// (even if befriended), soft-deleted/disabled bots, or removed space members.
+// Missing space_id must be a request-invalid error.
 func TestOwnedBots(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
@@ -314,6 +314,7 @@ func TestOwnedBots(t *testing.T) {
 	mineOther := "owned_other_sp_836"
 	friendBot := "owned_friend_836"
 	deletedBot := "owned_deleted_836"
+	disabledUserBot := "owned_disabled_user_858"
 	removedBot := "owned_removed_836"
 
 	spaceIDs := []string{testSpaceID, otherSpaceID, nonMemberSpaceID, removedMemberSpaceID, disabledSpaceID}
@@ -360,8 +361,8 @@ func TestOwnedBots(t *testing.T) {
 	mkBot := func(botUID, name string, robotStatus int, creator, spaceID string, memberStatus int) {
 		_, err := db.InsertInto("user").Columns("uid", "name", "short_no", "robot", "status").Values(botUID, name, botUID, 1, 1).Exec()
 		require.NoError(t, err)
-		_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description", "bot_commands").
-			Values(botUID, robotStatus, creator, name+" desc", "/start").Exec()
+		_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description", "bot_commands", "agent_hosting").
+			Values(botUID, robotStatus, creator, name+" desc", "/start", "self_hosted").Exec()
 		require.NoError(t, err)
 		_, err = db.InsertInto("space_member").Columns("space_id", "uid", "status").Values(spaceID, botUID, memberStatus).Exec()
 		require.NoError(t, err)
@@ -371,6 +372,9 @@ func TestOwnedBots(t *testing.T) {
 	mkBot(mineOther, "MineOtherSpace", 1, uid, otherSpaceID, 1)
 	mkBot(friendBot, "FriendBot", 1, other, testSpaceID, 1)
 	mkBot(deletedBot, "DeletedBot", 0, uid, testSpaceID, 1)
+	mkBot(disabledUserBot, "DisabledUserBot", 1, uid, testSpaceID, 1)
+	_, err = db.Update("user").Set("status", 0).Where("uid = ?", disabledUserBot).Exec()
+	require.NoError(t, err)
 	mkBot(removedBot, "RemovedBot", 1, uid, testSpaceID, 0)
 
 	_, err = db.InsertInto("friend").Columns("uid", "to_uid", "is_deleted").Values(uid, friendBot, 0).Exec()
@@ -423,6 +427,10 @@ func TestOwnedBots(t *testing.T) {
 	assert.Equal(t, mine, results[0]["uid"])
 	assert.Equal(t, "MineBot", results[0]["name"])
 	assert.Equal(t, "/start", results[0]["bot_commands"])
+	assert.Equal(t, "self_hosted", results[0]["agent_hosting"])
+	_, hasHostingReportedAt := results[0]["agent_reported_hosting_at"]
+	assert.True(t, hasHostingReportedAt)
+	assert.Nil(t, results[0]["agent_reported_hosting_at"])
 	_, hasToken := results[0]["token"]
 	assert.False(t, hasToken)
 	_, hasBotToken := results[0]["bot_token"]

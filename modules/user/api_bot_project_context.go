@@ -1,15 +1,24 @@
 package user
 
-import "github.com/gocraft/dbr/v2"
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/gocraft/dbr/v2"
+)
 
 // These are identity/membership facts, not delegated permissions. Owner projects
 // are not the Bot's seats and are never emitted as top-level projects.
 type verifyBotContext struct {
-	UID          string `json:"uid"`
-	Active       bool   `json:"active"`
-	AgentHosting string `json:"agent_hosting"`
-	SpaceID      string `json:"space_id"`
-	SpaceMember  bool   `json:"space_member"`
+	UID    string `json:"uid"`
+	Active bool   `json:"active"`
+	// AgentHosting is self-reported telemetry. Consumers must not use it as an
+	// authorization or quota signal.
+	AgentHosting           string  `json:"agent_hosting"`
+	AgentReportedHostingAt *string `json:"agent_reported_hosting_at"`
+	SpaceID                string  `json:"space_id"`
+	SpaceMember            bool    `json:"space_member"`
 }
 
 type verifyBotOwnerContext struct {
@@ -30,15 +39,17 @@ func (u *User) fillBotProjectContext(resp *authVerifyBotResp, req authVerifyBotR
 	owner := &verifyBotOwnerContext{UID: resp.OwnerUID, SpaceID: req.SpaceID}
 	resp.BotContext, resp.OwnerContext = bot, owner
 	var facts struct {
-		Hosting     string `db:"hosting"`
-		BotActive   bool   `db:"bot_active"`
-		OwnerActive bool   `db:"owner_active"`
-		BotMember   bool   `db:"bot_member"`
-		OwnerMember bool   `db:"owner_member"`
+		Hosting         string       `db:"hosting"`
+		HostingReported dbr.NullTime `db:"hosting_reported_at"`
+		BotActive       bool         `db:"bot_active"`
+		OwnerActive     bool         `db:"owner_active"`
+		BotMember       bool         `db:"bot_member"`
+		OwnerMember     bool         `db:"owner_member"`
 	}
 	err := u.db.session.SelectBySql(
-		"SELECT IFNULL(r.agent_hosting,'') AS hosting, "+
-			"(bu.status = 1 AND bu.robot = 1) AS bot_active, (ou.status = 1 AND ou.robot = 0) AS owner_active, "+
+		"SELECT IFNULL(r.agent_hosting,'') AS hosting, r.agent_reported_hosting_at AS hosting_reported_at, "+
+			"(bu.status = 1 AND bu.robot = 1 AND COALESCE(bu.is_destroy, 0) <> 2) AS bot_active, "+
+			"(ou.status = 1 AND ou.robot = 0 AND COALESCE(ou.is_destroy, 0) <> 2) AS owner_active, "+
 			"(s.space_id IS NOT NULL AND bm.uid IS NOT NULL) AS bot_member, "+
 			"(s.space_id IS NOT NULL AND om.uid IS NOT NULL) AS owner_member "+
 			"FROM robot r JOIN `user` bu ON bu.uid = r.robot_id JOIN `user` ou ON ou.uid = r.creator_uid "+
@@ -48,14 +59,21 @@ func (u *User) fillBotProjectContext(resp *authVerifyBotResp, req authVerifyBotR
 			"WHERE r.robot_id = ? AND r.creator_uid = ? AND r.bot_token = ? AND r.status = 1 LIMIT 1",
 		req.SpaceID, resp.BotUID, resp.OwnerUID, req.BotToken,
 	).LoadOne(&facts)
-	if err != nil && err != dbr.ErrNotFound {
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return fmt.Errorf("user: bot owner context disappeared after credential verification: %w", err)
+		}
 		return err
 	}
 	bot.Active, bot.AgentHosting = facts.BotActive, facts.Hosting
+	if facts.HostingReported.Valid {
+		formatted := facts.HostingReported.Time.Format(time.DateTime)
+		bot.AgentReportedHostingAt = &formatted
+	}
 	owner.Active = facts.OwnerActive
-	bot.SpaceMember = bot.Active && facts.BotMember
-	owner.SpaceMember = owner.Active && facts.OwnerMember
-	if bot.SpaceMember && owner.SpaceMember {
+	bot.SpaceMember = facts.BotMember
+	owner.SpaceMember = facts.OwnerMember
+	if bot.Active && owner.Active && bot.SpaceMember && owner.SpaceMember {
 		owner.Projects, err = u.answerProjectMembership(owner.UID, req.SpaceID, req.ProjectIDs)
 		return err
 	}

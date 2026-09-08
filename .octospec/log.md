@@ -2560,3 +2560,13 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - 非文本消息不再把原始结构化 payload 写入 session 标题，改用已有内容类型展示文案。
 - build、全仓 vet、AI Team 全包和 Robot 聚焦测试通过；Group DB 回归保留给干净数据库 CI，
   本机共享库的 migration 账本包含当前分支不存在的旧迁移，未为跑绿而破坏共享状态。
+
+## 2026-09-08 — eva-loop-assistants（PR #858 blocker 收敛）
+
+- `owned_bots` 的测试包通过外部测试包注册 botfather 迁移，修复 CI 中
+  `agent_hosting` 缺列；全新隔离 MySQL/Redis/WuKongIM 环境下原回归通过。
+- Bot/owner active 判定补上 `is_destroy=0`，并保持 active 与 Space membership
+  两个事实正交；只有双方均 active 且仍在 Space 时才返回 owner Project 角色。
+- hosting 与上报时间成对返回，并恢复「自报遥测不可用于鉴权/配额」的信任边界。
+- SQL mock 直接钉住账户、Space、membership 全部权限谓词；user/robot 定向测试、
+  Project helper、Group/Robot/User error guards、build、vet、diff 检查通过。

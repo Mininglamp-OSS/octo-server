@@ -2,15 +2,17 @@
 
 ## Goal
 
-Expose the identity facts Fleet needs to authorize a human's own self_hosted
-assistants, regardless of execution platform. Assistants do not join Projects.
+Expose credential-bound owner/Project facts for Fleet and separately surface
+self-reported Bot hosting telemetry. Hosting is not an authorization signal,
+and assistants do not join Projects.
 
 Related issue: Mininglamp-OSS/octo-server#857.
 
 ## Load-bearing list
 
-- Session robot/owned_bots adds agent_hosting directly to its existing four fields;
-  no include=agent_metadata switch and no agent_platform dependency.
+- Session robot/owned_bots adds agent_hosting and agent_reported_hosting_at
+  directly to its existing four fields; no include=agent_metadata switch and
+  no agent_platform dependency.
 - verify-bot opt-in owner_context, bound to the actual Bot credential.
 - Separate Bot/owner identity and current Space/Project facts; fail closed on lookup errors.
 
@@ -30,7 +32,7 @@ Related issue: Mininglamp-OSS/octo-server#857.
 - Explicit owner queries bind identity, validate accounts/Space and expose only
   requested Project facts; absent/failed context grants nothing.
 - Queries do not read agent_platform; existing IM storage/reporting is untouched.
-  Fleet, not Server, classifies Loop assistants.
+  Hosting remains self-reported observability metadata and must not feed authz.
 - Focused regression tests and broader auth/project/group checks are recorded in
   the workspace implementation report.
 
@@ -43,19 +45,21 @@ Reuse existing DB sessions, membership queries, errors and test helpers.
 
 - `GET /v1/robot/owned_bots?space_id=...` uses the authenticated owner and the
   requested Space. Every item contains `uid`, `name`, `description`,
-  `bot_commands`, and `agent_hosting`; no metadata query switch is required.
+  `bot_commands`, `agent_hosting`, and `agent_reported_hosting_at`; no metadata
+  query switch is required.
 - `POST /v1/auth/verify-bot?include=owner_context` accepts `bot_token`,
   `space_id`, and a bounded list of `project_ids`. It derives the owner from
   the validated credential and rejects a caller-supplied `owner_uid`.
-- The extension returns `bot_context` (identity, active state, hosting and
-  Space membership) separately from `owner_context` (identity, active state,
-  Space membership and answers for the requested Projects). Owner membership
-  must never be represented as the Bot's own Project membership.
+- The extension returns `bot_context` (identity, active state, self-reported
+  hosting plus report time, and Space membership) separately from
+  `owner_context` (identity, active state, Space membership and answers for the
+  requested Projects). Owner membership must never be represented as the Bot's
+  own Project membership.
 - A failed context lookup sets `context_error` and omits both contexts;
   inactive identities or missing Space membership disclose no Project roles.
 - Without `include=owner_context`, the original verifier's five fields and
-  legacy `space_id` remain unchanged. Hosting is returned as a fact, not used
-  here to classify or authorize downstream assistant operations.
+  legacy `space_id` remain unchanged. Hosting is telemetry, not authority;
+  consumers must not use it to classify authorization eligibility.
 
 Tests cover default compatibility, account/Space isolation, spoofed owner
 rejection, Project bounds, lookup failures, and independence from platform data.

@@ -59,7 +59,7 @@ func TestOwnedBotsMetadataMySQLContract(t *testing.T) {
 	exec("CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status INT NOT NULL)")
 	exec("CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status INT NOT NULL, PRIMARY KEY(space_id,uid))")
 	exec("CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(40), robot INT NOT NULL, status INT NOT NULL)")
-	exec("CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status INT NOT NULL, description TEXT, bot_commands TEXT, agent_platform VARCHAR(40), agent_hosting VARCHAR(40), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+	exec("CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status INT NOT NULL, description TEXT, bot_commands TEXT, agent_platform VARCHAR(40), agent_hosting VARCHAR(40), agent_reported_hosting_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
 	exec("INSERT INTO space VALUES ('space-a',1),('space-b',1)")
 	exec("INSERT INTO space_member VALUES ('space-a','owner',1),('space-b','owner',1),('space-a','other-owner',1)")
 	for _, bot := range []struct {
@@ -79,7 +79,7 @@ func TestOwnedBotsMetadataMySQLContract(t *testing.T) {
 		{"human", "owner", "space-a", "OpenClaw", "self_hosted", 1, 1, 1, 0},
 	} {
 		exec("INSERT INTO user VALUES (?,?,?,?)", bot.uid, bot.uid, bot.robot, bot.userStatus)
-		exec("INSERT INTO robot(robot_id,creator_uid,status,description,bot_commands,agent_platform,agent_hosting) VALUES (?,?,?,'description','[]',?,?)", bot.uid, bot.owner, bot.robotStatus, bot.platform, bot.hosting)
+		exec("INSERT INTO robot(robot_id,creator_uid,status,description,bot_commands,agent_platform,agent_hosting,agent_reported_hosting_at) VALUES (?,?,?,'description','[]',?,?,UTC_TIMESTAMP())", bot.uid, bot.owner, bot.robotStatus, bot.platform, bot.hosting)
 		exec("INSERT INTO space_member VALUES (?,?,?)", bot.space, bot.uid, bot.memberStatus)
 	}
 	// Prove the entire endpoint works without querying the unrelated platform column.
@@ -114,13 +114,14 @@ func TestOwnedBotsMetadataMySQLContract(t *testing.T) {
 			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &rows))
 			var ids []string
 			for _, row := range rows {
-				require.Len(t, row, 5)
+				require.Len(t, row, 6)
 				ids = append(ids, row["uid"].(string))
 				for _, field := range []string{"uid", "name", "description", "bot_commands"} {
 					require.Contains(t, row, field)
 				}
 				require.NotContains(t, row, "agent_platform")
 				require.NotEmpty(t, row["agent_hosting"])
+				require.NotEmpty(t, row["agent_reported_hosting_at"])
 			}
 			require.ElementsMatch(t, tc.want, ids)
 		})

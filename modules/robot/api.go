@@ -1976,20 +1976,23 @@ func (rb *Robot) ownedBots(c *wkhttp.Context) {
 	}
 
 	// creator_uid=loginUID 与 space_id 双重过滤即 space 隔离点，均为占位符，不可绕过。
-	// 托管类型是通用 Bot 事实；由消费方决定用途，绝不返回 token/凭据。
+	// 托管类型是 Bot 自报遥测，只可用于展示与排障，不得用于鉴权或配额；
+	// 与上报时间一起返回以便调用方判断新鲜度。绝不返回 token/凭据。
 	type ownedBotRow struct {
-		UID          string `db:"uid"`
-		Name         string `db:"name"`
-		Description  string `db:"description"`
-		BotCommands  string `db:"bot_commands"`
-		AgentHosting string `db:"agent_hosting"`
+		UID                    string       `db:"uid"`
+		Name                   string       `db:"name"`
+		Description            string       `db:"description"`
+		BotCommands            string       `db:"bot_commands"`
+		AgentHosting           string       `db:"agent_hosting"`
+		AgentReportedHostingAt dbr.NullTime `db:"agent_reported_hosting_at"`
 	}
 	var bots []ownedBotRow
 	_, err = rb.ctx.DB().SelectBySql(`
 		SELECT r.robot_id as uid, IFNULL(u.name,'') as name,
 			IFNULL(r.description,'') as description,
 			IFNULL(r.bot_commands,'') as bot_commands,
-			IFNULL(r.agent_hosting,'') as agent_hosting
+			IFNULL(r.agent_hosting,'') as agent_hosting,
+			r.agent_reported_hosting_at as agent_reported_hosting_at
 		FROM robot r
 		INNER JOIN user u ON u.uid = r.robot_id AND u.robot = 1
 		INNER JOIN space_member sm ON sm.uid = r.robot_id AND sm.space_id = ? AND sm.status = 1
@@ -2004,12 +2007,18 @@ func (rb *Robot) ownedBots(c *wkhttp.Context) {
 
 	results := make([]map[string]interface{}, 0, len(bots))
 	for _, b := range bots {
+		var agentReportedHostingAt *string
+		if b.AgentReportedHostingAt.Valid {
+			formatted := b.AgentReportedHostingAt.Time.Format(time.DateTime)
+			agentReportedHostingAt = &formatted
+		}
 		item := map[string]interface{}{
-			"uid":           b.UID,
-			"name":          b.Name,
-			"description":   b.Description,
-			"bot_commands":  b.BotCommands,
-			"agent_hosting": b.AgentHosting,
+			"uid":                       b.UID,
+			"name":                      b.Name,
+			"description":               b.Description,
+			"bot_commands":              b.BotCommands,
+			"agent_hosting":             b.AgentHosting,
+			"agent_reported_hosting_at": agentReportedHostingAt,
 		}
 		results = append(results, item)
 	}
