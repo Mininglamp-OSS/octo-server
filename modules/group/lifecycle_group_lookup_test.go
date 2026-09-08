@@ -15,6 +15,7 @@ func TestGetGroupsWithMemberUIDForLifecycleCleanupIncludesAITeamContainers(t *te
 	for _, model := range []*Model{
 		{GroupNo: "ordinary_lifecycle_lookup", Name: "ordinary", Creator: "owner", Status: GroupStatusNormal},
 		{GroupNo: "ai_lifecycle_lookup", Name: "ai", Creator: "owner", Status: GroupStatusNormal, Purpose: aiteam.GroupPurpose},
+		{GroupNo: "ai_team_lifecycle_lookup", Name: "ai team", Creator: "owner", Status: GroupStatusNormal, Purpose: aiteam.TeamGroupPurpose},
 	} {
 		require.NoError(t, NewDB(ctx).Insert(model))
 		require.NoError(t, NewDB(ctx).InsertMember(&MemberModel{
@@ -24,15 +25,18 @@ func TestGetGroupsWithMemberUIDForLifecycleCleanupIncludesAITeamContainers(t *te
 
 	productGroups, err := svc.GetGroupsWithMemberUID(botUID)
 	require.NoError(t, err)
-	require.Len(t, productGroups, 1)
-	require.Equal(t, "ordinary_lifecycle_lookup", productGroups[0].GroupNo)
+	require.Len(t, productGroups, 2)
+	require.ElementsMatch(t,
+		[]string{"ordinary_lifecycle_lookup", "ai_team_lifecycle_lookup"},
+		[]string{productGroups[0].GroupNo, productGroups[1].GroupNo},
+	)
 
 	lifecycleGroups, err := svc.GetGroupsWithMemberUIDForLifecycleCleanup(botUID)
 	require.NoError(t, err)
-	require.Len(t, lifecycleGroups, 2)
+	require.Len(t, lifecycleGroups, 3)
 	require.ElementsMatch(t,
-		[]string{"ordinary_lifecycle_lookup", "ai_lifecycle_lookup"},
-		[]string{lifecycleGroups[0].GroupNo, lifecycleGroups[1].GroupNo},
+		[]string{"ordinary_lifecycle_lookup", "ai_lifecycle_lookup", "ai_team_lifecycle_lookup"},
+		[]string{lifecycleGroups[0].GroupNo, lifecycleGroups[1].GroupNo, lifecycleGroups[2].GroupNo},
 	)
 }
 

@@ -4,6 +4,19 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-08 — ai-team-all-bots-group
+
+- **Added** — One visible “我的AI团队” group per Space/user, projected exactly
+  from active `ai_team_agent` rows after all private two-member containers are
+  ready. Existing owned Bots are lazily backfilled; all three production User
+  Bot creation paths trigger the same idempotent activation orchestration.
+- **Protected** — Ordinary human, manager, Bot API, invite/scan, org-directory,
+  transfer, exit, and disband paths cannot change either AI-managed group type;
+  personal settings remain available on the visible team group.
+- **Hardened** — Add/remove/list convergence retries complete idempotent
+  operations for MySQL 1213/1205, with concurrent real-MySQL and race coverage.
+  See [journal](journal/shared/ai-team-all-bots-group.md).
+
 ## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
 
 - **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的

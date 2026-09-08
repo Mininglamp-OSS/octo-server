@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
 	aiteammod "github.com/Mininglamp-OSS/octo-server/modules/ai_team"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
@@ -137,11 +138,14 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	assert.Equal(t, aiteammod.AgentGroupTypeCloudClone, emptyPage.Groups[0].Type)
 	assert.Equal(t, aiteammod.AgentGroupTypePersonalAssistant, emptyPage.Groups[1].Type)
 	assert.Equal(t, aiteammod.AgentGroupTypeDigitalEmployee, emptyPage.Groups[2].Type)
-	for _, group := range emptyPage.Groups {
-		assert.Zero(t, group.Count)
-		assert.NotNil(t, group.Items)
-		assert.Empty(t, group.Items)
-	}
+	assert.Zero(t, emptyPage.Groups[0].Count)
+	assert.EqualValues(t, 1, emptyPage.Groups[1].Count)
+	assert.Equal(t, []string{f.botID}, agentBotIDs(emptyPage.Groups[1].Items))
+	assert.Zero(t, emptyPage.Groups[2].Count)
+	require.NotNil(t, emptyPage.TeamGroup)
+	require.NotEmpty(t, emptyPage.TeamGroup.GroupNo)
+	assert.Equal(t, aiteampkg.TeamGroupName, emptyPage.TeamGroup.Name)
+	assert.Equal(t, 2, emptyPage.TeamGroup.State)
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -151,7 +155,14 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	}
 	decodeJSON(t, w, &first)
 	assert.Equal(t, f.botID, first.BotID)
-	assert.Empty(t, first.GroupNo, "adding an AI must not eagerly create a group")
+	assert.NotEmpty(t, first.GroupNo, "activating an Agent must eagerly create its two-member group")
+
+	var teamMembers []string
+	_, err := testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", emptyPage.TeamGroup.GroupNo).
+		OrderBy("uid").Load(&teamMembers)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.botID, f.uid}, teamMembers)
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -226,6 +237,12 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 
 	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	teamMembers = nil
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", emptyPage.TeamGroup.GroupNo).
+		OrderBy("uid").Load(&teamMembers)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.uid}, teamMembers)
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var restored struct {
@@ -233,6 +250,12 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	}
 	decodeJSON(t, w, &restored)
 	assert.Equal(t, session1.GroupNo, restored.GroupNo)
+	teamMembers = nil
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", emptyPage.TeamGroup.GroupNo).
+		OrderBy("uid").Load(&teamMembers)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.botID, f.uid}, teamMembers)
 
 	// Model the authoritative Space-removal aftermath: the owner and their Bot
 	// have been soft-removed from the parent while the durable agent/session rows
@@ -284,6 +307,116 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	mu.Unlock()
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.GroupNo])
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.ChannelID])
+}
+
+func TestAITeamGroupAndAgentContainersConvergeTogether(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var page aiteammod.AgentPage
+	decodeJSON(t, w, &page)
+	require.NotNil(t, page.TeamGroup)
+
+	secondBot := "ai_bot_" + util.GenerUUID()[:8]
+	_, err := testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)",
+		secondBot, "Second assistant", secondBot).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO robot (robot_id,creator_uid,status) VALUES (?,?,1)", secondBot, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, secondBot).Exec()
+	require.NoError(t, err)
+
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+secondBot, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var second aiteammod.Agent
+	decodeJSON(t, w, &second)
+	require.NotEmpty(t, second.GroupNo)
+
+	assertMembers := func(groupNo string, want []string) {
+		t.Helper()
+		var got []string
+		_, queryErr := testContext.DB().Select("uid").From("group_member").
+			Where("group_no=? AND status=1 AND is_deleted=0", groupNo).OrderBy("uid").Load(&got)
+		require.NoError(t, queryErr)
+		assert.ElementsMatch(t, want, got)
+	}
+	assertMembers(second.GroupNo, []string{f.uid, secondBot})
+	assertMembers(page.TeamGroup.GroupNo, []string{f.botID, secondBot, f.uid})
+
+	outsider := "outsider_" + util.GenerUUID()[:8]
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)",
+		outsider, "Outsider", outsider).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, outsider).Exec()
+	require.NoError(t, err)
+	_, err = group.NewService(testContext).AddGroupMembers(&group.AddGroupMembersServiceReq{
+		GroupNo: page.TeamGroup.GroupNo, Members: []string{outsider}, OperatorUID: f.uid,
+	})
+	require.ErrorIs(t, err, aiteampkg.ErrContainerProtected)
+	assertMembers(page.TeamGroup.GroupNo, []string{f.botID, secondBot, f.uid})
+
+	w = request(t, f, http.MethodPut, "/v1/groups/"+page.TeamGroup.GroupNo+"/setting", "", map[string]any{"mute": 1})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodPut, "/v1/groups/"+page.TeamGroup.GroupNo+"/setting", "", map[string]any{"allow_no_mention": 0})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.container_protected")
+
+	// A bypassed/stale row and a missing desired member are both repaired by the
+	// same exact-roster projection on the next AI-team list call.
+	groupDB := group.NewDB(testContext)
+	require.NoError(t, groupDB.InsertMember(&group.MemberModel{
+		GroupNo: page.TeamGroup.GroupNo, UID: outsider, Role: group.MemberRoleCommon,
+		Status: 1, Version: 1, Vercode: outsider + "@1",
+	}))
+	_, err = testContext.DB().Update("group_member").Set("is_deleted", 1).
+		Where("group_no=? AND uid=?", page.TeamGroup.GroupNo, f.botID).Exec()
+	require.NoError(t, err)
+	w = request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(page.TeamGroup.GroupNo, []string{f.botID, secondBot, f.uid})
+
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+secondBot, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(page.TeamGroup.GroupNo, []string{f.botID, f.uid})
+	assertMembers(second.GroupNo, []string{f.uid, secondBot})
+}
+
+func TestAITeamConcurrentAgentActivationCreatesOnePairAndOneTeamGroup(t *testing.T) {
+	f := seedFixture(t)
+	svc := aiteammod.NewService(testContext)
+
+	const workers = 6
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.AddAgent(f.spaceID, f.uid, f.botID)
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	var agentCount, pairGroupCount, teamGroupCount int
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&agentCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("`group`").
+		Where("creator=? AND space_id=? AND purpose=?", f.uid, f.spaceID, aiteampkg.GroupPurpose).LoadOne(&pairGroupCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("`group`").
+		Where("creator=? AND space_id=? AND purpose=?", f.uid, f.spaceID, aiteampkg.TeamGroupPurpose).LoadOne(&teamGroupCount))
+	assert.Equal(t, 1, agentCount)
+	assert.Equal(t, 1, pairGroupCount)
+	assert.Equal(t, 1, teamGroupCount)
 }
 
 func TestAITeamListAgentsGroupsByHostingAndKeepsCursorTotals(t *testing.T) {
@@ -659,7 +792,7 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 		`CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(100), status TINYINT, is_destroy TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status TINYINT, UNIQUE KEY uk_space_member(space_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		"CREATE TABLE `group` (group_no VARCHAR(40) PRIMARY KEY, creator VARCHAR(40), space_id VARCHAR(40), project_id VARCHAR(40) NOT NULL DEFAULT '', purpose VARCHAR(32), status TINYINT, KEY idx_group_purpose(purpose)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE `group` (group_no VARCHAR(40) PRIMARY KEY, name VARCHAR(50) NOT NULL DEFAULT '', creator VARCHAR(40), space_id VARCHAR(40), project_id VARCHAR(40) NOT NULL DEFAULT '', purpose VARCHAR(32), status TINYINT, version BIGINT NOT NULL DEFAULT 0, allow_view_history_msg TINYINT NOT NULL DEFAULT 1, allow_external TINYINT NOT NULL DEFAULT 0, allow_no_mention TINYINT NOT NULL DEFAULT 1, KEY idx_group_purpose(purpose)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		`CREATE TABLE group_member (group_no VARCHAR(40), uid VARCHAR(40), remark VARCHAR(100) NOT NULL DEFAULT '', role TINYINT, version BIGINT, status TINYINT, vercode VARCHAR(80), is_deleted TINYINT NOT NULL DEFAULT 0, invite_uid VARCHAR(40), robot TINYINT, bot_admin TINYINT NOT NULL DEFAULT 0, forbidden_expir_time BIGINT NOT NULL DEFAULT 0, is_external TINYINT NOT NULL DEFAULT 0, source_space_id VARCHAR(40) NOT NULL DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY uk_group_member(group_no,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE thread (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, short_id VARCHAR(32), group_no VARCHAR(40), name VARCHAR(100), status TINYINT, message_count BIGINT DEFAULT 0, last_message_content TEXT, last_message_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uk_thread_short(short_id), KEY idx_thread_group(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
 		`CREATE TABLE thread_setting (group_no VARCHAR(40), short_id VARCHAR(32), uid VARCHAR(40), mute TINYINT NOT NULL DEFAULT 0, UNIQUE KEY uk_thread_setting(group_no,short_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
@@ -675,10 +808,11 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 		INSERT INTO robot(robot_id,creator_uid,status) VALUES ('bot','human',1);
 		INSERT INTO space(space_id,status) VALUES ('space',1);
 		INSERT INTO space_member(space_id,uid,status) VALUES ('space','human',1),('space','bot',1);
-		INSERT INTO ` + "`group`" + `(group_no,creator,space_id,purpose,status) VALUES ('parent','human','space','ai_session_container',1);
-		INSERT INTO group_member(group_no,uid,role,version,status,vercode,invite_uid,robot) VALUES ('parent','human',1,1,1,'human@1','human',0),('parent','bot',0,2,1,'bot@1','human',1);
+		INSERT INTO ` + "`group`" + `(group_no,name,creator,space_id,purpose,status) VALUES ('parent','Bot AI','human','space','ai_session_container',1),('team','我的AI团队','human','space','ai_team_group',1);
+		INSERT INTO group_member(group_no,uid,role,version,status,vercode,invite_uid,robot) VALUES ('parent','human',1,1,1,'human@1','human',0),('parent','bot',0,2,1,'bot@1','human',1),('team','human',1,3,1,'human@2','human',0),('team','bot',0,4,1,'bot@2','human',1);
 		INSERT INTO thread(short_id,group_no,name,status,last_message_content) VALUES ('session','parent','Session',1,'');
 		INSERT INTO ai_team_agent(space_id,user_uid,bot_id,group_no,is_added,container_state) VALUES ('space','human','bot','parent',1,2);
+		INSERT INTO ai_team_group(space_id,user_uid,group_no,state) VALUES ('space','human','team',2);
 		INSERT INTO ai_team_session(agent_id,short_id,idempotency_key,request_hash,state) SELECT id,'session','key','hash',2 FROM ai_team_agent;`)
 	require.NoError(t, err)
 

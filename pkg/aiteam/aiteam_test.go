@@ -22,6 +22,13 @@ func TestEnabled(t *testing.T) {
 	}
 }
 
+func TestProtectedPurposes(t *testing.T) {
+	assert.True(t, IsProtectedPurpose(GroupPurpose))
+	assert.True(t, IsProtectedPurpose(TeamGroupPurpose))
+	assert.False(t, IsProtectedPurpose(""))
+	assert.False(t, IsProtectedPurpose("ordinary"))
+}
+
 func TestExcludeProtectedItemsSkipsNonGroupChannelsBeforeDB(t *testing.T) {
 	protected, err := ExcludeProtectedItems(nil, [][2]string{
 		{"person-a", "1"},

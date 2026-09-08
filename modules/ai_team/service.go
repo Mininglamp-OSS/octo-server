@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -14,9 +15,12 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
+
+const aiTeamMutationRetryAttempts = 3
 
 type Service struct {
 	ctx           *config.Context
@@ -74,7 +78,58 @@ func validateAuthorityTx(tx *dbr.Tx, spaceID, userUID, botID string) error {
 }
 
 func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
-	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
+	var agent *Agent
+	err := retryAITeamMutation(func() error {
+		var attemptErr error
+		agent, attemptErr = s.addAgentOnce(spaceID, userUID, botID)
+		return attemptErr
+	})
+	return agent, err
+}
+
+// addAgentOnce performs one idempotent activation attempt. Keeping the entire
+// orchestration behind the retry boundary matters: a lock conflict can occur in
+// the private-container transaction or while projecting the team-group roster.
+func (s *Service) addAgentOnce(spaceID, userUID, botID string) (*Agent, error) {
+	if _, err := s.ensureAgentContainer(spaceID, userUID, botID); err != nil {
+		return nil, err
+	}
+	if err := s.reconcileActiveAgentContainers(spaceID, userUID); err != nil {
+		return nil, err
+	}
+	if _, err := s.ensureTeamGroup(spaceID, userUID); err != nil {
+		return nil, err
+	}
+	return s.getAgent(spaceID, userUID, botID, false)
+}
+
+func retryAITeamMutation(fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < aiTeamMutationRetryAttempts; attempt++ {
+		err := fn()
+		if err == nil || !isRetryableAITeamMutationError(err) {
+			return err
+		}
+		lastErr = err
+		if attempt+1 < aiTeamMutationRetryAttempts {
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("ai team: mutation retries exhausted: %w", lastErr)
+}
+
+func isRetryableAITeamMutationError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1213 || mysqlErr.Number == 1205)
+}
+
+// ensureAgentContainer is the idempotent half of Agent activation that owns the
+// private two-member group. It deliberately does not recurse into team-group
+// reconciliation, allowing a caller to repair every Agent first and project the
+// complete roster exactly once afterwards.
+func (s *Service) ensureAgentContainer(spaceID, userUID, botID string) (*Agent, error) {
+	botName, err := s.validateAuthority(spaceID, userUID, botID)
+	if err != nil {
 		return nil, err
 	}
 	tx, err := s.ctx.DB().Begin()
@@ -102,17 +157,37 @@ func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
 		return nil, errNotFound
 	}
 
-	containerNeedsReconcile := false
-	if agent.GroupNo != "" {
-		repaired, repairErr := s.admitContainerMembersTx(tx, agent.GroupNo, spaceID, userUID, botID)
-		if repairErr != nil {
-			return nil, repairErr
+	if agent.GroupNo == "" {
+		agent.GroupNo = util.GenerUUID()
+		groupName := strings.TrimSpace(botName)
+		if groupName == "" {
+			groupName = botID
 		}
-		containerNeedsReconcile = repaired || agent.ContainerState != containerReady
-		if containerNeedsReconcile {
-			if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
-				return nil, err
-			}
+		groupName += " · AI"
+		if r := []rune(groupName); len(r) > group.MaxGroupNameLen {
+			groupName = string(r[:group.MaxGroupNameLen])
+		}
+		version, genErr := s.ctx.GenSeq(common.GroupSeqKey)
+		if genErr != nil {
+			return nil, genErr
+		}
+		if _, err = tx.InsertBySql("INSERT INTO `group` (group_no,name,creator,status,version,allow_view_history_msg,space_id,allow_external,allow_no_mention,purpose) VALUES (?,?,?,?,?,?,?,?,?,?)",
+			agent.GroupNo, groupName, userUID, group.GroupStatusNormal, version, 1, spaceID, 0, 1, aiteampkg.GroupPurpose).Exec(); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Update("ai_team_agent").Set("group_no", agent.GroupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+			return nil, err
+		}
+		agent.ContainerState = containerProvisioning
+	}
+	repaired, repairErr := s.admitContainerMembersTx(tx, agent.GroupNo, spaceID, userUID, botID)
+	if repairErr != nil {
+		return nil, repairErr
+	}
+	containerNeedsReconcile := repaired || agent.ContainerState != containerReady
+	if containerNeedsReconcile {
+		if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+			return nil, err
 		}
 	}
 	if err = tx.Commit(); err != nil {
@@ -143,6 +218,12 @@ func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
 }
 
 func (s *Service) RemoveAgent(spaceID, userUID, botID string) error {
+	return retryAITeamMutation(func() error {
+		return s.removeAgentOnce(spaceID, userUID, botID)
+	})
+}
+
+func (s *Service) removeAgentOnce(spaceID, userUID, botID string) error {
 	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
 		return err
 	}
@@ -154,7 +235,8 @@ func (s *Service) RemoveAgent(spaceID, userUID, botID string) error {
 	if err != nil {
 		return err
 	}
-	return nil
+	_, err = s.ensureTeamGroup(spaceID, userUID)
+	return err
 }
 
 func (s *Service) getAgent(spaceID, userUID, botID string, requireAdded bool) (*Agent, error) {
@@ -195,6 +277,15 @@ func (s *Service) eligibleAgentsQuery(spaceID, userUID string, columns ...string
 }
 
 func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int) (*AgentPage, error) {
+	var teamGroup *TeamGroup
+	err := retryAITeamMutation(func() error {
+		var attemptErr error
+		teamGroup, attemptErr = s.reconcileTeam(spaceID, userUID)
+		return attemptErr
+	})
+	if err != nil {
+		return nil, err
+	}
 	if limit <= 0 || limit > maxPageSize {
 		limit = defaultPageSize
 	}
@@ -208,7 +299,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 		q = q.Where("a.id<?", beforeID)
 	}
 	rows := make([]*Agent, 0)
-	_, err := q.Load(&rows)
+	_, err = q.Load(&rows)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +321,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	for _, groupCount := range groupCounts {
 		counts[groupCount.Type] = groupCount.Count
 	}
-	page := &AgentPage{Groups: []*AgentGroup{
+	page := &AgentPage{TeamGroup: teamGroup, Groups: []*AgentGroup{
 		{Type: AgentGroupTypeCloudClone, Count: counts[AgentGroupTypeCloudClone], Items: make([]*Agent, 0)},
 		{Type: AgentGroupTypePersonalAssistant, Count: counts[AgentGroupTypePersonalAssistant], Items: make([]*Agent, 0)},
 		{Type: AgentGroupTypeDigitalEmployee, Count: 0, Items: make([]*Agent, 0)},

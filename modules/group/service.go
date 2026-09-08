@@ -275,7 +275,7 @@ func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
 			Members:              []string{uid},
 			OperatorUID:          uid,
 			SuppressRemoveNotice: true,
-			AllowProtected:       group.Purpose == aiteampkg.GroupPurpose,
+			AllowProtected:       aiteampkg.IsProtectedPurpose(group.Purpose),
 		})
 		if removeErr != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: %w", uid, group.GroupNo, removeErr))

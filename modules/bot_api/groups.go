@@ -49,13 +49,13 @@ func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	var err error
 	if spaceID != "" {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose = ''",
-			robotID, spaceID,
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose IN ('', ?)",
+			robotID, spaceID, aiteampkg.TeamGroupPurpose,
 		).Load(&groups)
 	} else {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose = ''",
-			robotID,
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose IN ('', ?)",
+			robotID, aiteampkg.TeamGroupPurpose,
 		).Load(&groups)
 	}
 	if err != nil {

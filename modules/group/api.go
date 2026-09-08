@@ -112,7 +112,7 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, protectAIContainer, g.memberRemove) // 移除群成员
 		groups.GET("/:group_no/membersync", g.syncMembers)                                                    // 同步群成员
 		groups.GET("/:group_no", g.groupGet)                                                                  // 获取群信息
-		groups.PUT("/:group_no/setting", protectAIContainer, g.groupSettingUpdate)                            // 修改群设置
+		groups.PUT("/:group_no/setting", g.protectAISessionContainerMutation, g.groupSettingUpdate)           // 修改群设置
 		groups.PUT("/:group_no", protectAIContainer, g.groupUpdate)                                           // 修改群信息
 		groups.PUT("/:group_no/members/:uid", protectAIContainer, g.memberUpdate)                             // 修改群的群成员信息
 		groups.POST("/:group_no/exit", protectAIContainer, g.groupExit)                                       // 退出群聊
@@ -208,6 +208,25 @@ func (g *Group) protectAIContainerMutation(c *wkhttp.Context) {
 		return
 	}
 	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
+// protectAISessionContainerMutation lets the visible AI-team group use normal
+// per-user preferences. groupSettingUpdate separately rejects group-level keys
+// for that group, while the hidden two-member container remains fully sealed.
+func (g *Group) protectAISessionContainerMutation(c *wkhttp.Context) {
+	purpose, err := aiteampkg.Purpose(g.ctx.DB(), c.Param("group_no"))
+	if err != nil {
+		g.Error("query AI group purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if purpose == aiteampkg.GroupPurpose {
 		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
 		c.Abort()
 		return
@@ -1757,7 +1776,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
 		return nil, err
 	}
-	if purpose == aiteampkg.GroupPurpose {
+	if aiteampkg.IsProtectedPurpose(purpose) {
 		return nil, aiteampkg.ErrContainerProtected
 	}
 
@@ -3412,6 +3431,18 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 		if groupUpdateActionMap[key] != nil {
 			containsGroupUpdate = true
 			break
+		}
+	}
+	if containsGroupUpdate {
+		purpose, err := aiteampkg.Purpose(g.ctx.DB(), groupNo)
+		if err != nil {
+			g.Error("查询 AI 团队群用途失败", zap.Error(err), zap.String("group_no", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if purpose == aiteampkg.TeamGroupPurpose {
+			httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+			return
 		}
 	}
 	if containsGroupUpdate {

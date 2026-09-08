@@ -117,6 +117,7 @@ func TestProjectGroupRefusesANonProjectMember(t *testing.T) {
 		AdmissionEntryOrgEmployeeUpdate,
 		AdmissionEntryPresetGroups,
 		AdmissionEntryUnblacklist,
+		AdmissionEntryAITeamGroup,
 	}
 	for _, entry := range entries {
 		t.Run(entry, func(t *testing.T) {

@@ -447,7 +447,7 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 		isAdd := false
 		for _, groupModel := range groups {
 			if m.GroupNo == groupModel.GroupNo {
-				if groupModel.Purpose == aiteampkg.GroupPurpose {
+				if aiteampkg.IsProtectedPurpose(groupModel.Purpose) {
 					g.Warn("组织成员同步不能修改 AI 会话容器",
 						zap.String("group_no", m.GroupNo), zap.String("uid", m.EmployeeUid), zap.String("action", m.Action))
 					break
@@ -806,7 +806,7 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 				// containers may only change through explicit lifecycle cleanup;
 				// otherwise an HR event can remove the owner or Bot and break the
 				// two-member confidentiality boundary.
-				if group.Purpose == aiteampkg.GroupPurpose {
+				if aiteampkg.IsProtectedPurpose(group.Purpose) {
 					break
 				}
 				realGroups = append(realGroups, groupNo)

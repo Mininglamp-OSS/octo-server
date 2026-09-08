@@ -12,6 +12,8 @@ import (
 
 const (
 	GroupPurpose       = "ai_session_container"
+	TeamGroupPurpose   = "ai_team_group"
+	TeamGroupName      = "我的AI团队"
 	DefaultSessionName = "新对话"
 )
 
@@ -39,10 +41,28 @@ func IsProtectedGroup(session *dbr.Session, groupNo string) (bool, error) {
 	if session == nil || strings.TrimSpace(groupNo) == "" {
 		return false, nil
 	}
-	var count int
-	err := session.Select("COUNT(*)").From("`group`").
-		Where("group_no=? AND purpose=?", groupNo, GroupPurpose).LoadOne(&count)
-	return count > 0, err
+	purpose, err := Purpose(session, groupNo)
+	return IsProtectedPurpose(purpose), err
+}
+
+// IsProtectedPurpose reports whether membership and ownership of a group are
+// server-managed by AI Team rather than by ordinary group APIs.
+func IsProtectedPurpose(purpose string) bool {
+	return purpose == GroupPurpose || purpose == TeamGroupPurpose
+}
+
+// Purpose returns the persisted server-managed purpose, or an empty string for
+// an ordinary or unknown group.
+func Purpose(session *dbr.Session, groupNo string) (string, error) {
+	if session == nil || strings.TrimSpace(groupNo) == "" {
+		return "", nil
+	}
+	var purposes []string
+	_, err := session.Select("purpose").From("`group`").Where("group_no=?", groupNo).Limit(1).Load(&purposes)
+	if err != nil || len(purposes) == 0 {
+		return "", err
+	}
+	return purposes[0], nil
 }
 
 // LookupReadySessionTarget resolves automatic Bot delivery exclusively from

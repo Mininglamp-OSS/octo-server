@@ -100,6 +100,7 @@ func TestEveryAdmissionEntryLabelIsEmitted(t *testing.T) {
 		AdmissionEntryOrgEmployeeUpdate,
 		AdmissionEntryPresetGroups,
 		AdmissionEntryUnblacklist,
+		AdmissionEntryAITeamGroup,
 	}
 
 	for _, entry := range entries {
