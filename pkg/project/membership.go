@@ -224,7 +224,16 @@ func CheckMembership(session *dbr.Session, projectID string, uid string) (bool, 
 // Consumers outside octo-server must NOT be handed these to derive permissions
 // from; the verify read contract emits explicit capabilities alongside the role
 // for exactly that reason (D11).
-func MemberRole(session *dbr.Session, projectID string, uid string) (role int, ok bool, err error) {
+// The runner is an interface rather than *dbr.Session so a caller that has
+// already opened a transaction can pass its *dbr.Tx. That is not a convenience:
+// modules/group's all-member owner sync holds FOR UPDATE locks on the group's
+// group_member rows while it asks this question, and asking it on a pooled
+// connection reads a DIFFERENT snapshot than the one its writes will land in —
+// the role can change inside that window and the sync only re-fires on a project
+// owner change. dbr.SessionRunner is the repo's existing way of saying "either
+// one" (modules/group/bot_ownership.go, modules/user/db_manager.go), and widening
+// to it changes no call site.
+func MemberRole(session dbr.SessionRunner, projectID string, uid string) (role int, ok bool, err error) {
 	if projectID == "" || uid == "" {
 		return 0, false, nil
 	}

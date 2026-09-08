@@ -72,9 +72,16 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 	// 重复入队：下面 affected==0 就跳过。
 	//
 	// 反过来，读完之后新增的席位不会被本次处理。对「账号被删除」这个语义来说，
-	// 那意味着有人在删除进行中给一个正在消失的账号发了 Space 邀请；那条席位会被
-	// I1 对账扫描报出来，而不是被这里静默兜住——把它兜住需要一个跨 Space 的锁，
-	// 代价见上面「一个 Space 一个事务」。
+	// 那意味着有人在删除进行中给一个正在消失的账号发了 Space 邀请。
+	//
+	// 那条席位**没有任何扫描会报它**。上一版这里写着"会被 I1 对账扫描报出来"，
+	// 那句是错的，而且方向正好反了：I1 是"项目席位还活着但 Space 席位没了"，
+	// 定义域是 octo_project_member；这里剩下的恰恰是一条活着的 Space 席位，
+	// 而这个账号可能压根没有任何项目席位。PR #855 第五轮 review 的 Q6。
+	//
+	// 兜住它需要一个跨 Space 的锁，代价见上面「一个 Space 一个事务」。真正的兜底
+	// 在调用方：botfather 删 Bot 那条路径在本函数返回 error 时**中止删除**，让用户
+	// 重试，而重试是幂等的（已关的席位 affected=0）。
 	var spaceIDs []string
 	if _, err := session.SelectBySql(
 		"SELECT space_id FROM space_member WHERE uid=? AND status=1", uid,
@@ -217,9 +224,15 @@ func kickRemovalWorker() {
 // 活跃成员，鉴权缓存也已清掉。异步的只有工单驱动的那些清理步骤。调用方若在返回后
 // 立刻断言 `space_member.status=0`，断言仍然成立。
 //
-// 部分失败会返回 error 且 closed 非空：已提交的 Space 是真的已提交。调用方应当
-// 记日志而不是回滚——没有什么可回滚的，而重试整个函数是幂等的（已关的席位
-// affected=0，不会重复入队）。
+// 部分失败会返回 error 且 closed 非空：已提交的 Space 是真的已提交，没有什么可
+// 回滚的，而重试整个函数是幂等的（已关的席位 affected=0，不会重复入队）。
+//
+// 调用方**不要只记日志就往下走**。上一版这里写着"应当记日志而不是回滚"，而第四轮
+// review 恰好把那条行为从唯一的调用方身上删掉了：botfather 删 Bot 现在在
+// closeErr 非空时中止删除并让用户重试，正因为往下走会留下一个"Space 席位还活着、
+// robot 行已禁用"的残留，而上面那段说明了没有扫描看得见它。正确的处置是**中止
+// 本次操作、让它可重试**；"没有什么可回滚的"说的是不必补偿已提交的部分，不是
+// 可以当作成功。PR #855 第五轮 review 的 Q6。
 func CloseAllSpaceSeats(ctx *config.Context, uid, operatorUID, reason string) (closed []string, err error) {
 	closed, err = closeSeatsAllSpaces(ctx, uid, operatorUID, reason)
 
@@ -247,6 +260,35 @@ func CloseAllSpaceSeats(ctx *config.Context, uid, operatorUID, reason string) (c
 				}
 			}
 		}
+		// notify 的进程内成员缓存也要清。逐个 Space 一次，与 afterMembersRemoved
+		// 同一个调用；不清的话卡片/通知在本进程的 TTL 内仍然会投给这个已经消失的
+		// 账号。这一层不是隔离手段（隔离靠上面那份鉴权缓存），但它是每一条移除路径
+		// 都做的收尾，而本函数是"一个账号整体消失"的唯一入口——少做一样，Bot 删除
+		// 就成了唯一不做它的那条移除。PR #855 第五轮 review 的 Q7。
+		for _, spaceID := range closed {
+			invalidateSpaceMemberCacheOf(spaceID)
+		}
+
+		// SpaceMemberRemove 观察者事件。今天零监听方（fireSpaceMemberRemoveEventOn
+		// 在没有监听方时直接返回，一次 DB 都不写），所以这不是修一个现存的 bug，
+		// 而是修一个**将来一定会被踩到**的不对称：等哪天有人 AddEventListener，
+		// 别的移除路径都会通知他，只有 Bot 删除不会。
+		//
+		// 必须用 go 发：listener 分支在调用者 goroutine 上同步跑完所有监听方，
+		// 而本函数在 HTTP 请求里被调用。与 afterMembersRemoved 一样，**一个**
+		// goroutine 串行发完，不是每个 Space 一个。
+		go func(spaceIDs []string) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.NewTLog("Space").Error("账号整体移除收尾 panic",
+						zap.Any("recover", r), zap.String("uid", uid))
+				}
+			}()
+			for _, spaceID := range spaceIDs {
+				fireSpaceMemberRemoveEventOn(ctx, spaceID, uid, operatorUID, reason)
+			}
+		}(closed)
+
 		// 推一轮 worker，让级联不必等下一个 10s tick。best-effort。
 		kickRemovalWorker()
 	}

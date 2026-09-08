@@ -946,6 +946,34 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 	// Before the loop, so that the members added below have a group to be admitted
 	// into. It is best-effort — a batch add must not fail because the group could
 	// not be built — so the admissions below tolerate its absence.
+	//
+	// # The latency this puts on the request, and who can now trigger it
+	//
+	// Synchronous, inside the HTTP request. D15 widened this handler's pre-check
+	// from canManageMembers to canManageOwnAgents, so an ORDINARY member adding
+	// their own agent can reach it — the trade was argued for project creation,
+	// and the caller set got wider in the same change. PR #855s fifth review, Q3.
+	//
+	// Worst case, once per project and only while it has no usable group: one CAS
+	// UPDATE, one roster read of at most max_members + 1 rows, one batched
+	// Space-active read over those uids, then CreateGroup — one transaction
+	// inserting up to max_members member rows with a GenSeq (Redis) per member,
+	// plus one blocking IM channel call — then one write-back UPDATE. At the
+	// default cap of 500 that is a few hundred Redis round-trips and one IM call.
+	//
+	// The budget is the HTTP request: this has to stay inside it with room to
+	// spare, and if it ever does not, the answer is to move the rebuild onto the
+	// reconcile worker rather than to cap the roster (a capped rebuild is the
+	// incomplete-group defect the third round fixed). The 2-minute lease is NOT
+	// the budget — it is sized for a process dying mid-provision, so that the next
+	// write path can reclaim it; reading it as a latency allowance would be
+	// reading a crash timeout as a target.
+	//
+	// What keeps it bounded meanwhile: it is reachable only for a project whose
+	// provisioning already failed or whose group was detached, the lease
+	// serialises concurrent triggers so only one caller pays, and a failure does
+	// not fail the add. It has not been measured at a full 500-member roster;
+	// open_verification carries that.
 	allMemberGroupNo := p.ensureAllMemberGroup(projectID, spaceID)
 	if allMemberGroupNo == "" {
 		// 整批人都不会进群。补建自己失败时那一路已经记过原因；这里补的是它**没跑**
@@ -1300,11 +1328,21 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	//
 	// Only the WIDENING half is asked here, so the predicate is deliberately the
 	// narrow one: an active robot row owned by the actor. A person, an unknown uid
-	// and a disabled bot all read as "not the actor's agent" and fall through to
-	// the unchanged canManageMembers gate — which is the right answer for removal.
-	// Widening on a disabled bot would let an ordinary member act on a seat D2 says
-	// they could never have created; leaving it to an admin costs nothing, because
-	// removal is always available to one.
+	// and a bot whose ROBOT ROW is disabled all read as "not the actor's agent" and
+	// fall through to the unchanged canManageMembers gate — which is the right
+	// answer for removal. Widening on a disabled robot row would let an ordinary
+	// member act on a seat D2 says they could never have created; leaving it to an
+	// admin costs nothing, because removal is always available to one.
+	//
+	// A DEACTIVATED OR DESTROYED USER ACCOUNT is the one case where this path
+	// deliberately differs from the add path. `account_usable` gates the add
+	// (D2 keeps eligibility in step with the directory); it is not asked here, so
+	// an ordinary member can still take their own agent's seat back after the
+	// account is gone. That asymmetry is the point — the seat is the thing being
+	// cleaned up, and requiring an admin for it would strand exactly the seats
+	// nobody can see any more. The previous comment claimed a symmetry across all
+	// three cases, which stopped being true when account_usable was added.
+	// PR #855's fifth review, Q5.
 	class, err := p.db.queryAgentClassTx(tx, targetUID)
 	if err != nil {
 		return false, err

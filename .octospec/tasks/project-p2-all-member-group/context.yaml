@@ -173,6 +173,23 @@ not_delivered:
       being pushed down into the primitives, where it would block the cascades
       that maintain I2 and I4.
     consequence: "A future handler added on the four protected shapes has to remember the guard; the I4 reconcile scans are what would report the resulting drift."
+  - id: i4-is-stated-as-an-equality-and-only-one-direction-is-policed
+    what: |
+      A scan for EXTRA members of an all-member group -- someone in the group who
+      is not an active project member.
+    why_not: |
+      I4 is written as an equality, and both reconcile scans measure the missing
+      direction only. The reachable case is the repo-wide system-bot exemption:
+      assertAdmissibleTx waives the I2 check for whitelisted bots and memberAdd is
+      deliberately NOT D7-guarded, so a group manager can add fileHelper or
+      botfather to an all-member group and nothing reports it.
+      Left as is because the exemption is repo-wide and P2 is not the place to
+      revisit it -- narrowing it here would give the all-member group a different
+      bot rule from every other group -- and because a "report the extras" scan
+      would flag exactly the members the exemption is designed to allow. What is
+      NOT policed and should be said plainly: any OTHER way an extra could appear
+      would go unreported too.
+    consequence: "The equality holds in the direction the invariant was written for; extras exist only through the system-bot exemption today, and nothing would report a second source if one appeared. PR #855s fifth review nit."
 
 # Corrections to earlier entries in this file, kept rather than edited away so the
 # reasoning that was wrong stays visible.
@@ -977,6 +994,158 @@ pr_855_round_4_fixed:
 
 # octospec Verify phase. Each injected rule re-read and checked against the diff,
 # then the brief's Acceptance walked line by line.
+# PR #855 fifth pass, second half. The two blocking items were fixed in 07207f1;
+# this is the non-blocking remainder from the same two reviews, worked rather than
+# carried -- three of them had been restated across rounds, which is how an item
+# becomes invisible by having been mentioned.
+pr_855_round_5_fixed:
+  - id: the-owner-sync-could-not-converge-two-creators
+    severity: high
+    where: modules/group/all_member_group.go ensureAllMemberGroupOwner
+    what: |
+      The creator rows were read without ORDER BY and only creators[0] was
+      inspected. Two role=creator rows is the state the FOR UPDATE exists to
+      prevent, so it is reachable -- and if the row the engine happened to return
+      first was still an active project owner, the function returned at its first
+      check with both creators intact.
+    why: |
+      Nothing else converges it: D7 refuses transfer, exit and disband on an
+      all-member group, so no group-face path can clean up a second creator. The
+      unordered read had a second cost -- which row counted as "the sitting
+      creator" depended on the storage engine, so the outcome was untestable and
+      could differ on a replica.
+    fix: |
+      Ordered by (created_at, uid), the same total order PickActiveOwner uses; the
+      keeper is decided first and EVERY other creator row is demoted. The successor
+      being already one of the creator rows is its own branch: promoting a row that
+      is already a creator updates nothing, and the promote path treats that as a
+      bug and rolls back, so the naive convergence would have turned a repairable
+      state into a permanent error.
+    test: TestOwnerSyncConvergesAGroupWithTwoCreators, TestOwnerSyncKeepsTheOwnerWhoIsAlreadyACreator
+    mutation: "restoring the early return leaves the first test red."
+  - id: the-owner-sync-asked-the-project-on-a-pooled-connection
+    severity: medium
+    where: modules/group/all_member_group.go, pkg/project/{membership,all_member_group}.go
+    what: |
+      MemberRole and PickActiveOwner ran on ctx.DB() while the sync held FOR UPDATE
+      locks on the group's group_member rows -- a different snapshot from the one
+      its writes land in.
+    why: |
+      The role can change inside that window, and this sync only re-fires on a
+      project owner change, so a wrong answer is not retried until the next one.
+      Deferred for three rounds on the belief that it needed new *dbr.Tx variants
+      of two shared helpers.
+    fix: |
+      It did not. Widening both helpers to dbr.SessionRunner -- the repo's existing
+      idiom (modules/group/bot_ownership.go, modules/user/db_manager.go) -- takes
+      *dbr.Session and *dbr.Tx alike and changes no call site.
+    test: TestOwnerSyncAsksTheProjectInsideItsOwnTransaction
+  - id: the-last-index-served-no-query-either
+    severity: medium
+    where: modules/project/sql/20260907000002_project_all_member_group.sql
+    what: |
+      idx_octo_project_all_member_group (status, all_member_group_no) was justified
+      by scan A's predicate. The third round moved all_member_group_no out of that
+      WHERE and into the violating flag, so the justification stopped being true
+      two rounds before this one.
+    why: |
+      Measured, neither scan chooses it under either collation shape: scan A pages
+      by PRIMARY on p.id (a secondary index orders by all_member_group_no, not id),
+      and scan B is driven from octo_project_member. The cost is a non-INSTANT
+      online build plus a B+ tree on every octo_project write.
+    fix: |
+      Dropped, and the two ADD COLUMNs now say ALGORITHM=INSTANT so the file's own
+      INSTANT claim is enforced rather than hoped for. The migration needs no
+      deploy window at all now.
+  - id: the-drift-test-could-not-see-a-plan
+    severity: medium
+    where: modules/project/all_member_group_plan_test.go
+    what: |
+      TestP2StatementsSurviveCollationDrift proves the statements EXECUTE under the
+      production shape. That is the 1267 question. The fifth round's blocking item
+      was a PLAN question, and no test could see it.
+    fix: |
+      A plan guard on the same drifted fixture, EXPLAINing the split predicates
+      through constants the production code itself runs (a copy would pin the plan
+      of a statement nobody executes). The removed joined form is the control: it
+      MUST plan as a full scan of `group` under drift and must NOT after the
+      conversion -- which is simultaneously the evidence for the split and the
+      evidence that "move the COLLATE to the legacy side" is a fix with an expiry
+      date.
+    mutation: "putting a COLLATE back on the group-side read turns it red, naming the table."
+  - id: the-account-deletion-entry-point-skipped-two-aftercare-steps
+    severity: medium
+    where: modules/space/member_removal_all_spaces.go CloseAllSpaceSeats
+    what: |
+      It cleared the per-uid authorization cache and kicked the worker, but did not
+      invalidate notify's per-Space member cache and did not fire
+      SpaceMemberRemove -- both of which afterMembersRemoved does on kick, leave
+      and disband.
+    why: |
+      The event has zero listeners today, so nothing is broken now; that is exactly
+      why it would have stayed broken. This function's own doc calls it the only
+      correct entry point for "an account disappears entirely", and it was the one
+      removal shape that would never reach a listener.
+    fix: |
+      Both helpers were extracted to package-level functions (one implementation,
+      two entry points) and called from CloseAllSpaceSeats -- the event from a
+      single goroutine, as afterMembersRemoved does, because listeners run on the
+      caller's goroutine.
+    test: TestCloseAllSpaceSeatsDoesTheSameAftercareAsEveryOtherRemoval
+  - id: a-rename-could-resurrect-a-disbanded-group
+    severity: medium
+    where: modules/group/service.go UpdateGroupInfo, modules/group/db.go
+    what: |
+      UpdateGroupInfo read the group row on a pooled connection and wrote the whole
+      snapshot back through DB.UpdateTx -- status, forbidden, invite, notice and
+      creator included -- so anything committed inside that window was reverted.
+    why: |
+      Pre-existing, and the repo had already learned it twice (UpdateInviteTx and
+      UpdateStatusTx both carry the comment). What is new is D8: before P2 the
+      window opened when a person clicked rename; now every project rename drives
+      it automatically, with no human in the loop.
+    fix: "UpdateNameNoticeTx, a column-level write, used by UpdateGroupInfo. Fixes the HTTP rename path too."
+    test: TestUpdateGroupInfoWritesColumnsNotTheWholeRow
+  - id: the-create-path-half-of-account-usable-had-no-test
+    severity: low
+    where: modules/project/all_member_group_test.go
+    what: |
+      The deactivated / destroyed account cases were covered on members/add only.
+      The two entry points run DIFFERENT queries (queryAgentRowsTx vs
+      queryAgentClassTx), so "one of them is tested" was not coverage of the
+      expression.
+    fix: "Both cases added to the create-path refusal table, beside the four that were there."
+    test: TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent
+  - id: comments-that-claimed-what-the-code-does-not-do
+    severity: low
+    what: |
+      Four, each of which would have been cited by the next reader:
+      (1) member_removal_all_spaces.go said a seat granted after the snapshot
+      "会被 I1 对账扫描报出来" -- I1 is the opposite direction and no scan reports it;
+      (2) the same file told callers to log and continue on a partial failure,
+      which is the behaviour the fourth round REMOVED from its only caller;
+      (3) admitToAllMemberGroup and renameAllMemberGroup called group.creator "this
+      group's owner" -- it is the group's CREATOR, which no handover path in this
+      repo rewrites, so it goes stale the moment the original creator leaves;
+      (4) removeMemberOnce claimed a person, an unknown uid and a disabled bot all
+      read alike, which stopped being true when account_usable was added -- removal
+      deliberately does NOT ask it, so an owner can still reclaim the seat of an
+      agent whose account is gone.
+    fix: "All four corrected at the code, with the reason each was wrong."
+  - id: the-synchronous-rebuild-had-no-stated-budget
+    severity: low
+    where: modules/project/service.go addMembers
+    what: |
+      The latency trade was argued for project creation. D15 widened members/add to
+      canManageOwnAgents in the same PR, so an ordinary member adding their own
+      agent can now trigger it, and no budget was written down.
+    fix: |
+      The budget is stated where the call is made: it has to fit the HTTP request,
+      the 2-minute lease is a crash timeout and not an allowance, and if it stops
+      fitting the answer is to move the rebuild to the reconcile worker rather than
+      cap the roster (a capped rebuild is the defect the third round fixed).
+      open_verification carries the measurement.
+
 verify:
   rules_rechecked:
     - id: space-isolation
@@ -1117,13 +1286,29 @@ open_verification:
      Scan A drives from octo_project by id with a point lookup per row, and scan B
      from octo_project with the (p.id, pm.uid) row-constructor cursor -- the same
      shape P1 flagged as needing a real plan for queryI2Page, and for the same
-     reason the plan cannot be produced from CI."
-  - "Index build time for the ONE new index on octo_project
-     (idx_octo_project_all_member_group) at production row counts. Both ADD COLUMNs
-     are INSTANT on MySQL 8.0; the index is a separate online INPLACE statement
-     whose duration is proportional to row count. The second index this entry used
-     to name was dropped in the fourth review round -- nothing filtered on
-     all_member_group_no alone, so it served no query."
+     reason the plan cannot be produced from CI.
+     Measured again while fixing the fifth round, on a purpose-built database in
+     the production shape (2000 projects x 10 members, 5000 groups): scan A is
+     `p range PRIMARY` + `g ALL key=NULL` (hash join); scan B is not driven from
+     octo_project at all -- `pm ref idx_octo_project_member_removing` then eq_ref
+     back into p -- with `gm ALL` and `g ALL`, and `Using temporary; Using
+     filesort` for the two-table keyset ORDER BY. Both scans stay bounded by
+     ReconcileLimit and the 5-minute interval rather than by an index, which is
+     what makes this an item to verify at production scale rather than a blocker.
+     CI can now see the CLASS of defect even though it cannot see the scale:
+     TestTheD7PredicateReachesItsRowByAnIndexUnderCollationDrift EXPLAINs the
+     split predicates against a deliberately drifted database, with the removed
+     joined form as a control that must plan as a full scan under drift and must
+     not after the conversion."
+  - "RESOLVED, by removal. This entry used to ask for the index build time at
+     production row counts. There is no index left to build: the last one
+     (idx_octo_project_all_member_group) was dropped in the fifth review round
+     after EXPLAIN showed neither scan chooses it under EITHER collation shape --
+     scan A pages by PRIMARY on p.id, and scan B is not even driven from
+     octo_project. The migration is now two ADD COLUMNs, both pinned
+     ALGORITHM=INSTANT so a silent downgrade to a rebuild fails loudly instead of
+     becoming an unplanned long statement. Nothing in this migration needs a
+     deploy window."
   - "RESOLVED. A WuKongIM broker (the pinned v2.2.4-20260313, WK_TOKENAUTHON=false)
      was installed alongside MySQL 8.0.46 and Redis, and every suite was re-run.
      modules/project (including -race -shuffle=on), group, space, thread, message,
@@ -1156,6 +1341,19 @@ open_verification:
      Still not decided here: it is a product call about which failure a user is
      walked into, and splitting the guard by action costs the property that all
      five answer identically. But it should be asked about transfer."
+  - "The synchronous rebuild's latency at a full roster. ensureAllMemberGroup runs
+     inside the HTTP request on POST /v1/projects/:id/members/add, and D15 widened
+     that handler to canManageOwnAgents -- so an ORDINARY member adding their own
+     agent can trigger it. Worst case it reads up to max_members + 1 seats, calls
+     pkg/space.ActiveMembers once over them, then CreateGroup inserts up to
+     max_members member rows with one Redis GenSeq each plus one blocking IM call.
+     At the default cap of 500 that is a few hundred Redis round-trips; it has not
+     been measured. Bounded meanwhile by the fact that it is reachable only for a
+     project whose provisioning already failed and by the lease, which serialises
+     concurrent triggers. If it does not fit the request budget the answer is to
+     move the rebuild onto the reconcile worker, NOT to cap the roster -- a capped
+     rebuild is the incomplete-group defect the third round fixed.
+     PR #855's fifth review, Q3."
   - "GATING: modules/project listMembers cannot execute under the production
      collation shape at all -- its pre-existing `LEFT JOIN user u ON u.uid = pm.uid`
      compares 0900_ai_ci (`user`) with pinned general_ci (octo_project_member) and

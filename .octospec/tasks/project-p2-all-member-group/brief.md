@@ -180,13 +180,18 @@ bot 在本 Space 有活跃 `space_member` 行、不在 `pkg/space.SystemBots` �
 对账驱动补建——对账只报不修是仓库纪律，且补建会写群表，对账 worker 不该持有写路径。
 
 **D5 — 全员群身份记录在项目侧：`octo_project.all_member_group_no VARCHAR(40) NOT NULL
-DEFAULT ''`，加**一条**普通索引 `(status, all_member_group_no)`。**（本段原写"加普通索引"，
-实现时一度加了两条；第二条 `(all_member_group_no)` 在第四轮 review 时删掉了——把每条碰这
-一列的语句列一遍，没有任何一条单独按它过滤，那条索引服务不了任何查询，而它要付出一次
-非 INSTANT 的在线构建和每次写入多维护一棵 B+ 树。） 一个项目一个值，"有且仅有一个"由列本身保证，不需要在 `group` 表上
+DEFAULT ''`，**不加索引**。**（本段原写"加普通索引"，实现时一度加了两条，最后一条不剩，
+两次删除是同一条理由：把每条碰这一列的语句列一遍，没有任何一条会用上它。
+第二条 `(all_member_group_no)` 在第四轮 review 删掉——没有语句单独按它过滤。
+第一条 `(status, all_member_group_no)` 在第五轮 review 删掉——它的理由是"扫描 A 的谓词是
+(status, all_member_group_no)"，而第三轮已经把 `all_member_group_no` 从 WHERE 移进了
+violating 标志，此后扫描 A 的谓词只剩 `status` 与 `id > ?`。实测（MySQL 8.0.46，两种排序
+规则形态各一次）：扫描 A 走 PRIMARY，扫描 B 根本不从 `octo_project` 驱动，索引都在
+possible_keys 里没被选中。代价是一次非 INSTANT 的在线构建，加上每次写入多维护一棵 B+ 树。
+结果：整个迁移只剩两条 INSTANT 的 ADD COLUMN，不需要上线窗口。） 一个项目一个值，"有且仅有一个"由列本身保证，不需要在 `group` 表上
 做带 NULL 技巧的唯一索引；迁移放 `modules/project/sql`，因为只有 `modules/project` 写它。群侧
 要判断"这个群是不是全员群"时（D7），通过 `pkg/project` 新增的谓词
-`IsAllMemberGroup(session, spaceID, projectID, groupNo)` 查项目行，**只在 `group.project_id != ''`
+`IsAllMemberGroup(session, projectID, groupNo)` 查项目行（本段原写成带 `spaceID` 的四参数版本；实现时收窄成三参数——`spaceID` 在这个判定里不参与任何谓词，多一个参数只会让调用方以为它被校验过），**只在 `group.project_id != ''`
 时才查**，Space 直属群零成本（延续 P1 的 C1 纪律）。谓词必须同时要求
 `group.project_id = 该项目`：P1 的 detach 在群主无继任者时会把群回退成 Space 直属而
 `all_member_group_no` 还指着它，这时它已经不是全员群，保护和补建都要按"没有全员群"处理。
@@ -333,8 +338,9 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
   JOIN 带显式 `COLLATE`（P1 的 `TestP1ScansSurviveCollationDrift` 是范本）；只在完整轮转后
   发布 gauge；只报不修。
 - **群侧五个接口的行为变更（D7）。** `exit` / `disband` / `members` 删除 / `blacklist add` / `transfer` 对全员群
-  拒绝，对其他群（含普通项目群）响应字节不变；判定只在 `project_id != ''` 时发起一次索引点查，
-  Space 直属群零查询；保护只在 handler 层。touches: `error-response`, `i18n`, `acl`
+  拒绝，对其他群（含普通项目群）响应字节不变；判定只在 `project_id != ''` 时发起**两次**
+  单表索引点查（第五轮 review：原来是一次跨 schema 的 JOIN，在生产的排序规则形态下
+  实测退化成 `group` 全表扫），Space 直属群零查询；保护只在 handler 层。touches: `error-response`, `i18n`, `acl`
 - **群主移交的既有逻辑。** `groupExit` 群主退群时选第二老成员（排除其名下 bot）；P1 的
   `querySuccessorForProjectGroupTx` 把继任者收窄到项目成员。D6 的 owner 同步转让要把
   `transferGrouper` 的转让逻辑抽成服务层函数复用，不新写一套。
@@ -344,8 +350,9 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
   新的 project 文件加进 `TestProjectNoLegacyResponseError`。touches: `error-response`, `i18n`
 - **限流。** 不新增路由；`agent_uids` 搭乘已挂 `SharedUIDRateLimiter` 的建项目路由；
   钩子和对账不是 HTTP 路径，不得长出 Redis 计数器。touches: `rate-limit`
-- **迁移。** `octo_project` 加 `all_member_group_no` 列 + 索引、`all_member_group_lease_until`
-  列，放 `modules/project/sql`；`ADD COLUMN … NOT NULL DEFAULT ''` 在 MySQL 8.0 为 INSTANT；
+- **迁移。** `octo_project` 加 `all_member_group_no` 与 `all_member_group_lease_until` 两列，
+  不加索引（理由见 D5），放 `modules/project/sql`；两条 `ADD COLUMN` 都显式写
+  `ALGORITHM=INSTANT`，让"这是 INSTANT"成为被强制执行的断言而不是期望；
   无 `group` 表变更。迁移文件注释不得出现撇号（P1 迁移文件记录的解析缺陷）。touches: `migration`
 - **反探测。** 分身校验失败一个码；`IsAllMemberGroup` 对非项目成员不暴露项目是否存在
   （群侧五个接口里，转让/解散/拉黑在拒绝之前已经要求调用方是群主或管理员；**踢人和退群
@@ -444,7 +451,8 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
       `details.action ∈ {disband, exit, remove, transfer}`。
 - [ ] 对同一项目下用户手动建的项目群、以及任意 Space 直属群，这五个接口的响应与改动前
       **字节一致**（golden 断言）；Space 直属群路径上不多出任何查询（计数断言，C1 纪律），
-      普通项目群最多多一次索引点查。
+      普通项目群最多多两次单表索引点查（第五轮 review 把一次 JOIN 拆成两条单表读；
+      `TestTheD7PredicateReachesItsRowByAnIndexUnderCollationDrift` 在漂移库上对计划做断言）。
 - [ ] 服务层不受保护：P1 detach 把一个人从全员群移除、botfather 删 bot 把它从全员群移除，
       都仍然成功——用测试钉住，否则 D7 会挡掉 I2 的级联。
 - [ ] 手动向全员群加项目成员：幂等成功；加非项目成员：被 I2 以

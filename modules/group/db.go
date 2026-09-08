@@ -464,6 +464,27 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 	return err
 }
 
+// UpdateNameNoticeTx 仅更新群名 / 公告与群版本（列级写，事务内）。nil 的字段不动。
+//
+// 不能用 UpdateTx 整行回写，理由与 UpdateInviteTx / UpdateStatusTx 同一条：
+// UpdateGroupInfo 先无锁读出整行，再把这份快照写回去，于是窗口内并发提交的
+// status / forbidden / invite / notice 全部被旧值覆盖。最贵的一种是 disband：
+// 一次改名可以把刚解散的群改回正常状态。
+//
+// 这个窗口一直都在，但 P2 之前只有人手点"改群名"才会走到；D8 让它变成机器驱动的
+// ——每一次项目改名都自动跑一次全员群改名。PR #855 第五轮 review 的 Q9。
+func (d *DB) UpdateNameNoticeTx(groupNo string, name, notice *string, version int64, tx *dbr.Tx) error {
+	set := map[string]interface{}{"version": version}
+	if name != nil {
+		set["name"] = *name
+	}
+	if notice != nil {
+		set["notice"] = *notice
+	}
+	_, err := tx.Update("group").SetMap(set).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
 // UpdateInviteTx 仅更新「进群邀请开关」与群版本（列级写，事务内）。
 // 不能用 UpdateTx 整行回写：groupUpdate 在同一请求里若同时带 name 与 invite，name 分支
 // 已通过 UpdateGroupInfo（独立 fresh load）提交了新 name，而 invite 分支若再用建链时载入

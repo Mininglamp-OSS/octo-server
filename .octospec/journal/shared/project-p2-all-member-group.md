@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Learning: giving every project an all-member group, and what happens when the transaction stops being your serializer"
-description: "The lock order pushed group provisioning outside the project transaction, which cost a CAS lease and made every ordering assumption explicit; three review rounds where a fix reopened the thing it fixed; and the third repeat of one structural gap — a source guard that reads its subject file by name cannot see the file added next to it."
+description: "The lock order pushed group provisioning outside the project transaction, which cost a CAS lease and made every ordering assumption explicit; five review rounds, including one where a fix reopened the thing it fixed and one where a test proved the statement ran while it planned as a full table scan; and the third repeat of one structural gap — a source guard that reads its subject file by name cannot see the file added next to it."
 tags: ["octospec-learning", "space", "isolation", "acl", "wire-contract", "migration", "testing", "reconcile", "mysql"]
 timestamp: 2026-09-08T02:30:00Z
 source: self
@@ -162,8 +162,8 @@ The stand-in hooks were installed without restoring the real ones, on the
 reasoning that the registry is latest-wins and every case installs its own. The
 end-to-end cases do **not** install their own — they depend on the real hooks —
 so an in-package case leaving a stand-in behind disabled the feature for every
-later case in the binary. The symptom was the honest one: all eight passed alone
-and failed in a full run, which is what `-shuffle=on` exists to surface.
+later case in the binary. The symptom was the honest one: every one of them passed
+alone and failed in a full run, which is what `-shuffle=on` exists to surface.
 `modules/space`'s removal-step registry carries the same warning; this now
 follows it.
 
@@ -232,6 +232,48 @@ says exactly that — *"a green suite is structurally not evidence"* — and it 
 reviewer running EXPLAIN against a deliberately drifted database to make it
 concrete.
 
+### A justification can be true when it is written and false three rounds later
+
+The migration justified its one index with "scan A's predicate is
+`(status, all_member_group_no)`". That was accurate. Two rounds later the
+flag-over-base-page fix moved `all_member_group_no` out of the WHERE and into the
+violating flag — the right change, made for a different reason — and the index's
+entire reason for existing left with it. Nobody noticed, because nothing about the
+index changed.
+
+Measured afterwards, neither scan chooses it under either collation shape: scan A
+pages by `p.id`, which only the PRIMARY KEY can serve, and scan B is not driven
+from `octo_project` at all. The same thing had already happened once in this PR to
+the *other* index, and to the comment claiming the D7 join was "one index dive".
+
+The pattern is that a predicate does not move alone. Its index, the comment
+explaining the index, and the acceptance line quoting the comment all belong to
+it, and moving the predicate without them leaves three artefacts asserting a fact
+that stopped being one. Worth asking, whenever a WHERE clause changes: what was
+justified by the shape it used to have?
+
+### A test that proves a statement RUNS does not prove it runs well
+
+The collation drift test was built for exactly this class of defect and could not
+see the defect. It executes every cross-schema statement against a deliberately
+drifted database, which answers the 1267 question — does this raise an error in
+production. The fifth review's blocking finding was that the statement ran fine
+and *planned* as a full scan of a core table on every group exit.
+
+Two different questions, and the one the suite could answer was the cheaper one.
+CI could never have found the second: its database is general_ci on both sides, so
+every plan there is `const`.
+
+What closed it is smaller than it sounds — `EXPLAIN` the same statements against
+the same drifted fixture, and read the access type. The part worth copying is the
+**control**: the guard first EXPLAINs the joined form that was removed and requires
+that it IS a full scan under drift, and is NOT one after the conversion. Without
+that, "type is not ALL" would pass on an empty table, on a fixture that stopped
+drifting, on a statement nobody runs. With it, the assertion that the fixture can
+still produce the bug is part of the test — and the same pair of assertions is the
+argument for why the join was split rather than re-collated, held in CI instead of
+in a comment.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on
@@ -247,6 +289,14 @@ concrete.
   invisible to every scan here. The pairing is held by a source guard, not by a
   behavioural test, for the same reason as the item below — the broker's subscriber
   table cannot be read back.
+- **Only one direction of I4 is policed.** The invariant is written as an
+  equality; both scans measure "an active project member missing from the group".
+  Extras are reachable today through the repo-wide system-bot exemption — the
+  admission gate waives I2 for whitelisted bots and `memberAdd` is deliberately
+  not D7-guarded — and nothing reports them. Narrowing the exemption here would
+  give this one group a different bot rule from every other group, so it stays;
+  what is worth saying plainly is that a second source of extras would go
+  unreported too.
 - **The all-member group's IM subscriber list is not asserted to equal its member
   set.** Nothing in octo-server or octo-lib can read a channel's subscribers back
   from the broker, so the equality is not assertable from a test. Same gap P1

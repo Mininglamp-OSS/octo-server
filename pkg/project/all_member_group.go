@@ -82,7 +82,7 @@ func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, er
 	// section above for the measurement.
 	var pointers []string
 	if _, err := session.SelectBySql(
-		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ? AND status = 1",
+		sqlAllMemberGroupPointer,
 		projectID,
 	).Load(&pointers); err != nil {
 		return false, err
@@ -96,12 +96,32 @@ func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, er
 	// keeping it protected would leave its members unable to ever leave it.
 	var ok []int
 	if _, err := session.SelectBySql(
-		"SELECT 1 FROM `group` WHERE group_no = ? AND status <> ? AND project_id = ?",
+		sqlAllMemberGroupRow,
 		groupNo, GroupStatusDisband, projectID,
 	).Load(&ok); err != nil {
 		return false, err
 	}
 	return len(ok) > 0, nil
+}
+
+// The two statements IsAllMemberGroup runs, as constants so a plan guard can
+// EXPLAIN exactly what production executes instead of a copy that can drift away
+// from it — a copy would pin the plan of a statement nobody runs, which is the
+// same failure the drift test exists to prevent one level down.
+const (
+	sqlAllMemberGroupPointer = "SELECT all_member_group_no FROM `octo_project` " +
+		"WHERE project_id = ? AND status = 1"
+	sqlAllMemberGroupRow = "SELECT 1 FROM `group` " +
+		"WHERE group_no = ? AND status <> ? AND project_id = ?"
+)
+
+// AllMemberGroupPredicateStatementsForTest returns those two statements in the
+// order IsAllMemberGroup runs them, with the placeholder counts they expect
+// (1 and 3). Exported for the collation-drift plan guard in modules/project,
+// which is where the drifted-database fixture lives; same shape as
+// modules/project.AllMemberGroupHooksRegisteredForTest.
+func AllMemberGroupPredicateStatementsForTest() []string {
+	return []string{sqlAllMemberGroupPointer, sqlAllMemberGroupRow}
 }
 
 // GroupStatusDisband mirrors modules/group.GroupStatusDisband.
@@ -128,7 +148,10 @@ const GroupStatusDisband = 2
 // reachable — P0's Space cascade can close a sole owner's seat and leaves the
 // project active with no owner, deliberately and with a Warn — so a caller must
 // treat "no owner" as a normal answer and leave the group's creator where it is.
-func PickActiveOwner(session *dbr.Session, projectID string) (string, error) {
+// Takes a dbr.SessionRunner for the reason MemberRole documents: the owner sync
+// asks both questions while holding locks, and both answers have to come from
+// the transaction that will act on them.
+func PickActiveOwner(session dbr.SessionRunner, projectID string) (string, error) {
 	if projectID == "" {
 		return "", nil
 	}

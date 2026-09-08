@@ -77,18 +77,21 @@ func TestReconcileP2QueriesAreBounded(t *testing.T) {
 // One entry, and it is the same shape as P1's project_id exemption: `p.status` is not
 // a violation being filtered away, it SELECTS THE BASE POPULATION. I4 is a statement
 // about active projects; a disbanded project is out of scope, not a row that happens
-// to be compliant. It is also the leading column of
-// idx_octo_project_all_member_group, so it is what takes the scan to its rows at all —
-// moving it into the flag would make every disbanded project a base row and cost the
-// walk the rule exists to prevent.
+// to be compliant. Moving it into the flag would make every disbanded project a base
+// row and cost the walk the rule exists to prevent.
+//
+// This used to add "and it leads idx_octo_project_all_member_group". Measured, that
+// index was never chosen by either scan under either collation shape, and it has
+// since been dropped from the migration (PR #855s fifth review, Q1). The exemption
+// does not depend on it: a base selector earns its place in the WHERE by what it
+// selects, not by which index serves it.
 //
 // The test for whether a predicate belongs here: does removing it change WHICH ROWS
 // THE INVARIANT IS ABOUT, or only which of them are reported? The first is a base
 // selector and stays; the second is a violation test and goes in the flag.
 var whereExemptionsP2 = map[string]string{
-	"p.status = ?": "selects the base population (I4 is about active projects) and leads " +
-		"idx_octo_project_all_member_group; in the flag it would make every disbanded " +
-		"project a base row",
+	"p.status = ?": "selects the base population (I4 is about active projects); in the " +
+		"flag it would make every disbanded project a base row",
 }
 
 // innerJoinOnExemptionsP2 does the same for INNER JOIN ON clauses, which bound base

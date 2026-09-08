@@ -147,9 +147,16 @@ func (p *Project) scanMissingAllMemberGroups() {
 // future scan cannot regress to a filtering WHERE.
 //
 // `p.status` stays in the WHERE deliberately: it selects the BASE population
-// (active projects are what the invariant is about), it is served by
-// idx_octo_project_all_member_group, and a disbanded project is not a violation
-// to be flagged but a row that is out of scope.
+// (active projects are what the invariant is about), and a disbanded project is
+// not a violation to be flagged but a row that is out of scope.
+//
+// It is NOT served by an index, and this file used to say it was. The paging
+// predicate is `p.id > ? ORDER BY p.id`, which only the PRIMARY KEY can serve:
+// measured on MySQL 8.0.46 (2000 projects), `p type=range key=PRIMARY` under BOTH
+// collation shapes, with idx_octo_project_all_member_group in possible_keys and
+// unchosen — a secondary index on (status, all_member_group_no) orders its rows by
+// all_member_group_no, not by id. That index has been dropped from the migration
+// for exactly this reason. PR #855s fifth review, Q1.
 //
 // # The LEFT JOIN's plan, stated accurately
 //
@@ -309,11 +316,19 @@ func (p *Project) scanAllMemberGroupGaps() {
 // queryAllMemberGroupGapPage returns one bounded page of (project, active member)
 // pairs, each flagged with whether the member is missing from the all-member group.
 //
-// Driven project-first then member-by-project_id, mirroring P1's group-first I2
-// scan for the same reason: the driving side must have an index that leads with
-// the filter. Here that is idx_octo_project_all_member_group (status,
-// all_member_group_no) for the projects and the PRIMARY KEY (project_id, uid) for
-// their members.
+// Written project-first then member-by-project_id, mirroring P1's group-first I2
+// scan. The engine does NOT execute it in that order, and the comment used to
+// claim it did: measured on MySQL 8.0.46 (2000 projects x 10 members), the
+// optimizer drives from `pm` (ref on idx_octo_project_member_removing) and joins
+// back to `p` by eq_ref on uk_octo_project_project_id, under both collation shapes.
+// The keyset ORDER BY spans two tables, so it also costs `Using temporary; Using
+// filesort` over the page's candidate set.
+//
+// That is bounded by ReconcileLimit and a 5-minute interval rather than by an
+// index, and it is left as measured rather than forced with a join hint: the same
+// EXPLAIN is what B1's collation item is waiting on, and reshaping the paging is a
+// change worth its own measurement, not a rider. open_verification carries it.
+// PR #855s fifth review, Q1.
 //
 // Only projects that HAVE an all-member group are examined: a project without one
 // has no gap to measure, and scan A already reports it.

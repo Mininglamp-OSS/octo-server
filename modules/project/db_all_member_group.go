@@ -235,6 +235,16 @@ func (d *DB) clearAllMemberGroupNoTx(tx *dbr.Tx, projectID string) error {
 	return nil
 }
 
+// queryAllMemberGroupNo 的两条语句，提成常量，好让排序规则漂移下的执行计划守卫
+// EXPLAIN**生产真正跑的那一份**而不是一份抄件——抄件会把一条没人跑的语句的计划
+// 钉住，而那正是这套守卫要防的错误，只是低了一层。
+const (
+	sqlProjectAllMemberGroupPointer = "SELECT all_member_group_no FROM `octo_project` " +
+		"WHERE project_id = ? AND status = ? AND all_member_group_no <> ''"
+	sqlProjectAllMemberGroupRow = "SELECT 1 FROM `group` " +
+		"WHERE group_no = ? AND status <> ? AND project_id = ?"
+)
+
 // queryAllMemberGroupNo 读一个活跃项目**当前仍然拥有**的全员群号。
 //
 // 返回 "" 表示没有：项目不存在、已解散、尚未建成，或者那个群已经不属于本项目了。
@@ -267,8 +277,7 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	// 这条查询在加人批次的开头、群主同步、改名同步上各跑一次，都是写路径。
 	var pointers []string
 	if _, err := d.session.SelectBySql(
-		"SELECT all_member_group_no FROM `octo_project` "+
-			"WHERE project_id = ? AND status = ? AND all_member_group_no <> ''",
+		sqlProjectAllMemberGroupPointer,
 		projectID, StatusNormal,
 	).Load(&pointers); err != nil {
 		return "", fmt.Errorf("project: query all-member group pointer: %w", err)
@@ -280,7 +289,7 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	// 成 Space 直属的群仍会被当成全员群使用（见本函数上方的注释）。
 	var alive []int
 	if _, err := d.session.SelectBySql(
-		"SELECT 1 FROM `group` WHERE group_no = ? AND status <> ? AND project_id = ?",
+		sqlProjectAllMemberGroupRow,
 		pointers[0], groupStatusDisband, projectID,
 	).Load(&alive); err != nil {
 		return "", fmt.Errorf("project: query all-member group row: %w", err)

@@ -251,9 +251,30 @@ func TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent(t *testing.T) {
 	seedAgent(t, spaceA, "bot_local", "u_owner", "self_hosted")     // self-hosted
 	seedAgent(t, spaceB, "bot_elsewhere", "u_owner", "octo_hosted") // another Space
 
+	// The account itself is deactivated / destroyed while the robot row and the Space
+	// seat are still live. D2 says eligibility tracks the directory, and the directory
+	// passes u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2, so create must refuse
+	// these too.
+	//
+	// The members/add half of this rule was covered from the round it was added; the
+	// CREATE half was not, and the two run DIFFERENT queries (queryAgentRowsTx here,
+	// queryAgentClassTx there) — so "one of them is tested" was not coverage of this
+	// expression at all. PR #855s fifth review, Q4.
+	seedAgent(t, spaceA, "bot_deactivated", "u_owner", "octo_hosted")
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `user` SET status = 0 WHERE uid = ?", "bot_deactivated").Exec()
+	require.NoError(t, err)
+	seedAgent(t, spaceA, "bot_destroyed", "u_owner", "octo_hosted")
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `user` SET is_destroy = 2 WHERE uid = ?", "bot_destroyed").Exec()
+	require.NoError(t, err)
+
 	type refusal struct{ bad, details string }
-	refusals := make([]refusal, 0, 4)
-	for _, bad := range []string{"bot_theirs", "bot_local", "bot_elsewhere", "u_other"} {
+	refusals := make([]refusal, 0, 6)
+	for _, bad := range []string{
+		"bot_theirs", "bot_local", "bot_elsewhere", "u_other",
+		"bot_deactivated", "bot_destroyed",
+	} {
 		w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner, map[string]any{
 			"name":       "proj-" + bad,
 			"agent_uids": []string{"bot_ok", bad},

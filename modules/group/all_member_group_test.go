@@ -298,3 +298,148 @@ func TestAllMemberAdmissionPairsThreadSubscriptionWithTheParent(t *testing.T) {
 	require.Less(t, strings.Index(fn, "IMAddSubscriber"), strings.Index(fn, "addUsersToGroupThreads"),
 		"the parent subscription comes first, matching every sibling path")
 }
+
+// seedGroupMemberRole writes one group_member row with an explicit role and age.
+//
+// Age matters: the owner sync now orders its creator rows by (created_at, uid),
+// so a case about "which of two creators is treated as the sitting one" has to
+// control that order rather than inherit the storage engine's.
+func seedGroupMemberRole(
+	t *testing.T, tctx *config.Context, groupNo, uid string, role, ageSeconds int,
+) {
+	t.Helper()
+	_, err := tctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, remark, role, `version`, status, vercode, "+
+			"is_deleted, invite_uid, robot, forbidden_expir_time, is_external, source_space_id, created_at) "+
+			"VALUES (?, ?, '', ?, 1, 1, ?, 0, '', 0, 0, 0, '', DATE_SUB(NOW(3), INTERVAL ? SECOND))",
+		groupNo, uid, role, groupNo+"-"+uid, ageSeconds).Exec()
+	require.NoError(t, err)
+}
+
+// creatorsOf reads the group's live creator rows, ordered.
+func creatorsOf(t *testing.T, tctx *config.Context, groupNo string) []string {
+	t.Helper()
+	var uids []string
+	_, err := tctx.DB().SelectBySql(
+		"SELECT uid FROM group_member WHERE group_no=? AND role=? AND is_deleted=0 ORDER BY uid",
+		groupNo, MemberRoleCreator).Load(&uids)
+	require.NoError(t, err)
+	return uids
+}
+
+// seedAllMemberGroupRow writes the group row and points the project at it.
+func seedAllMemberGroupRow(t *testing.T, tctx *config.Context, groupNo, projectID, spaceID, creator string) {
+	t.Helper()
+	_, err := tctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, space_id, project_id) VALUES (?, ?, ?, 1, ?, ?)",
+		groupNo, "all-"+projectID, creator, spaceID, projectID).Exec()
+	require.NoError(t, err)
+	setProjectAllMemberGroup(t, tctx, projectID, groupNo)
+}
+
+// TestOwnerSyncConvergesAGroupWithTwoCreators pins that the sync treats a second
+// creator row as state to REPAIR, not as a row to ignore.
+//
+// The file's own comment says two role=creator rows is the reachable state the
+// FOR UPDATE exists to prevent — two concurrent syncs, or a sync racing P1's
+// cascade handover, each promoting a successor. It is reachable, so the sync also
+// has to converge it.
+//
+// It did not. The read had no ORDER BY and only creators[0] was inspected: if the
+// row the engine happened to return first was still an active project owner, the
+// function returned at its first check and both creators stayed. Nothing else can
+// fix it either — D7 refuses transfer, exit and disband on an all-member group, so
+// no group-face path reaches this state at all. PR #855s fifth review, Q2.
+func TestOwnerSyncConvergesAGroupWithTwoCreators(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer testutil.CleanAllTables(ctx)
+	g := New(ctx)
+
+	const projectID, spaceID, groupNo = "p_conv", "s_conv", "grp_conv"
+	seedProjectForGroupTest(t, ctx, projectID, spaceID, "u_owner")
+	seedAllMemberGroupRow(t, ctx, groupNo, projectID, spaceID, "u_owner")
+
+	// The sitting creator IS the active project owner, so the early return fires —
+	// which is exactly why the second creator used to survive.
+	seedGroupMemberRole(t, ctx, groupNo, "u_owner", MemberRoleCreator, 10)
+	seedGroupMemberRole(t, ctx, groupNo, "u_extra", MemberRoleCreator, 5)
+
+	require.NoError(t, g.ensureAllMemberGroupOwner(ctx, projectID, groupNo))
+
+	require.Equal(t, []string{"u_owner"}, creatorsOf(t, ctx, groupNo),
+		"the sync must leave exactly one creator, and it must be the project owner")
+
+	// The extra creator is DEMOTED, not removed: they are still a project member,
+	// and the all-member group's member set equals the project's.
+	var roles []int
+	_, err := ctx.DB().SelectBySql(
+		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+		groupNo, "u_extra").Load(&roles)
+	require.NoError(t, err)
+	require.Equal(t, []int{MemberRoleCommon}, roles)
+}
+
+// TestOwnerSyncKeepsTheOwnerWhoIsAlreadyACreator covers the other half of the same
+// state: the project owner is one of the two creator rows, but not the senior one.
+//
+// The naive convergence — promote the successor, then demote everyone else — turns
+// this into a hard error: promoting a row that is already a creator updates no row,
+// and the promote path treats "affected no live row" as a bug and rolls back. A
+// state the sync exists to repair would then fail permanently on every attempt.
+func TestOwnerSyncKeepsTheOwnerWhoIsAlreadyACreator(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer testutil.CleanAllTables(ctx)
+	g := New(ctx)
+
+	const projectID, spaceID, groupNo = "p_conv2", "s_conv2", "grp_conv2"
+	seedProjectForGroupTest(t, ctx, projectID, spaceID, "u_owner")
+	seedAllMemberGroupRow(t, ctx, groupNo, projectID, spaceID, "u_stale")
+
+	// u_stale is senior and is NOT a project member at all — a former owner whose
+	// seat is gone. u_owner is the active project owner and already holds a creator
+	// row.
+	seedGroupMemberRole(t, ctx, groupNo, "u_stale", MemberRoleCreator, 10)
+	seedGroupMemberRole(t, ctx, groupNo, "u_owner", MemberRoleCreator, 5)
+
+	require.NoError(t, g.ensureAllMemberGroupOwner(ctx, projectID, groupNo))
+
+	require.Equal(t, []string{"u_owner"}, creatorsOf(t, ctx, groupNo),
+		"the active project owner keeps the role; the stale creator is demoted")
+}
+
+// TestOwnerSyncAsksTheProjectInsideItsOwnTransaction is a source guard on the two
+// project-side reads the owner sync makes while holding locks.
+//
+// They used to run on ctx.DB() — a pooled connection, i.e. a different snapshot
+// from the one the transaction's writes land in. The window is real: the group's
+// creator rows are locked FOR UPDATE, the project role can change inside it, and
+// this sync only re-fires when a project owner changes, so a wrong answer here is
+// not retried until the next owner change. Carried as "deferred" for three rounds
+// before it was closed by widening the two helpers to dbr.SessionRunner.
+// PR #855s fifth review, Q11.
+//
+// A source guard rather than a behavioural one: what is being pinned is which
+// connection the read uses, and both connections give the same answer unless a
+// concurrent writer commits inside the window — a race a test would have to win
+// on purpose to observe.
+func TestOwnerSyncAsksTheProjectInsideItsOwnTransaction(t *testing.T) {
+	body, err := os.ReadFile("all_member_group.go")
+	require.NoError(t, err)
+	src := string(body)
+
+	start := strings.Index(src, "func (g *Group) ensureAllMemberGroupOwner(")
+	require.Positive(t, start, "ensureAllMemberGroupOwner must exist")
+	end := strings.Index(src[start:], "\n}\n")
+	require.Positive(t, end, "could not find the end of ensureAllMemberGroupOwner")
+	fn := src[start : start+end]
+
+	require.Contains(t, fn, "projectpkg.MemberRole(tx,",
+		"the sitting creator's project role must be read on the transaction, not on a "+
+			"pooled connection: the transaction already holds the group_member locks this "+
+			"answer is about")
+	require.Contains(t, fn, "projectpkg.PickActiveOwner(tx,",
+		"and so must the successor pick — the two answers have to come from the snapshot "+
+			"the writes land in")
+	require.NotContains(t, fn, "ctx.DB()."+"Select",
+		"no pooled read may reappear inside the sync's transaction")
+}

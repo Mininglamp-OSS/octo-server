@@ -188,7 +188,7 @@ func TestI4ScanBExemptsAClosingSeat(t *testing.T) {
 	assert.Zero(t, i4GapCount(t, p), "a closing seat's group rows belong to the cascade")
 }
 
-// TestI4ScanBExemptsABannedSpace covers exemption 4, and it is the case that
+// TestI4ScanBExemptsABannedSpace covers exemption 3, and it is the case that
 // corrected a wrong argument of mine.
 //
 // I first left the exemption out, on the reasoning that no NEW gap can open while

@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/stretchr/testify/require"
 )
 
@@ -121,4 +122,45 @@ func TestCloseAllSpaceSeatsRejectsAnUnknownReason(t *testing.T) {
 // unregistered reason would make every bot deletion fail to close its seats.
 func TestBotDeletedIsARegisteredRemovalReason(t *testing.T) {
 	require.True(t, IsMemberRemoveReason(MemberRemoveReasonBotDeleted))
+}
+
+// TestCloseAllSpaceSeatsDoesTheSameAftercareAsEveryOtherRemoval pins the two
+// steps this entry point used to skip.
+//
+// It clears the per-uid authorization cache and kicks the worker; it did NOT
+// invalidate notify's per-Space member cache, nor fire the SpaceMemberRemove
+// observer event, both of which afterMembersRemoved does on the kick, leave and
+// disband paths. The event has no listeners today, so nothing is broken right
+// now — which is exactly why it would have stayed broken: the day somebody
+// registers a listener, "an account was deleted" would be the one removal shape
+// that never reaches them. PR #855s fifth review, Q7.
+//
+// The cache invalidation is asserted rather than the event because it is the
+// synchronous half; the event is fired from a goroutine, and an assertion that
+// waits on it would be a race dressed as a test. The event's own delivery is
+// covered by TestFireSpaceMemberRemoveEvent* against the shared implementation
+// both paths now call.
+func TestCloseAllSpaceSeatsDoesTheSameAftercareAsEveryOtherRemoval(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+
+	var invalidated []string
+	prev := event.SpaceMemberCacheInvalidator
+	event.SpaceMemberCacheInvalidator = func(spaceID string) {
+		invalidated = append(invalidated, spaceID)
+	}
+	t.Cleanup(func() { event.SpaceMemberCacheInvalidator = prev })
+
+	seedSpaceForClose(t, ctx, "sp_care_a")
+	seedSpaceForClose(t, ctx, "sp_care_b")
+	seedSeat(t, ctx, "sp_care_a", "bot_care")
+	seedSeat(t, ctx, "sp_care_b", "bot_care")
+
+	closed, err := CloseAllSpaceSeats(ctx, "bot_care", "bot_care", MemberRemoveReasonBotDeleted)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"sp_care_a", "sp_care_b"}, closed)
+
+	require.ElementsMatch(t, []string{"sp_care_a", "sp_care_b"}, invalidated,
+		"every Space whose seat was closed must have its member cache invalidated, "+
+			"exactly as afterMembersRemoved does for a kick")
 }

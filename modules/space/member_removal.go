@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
@@ -152,6 +153,12 @@ func (s *Space) invalidateMembershipCache(spaceID, uid string) {
 // 只清本进程那一份，其它副本要等自己的 TTL（60s）到期；这一层只影响卡片/通知的
 // 投递目标，不是隔离手段，故接受最终一致。
 func (s *Space) invalidateSpaceMemberCache(spaceID string) {
+	invalidateSpaceMemberCacheOf(spaceID)
+}
+
+// invalidateSpaceMemberCacheOf 是上面那个方法的包级形式，给不持有 *Space 的调用方
+// 用（CloseAllSpaceSeats 是包级函数，只拿得到 *config.Context）。一份实现，两个入口。
+func invalidateSpaceMemberCacheOf(spaceID string) {
 	if spaceID == "" {
 		return
 	}
@@ -167,7 +174,14 @@ func (s *Space) invalidateSpaceMemberCache(spaceID string) {
 // 调用方必须用 `go` 发出：handleEvent 的 listener 分支会在调用者 goroutine 上
 // 同步跑完所有监听方，直接调用会把 HTTP handler 阻塞在别的模块的逻辑上。
 func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason string) {
-	if s.ctx.Event == nil {
+	fireSpaceMemberRemoveEventOn(s.ctx, spaceID, uid, operatorUID, reason)
+}
+
+// fireSpaceMemberRemoveEventOn 是上面那个方法的包级形式，理由同
+// invalidateSpaceMemberCacheOf：CloseAllSpaceSeats 拿不到 *Space。
+func fireSpaceMemberRemoveEventOn(ctx *config.Context, spaceID, uid, operatorUID, reason string) {
+	logger := log.NewTLog("Space")
+	if ctx.Event == nil {
 		return
 	}
 	// 没有任何监听方时不落库。事件行的代价是一次事务 + 后续 QueryWithID 与一条
@@ -175,15 +189,15 @@ func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason str
 	// 解散一个几千人的空间就是上万次纯浪费的 DB 操作，还会持续撑大 event 表。
 	// 保留这条事件是为了给下游留扩展点：一旦有人 AddEventListener，这里自动开始投递。
 	// 会话面清理的可靠投递由 space_member_removal_cleanup 工单承担，不依赖本事件。
-	if len(s.ctx.GetEventListeners(event.SpaceMemberRemove)) == 0 {
+	if len(ctx.GetEventListeners(event.SpaceMemberRemove)) == 0 {
 		return
 	}
-	tx, err := s.ctx.DB().Begin()
+	tx, err := ctx.DB().Begin()
 	if err != nil {
-		s.Error("开启SpaceMemberRemove事件事务失败", zap.Error(err))
+		logger.Error("开启SpaceMemberRemove事件事务失败", zap.Error(err))
 		return
 	}
-	eventID, err := s.ctx.EventBegin(&wkevent.Data{
+	eventID, err := ctx.EventBegin(&wkevent.Data{
 		Event: event.SpaceMemberRemove,
 		Type:  wkevent.Message,
 		Data: map[string]interface{}{
@@ -195,15 +209,15 @@ func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason str
 	}, tx)
 	if err != nil {
 		tx.Rollback()
-		s.Error("开启SpaceMemberRemove事件失败", zap.Error(err),
+		logger.Error("开启SpaceMemberRemove事件失败", zap.Error(err),
 			zap.String("spaceId", spaceID), zap.String("uid", uid))
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		s.Error("提交SpaceMemberRemove事件事务失败", zap.Error(err))
+		logger.Error("提交SpaceMemberRemove事件事务失败", zap.Error(err))
 		return
 	}
-	s.ctx.EventCommit(eventID)
+	ctx.EventCommit(eventID)
 }
 
 // afterMembersRemoved 成员行提交之后的收尾。清理工单本身已经在移除事务里写好了

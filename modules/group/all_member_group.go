@@ -8,6 +8,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -145,9 +146,16 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, _, groupNo, uid strin
 			Version: version,
 			Role:    MemberRoleCommon,
 			// 邀请人记为项目的创建者语义上不成立（把人加进项目的可能是任一管理员），
-			// 记本人则谎称是自助加入。记群主——他是这个群在群面上的负责人，也是
-			// 这个群存在的原因。这与 admitToPresetGroup 选择记本人是不同的答案，
-			// 因为那里确实没有人邀请，而这里有：项目把他带进来的。
+			// 记本人则谎称是自助加入。记 group.creator——**建这个群的那个人**，
+			// 对全员群而言就是补建那一刻的项目 owner。这与 admitToPresetGroup 选择
+			// 记本人是不同的答案，因为那里确实没有人邀请，而这里有：项目把他带进来的。
+			//
+			// 注意 group.creator 是**建群人**，不是"当前群主"：本仓库没有任何一条
+			// 交接路径改写它（handOverGroupCreator 与 ensureAllMemberGroupOwner 都
+			// 只动 group_member.role），所以建群人离开项目之后这一列会指向一个不在
+			// 群里的 uid。这里接受它——邀请人是一条历史记录，写成"当前群主"反而会
+			// 随着交接漂移，而且要为此在准入热路径上多读一次群主行。上一版注释把它
+			// 说成"这个群在群面上的负责人"，那是错的。PR #855 第五轮 review 的 Q10。
 			InviteUID: txGroup.Creator,
 		}}, AdmissionEntryAllMemberGroup); err != nil {
 		return err
@@ -207,9 +215,18 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 	// 群主在事务内、行锁下读出。无锁读会与并发的另一次同步（或 P1 的级联交接）
 	// 各自看到同一个群主并各自提升一个继任者，群里留下两个 role=creator 的行——
 	// handOverGroupCreator 上写着这个失败模式，这里是同一个形状。
+	//
+	// ORDER BY 是确定性的，而且**多行是要处理的状态，不是要忽略的**：上一版取
+	// creators[0] 就往下走，于是"两个群主、而第一个恰好还是项目 owner"这一状态
+	// 会在开头那个 early return 上原地不动——永远收敛不掉。而 D7 禁止对全员群
+	// 转让、退群、解散，群侧没有任何路径能清理它。PR #855 第五轮 review 的 Q2。
+	//
+	// 无序读还有第二个代价：谁被当成"当前群主"取决于存储引擎的行序，在副本上
+	// 可能不同，也测不了。created_at + uid 与 PickActiveOwner 用的是同一个全序。
 	var creators []string
 	if _, err := tx.SelectBySql(
-		"SELECT uid FROM group_member WHERE group_no=? AND role=? AND is_deleted=0 FOR UPDATE",
+		"SELECT uid FROM group_member WHERE group_no=? AND role=? AND is_deleted=0 "+
+			"ORDER BY created_at ASC, uid ASC FOR UPDATE",
 		groupNo, MemberRoleCreator,
 	).Load(&creators); err != nil {
 		return fmt.Errorf("group: read all-member group creator: %w", err)
@@ -219,83 +236,151 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 		// 制造第二条告警，也不擅自指派——指派一个群主是改变谁控制这个群。
 		return nil
 	}
-	currentCreator := creators[0]
+	// keeper 是这次同步之后**唯一**应当留任的群主。先假定是最元老的那一行，
+	// 下面在需要交接时改写它；最后一步把其余的 creator 行统统降级。
+	keeper := creators[0]
+	promotedTo := ""
 
-	role, ok, err := projectpkg.MemberRole(ctx.DB(), projectID, currentCreator)
+	// 项目侧的两问都走 tx，不走连接池。
+	//
+	// 池上读是另一份快照：这个事务此刻正握着上面那些 group_member 行的
+	// FOR UPDATE 锁，而"他还是不是项目 owner"的答案可能在读到与写下去之间变掉，
+	// 而本同步只在项目 owner 变动时才会再次触发——错过一次就是错过到下一次变动。
+	// pkg/project 的两个 helper 为此收成了 dbr.SessionRunner（本仓库既有写法）。
+	// PR #855 第五轮 review 的 Q11，也是第一轮 Q6 一直推迟的那一半。
+	role, ok, err := projectpkg.MemberRole(tx, projectID, keeper)
 	if err != nil {
 		return fmt.Errorf("group: read project role of all-member group creator: %w", err)
 	}
-	if ok && role == projectRoleOwner {
-		return nil // 群主仍是项目 owner，无事可做
+	if !ok || role != projectRoleOwner {
+		successor, err := projectpkg.PickActiveOwner(tx, projectID)
+		if err != nil {
+			return fmt.Errorf("group: pick project owner for all-member group: %w", err)
+		}
+		switch {
+		case successor == "" || successor == keeper:
+			// 无可交接（项目没有活跃 owner），或目标就是现任。群主留在原处——
+			// 交给一个非 owner 比留着一个前 owner 更糟。多群主仍要收敛，所以
+			// 这里不 return。
+		case containsUID(creators, successor):
+			// 继任者**已经**是 creator 行之一，即群里此刻有多个群主而目标就在
+			// 其中。不能再提升一次：updateMemberRoleIfLiveTx 对一行本就是 creator
+			// 的行影响 0 行，会被下面当成"提升落空"而硬失败——一个本该被收敛的
+			// 状态就成了永久报错。改留任他，其余的降级。
+			keeper = successor
+		default:
+			ok, err := g.promoteAllMemberGroupCreatorTx(ctx, tx, groupNo, successor)
+			if err != nil {
+				return err
+			}
+			if ok {
+				keeper = successor
+				promotedTo = successor
+			} else {
+				// 全员群的成员集合等于项目成员集合，所以一个项目 owner 正常总是在群里；
+				// 不在，说明 D12 的那次入群失败了（I4 扫描 B 正盯着这件事）。这种情况下
+				// 不把群主交给他——一个不在群里的群主客户端渲染不出来，而且下一次入群成功时
+				// 他会以普通成员身份被写回，角色就丢了。留在原处，等扫描报出来。
+				g.Warn("全员群群主同步：目标 owner 不在群内，保持原群主不变（I4 扫描 B 会报出缺口）",
+					zap.String("projectId", projectID), zap.String("groupNo", groupNo),
+					zap.String("successor", successor))
+			}
+		}
 	}
 
-	successor, err := projectpkg.PickActiveOwner(ctx.DB(), projectID)
-	if err != nil {
-		return fmt.Errorf("group: pick project owner for all-member group: %w", err)
+	// 收敛到一个群主：除 keeper 外的每一行 creator 都降为普通成员。
+	//
+	// 降级而不是移出群：他还是项目成员（只是不再是 owner），而全员群的成员集合
+	// 等于项目成员集合。
+	demoted := make([]string, 0, len(creators))
+	for _, uid := range creators {
+		if uid == keeper {
+			continue
+		}
+		version, err := ctx.GenSeq(common.GroupMemberSeqKey)
+		if err != nil {
+			return fmt.Errorf("group: generate demote version: %w", err)
+		}
+		if err := g.db.UpdateMemberRoleTx(groupNo, uid, MemberRoleCommon, version, tx); err != nil {
+			return fmt.Errorf("group: demote former all-member group creator: %w", err)
+		}
+		demoted = append(demoted, uid)
 	}
-	if successor == "" || successor == currentCreator {
-		return nil
+	if promotedTo == "" && len(demoted) == 0 {
+		return nil // 什么都没改，不提交
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("group: commit all-member owner sync: %w", err)
+	}
+	if promotedTo != "" {
+		g.Info("全员群群主已同步为项目 owner",
+			zap.String("projectId", projectID), zap.String("groupNo", groupNo),
+			zap.String("from", creators[0]), zap.String("to", promotedTo))
+	}
+	if len(demoted) > 1 || (promotedTo == "" && len(demoted) > 0) {
+		// 一次降掉不止一行，或者根本没发生交接却仍有要降的行：群里原本有多个
+		// role=creator。这是并发交接留下的痕迹，值得被看见。
+		g.Warn("全员群存在多个群主，已收敛为一个",
+			zap.String("projectId", projectID), zap.String("groupNo", groupNo),
+			zap.String("keeper", keeper), zap.Strings("demoted", demoted))
+	}
+	return nil
+}
 
-	// 继任者的成员行必须在**事务内、行锁下**读出。
-	//
-	// 无锁读 + 随后的两次写是这条路径最危险的形状：读到"他在群里"，项目侧的级联在
-	// 这之后把他的行软删除，于是下面的提升影响 0 行（UpdateMemberRoleTx 的 WHERE
-	// 带 is_deleted=0 且**不报错**），而降级照常执行——群里从此**一个群主都没有**。
-	// 而 D7 恰好禁止对全员群做转让、退群、解散，所以这个群谁也救不回来。
-	//
-	// 兄弟路径 project_cascade.go 的 handOverGroupCreator 早就是这么做的：
-	// FOR UPDATE 选继任者、用 updateMemberRoleIfLiveTx 拿"到底改没改到行"、
-	// 改不到就**硬失败**。这里当初两样都没做，等于把那条路径吃过的亏重演一遍。
+// containsUID 报告 uid 是否在 uids 里。
+func containsUID(uids []string, uid string) bool {
+	for _, u := range uids {
+		if u == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// promoteAllMemberGroupCreatorTx 在事务内把 successor 提升为群主。
+//
+// 返回 false 表示他此刻不在群里（成员行不存在或已软删除），此时**什么都没写**，
+// 调用方应保持原群主不变。
+//
+// 继任者的成员行必须在**事务内、行锁下**读出。
+//
+// 无锁读 + 随后的两次写是这条路径最危险的形状：读到"他在群里"，项目侧的级联在
+// 这之后把他的行软删除，于是提升影响 0 行（UpdateMemberRoleTx 的 WHERE 带
+// is_deleted=0 且**不报错**），而降级照常执行——群里从此**一个群主都没有**。
+// 而 D7 恰好禁止对全员群做转让、退群、解散，所以这个群谁也救不回来。
+//
+// 兄弟路径 project_cascade.go 的 handOverGroupCreator 早就是这么做的：
+// FOR UPDATE 选继任者、用 updateMemberRoleIfLiveTx 拿"到底改没改到行"、
+// 改不到就**硬失败**。这里当初两样都没做，等于把那条路径吃过的亏重演一遍。
+func (g *Group) promoteAllMemberGroupCreatorTx(
+	ctx *config.Context, tx *dbr.Tx, groupNo, successor string,
+) (bool, error) {
 	var successorLive []int
 	if _, err := tx.SelectBySql(
 		"SELECT 1 FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
 		groupNo, successor,
 	).Load(&successorLive); err != nil {
-		return fmt.Errorf("group: lock successor membership: %w", err)
+		return false, fmt.Errorf("group: lock successor membership: %w", err)
 	}
 	if len(successorLive) == 0 {
-		// 全员群的成员集合等于项目成员集合，所以一个项目 owner 正常总是在群里；
-		// 不在，说明 D12 的那次入群失败了（I4 扫描 B 正盯着这件事）。这种情况下
-		// 不把群主交给他——一个不在群里的群主客户端渲染不出来，而且下一次入群成功时
-		// 他会以普通成员身份被写回，角色就丢了。留在原处，等扫描报出来。
-		g.Warn("全员群群主同步：目标 owner 不在群内，保持原群主不变（I4 扫描 B 会报出缺口）",
-			zap.String("projectId", projectID), zap.String("groupNo", groupNo),
-			zap.String("successor", successor))
-		return nil
+		return false, nil
 	}
-
-	successorVersion, err := ctx.GenSeq(common.GroupMemberSeqKey)
+	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {
-		return fmt.Errorf("group: generate successor version: %w", err)
+		return false, fmt.Errorf("group: generate successor version: %w", err)
 	}
-	promoted, err := g.db.updateMemberRoleIfLiveTx(tx, groupNo, successor, MemberRoleCreator, successorVersion)
+	promoted, err := g.db.updateMemberRoleIfLiveTx(tx, groupNo, successor, MemberRoleCreator, version)
 	if err != nil {
-		return fmt.Errorf("group: promote all-member group creator: %w", err)
+		return false, fmt.Errorf("group: promote all-member group creator: %w", err)
 	}
 	if !promoted {
 		// 上面刚在 FOR UPDATE 下确认过这一行是活的，所以走到这里是 bug 而不是竞态——
 		// 但它**绝不能**继续往下走到降级。在一次落空的提升之上再降一次级，正是群里
 		// 一个群主都不剩的成因，而且全程无声。返回错误让事务回滚，什么都不改。
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"group: promote %s as creator of %s affected no live member row", successor, groupNo)
 	}
-	demoteVersion, err := ctx.GenSeq(common.GroupMemberSeqKey)
-	if err != nil {
-		return fmt.Errorf("group: generate demote version: %w", err)
-	}
-	// 原群主降为普通成员，而不是移出群：他还是项目成员（他只是不再是 owner），
-	// 而全员群的成员集合等于项目成员集合。
-	if err := g.db.UpdateMemberRoleTx(groupNo, currentCreator, MemberRoleCommon, demoteVersion, tx); err != nil {
-		return fmt.Errorf("group: demote former all-member group creator: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("group: commit all-member owner sync: %w", err)
-	}
-	g.Info("全员群群主已同步为项目 owner",
-		zap.String("projectId", projectID), zap.String("groupNo", groupNo),
-		zap.String("from", currentCreator), zap.String("to", successor))
-	return nil
+	return true, nil
 }
 
 // renameAllMemberGroup 把全员群名改成项目名（D8）。
@@ -303,8 +388,10 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 // 走 UpdateGroupInfo：它已经处理群名截断（MaxGroupNameLen）、版本号推进、
 // 以及给客户端下发群信息变更。截断规则属于群，所以项目侧传原始项目名即可。
 //
-// OperatorUID 传群主：改名会产生一条可见的变更，而"项目改名了"这件事在群里
-// 最贴切的归属人就是这个群的负责人。传一个系统 uid 会声称是机器人改的。
+// OperatorUID 传 group.creator，即**建这个群的人**（对全员群就是补建那一刻的项目
+// owner），不是"当前群主"——那一列不随交接改写，见 admitToAllMemberGroup 里的
+// 同一条说明。传一个系统 uid 会声称是机器人改的，那更差；这条变更的真正发起者是
+// "项目改名了"这件事本身，而建群人是群面上离它最近的一个真人。
 func (g *Group) renameAllMemberGroup(ctx *config.Context, groupNo, name string) error {
 	if groupNo == "" || name == "" {
 		return nil
