@@ -56,10 +56,13 @@ Reuse existing DB sessions, membership queries, errors and test helpers.
   requested Projects). Owner membership must never be represented as the Bot's
   own Project membership.
 - A failed context lookup sets `context_error` and omits both contexts;
-  inactive identities or missing Space membership disclose no Project roles.
+  disabled, cooling-off, or destroyed identities and missing Space membership
+  disclose no Project roles.
 - Without `include=owner_context`, the original verifier's five fields and
   legacy `space_id` remain unchanged. Hosting is telemetry, not authority;
   consumers must not use it to classify authorization eligibility.
 
 Tests cover default compatibility, account/Space isolation, spoofed owner
 rejection, Project bounds, lookup failures, and independence from platform data.
+The account and membership predicates execute against MySQL in the E2E lane;
+they are not covered only through pre-computed SQL-mock booleans.

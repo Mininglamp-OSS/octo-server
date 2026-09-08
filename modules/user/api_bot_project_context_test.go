@@ -1,25 +1,32 @@
 package user
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
 // Pin every SQL predicate that gates owner Project facts. The tests below also
 // inject each computed boolean to exercise the Go-level fail-closed logic.
 const botContextQueryPattern = `(?s)SELECT IFNULL.*` +
-	`bu.status = 1 AND bu.robot = 1 AND COALESCE\(bu.is_destroy, 0\) <> 2.*` +
-	`ou.status = 1 AND ou.robot = 0 AND COALESCE\(ou.is_destroy, 0\) <> 2.*` +
+	`bu.status = 1 AND bu.robot = 1 AND COALESCE\(bu.is_destroy, 0\) = 0.*` +
+	`ou.status = 1 AND ou.robot = 0 AND COALESCE\(ou.is_destroy, 0\) = 0.*` +
 	`s.space_id = 'space' AND s.status = 1.*` +
 	`bm.uid = bu.uid AND bm.status = 1.*` +
 	`om.uid = ou.uid AND om.status = 1.*` +
@@ -184,4 +191,100 @@ func TestBotOwnerContextMissingFactsIsAnError(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "disappeared after credential verification")
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBotOwnerContextMySQLLivenessContract executes the authorization-shaped
+// predicates in MySQL instead of injecting their already-computed booleans.
+// Every case gets distinct rows in a randomly named database; no shared schema
+// or testutil.CleanAllTables call is involved.
+func TestBotOwnerContextMySQLLivenessContract(t *testing.T) {
+	dsn := os.Getenv("OCTO_ASSISTANT_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set OCTO_ASSISTANT_TEST_MYSQL_DSN for an isolated MySQL server")
+	}
+	dbConfig, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	dbConfig.DBName = "information_schema"
+	bootstrap, err := sql.Open("mysql", dbConfig.FormatDSN())
+	require.NoError(t, err)
+	bootstrap.SetMaxOpenConns(2)
+	bootstrap.SetMaxIdleConns(1)
+	t.Cleanup(func() { require.NoError(t, bootstrap.Close()) })
+	require.NoError(t, bootstrap.Ping())
+	databaseName := "octo_bot_context_" + util.GenerUUID()[:12]
+	_, err = bootstrap.Exec("CREATE DATABASE `" + databaseName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := bootstrap.Exec("DROP DATABASE `" + databaseName + "`")
+		require.NoError(t, err)
+	})
+	dbConfig.DBName = databaseName
+	cfg := config.New()
+	cfg.DB.MySQLAddr = dbConfig.FormatDSN()
+	cfg.DB.MySQLMaxOpenConns = 2
+	cfg.DB.MySQLMaxIdleConns = 1
+	ctx := testutil.NewTestContext(cfg)
+	database := ctx.DB().DB
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	exec := func(query string, args ...any) {
+		t.Helper()
+		_, err := database.Exec(query, args...)
+		require.NoError(t, err)
+	}
+	exec("CREATE TABLE `user` (uid VARCHAR(40) PRIMARY KEY, status INT NOT NULL, robot INT NOT NULL, is_destroy INT NULL)")
+	exec("CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40) NOT NULL, bot_token VARCHAR(80) NOT NULL, status INT NOT NULL, agent_hosting VARCHAR(40) NOT NULL DEFAULT '', agent_reported_hosting_at TIMESTAMP NULL)")
+	exec("CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status INT NOT NULL)")
+	exec("CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status INT NOT NULL, PRIMARY KEY(space_id,uid))")
+	exec("CREATE TABLE octo_project (project_id VARCHAR(40) PRIMARY KEY, status INT NOT NULL, member_epoch BIGINT NOT NULL)")
+	exec("CREATE TABLE octo_project_member (project_id VARCHAR(40), uid VARCHAR(40), space_id VARCHAR(40), role INT NOT NULL, status INT NOT NULL, removing INT NOT NULL, PRIMARY KEY(project_id,uid))")
+
+	for i, tc := range []struct {
+		name                                                           string
+		botStatus, botDestroy, ownerStatus, ownerDestroy               int
+		botMemberStatus, ownerMemberStatus, spaceStatus, projectStatus int
+		wantMember                                                     bool
+	}{
+		{"live principals", 1, 0, 1, 0, 1, 1, 1, 1, true},
+		{"disabled bot", 0, 0, 1, 0, 1, 1, 1, 1, false},
+		{"destroying bot", 1, 1, 1, 0, 1, 1, 1, 1, false},
+		{"destroyed bot", 1, 2, 1, 0, 1, 1, 1, 1, false},
+		{"disabled owner", 1, 0, 0, 0, 1, 1, 1, 1, false},
+		{"destroying owner", 1, 0, 1, 1, 1, 1, 1, 1, false},
+		{"destroyed owner", 1, 0, 1, 2, 1, 1, 1, 1, false},
+		{"bot removed from Space", 1, 0, 1, 0, 0, 1, 1, 1, false},
+		{"owner removed from Space", 1, 0, 1, 0, 1, 0, 1, 1, false},
+		{"disbanded Space", 1, 0, 1, 0, 1, 1, 0, 1, false},
+		{"disbanded Project", 1, 0, 1, 0, 1, 1, 1, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			suffix := fmt.Sprintf("%02d", i)
+			botID, ownerID := "bot"+suffix, "owner"+suffix
+			spaceID, projectID, token := "space"+suffix, "project"+suffix, "bf_"+suffix
+			exec("INSERT INTO `user` VALUES (?,?,1,?),(?,?,0,?)", botID, tc.botStatus, tc.botDestroy, ownerID, tc.ownerStatus, tc.ownerDestroy)
+			exec("INSERT INTO robot VALUES (?,?,?,1,'self_hosted',UTC_TIMESTAMP())", botID, ownerID, token)
+			exec("INSERT INTO space VALUES (?,?)", spaceID, tc.spaceStatus)
+			exec("INSERT INTO space_member VALUES (?,?,?),(?,?,?)", spaceID, botID, tc.botMemberStatus, spaceID, ownerID, tc.ownerMemberStatus)
+			exec("INSERT INTO octo_project VALUES (?,?,7)", projectID, tc.projectStatus)
+			exec("INSERT INTO octo_project_member VALUES (?,?,?,2,1,0)", projectID, ownerID, spaceID)
+
+			resp := authVerifyBotResp{BotUID: botID, OwnerUID: ownerID}
+			err := (&User{db: NewDB(ctx)}).fillBotProjectContext(&resp, authVerifyBotReq{
+				BotToken: token, SpaceID: spaceID, ProjectIDs: []string{projectID},
+			})
+			require.NoError(t, err)
+			require.Len(t, resp.OwnerContext.Projects, 1)
+			require.Equal(t, tc.wantMember, resp.OwnerContext.Projects[0].Member)
+			if tc.wantMember {
+				require.True(t, resp.BotContext.Active)
+				require.True(t, resp.OwnerContext.Active)
+				require.True(t, resp.BotContext.SpaceMember)
+				require.True(t, resp.OwnerContext.SpaceMember)
+				require.NotNil(t, resp.OwnerContext.Projects[0].Role)
+			} else {
+				require.Nil(t, resp.OwnerContext.Projects[0].Role)
+				require.Nil(t, resp.OwnerContext.Projects[0].MemberEpoch)
+				require.Empty(t, resp.OwnerContext.Projects[0].Capabilities)
+			}
+		})
+	}
 }

@@ -19,9 +19,9 @@ source: user
 - `verify-bot?include=owner_context` derives the owner from the validated Bot
   credential, returns Bot and owner facts separately, and answers only the
   requested Project IDs.
-- Disabled, terminally destroyed, removed-from-Space, and disbanded-Space cases
-  all deny Project facts. Context lookup errors and a row disappearing between
-  credential verification and context lookup fail closed.
+- Disabled, cooling-off, terminally destroyed, removed-from-Space, and
+  disbanded-Space cases all deny Project facts. Context lookup errors and a row
+  disappearing between credential verification and context lookup fail closed.
 - The default five-field `verify-bot` response remains unchanged.
 
 ## Structural learnings
@@ -42,8 +42,9 @@ source: user
 ## Gotchas
 
 - A SQL mock that injects already-computed booleans does not prove the SQL that
-  computes them. The query expectation now pins every account, Space, and
-  membership predicate, while table cases exercise the downstream conjunction.
+  computes them. The query expectation pins every account, Space, and
+  membership predicate, and an isolated MySQL matrix executes those predicates
+  for disabled/destroyed principals, revoked memberships, and inactive scopes.
 - The CI package runner recreates the shared `test` database before every
   package because migration ledgers differ by linked module set. Local
   verification used fresh isolated service containers for the same reason.

@@ -189,6 +189,10 @@ jobs:
       # 32-char value here so re-runs are reproducible (the value is
       # ephemeral CI-only and never used outside tests).
       OCTO_MASTER_KEY: 0123456789abcdef0123456789abcdef
+      # Opt-in MySQL contract tests create and drop only randomly named
+      # databases. Wiring the existing service DSN here keeps those tests in
+      # the merge queue instead of silently skipping them.
+      OCTO_ASSISTANT_TEST_MYSQL_DSN: root:demo@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

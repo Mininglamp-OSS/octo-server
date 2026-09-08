@@ -48,8 +48,8 @@ func (u *User) fillBotProjectContext(resp *authVerifyBotResp, req authVerifyBotR
 	}
 	err := u.db.session.SelectBySql(
 		"SELECT IFNULL(r.agent_hosting,'') AS hosting, r.agent_reported_hosting_at AS hosting_reported_at, "+
-			"(bu.status = 1 AND bu.robot = 1 AND COALESCE(bu.is_destroy, 0) <> 2) AS bot_active, "+
-			"(ou.status = 1 AND ou.robot = 0 AND COALESCE(ou.is_destroy, 0) <> 2) AS owner_active, "+
+			"(bu.status = 1 AND bu.robot = 1 AND COALESCE(bu.is_destroy, 0) = 0) AS bot_active, "+
+			"(ou.status = 1 AND ou.robot = 0 AND COALESCE(ou.is_destroy, 0) = 0) AS owner_active, "+
 			"(s.space_id IS NOT NULL AND bm.uid IS NOT NULL) AS bot_member, "+
 			"(s.space_id IS NOT NULL AND om.uid IS NOT NULL) AS owner_member "+
 			"FROM robot r JOIN `user` bu ON bu.uid = r.robot_id JOIN `user` ou ON ou.uid = r.creator_uid "+
