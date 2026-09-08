@@ -2579,3 +2579,35 @@ consumer could cache an authorization grant that never expired. Fixed at the
 source — creation bumps the epoch, a migration lifts existing zero rows — rather
 than by changing the wire contract, which is the only option requiring no change
 from the consumer. See `.octospec/journal/shared/membership-epoch-absent-sentinel.md`.
+
+## 2026-09-08 — loop-project-fleet-integration（PR #852 第二轮 review：四个阻塞项）
+
+- **rebase 提交了未解决的冲突标记** —— `.octospec/log.md` 里 `<<<<<<< / ======= /
+  >>>>>>>` 三行原样进了仓库，而 CI 没有 markdown 闸门，所以 head 是绿的。那次提交
+  的**全部内容就是一次 rebase**，却没有端到端校对；同一次 rebase 还带了 `main.go`
+  的实质编辑。**「只是解冲突」不是少看一遍的理由，恰恰是多看一遍的理由。**
+- **一次性动作建立的是状态，不是不变量** —— 迁移 + 建项目路径读起来像全覆盖，直到
+  你问「不变量被破坏的那一刻，哪个进程在跑？」答案是「没有」：迁移已经跑完了，
+  建项目路径在被回滚掉的镜像里。**强制不变量的是那个反复运行、并且知道违规形状长什么
+  样的东西**——而已经在跑的对账扫描，从来没被告知这个形状存在。
+- **对读为真、对写为假的回滚说明，比没有说明更糟** —— 「回滚二进制即可」是运维会
+  照着做的那句话，而它是站在**读**这一列代码的角度写的。凡是描述回滚的迁移注释，
+  都该说清楚自己在推理哪一边。
+- **一个谓词的「对等」不是防线，缺的是它前面的闸门** —— `status = 1 AND removing = 0`
+  与仓内其它调用方一字不差，正因如此才不容易看出问题：其它每一个调用方都跑在 Space
+  闸门之后。这是第一个前面没有闸门的调用方，而它的消费方**拿不到**缺的那一半——
+  「你自己再叠一层 Space 检查」是一条它无法执行的建议。**把义务写进文档之前，先确认
+  对方有没有履行它的能力。**
+- **仓里已经判过一次的坑，第二次还是要判** —— 结尾那次 `decoder.Decode` 必须多读一个
+  字节才能区分「还有值」和「读完了」，本仓 #837 判过、`modules/bot_task` 已经给了不
+  用等 socket 的解法。**同一棵树里已经有一个既严格又不会挂住的形状时，重新发明一个
+  会挂住的没有任何收益。**
+- **rebase 把中心注册表从 4 个凭据扩到 7 个，两侧的模块级拒绝都留在 4 个** —— 中心检查
+  只**记日志**，模块级拒绝才是**失败关闭**的那一层。于是只有中心看得见的那一对，等于
+  一个泄漏值同时授予两种能力，而拦路的只有一行 ERROR。守卫也跟着一起漏了：
+  `TestTokenRefusedOnSiblingCollision` 的注释写着「覆盖每个兄弟能力」，钉的却是那份
+  过期的四项拷贝——**测试给缺口发了合格证**。改成迭代真实列表。
+- **源码守卫的每一条断言都是「某段文本不在这里」，唯一能知道它会不会发现的办法是把
+  文本喂给它** —— 路由顺序守卫钉了「Group 不带参数」和「每条路由上 limiter 在 auth
+  前」，而 `internal.Use(auth)` 两条都满足，执行时却仍然 auth 在前。现在守卫是一个函
+  数，喂四个危险样本 + 一个干净样本，「线上源码是干净的」这句话才有意义。
