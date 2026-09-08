@@ -166,23 +166,17 @@ func TestAnAbandonedEventDoesNotStallItsProjectForever(t *testing.T) {
 		return lifecycleDeliveryResult{}, false
 	}}
 	p.runLifecycleEventDelivery()
+
+	// ONE tick, because abandoned is DONE: the drain treats a terminally
+	// abandoned head as finished and moves straight to the next row.
+	//
+	// That distinction is the whole point of the boolean. Abandoned is terminal
+	// and nothing retries it, so blocking on it would convert one lost event into
+	// a project that never receives another — while blocking on a merely FAILED
+	// head is exactly what has to happen, which the case above pins.
 	rows := outboxRows(t, created.ProjectID)
 	require.Len(t, rows, 2)
 	require.EqualValues(t, lifecycleEventAbandoned, rows[0].Status)
-	assert.EqualValues(t, lifecycleEventPending, rows[1].Status,
-		"the claim takes at most one pending row per project, so the tail waits for the "+
-			"next tick — it is not delivered alongside the head")
-
-	// The NEXT tick is where the property lives. The claim declines a project that
-	// still has an older PENDING sibling; `abandoned` is not pending, so the tail
-	// becomes claimable as soon as the head reaches a terminal state.
-	//
-	// That distinction is the whole point. Abandoned is terminal and nothing
-	// retries it, so blocking on it would convert one lost event into a project
-	// that never receives another — while blocking on a merely FAILED head is
-	// exactly what has to happen.
-	p.runLifecycleEventDelivery()
-	rows = outboxRows(t, created.ProjectID)
 	assert.EqualValues(t, lifecycleEventDelivered, rows[1].Status,
 		"a terminally abandoned event must not block the ones behind it: nothing will ever "+
 			"retry it, so the project would never receive another event")
