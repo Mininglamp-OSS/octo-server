@@ -474,3 +474,75 @@ func TestListProjectGroupsIncludesTheAllMemberGroup(t *testing.T) {
 			"labels it by comparing against all_member_group_no rather than by position")
 	assert.Equal(t, later, list[1].GroupNo)
 }
+
+// seedProjectGroupWithAvatar seeds a project group with the avatar columns SET, so
+// the display fields can be asserted against values that are distinguishable from
+// each other and from the zero value.
+func seedProjectGroupWithAvatar(t *testing.T, groupNo, spaceID, projectID, name, avatarText string, avatarColor int) {
+	t.Helper()
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, `version`, space_id, project_id, "+
+			"is_named, avatar_text, avatar_color, is_upload_avatar) "+
+			"VALUES (?, ?, '', 1, 1, ?, ?, 1, ?, ?, 1)",
+		groupNo, name, spaceID, projectID, avatarText, avatarColor,
+	).Exec()
+	require.NoError(t, err)
+}
+
+// TestListProjectGroupsMapsEveryDisplayField covers the six fields the handler
+// hand-maps in a struct literal, which until PR #861's review nothing asserted:
+// every case went through group_no and member_count only.
+//
+// Two failure modes it catches, both of which ship green otherwise. A copy-paste
+// slip in the literal — AvatarText: g.Name — reads plausibly and renders wrong on
+// every project card. And changing AvatarColor from *int to int would turn null,
+// which means "derive the colour from group_no", into 0, which is a real palette
+// index: every unstyled group would silently acquire the first colour. That is
+// exactly the client-side drift the field set's own comment says it exists to
+// prevent, so it is worth more than a comment.
+func TestListProjectGroupsMapsEveryDisplayField(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-fields")
+
+	styled := util.GenerUUID()
+	seedProjectGroupWithAvatar(t, styled, spaceA, created.ProjectID, "关键供应商来料异常", "来料", 3)
+	seedGroupMemberRow(t, styled, "owner1")
+
+	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	list := decodeGroupList(t, w)
+	require.Len(t, list, 1)
+	g := list[0]
+
+	assert.Equal(t, styled, g.GroupNo)
+	assert.Equal(t, "关键供应商来料异常", g.Name, "name must come from name, not from another column")
+	assert.Equal(t, 1, g.IsNamed)
+	assert.Equal(t, "来料", g.AvatarText,
+		"avatar_text must come from avatar_text: a literal that reads g.Name here renders "+
+			"plausibly and is wrong on every card")
+	require.NotNil(t, g.AvatarColor, "a set palette index must survive the mapping")
+	assert.Equal(t, 3, *g.AvatarColor)
+	assert.Equal(t, 1, g.IsUploadAvatar)
+
+	// The unset case, which is the one a type change breaks.
+	plain := util.GenerUUID()
+	seedProjectGroup(t, plain, spaceA, created.ProjectID)
+	seedGroupMemberRow(t, plain, "owner1")
+
+	w = doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	byNo := map[string]*GroupResp{}
+	for _, item := range decodeGroupList(t, w) {
+		byNo[item.GroupNo] = item
+	}
+	require.Contains(t, byNo, plain)
+	assert.Nil(t, byNo[plain].AvatarColor,
+		"an unset avatar_color must stay null — it means \"derive the colour from "+
+			"group_no\", and a non-pointer field would report 0, which is a real palette index")
+	assert.Empty(t, byNo[plain].AvatarText)
+	assert.Zero(t, byNo[plain].IsUploadAvatar)
+}
