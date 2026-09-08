@@ -259,9 +259,44 @@ func (p *Project) lockSeatsTx(
 	if err != nil {
 		return nil, err
 	}
+
+	// ACCOUNT liveness, as a SEPARATE read rather than a third join in the statement above.
+	//
+	// A Space seat does not imply a live account: a super-admin ban writes only the `user` row
+	// (modules/user.liftBanUser) and account destroy cascades no membership removal, so a banned
+	// or destroyed uid keeps its seat. Without this, such an account could be admitted to a
+	// project — and since admission bumps member_epoch, a peer would re-verify and be served the
+	// wrong answer as a FRESH one.
+	//
+	// Why not in the locking statement, which is the obvious shape and what both existing
+	// precedents do: joining `user` there hands the optimizer the driving table. Measured on
+	// 8.0.33, `user` drives at BOTH 3 and 200 uids, which locks space_member rows one eq_ref at a
+	// time in user-PK order instead of letting InnoDB pick its own order for one IN predicate —
+	// the exact property lockSpaceSeatsTx's own comment relies on. Details and the EXPLAIN
+	// transcript are there.
+	//
+	// Intersecting AFTER the seat locks is sound: this read can only ever REMOVE uids, and every
+	// refusal below is fail-closed. It does open the read view — but so does the JOIN onto
+	// `space` in the statement immediately above, so nothing changes for callers of this helper.
+	// createProject deliberately does NOT use this helper for that reason; see its own liveness
+	// read and lockSpaceSeatRowTx.
+	live, err := userpkg.ActiveAccounts(p.db.session, uids)
+	if err != nil {
+		return nil, fmt.Errorf("project: check account liveness: %w", err)
+	}
+	for uid := range held {
+		if !live[uid] {
+			delete(held, uid)
+		}
+	}
+
 	// The ACTOR is checked first, so a caller who has lost their own seat is told that rather
 	// than being told something about the target. Their project role may well still be active,
 	// because the Space-removal cascade is asynchronous by design.
+	//
+	// A banned actor lands here too, and gets errActorNotSpaceMember rather than a distinct
+	// sentinel: a caller learning "your account is banned" from a project endpoint is an
+	// enumeration answer, and the ban is already reported on the paths that own it.
 	if !held[actorUID] {
 		return nil, errActorNotSpaceMember
 	}

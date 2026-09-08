@@ -159,6 +159,20 @@ func seedUser(t *testing.T, uid string) string {
 	return token
 }
 
+// seedUserBare inserts a live `user` row and nothing else.
+//
+// seedUser additionally mints a cache token, which is a Redis round trip per uid —
+// fine for a handful of fixtures, too slow for the thousands a plan-shape test needs
+// to give the optimizer a real choice. This is for fixtures that only have to EXIST
+// (and be live: status and is_destroy take their column defaults, 1 and 0).
+func seedUserBare(t *testing.T, uid string) {
+	t.Helper()
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, "user-"+uid, uid,
+	).Exec()
+	require.NoError(t, err)
+}
+
 // seedSpace creates an active Space.
 func seedSpace(t *testing.T, spaceID string, status int) {
 	t.Helper()

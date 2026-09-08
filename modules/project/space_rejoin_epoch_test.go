@@ -2,6 +2,7 @@ package project
 
 import (
 	"testing"
+	"time"
 
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/stretchr/testify/assert"
@@ -29,11 +30,22 @@ import (
 // Unbounded in a quiet project. This is the same shape the ban/unban fix closed one
 // table over (TestSpaceBanMovesTheEpochChannelToo).
 
-// TestSpaceMemberRejoinMovesTheEpoch pins both reactivation entry points.
+// TestSpaceMemberRejoinMovesTheEpoch pins EVERY reactivation entry point.
 //
-// They are separate cases because they are separate statements with different
-// capacity semantics: the invite/add path reactivates directly, the join path goes
-// through the capacity-checked variant.
+// FOUR of them, not two, and the first version of this test covered two — which is
+// how round 9 found the axis still open after it had been declared closed. They are
+// separate cases because they are separate statements with different semantics:
+//
+//	reactivateMember                  direct reactivation (invite/add-back)
+//	atomicReactivateMemberIfNotFull   capacity-checked (join)
+//	approveJoinApplyAtomic            the join-apply approval branch — the DESIGNED
+//	                                  rejoin funnel (resetApprovedApplyForRejoin
+//	                                  exists to route a removed member back through it)
+//	upsertMembers                     admin bulk add, whose ON DUPLICATE branch
+//	                                  reopens an existing removed row
+//
+// Enumerating from the SQL rather than from the names is what this table is for: two
+// of the four do not have "reactivate" anywhere in their signature.
 func TestSpaceMemberRejoinMovesTheEpoch(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -56,6 +68,35 @@ func TestSpaceMemberRejoinMovesTheEpoch(t *testing.T) {
 				t.Helper()
 				require.NoError(t, spacemod.ReactivateMemberIfNotFullForTest(
 					testCtx, spaceID, uid, maxUsers))
+			},
+		},
+		{
+			// The join-apply approval path, and it is not an afterthought: it is the
+			// DESIGNED rejoin funnel. resetApprovedApplyForRejoin exists precisely so a
+			// removed member can re-apply and be approved through this branch, which
+			// reopens the existing row rather than inserting a new one. Three approval
+			// entries (in-space, manager, H5 auth_code) all converge here.
+			name:     "approveJoinApplyAtomic",
+			maxUsers: 10,
+			rejoin: func(t *testing.T, spaceID, uid string, maxUsers int) {
+				t.Helper()
+				applyID, err := spacemod.UpsertJoinApplyForTest(testCtx, spaceID, uid)
+				require.NoError(t, err)
+				require.Positive(t, applyID)
+				_, err = spacemod.ApproveJoinApplyForTest(
+					testCtx, applyID, "rjOwner", spaceID, maxUsers)
+				require.NoError(t, err)
+			},
+		},
+		{
+			// The admin bulk add: `INSERT ... ON DUPLICATE KEY UPDATE status=1`, whose
+			// DUPLICATE branch fires on any existing removed row. The function's own
+			// name says "upsert" and its comment says "add/reactivate", so treating it
+			// as insert-only was a misreading of its own bytes.
+			name: "upsertMembers",
+			rejoin: func(t *testing.T, spaceID, uid string, _ int) {
+				t.Helper()
+				require.NoError(t, spacemod.UpsertMembersForTest(testCtx, spaceID, []string{uid}))
 			},
 		},
 	}
@@ -109,4 +150,60 @@ func TestSpaceMemberRejoinMovesTheEpoch(t *testing.T) {
 				"a project the member never held a seat in must not be churned")
 		})
 	}
+}
+
+// TestRepeatedUpsertOfAnActiveMemberDoesNotChurnTheEpoch pins the half of the
+// reactivation fix that the obvious implementation gets wrong.
+//
+// The reviews suggested gating on `ON DUPLICATE KEY UPDATE`'s affected-rows
+// convention (1 = insert, 2 = update, 0 = no change). Measured on MySQL 8.0.33
+// against this statement, that convention cannot express the distinction needed
+// here:
+//
+//	fresh insert                                   -> 1
+//	removed row (status=0) reactivated             -> 2
+//	ALREADY-ACTIVE member re-upserted, same second -> 0
+//	ALREADY-ACTIVE member re-upserted, next second -> 2   <-- same as reactivation
+//
+// because `updated_at=NOW()` makes a cross-second repeat count as "changed". So
+// affected==2 would bump the epoch on every repeated admin add of an existing
+// member — and "a no-op write does not change the epoch" is a rule consumers cache
+// against. Every needless bump costs every consumer of that project a re-verify.
+//
+// Hence the locking read. This test is what keeps it: it is timing-dependent in the
+// direction that matters, so it sleeps past a second boundary to reach the case that
+// the affected-rows shape gets wrong.
+func TestRepeatedUpsertOfAnActiveMemberDoesNotChurnTheEpoch(t *testing.T) {
+	srv, p := setup(t)
+	p.registerSpaceMemberRemovalCleanup()
+
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "chOwner")
+	seedSpaceMember(t, spaceA, "chOwner", 2, 1)
+	seedUser(t, "chTarget")
+	seedSpaceMember(t, spaceA, "chTarget", 0, 1)
+
+	inProject := createProjectVia(t, srv, spaceA, ownerToken, "upsert-churn")
+	admitted, err := p.addOneMember(inProject.ProjectID, spaceA, "chOwner", "chTarget")
+	require.NoError(t, err)
+	require.True(t, admitted)
+
+	before := epochOf(t, inProject.ProjectID)
+
+	// The target is ALREADY an active Space member, so neither of these is a
+	// reactivation and neither may move the epoch.
+	require.NoError(t, spacemod.UpsertMembersForTest(testCtx, spaceA, []string{"chTarget"}))
+	assert.Equal(t, before, epochOf(t, inProject.ProjectID),
+		"re-adding an already-active member is a no-op for membership and must not bump")
+
+	// Past a second boundary, which is where `updated_at=NOW()` starts reporting
+	// affected==2 — indistinguishable from a real reactivation.
+	time.Sleep(1100 * time.Millisecond)
+	require.NoError(t, spacemod.UpsertMembersForTest(testCtx, spaceA, []string{"chTarget"}))
+	assert.Equal(t, before, epochOf(t, inProject.ProjectID),
+		"still a no-op across a second boundary. If this fails, the reactivation check is "+
+			"keyed on affected-rows rather than on the row's actual prior status: NOW() makes "+
+			"a cross-second repeat report affected==2, which is exactly what a real "+
+			"reactivation reports, so every repeated admin add would churn the epoch and cost "+
+			"every consumer of this project a re-verify")
 }

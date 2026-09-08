@@ -2,6 +2,7 @@ package space
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -91,4 +92,39 @@ func ReactivateMemberIfNotFullForTest(ctx *config.Context, spaceID, uid string, 
 		return err
 	}
 	return NewDB(ctx).atomicReactivateMemberIfNotFull(spaceID, uid, maxUsers)
+}
+
+// ApproveJoinApplyForTest runs the join-apply approval transaction — including its
+// reactivation branch, which reopens an existing removed seat.
+func ApproveJoinApplyForTest(
+	ctx *config.Context, applyID int64, reviewerUID, spaceID string, maxUsers int,
+) (string, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return "", err
+	}
+	outcome, code, err := NewDB(ctx).approveJoinApplyAtomic(applyID, reviewerUID, spaceID, maxUsers)
+	if err != nil {
+		return code, err
+	}
+	if outcome != approveOK {
+		return code, fmt.Errorf("space: approval did not take: outcome=%d", outcome)
+	}
+	return code, nil
+}
+
+// UpsertJoinApplyForTest creates or resets a pending join apply and returns its id.
+func UpsertJoinApplyForTest(ctx *config.Context, spaceID, uid string) (int64, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return 0, err
+	}
+	return NewDB(ctx).upsertJoinApply(&spaceJoinApplyModel{SpaceId: spaceID, UID: uid})
+}
+
+// UpsertMembersForTest runs the admin bulk add/reactivate transaction — the
+// ON DUPLICATE KEY branch of which reopens an existing removed seat.
+func UpsertMembersForTest(ctx *config.Context, spaceID string, uids []string) error {
+	if err := refuseOutsideTests(); err != nil {
+		return err
+	}
+	return newManagerDB(ctx.DB()).upsertMembers(spaceID, uids)
 }

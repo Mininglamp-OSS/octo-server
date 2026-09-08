@@ -93,6 +93,23 @@ CrashLoopBackOff**，不是幂等跳过。
 
 对账扫描里的修复语句不受影响——它按 `project_id` 定位单行。
 
+## 4.1 首次升级的执行步骤（按顺序，不要跳）
+
+回填语句本身是幂等的，**但并发启动不是**（见上一节）。所以第一次带这个迁移上线时：
+
+1. **把副本数降到 1**（或确认 `maxSurge=0`，即滚动更新一次只起一个 pod）。
+   `kubectl rollout restart`、节点 drain、`maxSurge > 1` 都会并发起 pod。
+2. 部署新镜像，**等这一个 pod 就绪**。大表上它的就绪会明显变慢，那就是回填在跑。
+3. 确认迁移账本里已有 `20260908000001`：
+   `SELECT id, applied_at FROM gorp_migrations WHERE id LIKE '%project_member_epoch_base_one%';`
+   有记录才说明回填已提交，后续 pod 会跳过它。
+4. **确认没有活跃项目还落在 0 上**：
+   `SELECT COUNT(*) FROM octo_project WHERE status = 1 AND member_epoch = 0;`
+   期望 0。不为 0 说明有实例还在按旧逻辑写入（见第 2 节）。
+5. 恢复副本数 / 正常滚动。
+
+第 2 步之后再起并发 pod 就是安全的：谓词不再匹配任何行，语句是空操作。
+
 ## 5. 完整轴清单：哪些变化会移动 epoch，哪些不会
 
 对端把 epoch 一致当作「缓存仍然有效」的判据。这里逐条写清楚哪些事件会让它变，因为
@@ -105,7 +122,7 @@ CrashLoopBackOff**，不是幂等跳过。
 | **Space 封禁 / 解封** | ✅ | 不写项目行，但 epochs 的谓词会把父 Space 不活跃的项目折成 `0`；解封后恢复原值 |
 | **Space 解散** | ✅ | 同上。注意本仓**不会**级联解散其下项目，它们的 `status` 永远是 1——全靠这条谓词 |
 | **Space 成员移除** | ✅ **同事务内 +1** | 见下 |
-| **Space 成员重新加入** | ✅ **同事务内 +1** | 与移除对称。移除的异步级联若还没跑到，此人的项目席位仍然存活；重新打开 Space 席位会让那个席位**重新可达**，而这中间没有任何项目侧写入，所以必须在重新加入的事务内 bump——否则对端缓存的那条**拒绝**会一直和 epoch 对得上，一个合法回归的成员被无上界地拒绝 |
+| **Space 成员重新加入**（四条路径全覆盖） | ✅ **同事务内 +1** | 与移除对称。移除的异步级联若还没跑到，此人的项目席位仍然存活；重新打开 Space 席位会让那个席位**重新可达**，而这中间没有任何项目侧写入，所以必须在重新加入的事务内 bump——否则对端缓存的那条**拒绝**会一直和 epoch 对得上，一个合法回归的成员被无上界地拒绝。四条路径见下 |
 | **账号被全局封禁 / 注销** | ❌ **不会动**（已记录的偏离） | 见下「账号轴」 |
 | **Bot 被删除** | ❌ **不会动**（已记录的偏离） | 见下「Bot 轴」 |
 
@@ -121,6 +138,29 @@ CrashLoopBackOff**，不是幂等跳过。
 所以移除事务内会执行一条语句，把该成员还持有席位的所有活跃项目的 `member_epoch` 一次性
 +1。**这条语句失败会让整次成员移除回滚**——宁可让调用方重试，也不要提交一次没有失效
 信号的移除。
+
+### 重新加入有四条路径，按 SQL 枚举而不是按函数名
+
+这一条本来只覆盖了两条，第九轮 review 在引擎上证伪了「已全覆盖」的声明。四条都会把一个
+已存在的 `space_member` 行从 `status=0` 翻回 `1`，因此都会让移除窗口里**存活的项目席位重新
+可达**：
+
+| 路径 | 入口 |
+|---|---|
+| `reactivateMember` | 邀请 / 重新添加 |
+| `atomicReactivateMemberIfNotFull` | 加入（带容量校验） |
+| `approveJoinApplyAtomic` 的重新激活分支 | 申请审批（空间内 / 管理端 / H5 auth_code 三个入口都汇聚到它）|
+| `upsertMembers` 的 `ON DUPLICATE` 分支 | 管理端强制添加 `POST /spaces/:space_id/members` |
+
+**教训写在这里，因为它会重犯**：后两条的函数签名里没有任何「reactivate」字样，
+`approveJoinApplyAtomic` 甚至是**设计好的重新加入漏斗**（`resetApprovedApplyForRejoin` 存在的
+目的就是让被移除的人重新走审批回来）。按名字枚举会漏掉一半；要按 SQL 枚举 ——
+`ON DUPLICATE KEY UPDATE status=1` 撞上唯一索引就是一次重新激活，不是插入。
+
+**另外：判定「这次是不是重新激活」不能用 `ON DUPLICATE` 的 affected-rows。** 实测
+（MySQL 8.0.33）：全新插入=1、重新激活=2、而**已活跃成员跨秒重复 upsert 也是 2**（因为
+`updated_at=NOW()` 让它算「有变化」）。按 `affected==2` 分流会让每次重复添加都 bump 一次
+epoch，破坏「空写不动 epoch」这条对端缓存所依赖的规则。所以走 upsert 前的锁定读。
 
 ### 账号轴：全局封禁 / 注销 —— 只挡新答案，不动 epoch（已记录的偏离）
 
@@ -145,7 +185,10 @@ CrashLoopBackOff**，不是幂等跳过。
 
 `modules/botfather` 有四处直接关闭 / 删除 Bot 的 `space_member` 行
 （`api_user.go:529`、`command.go:652`、`db.go:231` 的硬 DELETE 与 `:270` 的兜底翻
-status），它们**都不在事务里**，所以既不跑事务内步骤、也不写清理工单。
+status）。前三处里 `api_user.go:529` 与 `command.go:652` 不在任何事务里；`db.go:231`
+的 DELETE 确实跑在 botfather 自己的补偿事务 `deleteCreatedBotArtifacts` 内 —— 但那个事务
+不跑移除 / 重新加入的任何步骤、也不写清理工单，所以结论不变（该处删的是同一次失败开通流程
+里刚建出来的席位，实践中不可能有存活的项目席位）。**四处都既不移动 epoch、也不排清理工单。**
 
 而项目准入不过滤 Bot：Bot 可以持有 `octo_project_member` 席位。于是 Bot 被删除后：
 

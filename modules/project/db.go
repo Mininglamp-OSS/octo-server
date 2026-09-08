@@ -609,30 +609,45 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 // lets it acquire the rows in ITS scan order, which is the same order the disband scan uses —
 // there is then no "second row" being waited for while the first is held.
 //
-// The predicate is CheckMembership's (space_member.status = 1 AND space.status = 1) PLUS the
-// account-liveness half (user.status = 1 AND user.is_destroy <> 2), and it keeps the JOIN onto
-// `space` because callers here do not lock the `space` row, so the JOIN is their only activeness
-// check. Deliberately NOT CheckMembershipForCleanup's relaxed variant: this is an authorization
-// decision and a banned Space must never pass one. (The reconcile scans ask the opposite question
-// and correctly use the relaxed form — see queryI1ViolationPage.)
+// The predicate is CheckMembership's (space_member.status = 1 AND space.status = 1), and it keeps
+// the JOIN onto `space` because callers here do not lock the `space` row, so the JOIN is their
+// only activeness check. Deliberately NOT CheckMembershipForCleanup's relaxed variant: this is an
+// authorization decision and a banned Space must never pass one. (The reconcile scans ask the
+// opposite question and correctly use the relaxed form — see queryI1ViolationPage.)
 //
-// The `user` join closes the ADMISSION direction of the account axis: a super-admin ban writes
-// only the `user` row, so without it a globally banned account could be admitted to a project
-// seat — and since the admission bumps member_epoch, a peer would re-verify and be served that
-// wrong answer as a FRESH one. Two existing precedents have this exact shape
-// (modules/user.authVerifyAPIKey, modules/bot_provision.assertSpaceMember).
+// ACCOUNT liveness is NOT in this statement, and that is a correction rather than an omission.
+// It was briefly a third `INNER JOIN user u ON u.uid = sm.uid AND u.status = 1 ...` — the shape
+// both existing precedents use (modules/user.authVerifyAPIKey,
+// modules/bot_provision.assertSpaceMember), and collation-safe here since space_member, space and
+// user all drifted to utf8mb4_0900_ai_ci together. It was still wrong, because it takes the
+// LOCK-ORDER argument above away:
 //
-// Joining `user` is safe HERE and only here: this statement is rooted at space_member, and
-// space_member / space / user are all dump-imported tables sitting at the same collation
-// (utf8mb4_0900_ai_ci in production), so no cross-collation comparison arises. A statement rooted
-// at an octo_* table must NOT join `user` — that is error 1267 in production while passing in CI.
-// See pkg/user.ActiveAccounts, which is what the READ path uses for the same reason.
+//	EXPLAIN, MySQL 8.0.33, real schema, ~3400 members in the Space, ANALYZEd, 200 uids:
+//	  WITH the user join:  s=const, u=range(uid), sm=eq_ref   <- `user` DRIVES
+//	  WITHOUT it:          s=const, sm=range(spacemember_spaceid_uid)
 //
-// It also must not be copied into lockSpaceSeatRowTx, whose whole point is having no JOIN at all:
-// a table outside `FOR SHARE OF` is a consistency read, which opens the read view before the
-// `space` lock and un-does createProject's three quota counts. That helper gets the liveness check
-// as a separate single-table read instead, and TestCreateQuotaStillHoldsUnderConcurrency is the
-// regression net.
+// Scoped honestly, because a first measurement of this overstated it: the flip depends on DATA
+// DISTRIBUTION, not only on row count, and it needs the real table's `spacemember_uid` index to
+// be present (a hand-written fixture omitting it plans differently). So this is "the join CAN
+// take the driving position", not "it always does" — which is enough, because the lock-order
+// argument requires that it never can.
+//
+// MySQL propagates `u.uid = sm.uid` with `sm.uid IN (...)` into `u.uid IN (...)`, making a `user`
+// PK range a cheap driving candidate — and once `user` drives, space_member rows are locked one
+// eq_ref at a time in `user`-PK order rather than in InnoDB's own scan order for one IN predicate.
+// That is precisely the property the paragraphs above depend on to stay out of the row-order cycle
+// with the disband scan, and precisely the class round 7 diagnosed in the single-statement epoch
+// bump ("the order is not in the SQL at all: the optimizer picks the driving table"). Reviewers
+// flagged it as a cardinality-dependent flip; measured, it is worse than a flip — `user` drives at
+// BOTH cardinalities.
+//
+// So account liveness moved OUT of the locking statement into pkg/user.ActiveAccounts, a separate
+// single-table read the callers run alongside it. That also dissolves the read-view question this
+// statement would otherwise raise, and it makes both paths symmetric: the READ path already had to
+// use a separate query, being rooted at an octo_* table where `JOIN user` is error 1267 in
+// production and green in CI.
+//
+// TestSeatLockStatementLetsInnoDBChooseTheRowOrder pins the plan so the join cannot come back.
 //
 // The read view that JOIN opens is no longer load-bearing, because every aggregate that authorises
 // a write is now a locking read (see countActiveOwnersTx).
@@ -667,7 +682,6 @@ func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[st
 	_, err := tx.SelectBySql(
 		"SELECT sm.uid FROM `space_member` sm "+
 			"INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
-			"INNER JOIN `user` u ON u.uid = sm.uid AND u.status = 1 AND u.is_destroy <> 2 "+
 			"WHERE sm.space_id = ? AND sm.uid IN ("+placeholders+") AND sm.status = 1 "+
 			"FOR SHARE OF sm",
 		args...,

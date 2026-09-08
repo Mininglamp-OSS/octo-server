@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -28,6 +29,10 @@ type Module struct {
 	store         membershipStore
 	internalToken string
 	log.Log
+
+	// repairing collapses concurrent out-of-band sentinel repairs of the SAME project
+	// to one in-flight goroutine. Keyed by project id; see repairSentinelOutOfBand.
+	repairing sync.Map
 }
 
 // New loads the token at construction. When it is unset, too short or collides
@@ -494,15 +499,25 @@ func (m *Module) logLookupFailure(op string, err error, spaceID string, count in
 // wire-identical to a database outage — and the peer must not be able to tell a data
 // anomaly from an outage by TIMING either. It also must not wait on our repair.
 //
-// Not idempotency-guarded here because the statement is: `member_epoch = 0` is its
-// own CAS, so concurrent requests hitting the same row produce exactly one
-// increment. Failure is logged and dropped — the reconcile scan remains the
-// backstop, which is why this is a fast path rather than the mechanism.
+// The DATA effect needs no idempotency guard — `member_epoch = 0` is its own CAS, so
+// concurrent requests on the same row produce exactly one increment. The COST does:
+// one anomalous row poisons every 50-id batch containing it, so at the configured
+// rate limit a retrying peer could have hundreds of goroutines in flight racing for a
+// row only the first can change. An in-flight set keyed on project id collapses that
+// to one; the rest return immediately, which is correct rather than merely cheaper —
+// the second concurrent repair of the same row has nothing to do.
+//
+// Failure is logged and dropped. The reconcile scan remains the backstop, which is
+// what makes this a fast path rather than the mechanism.
 func (m *Module) repairSentinelOutOfBand(projectID string) {
 	if projectID == "" {
 		return
 	}
+	if _, inFlight := m.repairing.LoadOrStore(projectID, struct{}{}); inFlight {
+		return
+	}
 	go func() {
+		defer m.repairing.Delete(projectID)
 		defer func() {
 			if r := recover(); r != nil {
 				m.Error("sentinel out-of-band repair panicked", zap.Any("recover", r))

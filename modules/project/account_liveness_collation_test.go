@@ -184,8 +184,14 @@ func TestAccountLivenessSurvivesCollationDrift(t *testing.T) {
 			exec("DELETE FROM `octo_project` WHERE project_id = 'cp1'")
 			return nil
 		},
-		// The WRITE path's half: JOIN rooted at space_member, where all three sides
-		// drifted together.
+		// The WRITE path's SEAT half. It answers Space membership only — account
+		// liveness is intersected by the caller (lockSeatsTx) from a separate
+		// ActiveAccounts read, because joining `user` here hands the optimizer the
+		// driving table and takes the lock-order argument away. So a banned account
+		// legitimately still HOLDS a seat as far as this statement is concerned; the
+		// refusal is asserted where it happens, in TestBannedAccountCannotBeAdmitted-
+		// ToAProject. What this entry covers is that the statement RESOLVES on a
+		// drifted database.
 		"lockSpaceSeatsTx": func() error {
 			tx, e := sess.Begin()
 			if e != nil {
@@ -196,10 +202,26 @@ func TestAccountLivenessSurvivesCollationDrift(t *testing.T) {
 			if e != nil {
 				return e
 			}
-			assert.True(t, held["clive"], "the live member must hold a seat")
-			assert.False(t, held["cbanned"],
-				"the banned account must be refused by the user join")
+			assert.True(t, held["clive"], "the live member must hold a Space seat")
+			assert.True(t, held["cbanned"],
+				"and so does the banned account, as far as THIS statement goes: it answers "+
+					"Space membership, not account liveness. If this flips to false, the "+
+					"`user` join came back into the locking statement — see "+
+					"TestSeatLockStatementHasNoUserJoin for why that is not the place for it")
 			return tx.Commit()
+		},
+		// The account half of the WRITE path, which is where the refusal actually
+		// lives now: a separate single-table read, same function the READ path uses.
+		"pkg/user.ActiveAccounts on the write path": func() error {
+			live, e := userpkg.ActiveAccounts(sess, []string{"clive", "cbanned"})
+			if e != nil {
+				return e
+			}
+			assert.True(t, live["clive"])
+			assert.False(t, live["cbanned"],
+				"the banned account must be refused by the liveness read that lockSeatsTx "+
+					"intersects with the seat set")
+			return nil
 		},
 	}
 
@@ -265,4 +287,53 @@ func readPkgProjectFuncBody(t *testing.T, name string) string {
 		kept.WriteByte('\n')
 	}
 	return kept.String()
+}
+
+// ---------- the seat lock's row order ----------
+
+// Why there is no EXPLAIN-asserting test here, having written one and deleted it.
+//
+// The property that matters is a LOCK ORDER: lockSpaceSeatsTx takes all of its
+// space_member locks in one statement with one `uid IN (...)` predicate so InnoDB
+// acquires the rows in its own scan order — the same order modules/space's disband
+// scan uses — instead of one eq_ref at a time in some driver's order. Round 4
+// reproduced the 1213 that arises otherwise.
+//
+// Adding `INNER JOIN user` for account liveness takes that away without touching a
+// line of the reasoning, because MySQL propagates `u.uid = sm.uid` with
+// `sm.uid IN (...)` into `u.uid IN (...)`, making a `user` PK range a cheap driving
+// candidate. MEASURED on 8.0.33 against the real schema: with the join, 200 uids over
+// ~3400 members plans `s=const, u=range(uid), sm=eq_ref` — `user` drives. Without it:
+// `s=const, sm=range(spacemember_spaceid_uid)`. That measurement is why the liveness
+// half lives in a separate read (see lockSeatsTx and lockSpaceSeatsTx's comment).
+//
+// An EXPLAIN-asserting test was written and removed, and the reason is worth keeping
+// so nobody re-adds it expecting it to work: the flip depends on DATA DISTRIBUTION,
+// not just row count. Seeding 3400 members through this suite's own fixtures produced
+// `sm` driving for BOTH shapes, so the control — "the rejected form must drive
+// something else here, or this fixture does not reproduce the hazard" — failed, i.e.
+// the test could not distinguish the two statements it existed to compare. Raising the
+// fixture further costs ~40s per run to chase an optimizer choice that is not stable
+// across distributions, and a plan assertion that flakes on statistics teaches people
+// to delete plan assertions.
+//
+// What guards it instead: TestSeatLockStatementHasNoUserJoin, a structural assertion
+// that costs a string scan and cannot flake. It names the property, the measurement
+// and where the liveness check belongs, so a future reader who reintroduces the join
+// gets the argument rather than a red plan they might "fix" by adjusting a fixture.
+
+// TestSeatLockStatementHasNoUserJoin is the cheap structural half of the test above,
+// which needs a live MySQL and 400 seeded members.
+func TestSeatLockStatementHasNoUserJoin(t *testing.T) {
+	body := funcBody(t, readLinesWithoutComments(t, "db.go"), "func (d *DB) lockSpaceSeatsTx(")
+	require.Contains(t, body, "space_member",
+		"the guard must be reading the right function, or it is vacuous")
+	assert.NotContains(t, strings.ToUpper(body), "JOIN `USER`",
+		"lockSpaceSeatsTx must not join `user`: that hands the optimizer the driving table "+
+			"(measured: `user` drives at both 3 and 200 uids), which locks space_member one "+
+			"eq_ref at a time in user-PK order instead of letting InnoDB pick its own order for "+
+			"the single IN predicate — the property this statement's own comment depends on. "+
+			"Account liveness belongs in the separate pkg/user.ActiveAccounts read in lockSeatsTx")
+	assert.Contains(t, body, "FOR SHARE OF sm",
+		"and it must still take the shared lock on space_member only")
 }

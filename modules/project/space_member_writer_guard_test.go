@@ -56,6 +56,20 @@ import (
 // on what it cannot express. A new axis needs its own guard, not a wider regexp
 // here.
 //
+// # A baseline whose REASON is false is worse than a missing entry
+//
+// Round 9 found the reactivation axis still open on two of its four writers, and
+// this file is part of why: the counts were correct, so the guard was green, while
+// two entries asserted coverage that the code contradicted ("BOTH reactivation
+// paths", "an INSERT of a seat that did not exist"). Nothing mechanical can check a
+// prose reason.
+//
+// So when adding an entry: enumerate from the SQL, not from the function names. Two
+// of the four reactivation writers — approveJoinApplyAtomic and upsertMembers — have
+// no form of "reactivate" in their signature, and one of them is the DESIGNED rejoin
+// funnel. "It looks like an insert" is not a finding; `ON DUPLICATE KEY UPDATE
+// status=1` against a unique index is a reactivation.
+//
 // This sweep is the structural half. It cannot verify that a writer bumps — that
 // needs execution — but it CAN make a new writer impossible to add silently, which
 // is the failure mode that produced three rounds of the same finding.
@@ -103,23 +117,36 @@ var spaceMemberWriterBaseline = map[string]struct {
 		why: "SANCTIONED. The two seat-CLOSING paths — removeMemberLockedOnce and " +
 			"removeMembersForceOnce — run runMemberRemovalTxSteps in the same " +
 			"transaction, which is where bumpMemberEpochForSpaceMemberTx is registered. " +
-			"Of the rest: the admin disband is covered by the read-time Space fold; the " +
-			"admin re-admission is an INSERT of a seat that did not exist, so no project " +
-			"seat can have survived for it to reopen (a fresh member is admitted to " +
-			"projects by a project-side write, which bumps on its own); the two role " +
-			"writes change space_member.role, which is not part of the project " +
-			"membership answer.",
+			"upsertMembers REOPENS seats (its ON DUPLICATE branch fires on any existing " +
+			"removed row) and now runs runMemberReactivationTxSteps for exactly that " +
+			"case, gated on a locking read of the row's prior status. The previous " +
+			"version of this entry called it \"an INSERT of a seat that did not exist\", " +
+			"which its own function name and comment (upsert / add-REACTIVATE) " +
+			"contradicted — recorded because a baseline whose REASON is false is worse " +
+			"than a missing entry: the counts stay right and the guard reads as green. " +
+			"Of the rest: the admin disband is covered by the read-time Space fold, and " +
+			"the two role writes change space_member.role, which is not part of the " +
+			"project membership answer.",
 	},
 	"modules/space/db.go": {
 		writes: 11,
-		why: "SANCTIONED. Single-member removal delegates to removeMemberLocked. BOTH " +
-			"reactivation paths (reactivateMember, atomicReactivateMemberIfNotFull) now " +
-			"run runMemberReactivationTxSteps in the same transaction — reopening a seat " +
-			"makes a SURVIVING project seat reachable again through the Space " +
-			"conjunction with no project-side write, so nothing else would move the " +
-			"epoch and a consumer's cached denial would keep agreeing with it. The " +
-			"disband paths close every member at once and need no bump: an inactive " +
-			"Space folds all of its projects into the absent answer at read time " +
+		why: "SANCTIONED. Single-member removal delegates to removeMemberLocked. ALL " +
+			"THREE reactivation writers in this file now run " +
+			"runMemberReactivationTxSteps in the same transaction: reactivateMember, " +
+			"atomicReactivateMemberIfNotFull, and approveJoinApplyAtomic's " +
+			"reactivation branch (memberRows > 0, i.e. an existing row whose status is " +
+			"0 — the status==1 case returns approveAlreadyMember earlier under " +
+			"FOR UPDATE). Reopening a seat makes a SURVIVING project seat reachable " +
+			"again through the Space conjunction with no project-side write, so nothing " +
+			"else would move the epoch and a consumer's cached denial would keep " +
+			"agreeing with it. The previous version of this entry said \"BOTH " +
+			"reactivation paths\" — there were four across this file and db_manager.go, " +
+			"and approveJoinApplyAtomic is the DESIGNED rejoin funnel " +
+			"(resetApprovedApplyForRejoin exists to route a removed member back through " +
+			"it). Enumerate reactivation writers from the SQL, not from the names: two " +
+			"of the four have no form of \"reactivate\" in their signature. The disband " +
+			"paths close every member at once and need no bump: an inactive Space folds " +
+			"all of its projects into the absent answer at read time " +
 			"(pkg/project.ProjectEpochsInSpace). The remaining writes are INSERTs of " +
 			"seats that did not exist (no surviving project seat to reopen) and role " +
 			"changes (role is not part of the project membership answer).",

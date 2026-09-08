@@ -402,7 +402,29 @@ func (d *managerDB) updateSpaceProfile(
 	return &before, nil
 }
 
-// upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）
+// upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）。
+//
+// 「重新激活」这一半会让**移除窗口里存活的项目席位重新可达**，而中间没有任何项目侧
+// 写入，所以必须在同一事务内发失效信号（见 MemberReactivationTxStep）。此前这里被
+// 当成「只会插入不存在的席位」，而函数名与注释本身就写着 upsert / 重新激活 —— 唯一索引
+// spacemember_spaceid_uid 让 ON DUPLICATE 分支对任何已移除行都会命中。
+//
+// # 为什么不用 affected-rows 分流
+//
+// `ON DUPLICATE KEY UPDATE` 的 ROW_COUNT() 惯例是 1=插入 / 2=更新 / 0=无变化，看着
+// 正好够用。**实测（MySQL 8.0.33）证明它在这里不够用**：
+//
+//	全新插入                    -> 1
+//	已移除行(status=0)被重新激活 -> 2
+//	已活跃成员(status=1)重复 upsert，同一秒内 -> 0
+//	已活跃成员(status=1)重复 upsert，跨秒     -> 2   ← 和「重新激活」不可区分
+//
+// 因为 `updated_at=NOW()` 让跨秒的重复 upsert 也算「有变化」。按 affected==2 分流会让
+// 每一次重复添加都 bump 一次 epoch，破坏「空写不动 epoch」——那是消费方缓存所依赖的
+// 规则，而且是让每个消费方白做一次复核的净损失。
+//
+// 所以先用锁定读取出**当前** status 再决定，读与写在同一事务、同一行锁下，中间没有
+// 窗口。多一次单行 PK 查询的代价，换一个不依赖 MySQL 行为细节的判定。
 func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
@@ -413,12 +435,27 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 	for _, uid := range uids {
+		// 锁定读，在 upsert 之前：拿到的是本事务将要改写的那一行的当前状态。
+		var existing []int
+		if _, err := tx.SelectBySql(
+			"SELECT status FROM space_member WHERE space_id=? AND uid=? FOR UPDATE", spaceId, uid,
+		).Load(&existing); err != nil {
+			return err
+		}
+		reactivating := len(existing) > 0 && existing[0] == 0
+
 		if _, err := tx.InsertBySql(
 			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
 				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
 			spaceId, uid,
 		).Exec(); err != nil {
 			return err
+		}
+
+		if reactivating {
+			if err := runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

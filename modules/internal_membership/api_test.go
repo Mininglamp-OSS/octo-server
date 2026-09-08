@@ -865,3 +865,60 @@ func TestAnswersAreKeyedByTheCallerNotTheDatabase(t *testing.T) {
 		}
 	})
 }
+
+// TestSentinelRepairCollapsesConcurrentAttempts pins the in-flight guard on the
+// out-of-band repair.
+//
+// One anomalous row deliberately poisons every batch containing it, so a retrying
+// peer produces a 500 — and a repair goroutine — per request. The DATA effect is
+// already safe (`member_epoch = 0` is its own CAS, so only the first increment
+// lands), but the COST is not: at the configured rate limit that is hundreds of
+// goroutines and round trips racing for a row only one can change.
+//
+// Asserted structurally rather than by racing goroutines: what matters is that the
+// guard is CHECKED BEFORE the goroutine is spawned and RELEASED when it finishes. A
+// timing test over a sync.Map would pass whether or not the release exists, and a
+// missing release is the failure that matters — it would latch the repair off for a
+// project id after the first attempt.
+func TestSentinelRepairCollapsesConcurrentAttempts(t *testing.T) {
+	src, err := os.ReadFile("api.go")
+	if err != nil {
+		t.Fatalf("read api.go: %v", err)
+	}
+	body := string(src)
+	start := strings.Index(body, "func (m *Module) repairSentinelOutOfBand(")
+	if start < 0 {
+		t.Fatal("repairSentinelOutOfBand not found — if it moved, point this guard at it " +
+			"rather than deleting it")
+	}
+	if end := strings.Index(body[start:], "\n}\n"); end > 0 {
+		body = body[start : start+end]
+	}
+
+	store := strings.Index(body, "repairing.LoadOrStore(")
+	spawn := strings.Index(body, "go func()")
+	release := strings.Index(body, "repairing.Delete(")
+
+	if store < 0 {
+		t.Fatal("concurrent repairs of the same project must be collapsed: one anomalous row " +
+			"poisons every batch containing it, so a retrying peer spawns a goroutine and a " +
+			"round trip per 500, all racing for a row only the first can change")
+	}
+	if spawn < 0 {
+		t.Fatal("the repair must stay off the request's critical path — the 500 is already " +
+			"decided and must remain timing-identical to a database outage")
+	}
+	if store > spawn {
+		t.Error("the in-flight check must happen BEFORE the goroutine is spawned, or the " +
+			"goroutine is created and only then discovers it has nothing to do — which is " +
+			"the cost this guard exists to remove")
+	}
+	if release < 0 {
+		t.Fatal("the in-flight entry must be released when the repair finishes, or the first " +
+			"attempt latches the repair OFF for that project id forever and a genuinely " +
+			"needed second attempt (the first one failed) never runs")
+	}
+	if release < spawn {
+		t.Error("the release must be inside the goroutine (a deferred Delete), not before it")
+	}
+}

@@ -857,6 +857,18 @@ func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) 
 // atomicReactivateMemberIfNotFull atomically checks capacity and reactivates a member.
 // Returns ErrSpaceFull if the space has reached its member limit.
 func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUsers int) error {
+	// 与 reactivateMember 对称地包上有界的 1213/1205 重试。此前只有那一条包了，
+	// 而两者现在都在同一事务内跑 reactivation 步骤、都按 space_member → octo_project
+	// 的顺序取锁，重试与否不该看函数名。步骤失败会回滚整次加入，而死锁是**瞬时**
+	// 失败——不重试就等于把「这次加入失败」的错误甩给用户。
+	//
+	// 从 BEGIN 重跑是安全的：失败的那次已被 InnoDB 回滚。
+	return dbpkg.RetryOnLockConflict(func() error {
+		return d.atomicReactivateMemberIfNotFullOnce(spaceId, uid, maxUsers)
+	})
+}
+
+func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, maxUsers int) error {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
@@ -1096,7 +1108,18 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 	}
 
 	// 6. 写入或重新激活成员行
-	if memberRows > 0 {
+	//
+	// 这两个分支不是同一件事，区别对下游是**载荷性**的：INSERT 建的是一个此前不存在的
+	// 席位，而 UPDATE 把一个已关闭的席位重新打开——后者会让**移除窗口里存活的项目席位
+	// 重新可达**，而这中间没有任何项目侧写入，所以除了下面那步没有任何东西会移动
+	// member_epoch。漏掉它，消费方缓存的那条**拒绝**会一直和 epoch 对得上（见
+	// MemberReactivationTxStep）。
+	//
+	// 本函数是**设计好的重新加入漏斗**，不是边缘路径：resetApprovedApplyForRejoin 存在
+	// 的目的就是把陈旧的已通过申请打回待审批，让被移除的人重新申请并从这里回来。
+	// 三个审批入口（空间内 / 管理端 / H5 auth_code）都汇聚到这里。
+	reactivated := memberRows > 0
+	if reactivated {
 		_, err = tx.Update("space_member").
 			Set("status", 1).Set("role", 0).Set("updated_at", time.Now()).
 			Where("space_id=? AND uid=?", spaceId, row.UID).Exec()
@@ -1108,6 +1131,16 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 	}
 	if err != nil {
 		return approveFailed, "", err
+	}
+	// 只有重新激活分支需要发失效信号。锁上下文和另外两条已修路径一致：本事务已经
+	// 持有这一行的 FOR UPDATE（上面第 3 步），所以步骤里的枚举读视图晚于该 X 锁。
+	//
+	// 走到这里必然是 status=0 的行：status==1 的情形在第 3 步就以
+	// approveAlreadyMember 提前返回了，所以这不是「空写也 bump」。
+	if reactivated {
+		if err = runMemberReactivationTxSteps(tx, spaceId, row.UID); err != nil {
+			return approveFailed, "", err
+		}
 	}
 
 	if err = tx.Commit(); err != nil {
