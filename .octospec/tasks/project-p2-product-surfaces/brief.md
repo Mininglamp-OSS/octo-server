@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: project-p2-product-surfaces"
-description: The four product surfaces P1 and P2 both deferred to a sibling brief — the project-scoped group list a client needs to render the 群聊 tab, `project_id` passthrough on the group reads that already exist, `join_mode = 0` self-join, `is_official` management, and per-user project pinning. P1 and P2 built a Project that owns groups and enforces I2 on the write side; nothing on the read side lets a client discover that a group belongs to a project at all.
+description: The four product surfaces P0, P1 and P2 all deferred to a sibling brief that was never written — the project-scoped group list a client needs to render the 群聊 tab, `project_id` on the sidebar (the half #855 does not cover), `join_mode = 0` self-join, `is_official` management, and per-user project pinning. P1 gave a Project groups and enforced I2 on the write side; #855 gives it an all-member group; neither ships a way to ask which groups a project has.
 tags: ["space", "isolation", "acl", "wire-contract", "error-response", "i18n", "rate-limit", "testing", "commit", "migration"]
 timestamp: 2026-09-08T00:00:00Z
 # --- octospec extension fields ---
@@ -18,6 +18,13 @@ source: self
 > **Status: DRAFT.** Q1 (`is_official` ownership) is open and gates PR-4 only.
 > Named by `.octospec/tasks/project-p2-subsystem-integration/brief.md:1023-1024`,
 > which is where these four items were parked.
+>
+> **Depends on #855** (`feat(project): give every project an all-member group (P2)`,
+> OPEN, in review, base `5dd80d4`). Every line reference below is measured at
+> `main@5dd80d4`; #855 touches 61 files including `modules/group/service.go`,
+> `modules/group/db.go`, `modules/project/{api,db,model,service}.go`, so they will
+> move. Two of its changes are load-bearing for this brief and are folded in below:
+> it ships the all-member group, and it ships **most of PR-2 already**.
 
 ## Goal
 
@@ -35,7 +42,8 @@ group read admit which project it belongs to. Measured at HEAD:
   parameter.
 - `GroupResp` (`modules/group/service.go:905-951`) carries `space_id` and **not**
   `project_id`. `Model.ProjectID` (`modules/group/db.go:858`) exists and is never
-  serialized.
+  serialized. (#855 fixes exactly this one — see below. The sidebar's own item struct,
+  which #855 does not touch, still cannot say it.)
 - The query the endpoint needs already exists and is unexported:
   `queryProjectGroupNosWithActiveMember` (`modules/group/db.go:1316`), whose only caller
   is the member-removal cascade worker (`modules/group/project_cascade.go:101`).
@@ -47,12 +55,33 @@ expressible against HEAD. That is the gap this task closes.
 Four surfaces, in the order they unblock things:
 
 1. **`GET /v1/projects/:project_id/groups`** — the caller's groups within one project (PR-1).
-2. **`project_id` passthrough** on the group reads that already exist (PR-2).
+2. **`project_id` on the sidebar** — the last hop of the passthrough #855 starts (PR-2).
 3. **`join_mode = 0` self-join** — a column P0 shipped with no writer and no reader (PR-3).
 4. **`is_official` management** and **per-user project pinning** (PR-4, PR-5).
 
 PR-1 and PR-2 are independently shippable and are the whole of the unblock. PR-3 to PR-5
 carry their own product questions and must not hold PR-1 up.
+
+### What #855 already does, so this brief does not
+
+- **`GroupResp.ProjectID`** — added, with the disclosure argument written out in the field's
+  own comment (「客户端要靠它把项目群归到项目名下展示」), and populated in **both** mappers
+  (`from` and `fromModel`). That covers `GET /v1/group/my` on both branches and the group
+  detail. Nothing is left for this brief there.
+- **The all-member group** — provisioned with the project, `octo_project.all_member_group_no`
+  on the project `Resp`, invariant I4 (the group's active member set *equals* the project's)
+  and two reconcile scans behind it. So the prototype's 全员群 row is real, and PR-1 will list
+  it like any other project group. The client can label it by comparing `group_no` against the
+  `all_member_group_no` it already has from the project detail — PR-1 adds no flag for that.
+- **The import ban is now a test.** `pkg/project/import_guard_test.go` pins
+  `modules/project → modules/group` at zero, and #855's own group-side work is registered
+  *into* project through `modules/project/all_member_group_registry.go`. D2 below is
+  unchanged by this — it gets stricter.
+
+What #855 leaves for PR-2 is the **sidebar**: `modules/message/api_sidebar.go` is not in its
+61 files, and `SidebarItem` (`:107-137`) carries `space_id` / `my_source_space_id` and no
+`project_id`. So a client rendering the 消息 list still cannot tell which of those
+conversations belong to a project — the one remaining half of 「拿到一个群，问它属于哪个项目」.
 
 ## Background
 
@@ -99,11 +128,12 @@ This is that brief.
   verified Space via `spacepkg.SetSpaceID` — *after* the Space membership check, never before
   (`middleware.go:315-319`). A new handler that reads `GetSpaceID` without that ordering gets a
   Space the caller has no seat in.
-- **`wire-contract` — `GroupResp` gains a field (PR-2).** `modules/group/service.go:905-951` is
-  consumed by `GET /v1/group/my`, group detail, and the sidebar. An added field is additive,
-  but it is a wire contract with existing clients and both mappers must populate it
-  (`from` at `:953`, `fromModel` at `:1000`) or the field silently reads `""` on one path and
-  correctly on the other — worse than absent.
+- **`wire-contract` — `SidebarItem` gains a field (PR-2).** `modules/message/api_sidebar.go:107-137`
+  is one of the hottest read payloads in the product, and its existing `SpaceID` comment
+  (`:112-119`) already fixes the per-target-type contract a new `project_id` must match. #855
+  makes the equivalent change on `GroupResp` and shows the failure mode to avoid: a field
+  populated in one mapper and not the other reads `""` on one path and correctly on the other,
+  which is worse than absent.
 - **`error-response` / `i18n` — the envelope.** `httperr.ResponseErrorL` + a registered
   `pkg/errcode` code only. The per-module helpers already exist
   (`modules/project/api_i18n.go`: `respondProjectNotFound`, `respondQueryFailed`,
@@ -162,8 +192,10 @@ project, not every group in it.**
 
 I2 is a ceiling, not a floor: being in the project does not put you in its groups. Returning
 every group would hand a project member the names of groups they hold no seat in, and there
-is nothing they could do with that — there is no self-join path into a group, and the
-all-hands group (P2 PR-0) is unshipped. A name is the most sensitive field a group has at
+is nothing they could do with that — there is no self-join path into a group. The
+all-member group is not a counter-example: every project member is already in it (#855's I4),
+so it shows up in a membership-scoped list for everyone anyway, without the list having to
+disclose anything. A name is the most sensitive field a group has at
 list granularity (「关键供应商来料异常」 tells you the incident exists), so the default is
 membership-scoped.
 
@@ -217,18 +249,21 @@ The prototype's red badges come from the conversation layer (`sidebar/sync`). Se
 here would make a second source of truth for a number that changes on every message, read
 through a route with a 60-second membership cache. Out.
 
-**D6 — PR-2 adds `project_id` to `GroupResp`, and that is a disclosure argument, not a
-formality.**
+**D6 — PR-2 is the sidebar only, and it inherits #855's disclosure argument rather than
+re-deciding it.**
 
-Who learns what: only an existing member of the group learns which project it belongs to. By
-I2 they are already an active member of that project, so the field tells them nothing their
-own project roster does not. It does **not** go on any unauthenticated or pre-admission
-surface — specifically not the public invite preview
-(`GET /v1/group/invite/detail`, `modules/group/api.go:191`), where a `project_id` would leak
-project existence to an unauthenticated caller holding only an invite code.
+#855 already settled who may learn a group's `project_id`: a member of the group, who by I2 is
+already an active member of that project, so the field tells them nothing their own project
+roster does not. The sidebar is the same population — `SidebarItem`s are built from the
+IM-returned conversation list, which only contains channels the caller is a current member of
+(`modules/message/api_sidebar.go:560-578`). So the field carries no new disclosure there.
 
-Both mappers must populate it (`from` at `service.go:953`, `fromModel` at `:1000`). One
-populated and one not is the failure mode this decision exists to prevent.
+It must still stay off every unauthenticated or pre-admission surface. The one to check is the
+public invite preview (`GET /v1/group/invite/detail`, `modules/group/api.go:191`), where a
+`project_id` would leak project existence to an anonymous caller holding only an invite code.
+At `5dd80d4` that handler builds its response as a hand-written `gin.H`
+(`modules/group/api.go:5040-5100`) rather than through `GroupResp`, so it is not exposed by
+#855's change and must not be "tidied up" onto `GroupResp` by this one. A test pins that.
 
 **D7 — `join_mode = 0` self-join (PR-3) needs a writer before it needs an endpoint.**
 
@@ -275,7 +310,8 @@ membership change and must not bump `member_epoch`.
 P0 (`project-p0-foundation/brief.md:215`) and P1 (`project-p1-group-binding/brief.md:279-282`)
 parked **seven** items as "P2". P2's brief reassigned only four of them to this task
 (`project-p2-subsystem-integration/brief.md:1023-1024`). Of the remaining three, one is
-decided here (the nested tree — D4) and one is PR-2 (`project_id` passthrough). **Two were
+decided here (the nested tree — D4) and one is `project_id` passthrough, which #855 lands for
+`GroupResp` and PR-2 finishes on the sidebar. **Two were
 never given a home by any brief, and are recorded here so they stop being invisible rather
 than because this task claims them:**
 
@@ -322,19 +358,21 @@ admission transaction」, which P1 called a separate task and nobody has opened.
 
 ## Out of scope
 
-- **The all-hands group (全员群).** Creating a group with the project is P2 PR-0
-  (`project-p2-subsystem-integration/brief.md` D10) and is unshipped at HEAD — there is no
-  `全员群` / `all_hands` anywhere in `modules/`. PR-1 lists whatever groups exist; it does not
-  create one. The prototype's first row stays empty until PR-0 lands, and that is expected, not
-  a defect in this task.
+- **The all-member group (全员群) itself.** #855 creates it, owns invariant I4, and exposes
+  `all_member_group_no` on the project `Resp`. PR-1 **lists** it — it is a project group like
+  any other — and creates, names, protects and repairs nothing about it. In particular the five
+  operations #855's D7 refuses on an all-member group (disband, exit, member removal, owner
+  transfer, blacklist) are refused in `modules/group`'s handlers and stay there; PR-1 must not
+  grow a second copy of that verdict just because it happens to be listing the group.
 - **Listing groups the caller is not a member of.** D1, pending Q3.
 - **Nested threads in the group-list response.** D4.
 - **Unread / badge state.** D5.
 - **Read-path hardening** — `sidebar/sync`'s `ExistMembersActive` backstop, the deprecated
   `/v1/coversations` filter, the group-avatar enumeration oracle, `querySavedGroups` after
   leaving. Its own brief, named `project-p2-read-path-hardening` by
-  `project-p2-subsystem-integration/brief.md:1015-1022`. PR-2 adds a field to an existing
-  response; it does not touch those gates.
+  `project-p2-subsystem-integration/brief.md:1015-1022`. PR-2 adds a field to the sidebar
+  payload; it does not touch the `ExistMembersActive` question, and must not be read as having
+  settled it.
 - **Re-parenting a group between projects.** I3 forbids it; the source guard
   (`TestNoProjectIDRewritesOutsideTheDetachStep`, `modules/group/admission_guard_test.go:134`) must keep passing untouched.
 - **Pending invitations** (`octo_project_invitation`, P2 D8) and **ownership transfer** — P2's,
@@ -375,13 +413,17 @@ golangci-lint run ./...
   with it.
 - `TestProjectNoLegacyResponseError` still green (automatic — the file list is dynamic).
 
-**PR-2 — `project_id` passthrough:**
+**PR-2 — `project_id` on the sidebar** (the rest landed in #855):
 
-- `project_id` present and correct on `GET /v1/group/my?space_id=`, on group detail, and on the
-  sidebar payload, asserted for a project group **and** asserted as `""` for a Space-direct
-  group.
-- Both mappers covered: a test that would fail if only `from` or only `fromModel` were changed.
-- `project_id` absent from the public invite-preview response (D6), pinned by a test.
+- `project_id` present and correct on the `/v1/sidebar/*` payload for a project group, `""`
+  (omitted) for a Space-direct group, and `""` for a DM — the same three-way split
+  `SidebarItem.SpaceID` already documents at `modules/message/api_sidebar.go:112-119`.
+- For a COMMUNITY_TOPIC item, `project_id` is the **parent group's**, matching how `SpaceID` is
+  resolved for that target type. Asserted, not assumed.
+- No extra per-item query: the value must come from the batch the sidebar already runs, not a
+  per-group round-trip on the hot read path.
+- `project_id` still absent from the public invite-preview response (D6), pinned by a test.
+- Regression: `GroupResp.project_id` from #855 still correct on both mappers after the rebase.
 - `TestGroupNoLegacyResponseError`'s fixed file list updated if `modules/group` gains a file.
 
 **PR-3 — `join_mode = 0` self-join:**
