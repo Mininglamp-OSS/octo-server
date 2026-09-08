@@ -221,8 +221,14 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 	}
 
 	out := make(map[string]int64, len(projectIDs))
+	byFold := foldKeys(len(found))
+	for id, epoch := range found {
+		byFold[foldID(id)] = epoch
+	}
 	for _, id := range projectIDs {
-		out[id] = found[id] // absent -> 0, which is the contract's sentinel
+		// Keyed by what the CALLER asked, matched case-insensitively — see foldID.
+		// Absent -> 0, which is the contract's sentinel.
+		out[id] = byFold[foldID(id)]
 	}
 	c.Response(epochsResponse{Projects: out})
 }
@@ -289,6 +295,42 @@ func parseIDList(raw []string, limit int) (ids []string, overLimit bool) {
 	}
 	return out, false
 }
+
+// foldID normalizes an identifier for matching, and foldKeys builds the map it
+// keys.
+//
+// # Why the answers cannot be keyed by what the DATABASE returned
+//
+// octo_project and octo_project_member are pinned to utf8mb4_general_ci, which is
+// case-INSENSITIVE. So `project_id IN (?)` matches a stored `abc` when the caller
+// sends `ABC`, and the row comes back spelled `abc`. Keying the response off that
+// returned spelling means a caller looking up its own `ABC` finds nothing — and
+// an absent key is the contract's "does not exist" / member:false sentinel. A real
+// member of a live project would read as denied, and a whole project as absent,
+// while the SQL had matched perfectly.
+//
+// That contradicts what this module promises for itself: every answer carries the
+// identifier the caller sent, so a consumer keying by its own strings always finds
+// it. The peer persists project_id in a different engine and reads it back; there
+// is no guarantee the spelling survives that round trip unchanged, and it is not
+// this endpoint's business to require that it does.
+//
+// So the answer is keyed by the caller's string and MATCHED by the folded form.
+//
+// Fold, not reject. Rejecting non-canonical case was the alternative and it is
+// worse: it would break a caller holding a legitimately re-cased id, and the
+// endpoint has no basis to declare one spelling canonical — existing project ids
+// predate the UUID format and nothing validates their shape.
+//
+// ASCII-only folding, deliberately. It is not a reimplementation of
+// utf8mb4_general_ci — matching that exactly would mean tracking a MySQL collation
+// table in Go. Identifiers here are hex UUIDs and generated uids, where the two
+// agree. Where they could disagree, this fold is the STRICTER of the two, so the
+// disagreement costs an answer of "absent" rather than a wrong positive: the
+// fail-closed direction.
+func foldID(id string) string { return strings.ToLower(id) }
+
+func foldKeys(n int) map[string]int64 { return make(map[string]int64, n) }
 
 // ---------- POST /v1/internal/project-memberships/_verify ----------
 
@@ -397,9 +439,14 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 		return
 	}
 
+	byFold := foldKeys(len(roles))
+	for uid, role := range roles {
+		byFold[foldID(uid)] = int64(role)
+	}
 	answers := make([]verifyMemberAnswer, 0, len(uids))
 	for _, uid := range uids {
-		role, ok := roles[uid]
+		folded, ok := byFold[foldID(uid)]
+		role := int(folded)
 		if !ok {
 			answers = append(answers, verifyMemberAnswer{UID: uid, Member: false})
 			continue

@@ -540,14 +540,20 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 // token holder on a route that already ran SpaceMiddleware, so its consumer both
 // has the Space half and has already applied it.
 //
-// # What this does NOT close
+// # Already-cached grants: closed elsewhere, not here
 //
-// Only FRESH answers. A grant the consumer cached BEFORE the Space removal keeps
-// riding epoch agreement, because a Space removal does not move member_epoch —
-// the epoch only bumps when the cascade actually changes a project row. Closing
-// that requires either an epoch bump at Space-removal commit time or a hard TTL
-// in the peer contract that does not depend on epoch agreement. Neither is in
-// this function.
+// This conjunction fixes FRESH answers only. A grant the consumer cached BEFORE
+// the removal is invalidated by the epoch moving, and that bump is NOT in this
+// function — it happens in the Space-removal transaction itself
+// (modules/project.bumpMemberEpochForSpaceMemberTx, registered as a synchronous
+// tx step).
+//
+// It has to be there rather than here for a reason worth stating: closing the
+// seats is asynchronous, the cleanup job can sit in backoff for minutes, and it
+// has a terminal abandoned state after which nothing re-claims it. An
+// invalidation signal that moves when the seat closes is therefore not bounded at
+// all. Moving it at removal commit is what makes the peer contract's "epoch
+// agreement means the cache is still good" true for this path.
 func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	roles := make(map[string]int, len(uids))
 	if spaceID == "" || projectID == "" {

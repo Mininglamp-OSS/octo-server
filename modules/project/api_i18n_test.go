@@ -155,10 +155,19 @@ func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 }
 
 var (
-	epochAssignment = regexp.MustCompile(`member_epoch\s*=`)
-	epochIncrement  = regexp.MustCompile(`member_epoch\s*=\s*member_epoch\s*\+\s*1`)
+	// Each pattern tolerates an optional table alias, because a multi-table UPDATE
+	// has to qualify the column: `UPDATE octo_project p INNER JOIN ... SET
+	// p.member_epoch = p.member_epoch + 1`. That form is a real increment and the
+	// guard used to reject it.
+	//
+	// Tolerating the alias must not tolerate a CROSS-alias assignment
+	// (`p.member_epoch = q.member_epoch + 1`), which reads one table's column and
+	// writes another's. RE2 has no backreferences, so the two aliases are captured
+	// and compared in Go below rather than in the pattern.
+	epochAssignment = regexp.MustCompile(`(?:\w+\.)?member_epoch\s*=`)
+	epochIncrement  = regexp.MustCompile(`(?:(\w+)\.)?member_epoch\s*=\s*(?:(\w+)\.)?member_epoch\s*\+\s*1`)
 	// epochPredicate matches the SQL read positions a column name can appear in
-	// with an `=` after it: `WHERE member_epoch = ?`, `AND member_epoch = 0`.
+	// with an `=` after it: `WHERE member_epoch = ?`, `AND p.member_epoch = 0`.
 	// Those are comparisons, not writes, and this guard is about the write shape.
 	//
 	// Excluding them is a sharpening rather than a relaxation: `SET member_epoch =`
@@ -167,26 +176,47 @@ var (
 	// mutations that motivated the exclusion. The alternative — spelling the repair
 	// predicate some other way to dodge a regex — would have hidden a real
 	// comparison from every future reader instead.
-	epochPredicate = regexp.MustCompile(`(?i)\b(?:where|and|or)\s+member_epoch\s*=`)
+	epochPredicate = regexp.MustCompile(`(?i)\b(?:where|and|or)\s+(?:\w+\.)?member_epoch\s*=`)
 )
+
+// columnAt returns where "member_epoch" starts inside a match, so every pattern
+// here identifies an occurrence by the COLUMN's position rather than by its own
+// match start — which differ once an optional alias is in play.
+func columnAt(cleaned string, m []int) int {
+	return strings.Index(cleaned[m[0]:m[1]], "member_epoch") + m[0]
+}
 
 // nonIncrementEpochWrites returns every member_epoch assignment in `cleaned`
 // that is not the increment, as printable windows. Empty means the file is clean.
 func nonIncrementEpochWrites(cleaned string) []string {
 	predicates := make(map[int]bool)
 	for _, m := range epochPredicate.FindAllStringIndex(cleaned, -1) {
-		// Key on where the column name starts, so the two regexes agree on identity.
-		predicates[strings.Index(cleaned[m[0]:m[1]], "member_epoch")+m[0]] = true
+		predicates[columnAt(cleaned, m)] = true
+	}
+	increments := make(map[int]bool)
+	for _, m := range epochIncrement.FindAllStringSubmatchIndex(cleaned, -1) {
+		// Groups 1 and 2 are the aliases on the written and read sides. Absent
+		// (-1) on both is the unqualified form; present on both they must match,
+		// or this is one table's column being written from another's.
+		lhs, rhs := "", ""
+		if m[2] >= 0 {
+			lhs = cleaned[m[2]:m[3]]
+		}
+		if m[4] >= 0 {
+			rhs = cleaned[m[4]:m[5]]
+		}
+		if lhs != rhs {
+			continue
+		}
+		increments[columnAt(cleaned, m[0:2])] = true
 	}
 	var bad []string
 	for _, m := range epochAssignment.FindAllStringIndex(cleaned, -1) {
-		if predicates[m[0]] {
+		at := columnAt(cleaned, m)
+		if predicates[at] || increments[at] {
 			continue
 		}
-		window := cleaned[m[0]:min(m[1]+60, len(cleaned))]
-		if !epochIncrement.MatchString(window) {
-			bad = append(bad, strings.TrimSpace(window))
-		}
+		bad = append(bad, strings.TrimSpace(cleaned[m[0]:min(m[1]+60, len(cleaned))]))
 	}
 	return bad
 }
@@ -203,6 +233,12 @@ func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
 		`UPDATE octo_project SET member_epoch = member_epoch - 1 WHERE project_id = ?`,
 		// The repair statement's own shape, mutated back to an absolute assignment.
 		`UPDATE octo_project SET member_epoch = 1 WHERE project_id = ? AND member_epoch = ?`,
+		// Aliased forms. The alias tolerance must not become a hole: an absolute
+		// assignment is still one, and reading ANOTHER table's column is worse than
+		// either — it is not an increment of the row being written at all.
+		`UPDATE octo_project p INNER JOIN octo_project_member pm ON pm.project_id = p.project_id SET p.member_epoch = 1`,
+		`UPDATE octo_project p INNER JOIN octo_project_member pm ON pm.project_id = p.project_id SET p.member_epoch = pm.member_epoch + 1`,
+		`UPDATE octo_project p SET p.member_epoch = p.member_epoch - 1 WHERE p.space_id = ?`,
 	}
 	for _, src := range caught {
 		if got := nonIncrementEpochWrites(src); len(got) == 0 {
@@ -214,6 +250,9 @@ func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
 		`UPDATE octo_project SET member_epoch = member_epoch + 1 WHERE project_id = ? AND status = ?`,
 		`UPDATE octo_project SET member_epoch = member_epoch + 1 WHERE project_id = ? AND member_epoch = ?`,
 		`SELECT id FROM octo_project WHERE member_epoch = 0`,
+		// The Space-removal bump: aliased on both sides, same alias.
+		`UPDATE octo_project p INNER JOIN octo_project_member pm ON pm.project_id = p.project_id SET p.member_epoch = p.member_epoch + 1 WHERE p.space_id = ? AND pm.uid = ?`,
+		`SELECT id FROM octo_project p WHERE p.member_epoch = 0`,
 	}
 	for _, src := range allowed {
 		if got := nonIncrementEpochWrites(src); len(got) != 0 {

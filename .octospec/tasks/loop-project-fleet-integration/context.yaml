@@ -241,6 +241,53 @@ review_fixes:
       TS_WEBHOOK_SECRET_KEY, OCTO_MAIL_GATEWAY_SECRET and TS_GRPC_AUTH_TOKEN are
       now registered and refused by both module-local lists.
     touches: main.go, main_internaltoken_test.go, modules/internal_membership/config.go, modules/project/config_provisioning.go
+  - id: P1g
+    finding: >
+      Convergent blocker from two reviewers. The Space conjunction fixed FRESH
+      answers, but Space MEMBER removal still did not move member_epoch, and this
+      PR ships a peer-facing document presenting epoch re-reading as how the
+      consumer decides its cache is good. The seat closes, and only then bumps,
+      when the async cleanup job reaches it - that job can sit in backoff for
+      minutes and has a terminal abandoned state after which nothing re-claims
+      it. So a revoked grant survived for minutes normally and forever once the
+      job gave up, while the peer's own staleness check kept agreeing. Two
+      aggravators both reviewers named: the rollout doc contained the word
+      "Space" zero times, and the only detector (scanAbandonedCleanupLeak) sits
+      behind OCTO_PROJECT_RECONCILE_ENABLED, which defaults to false.
+    decision: >
+      Bump the epoch in the Space-removal TRANSACTION, not in the cascade.
+      modules/space gained RegisterMemberRemovalTxStep - a synchronous sibling of
+      the existing async cleanup registry, whose failure ROLLS THE REMOVAL BACK,
+      because committing a removal whose invalidation signal did not fire is the
+      exact state it exists to prevent. modules/project registers one statement:
+      a single aliased UPDATE joining octo_project to octo_project_member, so a
+      member of N projects costs one statement rather than N in a user-facing
+      transaction. Both tables are octo_project*, same pinned collation, so no
+      cross-schema hazard. The rollout doc gained a Space section naming every
+      axis and the gated detector.
+      Chosen over the alternative (a hard TTL in the peer contract) because that
+      would make our correctness depend on a peer commitment we do not have.
+    touches: modules/space (member_removal.go, db_manager.go), modules/project (db.go, space_member_removal.go), docs
+  - id: P2h
+    finding: >
+      Three P2s, all defects in artifacts this increment added. (a) Answers were
+      keyed by the spelling the DATABASE returned; the tables are
+      utf8mb4_general_ci, so a case-variant id matched in SQL but missed the Go
+      map and was served as the "does not exist" / member:false sentinel - a real
+      member of a live project denied. (b) The credential sweep's regex could not
+      express two real envs (OCTO_SEARCH_OS_PASSWORD, SPEECH_API_KEY), so a guard
+      reported green for shapes it structurally could not see. (c) An assertion in
+      the incomplete-body test built a FRESH stub instead of the wired one and
+      therefore could not fail.
+    decision: >
+      (a) Answers are keyed by the caller's string and matched on a folded form -
+      folding rather than rejecting, because the peer round-trips ids through its
+      own store and no spelling here is canonical. The stub now models the
+      case-insensitive database, so an exact-match stub can no longer agree with a
+      wrong handler. (b) Prefix restriction dropped and PASSWORD/PASSPHRASE/
+      CREDENTIAL/SALT added; the widening immediately surfaced a third env, now
+      annotated. (c) Stub hoisted into a variable; verified it can now fail.
+    touches: modules/internal_membership, main_internaltoken_test.go
   - id: P1c
     finding: >
       ProjectMemberships answered from the project seat alone. The Space to
@@ -259,10 +306,8 @@ review_fixes:
       on. MembershipsInSpace is unchanged — it answers for the caller own token
       holder behind SpaceMiddleware.
     open: >
-      FRESH answers only. A grant cached BEFORE the removal still rides epoch
-      agreement. Closing it needs either an epoch bump at Space-removal commit
-      time (the O5/O7 event slice) or a hard TTL in the peer contract that does
-      not depend on epoch agreement.
+      CLOSED in round 6 — see P1g. This entry is kept because two review rounds
+      reasoned against it.
     touches: pkg/project/membership.go
   - id: P1d
     finding: >

@@ -294,6 +294,54 @@ func (d *DB) repairAbsentSentinelEpoch(projectID string) (int64, error) {
 	return affected, nil
 }
 
+// bumpMemberEpochForSpaceMemberTx raises member_epoch on every ACTIVE project in
+// spaceID where uid still holds an active seat, in the caller's transaction.
+//
+// This runs inside the SPACE-REMOVAL transaction, and it is the only thing that
+// makes the epoch a complete invalidation channel for that path.
+//
+// Why it cannot be left to the cascade. Closing the seats is asynchronous: the
+// cleanup job may sit in backoff for minutes, and once it exhausts
+// removalCleanupMaxAttempts it is terminal and never re-claimed. Until it runs,
+// `_verify` already answers member:false (its Space conjunction sees the removal)
+// while `epochs` still answers the old value — so a peer holding a grant cached
+// under that epoch re-reads it, gets the same number, and its staleness check
+// AGREES. The revocation survives for minutes normally and forever when the job
+// is abandoned. Bumping here closes that: the epoch moves at the same instant the
+// answer does.
+//
+// ONE statement, not one per project. A user can hold seats in up to the
+// per-Space project quota, and this runs in a user-facing transaction — paging it
+// the way the cascade does would be wrong here (the cascade pages because it
+// shares a 10-minute lease, a constraint that does not apply inside a
+// transaction) and a loop of N updates would be a real cost on removal. The join
+// is between two octo_project* tables, both pinned to utf8mb4_general_ci, so it
+// carries no cross-schema collation hazard — unlike a join to `space`, see
+// pkg/project.ProjectEpochsInSpace.
+//
+// Increment-only, like every other writer of this column, so the write-discipline
+// guard holds. Idempotent in the sense that matters: a retried removal finds the
+// seats already closed by the cascade and matches no row. A retry that lands
+// BEFORE the cascade bumps a second time, which costs the peer one extra
+// re-verify — the safe direction.
+func (d *DB) bumpMemberEpochForSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) error {
+	if spaceID == "" || uid == "" {
+		return nil
+	}
+	_, err := tx.UpdateBySql(
+		"UPDATE octo_project p "+
+			"INNER JOIN octo_project_member pm ON pm.project_id = p.project_id "+
+			"SET p.member_epoch = p.member_epoch + 1 "+
+			"WHERE p.space_id = ? AND p.status = ? "+
+			"  AND pm.space_id = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0",
+		spaceID, StatusNormal, spaceID, uid, MemberStatusActive,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("project: bump member epoch for space member removal: %w", err)
+	}
+	return nil
+}
+
 // countActiveInSpaceTx counts a Space's active projects inside the create transaction.
 // The quota must be counted in the same transaction that inserts, or two
 // concurrent creates both pass the check and both land.

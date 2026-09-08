@@ -3,6 +3,7 @@ package project
 import (
 	"errors"
 	"fmt"
+	"github.com/gocraft/dbr/v2"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -57,6 +58,23 @@ var errCascadeIncomplete = errors.New("project: cascade page budget exhausted, s
 // test substitute a deliberately failing step.
 func (p *Project) registerSpaceMemberRemovalCleanup() {
 	spacemod.RegisterMemberRemovalCleanupStep(spaceMemberRemovalStepName, p.cleanupSpaceMemberProjects)
+	// And the SYNCHRONOUS half. Closing the seats stays asynchronous; moving the
+	// invalidation signal does not, because the signal is what a peer uses to
+	// decide a cached authorization is stale, and an async signal with a terminal
+	// abandoned state is not a bound at all. See bumpMemberEpochForSpaceMemberTx.
+	spacemod.RegisterMemberRemovalTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSpaceMemberRemoval)
+}
+
+// bumpEpochsOnSpaceMemberRemoval moves member_epoch for every project the removed
+// member still holds a seat in, inside the Space-removal transaction.
+//
+// One statement, and its failure rolls the removal back — see
+// MemberRemovalTxStep for why that is the right direction: committing a removal
+// whose invalidation signal did not fire hands a peer an authorization it cannot
+// detect as stale, and the async compensation has no upper bound once its job is
+// abandoned.
+func (p *Project) bumpEpochsOnSpaceMemberRemoval(tx *dbr.Tx, spaceID, uid string) error {
+	return p.db.bumpMemberEpochForSpaceMemberTx(tx, spaceID, uid)
 }
 
 // cleanupSpaceMemberProjects closes every project seat a removed Space member still

@@ -192,7 +192,12 @@ func TestVerifyDoesNotWaitForeverOnAnIncompleteBody(t *testing.T) {
 		t.Skipf("readBodyTimeout is %s; this test would outlive the suite", readBodyTimeout)
 	}
 
-	router := newRouter(newTestModule(&stubStore{}))
+	// Held in a variable, not built inline at the assertion: an assertion against a
+	// FRESH stub cannot fail, and this test carried exactly that defect for a round
+	// — a regression letting a half-sent body reach the database would have stayed
+	// green. The sibling cases above get this right.
+	store := &stubStore{}
+	router := newRouter(newTestModule(store))
 	srv := httptest.NewServer(router)
 	defer srv.Close()
 
@@ -239,8 +244,9 @@ func TestVerifyDoesNotWaitForeverOnAnIncompleteBody(t *testing.T) {
 	}
 	t.Logf("server answered after %s: %q", elapsed, strings.SplitN(string(buf[:n]), "\r\n", 2)[0])
 
-	if store := (&stubStore{}); store.memberCalls != 0 {
-		t.Fatal("an incomplete body must never reach the store")
+	if store.memberCalls != 0 {
+		t.Fatalf("an incomplete body reached the store %d time(s): the decode must fail before "+
+			"any lookup, or a half-sent request becomes a database query", store.memberCalls)
 	}
 }
 

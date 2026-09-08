@@ -133,6 +133,16 @@ func TestFixedInternalTokenRegistryIsCompleteBySweep(t *testing.T) {
 		"OCTO_SEARCH_CURSOR_HMAC":         "cursor signing key",
 		"OCTO_USER_API_KEY_SECRET":        "key-encryption key for user API keys",
 		"TS_CACHE_TOKENEXPIRE":            "a duration; matches on TOKEN",
+		// Found only after the pattern was widened. Both are real single-env
+		// credentials of THIS binary, and both were invisible to the previous
+		// pattern — which is the reason the widening happened.
+		"OCTO_SEARCH_OS_PASSWORD": "OpenSearch cluster password: a credential for an " +
+			"infrastructure dependency, not a capability of this binary that a peer authenticates to",
+		"SPEECH_API_KEY": "third-party speech vendor API key, outbound only; sharing it with an " +
+			"inbound token would be a vendor-account problem, not a capability collision here",
+		"DM_OIDC_RESET_PASSWORD_URL": "a URL; matches on PASSWORD. The widened pattern is " +
+			"expected to catch shapes like this — one annotated line is the price of not " +
+			"missing a real credential",
 	}
 
 	registered := make(map[string]bool, len(fixedInternalTokenEnvs))
@@ -141,7 +151,7 @@ func TestFixedInternalTokenRegistryIsCompleteBySweep(t *testing.T) {
 	}
 
 	found := sweepCredentialEnvLiterals(t)
-	if len(found) < 20 {
+	if len(found) < 24 {
 		t.Fatalf("the sweep found only %d env literals; it is probably not walking the tree, "+
 			"and a guard that reads nothing passes for the wrong reason", len(found))
 	}
@@ -176,12 +186,26 @@ func TestFixedInternalTokenRegistryIsCompleteBySweep(t *testing.T) {
 	}
 }
 
-// credentialEnvLiteral matches the naming convention this repository uses for
-// deployment-configured credentials. Deliberately over-broad — it also catches
-// durations and identifiers — because the cost of a false positive is one line
-// in `excluded` with a reason, and the cost of a false negative is an
-// unregistered capability credential.
-var credentialEnvLiteral = regexp.MustCompile(`"((?:TS|OCTO|DM|NOTIFY)_[A-Z0-9_]*(?:SECRET|TOKEN|KEY|HMAC)[A-Z0-9_]*)"`)
+// credentialEnvLiteral matches env literals that could be a deployment-configured
+// credential. Deliberately over-broad — it also catches durations and identifiers
+// — because the cost of a false positive is one line in `excluded` with a reason,
+// and the cost of a false negative is an unregistered capability credential.
+//
+// Both halves were too narrow for a round, and the failure mode is the one that
+// matters: a guard that cannot EXPRESS a form of the thing it guards reports
+// green for it forever.
+//
+//   - The keyword set lacked PASSWORD, so OCTO_SEARCH_OS_PASSWORD
+//     (modules/messages_search) was unclassifiable in either direction.
+//   - The prefix list (TS|OCTO|DM|NOTIFY) excluded SPEECH_API_KEY
+//     (modules/voice_adapter) for having a prefix nobody had thought of — which is
+//     exactly what a new module's env looks like.
+//
+// So the prefix restriction is gone: any SCREAMING_SNAKE literal carrying a
+// credential keyword is swept. That widens the false-positive set, which is the
+// cheap direction.
+var credentialEnvLiteral = regexp.MustCompile(
+	`"([A-Z][A-Z0-9_]*(?:SECRET|TOKEN|KEY|HMAC|PASSWORD|PASSPHRASE|CREDENTIAL|SALT)[A-Z0-9_]*)"`)
 
 // sweepCredentialEnvLiterals returns every credential-shaped env literal in
 // non-test Go source, mapped to the first file it was seen in.

@@ -479,6 +479,12 @@ func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUI
 		if err := enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved); err != nil {
 			return nil, err
 		}
+		// Synchronous steps, beside the outbox enqueue and for the opposite reason:
+		// the enqueue makes the cleanup EVENTUAL, these make a fact TRUE AT COMMIT.
+		// A failure here rolls the removal back on purpose — see MemberRemovalTxStep.
+		if err := runMemberRemovalTxSteps(tx, spaceId, uid); err != nil {
+			return nil, err
+		}
 		removed = append(removed, uid)
 	}
 	if err := tx.Commit(); err != nil {
@@ -586,6 +592,11 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 		return false, err
 	}
 	if err = enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, reason); err != nil {
+		return false, err
+	}
+	// See the sibling call site: synchronous steps run beside the outbox enqueue,
+	// and their failure rolls the removal back.
+	if err = runMemberRemovalTxSteps(tx, spaceId, uid); err != nil {
 		return false, err
 	}
 	if err = tx.Commit(); err != nil {

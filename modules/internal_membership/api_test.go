@@ -52,10 +52,18 @@ func (s *stubStore) Epochs(spaceID string, projectIDs []string) (map[string]int6
 	if s.epochErr != nil {
 		return nil, s.epochErr
 	}
+	// Matched case-INSENSITIVELY and returned under the STORED spelling, because
+	// that is what the real tables do: octo_project* are pinned to
+	// utf8mb4_general_ci. A stub that matched exactly would agree with any handler,
+	// including one that keys its answers off the database's spelling — which
+	// answers a real member "not a member" whenever the caller's case differs.
 	out := make(map[string]int64, len(projectIDs))
 	for _, id := range projectIDs {
-		if v, ok := s.epochs[id]; ok {
-			out[id] = v
+		for stored, v := range s.epochs {
+			if strings.EqualFold(stored, id) {
+				out[stored] = v
+				break
+			}
 		}
 	}
 	return out, nil
@@ -69,10 +77,14 @@ func (s *stubStore) Memberships(spaceID, projectID string, uids []string) (int64
 	if s.memErr != nil {
 		return 0, nil, s.memErr
 	}
+	// Case-insensitive match, stored spelling returned — see Epochs above.
 	out := make(map[string]int, len(uids))
 	for _, uid := range uids {
-		if role, ok := s.roles[uid]; ok {
-			out[uid] = role
+		for stored, role := range s.roles {
+			if strings.EqualFold(stored, uid) {
+				out[stored] = role
+				break
+			}
 		}
 	}
 	return s.epoch, out, nil
@@ -765,4 +777,66 @@ func TestBothEndpointsAgreeAboutSpaceID(t *testing.T) {
 		verifyRequest{SpaceID: "sp1", ProjectID: "p1", UIDs: []string{"u1"}}); w.Code != http.StatusOK {
 		t.Fatalf("verify: a clean space_id must be accepted, got %d (%s)", w.Code, w.Body.String())
 	}
+}
+
+// TestAnswersAreKeyedByTheCallerNotTheDatabase pins the fix for a defect that
+// looks like nothing and denies real members.
+//
+// Both tables are pinned to utf8mb4_general_ci, which is case-INSENSITIVE, so the
+// SQL matches a stored `abc` for a caller's `ABC` and returns the row spelled
+// `abc`. Keying the response off the returned spelling means the caller's lookup
+// of its own `ABC` misses — and a missing key is the contract's "does not exist" /
+// member:false sentinel. Fail-closed, but wrong: a live project reads as absent
+// and a real member as denied, while the database matched perfectly.
+//
+// The stub returns lowercase, the request uses uppercase — exactly the shape a
+// peer produces after round-tripping the id through its own store.
+func TestAnswersAreKeyedByTheCallerNotTheDatabase(t *testing.T) {
+	t.Run("epochs", func(t *testing.T) {
+		s := &stubStore{epochs: map[string]int64{"p-abc": 7}}
+		w := doGet(t, newRouter(newTestModule(s)), testInternalToken,
+			"?space_id=sp1&project_ids=P-ABC")
+		if w.Code != http.StatusOK {
+			t.Fatalf("want 200, got %d (%s)", w.Code, w.Body.String())
+		}
+		var resp epochsResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		got, ok := resp.Projects["P-ABC"]
+		if !ok {
+			t.Fatalf("the answer must be keyed by the id the CALLER sent; got %v", resp.Projects)
+		}
+		if got != 7 {
+			t.Errorf("want the matched project's epoch 7 under the caller's key, got %d — a 0 here "+
+				"is the contract's \"does not exist\" sentinel for a project that plainly exists", got)
+		}
+	})
+
+	t.Run("verify", func(t *testing.T) {
+		s := &stubStore{epoch: 3, roles: map[string]int{"u-abc": 1}}
+		w := doPost(t, newRouter(newTestModule(s)), testInternalToken,
+			verifyRequest{SpaceID: "sp1", ProjectID: "p1", UIDs: []string{"U-ABC"}})
+		if w.Code != http.StatusOK {
+			t.Fatalf("want 200, got %d (%s)", w.Code, w.Body.String())
+		}
+		var resp verifyResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		if len(resp.Members) != 1 {
+			t.Fatalf("want one answer, got %+v", resp.Members)
+		}
+		a := resp.Members[0]
+		if a.UID != "U-ABC" {
+			t.Errorf("the answer must echo the caller's uid verbatim, got %q", a.UID)
+		}
+		if !a.Member {
+			t.Fatal("a real member must not be answered member:false because the database " +
+				"returned their uid in a different case than the caller sent")
+		}
+		if a.Role == nil || *a.Role != 1 {
+			t.Errorf("want role 1, got %v", a.Role)
+		}
+	})
 }

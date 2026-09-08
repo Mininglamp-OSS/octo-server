@@ -3,6 +3,7 @@ package project
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
@@ -323,4 +324,113 @@ func TestDisbandedSpaceProjectsReadAsAbsent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, epoch)
 	assert.Empty(t, roles)
+}
+
+// TestSpaceRemovalMovesTheEpochAtCommit is the P1 both round-6 reviewers filed,
+// and it is the half the Space conjunction did NOT close.
+//
+// The conjunction fixes FRESH answers: `_verify` denies a removed user
+// immediately. It does nothing for a grant the peer cached BEFORE the removal,
+// because that peer re-checks staleness by re-reading member_epoch — and nothing
+// used to move it at removal time. The seat closes, and only then bumps, when the
+// async cleanup job reaches it; that job can sit in backoff for minutes and has a
+// terminal abandoned state after which nothing re-claims it. So the revocation
+// survived for minutes normally and forever when the job gave up, while the
+// peer's own check kept agreeing the cached answer was current.
+//
+// What makes that this PR's defect rather than a pre-existing one: before it, the
+// stale seat granted nothing outside this repository. This PR publishes it as an
+// authorization fact to a peer, under a contract that says epoch agreement is
+// sufficient.
+//
+// The removal here goes through the real Space handler path, so the assertion is
+// about the transaction that actually ships — not about a helper called directly.
+func TestSpaceRemovalMovesTheEpochAtCommit(t *testing.T) {
+	srv, p := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "epochRemOwner")
+	seedSpaceMember(t, spaceA, "epochRemOwner", 0, 1)
+	seedUser(t, "epochRemTarget")
+	seedSpaceMember(t, spaceA, "epochRemTarget", 0, 1)
+
+	// Two projects the target is in, and one they are not — the third is the
+	// bound: a removal must not churn epochs of projects it does not touch.
+	inA := createProjectVia(t, srv, spaceA, ownerToken, "space-removal-a")
+	inB := createProjectVia(t, srv, spaceA, ownerToken, "space-removal-b")
+	untouched := createProjectVia(t, srv, spaceA, ownerToken, "space-removal-untouched")
+	for _, p := range []string{inA.ProjectID, inB.ProjectID} {
+		w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+p+"/members/add",
+			ownerToken, map[string]any{"uids": []string{"epochRemTarget"}})
+		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	}
+
+	before := map[string]int64{}
+	for _, p := range []string{inA.ProjectID, inB.ProjectID, untouched.ProjectID} {
+		before[p] = epochOf(t, p)
+	}
+
+	// The removal transaction: the Space seat closes and the registered tx step
+	// runs, in one commit. Seats in octo_project_member are NOT closed here —
+	// that is the cascade's job and it stays asynchronous on purpose.
+	//
+	// Driven through the step this module registers rather than through
+	// modules/space's handler, because the two halves are tested where they live:
+	// that modules/space actually RUNS a registered step inside the removal
+	// transaction (and rolls back when it fails) is pinned by
+	// TestMemberRemovalTxStepRunsInsideTheTransaction over there.
+	tx, err := testCtx.DB().Begin()
+	require.NoError(t, err)
+	_, err = tx.UpdateBySql(
+		"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?",
+		spaceA, "epochRemTarget").Exec()
+	require.NoError(t, err)
+	require.NoError(t, p.bumpEpochsOnSpaceMemberRemoval(tx, spaceA, "epochRemTarget"))
+	require.NoError(t, tx.Commit())
+
+	seat, err := testDB.queryMember(inA.ProjectID, "epochRemTarget")
+	require.NoError(t, err)
+	require.NotNil(t, seat, "the project seat must still be open — the cascade has not run, "+
+		"which is exactly the window this test is about")
+
+	for _, p := range []string{inA.ProjectID, inB.ProjectID} {
+		assert.Greater(t, epochOf(t, p), before[p],
+			"project %s: the epoch must move AT REMOVAL COMMIT. Left to the cascade it moves "+
+				"minutes later, or never once the job is abandoned — and until it does, a peer "+
+				"re-reading the epoch gets the same value and keeps a grant the removal revoked", p)
+	}
+	assert.Equal(t, before[untouched.ProjectID], epochOf(t, untouched.ProjectID),
+		"a project the removed member was never in must not be churned: every bump costs "+
+			"every consumer of that project a re-verify")
+}
+
+// TestSpaceMemberRemovalRegistersBothHalves pins the WIRING, which no behavioural
+// test in this package can see.
+//
+// TestSpaceRemovalMovesTheEpochAtCommit calls the step directly, so it proves the
+// STATEMENT is right and says nothing about whether anything ever calls it —
+// deleting the registration leaves that test green. Registration happens in an
+// init-time reverse hook into modules/space, and its absence is silent: removals
+// would simply stop moving the epoch, and the only symptom is a peer holding a
+// grant it cannot detect as stale.
+//
+// Both halves must be there. The async step closes the seats; the sync step moves
+// the invalidation signal. Dropping either one is a different, and equally quiet,
+// regression.
+func TestSpaceMemberRemovalRegistersBothHalves(t *testing.T) {
+	body := funcBody(t, readLinesWithoutComments(t, "space_member_removal.go"),
+		"func (p *Project) registerSpaceMemberRemovalCleanup(")
+
+	if !strings.Contains(body, "RegisterMemberRemovalCleanupStep(") {
+		t.Error("the ASYNC cleanup step must stay registered: nothing else closes the project " +
+			"seats of a removed Space member")
+	}
+	if !strings.Contains(body, "RegisterMemberRemovalTxStep(") {
+		t.Fatal("the SYNCHRONOUS tx step must be registered, or member_epoch never moves at " +
+			"Space-removal commit and a peer keeps a revoked grant riding epoch agreement — " +
+			"for minutes on the normal path, forever once the cleanup job is abandoned")
+	}
+	if !strings.Contains(body, "bumpEpochsOnSpaceMemberRemoval") {
+		t.Error("the tx step must be the epoch bump; registering something else here would " +
+			"satisfy the check above while leaving the signal unmoved")
+	}
 }

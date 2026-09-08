@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -91,6 +92,73 @@ func RegisterMemberRemovalCleanupStep(name string, fn MemberRemovalCleanupStep) 
 		}
 	}
 	cleanupSteps = append(cleanupSteps, namedCleanupStep{name: name, fn: fn})
+}
+
+// MemberRemovalTxStep 是在成员移除**事务内**同步执行的一步。
+//
+// 与 MemberRemovalCleanupStep 的区别是本质的，不是时机上的微调：
+//
+//   - 清理步骤是**异步**的，可以退避、可以重试、耗尽后进 abandoned 终态。适合
+//     「把这个人从各处摘出去」这类最终一致就够的收尾工作。
+//   - 事务步骤是**同步**的，它的失败会让整次移除回滚。只放那些「一旦提交就必须
+//     已经成立」的事实——典型的是对外发布的失效信号：如果移除提交了而信号没发，
+//     消费方会拿着一个它自己检查不出过期的授权，而异步补偿的窗口在作业被 abandoned
+//     之后是无限的。
+//
+// 契约：
+//   - 必须只做一件小事，并且是**一条语句量级**的。它跑在面向用户的事务里。
+//   - 返回 error 会让整次成员移除失败。这是刻意的：宁可这次移除失败让调用方重试，
+//     也不要提交一次没有失效信号的移除。
+//   - 必须幂等：调用方可能重试整个移除。
+type MemberRemovalTxStep func(tx *dbr.Tx, spaceID, uid string) error
+
+var (
+	txStepsMu sync.RWMutex
+	txSteps   []namedTxStep
+)
+
+type namedTxStep struct {
+	name string
+	fn   MemberRemovalTxStep
+}
+
+// RegisterMemberRemovalTxStep 由下游模块在 init 中反向注册事务内步骤。
+//
+// 反向注册的理由与 RegisterMemberRemovalCleanupStep 相同：modules/project 已经
+// import modules/space，反向 import 即构成 import cycle。
+//
+// 同名重复注册会覆盖（latest wins），方便测试替身。
+func RegisterMemberRemovalTxStep(name string, fn MemberRemovalTxStep) {
+	if name == "" || fn == nil {
+		return
+	}
+	txStepsMu.Lock()
+	defer txStepsMu.Unlock()
+	for i := range txSteps {
+		if txSteps[i].name == name {
+			txSteps[i].fn = fn
+			return
+		}
+	}
+	txSteps = append(txSteps, namedTxStep{name: name, fn: fn})
+}
+
+// runMemberRemovalTxSteps 在移除事务内依次执行已注册的同步步骤。
+//
+// 第一个失败即返回，**不继续执行后续步骤**——与异步清理相反。异步那边步骤之间互不
+// 阻塞，因为整条工单会重跑；这边一旦有步骤失败，事务就要回滚，继续跑余下的步骤只是
+// 在做注定被丢弃的工作。
+func runMemberRemovalTxSteps(tx *dbr.Tx, spaceID, uid string) error {
+	txStepsMu.RLock()
+	steps := make([]namedTxStep, len(txSteps))
+	copy(steps, txSteps)
+	txStepsMu.RUnlock()
+	for _, step := range steps {
+		if err := step.fn(tx, spaceID, uid); err != nil {
+			return fmt.Errorf("space: member removal tx step %s: %w", step.name, err)
+		}
+	}
+	return nil
 }
 
 // snapshotCleanupSteps 取注册表快照，避免执行期间持锁。
