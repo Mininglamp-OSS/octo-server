@@ -159,6 +159,16 @@ var (
 	//
 	// A bot_api code rather than the group one because this module answers in its
 	// own namespace and its adapters branch on that prefix.
+	//
+	// Note for whoever writes the client handling: this answers 403 while its Web
+	// twin (ErrGroupAllMemberGroupProtected) answers 400, so the same "manage this
+	// from the project instead" arrives with two different statuses depending on
+	// the door. Each is consistent inside its own module — modules/group follows
+	// the repo default of pinning 400 for D14 compatibility, and every refusal in
+	// this handler uses the real status — so the divergence is two conventions
+	// meeting, not a mistake. Raised in PR #855s review; recorded rather than
+	// unified, because unifying means changing one module wire contract to match
+	// the other and that is not this change decision to make.
 	ErrBotAPIAllMemberGroupProtected = register(codes.Code{
 		ID:             "err.server.bot_api.all_member_group_protected",
 		HTTPStatus:     http.StatusForbidden,

@@ -256,7 +256,7 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	return groupNos[0], nil
 }
 
-// queryActiveOwnerForProvision 返回项目里资历最老的活跃 owner，没有则返回 ""。
+// queryActiveOwnerCandidatesForProvision 按资历返回项目的活跃 owner 候选（最老在前）。
 //
 // 补建全员群时用来决定"谁当群主"。不能用 octo_project.creator：那一列记的是
 // 当初是谁建的项目，**永不改变**，而这个人可能早就离开了项目或 Space。用他去建群
@@ -266,25 +266,36 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 // 选人规则与 pkg/project.PickActiveOwner 一致（资历最老），刻意同源：那个是群侧
 // 群主同步用的，两边对"谁该拥有这个群"必须给出同一个答案，否则补建刚建好，
 // 群主同步就把它改掉。
-func (d *DB) queryActiveOwnerForProvision(projectID string) (string, error) {
+//
+// # 为什么是候选**列表**而不是一个人
+//
+// 前一版只取 LIMIT 1，把那个 uid 直接交给 CreateGroup —— 而 CreateGroup 的第一件事
+// 就是 CheckMembership(space, creator)：项目席位不蕴含 Space 席位。资历最老的那位
+// owner 一旦成了 I1 泄漏（项目席位还活着、Space 席位没了，P0 的级联工单放弃后就是
+// 这个状态，i1_abandoned_cleanup_leak 这个指标就是为它设的），补建就会失败——而且
+// 因为这个选择是**确定性全序**，它会以完全相同的方式失败每一次，哪怕项目里还有
+// 别的 owner 本可以通过。一个只报不修的扫描 A，加上一条永远修不好的补建路径。
+//
+// 返回有序候选，由调用方按 Space 席位筛，是把"谁能当群主"这个判断交给会真正校验它
+// 的那个谓词。
+const provisionOwnerCandidates = 16
+
+func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string) ([]string, error) {
 	if projectID == "" {
-		return "", nil
+		return nil, nil
 	}
 	var uids []string
 	_, err := d.session.SelectBySql(
 		"SELECT uid FROM `octo_project_member` "+
 			"WHERE project_id = ? AND role = ? AND status = ? AND removing = 0 "+
 			// created_at 不是全序（同毫秒会并列），补 uid 让选择可测且跨副本一致。
-			"ORDER BY created_at ASC, uid ASC LIMIT 1",
-		projectID, RoleOwner, MemberStatusActive,
+			"ORDER BY created_at ASC, uid ASC LIMIT ?",
+		projectID, RoleOwner, MemberStatusActive, provisionOwnerCandidates,
 	).Load(&uids)
 	if err != nil {
-		return "", fmt.Errorf("project: query active owner: %w", err)
+		return nil, fmt.Errorf("project: query active owner candidates: %w", err)
 	}
-	if len(uids) == 0 {
-		return "", nil
-	}
-	return uids[0], nil
+	return uids, nil
 }
 
 // queryActiveMemberUIDsForRebuild 读一个项目当前的活跃成员 uid，供 D4 补建把整份

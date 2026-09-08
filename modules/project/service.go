@@ -947,6 +947,14 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, uids []string)
 	// into. It is best-effort — a batch add must not fail because the group could
 	// not be built — so the admissions below tolerate its absence.
 	allMemberGroupNo := p.ensureAllMemberGroup(projectID, spaceID)
+	if allMemberGroupNo == "" {
+		// 整批人都不会进群。补建自己失败时那一路已经记过原因；这里补的是它**没跑**
+		// 的那种情况——另一个写路径握着租约，认领 CAS 影响 0 行就直接返回，此前
+		// 什么都不记。一条批次级的日志，而不是逐 uid 一条。
+		p.Warn("项目此刻没有全员群，本批加人不会进群（补建失败或正被他人认领），由 I4 扫描 B 报出",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID),
+			zap.Int("uids", len(uids)))
+	}
 
 	results := make([]addMemberResult, 0, len(uids))
 	for _, uid := range uids {

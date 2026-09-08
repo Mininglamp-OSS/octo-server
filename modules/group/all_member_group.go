@@ -82,7 +82,13 @@ func (g *Group) provisionAllMemberGroup(ctx *config.Context, seed projectmod.All
 // projectID 从群行读出，而不是由调用方传：项目侧传进来的是"它认为的"归属，
 // 而闸门要按群自己的归属判定。P1 在 admitToPresetGroup 上写过同一段理由——
 // 传空串会变成一个 fail-OPEN 的捷径（空 project_id 读作"不是项目群"）。
-func (g *Group) admitToAllMemberGroup(ctx *config.Context, spaceID, groupNo, uid string) error {
+// 第二个参数（注册契约里的 spaceID）**刻意不用**，所以写成 `_`。
+//
+// 项目侧传进来的是"它认为的" Space，而准入闸门必须按群自己的 space_id 判定——那一份
+// 从事务内重读的群行来（txGroup.SpaceID）。用参数就是拿调用方的说法去评判不变量，
+// 与下面 projectID 那段是同一条理由。签名保留这个位置是因为它属于共享的钩子契约；
+// 不用它这件事写在这里，免得下一个读者以为是漏传了。
+func (g *Group) admitToAllMemberGroup(ctx *config.Context, _, groupNo, uid string) error {
 	if groupNo == "" || uid == "" {
 		return errors.New("group: all-member admission requires group_no and uid")
 	}

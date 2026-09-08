@@ -125,30 +125,17 @@ func PickActiveOwner(session *dbr.Session, projectID string) (string, error) {
 	return uids[0], nil
 }
 
-// AllMemberGroupNo returns projectID's all-member group, or "" when it has none
-// (no such project, disbanded, or not provisioned yet).
+// An exported AllMemberGroupNo used to live here, answering "what does the
+// project point at" without verifying the group side. It had zero callers, and
+// it kept answering the PRE-FIX version of the question after IsAllMemberGroup
+// gained the disbanded-group and project_id checks — so the one exported helper
+// on this subject was the one that would give the wrong answer.
 //
-// Deliberately does NOT verify the group's own project_id — unlike
-// IsAllMemberGroup, whose whole job is that check. This one answers "what does
-// the project point at", which is what a caller needs when it is about to act ON
-// the project's group rather than deciding whether some group is protected.
-func AllMemberGroupNo(session *dbr.Session, projectID string) (string, error) {
-	if projectID == "" {
-		return "", nil
-	}
-	var groupNos []string
-	_, err := session.SelectBySql(
-		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ? AND status = 1",
-		projectID,
-	).Load(&groupNos)
-	if err != nil {
-		return "", err
-	}
-	if len(groupNos) == 0 {
-		return "", nil
-	}
-	return groupNos[0], nil
-}
+// Deleted rather than fixed: an exported predicate with no caller is a trap
+// whichever contract it has, and modules/project reads the column through its own
+// queryAllMemberGroupNo, which does verify the group side. If a caller outside
+// that module ever needs it, add it back with that caller and with the same
+// checks IsAllMemberGroup makes. PR #855s second review.
 
 // AllMemberGroupGuardFailures counts D7 guard evaluations that could not be
 // decided and were therefore let through.

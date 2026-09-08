@@ -3,6 +3,7 @@ package project
 import (
 	"time"
 
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -136,12 +137,12 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
 	// 项目活跃成员），于是一个初次建群失败过的项目**永远**补建不出来——每次写
 	// 路径都认领租约、建群失败、释放租约，无限循环，而 I4 扫描 A 会永远报着它。
 	// 这条正是补建存在的意义所在，用错人等于补建从来没生效过。
-	owner, err := p.db.queryActiveOwnerForProvision(projectID)
+	ownerCandidates, err := p.db.queryActiveOwnerCandidatesForProvision(projectID)
 	if err != nil {
 		p.Warn("查询项目 owner 失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
 		return ""
 	}
-	if owner == "" {
+	if len(ownerCandidates) == 0 {
 		// 无主项目（P0 的 Space 级联可以造出这种状态并留了 Warn）。没有人能当群主，
 		// 补建只会失败；等有 owner 了再说。I4 扫描 A 继续报着它。
 		p.Warn("项目暂无活跃 owner，跳过全员群补建",
@@ -170,12 +171,90 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
 		p.Warn("读取项目名册失败，跳过全员群补建", zap.Error(err), zap.String("projectId", projectID))
 		return ""
 	}
-	if len(roster) >= maxMembers {
-		p.Warn("补建全员群：名册取满上限，可能有成员未被带入新群（由 I4 扫描 B 报出）",
+	if len(roster) > maxMembers {
+		p.Warn("补建全员群：名册超过上限，可能有成员未被带入新群（由 I4 扫描 B 报出）",
 			zap.String("projectId", projectID), zap.Int("limit", maxMembers))
 	}
-	// owner 由 CreateGroup 自己作为群主加入，出现在 Members 里会变成重复插入。
-	p.provisionAllMemberGroup(projectID, spaceID, owner, row.Name, withoutUID(roster, owner))
+
+	// 名册和 owner 候选都要先过 Space 席位这一关，因为**建群会拿它们去过**。
+	//
+	// 补建的两个输入都读自 octo_project_member，而 CreateGroup 用 space_member 校验：
+	// 群主走 CheckMembership（不过就整个失败），成员走 I2 准入闸门的 Space 半边
+	// （ActiveMembers，一个不过就整批拒）。项目席位**不蕴含** Space 席位——这正是
+	// 那个闸门是合取的原因，也是 i1_violations 和 i1_abandoned_cleanup_leak 是两个
+	// 独立指标的原因。
+	//
+	// 上一版这里写着「读的就是项目的活跃成员，按定义全部通过 I2」。那句话漏了 Space
+	// 那一半，而漏掉的正好是可达且**终局**的一半：Space 移除工单耗尽重试后放弃，会
+	// 留下一个项目席位还活着、Space 席位已经没了的 uid，没有任何东西会再来处理它。
+	// 于是一个这样的成员就让补建整个失败，而且因为输入是确定性全序，每一次加人都
+	// 以完全相同的方式失败——补建是这个功能唯一的修复路径，扫描 A 只报不修。
+	//
+	// 一次批量查询而不是逐个查：ActiveMembers 一条语句读完，与准入闸门的 Space 半边
+	// 用的是同一个函数，所以两边不会对"谁是活跃 Space 成员"给出不同答案。
+	//
+	// 被筛掉的人按定义就是 I1 违规，扫描 B 会把他们报成缺口——那是它们该待的地方，
+	// 而且比"整个项目没有群"好得多。
+	probe := append(append([]string{}, ownerCandidates...), roster...)
+	spaceActive, err := spacepkg.ActiveMembers(p.db.session, spaceID, probe)
+	if err != nil {
+		p.Warn("校验补建成员的 Space 席位失败，跳过补建",
+			zap.Error(err), zap.String("projectId", projectID))
+		return ""
+	}
+	owner := ""
+	for _, candidate := range ownerCandidates {
+		if spaceActive[candidate] {
+			owner = candidate
+			break
+		}
+	}
+	if owner == "" {
+		p.Warn("项目的活跃 owner 都没有 Space 席位，跳过全员群补建（I1 泄漏，需人工处理）",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID),
+			zap.Int("candidates", len(ownerCandidates)))
+		return ""
+	}
+	admissible := make([]string, 0, len(roster))
+	dropped := make([]string, 0)
+	for _, uid := range roster {
+		if uid == owner {
+			// owner 由 CreateGroup 自己作为群主加入，出现在 Members 里会变成重复插入。
+			continue
+		}
+		if spacepkg.IsSystemBot(uid) || spaceActive[uid] {
+			admissible = append(admissible, uid)
+			continue
+		}
+		dropped = append(dropped, uid)
+	}
+	if len(dropped) > 0 {
+		p.Warn("补建全员群：部分项目成员没有 Space 席位，未带入新群（I1 泄漏，由 I4 扫描 B 报出）",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID),
+			zap.Strings("dropped", dropped))
+	}
+
+	// # 名册**不**截断，这是一个决定
+	//
+	// PR #855 第二轮 review 的 Q1：补建的代价是 O(名册)，而且发生在一次加人请求的
+	// 同步路径上。可选项是按 MemberBatchMax 截断、让扫描 B 兜住尾巴。不截，理由是
+	// 两条：
+	//
+	//  1. 截断把"补建"变回上一轮刚修掉的那个缺陷——建出一个**不完整而且没人会补全**
+	//     的群。尾巴的唯一补救仍然是管理员逐个重加，那正是 Q11 判定为不可接受的。
+	//  2. 这个代价是**一次性**的，不是每请求的。上面那条 P1 修复拿掉了让补建永久
+	//     失败的那个状态，所以补建成功之后就不再发生；而它失败时，租约会释放、下一次
+	//     写路径重试——重试的次数取决于失败原因，不取决于名册大小。
+	//
+	// 顺序往返那一半单独解决了：CreateGroup 的逐个 CheckMembership 循环已经换成
+	// 一条 ActiveMembers 批量查询。剩下的是每个成员一次 GenSeq，那是建群路径对所有
+	// 调用方都有的形状，改它要动版本号的分配方式，不搭这一版的车。
+	if len(admissible)+1 > p.cfg.MemberBatchMax {
+		p.Info("补建全员群：初始成员数超过单批加人上限，属预期（补建是一次性的，见此处注释）",
+			zap.String("projectId", projectID), zap.Int("members", len(admissible)+1),
+			zap.Int("batchMax", p.cfg.MemberBatchMax))
+	}
+	p.provisionAllMemberGroup(projectID, spaceID, owner, row.Name, admissible)
 
 	// 再读一次而不是让 provisionAllMemberGroup 返回群号：补建可能因为任何一种
 	// 原因没成（钩子没注册、认领失败、建群失败、写回落空），而这些分支各自的
@@ -212,9 +291,21 @@ func (p *Project) admitAllMemberGroup(projectID, spaceID, groupNo, uid string) {
 		return
 	}
 	if groupNo == "" {
-		// 还没有全员群。这不是入群失败，是补建的活；调用方已经在这之前调过
-		// ensureAllMemberGroup，所以走到这里说明补建也没成功——那一路已经记过
-		// 日志和指标了，这里不重复计数。
+		// 还没有全员群。这不是入群失败，是补建的活；调用方在这之前调过
+		// ensureAllMemberGroup，所以走到这里说明那一路没能给出群号。
+		//
+		// 两种情况，而且必须分开记：补建**失败**了（那一路已经记过日志和指标，
+		// 这里重复计数只会让同一件事在两个指标上各响一次），或者补建被**跳过**了
+		// ——另一个写路径正握着租约，认领 CAS 影响 0 行就直接返回。后者原本什么
+		// 都不记，理由写的是"补建那一路已经记过"，而那条理由恰恰在这里不成立：
+		// 没跑，就没记。于是一次并发的加人会把整批人的入群静默丢掉，直到扫描 B
+		// 过了宽限期才看得见。
+		//
+		// 无从在这里分辨是哪一种，所以按"输了竞态"记：失败那一路自己已经有指标，
+		// 这个计数器的价值在于让"整批入群什么都没发生"这件事在仪表盘上有痕迹。
+		// 只记指标不记日志：这个分支是逐 uid 的，一次 200 人的加人会写 200 行同样的
+		// 话。批次级的那一条由 addMembers 记（它知道整批的规模）。
+		observeAllMemberGroupAdmitFailure(reasonAdmitRaceLost)
 		return
 	}
 	if err := admit(p.ctx, spaceID, groupNo, uid); err != nil {

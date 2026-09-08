@@ -29,6 +29,14 @@ const (
 	reasonAdmitterMissing   = "admitter_missing"
 	reasonAdmitLookupFailed = "lookup_failed"
 	reasonAdmitCallFailed   = "admit_failed"
+	// reasonAdmitRaceLost：本次写路径要入群，但这个项目此刻还没有全员群，而**补建
+	// 并不是失败的，是被跳过的**——另一个写路径正握着租约在建。
+	//
+	// 单独一个原因而不是不计数，是 PR #855 第二轮 review 的 Q4：这一批人的入群被
+	// 整批丢掉了，而丢掉它的那条分支原本什么都不记，理由是"补建那一路已经记过日志"。
+	// 那条理由在这里不成立——补建没跑，何来日志。于是并发的一次加人可以让整份名册
+	// 静默地不在群里，直到扫描 B 过了宽限期才看见。
+	reasonAdmitRaceLost = "provision_race_lost"
 )
 
 // 同步失败的种类。

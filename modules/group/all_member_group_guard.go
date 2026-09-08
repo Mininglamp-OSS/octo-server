@@ -109,8 +109,19 @@ func (g *Group) refuseIfAllMemberGroup(c *wkhttp.Context, groupModel *Model, act
 // respondAllMemberGroupProtected 写出 D7 的拒绝。
 //
 // details.action 告诉客户端被拒的是哪一个动作，它才能渲染出对应的引导文案
-// （"请退出项目"而不是一句泛泛的"不允许"）。这不泄露任何东西：动作是调用方自己
-// 发起的，而它已经是这个群的成员。
+// （"请退出项目"而不是一句泛泛的"不允许"）。
+//
+// # 泄露面：不是零，是有界
+//
+// 前一版这里写的是"这不泄露任何东西：动作是调用方自己发起的，而它已经是这个群的
+// 成员"。后半句在五个调用点里有两个不成立：踢人和退群的守卫都排在"读调用方的群成员
+// 身份"之前（api.go 的 memberRemove / groupExit），退群那一处还是被 IMRemoveSubscriber
+// 的位置逼出来的——守卫必须在那次退订之前。
+//
+// 所以口径改成实话：一个**非成员**能从这条拒绝里读出"这个群是某个项目的全员群"。
+// 这个泄露是有界的，因为同一个 handler 上游的 getGroupInfo 已经用 404 与否回答了
+// "这个群存不存在"，多出来的只是"它属于某个项目"。把它写清楚，是因为将来有人要动
+// 守卫的位置时，会引用这段话——引用一句错的，就会把它挪到 IMRemoveSubscriber 后面。
 func respondAllMemberGroupProtected(c *wkhttp.Context, action string) {
 	httperr.ResponseErrorL(c, errcode.ErrGroupAllMemberGroupProtected, nil, i18n.Details{
 		"action": action,

@@ -601,6 +601,143 @@ pr_855_found_while_fixing:
   - id: space-cascade-agent-removals-were-unaudited
     fix: "auditCascade with reason agent_follows_owner, in the post-commit loop that already invalidates their caches -- closedAgents does not leave the service, so the caller cannot do it."
 
+# PR #855 second formal pass (yujiawei on head 0b9e784), plus the review from
+# mochashanyao on 153a8a9 that arrived after the first round had been answered.
+pr_855_round_2_fixed:
+  - id: rebuild-inputs-validated-against-a-different-table-than-they-came-from
+    severity: blocking
+    where: modules/project/service_all_member_group.go ensureAllMemberGroup
+    what: |
+      The rebuild picked BOTH its inputs from octo_project_member and handed them
+      to CreateGroup, which validates against space_member: the creator through
+      CheckMembership (hard failure), the roster through the I2 gate whose Space
+      half is a conjunction refusing the whole batch on one miss.
+    why_that_was_wrong: |
+      The comment I wrote said "these are the project active members, so by
+      definition they all pass I2". That skips the Space half, and the half it
+      skips is the reachable AND TERMINAL one: an abandoned Space-removal cleanup
+      job leaves a uid with an active project seat and no Space seat, and the
+      module already has a gauge named for exactly that state whose help text
+      reads "nothing re-drives these; a non-zero value needs manual repair".
+    consequence: |
+      One such member refused the entire rebuild. Because both inputs are a
+      deterministic total order, it failed IDENTICALLY on every later add -- and
+      the rebuild is the only repair path this feature has, since scan A is
+      report-only by decision. The project could never get an all-member group,
+      and scan A would report it forever.
+    fix: |
+      Both inputs are filtered through pkg/space.ActiveMembers -- the same
+      function the admission gate Space half uses, so the two cannot disagree --
+      in one batched query. The owner pick returns an ordered CANDIDATE LIST and
+      falls through to the first one holding a Space seat. Dropped members are by
+      construction I1 violations that scan B then reports, which is where they
+      belong and strictly better than no group.
+    test: |
+      TestRebuildProducesAGroupMatchingTheAdmissibleRoster and
+      TestRebuildSkipsAnOwnerWhoLostTheirSpaceSeat -- end to end through the REAL
+      provisioner, asserting on group_member rows rather than on what the stand-in
+      was called with. Both confirmed to fail on the unfixed code.
+    note: |
+      The review named the coverage shape behind this: four blocking findings on
+      this PR have now come out of ensureAllMemberGroup / provisionAllMemberGroup,
+      and all four were invisible to tests that assert on the stand-in stub. The
+      first test above is written as an INVARIANT over the rebuild rather than as
+      a regression case, which is what that observation asks for.
+  - id: i4-scan-b-banned-space-exemption
+    severity: spec
+    brief_ref: S1
+    what: "I argued the exemption unnecessary and was half right, which is the same as wrong."
+    why_that_was_wrong: |
+      My argument was that no NEW gap can open during a ban, since lockSpaceSeatsTx
+      joins `space` on status = 1 and refuses every add and removal. True, and
+      beside the point: the exemption is not there to stop gaps appearing, it is
+      there to stop the gauge holding rows nobody can act on. A gap that PREDATES
+      the ban is still reported, and its only documented repair -- an admin
+      re-adding the member -- goes through that same refused path. My own test
+      asserted the wrong half: it checked that a gap opened AFTER the ban was
+      still reported, and called that "not merely mute".
+    fix: |
+      Exemption 4 added, in the violating flag (LEFT JOIN `space`), matching
+      reconcile_p1.go:178. TestI4ScanBExemptsABannedSpace now opens a real gap
+      BEFORE the ban, asserts it is reported, bans, asserts it stops, un-bans,
+      asserts it returns -- so the exemption is the ban and not a silence.
+  - id: index-with-no-query
+    brief_ref: Q2
+    what: |
+      idx_octo_project_all_member_group_no was justified as serving D7 reverse
+      lookups. The review enumerated every statement touching the column: all of
+      them also filter on project_id (served by the UNIQUE uk_octo_project_project_id)
+      or drive off p.status / p.id. Nothing looks the column up alone.
+    fix: "Dropped. It is not free -- a non-INSTANT online build at deploy time, and a B+ tree maintained on every octo_project write, for no reader."
+  - id: service-layer-guard-read-one-file
+    brief_ref: Q3
+    what: |
+      The guard asserted refuseIfAllMemberGroup is absent from ../group/service.go.
+      Of the primitives its own message names, only RemoveGroupMembers is there:
+      UpdateMemberRoleTx and UpdateStatusTx are in db.go, and admitOrRestoreMembersTx
+      -- the one the all-member admitter itself goes through -- is in admission.go.
+    note: |
+      The same diff ships learnings/pending/a-guard-that-names-its-subject-file-is-not-a-floor.md,
+      which states this rule verbatim. Writing the rule down did not stop me
+      breaking it in the same commit.
+    fix: "It globs the package, allow-listing api.go (where the refusals belong) and the guard definition itself, with a floor on the number of files scanned."
+  - id: losing-the-provisioning-race-dropped-a-batch-silently
+    brief_ref: Q4
+    what: |
+      ensureAllMemberGroup returns "" both when the rebuild FAILED and when it was
+      SKIPPED because another writer holds the lease. The empty string is threaded
+      to every admission in the batch, and the groupNo == "" arm counted nothing on
+      the reasoning that the rebuild path had already logged. It had not -- it was
+      never entered.
+    fix: "reasonAdmitRaceLost on the metric (per uid) plus one batch-level Warn in addMembers, rather than one log line per uid."
+  - id: rebuild-cost-decision
+    brief_ref: Q1
+    decision: |
+      The seed is NOT capped at MemberBatchMax. Capping turns the rebuild back into
+      the defect the previous round fixed -- a group that is incomplete and that
+      nothing backfills -- and the tail's only repair would again be per-member
+      re-adds. The cost is one-off rather than per-request: the blocking fix above
+      removes the state that made a rebuild fail permanently.
+      The sequential half IS fixed: CreateGroup batched its per-member
+      CheckMembership loop into one pkg/space.ActiveMembers call, which that
+      helper doc explicitly exists for and which benefits every caller. The
+      remaining per-member GenSeq is the create path shape for all callers and
+      changing it means changing version allocation -- not a rider on this change.
+  - id: assorted-nits
+    fixes: |
+      pkg/project.AllMemberGroupNo deleted: zero callers, and it kept answering the
+      pre-fix version of the question after IsAllMemberGroup gained the
+      disbanded-group and project_id checks.
+      admitToAllMemberGroup spaceID parameter renamed to _ with the reason (the
+      gate must judge by the group own space_id, re-read in the transaction).
+      The "leaks nothing" claim corrected in both places it appears: two of the
+      five call sites run the guard before reading the caller membership, so a
+      non-member CAN learn the group belongs to a project. Bounded, not nothing --
+      stated accurately because the next person to move the guard will cite it.
+      Scan B system-bot exemption moved from the WHERE into the violating flag,
+      matching the rule stated three lines above it.
+      len(roster) >= maxMembers relaxed to >, which was warning on a project that
+      is legitimately exactly full.
+      The 400-vs-403 divergence between the group and bot_api codes for one rule
+      is documented at the code, not unified: each is consistent inside its own
+      module convention, and unifying means changing one module wire contract.
+
+# From mochashanyao (review on 153a8a9, submitted after the first round had been
+# answered, so it was not seen at the time). Its P1 and four of its five P2s were
+# already fixed by the response to the first review; the rest are above.
+pr_855_second_reviewer:
+  already_fixed_by_round_1: |
+    P1 (rebuild leaves pre-existing members out) = Q11. P2s: unaudited agent seats
+    on the Space cascade, the blacklist guard having no test, the create handler
+    auditing uids the service dropped, and self-hosted agents accepted by
+    members/add but refused by create.
+  unique_items: |
+    The 400-vs-403 note (handled above), and four human-verify items. One of those
+    is new and is NOT resolved here: whether DISBAND specifically should fail
+    CLOSED rather than open. The fail-open argument is strongest for exit (a user
+    who cannot leave has no way round it) and weakest for disband (irreversible).
+    Recorded in open_verification rather than decided.
+
 # octospec Verify phase. Each injected rule re-read and checked against the diff,
 # then the brief's Acceptance walked line by line.
 verify:
@@ -749,3 +886,10 @@ open_verification:
      such call anywhere in octo-server or octo-lib -- so the equality itself is not
      assertable from a test. Same class as the EXPLAIN items above: check it
      against a running broker before merge."
+  - "Whether the D7 guard should fail CLOSED on disband specifically, while
+     staying fail-open on the other four actions. Raised by mochashanyao on
+     PR #855. The fail-open argument -- one database error must not become
+     nobody can leave any project group -- is strongest for exit and weakest for
+     disband, which is irreversible. Not decided here because it is a product
+     call about which failure a user should be walked into, and because splitting
+     the guard by action costs the property that all five answer identically."

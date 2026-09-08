@@ -667,3 +667,171 @@ func contains(list []string, want string) bool {
 	}
 	return false
 }
+
+// allMemberGroupNoE2E reads the project's pointer from outside the package.
+func allMemberGroupNoE2E(t *testing.T, ctx *config.Context, projectID string) string {
+	t.Helper()
+	var v []string
+	_, err := ctx.DB().SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ?", projectID).Load(&v)
+	require.NoError(t, err)
+	require.Len(t, v, 1)
+	return v[0]
+}
+
+// leakI1Seat produces the state modules/project's i1_abandoned_cleanup_leak gauge
+// is named after: an active project seat whose Space seat is gone, with no cleanup
+// job coming.
+//
+// Reachable in production, and terminal: P0's Space→Project cascade is a leased
+// worker with a retry budget and an ABANDONED end state, and the gauge's own help
+// text says "nothing re-drives these; a non-zero value needs manual repair".
+func leakI1Seat(t *testing.T, ctx *config.Context, spaceID, uid string) {
+	t.Helper()
+	exec(t, ctx, "UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?", spaceID, uid)
+}
+
+// TestRebuildProducesAGroupMatchingTheAdmissibleRoster is the behavioural
+// invariant over D4's rebuild that PR #855's second review asked for, and it is
+// deliberately stated as an invariant rather than as a regression case:
+//
+//	after a rebuild, the group's active member set equals the project's ADMISSIBLE
+//	roster, and the group has exactly one creator who is an active project owner.
+//
+// Four blocking findings on this PR have now come out of ensureAllMemberGroup /
+// provisionAllMemberGroup — the stale pointer that wedged the rebuild, the owner
+// sync that could leave a group with no creator, the nil roster, and this one —
+// and all four were invisible to tests that assert on what the STAND-IN
+// provisioner was called with. This one asserts on the `group_member` rows that
+// came out of the real one.
+//
+// The state under test is an I1 leak: a project member with no Space seat. The
+// rebuild reads its inputs from octo_project_member and CreateGroup validates them
+// against space_member, so before the fix ONE leaked member refused the whole
+// rebuild — permanently, since the inputs are a deterministic total order and
+// every later add repeats it verbatim. The project never gets a group, scan A
+// reports it forever, and the repair the design points at is the broken thing.
+func TestRebuildProducesAGroupMatchingTheAdmissibleRoster(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID = "e2e_rb_space"
+		owner   = "e2e_rb_owner"
+		leaked  = "e2e_rb_leaked"
+		kept    = "e2e_rb_kept"
+		late    = "e2e_rb_late"
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, owner)
+	for _, uid := range []string{owner, leaked, kept, late} {
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, uid)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, uid, uid)
+	}
+
+	ownerToken := seedToken(t, ctx, owner)
+	resp := createProjectE2E(t, srv, spaceID, ownerToken, map[string]any{"name": "rebuild-e2e"})
+	projectID, _ := resp["project_id"].(string)
+	firstGroup, _ := resp["all_member_group_no"].(string)
+	require.NotEmpty(t, firstGroup)
+
+	w := postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{leaked, kept}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	// Put the project back into "provisioning never succeeded": the pointer is the
+	// empty sentinel and the group it used to name is gone. This is scan A's state 1,
+	// and it is what every rebuild starts from.
+	exec(t, ctx, "UPDATE `group` SET status = 2 WHERE group_no = ?", firstGroup)
+	exec(t, ctx, "UPDATE `octo_project` SET all_member_group_no = '', all_member_group_lease_until = NULL "+
+		"WHERE project_id = ?", projectID)
+
+	// One member becomes an I1 leak: project seat active, Space seat gone.
+	leakI1Seat(t, ctx, spaceID, leaked)
+
+	// Trigger the rebuild through a real add.
+	w = postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{late}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	rebuilt := allMemberGroupNoE2E(t, ctx, projectID)
+	require.NotEmpty(t, rebuilt,
+		"the rebuild must produce a group. One project member with no Space seat used to "+
+			"refuse the whole CreateGroup — and because the inputs are a deterministic total "+
+			"order, every later add failed identically, so the project could never get one")
+	require.NotEqual(t, firstGroup, rebuilt)
+
+	// The invariant.
+	require.Eventually(t, func() bool {
+		live := liveGroupMembers(t, ctx, rebuilt)
+		return len(live) == 3
+	}, 30*time.Second, 250*time.Millisecond,
+		"current members: %v", liveGroupMembers(t, ctx, rebuilt))
+	assert.ElementsMatch(t, []string{owner, kept, late}, liveGroupMembers(t, ctx, rebuilt),
+		"the group's active set must equal the project's ADMISSIBLE roster: everyone who "+
+			"holds both a project seat and a Space seat. The leaked member is left out — they "+
+			"are an I1 violation, scan B reports them as a gap, and that is strictly better "+
+			"than no group at all")
+
+	row := groupRowE2E(t, ctx, rebuilt)
+	require.NotNil(t, row)
+	assert.Equal(t, projectID, row.ProjectID)
+	assert.Equal(t, owner, row.Creator, "and exactly one creator, who is an active project owner")
+}
+
+// TestRebuildSkipsAnOwnerWhoLostTheirSpaceSeat is leg A of the same finding.
+//
+// queryActiveOwnerForProvision picks the senior active project owner with no Space
+// predicate, and hands it to CreateGroup, whose first act is a Space membership
+// check on the creator. A senior owner who is an I1 leak therefore failed the
+// rebuild — identically every time, because the pick is a deterministic total
+// order — even though the project had a second owner who would have passed.
+func TestRebuildSkipsAnOwnerWhoLostTheirSpaceSeat(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID     = "e2e_rbo_space"
+		seniorOwner = "e2e_rbo_a_senior"
+		juniorOwner = "e2e_rbo_b_junior"
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, seniorOwner)
+	for _, uid := range []string{seniorOwner, juniorOwner} {
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, uid)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, uid, uid)
+	}
+
+	seniorToken := seedToken(t, ctx, seniorOwner)
+	resp := createProjectE2E(t, srv, spaceID, seniorToken, map[string]any{"name": "rebuild-owner-e2e"})
+	projectID, _ := resp["project_id"].(string)
+	firstGroup, _ := resp["all_member_group_no"].(string)
+
+	w := postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", seniorToken,
+		map[string]any{"uids": []string{juniorOwner}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	// Promoted by SQL: the role endpoint is a PUT and this case is about the
+	// rebuild's owner pick, not about the promotion path.
+	exec(t, ctx, "UPDATE `octo_project_member` SET role = 2 WHERE project_id = ? AND uid = ?",
+		projectID, juniorOwner)
+
+	exec(t, ctx, "UPDATE `group` SET status = 2 WHERE group_no = ?", firstGroup)
+	exec(t, ctx, "UPDATE `octo_project` SET all_member_group_no = '', all_member_group_lease_until = NULL "+
+		"WHERE project_id = ?", projectID)
+
+	// The SENIOR owner — the one the deterministic pick returns first — is the leak.
+	leakI1Seat(t, ctx, spaceID, seniorOwner)
+
+	// A write path that is not the leaked owner's own triggers the rebuild.
+	juniorToken := seedToken(t, ctx, juniorOwner)
+	w = postJSONE2E(t, srv, "/v1/projects/"+projectID+"/members/add", juniorToken,
+		map[string]any{"uids": []string{juniorOwner}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	rebuilt := allMemberGroupNoE2E(t, ctx, projectID)
+	require.NotEmpty(t, rebuilt,
+		"the rebuild must fall through to an owner who can actually hold the group")
+	row := groupRowE2E(t, ctx, rebuilt)
+	require.NotNil(t, row)
+	assert.Equal(t, juniorOwner, row.Creator,
+		"the senior owner has no Space seat, so CreateGroup would refuse them as creator; "+
+			"the pick must move on rather than failing the rebuild forever")
+}

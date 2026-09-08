@@ -12,10 +12,17 @@ import (
 
 // Source guards for the P2 all-member group work.
 //
-// All three are the tree-walking / list-comparing kind rather than the
-// "does this string appear" kind, for the reason P1's D8 gives: a fixed list
-// cannot see a new file, and a guard that quietly stops covering things is worse
-// than no guard, because it still passes.
+// Both derive the set they check rather than naming it, for the reason P1's D8
+// gives: a fixed list cannot see a new file, and a guard that quietly stops
+// covering things is worse than no guard, because it still passes.
+//
+// The second one used to name `../group/service.go` and only that file, which was
+// the very rule it was written under. PR #855's second review pointed out that of
+// the primitives its own message names, only RemoveGroupMembers is in service.go:
+// UpdateMemberRoleTx and UpdateStatusTx are in db.go, and admitOrRestoreMembersTx
+// — the one the all-member admitter itself goes through — is in admission.go. A
+// refusal moved into any of those kept the guard green while disabling every
+// cascade it exists to protect. It globs the package now.
 
 // TestProjectMigrationListCoversEveryMigrationFile pins projectMigrationFiles
 // against what the module actually ships.
@@ -67,12 +74,39 @@ func TestProjectMigrationListCoversEveryMigrationFile(t *testing.T) {
 // modules/group and will not think to look here, which is precisely when a guard
 // earns its keep.
 func TestAllMemberGroupProtectionIsNotInTheServiceLayer(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join("..", "group", "service.go"))
+	groupDir := filepath.Join("..", "group")
+	entries, err := os.ReadDir(groupDir)
 	require.NoError(t, err)
-	require.NotContains(t, string(body), "refuseIfAllMemberGroup",
-		"modules/group/service.go must not call the all-member group guard.\n"+
-			"D7's refusals belong on the HTTP handlers. In the service layer they would "+
-			"also refuse P1's project cascade, the Space-removal cascade, botfather's bot "+
-			"deletion and P2's own owner-sync hook — every path that MAINTAINS the "+
-			"invariant this guard exists to protect.")
+
+	// api.go is where the refusals belong; every other non-test file in the package
+	// is a place they must not appear. Naming the ALLOWED file rather than the
+	// forbidden ones is what makes this survive a new file being added.
+	const handlerFile = "api.go"
+
+	scanned := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") ||
+			strings.HasSuffix(name, "_test.go") || name == handlerFile {
+			continue
+		}
+		// all_member_group_guard.go DEFINES the guard; it is not a call site.
+		if name == "all_member_group_guard.go" {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(groupDir, name))
+		require.NoError(t, err)
+		scanned++
+		require.NotContains(t, string(body), "refuseIfAllMemberGroup(",
+			"modules/group/%s must not call the all-member group guard.\n"+
+				"D7's refusals belong on the HTTP handlers (%s). Anywhere else in this "+
+				"package they would also refuse P1's project cascade, the Space-removal "+
+				"cascade, botfather's bot deletion and P2's own owner-sync hook — every "+
+				"path that MAINTAINS the invariant this guard exists to protect. The "+
+				"primitives are spread across service.go, db.go and admission.go, which is "+
+				"why this scans the package rather than one file.", name, handlerFile)
+	}
+	require.Greater(t, scanned, 10,
+		"expected to scan the whole modules/group package, saw %d files — if the scan "+
+			"stopped matching, this guard passes vacuously", scanned)
 }

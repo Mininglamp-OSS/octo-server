@@ -1244,13 +1244,19 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		// 行为与 scanjoin / AddGroupMembers 路径对齐，保证 YUJ-53 消息头来源 tag 在
 		// 建群初始成员路径也能被正确渲染。建群暂不做 allow_external 门禁，默认允许（与
 		// 新群 allow_external=1 一致）；若未来需要拒绝，应由 API 层提前校验。
+		//
+		// 一条批量查询，不是逐个 CheckMembership。ActiveMembers 的谓词与
+		// CheckMembership 逐字节相同，它的文档写明存在的理由就是"别让一个拿着很多
+		// uid 的调用方发 N 次往返"。P2 的补建把整份项目名册当作建群初始成员，于是
+		// 这个循环第一次真的会拿到几百个 uid——PR #855 第二轮 review 的 Q1 量到的
+		// 就是这里。
+		spaceActive, err := spacepkg.ActiveMembers(s.ctx.DB(), req.SpaceID, req.Members)
+		if err != nil {
+			s.Error("check member space membership failed", zap.Error(err))
+			return nil, errors.New("failed to check space membership")
+		}
 		for _, uid := range req.Members {
-			ok, err := spacepkg.CheckMembership(s.ctx.DB(), req.SpaceID, uid)
-			if err != nil {
-				s.Error("check member space membership failed", zap.Error(err), zap.String("uid", uid))
-				return nil, errors.New("failed to check space membership")
-			}
-			if ok {
+			if spaceActive[uid] {
 				continue
 			}
 			externalMap[uid] = true

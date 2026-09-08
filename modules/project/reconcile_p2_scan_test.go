@@ -188,21 +188,24 @@ func TestI4ScanBExemptsAClosingSeat(t *testing.T) {
 	assert.Zero(t, i4GapCount(t, p), "a closing seat's group rows belong to the cascade")
 }
 
-// TestI4ScanBStaysQuietWhenTheSpaceIsBanned is the evidence for a DECLARED
-// DEVIATION from the brief, which asks scan B to exempt projects in a banned
-// Space (as P1's I2 scan does) and does not.
+// TestI4ScanBExemptsABannedSpace covers exemption 4, and it is the case that
+// corrected a wrong argument of mine.
 //
-// P1 needs that exemption because it is the ⊆ direction: CheckMembershipForCleanup
-// deliberately leaves a banned Space's seats alone, so the group rows are EXPECTED
-// to remain and would otherwise be reported. Scan B is the ⊇ direction, and the
-// state it would suppress cannot arise — the cascade leaves BOTH sides alone, and
-// every path that could strip a group row while leaving the seat is refused by D7.
-// Adding the exemption would be a `space` lookup per examined row that never fires.
+// I first left the exemption out, on the reasoning that no NEW gap can open while
+// a Space is banned — lockSpaceSeatsTx joins `space` on status = 1, so every add
+// and removal is refused — and wrote a test asserting the gauge stayed at zero
+// under a ban while still reporting a real gap. Both halves passed. The reasoning
+// was still wrong, and PR #855's second review said why: the exemption is not
+// there to stop gaps appearing, it is there to stop the gauge holding rows nobody
+// can act on. A gap that PREDATES the ban is still reported, and its only
+// documented repair — an admin re-adding the member — goes through that same
+// refused path.
 //
-// That argument was written before it was checked, which is not evidence. This is:
-// the same project, the same members, the Space banned, and the gauge at zero —
-// and the second half shows the scan has not simply gone silent.
-func TestI4ScanBStaysQuietWhenTheSpaceIsBanned(t *testing.T) {
+// So the assertion that used to say "a real gap inside a banned Space is still
+// worth reporting" now says the opposite, deliberately: a violation with no
+// available remedy, published for the whole duration of a ban, is the shape that
+// trains an operator to ignore the gauge.
+func TestI4ScanBExemptsABannedSpace(t *testing.T) {
 	_, p := setup(t)
 	seedSpace(t, spaceA, 1)
 	seedUser(t, "u_owner")
@@ -223,21 +226,28 @@ func TestI4ScanBStaysQuietWhenTheSpaceIsBanned(t *testing.T) {
 	backdateSeat(t, model.ProjectID, "u_owner")
 	require.Zero(t, i4GapCount(t, p), "precondition: healthy before the ban")
 
-	// Ban the Space. Seats stay, group rows stay — that is the whole point of the
-	// banned-Space treatment, and it is why the ⊇ direction has nothing to suppress.
-	_, err = testCtx.DB().UpdateBySql(
-		"UPDATE `space` SET status = 2 WHERE space_id = ?", spaceA).Exec()
-	require.NoError(t, err)
-	assert.Zero(t, i4GapCount(t, p),
-		"a banned Space produces no I4-B gap, so the exemption the brief asks for would be "+
-			"a per-row `space` lookup that can never fire")
-
-	// And the scan is not merely mute: break the invariant under the same ban.
+	// A REAL gap, opened before the ban.
 	_, err = testCtx.DB().UpdateBySql(
 		"UPDATE group_member SET is_deleted = 1 WHERE group_no = ? AND uid = ?",
 		groupNo, "u_owner").Exec()
 	require.NoError(t, err)
+	require.Equal(t, 1, i4GapCount(t, p), "precondition: reported while the Space is live")
+
+	// Now ban the Space. The gap has not gone away — but nothing can act on it,
+	// because every add and removal in a banned Space is refused.
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `space` SET status = 2 WHERE space_id = ?", spaceA).Exec()
+	require.NoError(t, err)
+	assert.Zero(t, i4GapCount(t, p),
+		"the SAME gap must stop being reported once the Space is banned: the documented "+
+			"repair is an admin re-adding the member, and that path is refused for as long "+
+			"as the ban lasts. Reporting a violation with no available remedy is what "+
+			"teaches an operator to ignore the gauge")
+
+	// Un-ban: the gap is actionable again, so it is reported again.
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `space` SET status = 1 WHERE space_id = ?", spaceA).Exec()
+	require.NoError(t, err)
 	assert.Equal(t, 1, i4GapCount(t, p),
-		"a REAL gap inside a banned Space is still worth reporting — an admitter failure "+
-			"does not stop being one because the Space was banned afterwards")
+		"and the exemption must be exactly the ban, not a permanent silence")
 }

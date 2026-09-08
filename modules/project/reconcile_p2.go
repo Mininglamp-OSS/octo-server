@@ -217,6 +217,18 @@ type i4GapRow struct {
 //     seat exists and the group row does not. Without this the scan would report
 //     every single add for as long as that window lasts, i.e. it would report
 //     the design.
+//  4. a project in a BANNED Space (space.status = 2), which P1's I2 scan exempts
+//     for the mirror reason.
+//
+// Exemption 4 was left out of the first version on the argument that no NEW gap
+// can open during a ban — lockSpaceSeatsTx joins `space` on status = 1, so every
+// add and removal is refused. That argument is true and it is beside the point,
+// which PR #855's second review made: the exemption is not there to stop gaps
+// appearing, it is there to stop the gauge holding rows nobody can act on. A gap
+// that PREDATES the ban is still reported, and its only documented repair — an
+// admin re-adding the member — goes through that same refused path. So the scan
+// would publish violations with no available remedy for the whole duration of a
+// ban, which is precisely the condition the exemption exists to suppress.
 //
 // Not exempted, deliberately: a project with no all-member group at all. Those
 // rows are scan A's business, and counting them here too would double-report one
@@ -281,7 +293,22 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 	graceCutoff := time.Now().UTC().Add(-p.admitGrace())
 	_, err := p.db.session.SelectBySql(
 		"SELECT p.id, p.project_id, pm.uid, pm.space_id, p.all_member_group_no AS group_no, "+
-			"  (gm.uid IS NULL AND pm.updated_at < ?) AS violating "+
+			// exemption 3: a banned Space. In the violating FLAG, not the WHERE, for
+			// the reason the cost guard states — `space`.status leads no index here.
+			//
+			// `IS NULL OR` keeps it two-valued for the same per-binary reason P1's
+			// scan documents at reconcile_p1.go:178: a binary whose migration set
+			// lacks modules/space gets a stub table, and the LEFT JOIN itself yields
+			// NULL for a project whose Space row is gone.
+			"  (gm.uid IS NULL AND pm.updated_at < ? "+
+			"   AND (sp.status IS NULL OR sp.status <> 2) "+
+			// exemption 2: whitelisted system bots. In the flag rather than the
+			// WHERE like the other three. The list is tiny and the effect is the
+			// same either way, so this is consistency rather than a measured cost:
+			// the comment above states that exemptions are flags over the base
+			// page, and one of them sitting in the WHERE is how a rule stops being
+			// read as a rule. PR #855s second review noticed the contradiction.
+			"   AND pm.uid NOT IN ?) AS violating "+
 			"FROM `octo_project` p "+
 			"INNER JOIN `octo_project_member` pm "+
 			// Both sides are octo_project*, i.e. both general_ci. No COLLATE:
@@ -294,14 +321,13 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			"  ON gm.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
 			"  AND gm.uid = pm.uid COLLATE utf8mb4_general_ci "+
 			"  AND gm.is_deleted = 0 AND gm.status = 1 "+
+			// Same schema crossing as the group_member join, same COLLATE placement.
+			"LEFT JOIN `space` sp ON sp.space_id = p.space_id COLLATE utf8mb4_general_ci "+
 			"WHERE p.status = ? AND p.all_member_group_no <> '' "+
 			"  AND (p.id, pm.uid) > (?, ?) "+
-			// System bots are exempt from project membership entirely, so they are
-			// not expected in the group either.
-			"  AND pm.uid NOT IN ? "+
 			"ORDER BY p.id, pm.uid LIMIT ?",
-		graceCutoff, MemberStatusActive, StatusNormal, cursorProjectID, cursorUID,
-		systemBotUIDsForScan(), limit,
+		graceCutoff, systemBotUIDsForScan(), MemberStatusActive, StatusNormal,
+		cursorProjectID, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: query I4 all-member group gap page: %w", err)

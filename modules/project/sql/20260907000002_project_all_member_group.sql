@@ -67,13 +67,27 @@ ALTER TABLE `octo_project`
 -- 3. 索引
 -- ---------------------------------------------------------------------------
 --
--- 下面两条 CREATE INDEX **不是** INSTANT。上面那两条 ADD COLUMN 是（与表大小
+-- 下面那条 CREATE INDEX **不是** INSTANT。上面两条 ADD COLUMN 是（与表大小
 -- 无关），而建索引是独立的 ONLINE / INPLACE 操作，耗时与行数成正比，需要按生产
 -- 的 octo_project 行数单独估一次上线窗口。两者放在同一个文件里，容易让人把前者
 -- 的结论顺手套到后者身上——PR #855 的 review 指出了这一点。
 --
 -- ONLINE 意味着期间读写不被阻塞，所以这不是停机窗口，是"这条语句要跑多久、
 -- 什么时候能确认跑完"的问题。
+--
+-- 这里曾经有第二条索引 idx_octo_project_all_member_group_no (all_member_group_no)，
+-- 理由写的是"D7 的反向点查：给定 group_no 问它是不是某项目的全员群，否则全表扫"。
+-- 那个理由是错的，PR #855 的第二轮 review 把它查穿了：那个判定是 IsAllMemberGroup，
+-- 它的 WHERE 以 p.project_id = ? 打头，走 uk_octo_project_project_id 这个 UNIQUE 键，
+-- 本来就是一行点查。
+--
+-- 把所有碰这一列的语句列一遍：db_all_member_group.go 与 pkg/project 里的五条都带
+-- project_id，两个对账扫描分别驱动于 p.status/p.id 和 (status, all_member_group_no)。
+-- **没有任何一条**单独按 all_member_group_no 过滤，所以那条索引服务不了任何查询。
+--
+-- 删掉而不是留着，因为它不是免费的：CREATE INDEX 不是 INSTANT（见上面那段），
+-- 上线时要为它单独估一次在线构建时长，而它换来的是每一次 octo_project 写入都要
+-- 多维护一棵 B+ 树。将来真出现按 group_no 反查项目的需求，那时连着它的查询一起加。
 --
 -- I4 的对账扫描 A 要找"活跃项目里 all_member_group_no 为空的"，谓词是
 -- (status, all_member_group_no)。已有的 idx_octo_project_space_status 首列是
@@ -84,13 +98,6 @@ ALTER TABLE `octo_project`
 -- 从而满足 TestReconcileQueriesAreBounded 对"按检查行数有界"的要求。
 CREATE INDEX `idx_octo_project_all_member_group`
   ON `octo_project` (`status`, `all_member_group_no`);
-
--- 反向点查：给定一个 group_no 问"它是不是某个项目的全员群"。D7 的四道保护每次
--- 都要问一次，而它拿到的是 group_no 和 project_id。没有这条索引，那个判定会退化
--- 成全表扫 octo_project——它挂在群退出/解散/踢人/转让四个接口上，是用户路径。
-CREATE INDEX `idx_octo_project_all_member_group_no`
-  ON `octo_project` (`all_member_group_no`);
-
 
 -- +migrate Down
 --
@@ -103,7 +110,6 @@ CREATE INDEX `idx_octo_project_all_member_group_no`
 -- 字符串定界符，一个所有格撇号就会让它把下一个分号读成在字面量内部。撇号是成对
 -- 抵消的，所以偶数个能过、奇数个报错，而它报错时指的是恰好夹在最后一对之间的那条
 -- 语句——它已经这样咬过两次人了。不要靠数个数。
-DROP INDEX `idx_octo_project_all_member_group_no` ON `octo_project`;
 DROP INDEX `idx_octo_project_all_member_group` ON `octo_project`;
 ALTER TABLE `octo_project` DROP COLUMN `all_member_group_lease_until`;
 ALTER TABLE `octo_project` DROP COLUMN `all_member_group_no`;

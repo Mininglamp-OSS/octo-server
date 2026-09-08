@@ -80,8 +80,16 @@ var (
 	//
 	// details.action names which of the four was refused, so a client can render
 	// the right redirection ("leave the project instead") rather than a generic
-	// refusal. It leaks nothing: the caller performed that action and is a member
-	// of the group, both of which they already knew.
+	// refusal.
+	//
+	// What it exposes is BOUNDED, not nothing. Two of the five call sites — member
+	// removal and exit — run the guard before reading the caller's own membership,
+	// the exit one because the handler unsubscribes from the IM channel first and
+	// the guard has to precede that. So a non-member can learn from this refusal
+	// that the group belongs to a project. The bound is that the same handler's
+	// getGroupInfo has already answered "does this group exist" with its 404, so
+	// the increment is "and it is a project's". Stated accurately here because the
+	// next person to move the guard will cite this line.
 	//
 	// The refusal is on the HTTP handlers ONLY. The service-layer primitives stay
 	// open, because P1's project cascade, the Space-removal cascade, botfather's
