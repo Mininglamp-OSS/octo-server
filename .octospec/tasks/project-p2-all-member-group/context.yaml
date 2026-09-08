@@ -161,23 +161,6 @@ defects_found:
 
 # Scoped out during implementation, with the reason. NOT silently dropped.
 not_delivered:
-  - id: real-provisioner-covered-only-indirectly
-    what: |
-      modules/project's tests drive the all-member group through stand-in hooks,
-      not through modules/group's real provisioner and admitter.
-    why_not: |
-      modules/project must never import modules/group, so the real hooks are not
-      reachable from that package at all. What IS testable there -- and is tested
-      -- is the registry contract: the hook runs after the project transaction
-      commits, and its failure never fails the caller. The group side is covered
-      from modules/group (predicate, owner pick, creator-only create, the four D7
-      refusals, and that construction registers all four hooks).
-    consequence: |
-      No single test drives "create a project and end up with a real group
-      containing real members". That needs a WuKongIM broker, which the group
-      package's own suite already requires and which CI provides; the pieces are
-      covered on both sides of the boundary but the seam is not covered end to
-      end in one case.
   - id: d7-guard-not-behind-a-tree-walking-source-guard
     what: |
       A guard that a NEW group handler mutating membership must consult
@@ -190,6 +173,46 @@ not_delivered:
       being pushed down into the primitives, where it would block the cascades
       that maintain I2 and I4.
     consequence: "A future handler added on the four protected shapes has to remember the guard; the I4 reconcile scans are what would report the resulting drift."
+
+# Corrections to earlier entries in this file, kept rather than edited away so the
+# reasoning that was wrong stays visible.
+corrections:
+  - id: end-to-end-coverage-was-wrongly-scoped-out
+    superseded: real-provisioner-covered-only-indirectly
+    what_was_claimed: |
+      That the seam between modules/project and modules/group could not be tested
+      end to end, because modules/project must never import modules/group.
+    why_that_was_wrong: |
+      The import ban constrains the PACKAGE, not the test BINARY. The external
+      test package modules/project/project_external_test.go already blank-imports
+      octo-server/internal, so module.Setup registers every module and
+      modules/group's real provisioner, admitter, owner sync and rename are all
+      live in that binary. The claim also conflated two obstacles: the import
+      rule, which does not apply, and the absence of a WuKongIM broker in the
+      development environment, which is an environment gap and not a design
+      constraint. Raised by the requester.
+    what_was_done: |
+      modules/project/all_member_group_e2e_test.go: seven cases through the REAL
+      modules/group implementation, covering create with agents, add, remove with
+      the agent cascade, disband, the D7 refusals, rename, and D14's bot deletion
+      closing a project seat. They assert on the actual group and group_member
+      rows, not on stand-in call counts.
+  - id: stand-ins-were-not-restoring-the-real-hooks
+    what: |
+      stubAllMemberGroup installed stand-in hooks and deliberately did not restore
+      them, on the reasoning that the registry is latest-wins and every case that
+      cares installs its own.
+    why_that_was_wrong: |
+      The end-to-end cases care and do NOT install their own -- they depend on the
+      real hooks module.Setup registered. Since the registry is process-wide, an
+      in-package case leaving a stand-in behind disabled the feature for every
+      later case in the same binary. The symptom was the honest one: all seven
+      end-to-end cases passed when run alone and failed in a full run.
+    fix: |
+      Snapshot/restore added to the registry and used by every case that installs
+      a stand-in. modules/space's member-removal registry carries the same warning
+      about the same hazard; this now follows it. Verified under
+      `go test -race -shuffle=on`.
 
 # Cannot be verified from here; must be checked before merge.
 open_verification:
@@ -205,8 +228,12 @@ open_verification:
   - "Index build time for the two new indexes on octo_project at production row
      counts. Both ADD COLUMNs are INSTANT on MySQL 8.0; the indexes are separate
      online INPLACE statements whose duration is proportional to row count."
-  - "The 13 failing tests in modules/group, 2 in thread, 10 in integration, 1 in
-     user and 1 in channel are PRE-EXISTING in this environment (no WuKongIM
-     broker) -- verified by running each suite on a stashed clean tree and
-     comparing the failure sets, which matched exactly. They must still be green
-     in CI, which does run a broker."
+  - "RESOLVED. A WuKongIM broker (the pinned v2.2.4-20260313, WK_TOKENAUTHON=false)
+     was installed alongside MySQL 8.0.46 and Redis, and every suite was re-run.
+     modules/project (including -race -shuffle=on), group, space, thread, message,
+     bot_api and integration are GREEN. Two failures remain and both are
+     pre-existing, verified against a stashed clean tree: botfather's
+     TestRegisterStoresAgentHosting and channel's TestGetStoryline_NotGroupMember.
+     modules/user has an order-dependent failure in its VerifyPasswordByUID family
+     that appears on the clean tree too and passes when that family is run alone;
+     nothing in this change touches modules/user."

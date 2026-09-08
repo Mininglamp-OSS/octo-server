@@ -166,3 +166,44 @@ func AllMemberGroupHooksRegisteredForTest() bool {
 	return allMemberGroupProvish != nil && allMemberGroupAdmitFn != nil &&
 		allMemberGroupOwnerFn != nil && allMemberGroupRenameFn != nil
 }
+
+// AllMemberGroupHooksSnapshot holds the four registered hooks so a test can put
+// them back.
+type AllMemberGroupHooksSnapshot struct {
+	provision AllMemberGroupProvisioner
+	admit     AllMemberGroupAdmitter
+	owner     AllMemberGroupOwnerTransfer
+	rename    AllMemberGroupRename
+}
+
+// SnapshotAllMemberGroupHooksForTest captures the current registrations.
+//
+// The registry is process-wide and latest-wins, so a test that installs
+// stand-ins disables the REAL hooks for every later case in the same binary.
+// That is not hypothetical: modules/project's test binary contains modules/group
+// (through the external package's import of internal), so the end-to-end cases
+// run against whatever the last stand-in left behind — they passed alone and
+// failed in a full run until the stand-ins started restoring.
+//
+// modules/space's member-removal registry carries the same warning on its own
+// substitution, for the same reason.
+func SnapshotAllMemberGroupHooksForTest() AllMemberGroupHooksSnapshot {
+	allMemberGroupMu.RLock()
+	defer allMemberGroupMu.RUnlock()
+	return AllMemberGroupHooksSnapshot{
+		provision: allMemberGroupProvish,
+		admit:     allMemberGroupAdmitFn,
+		owner:     allMemberGroupOwnerFn,
+		rename:    allMemberGroupRenameFn,
+	}
+}
+
+// RestoreAllMemberGroupHooksForTest puts a snapshot back.
+func RestoreAllMemberGroupHooksForTest(s AllMemberGroupHooksSnapshot) {
+	allMemberGroupMu.Lock()
+	defer allMemberGroupMu.Unlock()
+	allMemberGroupProvish = s.provision
+	allMemberGroupAdmitFn = s.admit
+	allMemberGroupOwnerFn = s.owner
+	allMemberGroupRenameFn = s.rename
+}

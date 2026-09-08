@@ -60,6 +60,21 @@ type allMemberGroupStub struct {
 
 func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
 	t.Helper()
+	// Put the REAL hooks back when this case ends.
+	//
+	// The registry is process-wide and latest-wins, and this binary CONTAINS
+	// modules/group: the external test package imports octo-server/internal, so
+	// module.Setup registers the real provisioner and admitter, and the
+	// end-to-end cases depend on them. Leaving a stand-in behind silently
+	// disables the feature for every later case — those cases passed when run
+	// alone and failed in a full run until this restore existed, which is exactly
+	// the order-dependent failure -shuffle=on is meant to surface.
+	//
+	// modules/space's removal-step registry carries the same warning about the
+	// same hazard.
+	restore := SnapshotAllMemberGroupHooksForTest()
+	t.Cleanup(func() { RestoreAllMemberGroupHooksForTest(restore) })
+
 	s := &allMemberGroupStub{groupNo: groupNo}
 	RegisterAllMemberGroupProvisioner(func(_ *config.Context, seed AllMemberGroupSeed) (string, error) {
 		s.provisionCalls++
@@ -84,10 +99,6 @@ func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
 		s.renames = append(s.renames, name)
 		return nil
 	})
-	// Restore nothing on cleanup: the registry is latest-wins and every test that
-	// cares installs its own. Clearing to nil instead would make the ORDER of
-	// cases decide whether a later one sees a hook, which is exactly the
-	// cross-case coupling -shuffle=on exists to find.
 	return s
 }
 
@@ -348,9 +359,10 @@ func TestAllMemberGroupRebuildIsClaimedOnce(t *testing.T) {
 // is absent, and nothing panics.
 func TestAllMemberGroupProvisioningIsSkippedWhenUnregistered(t *testing.T) {
 	_, p := setup(t)
+	restore := SnapshotAllMemberGroupHooksForTest()
+	t.Cleanup(func() { RestoreAllMemberGroupHooksForTest(restore) })
 	RegisterAllMemberGroupProvisioner(nil)
 	RegisterAllMemberGroupAdmitter(nil)
-	t.Cleanup(func() { stubAllMemberGroup(t, "grp_restore") })
 
 	seedSpace(t, spaceA, 1)
 	seedUser(t, "u_owner")
