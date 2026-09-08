@@ -19,6 +19,15 @@ import (
 const (
 	lifecycleEventVersionHeader = "X-Octo-Event-Version"
 	lifecycleEventVersion       = "1"
+
+	// lifecycleEventMinSecretBytes is the HMAC key floor.
+	//
+	// Same value as projectprovision's minSecretBytes, but an INDEPENDENT
+	// constant: that one is unexported, and widening a package's API for a
+	// number is the larger change. Nothing enforces that the two stay equal —
+	// they are two floors on two different secrets, and either can be raised
+	// alone.
+	lifecycleEventMinSecretBytes = 32
 )
 
 // The outbound half of the project lifecycle outbox .
@@ -102,6 +111,15 @@ func newLifecycleHTTPClient(rawURL, secret string, timeout time.Duration) (*life
 	// against whatever path its router matched — the two would never agree.
 	if parsed.EscapedPath() == "" || parsed.EscapedPath() == "/" {
 		return nil, fmt.Errorf("project: lifecycle event url must include the event path")
+	}
+	// A floor on the key, the same 32 bytes projectprovision.ValidateTarget
+	// requires of the provisioning secrets, and here for the same reason: HMAC's
+	// strength is the key's, and a short shared secret is guessable offline from
+	// one captured request. Length only — the message never reports the observed
+	// length, which would be a (small) oracle in a log.
+	if len(secret) < lifecycleEventMinSecretBytes {
+		return nil, fmt.Errorf("project: lifecycle event secret must be at least %d bytes",
+			lifecycleEventMinSecretBytes)
 	}
 	if parsed.RawQuery != "" {
 		// Refused rather than silently dropped: the signature does NOT cover the

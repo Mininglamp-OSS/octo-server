@@ -931,6 +931,13 @@ var fixedInternalTokenEnvs = []string{
 	// ITSELF on every deployment that sets it, turning a real detector into a standing
 	// false ERROR line. One value serving two purposes is a decision main made; this
 	// registry's job is to catch the ones nobody decided.
+	// And the lifecycle event signing secret, outbound to the same peer that
+	// holds the fleet provisioning secret. Two secrets to one peer is not
+	// redundancy: provisioning creates containers, the event feed reports
+	// membership revocations, and a single value would mean a leak from either
+	// path grants both. It is also the reason this one cannot simply reuse
+	// ProvisionFleetSecretEnv.
+	project.LifecycleEventSecretEnv,
 	// Three more inbound capability credentials, each a single env, each missed
 	// until the sweep test above was written: the webhook HMAC secret
 	// (modules/webhook), the mail gateway secret (modules/agentmailgateway), and

@@ -642,6 +642,21 @@ func (p *Project) createProjectTxWithSeatRefs(
 	}
 	model.LifecycleVersion++
 
+	// The lifecycle event, in the SAME transaction as the row it reports. Publishing
+	// after the commit would lose the publication to a crash in between, with
+	// nothing downstream able to notice — the consumer cannot miss what it was
+	// never told about. That is the whole reason the outbox table exists.
+	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+		EventType:      LifecycleEventProjectCreated,
+		ProjectID:      model.ProjectID,
+		SpaceID:        model.SpaceID,
+		ProjectVersion: &model.LifecycleVersion,
+		Payload:        projectCreatedPayload{CreatorUID: in.Creator},
+		OccurredAt:     now,
+	}, now); err != nil {
+		return nil, err
+	}
+
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
 	// construction under which "the project exists ⟹ its provisioning jobs exist" is
 	// true; a Redis queue or a post-commit call can drop the job or orphan it.
@@ -776,7 +791,25 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	if _, err := p.db.bumpLifecycleVersionTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
-	row.LifecycleVersion++
+	version, err := p.db.readLifecycleVersionTx(tx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	row.LifecycleVersion = version
+	// Payload is EMPTY: the event says "this project's profile changed, at
+	// version N" and nothing else. See docs/project-lifecycle-contract.md §5 —
+	// the name is user-supplied free text this repository holds authoritatively
+	// and does not egress, so the event is a change signal, not a sync.
+	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+		EventType:      LifecycleEventMetadataUpdated,
+		ProjectID:      projectID,
+		SpaceID:        spaceID,
+		ProjectVersion: &version,
+		Payload:        metadataUpdatedPayload{},
+		OccurredAt:     now,
+	}, now); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit update: %w", err)
 	}
@@ -1843,6 +1876,36 @@ func (p *Project) beginRemovalWithAgentsTx(
 
 	// bumpMemberEpochTx returns the affected-row count now; only createProject checks it (a silent no-op there would ship a project on the absent sentinel). Here the seat write above already established the row exists.
 	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		return false, nil, err
+	}
+	// Both project-side revocation paths — an admin removing someone, and a member
+	// leaving — funnel through here with their own `reason`, so the event is
+	// enqueued once, in the transaction that revokes, rather than at two call
+	// sites that could drift.
+	//
+	// The epoch is READ rather than taken from the bump: the bump reports rows
+	// affected, and a guessed epoch is worse than none, since the consumer uses it
+	// to recognise a revocation it has already superseded.
+	//
+	// NO project_version. A consumer discards a lifecycle statement not newer than
+	// what it holds — right for statements about the project, catastrophic for a
+	// revocation, which must be applied even when late: dropping it as stale leaves
+	// a removed member executing. Contract §3.
+	epoch, err := p.db.readMemberEpochTx(tx, projectID)
+	if err != nil {
+		return false, nil, err
+	}
+	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+		EventType: LifecycleEventMemberRevoked,
+		ProjectID: projectID,
+		SpaceID:   spaceID,
+		Payload: memberRevokedPayload{
+			SubjectUID:  targetUID,
+			MemberEpoch: epoch,
+			Reason:      reason,
+		},
+		OccurredAt: now,
+	}, now); err != nil {
 		return false, nil, err
 	}
 	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{

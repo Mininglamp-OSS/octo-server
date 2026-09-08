@@ -519,6 +519,47 @@ func (d *DB) bumpLifecycleVersionTx(tx *dbr.Tx, projectID string, now time.Time)
 	return affected, nil
 }
 
+// readMemberEpochTx reads the current member_epoch inside the caller's
+// transaction.
+//
+// Read rather than derived from the bump's return value, because the bump
+// reports rows AFFECTED, not the resulting value — and an event that carried a
+// guessed epoch would be worse than one carrying none: the consumer uses it to
+// recognise a revocation it has already superseded.
+//
+// In the caller's transaction on purpose. Reading after the commit would race
+// another membership write and could report an epoch NEWER than the revocation
+// this event describes, which would let the consumer discard a later, real
+// revocation as already-seen.
+func (d *DB) readMemberEpochTx(tx *dbr.Tx, projectID string) (int64, error) {
+	var epochs []int64
+	if _, err := tx.SelectBySql(
+		"SELECT member_epoch FROM `octo_project` WHERE project_id = ?", projectID,
+	).Load(&epochs); err != nil {
+		return 0, fmt.Errorf("project: read member epoch: %w", err)
+	}
+	if len(epochs) == 0 {
+		return 0, fmt.Errorf("project: read member epoch: no row for %s", projectID)
+	}
+	return epochs[0], nil
+}
+
+// readLifecycleVersionTx is readMemberEpochTx for the lifecycle counter, and it
+// exists for the same reason: an event carrying a guessed version is worse than
+// one carrying none, because the consumer orders on it.
+func (d *DB) readLifecycleVersionTx(tx *dbr.Tx, projectID string) (int64, error) {
+	var versions []int64
+	if _, err := tx.SelectBySql(
+		"SELECT lifecycle_version FROM `octo_project` WHERE project_id = ?", projectID,
+	).Load(&versions); err != nil {
+		return 0, fmt.Errorf("project: read lifecycle version: %w", err)
+	}
+	if len(versions) == 0 {
+		return 0, fmt.Errorf("project: read lifecycle version: no row for %s", projectID)
+	}
+	return versions[0], nil
+}
+
 // countActiveInSpaceTx counts a Space's active projects inside the create transaction.
 // The quota must be counted in the same transaction that inserts, or two
 // concurrent creates both pass the check and both land.

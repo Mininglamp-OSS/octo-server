@@ -74,9 +74,15 @@ func (p *Project) startLifecycleEventWorker() {
 		if p.cfg.LifecycleEventsEnabled {
 			// Asked for, but unusable. Say which half is missing — without this
 			// the feature is simply inert and the next person debugs the peer.
+			//
+			// The problem field is included because a REFUSED secret and an
+			// unset one look identical from cfg alone (both leave it empty), and
+			// those two want opposite fixes: one is "set the env", the other is
+			// "the env is set to a value another capability already uses".
 			p.Error("项目生命周期事件已开启但配置不完整，发件箱不会入队也不会投递",
 				zap.Bool("url_set", p.cfg.LifecycleEventURL != ""),
-				zap.Bool("secret_set", p.cfg.LifecycleEventSecret != ""))
+				zap.Bool("secret_set", p.cfg.LifecycleEventSecret != ""),
+				zap.Error(p.cfg.LifecycleEventProblem))
 		}
 		return
 	}

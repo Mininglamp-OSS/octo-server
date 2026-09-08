@@ -309,3 +309,20 @@ func TestClientRefusesEndpointsThatCannotBeSigned(t *testing.T) {
 		})
 	}
 }
+
+// TestClientRefusesAShortSecret puts a floor under the HMAC key.
+//
+// The URL checks above are about the signature covering the right STRING; this is
+// about the key being worth signing with. A short shared secret is recoverable
+// offline from one captured request, and every guarantee the envelope makes then
+// belongs to whoever recovered it.
+func TestClientRefusesAShortSecret(t *testing.T) {
+	const url = "https://peer.invalid/internal/project-events"
+	if _, err := newLifecycleHTTPClient(url, strings.Repeat("k", lifecycleEventMinSecretBytes-1), time.Second); err == nil {
+		t.Fatalf("a %d-byte secret must be refused", lifecycleEventMinSecretBytes-1)
+	}
+	if _, err := newLifecycleHTTPClient(url, strings.Repeat("k", lifecycleEventMinSecretBytes), time.Second); err != nil {
+		t.Fatalf("a %d-byte secret is exactly the floor and must be accepted, got %v",
+			lifecycleEventMinSecretBytes, err)
+	}
+}

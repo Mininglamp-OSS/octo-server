@@ -1,6 +1,7 @@
 package project
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -195,6 +196,11 @@ type Config struct {
 	LifecycleEventURL      string
 	LifecycleEventSecret   string
 	LifecycleEventTimeout  time.Duration
+	// LifecycleEventProblem is why the secret was dropped, when it was. Carried
+	// rather than logged at load, for the reason ProvisioningConfig.Problems is:
+	// loadConfig has no logger, and a config loader that logs is a config loader
+	// that cannot be tested without capturing the process-wide one.
+	LifecycleEventProblem error
 	// Provisioning is the eager subsystem-container configuration (brief D2).
 	// Zero value = inert: no outbox row is enqueued and no worker starts, which is
 	// the default until an operator names a target. See config_provisioning.go.
@@ -216,6 +222,7 @@ func loadConfig() Config {
 		}
 	}
 	provisioning, _ := loadProvisioningConfig(os.Getenv)
+	lifecycleSecret, lifecycleProblem := resolveLifecycleEventSecret(os.Getenv)
 	return Config{
 		CreateEnabled:                  envBool(envCreateEnabled, false),
 		CollaborationRoleEnabled:       envBool(envCollaborationRoleEnabled, false),
@@ -237,7 +244,8 @@ func loadConfig() Config {
 
 		LifecycleEventsEnabled: envBool(envLifecycleEventsEnabled, false),
 		LifecycleEventURL:      strings.TrimSpace(envString(envLifecycleEventURL, "")),
-		LifecycleEventSecret:   envString(LifecycleEventSecretEnv, ""),
+		LifecycleEventSecret:   lifecycleSecret,
+		LifecycleEventProblem:  lifecycleProblem,
 		LifecycleEventTimeout:  envDuration(envLifecycleEventTimeout, defaultLifecycleEventTimeout),
 		// Rejected targets are dropped rather than fatal; the reasons ride along on
 		// ProvisioningConfig.Problems for New() to log. See loadProvisioningConfig.
@@ -275,6 +283,69 @@ func (p *Project) lifecycleEventsEnabled() bool {
 	return p.cfg.LifecycleEventsEnabled &&
 		p.cfg.LifecycleEventURL != "" &&
 		p.cfg.LifecycleEventSecret != ""
+}
+
+// lifecycleSecretSiblings is the set of fixed capability credentials the
+// lifecycle event secret must not equal.
+//
+// It is main.go's fixedInternalTokenEnvs minus this env, and it exists for the
+// reason that list gives: main.go LOGS a collision, while this refuses one, and
+// a logged collision on a security credential is a collision that ships. The
+// The fleet provisioning secret is in here too — it goes to the same peer, and
+// sharing one value across the two channels means a leak from either grants
+// both. (It used to say "the two provisioning secrets"; #887 collapsed Drive's
+// onto OCTO_DRIVE_INTERNAL_TOKEN, so there is one provisioning secret now.)
+var lifecycleSecretSiblings = []string{
+	"NOTIFY_INTERNAL_TOKEN",
+	"OCTO_DOCS_NOTIFY_TOKEN",
+	"OCTO_DOCS_BOT_MENTION_TOKEN",
+	"OCTO_DRIVE_INTERNAL_TOKEN",
+	"OCTO_MEMBERSHIP_INTERNAL_TOKEN",
+	ProvisionFleetSecretEnv,
+	// Drive's provisioning credential is NOT a separate entry: main's #887 pointed
+	// project provisioning at the existing OCTO_DRIVE_INTERNAL_TOKEN, listed four
+	// lines up, rather than giving Drive its own per-target secret. Naming it twice
+	// in a list whose job is finding duplicates is how such a list fails silently.
+	"TS_WEBHOOK_SECRET_KEY",
+	"OCTO_MAIL_GATEWAY_SECRET",
+	"TS_GRPC_AUTH_TOKEN",
+	// Added when main's #827 landed the Space internal API's token: this list is
+	// defined as main.go's registry minus this module's own env, so an entry missing
+	// here is a collision this module would accept and main.go would only log.
+	"OCTO_MARKETPLACE_INTERNAL_TOKEN",
+}
+
+// resolveLifecycleEventSecret loads the secret, and returns "" plus a reason
+// when it collides with a sibling credential.
+//
+// Dropping the secret rather than returning it with a warning is what makes the
+// refusal load-bearing: lifecycleEventsEnabled() requires a non-empty secret, so
+// an empty one disables BOTH the enqueue and the worker. The feed goes dark and
+// says why, instead of running on a credential that grants a second capability.
+//
+// The refusal is symmetric with checkSecretExclusivity, which carries the
+// reciprocal entry — so a collision between this secret and a provisioning one
+// disables both channels rather than picking a winner. That is the intended
+// outcome: with one value serving two capabilities there is no half that is
+// safe to keep.
+//
+// Messages name ENVs, never values.
+func resolveLifecycleEventSecret(getenv func(string) string) (string, error) {
+	if getenv == nil {
+		return "", nil
+	}
+	secret := strings.TrimSpace(getenv(LifecycleEventSecretEnv))
+	if secret == "" {
+		return "", nil
+	}
+	for _, sibling := range lifecycleSecretSiblings {
+		if v := strings.TrimSpace(getenv(sibling)); v != "" && v == secret {
+			return "", fmt.Errorf(
+				"%s must differ from %s; the lifecycle event feed is disabled until it does",
+				LifecycleEventSecretEnv, sibling)
+		}
+	}
+	return secret, nil
 }
 
 func envString(key, fallback string) string {

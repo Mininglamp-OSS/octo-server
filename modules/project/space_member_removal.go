@@ -547,6 +547,39 @@ func (p *Project) deactivateSeatForCascadeResult(
 		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return cascadeSeatResult{}, err
 		}
+		// And the revocation event, in this transaction — the one that actually
+		// closes the seat.
+		//
+		// Later than the epoch, and that asymmetry is deliberate. The epoch moved
+		// at Space-removal COMMIT (bumpMemberEpochForSpaceMemberTx), because
+		// authorization must not depend on an asynchronous job that can sit in
+		// backoff for minutes and has a terminal abandoned state. The event is the
+		// notification, and it rides the job because that is where the affected
+		// projects are already enumerated and paged — enqueuing one event per
+		// project inside the Space-removal transaction would put an unbounded
+		// number of inserts on a user-facing write.
+		//
+		// The consequence, stated rather than discovered: if this job is abandoned,
+		// the peer never gets the notification. It is still DENIED correctly,
+		// because the epoch moved at commit and the verify endpoint conjoins the
+		// Space half. What is lost is the push, not the authorization.
+		epoch, err := p.db.readMemberEpochTx(tx, projectID)
+		if err != nil {
+			return cascadeSeatResult{}, err
+		}
+		if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+			EventType: LifecycleEventMemberRevoked,
+			ProjectID: projectID,
+			SpaceID:   spaceID,
+			Payload: memberRevokedPayload{
+				SubjectUID:  uid,
+				MemberEpoch: epoch,
+				Reason:      reason,
+			},
+			OccurredAt: now,
+		}, now); err != nil {
+			return cascadeSeatResult{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return cascadeSeatResult{}, fmt.Errorf("project: commit cascade seat close: %w", err)

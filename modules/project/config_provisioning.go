@@ -494,6 +494,13 @@ func checkSecretExclusivity(
 		siblingMailGatewaySecret,
 		siblingGRPCAuthTokenEnv,
 		siblingMarketplaceToken,
+		// The lifecycle event secret. Same-module and same peer, which is exactly
+		// why it needs saying: both go to fleet, one creates containers and one
+		// reports membership revocations, and one value for both means a leak
+		// from either grants both. The reciprocal entry is
+		// resolveLifecycleEventSecret, so a collision disables both channels
+		// rather than picking a winner.
+		LifecycleEventSecretEnv,
 	} {
 		if siblingEnv == credentialEnv {
 			continue
