@@ -124,35 +124,95 @@ func splitPredicateStatements(projectID, groupNo string) map[string]planStatemen
 }
 
 // TestTheSplitPredicatesAreWhatProductionRuns closes the gap the plan guard has on
-// its own: it EXPLAINs constants, and a constant stays referenced by this test even
-// if the production function stops using it.
+// its own: it EXPLAINs constants, and a constant stays referenced no matter what
+// production does with it.
 //
-// So somebody could re-inline a joined query into IsAllMemberGroup, leave the
-// constant in place, and the plan guard would stay green while production
-// regressed to the shape the fifth review blocked on. PR #855s sixth review, P2-4.
+// Somebody could re-inline a joined query into IsAllMemberGroup, leave the constant
+// declared, and every plan assertion would stay green while the user-facing D7
+// predicate went back to the shape the fifth review blocked on. The DB-backed drift
+// suite would not catch it either: it asserts the statement EXECUTES under drift,
+// and a joined query with an explicit COLLATE executes fine — that is the whole
+// reason the fifth round's regression was a plan regression and not a 1267.
+//
+// # Per function, not per file
+//
+// The first version of this guard counted occurrences in the file and required two,
+// on the reasoning that a declaration plus a use is two. It was vacuous, and PR
+// #855s seventh review proved it by executing the exact mutation it names: the
+// pkg/project constants occur THREE times (declaration, production use, and the
+// exported test helper the plan guard reads them through), so deleting the
+// production use still left two. On the module side the same threshold was soft for
+// a different reason — two production call sites each, so deleting one left two.
+//
+// Counting is the wrong instrument. Each entry below names the function that must
+// RUN the statement, and the assertion is that the constant appears inside that
+// function's body with comments stripped. Deleting any single production use turns
+// it red, and no reference anywhere else in the file can satisfy it.
 func TestTheSplitPredicatesAreWhatProductionRuns(t *testing.T) {
-	for path, wanted := range map[string][]string{
-		"../../pkg/project/all_member_group.go": {
-			"sqlAllMemberGroupPointer", "sqlAllMemberGroupRow",
+	for _, want := range []struct {
+		path      string
+		signature string
+		constants []string
+	}{
+		{
+			path:      "../../pkg/project/all_member_group.go",
+			signature: "func IsAllMemberGroup(",
+			constants: []string{"sqlAllMemberGroupPointer", "sqlAllMemberGroupRow"},
 		},
-		"db_all_member_group.go": {
-			"sqlProjectAllMemberGroupPointer",
-			"sqlProjectAllMemberGroupRow",
-			"sqlProjectClearStaleAllMemberGroup",
+		{
+			path:      "db_all_member_group.go",
+			signature: "func (d *DB) queryAllMemberGroupNo(",
+			constants: []string{"sqlProjectAllMemberGroupPointer", "sqlProjectAllMemberGroupRow"},
+		},
+		{
+			// The repair path reads the same two and then writes its own.
+			path:      "db_all_member_group.go",
+			signature: "func (d *DB) clearStaleAllMemberGroupPointer(",
+			constants: []string{
+				"sqlProjectAllMemberGroupPointer",
+				"sqlProjectAllMemberGroupRow",
+				"sqlProjectClearStaleAllMemberGroup",
+			},
 		},
 	} {
-		raw, err := os.ReadFile(path)
-		require.NoError(t, err)
-		src := string(raw)
-		for _, name := range wanted {
-			// Twice: the declaration and at least one use. A constant declared and
-			// never executed is exactly the state this guard exists to catch.
-			require.GreaterOrEqual(t, strings.Count(src, name), 2,
-				"%s must both declare and USE %s — the plan guard EXPLAINs that constant, "+
-					"so a production function that stopped running it would regress silently "+
-					"with every plan assertion still green", path, name)
+		fn := functionBodyOf(t, want.path, want.signature)
+		for _, name := range want.constants {
+			require.True(t, strings.Contains(fn, name),
+				"%s must RUN %s. The plan guard EXPLAINs that constant, so a body that "+
+					"stopped executing it would regress production with every plan "+
+					"assertion still green — and the drift suite cannot see it either, "+
+					"because the regressed shape still executes", want.signature, name)
 		}
 	}
+}
+
+// functionBodyOf slices one function out of a source file, comments stripped.
+func functionBodyOf(t *testing.T, path, signature string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	src := string(raw)
+
+	at := strings.Index(src, signature)
+	require.GreaterOrEqual(t, at, 0, "%s not found in %s", signature, path)
+	end := strings.Index(src[at:], "\n}\n")
+	require.Positive(t, end, "could not delimit %s in %s", signature, path)
+	return stripSourceComments(src[at : at+end])
+}
+
+// stripSourceComments blanks out // comments so a source guard matches code rather
+// than prose about the code — the round-6 lesson, applied here from the start.
+//
+// Over-stripping is the safe direction: removing text can only make an assertion
+// harder to satisfy, never easier.
+func stripSourceComments(src string) string {
+	lines := strings.Split(src, "\n")
+	for i, line := range lines {
+		if cut := strings.Index(line, "//"); cut >= 0 {
+			lines[i] = line[:cut]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // explainRow is the subset of EXPLAIN this test reads. Pointers because MySQL

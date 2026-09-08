@@ -1,6 +1,7 @@
 package project
 
 import (
+	"errors"
 	"github.com/gocraft/dbr/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -123,6 +124,21 @@ const (
 func AllMemberGroupPredicateStatementsForTest() []string {
 	return []string{sqlAllMemberGroupPointer, sqlAllMemberGroupRow}
 }
+
+// ErrAdmittedButNotSubscribed marks the one admission failure whose damage is NOT
+// what the failure message would suggest: the group_member row committed, and the
+// broker subscription that follows it did not.
+//
+// It matters because the two states have different witnesses. A failed admission
+// transaction leaves an active project seat with no group row, which I4 scan B
+// compares and reports. This one leaves the row in place, so scan B is structurally
+// blind to it — what is missing is a subscriber entry, and open_verification records
+// that nothing in this repository can read a channel's subscribers back from the
+// broker. Pointing on-call at scan B for it is worse than saying nothing.
+//
+// Lives here because modules/project must never import modules/group: the group side
+// wraps it, the project side matches it with errors.Is. PR #855s seventh review.
+var ErrAdmittedButNotSubscribed = errors.New("project: admitted to the all-member group but not subscribed")
 
 // GroupStatusDisband mirrors modules/group.GroupStatusDisband.
 //

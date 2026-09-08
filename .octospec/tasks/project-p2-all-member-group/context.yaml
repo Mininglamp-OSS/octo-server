@@ -1239,6 +1239,81 @@ pr_855_round_6_fixed:
       assertion still green.
     fix: "TestTheSplitPredicatesAreWhatProductionRuns requires each constant to appear at least twice in its own file -- declared AND used."
 
+# PR #855 seventh pass. Jerry-Xin approved at 12:58Z and then dismissed his own
+# review when yujiawei's landed on the same head one blocking finding -- which he
+# then confirmed by executed mutation, recording the under-call as his. The
+# authoritative vote on 90bb457 is REQUEST_CHANGES.
+pr_855_round_7_fixed:
+  - id: the-production-use-guard-counted-occurrences
+    severity: blocking
+    where: modules/project/all_member_group_plan_test.go
+    what: |
+      The guard added last round required each statement constant to appear at least
+      twice in its file -- "declaration plus a use". Vacuous for both pkg/project
+      constants: they occur three times, because the exported test helper the plan
+      guard reads them through is itself a reference. Deleting the production use
+      still left two. Executed by the reviewer with the exact regression the guard
+      names -- a re-inlined joined query with COLLATE inside IsAllMemberGroup -- and
+      the guard stayed green.
+    why: |
+      The same threshold was soft on the module side for a different reason: two
+      production call sites each, so deleting one still left two. And CI could not
+      catch either, because the DB-backed drift suite asserts the statement
+      EXECUTES, which a joined query with an explicit COLLATE does -- that is the
+      whole reason the fifth round's regression was a plan regression and not a 1267.
+    fix: |
+      Counting was the wrong instrument. The guard now names, per constant, the
+      FUNCTION that must run it, slices that function's body, strips comments, and
+      asserts the constant appears inside it. No reference elsewhere in the file can
+      satisfy it, and every one of the five production call sites is pinned
+      individually.
+    mutation: "the reviewer's re-inlined join now turns it red, naming the function."
+  - id: the-rename-still-published-what-it-did-not-write
+    severity: medium
+    where: modules/group/db.go, modules/group/service.go
+    what: |
+      The status predicate added last round stopped the write; UpdateGroupInfo
+      ignored RowsAffected and still invalidated the push-name cache, sent two
+      GroupUpdate broadcasts and a channel refresh, then returned nil. On the race
+      it was meant to close, the database ended clean and the clients were told a
+      disbanded group had been renamed.
+    fix: "UpdateNameNoticeTx returns rows affected; 0 skips all three publish steps and returns nil (nothing happened is not a failure)."
+    test: "the behavioural case asserts affected == 0 / == 1, and a body-scoped source guard pins that the early return precedes all three publish calls -- the caller half cannot be reproduced without a hook between its pooled status read and its write."
+  - id: the-seat-count-had-the-blocking-shape-one-table-over
+    severity: medium
+    where: modules/project/db_agent.go countActiveSeatsByKind
+    what: |
+      octo_project_member driving, `user` probed, COLLATE on the driving side. Under
+      the production collation shape that is a full scan of `user` per call, and the
+      call runs on the project detail, create and update responses. The file header's
+      rule -- put the COLLATE on the driving side so the octo_project* indexes stay
+      usable -- describes the sibling statement and had been applied here, where
+      octo_project* IS the driving side.
+    fix: "Two single-table reads (seat uids by project_id, then those uids against `user`), no COLLATE anywhere. The header now states the condition the rule depends on."
+  - id: a-post-commit-subscribe-failure-pointed-on-call-at-a-blind-scan
+    severity: medium
+    where: modules/group/all_member_group.go, modules/project/service_all_member_group.go
+    what: |
+      When the admission transaction commits and the broker subscribe then fails, the
+      caller logged "人未进群，由 I4 扫描 B 报出" and counted admit_failed. Both halves
+      are wrong for that path: the member IS in group_member, so scan B -- which
+      compares seats against group_member rows -- reports nothing, and what actually
+      remains is a subscriber gap nothing in this repository can read back.
+    fix: |
+      pkg/project.ErrAdmittedButNotSubscribed (the shared leaf both modules may
+      import), wrapped by the group side and matched with errors.Is by the project
+      side, with its own reason label subscribe_failed_after_commit and a message
+      that says what is actually missing.
+  - id: one-doc-line-called-a-read-view-a-lock
+    severity: low
+    where: modules/group/all_member_group.go
+    what: |
+      The comment said the project-side questions go through tx because the answer
+      must come from the snapshot that will be written. MemberRole and PickActiveOwner
+      are non-locking reads: they join the transaction's read view but lock nothing,
+      so the role can still change before the commit.
+    fix: "Corrected in place, with why the trade is right (the no-escalation invariant, and FOR SHARE would add an unanalysed edge to the declared lock order) rather than deleting the paragraph."
+
 verify:
   rules_rechecked:
     - id: space-isolation
@@ -1447,6 +1522,16 @@ open_verification:
      move the rebuild onto the reconcile worker, NOT to cap the roster -- a capped
      rebuild is the incomplete-group defect the third round fixed.
      PR #855's fifth review, Q3."
+  - "NOT a gate, resolved by splitting: countActiveSeatsByKind carried the same
+     shape as the fifth round's blocking finding one table over -- octo_project_member
+     driving, `user` probed, COLLATE on the driving side, so under the production
+     collation shape it was a full scan of `user` per call, on the project detail,
+     create and update responses. PR #855's seventh review found it and offered the
+     gate as an option; it is two single-table reads now instead (seat uids by
+     project_id, then those uids against `user`), so it crosses no schema and needs
+     no collation opinion. The file header's driving-side rule was corrected too --
+     it holds only when octo_project* is the PROBED side, and it had been applied to
+     a statement where octo_project* drives."
   - "GATING: modules/project listMembers cannot execute under the production
      collation shape at all -- its pre-existing `LEFT JOIN user u ON u.uid = pm.uid`
      compares 0900_ai_ci (`user`) with pinned general_ci (octo_project_member) and

@@ -1,8 +1,10 @@
 package project
 
 import (
+	"errors"
 	"time"
 
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -341,6 +343,16 @@ func (p *Project) admitAllMemberGroup(projectID, spaceID, groupNo, uid string) {
 		return
 	}
 	if err := admit(p.ctx, spaceID, groupNo, uid); err != nil {
+		// 两种失败，两种残留，两条不同的处置——上一版把它们合成了一条，而那条话
+		// 对其中一种是错的。PR #855 第七轮 review 的 P2-3。
+		if errors.Is(err, projectpkg.ErrAdmittedButNotSubscribed) {
+			p.Error("全员群订阅失败（人已在群里，但 broker 侧没有订阅：收不到消息、"+
+				"子区里发不了言。I4 扫描 B 看不见这种状态——它比对的是 group_member 行）",
+				zap.Error(err), zap.String("projectId", projectID),
+				zap.String("groupNo", groupNo), zap.String("uid", uid))
+			observeAllMemberGroupAdmitFailure(reasonAdmitSubscribeFailed)
+			return
+		}
 		p.Error("加入全员群失败（项目席位已生效，人未进群，由 I4 扫描 B 报出）",
 			zap.Error(err), zap.String("projectId", projectID),
 			zap.String("groupNo", groupNo), zap.String("uid", uid))

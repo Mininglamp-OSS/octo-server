@@ -28,6 +28,14 @@ import (
 //
 // 方向的选择与 P1 的 I2/I3 扫描一致：把 COLLATE 写在**驱动侧的值**上，让被查的
 // octo_project* 索引保持可用。
+//
+// 这条规则只在 octo_project* 是**被查侧**时成立，而这一点上一版没写出来，于是它
+// 被套到了一条驱动侧就是 octo_project* 的语句上（countActiveSeatsByKind），结果
+// 正好相反：显式 COLLATE 的 coercibility 是 0，比较落在 general_ci，被查的
+// `user`.uid（生产上 0900_ai_ci）逐行转换，主键用不上，每次调用一次 `user` 全表扫。
+// 这与第五轮 review 拦下的 D7 谓词是同一个形状，只是换了一张表。
+// 那条语句已经拆成两条单表读（见下），本注释保留这段是为了让下一个读者不要再把
+// 驱动侧规则套到驱动侧是 pinned 表的语句上。PR #855 第七轮 review 的 P2-2。
 
 // agentRow 是一次分身资格判定的输入。
 type agentRow struct {
@@ -231,26 +239,38 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 //
 // LEFT JOIN `user`：没有 user 行的成员必须仍被计入（与 listMembers 的 LEFT JOIN
 // 同一个理由——名册和计数不能各说各话），此时 robot 读作 0，计为人。
+// # 两条单表读，不是一条跨 schema 的 JOIN
+//
+// 上一版是 `octo_project_member pm LEFT JOIN user u ON u.uid = pm.uid COLLATE
+// utf8mb4_general_ci`——驱动侧是 pinned 的 octo_project_member，被查侧是老表
+// `user`。显式 COLLATE 让比较落在 general_ci，于是生产里 0900_ai_ci 的 user.uid
+// 主键服务不了它：每次调用一次 `user` 全表扫，而这条调用在项目详情、建项目响应、
+// 改项目响应上都会跑。第七轮 review 点了名，形状与第五轮拦下的 D7 谓词相同。
+//
+// 拆开之后两条都是单表、都没有 COLLATE：先按 project_id 读活跃席位的 uid（走
+// idx/PK），再用这批 uid 反查哪些是 bot（走 user 主键）。uid 批量最多 max_members，
+// 与 pkg/space.ActiveMembers 是同一个形状。
+//
+// 语义逐条保留：没有 user 行的成员不会出现在 bot 那批里，因此仍然计为人。
 func (d *DB) countActiveSeatsByKind(projectID string) (humans, agents int, err error) {
-	var row struct {
-		Humans int `db:"humans"`
-		Agents int `db:"agents"`
-	}
-	err = d.session.SelectBySql(
-		// COALESCE around each SUM: SUM over an EMPTY set is NULL, not 0, and
-		// scanning NULL into an int errors. An empty active roster is reachable —
-		// P0's Space cascade can close the last seat — so without this a project in
-		// that state makes every detail read log a warning and fall back.
-		"SELECT "+
-			"COALESCE(SUM(IF(IFNULL(u.robot, 0) = 1, 0, 1)), 0) AS humans, "+
-			"COALESCE(SUM(IF(IFNULL(u.robot, 0) = 1, 1, 0)), 0) AS agents "+
-			"FROM `octo_project_member` pm "+
-			"LEFT JOIN `user` u ON u.uid = pm.uid COLLATE utf8mb4_general_ci "+
-			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0",
+	var uids []string
+	if _, err := d.session.SelectBySql(
+		"SELECT uid FROM `octo_project_member` "+
+			"WHERE project_id = ? AND status = ? AND removing = 0",
 		projectID, MemberStatusActive,
-	).LoadOne(&row)
-	if err != nil {
-		return 0, 0, fmt.Errorf("project: count seats by kind: %w", err)
+	).Load(&uids); err != nil {
+		return 0, 0, fmt.Errorf("project: read active seats for count: %w", err)
 	}
-	return row.Humans, row.Agents, nil
+	if len(uids) == 0 {
+		// 活跃名册为空是可达的（P0 的 Space 级联可以关掉最后一个席位），而且必须
+		// 答 0/0 而不是报错——上一版用 COALESCE 处理的就是这一种。
+		return 0, 0, nil
+	}
+	var bots []string
+	if _, err := d.session.SelectBySql(
+		"SELECT uid FROM `user` WHERE uid IN ? AND robot = 1", uids,
+	).Load(&bots); err != nil {
+		return 0, 0, fmt.Errorf("project: count agent seats: %w", err)
+	}
+	return len(uids) - len(bots), len(bots), nil
 }

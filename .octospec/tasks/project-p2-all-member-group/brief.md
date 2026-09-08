@@ -362,9 +362,10 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
   实现侧的注释按这个口径写，本行原来的"所以不新增探测面"是错的）。touches: `isolation`
 - **响应契约。** 项目 `Resp` 新增 `all_member_group_no`（空串表示尚未建成）、`agent_count`，
   `member_count` 语义改为只数人（D16，**既有字段语义变更**）；`MemberResp` 新增 `robot`、
-  `owner_uid`；`Capabilities` 新增 `can_manage_own_agents`；`GroupResp` 及群详情新增
-  `project_id`（空串 = Space 直属）。`POST /v1/auth/verify?include=context` 的 `projects[]`
-  **不变**。touches: `wire-contract`
+  `owner_uid`；`Capabilities` 新增 `can_manage_own_agents`；`GroupResp`、群详情、以及
+  `channelInfo.orgData`（`newChannelRespWithGroupResp`，与 `space_id` 并列）新增
+  `project_id`（空串 = Space 直属，不发）。`POST /v1/auth/verify?include=context` 的
+  `projects[]` **不变**。touches: `wire-contract`
 - **测试纪律。** 不改既有测试文件的断言；命中 UID 限流路由的测试在 setup 里重置
   `ratelimit:uid:*`。touches: `testing`
 
@@ -473,8 +474,8 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
       成员不动；从此对该群 `exit` / `disband` 恢复正常。
 - [ ] 项目 `Resp` 含 `all_member_group_no`、`agent_count`，`member_count` 只数人；
       `MemberResp` 含 `robot`、`owner_uid`；`Capabilities` 含 `can_manage_own_agents`；
-      `GroupResp` 与群详情含 `project_id`；`POST /v1/auth/verify?include=context` 的响应
-      golden 断言不变。
+      `GroupResp`、群详情与 `channelInfo.orgData` 含 `project_id`；
+      `POST /v1/auth/verify?include=context` 的响应 golden 断言不变。
 
 **约定**
 

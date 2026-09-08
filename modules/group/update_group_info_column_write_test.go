@@ -47,7 +47,13 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 	name := "after"
 	tx, err := ctx.DB().Begin()
 	require.NoError(t, err)
-	require.NoError(t, g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, tx))
+	affected, err := g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, tx)
+	require.NoError(t, err)
+	require.Zero(t, affected,
+		"the write must report that it changed nothing, so the caller can skip the "+
+			"push-cache invalidation, the GroupUpdate broadcast and the channel refresh — "+
+			"otherwise the database is clean and the clients are told a group that is gone "+
+			"was renamed")
 	require.NoError(t, tx.Commit())
 
 	row := readGroupColumns(t, ctx, disbanded)
@@ -73,7 +79,9 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 
 	tx, err = ctx.DB().Begin()
 	require.NoError(t, err)
-	require.NoError(t, g.db.UpdateNameNoticeTx(live, &name, nil, 42, tx))
+	affected, err = g.db.UpdateNameNoticeTx(live, &name, nil, 42, tx)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, affected, "a live group's rename lands, so the notifications go out")
 	require.NoError(t, tx.Commit())
 
 	row = readGroupColumns(t, ctx, live)
@@ -132,4 +140,22 @@ func TestUpdateGroupInfoDoesNotWriteTheWholeRow(t *testing.T) {
 		"UpdateGroupInfo must NOT write the whole row back: the snapshot it read is "+
 			"stale for status, forbidden, invite and notice, and D8 now drives this path "+
 			"on every project rename")
+
+	// And the caller half of the same window: when the status predicate refuses the
+	// write, the three publish steps must not run. Asserted at the source because
+	// reproducing it needs a hook between the service's pooled status read and its
+	// write, which does not exist. PR #855s seventh review, P2-1.
+	zero := strings.Index(fn, "if affected == 0")
+	require.Positive(t, zero,
+		"UpdateGroupInfo must inspect the rows affected: 0 means the group was "+
+			"disbanded after its snapshot, and the database is then clean while the "+
+			"clients are not")
+	for _, publish := range []string{"InvalidateGroupName(", "SendGroupUpdate(", "SendChannelUpdateToGroup("} {
+		at := strings.Index(fn, publish)
+		require.Positive(t, at, "%s must still be part of the happy path", publish)
+		require.Less(t, zero, at,
+			"the affected == 0 return must come BEFORE %s — otherwise a rename that "+
+				"wrote nothing still tells every client the group was renamed, and the "+
+				"API reports success", publish)
+	}
 }

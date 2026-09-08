@@ -174,7 +174,11 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, _, groupNo, uid strin
 	}); err != nil {
 		g.Error("全员群 IM 订阅失败，成员已入库但收不到消息",
 			zap.String("groupNo", groupNo), zap.String("uid", uid), zap.Error(err))
-		return fmt.Errorf("group: all-member admission IM subscribe: %w", err)
+		// 裹上 ErrAdmittedButNotSubscribed：行已经提交了，剩下的是 broker 侧的订阅
+		// 缺口。调用方必须能把它与"准入事务失败"分开——后者由 I4 扫描 B 报出，
+		// 前者扫描 B 结构上看不见。PR #855 第七轮 review 的 P2-3。
+		return fmt.Errorf("%w: group: all-member admission IM subscribe: %w",
+			projectpkg.ErrAdmittedButNotSubscribed, err)
 	}
 
 	// 子区订阅。父频道订阅**不覆盖**子区：WuKongIM 里每个子区是独立频道
@@ -243,11 +247,16 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 
 	// 项目侧的两问都走 tx，不走连接池。
 	//
-	// 池上读是另一份快照：这个事务此刻正握着上面那些 group_member 行的
-	// FOR UPDATE 锁，而"他还是不是项目 owner"的答案可能在读到与写下去之间变掉，
-	// 而本同步只在项目 owner 变动时才会再次触发——错过一次就是错过到下一次变动。
-	// pkg/project 的两个 helper 为此收成了 dbr.SessionRunner（本仓库既有写法）。
+	// 池上读是**另一份快照**，而这个事务此刻正握着上面那些 group_member 行的
+	// FOR UPDATE 锁；用另一份快照的答案去决定这一份快照里的写，是没必要引入的一层
+	// 不一致。pkg/project 的两个 helper 为此收成了 dbr.SessionRunner（本仓库既有写法）。
 	// PR #855 第五轮 review 的 Q11，也是第一轮 Q6 一直推迟的那一半。
+	//
+	// 但它**不是**一把锁，上一版注释把话说大了（第七轮 review 的 P2-5）：MemberRole
+	// 与 PickActiveOwner 都是非锁定读，只是读进了本事务的读视图，并没有锁住
+	// octo_project_member——角色仍然可能在读到与提交之间被改掉。这是刻意的取舍：
+	// pkg/project 那条不可提权的不变量本来就禁止往上升，而在这里加 FOR SHARE 会给
+	// 声明过的锁序添一条没人分析过的边。事务内读严格好于池上读，仅此而已。
 	role, ok, err := projectpkg.MemberRole(tx, projectID, keeper)
 	if err != nil {
 		return fmt.Errorf("group: read project role of all-member group creator: %w", err)
@@ -352,7 +361,8 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 // 而留任者本身不是 owner 的时候。uids 是这个群的 creator 行，正常是一行、异常是两行，
 // 所以这里的逐个查询是有界的，而且这条分支本身就已经是异常路径。
 //
-// 走 tx，与本函数其余的项目侧查询同一个理由：答案必须来自会落盘的那个快照。
+// 走 tx，与本函数其余的项目侧查询同一个理由：答案与写落在同一份读视图里。
+// 同样不是锁——见 ensureAllMemberGroupOwner 里那段说明。
 func firstActiveProjectOwner(tx *dbr.Tx, projectID string, uids []string) (string, error) {
 	for _, uid := range uids {
 		role, ok, err := projectpkg.MemberRole(tx, projectID, uid)

@@ -40,6 +40,13 @@ const (
 	// 与 provision_failures_total 重复计数一次——而这条分支分辨不出是哪一种。
 	// "入群被跳过，因为没有群"才是它确实知道的事。
 	reasonAdmitSkippedNoGroup = "admit_skipped_no_group"
+	// reasonAdmitSubscribeFailed：group_member 行已经提交，broker 订阅失败。
+	//
+	// 与 admit_failed 分开，因为两者的见证者不同：准入事务失败留下的是"有项目席位、
+	// 没有群成员行"，I4 扫描 B 会报；这一种行在、订阅缺，扫描 B 结构上看不见，而
+	// 谁也读不回 broker 的订阅表（open_verification 里那一条）。合并计数会让告警
+	// 把 on-call 指向一个对这个状态失明的扫描。PR #855 第七轮 review 的 P2-3。
+	reasonAdmitSubscribeFailed = "subscribe_failed_after_commit"
 )
 
 // 同步失败的种类。

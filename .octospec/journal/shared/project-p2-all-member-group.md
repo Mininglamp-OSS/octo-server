@@ -315,6 +315,27 @@ Worth noting what did work. Two other source guards in the same commit were
 mutated by the same reviewer and both went red, because both matched call shapes.
 The technique is fine; the haystack was not.
 
+### Counting occurrences pins the file's size, not the thing you meant
+
+The round-6 fix for "the plan guard EXPLAINs constants, so production could stop
+running them" was a guard requiring each constant to appear at least twice in its
+file — a declaration plus a use. It was vacuous on arrival, and the reason is
+almost funny: the third reference is the exported test helper *the plan guard reads
+the constants through*. Delete the production use and the count is still two. The
+reviewer proved it by re-inlining the exact joined query the guard names, and
+everything stayed green.
+
+The module side was soft for a different reason — two production call sites each,
+so deleting one still left two — which is the tell. A threshold has to be re-derived
+every time the file changes, and nobody re-derives it.
+
+Body-scoping is the instrument that does not have this property: name the function
+that must run the statement, slice its body, strip the comments, and look inside.
+Then each call site is pinned individually and no reference anywhere else can
+satisfy it. Same move as the round-6 comment-stripping fix, one level up — and this
+is the fifth time in this change that a guard turned out to be matching a haystack
+larger than its subject.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

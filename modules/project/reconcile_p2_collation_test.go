@@ -70,8 +70,11 @@ func TestP2StatementsSurviveCollationDrift(t *testing.T) {
 		// creates nor widens that gap; the roster endpoint stays a known casualty
 		// of the drift until the conversion lands.
 
-		// D16's seat split, which joins `user` — with a COLLATE, so unlike
-		// listMembers it does survive.
+		// D16's seat split. It used to join `user` with a COLLATE on the driving
+		// side, which executes under drift (this test's subject) while planning as
+		// a full scan of `user` (which this test cannot see — see the plan guard).
+		// PR #855s seventh review; it is now two single-table reads and crosses no
+		// schema at all, so it survives here for the stronger reason.
 		"countActiveSeatsByKind": func() error {
 			_, _, err := p.db.countActiveSeatsByKind(probeProject)
 			return err

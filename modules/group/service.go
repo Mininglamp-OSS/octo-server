@@ -2177,7 +2177,7 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	// 列级写：只动本次真正要改的列 + version。整行回写会把无锁读之后、这次提交
 	// 之前别人改掉的 status / forbidden / invite 用旧快照盖回去——其中 status 那一
 	// 项意味着一次改名可以撤销一次解散。见 UpdateNameNoticeTx 上的说明。
-	err = s.db.UpdateNameNoticeTx(req.GroupNo, req.Name, req.Notice, groupModel.Version, tx)
+	affected, err := s.db.UpdateNameNoticeTx(req.GroupNo, req.Name, req.Notice, groupModel.Version, tx)
 	if err != nil {
 		s.Error("update group failed", zap.Error(err))
 		return errors.New("failed to update group")
@@ -2186,6 +2186,17 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	if err := tx.Commit(); err != nil {
 		s.Error("commit transaction failed", zap.Error(err))
 		return errors.New("failed to commit transaction")
+	}
+
+	// 0 行 = 上面那条谓词把写挡住了，也就是 status 检查（无锁读）之后、这次写之前
+	// 群被解散了。数据库这时是干净的，但下面三步不是数据库：失效推送缓存、给群里
+	// 发 GroupUpdate、通知客户端刷频道。照发就等于给一个已经不存在的群推一条改名，
+	// 而接口还报成功。返回 nil 而不是错误——什么都没发生不是失败，调用方（D8 的
+	// 项目改名同步）该做的也只是安静地跳过。PR #855 第七轮 review 的 P2-1。
+	if affected == 0 {
+		s.Warn("群信息更新未落库（群已解散），跳过全部通知",
+			zap.String("group_no", req.GroupNo))
+		return nil
 	}
 
 	// 发布群更新事件（name 和 notice 分开发送）

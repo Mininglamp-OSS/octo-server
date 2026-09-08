@@ -478,7 +478,12 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 // 的机器驱动流量会撞上的——第六轮 review 指出列级写只关掉了"改名把解散盖回去"这
 // 一半，另一半（改名照样落库、推版本、发通知）还在。谓词在 WHERE 里，所以影响 0 行
 // 就是全部效果：不报错，调用方的幂等语义不变。
-func (d *DB) UpdateNameNoticeTx(groupNo string, name, notice *string, version int64, tx *dbr.Tx) error {
+// 返回受影响行数，让调用方能看出这次写有没有落地。0 行意味着谓词把它挡住了
+// （群已解散），而调用方后面还有推送：不看这个返回值就会给一个已经没了的群发一条
+// 改名通知，并对外报成功——第七轮 review 的 P2-1，上一版只关掉了落库那一半。
+func (d *DB) UpdateNameNoticeTx(
+	groupNo string, name, notice *string, version int64, tx *dbr.Tx,
+) (int64, error) {
 	set := map[string]interface{}{"version": version}
 	if name != nil {
 		set["name"] = *name
@@ -486,9 +491,12 @@ func (d *DB) UpdateNameNoticeTx(groupNo string, name, notice *string, version in
 	if notice != nil {
 		set["notice"] = *notice
 	}
-	_, err := tx.Update("group").SetMap(set).
+	result, err := tx.Update("group").SetMap(set).
 		Where("group_no=? AND status<>?", groupNo, GroupStatusDisband).Exec()
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // UpdateInviteTx 仅更新「进群邀请开关」与群版本（列级写，事务内）。
