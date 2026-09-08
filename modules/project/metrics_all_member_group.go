@@ -29,14 +29,17 @@ const (
 	reasonAdmitterMissing   = "admitter_missing"
 	reasonAdmitLookupFailed = "lookup_failed"
 	reasonAdmitCallFailed   = "admit_failed"
-	// reasonAdmitRaceLost：本次写路径要入群，但这个项目此刻还没有全员群，而**补建
-	// 并不是失败的，是被跳过的**——另一个写路径正握着租约在建。
+	// reasonAdmitSkippedNoGroup：本次写路径要入群，但这个项目此刻没有全员群。
 	//
 	// 单独一个原因而不是不计数，是 PR #855 第二轮 review 的 Q4：这一批人的入群被
 	// 整批丢掉了，而丢掉它的那条分支原本什么都不记，理由是"补建那一路已经记过日志"。
-	// 那条理由在这里不成立——补建没跑，何来日志。于是并发的一次加人可以让整份名册
-	// 静默地不在群里，直到扫描 B 过了宽限期才看见。
-	reasonAdmitRaceLost = "provision_race_lost"
+	// 那条理由在补建**被跳过**（另一个写路径握着租约）时不成立——没跑，就没记。
+	//
+	// 名字按它真正度量的东西取，不按其中一种成因取。第四轮 review 的 Q7：叫
+	// provision_race_lost 会在仪表盘上读作并发信号，而它同样会在补建**失败**时增长，
+	// 与 provision_failures_total 重复计数一次——而这条分支分辨不出是哪一种。
+	// "入群被跳过，因为没有群"才是它确实知道的事。
+	reasonAdmitSkippedNoGroup = "admit_skipped_no_group"
 )
 
 // 同步失败的种类。

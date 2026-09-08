@@ -198,15 +198,25 @@ DEFAULT ''`，加普通索引。** 一个项目一个值，"有且仅有一个"�
 形成一个没人能操作的群主。钩子失败时不回滚项目侧转让；原 owner 之后一旦离开项目，P1 的
 detach 会按"群主离开"路径把群主移交给资深项目成员，是现成的兜底。
 
-**D7 — 全员群受保护：群主不能解散、任何人不能退群、群内不能踢人、不能手动转让群主。**
-"全员"的含义就是这四件事都由项目侧驱动：退出走项目退出，踢人走项目移除，转让走项目 owner
+**D7 — 全员群受保护：群主不能解散、任何人不能退群、群内不能踢人、不能拉黑、不能手动转让群主。**
+"全员"的含义就是这几件事都由项目侧驱动：退出走项目退出，踢人走项目移除，转让走项目 owner
 转让。受影响的接口：`POST /:group_no/exit`、`DELETE /:group_no/disband`、
-`DELETE|POST /:group_no/members(_delete)`、`POST /:group_no/transfer/:to_uid`，仅当该群是
-全员群时拒绝，新错误码 `err.server.group.all_member_group_protected`（一个码，`details.action`
+`DELETE|POST /:group_no/members(_delete)`、`POST /:group_no/transfer/:to_uid`、
+`POST /:group_no/blacklist/add`，仅当该群是全员群时拒绝，新错误码 `err.server.group.all_member_group_protected`（一个码，`details.action`
 区分动作）。**保护只加在 HTTP handler 层，不加在 `RemoveGroupMembers` 等服务层函数上**：
 P1 的 detach、Space 级联、botfather 删 bot、本期的四个钩子都走服务层，加在那里等于把 I2 的
 级联一起挡掉。**手动加人不禁止**：加项目成员会被幂等吸收，加非项目成员会被 I2 拒绝，无需
 新规则。这是本期最大的一块新增限制，单独一个 PR（PR-C）。
+
+**拉黑是实现时补上的第五条**（本段原文只列了四条）。它不叫"移除"、不走
+`RemoveGroupMembers`，只把 `group_member.status` 翻成 Blacklist 并做 IM 退订，但对 I4 的
+效果与踢人完全相同：人还是项目成员，却不在全员群的活跃成员集合里。**解除拉黑不挡**——那是
+把人放回活跃集合，方向与 I4 一致，挡住反而会让已被拉黑的成员永远出不来。
+`bot_api` 的成员移除接口同理补了一份守卫：它直接调服务层原语，Web 侧那道挡不到它。
+
+**`IsAllMemberGroup` 的实际签名是 `(session, projectID, groupNo)`**，比本段上文写的
+`(session, spaceID, projectID, groupNo)` 窄一个参数——群行本身已经限定了 Space，多传一个
+只会给出两个可能互相矛盾的 Space 来源。
 
 **D8 — 项目改名同步全员群群名；项目 logo 不同步群头像。** 群名 = 项目名是用户识别全员群的
 心智，改了不同步等于让全员群"失联"；群名上限 50 字（`MaxGroupNameLen`）短于项目名 64 字，
@@ -319,7 +329,7 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
   `TestReconcilePageQueriesExamineBoundedRows`；跨进 `group` / `group_member` / `robot` 的
   JOIN 带显式 `COLLATE`（P1 的 `TestP1ScansSurviveCollationDrift` 是范本）；只在完整轮转后
   发布 gauge；只报不修。
-- **群侧四个接口的行为变更（D7）。** `exit` / `disband` / `members` 删除 / `transfer` 对全员群
+- **群侧五个接口的行为变更（D7）。** `exit` / `disband` / `members` 删除 / `blacklist add` / `transfer` 对全员群
   拒绝，对其他群（含普通项目群）响应字节不变；判定只在 `project_id != ''` 时发起一次索引点查，
   Space 直属群零查询；保护只在 handler 层。touches: `error-response`, `i18n`, `acl`
 - **群主移交的既有逻辑。** `groupExit` 群主退群时选第二老成员（排除其名下 bot）；P1 的

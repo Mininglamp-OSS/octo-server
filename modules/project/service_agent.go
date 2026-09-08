@@ -37,15 +37,19 @@ type agentEligibility struct {
 
 // 具体原因，只进日志（见 errAgentNotEligible 的注释）。
 const (
-	agentReasonNotFound      = "not_found"
-	agentReasonNotBot        = "not_a_bot"
-	agentReasonNoRobotRow    = "no_active_robot_row"
-	agentReasonSelfHosted    = "self_hosted"
-	agentReasonSystemBot     = "system_bot"
-	agentReasonNotOwned      = "not_owned_by_actor"
-	agentReasonNoSpaceSeat   = "no_space_seat"
-	agentHostingSelfHosted   = "self_hosted"
-	agentReasonOKPlaceholder = ""
+	agentReasonNotFound    = "not_found"
+	agentReasonNotBot      = "not_a_bot"
+	agentReasonNoRobotRow  = "no_active_robot_row"
+	agentReasonSelfHosted  = "self_hosted"
+	agentReasonSystemBot   = "system_bot"
+	agentReasonNotOwned    = "not_owned_by_actor"
+	agentReasonNoSpaceSeat = "no_space_seat"
+	// agentReasonAccountUnusable：账号已停用或已销毁。与通讯录选择器同口径
+	// （u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2）——D2 说资格口径与通讯录
+	// 一致，而这一半原本漏了。
+	agentReasonAccountUnusable = "account_unusable"
+	agentHostingSelfHosted     = "self_hosted"
+	agentReasonOKPlaceholder   = ""
 )
 
 // classifyAgentsTx 判定一批 uid 是否可以作为 ownerUID 的分身进入 spaceID 下的项目。
@@ -91,6 +95,11 @@ func (p *Project) classifyAgentsTx(
 		}
 		if row.Robot != 1 {
 			out[uid] = agentEligibility{Reason: agentReasonNotBot}
+			continue
+		}
+		if !row.AccountUsable {
+			// 已停用 / 已销毁的账号。通讯录里看不到它，所以接口也不该接受它。
+			out[uid] = agentEligibility{Reason: agentReasonAccountUnusable}
 			continue
 		}
 		if row.CreatorUID == "" {

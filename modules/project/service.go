@@ -1113,6 +1113,7 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	}
 	isAgentTarget := class.IsBot || spacepkg.IsSystemBot(uid)
 	isOwnAgent := class.IsBot &&
+		class.AccountUsable &&
 		!spacepkg.IsSystemBot(uid) &&
 		class.OwnerUID != "" &&
 		class.OwnerUID == actorUID &&
@@ -1145,6 +1146,7 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 				zap.String("projectId", projectID), zap.String("actor", actorUID),
 				zap.String("target", uid), zap.String("owner", class.OwnerUID),
 				zap.String("hosting", class.Hosting),
+				zap.Bool("accountUsable", class.AccountUsable),
 				zap.Bool("systemBot", spacepkg.IsSystemBot(uid)))
 			return false, errAgentNotEligible
 		}

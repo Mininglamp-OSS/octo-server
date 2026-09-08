@@ -738,6 +738,133 @@ pr_855_second_reviewer:
     who cannot leave has no way round it) and weakest for disband (irreversible).
     Recorded in open_verification rather than decided.
 
+# PR #855 fourth pass (yujiawei on head 1142ad5). Spec came back green; three new
+# blocking findings, two of which this project put there in the round before.
+pr_855_round_3_fixed:
+  - id: writeback-was-not-fenced-on-the-lease-it-claimed
+    severity: blocking
+    where: modules/project/db_all_member_group.go setAllMemberGroupNo
+    what: |
+      Round 2 fenced releaseAllMemberGroupProvision on the claimed deadline.
+      setAllMemberGroupNo never got the other half: its only guard was "the
+      pointer is still empty".
+    why_that_was_wrong: |
+      The comment argued exactly one ordering -- the successor writes back first,
+      so the late one finds a non-empty pointer and loses -- and that ordering is
+      self-consistent. The reverse was not considered: A claims, runs past its
+      lease, B claims and builds from the CURRENT roster, then A returns FIRST and
+      writes back. The pointer is still empty, so A wins with its older snapshot.
+    consequence: |
+      The project names the group built from the stale roster; everyone added in
+      the window is missing from it, and B group -- which has the complete roster
+      -- survives as an ordinary project group, so the Space shows two groups
+      named after the project. Lease expiry is not exotic here: the constant own
+      comment sizes 2 minutes against the IM channel call as "the only part that
+      can take minutes".
+    fix: "the claimed deadline is threaded into the writeback as an equality fence. Correct in both directions: an expired-but-UNCLAIMED lease still holds the claimant own deadline, so a late write with no successor still lands."
+    test: |
+      all_member_group_lease_test.go -- the lease PROTOCOL, not the rebuild
+      inputs. Two properties: exactly one group ever carries the pointer, and the
+      one that does is built from the later roster. Confirmed non-vacuous by
+      removing the fence and watching the stale write win.
+    note: |
+      The review asked for exactly this test and named why the previous round
+      invariant test did not catch it: that one exercises the rebuild INPUTS,
+      while what was unguarded is the protocol AROUND it -- which of two
+      concurrent attempts becomes authoritative.
+  - id: roster-truncation-became-silent
+    severity: blocking
+    where: modules/project/service_all_member_group.go / db_all_member_group.go
+    what: |
+      queryActiveMemberUIDsForRebuild was called with LIMIT = maxMembers while the
+      caller checked len(roster) > maxMembers, so the check was unreachable.
+    why_that_was_wrong: |
+      Round 2 relaxed >= to > in response to a nit (>= also fires on a project
+      legitimately at exactly max_members) and did not change the limit. The
+      correct answer to that nit is to fetch maxMembers + 1 and keep >. So the
+      round that was fixing a false-positive removed the only true signal, in a
+      commit whose own heading reads "the roster is NOT truncated, this is a
+      decision" -- while the code truncated anyway, at a bound updateProject can
+      lower below the current seat count with no check.
+    fix: "fetch maxMembers + 1, keep >, drop the probe row before seeding."
+    test: TestRebuildWarnsWhenTheRosterIsTruncated
+  - id: bot-deletion-continued-past-a-failed-seat-close
+    severity: blocking
+    where: modules/botfather/command.go onDeleteConfirm
+    what: |
+      CloseAllSpaceSeats returning an error was logged and the flow continued to
+      deleteRobot. The comment justified that with two claims, and the review
+      showed both are false.
+    why_those_claims_were_false: |
+      "I1 will report it" -- I1 looks for an active project seat whose SPACE seat
+      is gone. In this failure the Space seat is still ACTIVE (the UPDATE never
+      ran, or rolled back). No scan in this repository looks for an active
+      space_member row whose robot row is status = 0.
+      "Retrying the whole delete is idempotent" -- deleteRobot sets
+      robot.status = 0, and the bot selection query requires status = 1, so the
+      owner can never reach that bot again.
+    consequence: |
+      A bot the user deleted keeps an active Space seat in the failed Space,
+      therefore an active project seat, therefore keeps satisfying the I2 gate and
+      stays a reading member of that project groups -- permanently, invisible to
+      every scan, with no user-reachable repair. Exactly the end state D14 exists
+      to eliminate, and LESS observable than the raw UPDATE it replaced (that one,
+      when it succeeded, left a state I1 could see).
+    fix: "abort before deleteRobot and reply MsgDeleteFailedRetry. The robot row is still status = 1 at that point, so the retry the message promises actually works."
+  - id: scan-b-double-reported-scan-a-problem
+    brief_ref: Q2
+    what: |
+      Scan B base population required only that the pointer be non-empty. A
+      project pointing at a DISBANDED group is therefore in it -- and group_member
+      rows survive a disband (only group.status flips; the member cleanup is an
+      async event that can fail), so the join keeps finding them until that
+      cleanup lands and then finds none of them at once. Scan A already reports
+      that project as one row.
+    note: "The scan own doc comment claimed this exclusion. It only covered the empty-pointer case."
+    fix: "exemption 5, in the violating flag with scan A join shape, so the two agree on usable."
+    test: TestI4ScanBDoesNotDoubleReportScanAsProblem
+  - id: assorted
+    fixes: |
+      Q5: the owner-candidate cap was a self-chosen 16 with nothing bounding a
+      project to 16 owners; if the sixteen most senior were all I1 leaks the
+      rebuild failed forever -- a narrow version of the P1 fixed last round. Now
+      bounded by max_members, which is the meaningful bound (owners are a subset
+      of members).
+      Q6: bot_api guard copy read group.project_id itself, so a Space-direct group
+      paid one query where C1 budgets zero. project_id now rides along with the
+      status the handler already reads for its disband check.
+      Q7: reasonAdmitRaceLost renamed admit_skipped_no_group -- the arm cannot
+      tell a lost race from a failed provision, so a name that says "race" reads
+      as a concurrency signal while double-counting provisioning failures.
+      Q4: agent eligibility now includes the account itself
+      (u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2), matching the contact
+      directory that D2 says it matches. Read as a separate flag rather than
+      filtered in the WHERE, so a deactivated bot does not fall through to the
+      HUMAN branch -- which is the shape of the hole closed two rounds ago.
+      Nits: the D7 header said "four operations" while five are guarded; the brief
+      D7 paragraph now names blacklist and the bot_api copy, and records that
+      IsAllMemberGroup real signature is narrower than D5 wrote.
+      Two stale spec-record entries corrected: declared_deviations still said the
+      banned-Space exemption was not implemented, and open_verification still
+      asked the deploy team to budget for TWO indexes after one was dropped. The
+      second was a live instruction to whoever runs the migration.
+  - id: transfer-not-disband-is-the-fail-open-outlier
+    brief_ref: Q1
+    what: |
+      The open_verification entry asking whether the D7 guard should fail CLOSED
+      was aimed at DISBAND, following the third-round reviewer. The fourth round
+      showed that aim is backwards.
+    detail: |
+      The fail-open argument is that the worst case leaves a state a scan reports.
+      remove / exit / blacklist leave member-set gaps (scan B); disband leaves a
+      project pointing at a disbanded group (scan A, then the stale-pointer clear
+      and a rebuild). TRANSFER is the one where it does not hold: a group-side
+      owner transfer that slips through leaves the all-member group creator on
+      someone who need not be a project owner, and no scan checks that relation.
+      D6 own comment already describes the resulting state -- a group owner nobody
+      can change, since D7 then refuses them transfer, exit and disband.
+    status: "re-aimed in open_verification, still a product call rather than decided here."
+
 # octospec Verify phase. Each injected rule re-read and checked against the diff,
 # then the brief's Acceptance walked line by line.
 verify:
@@ -829,7 +956,11 @@ verify:
 
   # Delivered differently from the brief, on purpose.
   declared_deviations:
-    - id: i4-scan-b-does-not-exempt-banned-spaces
+    # SUPERSEDED by pr_855_round_2_fixed / i4-scan-b-banned-space-exemption: the
+    # exemption IS implemented now. Kept rather than deleted so the reasoning that
+    # was wrong stays visible, but marked here because declared_deviations is what
+    # a merger reads to decide what was skipped on purpose.
+    - id: i4-scan-b-does-not-exempt-banned-spaces-SUPERSEDED
       brief_line: "扫描 B 的豁免：... 被封禁 Space 的项目"
       what_was_done: "the exemption was not implemented; the other two (grace window, system bots) are, plus removing = 1."
       why: |
@@ -864,12 +995,12 @@ open_verification:
      from octo_project with the (p.id, pm.uid) row-constructor cursor -- the same
      shape P1 flagged as needing a real plan for queryI2Page, and for the same
      reason the plan cannot be produced from CI."
-  - "Index build time for the two new indexes on octo_project at production row
-     counts. Both ADD COLUMNs are INSTANT on MySQL 8.0; the indexes are separate
-     online INPLACE statements whose duration is proportional to row count.
-     PR #855's review noted that the migration comment stated the INSTANT half and
-     said nothing about the indexes, which invites a reader to carry the first
-     conclusion onto the second; the file now says so explicitly."
+  - "Index build time for the ONE new index on octo_project
+     (idx_octo_project_all_member_group) at production row counts. Both ADD COLUMNs
+     are INSTANT on MySQL 8.0; the index is a separate online INPLACE statement
+     whose duration is proportional to row count. The second index this entry used
+     to name was dropped in the fourth review round -- nothing filtered on
+     all_member_group_no alone, so it served no query."
   - "RESOLVED. A WuKongIM broker (the pinned v2.2.4-20260313, WK_TOKENAUTHON=false)
      was installed alongside MySQL 8.0.46 and Redis, and every suite was re-run.
      modules/project (including -race -shuffle=on), group, space, thread, message,
@@ -886,10 +1017,19 @@ open_verification:
      such call anywhere in octo-server or octo-lib -- so the equality itself is not
      assertable from a test. Same class as the EXPLAIN items above: check it
      against a running broker before merge."
-  - "Whether the D7 guard should fail CLOSED on disband specifically, while
-     staying fail-open on the other four actions. Raised by mochashanyao on
-     PR #855. The fail-open argument -- one database error must not become
-     nobody can leave any project group -- is strongest for exit and weakest for
-     disband, which is irreversible. Not decided here because it is a product
-     call about which failure a user should be walked into, and because splitting
-     the guard by action costs the property that all five answer identically."
+  - "Whether the D7 guard should fail CLOSED on TRANSFER specifically, while
+     staying fail-open on the other four actions.
+     This entry first asked the question about DISBAND, following mochashanyao,
+     and the fourth review round showed that aim was backwards. The fail-open
+     argument is that the worst case leaves a state a scan reports: remove / exit
+     / blacklist leave member-set gaps (scan B), and disband leaves a project
+     pointing at a disbanded group (scan A, then clearStaleAllMemberGroupPointer
+     and a rebuild). Transfer is the one where it does not hold -- a group-side
+     owner transfer that slips through leaves the all-member group creator on
+     someone who need not be a project owner, and NO scan checks that relation.
+     D6 own comment names the resulting state: a group owner nobody can change,
+     because D7 then refuses them transfer, exit and disband. The only automatic
+     repair is the next project-side owner event.
+     Still not decided here: it is a product call about which failure a user is
+     walked into, and splitting the guard by action costs the property that all
+     five answer identically. But it should be asked about transfer."

@@ -680,12 +680,35 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	// operatorUID 是**发起删除的主人**，不是 Bot 自己。它会流进
 	// deactivateSeatForCascade 的审计与日志归因，前一版两个参数都传 botID，于是
 	// 审计记录读作"这个 Bot 把自己从每个项目里移除了"——一个不存在的行为者。
-	if _, closeErr := spacemod.CloseAllSpaceSeats(
+	if closed, closeErr := spacemod.CloseAllSpaceSeats(
 		h.ctx, botID, fromUID, spacemod.MemberRemoveReasonBotDeleted,
 	); closeErr != nil {
-		// 部分 Space 可能已经成功关闭并入队，失败的那些会被 I1 对账扫描报出来。
-		// 不回滚：没有什么可回滚的，而重试整个删除流程是幂等的。
-		h.Error("关闭Bot的Space席位失败", zap.String("botId", botID), zap.Error(closeErr))
+		// 关不掉席位就**不往下走**，尤其不能走到 deleteRobot。
+		//
+		// 前一版是记日志继续，理由写的两条现在都不成立，PR #855 第四轮 review 把它们
+		// 拆穿了：
+		//
+		//  1. 「失败的那些会被 I1 对账扫描报出来」——不会。I1 找的是"项目席位还活着
+		//     但 Space 席位没了"，而这次失败的形态恰恰相反：Space 席位**还是活的**
+		//     （UPDATE 没执行，或事务回滚了）。本仓库十个扫描没有一个在找"space_member
+		//     还活着、而它的 robot 行已经 status=0"。这个状态没有任何东西看得见。
+		//  2. 「重试整个删除流程是幂等的」——重试根本进不来。下面的 deleteRobot 会把
+		//     robot.status 置 0，而选 bot 的查询要求 status=1，于是主人再也选不到这个
+		//     bot。所谓幂等只对还能走到这一步的调用方成立。
+		//
+		// 两条加起来的终态：一个用户已经删掉的 bot，在失败的那个 Space 里保留活跃席位，
+		// 于是保留项目席位，于是继续满足 I2，继续留在那个项目的群里读消息——永久，
+		// 没有扫描、没有用户可达的修复。这正是 D14 要消灭的终态。
+		//
+		// 在这里返回时 robot 行仍是 status=1，所以提示里说的"重试"是真的能重试。
+		// 已经成功关闭的那些 Space 不回滚，也不需要：它们的清理工单已经入队，而重跑
+		// 整个删除流程对它们是幂等的（席位已关，affected=0，不重复入队）。
+		h.Error("关闭Bot的Space席位失败，中止删除（robot 行保持可选，用户可重试）",
+			zap.String("botId", botID), zap.Strings("closedSpaces", closed),
+			zap.Error(closeErr))
+		h.replyL(fromUID, MsgDeleteFailedRetry, nil)
+		h.sm.Clear(fromUID, h.spaceID(fromUID))
+		return
 	}
 
 	// Remove bot from friend records with version for client sync (both directions)

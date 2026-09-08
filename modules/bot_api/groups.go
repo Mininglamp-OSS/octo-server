@@ -696,11 +696,16 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	}
 
 	// 解散守卫（企业微信式只读）：群解散后禁止 bot 移除成员。
-	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
+	//
+	// project_id 与 status 同一条查询读回，供下面的 D7 守卫短路用——Space 直属群
+	// 因此在这条路径上也是零额外查询（C1）。
+	groupStatus, groupProjectID, err := ba.queryGroupStatusAndProject(groupNo)
+	if err != nil {
 		ba.Error("查询群是否已解散错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
-	} else if disbanded {
+	}
+	if groupStatus == group.GroupStatusDisband {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 		return
 	}
@@ -786,7 +791,7 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	// 不挡的话，一个 bot_admin 能把普通成员从全员群里踢掉，而他的项目席位纹丝不动：
 	// I4 出现一个缺口，且没有任何东西会修复——席位没变，级联不会再看它，准入器只在
 	// 新加入时跑。
-	if protected, perr := ba.isProjectAllMemberGroup(groupNo); perr != nil {
+	if protected, perr := ba.isProjectAllMemberGroup(groupNo, groupProjectID); perr != nil {
 		// 放行并记日志，与 Web 侧守卫同一个取舍：这道守卫保护的是产品语义而不是
 		// 安全边界，fail-closed 会让一次数据库抖动变成"所有项目群都踢不了人"。
 		//
@@ -881,18 +886,13 @@ func (ba *BotAPI) sendGroupMdNotification(groupNo string, updatedBy string, vers
 // A Space-direct group short-circuits with no project query at all: this runs on
 // a member-removal path, and a check that runs and passes is still latency on
 // every ordinary removal.
-func (ba *BotAPI) isProjectAllMemberGroup(groupNo string) (bool, error) {
-	if groupNo == "" {
+func (ba *BotAPI) isProjectAllMemberGroup(groupNo, projectID string) (bool, error) {
+	if groupNo == "" || projectID == "" {
+		// C1: a Space-direct group costs zero queries here. projectID comes from the
+		// row this handler already read for its disband check, so the caller pays
+		// nothing for it — which is what the Web-side guard gets for free from the
+		// group row its handlers have in hand.
 		return false, nil
 	}
-	var projectIDs []string
-	if _, err := ba.ctx.DB().SelectBySql(
-		"SELECT project_id FROM `group` WHERE group_no=?", groupNo,
-	).Load(&projectIDs); err != nil {
-		return false, err
-	}
-	if len(projectIDs) == 0 || projectIDs[0] == "" {
-		return false, nil
-	}
-	return projectpkg.IsAllMemberGroup(ba.ctx.DB(), projectIDs[0], groupNo)
+	return projectpkg.IsAllMemberGroup(ba.ctx.DB(), projectID, groupNo)
 }

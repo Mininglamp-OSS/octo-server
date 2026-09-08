@@ -230,9 +230,19 @@ type i4GapRow struct {
 // would publish violations with no available remedy for the whole duration of a
 // ban, which is precisely the condition the exemption exists to suppress.
 //
-// Not exempted, deliberately: a project with no all-member group at all. Those
-// rows are scan A's business, and counting them here too would double-report one
-// problem in two gauges and make both move together for one cause.
+//  5. a project whose pointer names a group that is gone, disbanded, or detached
+//     to another project. Scan A reports that project as ONE row; counting it
+//     here too would double-report one problem in two gauges and make both move
+//     together for one cause — inflated by project size, since scan B counts
+//     MEMBERS.
+//
+// This last one used to be claimed rather than implemented: the comment said
+// "a project with no all-member group at all ... is scan A's business", and the
+// only thing excluding it was `all_member_group_no <> ”`, which covers the empty
+// sentinel and nothing else. The disbanded case is worse than the empty one,
+// because group_member rows survive a disband (only group.status flips, and the
+// member cleanup is an async event that can fail), so the join keeps finding them
+// until that cleanup lands and then stops finding any of them at once.
 func (p *Project) scanAllMemberGroupGaps() {
 	start := time.Now()
 	defer func() {
@@ -301,6 +311,17 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			// lacks modules/space gets a stub table, and the LEFT JOIN itself yields
 			// NULL for a project whose Space row is gone.
 			"  (gm.uid IS NULL AND pm.updated_at < ? "+
+			// exemption 5: the pointed-at group is not usable. Scan A already
+			// reports that project as ONE row; without this, once the disband
+			// event asynchronously clears group_member, scan B flags EVERY member
+			// of it — the same problem double-reported in two gauges, inflated by
+			// project size, and indefinitely for a project that sees no further
+			// write (the pointer is only cleared on a write path).
+			//
+			// The scan doc comment already claimed this exclusion; it only covered
+			// the pointer being the empty sentinel. PR #855s fourth review found
+			// the gap. Same join shape as scan A, so the two agree on "usable".
+			"   AND g.id IS NOT NULL "+
 			"   AND (sp.status IS NULL OR sp.status <> 2) "+
 			// exemption 2: whitelisted system bots. In the flag rather than the
 			// WHERE like the other three. The list is tiny and the effect is the
@@ -323,11 +344,18 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			"  AND gm.is_deleted = 0 AND gm.status = 1 "+
 			// Same schema crossing as the group_member join, same COLLATE placement.
 			"LEFT JOIN `space` sp ON sp.space_id = p.space_id COLLATE utf8mb4_general_ci "+
+			// The group the pointer names, on scan As terms. A LEFT JOIN so it
+			// cannot eliminate a base row: whether it matched is read off g.id in
+			// the violating flag above.
+			"LEFT JOIN `group` g "+
+			"  ON g.group_no = p.all_member_group_no COLLATE utf8mb4_general_ci "+
+			"  AND g.status <> ? "+
+			"  AND g.project_id = p.project_id COLLATE utf8mb4_general_ci "+
 			"WHERE p.status = ? AND p.all_member_group_no <> '' "+
 			"  AND (p.id, pm.uid) > (?, ?) "+
 			"ORDER BY p.id, pm.uid LIMIT ?",
-		graceCutoff, systemBotUIDsForScan(), MemberStatusActive, StatusNormal,
-		cursorProjectID, cursorUID, limit,
+		graceCutoff, systemBotUIDsForScan(), MemberStatusActive, groupStatusDisband,
+		StatusNormal, cursorProjectID, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: query I4 all-member group gap page: %w", err)

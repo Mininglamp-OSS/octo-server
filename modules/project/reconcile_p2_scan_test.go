@@ -251,3 +251,59 @@ func TestI4ScanBExemptsABannedSpace(t *testing.T) {
 	assert.Equal(t, 1, i4GapCount(t, p),
 		"and the exemption must be exactly the ban, not a permanent silence")
 }
+
+// TestI4ScanBDoesNotDoubleReportScanAsProblem covers exemption 5.
+//
+// A project whose pointer names a disbanded group is scan A's row. Scan B used to
+// count it too — once per MEMBER — because its base population only required the
+// pointer to be non-empty. The two gauges then moved together for one cause, and
+// the member-side one was inflated by project size.
+//
+// The disbanded case is worse than the empty-pointer one it was confused with:
+// group_member rows survive a disband (only group.status flips; the member
+// cleanup is an async event that can fail), so the join keeps finding them until
+// that cleanup lands and then stops finding any of them at once — a gauge that
+// goes from 0 to the whole roster in one step, for a project scan A has been
+// reporting all along.
+func TestI4ScanBDoesNotDoubleReportScanAsProblem(t *testing.T) {
+	_, p := setup(t)
+	seedSpace(t, spaceA, 1)
+	seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+
+	groupNo := util.GenerUUID()
+	model, err := p.createProjectOnce(createInput{
+		SpaceID: spaceA, Creator: "u_owner", Name: "i4b-double",
+		Discoverability: DiscoverabilitySpaceListed,
+	})
+	require.NoError(t, err)
+	seedProjectGroup(t, groupNo, spaceA, model.ProjectID)
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET all_member_group_no = ? WHERE project_id = ?",
+		groupNo, model.ProjectID).Exec()
+	require.NoError(t, err)
+	backdateSeat(t, model.ProjectID, "u_owner")
+
+	require.Equal(t, 1, i4GapCount(t, p), "precondition: a real gap while the group is usable")
+	require.Zero(t, i4MissingCount(t, p), "and scan A is quiet")
+
+	// Disband the group under the project. The member rows survive the flip.
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `group` SET status = ? WHERE group_no = ?", groupStatusDisband, groupNo).Exec()
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, i4MissingCount(t, p),
+		"scan A owns this project now: its pointer names an unusable group")
+	assert.Zero(t, i4GapCount(t, p),
+		"and scan B must stop counting its members. One problem, one gauge — otherwise "+
+			"the member-side number moves with project size for a cause scan A already "+
+			"reports as a single row")
+
+	// Detached rather than disbanded — the other half of scan A's predicate.
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `group` SET status = 1, project_id = '' WHERE group_no = ?", groupNo).Exec()
+	require.NoError(t, err)
+	assert.Equal(t, 1, i4MissingCount(t, p))
+	assert.Zero(t, i4GapCount(t, p),
+		"a group detached to Space-direct is equally scan A's business")
+}

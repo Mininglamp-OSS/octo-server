@@ -666,28 +666,59 @@ func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
 // fail-closed and decide whether dbr.ErrNotFound is a business not-found result
 // or whether another error is an internal query failure.
 func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
+	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
+	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
+	// 两条分支（测试 override、db 未初始化）都在 queryGroupStatusAndProject 里。
+	status, _, err := ba.queryGroupStatusAndProject(groupNo)
+	if err != nil {
+		return false, err
+	}
+	return status == group.GroupStatusDisband, nil
+}
+
+// queryGroupStatusAndProject reads the two `group` columns the bot group handlers
+// need, in ONE query.
+//
+// project_id rides along because of the C1 discipline the D7 guard states as a
+// hard requirement: a Space-direct group must cost ZERO extra queries for that
+// guard. The Web-side guard gets project_id free, because its handlers already
+// have the group row; this module did not, so its copy of the guard was issuing
+// its own lookup on every bot-driven member removal — including the Space-direct
+// ones, where the budget is zero. PR #855s fourth review, Q6.
+//
+// projectID is "" when the group row is missing, which reads as Space-direct and
+// short-circuits the guard — the same answer the guard reaches on its own.
+func (ba *BotAPI) queryGroupStatusAndProject(groupNo string) (int, string, error) {
+	// The status seam stays honoured: a stub that answers only status gets ""
+	// for project_id, which reads as Space-direct — the D7 guard then short-circuits
+	// rather than querying, which is the correct answer in a binary with no project
+	// tables anyway.
 	if ba.groupStatusQueryOverride != nil {
 		status, err := ba.groupStatusQueryOverride(groupNo)
 		if err != nil {
-			return false, fmt.Errorf("query group status: %w", err)
+			return 0, "", fmt.Errorf("query group status: %w", err)
 		}
-		return status == group.GroupStatusDisband, nil
+		return status, "", nil
 	}
-	// db 未初始化时（如单元测试 stub 不注入 db），无法查询群状态。
-	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
-	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
+	// db 未初始化时（如单元测试 stub 不注入 db），无法查询群状态。跳过而非
+	// fail-closed，理由见 isGroupDisbanded。
 	if ba.db == nil || ba.db.session == nil {
-		return false, nil
+		return 0, "", nil
 	}
-	var status int
-	err := ba.db.session.SelectBySql(
-		"SELECT status FROM `group` WHERE group_no=?",
+	var rows []*struct {
+		Status    int    `db:"status"`
+		ProjectID string `db:"project_id"`
+	}
+	if _, err := ba.db.session.SelectBySql(
+		"SELECT status, IFNULL(project_id, '') AS project_id FROM `group` WHERE group_no=?",
 		groupNo,
-	).LoadOne(&status)
-	if err != nil {
-		return false, fmt.Errorf("query group status: %w", err)
+	).Load(&rows); err != nil {
+		return 0, "", fmt.Errorf("query group status: %w", err)
 	}
-	return status == group.GroupStatusDisband, nil
+	if len(rows) == 0 {
+		return 0, "", nil
+	}
+	return rows[0].Status, rows[0].ProjectID, nil
 }
 
 // ==================== Read Receipt ====================

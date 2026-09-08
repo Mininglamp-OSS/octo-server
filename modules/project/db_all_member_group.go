@@ -160,23 +160,46 @@ func (d *DB) releaseAllMemberGroupProvision(projectID string, deadline time.Time
 	return nil
 }
 
-// setAllMemberGroupNo 把建好的群写回项目行并清空租约。
+// setAllMemberGroupNo 把建好的群写回项目行并清空租约，围栏在本次认领的 deadline 上。
 //
-// WHERE 里那句「all_member_group_no 仍为空串」是这里唯一防止"两个群都写进去、后者覆盖前者"的
-// 东西。理论上认领已经保证了只有一个人走到这里，但认领租约会过期：一个跑了超过
-// allMemberGroupLease 的建群操作，其租约可能已经被别人接走并且别人已经建成了。
-// 这时后到的那次写回必须落空——它建出来的那个群会变成一个普通项目群（group.project_id
-// 已经指向本项目），由 I4 扫描 A 报出来，而不是把已经生效的全员群顶掉。
+// # 为什么"指针仍为空串"这一条不够
 //
-// 返回 false 即表示发生了上面这种情况，调用方应当记日志。
-func (d *DB) setAllMemberGroupNo(projectID, groupNo string) (bool, error) {
-	if projectID == "" || groupNo == "" {
+// 前一版只有那一条谓词，理由写的是：租约会过期，别人可能已经接手并建成，这时后到的
+// 写回必须落空。那段论证只考虑了**后继者先写回**的那个顺序，而它恰好是自洽的——指针
+// 已非空，晚到的一方自然落空。
+//
+// 反过来的顺序没被考虑，而它才是有害的那个：
+//
+//	A 认领（deadline Ta）→ A 的 CreateGroup 跑得很久 → Ta 过期
+//	→ B 认领（Tb）、读**当前**名册、建出 Gb
+//	→ A 回来写回 Ga（此时指针仍是空串，于是**成功**）
+//	→ B 写回 Gb，落空
+//
+// 结果是项目指向 Ga —— A 那份更旧的名册快照建出来的群，窗口期内加进项目的人一个都
+// 不在里面；而带着完整名册的 Gb 留成一个普通项目群，于是这个 Space 里出现两个以项目
+// 命名的群。缺的那些人是 I4 缺口，扫描 B 过了宽限期才报，而且没有自动修复。
+//
+// 租约超时不是异常路径：allMemberGroupLease 的注释自己说，IM 建频道是"这里唯一可能
+// 慢到分钟级的部分"，2 分钟是按它的数量级取的——超出它正是租约被设计出来要处理的情况。
+//
+// # 为什么围栏是 deadline 的**等值**比较
+//
+// 直觉上会担心它把良性情况也挡掉：一次超时但**没人接手**的认领怎么办？不会挡——那种
+// 情况下行上的 lease_until 仍然是这个 claimant 自己写下的那个值，等值比较成立，写回照常
+// 落地。只有真的出现了后继者（行上的值被换成 Tb）才会落空，而那时该赢的本来就是 B。
+// 两个方向都对，这是选等值而不是"检查新鲜度"的理由。
+//
+// 返回 false 表示本次写回落空，调用方应当记日志——它建出来的那个群会作为普通项目群
+// 留存（group.project_id 已经指向本项目），由 I4 扫描 A 报出来。
+func (d *DB) setAllMemberGroupNo(projectID, groupNo string, deadline time.Time) (bool, error) {
+	if projectID == "" || groupNo == "" || deadline.IsZero() {
 		return false, nil
 	}
 	result, err := d.session.UpdateBySql(
 		"UPDATE octo_project SET all_member_group_no = ?, all_member_group_lease_until = NULL "+
-			"WHERE project_id = ? AND status = ? AND all_member_group_no = ''",
-		groupNo, projectID, StatusNormal,
+			"WHERE project_id = ? AND status = ? AND all_member_group_no = '' "+
+			"  AND all_member_group_lease_until = ?",
+		groupNo, projectID, StatusNormal, deadline,
 	).Exec()
 	if err != nil {
 		return false, fmt.Errorf("project: set all-member group: %w", err)
@@ -278,10 +301,13 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 //
 // 返回有序候选，由调用方按 Space 席位筛，是把"谁能当群主"这个判断交给会真正校验它
 // 的那个谓词。
-const provisionOwnerCandidates = 16
-
-func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string) ([]string, error) {
-	if projectID == "" {
+//
+// limit 由调用方按 max_members 传入，而不是一个自选的小常数。前一版写死 16，而没有
+// 任何东西把一个项目的 owner 数量限制在 16 以内——如果最资深的 16 位恰好都是 I1 泄漏
+// 而第 17 位持有席位，补建会以完全相同的方式失败每一次，也就是刚修掉的那个缺陷的
+// 窄版本。owner 是成员的子集，所以成员配额就是这里天然的、有意义的界。
+func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string, limit int) ([]string, error) {
+	if projectID == "" || limit <= 0 {
 		return nil, nil
 	}
 	var uids []string
@@ -290,7 +316,7 @@ func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string) ([]string,
 			"WHERE project_id = ? AND role = ? AND status = ? AND removing = 0 "+
 			// created_at 不是全序（同毫秒会并列），补 uid 让选择可测且跨副本一致。
 			"ORDER BY created_at ASC, uid ASC LIMIT ?",
-		projectID, RoleOwner, MemberStatusActive, provisionOwnerCandidates,
+		projectID, RoleOwner, MemberStatusActive, limit,
 	).Load(&uids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active owner candidates: %w", err)
@@ -307,8 +333,15 @@ func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string) ([]string,
 // 不排除系统 bot：它们本来就不持有项目席位（I2/I4 都豁免它们），所以这条查询
 // 读不到它们，不需要额外的谓词。
 //
-// limit 由调用方按 max_members 传入。名册不可能超过配额——每一条加人路径都在
-// 事务里数过——所以取满 limit 意味着配额被调小过或数据异常，调用方据此记日志。
+// limit 由调用方传入，而且调用方要传 **max_members + 1**，不是 max_members。
+//
+// 因为这个函数只负责有界，判断"有没有被截断"是调用方的事，而它只能通过"拿回来的
+// 行数超过了配额"来判断——如果 limit 就等于配额，那个条件按构造永远不成立，检查
+// 变成死代码。上一轮就是这么错的：nit 说 `>=` 会在项目正好满员时误报，我只把比较符
+// 改成 `>`，于是唯一的信号没了，截断变成静默的。
+//
+// 截断本身是可达的：updateProject 允许调小 max_members，且不校验当前活跃席位数。
+//
 // 有界是硬要求而不是防御：这条语句在一次 HTTP 请求里同步执行。
 func (d *DB) queryActiveMemberUIDsForRebuild(projectID string, limit int) ([]string, error) {
 	var uids []string

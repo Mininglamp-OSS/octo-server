@@ -407,7 +407,7 @@ func TestAllMemberGroupRebuildIsClaimedOnce(t *testing.T) {
 
 	// Once the group is written back, no further claim succeeds at all — that is
 	// what makes the rebuild idempotent rather than merely serialized.
-	ok, err := p.db.setAllMemberGroupNo(model.ProjectID, "grp_race")
+	ok, err := p.db.setAllMemberGroupNo(model.ProjectID, "grp_race", firstLease)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -416,7 +416,10 @@ func TestAllMemberGroupRebuildIsClaimedOnce(t *testing.T) {
 	require.False(t, third, "a project that already has a group has no work to claim")
 
 	// A late write-back from a claim whose lease expired must NOT overwrite.
-	overwritten, err := p.db.setAllMemberGroupNo(model.ProjectID, "grp_late")
+	// (Both predicates refuse it now — the pointer is non-empty AND the lease was
+	// cleared by the write above. The lease-protocol cases in
+	// all_member_group_lease_test.go separate the two.)
+	overwritten, err := p.db.setAllMemberGroupNo(model.ProjectID, "grp_late", firstLease)
 	require.NoError(t, err)
 	require.False(t, overwritten)
 
@@ -1213,7 +1216,21 @@ func TestMembersAddAppliesTheSameAgentPredicateAsCreate(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	resp := decodeResp(t, w)
 
-	for _, bad := range []string{"bot_selfhosted", "bot_disabled", "bot_orphan"} {
+	// 账号本身已停用 / 已销毁，但 robot 行和 Space 席位还活着。通讯录里看不到它
+	// （u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2），所以接口也不该接受它 ——
+	// D2 说资格口径与通讯录一致，而这一半原本漏了（PR #855 第四轮 review 的 Q4）。
+	seedAgent(t, spaceA, "bot_deactivated", "u_owner", "octo_hosted")
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `user` SET status = 0 WHERE uid = ?", "bot_deactivated").Exec()
+	require.NoError(t, err)
+	seedAgent(t, spaceA, "bot_destroyed", "u_owner", "octo_hosted")
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE `user` SET is_destroy = 2 WHERE uid = ?", "bot_destroyed").Exec()
+	require.NoError(t, err)
+
+	for _, bad := range []string{
+		"bot_selfhosted", "bot_disabled", "bot_orphan", "bot_deactivated", "bot_destroyed",
+	} {
 		w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
 			map[string]any{"uids": []string{bad}})
 		require.Equal(t, http.StatusOK, w.Code, "case %s body: %s", bad, w.Body.String())
@@ -1348,4 +1365,59 @@ func TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease(t *testing.T) {
 	fourth, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
 	require.NoError(t, err)
 	require.True(t, fourth, "a released lease must be immediately re-claimable")
+}
+
+// TestRebuildWarnsWhenTheRosterIsTruncated pins the signal PR #855's fourth
+// review found unreachable.
+//
+// The rebuild bounds the roster at the project's max_members. That bound is
+// reachable through the public API — updateProject accepts max_members and does
+// not check it against the current active seat count — so lowering it on a
+// project that already has more members means every later rebuild seeds a strict
+// subset. The guard meant to make that visible compared len(roster) > maxMembers
+// while the query's own LIMIT was maxMembers, so it could never fire: the
+// previous round changed >= to > without changing the limit, and removed the only
+// signal in the process.
+func TestRebuildWarnsWhenTheRosterIsTruncated(t *testing.T) {
+	_, p := setup(t)
+	stub := stubAllMemberGroup(t, "grp_truncate")
+	stub.provisionErr = errStubProvision
+	r := mountProject(t, p)
+
+	seedSpace(t, spaceA, 1)
+	owner := seedUser(t, "u_owner")
+	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
+	for _, uid := range []string{"u_a", "u_b", "u_c"} {
+		seedUser(t, uid)
+		seedSpaceMember(t, spaceA, uid, 0, 1)
+	}
+
+	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
+		map[string]any{"name": "truncate"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decodeResp(t, w)
+
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_a", "u_b", "u_c"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	// Lower the cap below the roster, exactly as updateProject permits.
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET max_members = 2 WHERE project_id = ?", resp.ProjectID).Exec()
+	require.NoError(t, err)
+
+	stub.provisionErr = nil
+	stub.seeds = nil
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+resp.ProjectID+"/members/add", owner,
+		map[string]any{"uids": []string{"u_a"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	require.Len(t, stub.seeds, 1, "the rebuild must have run")
+	// max_members = 2 → the seed is bounded at 2 uids, the owner among them, so at
+	// most one non-owner reaches Members. The point is the BOUND, not which uid.
+	assert.LessOrEqual(t, len(stub.seeds[0].Members), 2,
+		"the seed must respect the project's max_members")
+	assert.NotEmpty(t, stub.seeds[0].Members,
+		"and must not collapse to nothing — a bound of 2 still admits one member "+
+			"beside the owner")
 }

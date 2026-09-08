@@ -35,6 +35,10 @@ type agentRow struct {
 	CreatorUID string `db:"creator_uid"`
 	Hosting    string `db:"hosting"`
 	Robot      int    `db:"robot"`
+	// AccountUsable mirrors the contact directory: u.status = 1 AND
+	// COALESCE(u.is_destroy, 0) <> 2. D2 says the eligibility rule matches the
+	// picker, and this is the half that was missing.
+	AccountUsable bool `db:"account_usable"`
 }
 
 // queryAgentRowsTx 在事务内读出 uids 里"看起来像分身"的那些行。
@@ -58,7 +62,17 @@ func (d *DB) queryAgentRowsTx(tx *dbr.Tx, uids []string) (map[string]agentRow, e
 	var rows []agentRow
 	_, err := tx.SelectBySql(
 		"SELECT u.uid AS uid, IFNULL(r.creator_uid, '') AS creator_uid, "+
-			"IFNULL(r.agent_hosting, '') AS hosting, u.robot AS robot "+
+			"IFNULL(r.agent_hosting, '') AS hosting, u.robot AS robot, "+
+			// 账号本身是否可用。D2 说资格口径与通讯录一致，而通讯录过的是
+			// u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2
+			// （modules/space/db_directory.go）。前一版只看 user.robot 和 robot.status，
+			// 于是一个已停用/已销毁、但 robot 行和 Space 席位还活着的账号在选择器里
+			// 看不到、却能从 agent_uids 带进来——正是 D2 那句话要堵的口子。
+			// PR #855 第四轮 review 的 Q4。
+			//
+			// 读成一个布尔而不是在 WHERE 里过滤掉：过滤掉会让它"查不到"，从而与
+			// "这个 uid 不存在"合并，日志里就分不出是哪一种了。
+			"(u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2) AS account_usable "+
 			"FROM `user` u "+
 			// LEFT JOIN，不是 INNER：一个 robot=1 但没有 robot 行的 uid（孤儿 bot）
 			// 必须能被读到并**判为不合格**，而不是查不到就当"这个 uid 不存在"——
@@ -144,6 +158,12 @@ type agentClass struct {
 	OwnerUID string
 	// Hosting 是自报的托管方式；self_hosted 与通讯录选择器同口径被排除。
 	Hosting string
+	// AccountUsable 是账号本身可不可用（u.status = 1 且未销毁），与通讯录同口径。
+	//
+	// 与 IsBot 分开，理由和 IsBot 与 OwnerUID 分开一样：IsBot 决定走哪个分支，
+	// 这一位决定该不该放行。把它并进 IsBot 会让一个已停用的 bot 落到**人类**分支，
+	// 也就是上一轮刚修掉的那个洞的另一种入口。
+	AccountUsable bool
 }
 
 // queryAgentClassTx 读一个 uid 的分身事实（D2 / D15）。
@@ -171,13 +191,15 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 		return agentClass{}, nil
 	}
 	var rows []*struct {
-		Robot      int    `db:"robot"`
-		CreatorUID string `db:"creator_uid"`
-		Hosting    string `db:"hosting"`
+		Robot         int    `db:"robot"`
+		CreatorUID    string `db:"creator_uid"`
+		Hosting       string `db:"hosting"`
+		AccountUsable bool   `db:"account_usable"`
 	}
 	_, err := tx.SelectBySql(
 		"SELECT u.robot AS robot, IFNULL(r.creator_uid, '') AS creator_uid, "+
-			"  IFNULL(r.agent_hosting, '') AS hosting "+
+			"  IFNULL(r.agent_hosting, '') AS hosting, "+
+			"  (u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2) AS account_usable "+
 			"FROM `user` u "+
 			"LEFT JOIN `robot` r ON r.robot_id = u.uid AND r.status = 1 "+
 			"WHERE u.uid = ?",
@@ -190,9 +212,10 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 		return agentClass{}, nil
 	}
 	return agentClass{
-		IsBot:    rows[0].Robot == 1,
-		OwnerUID: rows[0].CreatorUID,
-		Hosting:  rows[0].Hosting,
+		IsBot:         rows[0].Robot == 1,
+		OwnerUID:      rows[0].CreatorUID,
+		Hosting:       rows[0].Hosting,
+		AccountUsable: rows[0].AccountUsable,
 	}, nil
 }
 

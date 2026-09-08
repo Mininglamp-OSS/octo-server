@@ -64,7 +64,10 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 		return
 	}
 
-	ok, err := p.db.setAllMemberGroupNo(projectID, groupNo)
+	// 围栏在本次认领的 deadline 上，与 releaseAllMemberGroupProvision 同一条理由的
+	// 另一半：一次超时的尝试既不得清掉后继者的租约，也不得用它的旧名册快照顶掉
+	// 后继者建好的群。
+	ok, err := p.db.setAllMemberGroupNo(projectID, groupNo, lease)
 	if err != nil {
 		p.Error("写回全员群失败（群已建出，项目行未更新，由 I4 扫描 A 报出）",
 			zap.Error(err), zap.String("projectId", projectID), zap.String("groupNo", groupNo))
@@ -137,18 +140,6 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
 	// 项目活跃成员），于是一个初次建群失败过的项目**永远**补建不出来——每次写
 	// 路径都认领租约、建群失败、释放租约，无限循环，而 I4 扫描 A 会永远报着它。
 	// 这条正是补建存在的意义所在，用错人等于补建从来没生效过。
-	ownerCandidates, err := p.db.queryActiveOwnerCandidatesForProvision(projectID)
-	if err != nil {
-		p.Warn("查询项目 owner 失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
-		return ""
-	}
-	if len(ownerCandidates) == 0 {
-		// 无主项目（P0 的 Space 级联可以造出这种状态并留了 Warn）。没有人能当群主，
-		// 补建只会失败；等有 owner 了再说。I4 扫描 A 继续报着它。
-		p.Warn("项目暂无活跃 owner，跳过全员群补建",
-			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
-		return ""
-	}
 	// 补建的初始成员是**当前全体活跃成员**，不是只有 owner。
 	//
 	// 前一版传 nil，并写着"剩下的人由 admitAllMemberGroup 逐个补进去"。没有任何
@@ -165,15 +156,42 @@ func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
 	//
 	// 有界：名册不可能超过项目的 max_members（每条加人路径都在事务里数过），
 	// 取满即数据异常，记一条 Warn。
+	// maxMembers + 1：多读一行，才分得清"正好满员"和"被截断"。
+	//
+	// 上一轮这里传的是 maxMembers，于是 len(roster) > maxMembers 按构造不可能成立，
+	// 那条本该让截断可见的 Warn 是死代码——而同一个 commit 里还写着「名册**不**截断，
+	// 这是一个决定」。代码在截断，只是不说。
+	//
+	// 截断是可达的：updateProject 接受 max_members 且不校验当前活跃席位数，所以把一个
+	// 已有 300 人的项目改成 200，之后每一次补建都只会带进 200 个人。
 	maxMembers := p.cfg.effectiveMaxMembers(row.MaxMembers)
-	roster, err := p.db.queryActiveMemberUIDsForRebuild(projectID, maxMembers)
+
+	// owner 候选按成员配额取，不是按一个自选的小常数：owner 是成员的子集，所以配额
+	// 就是这里天然的界。写死一个小数会让"最资深的 N 位恰好都是 I1 泄漏"变成一次
+	// 永久失败——正是下面那段要修的缺陷的窄版本。
+	ownerCandidates, err := p.db.queryActiveOwnerCandidatesForProvision(projectID, maxMembers)
+	if err != nil {
+		p.Warn("查询项目 owner 失败，跳过补建", zap.Error(err), zap.String("projectId", projectID))
+		return ""
+	}
+	if len(ownerCandidates) == 0 {
+		// 无主项目（P0 的 Space 级联可以造出这种状态并留了 Warn）。没有人能当群主，
+		// 补建只会失败；等有 owner 了再说。I4 扫描 A 继续报着它。
+		p.Warn("项目暂无活跃 owner，跳过全员群补建",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
+		return ""
+	}
+
+	roster, err := p.db.queryActiveMemberUIDsForRebuild(projectID, maxMembers+1)
 	if err != nil {
 		p.Warn("读取项目名册失败，跳过全员群补建", zap.Error(err), zap.String("projectId", projectID))
 		return ""
 	}
 	if len(roster) > maxMembers {
-		p.Warn("补建全员群：名册超过上限，可能有成员未被带入新群（由 I4 扫描 B 报出）",
-			zap.String("projectId", projectID), zap.Int("limit", maxMembers))
+		// 多读的那一行只是探针，不进群。
+		roster = roster[:maxMembers]
+		p.Warn("补建全员群：项目活跃成员多于 max_members，名册被截断，超出的成员未带入新群（由 I4 扫描 B 报出）",
+			zap.String("projectId", projectID), zap.Int("maxMembers", maxMembers))
 	}
 
 	// 名册和 owner 候选都要先过 Space 席位这一关，因为**建群会拿它们去过**。
@@ -305,7 +323,7 @@ func (p *Project) admitAllMemberGroup(projectID, spaceID, groupNo, uid string) {
 		// 这个计数器的价值在于让"整批入群什么都没发生"这件事在仪表盘上有痕迹。
 		// 只记指标不记日志：这个分支是逐 uid 的，一次 200 人的加人会写 200 行同样的
 		// 话。批次级的那一条由 addMembers 记（它知道整批的规模）。
-		observeAllMemberGroupAdmitFailure(reasonAdmitRaceLost)
+		observeAllMemberGroupAdmitFailure(reasonAdmitSkippedNoGroup)
 		return
 	}
 	if err := admit(p.ctx, spaceID, groupNo, uid); err != nil {
