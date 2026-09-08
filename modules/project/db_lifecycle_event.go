@@ -53,6 +53,32 @@ func (d *DB) insertLifecycleEventTx(tx *dbr.Tx, row lifecycleEventRow, now time.
 // enqueued in the same millisecond by the same transaction; without the
 // tiebreak, two events sharing a timestamp could be claimed in either order, and
 // the consumer would receive a rename after the archive that superseded it.
+//
+// # The NOT EXISTS clause is what actually enforces per-project order
+//
+// At most ONE pending event per project is claimable: the row is skipped while
+// any older pending sibling exists. Everything about per-project ordering rests
+// on this clause, and it replaced an in-memory version that did not work.
+//
+// That earlier attempt blocked a project inside the delivery loop after its
+// first failure. It held for the rows in one claim and inverted on the very next
+// tick, because the two statements that hand rows back leave the queue in the
+// wrong order: the failed head is pushed to now+backoff, while a skipped tail is
+// released with next_attempt_at UNTOUCHED at its original enqueue time. So the
+// tail sorted FIRST — and during the first backoff the head was not even due, so
+// the tail was claimed alone, with an empty blocked map. It was sent, the peer
+// answered "unknown project", and a plain 4xx is terminal here: the revocation
+// behind a transiently failed creation event was abandoned. The test missed it
+// by calling the delivery loop exactly once.
+//
+// A predicate in the claim has the property the map structurally cannot: it also
+// holds ACROSS REPLICAS. One pod holding a leased head does not stop another pod
+// from claiming that project's tail, and no amount of per-process state can see
+// that.
+//
+// Cost: the subquery runs per candidate row over
+// idx_octo_project_lifecycle_event_pending, and the batch is ten rows. The
+// alternative — a window function — cannot be combined with FOR UPDATE.
 func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease time.Duration) ([]lifecycleEventRow, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -62,13 +88,17 @@ func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease 
 
 	var rows []lifecycleEventRow
 	_, err = tx.SelectBySql(
-		"SELECT id, event_id, event_type, project_id, space_id, project_version, "+
-			"payload, occurred_at, attempts "+
-			"FROM `octo_project_lifecycle_event` "+
-			"WHERE status = ? AND next_attempt_at <= ? "+
-			"  AND (lease_until IS NULL OR lease_until <= ?) "+
-			"ORDER BY next_attempt_at ASC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
-		lifecycleEventPending, now, now, limit,
+		"SELECT e.id, e.event_id, e.event_type, e.project_id, e.space_id, e.project_version, "+
+			"e.payload, e.occurred_at, e.attempts "+
+			"FROM `octo_project_lifecycle_event` e "+
+			"WHERE e.status = ? AND e.next_attempt_at <= ? "+
+			"  AND (e.lease_until IS NULL OR e.lease_until <= ?) "+
+			"  AND e.attempts < ? "+
+			"  AND NOT EXISTS ("+
+			"    SELECT 1 FROM `octo_project_lifecycle_event` older "+
+			"    WHERE older.project_id = e.project_id AND older.status = ? AND older.id < e.id) "+
+			"ORDER BY e.next_attempt_at ASC, e.id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
+		lifecycleEventPending, now, now, lifecycleEventMaxAttempts, lifecycleEventPending, limit,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: claim lifecycle events select: %w", err)
@@ -193,6 +223,58 @@ func (d *DB) releaseUnattemptedLifecycleEvents(ids []int64, owner string) error 
 		return fmt.Errorf("project: release unattempted lifecycle events: %w", err)
 	}
 	return nil
+}
+
+// abandonExhaustedLifecycleEvents retires pending rows whose attempt budget is
+// already gone.
+//
+// It is the other half of the claim-time `attempts < max` predicate, and it is
+// REQUIRED rather than tidy. The budget used to be evaluated only after Send
+// returned, so a worker that died between claiming and completing re-charged an
+// attempt on every lease expiry and the row never reached a terminal state.
+// Adding the claim-time predicate alone would convert that into something worse:
+// an exhausted row becomes unclaimable, and because the claim now refuses any
+// project with an older pending sibling, one such row would block its project's
+// queue permanently.
+//
+// So the two go together. The predicate stops budget from being spent on rows
+// that cannot use it; this sweep gives those rows the terminal state the
+// delivery path would have given them, with the same alerting attached.
+//
+// Only unleased rows: a leased row belongs to a worker that may be mid-send.
+func (d *DB) abandonExhaustedLifecycleEvents(now time.Time, reason string, limit int) ([]lifecycleEventRow, error) {
+	var rows []lifecycleEventRow
+	if _, err := d.session.SelectBySql(
+		"SELECT id, event_id, event_type, project_id, space_id, project_version, "+
+			"payload, occurred_at, attempts "+
+			"FROM `octo_project_lifecycle_event` "+
+			"WHERE status = ? AND attempts >= ? "+
+			"  AND (lease_until IS NULL OR lease_until <= ?) "+
+			"ORDER BY id LIMIT ?",
+		lifecycleEventPending, lifecycleEventMaxAttempts, now, limit,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("project: find exhausted lifecycle events: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	ids := make([]int64, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	// The status and lease predicates are repeated so a row claimed between the
+	// two statements is left to the worker that now owns it.
+	if _, err := d.session.UpdateBySql(
+		"UPDATE `octo_project_lifecycle_event` "+
+			"SET status = ?, last_error = ?, finished_at = ?, lease_owner = '', lease_until = NULL "+
+			"WHERE id IN ? AND status = ? AND attempts >= ? "+
+			"  AND (lease_until IS NULL OR lease_until <= ?)",
+		lifecycleEventAbandoned, truncateError(reason), now,
+		ids, lifecycleEventPending, lifecycleEventMaxAttempts, now,
+	).Exec(); err != nil {
+		return nil, fmt.Errorf("project: abandon exhausted lifecycle events: %w", err)
+	}
+	return rows, nil
 }
 
 // countPendingLifecycleEvents backs the backlog gauge.

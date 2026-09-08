@@ -703,11 +703,18 @@ func (p *Project) createProjectTxWithSeatRefs(
 // The sync is after the retry loop for the same reason the provisioner is: a
 // lock-conflict retry re-runs the transaction, and a rename inside the closure
 // would fire once per attempt.
-func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+//
+// It returns the row plus whether anything was actually WRITTEN. The flag exists
+// for the audit log: a request naming fields the project already matches is a
+// well-formed 200 with nothing written, and auditing it would record a change
+// that never happened — the exact defect the errNoFieldsToUpdate branch was
+// introduced to remove, reintroduced through the other door.
+func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 	var model *Model
+	var changed bool
 	err := retryOnLockConflict(func() error {
 		var e error
-		model, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
+		model, changed, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
 		return e
 	})
 	if err == nil && model != nil && req.Name != nil {
@@ -726,7 +733,7 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 		// The next rename converges them.
 		p.syncAllMemberGroupName(projectID, model.Name)
 	}
-	return model, err
+	return model, changed, err
 }
 
 // updateProject applies a partial profile update under the project row lock.
@@ -734,27 +741,27 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 // The allow-list is built here, not from the request payload: active_name and
 // is_official must never reach a SET clause, and an allow-list is the only form of
 // that guarantee which survives someone later adding a field to updateReq.
-func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, []string{actorUID})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("project: begin update: %w", err)
+		return nil, false, fmt.Errorf("project: begin update: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
 	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seatRefs); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if row == nil {
-		return nil, errProjectGone
+		return nil, false, errProjectGone
 	}
 
 	// Re-read the actor's role under the project lock. The handler's check came from the
@@ -763,10 +770,10 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	// this file already did this; update and disband were the two that did not.
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !canUpdateProject(actorRole) {
-		return nil, errPermissionDenied
+		return nil, false, errPermissionDenied
 	}
 
 	// NAMED and DIFFERENT, not merely named.
@@ -826,17 +833,32 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	// disagreed with the very next GET, and the audit log recorded a change that never
 	// happened. Both are worse than a 400.
 	if named == 0 {
-		return nil, errNoFieldsToUpdate
+		return nil, false, errNoFieldsToUpdate
 	}
 	// Named every field, changed none. NOT a 400 — the request was well formed and
 	// the project already holds the requested state, so the honest answer is the
 	// current row. Nothing is written, so updated_at does not move either, which
 	// is the same consistency argument the 400 above is made from.
 	if len(set) == 0 {
-		return row, tx.Commit()
+		return row, false, tx.Commit()
 	}
 	if err := p.db.updateProfileTx(tx, projectID, set, now); err != nil {
-		return nil, err
+		// No duplicate-name mapping here, and its absence is the correct state after
+		// the rebase rather than something lost in it.
+		//
+		// This branch used to translate a 1062 into a "name already used" sentinel,
+		// because `octo_project` carried UNIQUE (space_id, active_name). main's
+		// 20260910000001_project_read_default.sql DROPPED that index on the stated
+		// ground that project names are display labels, not tenant identity, and
+		// that one Space may hold several active projects with the same name. The
+		// only unique key left on this table is uk_octo_project_project_id.
+		//
+		// So the mapping is not merely unreachable, it would be WRONG if it ever
+		// fired: the one 1062 this statement can still raise means a project_id
+		// collision — a crypto/rand failure in newProjectID, not a user naming
+		// mistake — and reporting that as a taken name would send an operator
+		// looking at the wrong thing.
+		return nil, false, err
 	}
 	// Bump on ANY profile change, not only the fields a consumer is told about.
 	// Bumping selectively would let two distinct project states share a version,
@@ -844,11 +866,11 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	// then drop the second one. Versions must be monotonic; they need not be
 	// gap-free, so an unreported change simply advances the counter.
 	if _, err := p.db.bumpLifecycleVersionTx(tx, projectID, now); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	version, err := p.db.readLifecycleVersionTx(tx, projectID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	row.LifecycleVersion = version
 	// Payload is EMPTY: the event says "this project's profile changed, at
@@ -863,13 +885,13 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 		Payload:        metadataUpdatedPayload{},
 		OccurredAt:     now,
 	}, now); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("project: commit update: %w", err)
+		return nil, false, fmt.Errorf("project: commit update: %w", err)
 	}
 	row.UpdatedAt = now
-	return row, nil
+	return row, true, nil
 }
 
 // disbandProject runs disbandProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.

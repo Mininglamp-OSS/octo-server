@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -108,6 +109,35 @@ func TestATransientFailureHoldsBackOnlyItsOwnProject(t *testing.T) {
 		b.ProjectID + "/" + LifecycleEventProjectCreated,
 	}, sender.snapshot(),
 		"A's metadata_updated must not be sent while A's created is still owed")
+
+	// A SECOND TICK, and this is the assertion that matters.
+	//
+	// The first version of this ordering rule was an in-memory `blocked` map in
+	// the delivery loop, and a single-tick test made it read as pinned. It was
+	// not: rescheduleLifecycleEvent pushes the failed head to now+backoff while a
+	// released tail keeps its original next_attempt_at, and the claim orders by
+	// next_attempt_at — so on the next tick the tail sorted FIRST, and during the
+	// first backoff the head was not even due, so the tail was claimed ALONE with
+	// an empty map. The rule now lives in the claim query, where it also holds
+	// across replicas; a per-process map cannot see another pod's leased head at
+	// all.
+	//
+	// A third tick, past the 2s first backoff, would deliver A's head and then its
+	// tail. This stops at two because the property under test is that the tail
+	// cannot overtake, not how long the backoff is.
+	p.runLifecycleEventDelivery()
+	for _, sent := range sender.snapshot() {
+		assert.NotEqual(t, a.ProjectID+"/"+LifecycleEventMetadataUpdated, sent,
+			"A's metadata_updated overtook A's still-owed project.created on a later tick. "+
+				"The peer answers 'unknown project' — a plain 4xx, which is TERMINAL here — so "+
+				"a revocation queued behind a transiently failed creation event is abandoned.")
+	}
+
+	// The tail is still pending and still unattempted: held back, not charged.
+	rowsA = outboxRows(t, a.ProjectID)
+	require.Len(t, rowsA, 2)
+	assert.EqualValues(t, lifecycleEventPending, rowsA[1].Status)
+	assert.Zero(t, rowsA[1].Attempts, "a row the claim declined to take must not be charged")
 }
 
 // TestAnAbandonedEventDoesNotStallItsProjectForever is the other half of the
@@ -135,10 +165,23 @@ func TestAnAbandonedEventDoesNotStallItsProjectForever(t *testing.T) {
 		return lifecycleDeliveryResult{}, false
 	}}
 	p.runLifecycleEventDelivery()
-
 	rows := outboxRows(t, created.ProjectID)
 	require.Len(t, rows, 2)
-	assert.EqualValues(t, lifecycleEventAbandoned, rows[0].Status)
+	require.EqualValues(t, lifecycleEventAbandoned, rows[0].Status)
+	assert.EqualValues(t, lifecycleEventPending, rows[1].Status,
+		"the claim takes at most one pending row per project, so the tail waits for the "+
+			"next tick — it is not delivered alongside the head")
+
+	// The NEXT tick is where the property lives. The claim declines a project that
+	// still has an older PENDING sibling; `abandoned` is not pending, so the tail
+	// becomes claimable as soon as the head reaches a terminal state.
+	//
+	// That distinction is the whole point. Abandoned is terminal and nothing
+	// retries it, so blocking on it would convert one lost event into a project
+	// that never receives another — while blocking on a merely FAILED head is
+	// exactly what has to happen.
+	p.runLifecycleEventDelivery()
+	rows = outboxRows(t, created.ProjectID)
 	assert.EqualValues(t, lifecycleEventDelivered, rows[1].Status,
 		"a terminally abandoned event must not block the ones behind it: nothing will ever "+
 			"retry it, so the project would never receive another event")
@@ -203,4 +246,56 @@ func TestTheGateAndTheClientAgree(t *testing.T) {
 				tc.url, len(tc.secret), clientErr == nil, gateOK)
 		}
 	}
+}
+
+// TestExhaustedRowsAreSweptRatherThanBlockingTheirProject is the other half of
+// the claim-time budget predicate.
+//
+// The budget used to be evaluated only after Send returned, so a worker that
+// died between claiming and completing re-charged an attempt on every lease
+// expiry and the row never reached a terminal state. Adding `attempts < max` to
+// the claim alone would make that strictly worse: the row becomes unclaimable,
+// and because the claim declines any project with an older pending sibling, one
+// such row blocks its project's queue permanently.
+func TestExhaustedRowsAreSweptRatherThanBlockingTheirProject(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "sweepOwner")
+	seedSpaceMember(t, spaceA, "sweepOwner", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "sweep-me")
+	w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
+		map[string]any{"name": "sweep-me-2"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	// Reproduce the crash shape: the head row has spent its whole budget without
+	// ever reaching a terminal state.
+	rows := outboxRows(t, created.ProjectID)
+	require.Len(t, rows, 2)
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project_lifecycle_event` SET attempts = ? WHERE event_id = ?",
+		lifecycleEventMaxAttempts, rows[0].EventID).Exec()
+	require.NoError(t, err)
+
+	sender := &scriptedSender{}
+	p.lifecycleEventSender = sender
+
+	// Before the sweep the project is stuck: the head cannot be claimed (no budget)
+	// and the tail cannot be claimed (an older pending sibling exists).
+	p.runLifecycleEventDelivery()
+	assert.Empty(t, sender.snapshot(),
+		"an exhausted head must not be claimed, and it must block its own tail while pending")
+
+	p.sweepExhaustedLifecycleEvents()
+	after := outboxRows(t, created.ProjectID)
+	assert.EqualValues(t, lifecycleEventAbandoned, after[0].Status,
+		"the sweep must give the row the terminal state the delivery path can no longer reach")
+	assert.NotEmpty(t, after[0].LastError, "and say why, in the column the runbook reads")
+
+	// And the project moves again.
+	p.runLifecycleEventDelivery()
+	assert.Equal(t, []string{created.ProjectID + "/" + LifecycleEventMetadataUpdated},
+		sender.snapshot(), "once the head is terminal the tail is claimable")
 }

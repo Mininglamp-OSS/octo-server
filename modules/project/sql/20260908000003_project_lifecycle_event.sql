@@ -85,7 +85,12 @@ CREATE TABLE IF NOT EXISTS `octo_project_lifecycle_event` (
   UNIQUE KEY `uk_octo_project_lifecycle_event_id` (`event_id`),
   KEY `idx_octo_project_lifecycle_event_pending` (`status`, `next_attempt_at`, `lease_until`),
   KEY `idx_octo_project_lifecycle_event_project` (`project_id`, `id`),
-  KEY `idx_octo_project_lifecycle_event_finished` (`status`, `finished_at`)
+  KEY `idx_octo_project_lifecycle_event_finished` (`status`, `finished_at`),
+  -- 积压年龄 gauge 的索引：`WHERE status = 0 ORDER BY created_at LIMIT 1`。
+  -- 上面 pending 那条索引的第二列是 next_attempt_at，帮不上这个排序，于是 MySQL 要对整个
+  -- pending 集合做 filesort。这里的代价曲线和 0004 的 activated_at 正好相反：稳态（队列空）
+  -- 几乎免费，**积压时最贵**——而积压正是这个 gauge 唯一有意义的时刻。
+  KEY `idx_octo_project_lifecycle_event_age` (`status`, `created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='项目生命周期事件发件箱（O4）';
 
 -- +migrate Down

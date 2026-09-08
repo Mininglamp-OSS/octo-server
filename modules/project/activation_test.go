@@ -240,16 +240,86 @@ func TestReconcileDoesNotLatchAnUnconfirmedProject(t *testing.T) {
 // reactive path it backs up.
 func TestDriveReadyDoesNotSatisfyTheRepair(t *testing.T) {
 	fleet := newFakeTarget(t)
+	fleet.setStatus(500)
 	drive := newFakeTarget(t)
+	// BOTH targets stay configured. Dropping fleet from the config to isolate the
+	// drive job would change which repair runs at all — with no fleet target
+	// nothing can ever confirm the project, and the straggler branch latches it on
+	// purpose. Keeping fleet enabled but failing is what puts the confirmation
+	// repair, and only it, under test.
 	p, r, token := provisioningSetup(t, fleet, drive)
 	created := createVia(t, r, token, "activate-repair-drive")
 
-	p.cfg.Provisioning.Targets = []provisionTarget{driveTargetOn(drive)}
 	p.processProvisioningJobs()
+	byTarget := map[string]uint8{}
+	for _, row := range readProvisioningRows(t, created.ProjectID) {
+		byTarget[row.Target] = row.Status
+	}
+	require.Equal(t, provisionStatusReady, byTarget[TargetDrive], "precondition: drive succeeded")
+	require.NotEqual(t, provisionStatusReady, byTarget[TargetFleet], "precondition: fleet did not")
 	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition")
+	require.True(t, p.twoPhaseCreateApplies(), "precondition: the fleet target is enabled")
 
 	p.scanUnlatchedActivations()
 
 	assert.Nil(t, activatedAtOf(t, created.ProjectID),
-		"a ready DRIVE job must not satisfy the repair either")
+		"a ready DRIVE job must not satisfy the repair: drive is storage and says nothing "+
+			"about whether the peer control plane may act on the project")
+}
+
+// TestRollingUpgradeStragglersGetLatched is P1-4: the case with no confirming
+// step at all.
+//
+// activated_at is a column with a ONE-SHOT backfill. Between the first pod
+// applying the migration and the last old pod draining, old binaries insert
+// through the previous column list — which does not name it — so those rows land
+// NULL after the backfill has already run, and both inbound endpoints then hide
+// them from the peer.
+//
+// The confirmation repair cannot reach them: it needs a ready fleet provisioning
+// row, and with the fleet target off none is ever written. So without this they
+// are invisible to the peer forever and awaiting_activation climbs monotonically,
+// with hand-written SQL as the only remedy.
+func TestRollingUpgradeStragglersGetLatched(t *testing.T) {
+	_, p := setup(t)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "stragglerOwner")
+	seedSpaceMember(t, spaceA, "stragglerOwner", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "straggler")
+	// Exactly what an old binary leaves behind: the column exists, the row does
+	// not name it, so it is NULL after the backfill has run.
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = NULL WHERE project_id = ?",
+		created.ProjectID).Exec()
+	require.NoError(t, err)
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition")
+	require.False(t, p.twoPhaseCreateApplies(), "precondition: nothing will confirm it")
+
+	p.scanUnlatchedActivations()
+
+	require.NotNil(t, activatedAtOf(t, created.ProjectID),
+		"with the fleet target off nothing will ever confirm this project, so the scan must "+
+			"latch it — the alternative is not 'confirmed later', it is invisible forever")
+}
+
+// TestStragglerRepairDoesNotFireWhileSomethingCanStillConfirm keeps the two
+// repairs apart. Latching unconditionally would turn the gate into a delay of
+// one reconcile interval rather than a gate.
+func TestStragglerRepairDoesNotFireWhileSomethingCanStillConfirm(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.setStatus(500)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "straggler-gated")
+
+	p.processProvisioningJobs()
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition: the ensure failed")
+	require.True(t, p.twoPhaseCreateApplies(), "precondition: the fleet target is on")
+
+	p.scanUnlatchedActivations()
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"while the fleet target is enabled the straggler repair must NOT run: a confirmation "+
+			"is still possible, and latching here would make the gate a delay")
 }

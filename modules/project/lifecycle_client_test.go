@@ -3,10 +3,13 @@ package project
 import (
 	"context"
 	"encoding/json"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,8 +171,11 @@ func TestEnvelopeShape(t *testing.T) {
 			t.Errorf("envelope is missing %q", key)
 		}
 	}
-	if got["occurred_at"] != "2026-09-07T10:45:00Z" {
-		t.Errorf("occurred_at must be RFC3339 UTC, got %v", got["occurred_at"])
+	// Milliseconds, matching the contract's example envelope and the DATETIME(3)
+	// column the value comes from. time.RFC3339 drops the fractional part, so the
+	// millisecond was stored and then discarded on the wire.
+	if got["occurred_at"] != "2026-09-07T10:45:00.000Z" {
+		t.Errorf("occurred_at must be RFC3339 UTC with milliseconds, got %v", got["occurred_at"])
 	}
 	payload, ok := got["payload"].(map[string]any)
 	if !ok {
@@ -183,7 +189,7 @@ func TestEnvelopeShape(t *testing.T) {
 // TestEnvelopeOmitsAbsentVersion: an event carrying no lifecycle version must
 // omit the key rather than send null or zero. Zero is a real version — the value
 // pre-migration rows carry — so sending it would read as an ordering claim.
-func TestEnvelopeOmitsAbsentVersion(t *testing.T) {
+func TestEnvelopeSpellsAnAbsentVersionAsExplicitNull(t *testing.T) {
 	row := lifecycleEventRow{
 		EventID:    "id",
 		EventType:  LifecycleEventRestored,
@@ -196,8 +202,22 @@ func TestEnvelopeOmitsAbsentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if strings.Contains(string(raw), "project_version") {
-		t.Fatalf("an absent version must be omitted, not sent as null or 0: %s", raw)
+	// PRESENT and null, not omitted. The contract says an event that does not
+	// order by version carries project_version: null (§2, §3), and an omitted key
+	// is a different wire shape. Go decoders map both to a nil pointer, which is
+	// why omitempty looked free — but a peer validating the envelope against a
+	// schema written from §2 answers a plain 4xx, and a plain 4xx is terminal
+	// here, so the first event abandoned would be member_revoked.
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	v, ok := decoded["project_version"]
+	if !ok {
+		t.Fatalf("project_version must be present as null, not omitted: %s", raw)
+	}
+	if string(v) != "null" {
+		t.Fatalf("an absent version must be spelled null, got %s", v)
 	}
 }
 
@@ -324,5 +344,84 @@ func TestClientRefusesAShortSecret(t *testing.T) {
 	if _, err := newLifecycleHTTPClient(url, strings.Repeat("k", lifecycleEventMinSecretBytes), time.Second); err != nil {
 		t.Fatalf("a %d-byte secret is exactly the floor and must be accepted, got %v",
 			lifecycleEventMinSecretBytes, err)
+	}
+}
+
+// TestClientRefusesRedirectsAndProxies is P1-1: the two hardening properties the
+// repository's other two signed outbound clients already carry, and this one did
+// not.
+//
+// The redirect half is the one that produces a WRONG ANSWER rather than a
+// failure. Go rewrites a 302 POST into a GET and drops the body; if the target
+// answers 2xx, the delivery is classified OK, the row is marked delivered, the
+// counter increments "delivered" and the backlog gauge falls — while the peer
+// never saw the event. For a member revocation that is a permanent loss reported
+// as a success.
+func TestClientRefusesRedirectsAndProxies(t *testing.T) {
+	var landed int32
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&landed, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/internal/project-events", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	c, err := newLifecycleHTTPClient(redirector.URL+"/internal/project-events",
+		strings.Repeat("k", 32), 2*time.Second)
+	require.NoError(t, err)
+
+	res := c.Send(context.Background(), lifecycleEventEnvelope{
+		EventID: "11111111-1111-4111-8111-111111111111", EventType: LifecycleEventMemberRevoked,
+		ProjectID: "p", SpaceID: "s", OccurredAt: "2026-09-08T00:00:00.000Z",
+		Payload: json.RawMessage(`{}`),
+	})
+
+	assert.False(t, res.OK,
+		"a redirect must never be reported as delivered: Go drops the body on a 302 POST, so "+
+			"a 2xx from the target would mark the event delivered while the peer never saw it")
+	assert.Equal(t, lifecycleErrRedirect, res.Class)
+	assert.True(t, res.Retryable,
+		"a peer migration that temporarily fronts the endpoint self-heals; for a revocation, "+
+			"abandoning after the budget beats abandoning on the first attempt")
+	assert.Zero(t, atomic.LoadInt32(&landed), "the client must not follow the redirect at all")
+
+	// And the transport refuses the ambient proxy, so a deployment-level setting
+	// cannot interpose the revocation feed.
+	require.NotNil(t, c.client.Transport)
+	tr, ok := c.client.Transport.(*http.Transport)
+	require.True(t, ok, "the transport must be a configured *http.Transport, not the default")
+	assert.Nil(t, tr.Proxy, "HTTP(S)_PROXY must not be honoured for a signed outbound feed")
+}
+
+// TestValidateMatchesTheProvisioningValidator is P1-3. This is the third signed
+// outbound client against the same peer and the same signing scheme, and its
+// validator was a strict subset of the one already guarding the other channel.
+//
+// The scheme check is the load-bearing one: `htps://peer/hook` is a
+// one-character typo that parses to a real Host and Path, so the enqueue gate
+// opened and every attempt failed with "unsupported protocol scheme" — which is
+// classified RETRYABLE, so every event burned twelve attempts and abandoned.
+func TestValidateMatchesTheProvisioningValidator(t *testing.T) {
+	good := strings.Repeat("k", 32)
+	for name, raw := range map[string]string{
+		"typo'd scheme":   "htps://peer.invalid/internal/project-events",
+		"non-http scheme": "ftp://peer.invalid/internal/project-events",
+		"userinfo":        "https://user:pw@peer.invalid/internal/project-events",
+		"bare query":      "https://peer.invalid/internal/project-events?",
+		"fragment":        "https://peer.invalid/internal/project-events#frag",
+		"no host":         "https://:8080/internal/project-events",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateLifecycleEndpoint(raw, good); err == nil {
+				t.Fatalf("%q must be refused; projectprovision.ValidateTarget refuses it for the "+
+					"same signing scheme", raw)
+			}
+		})
+	}
+	if err := validateLifecycleEndpoint("https://peer.invalid/internal/project-events", good); err != nil {
+		t.Fatalf("a well-formed endpoint must still be accepted, got %v", err)
 	}
 }

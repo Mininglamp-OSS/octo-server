@@ -49,7 +49,7 @@ func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 
 	// updateProject
 	desc := "should not land"
-	_, err = p.updateProject(created.ProjectID, "admin9", spaceID, updateReq{Description: &desc})
+	_, _, err = p.updateProject(created.ProjectID, "admin9", spaceID, updateReq{Description: &desc})
 	assert.ErrorIs(t, err, errNotSpaceMember, "updateProject must refuse an actor without a Space seat")
 
 	// disbandProject

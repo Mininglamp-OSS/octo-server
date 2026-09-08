@@ -346,3 +346,34 @@ func lifecycleVersionOf(t *testing.T, projectID string) int64 {
 	require.Len(t, v, 1)
 	return v[0]
 }
+
+// TestANoOpUpdateWritesNoAuditEntry is the other half of the no-op fix.
+//
+// The service stopped writing, but the handler still called p.audit on any
+// err == nil — so the audit log recorded a change that never happened. That is
+// verbatim the argument the errNoFieldsToUpdate branch is made from, arriving
+// through the other door.
+func TestANoOpUpdateWritesNoAuditEntry(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	rec := &auditRecorder{}
+	p.auditSink = rec.sink
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "auditUpdater")
+	seedSpaceMember(t, spaceA, "auditUpdater", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "audit-noop")
+	before := len(rec.byAction(auditUpdate))
+
+	w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
+		map[string]any{"name": "audit-noop"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, before, len(rec.byAction(auditUpdate)),
+		"a request that changed nothing must not be audited as an update")
+
+	w = doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
+		map[string]any{"name": "audit-noop-real"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, before+1, len(rec.byAction(auditUpdate)), "a real change is still audited")
+}

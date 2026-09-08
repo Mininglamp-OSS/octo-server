@@ -39,7 +39,7 @@ func TestEveryWritePathNamesTheActorsOwnMissingSpaceSeat(t *testing.T) {
 	seedSpaceMember(t, spaceA, "acT", 0, 1)
 
 	desc := "nope"
-	_, uErr := p.updateProject(pid, "ac9", spaceA, updateReq{Description: &desc})
+	_, _, uErr := p.updateProject(pid, "ac9", spaceA, updateReq{Description: &desc})
 	assert.ErrorIs(t, uErr, errActorNotSpaceMember, "updateProject must name the ACTOR's seat")
 
 	_, dErr := p.disbandProject(pid, "ac9", spaceA)

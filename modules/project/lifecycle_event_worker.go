@@ -52,6 +52,8 @@ const (
 	lifecycleEventRetention  = 30 * 24 * time.Hour
 	lifecycleEventPurgeBatch = 500
 	lifecycleEventPurgeEvery = time.Hour
+	// lifecycleEventSweepEvery is how often exhausted-but-pending rows are retired.
+	lifecycleEventSweepEvery = 5 * time.Minute
 )
 
 var (
@@ -97,6 +99,9 @@ func (p *Project) startLifecycleEventWorker() {
 	lifecycleEventWorkerOnce.Do(func() {
 		p.ctx.Schedule(lifecycleEventPollInterval, p.runLifecycleEventDelivery)
 		p.ctx.Schedule(jitter(lifecycleEventPurgeEvery), p.purgeLifecycleEvents)
+		// Sparser than delivery: it only has work when a worker died mid-attempt,
+		// and each pass is bounded. Jittered so replicas do not converge on it.
+		p.ctx.Schedule(jitter(lifecycleEventSweepEvery), p.sweepExhaustedLifecycleEvents)
 	})
 }
 
@@ -157,35 +162,50 @@ func (p *Project) runLifecycleEventDelivery() {
 		return
 	}
 
-	// ONE PROJECT AT A TIME, IN ORDER, AND STOP THAT PROJECT ON ITS FIRST FAILURE.
-	//
-	// The queue is ordered globally (next_attempt_at, id), but delivery is not
-	// automatically ordered PER PROJECT, and for this peer it has to be. A
-	// project.created that hits a transient 503 is rescheduled with backoff and
-	// drops behind; the next row for the same project is then sent first, and the
-	// peer answers "unknown project" — a plain 4xx, which this client classifies
-	// as terminal. So one transient failure on the creation event could
-	// permanently ABANDON the member_revoked behind it, which is the one loss this
-	// module calls a security failure rather than a stale display.
-	//
-	// Blocking is per project, not per batch: other projects in the same claim are
-	// unaffected, so a single slow peer response does not stall the queue. Rows
-	// skipped this way are released with their attempt refunded — they were never
-	// sent, and charging them would retire a project's tail without a single
-	// delivery attempt on it.
-	blocked := make(map[string]bool)
-	var skipped []int64
+	// No per-project bookkeeping here, deliberately: the CLAIM guarantees at most
+	// one pending event per project (see claimLifecycleEvents), so a batch cannot
+	// contain two rows of the same project and there is nothing for this loop to
+	// order. An earlier version tracked a `blocked` map here instead, which held
+	// inside one batch and inverted on the very next tick — the full account is on
+	// the claim query, along with why a per-process map could not have worked
+	// across replicas anyway.
 	for _, row := range rows {
-		if blocked[row.ProjectID] {
-			skipped = append(skipped, row.ID)
-			continue
-		}
-		if !p.deliverLifecycleEvent(sender, row, owner) {
-			blocked[row.ProjectID] = true
-		}
+		p.deliverLifecycleEvent(sender, row, owner)
 	}
-	if err := p.db.releaseUnattemptedLifecycleEvents(skipped, owner); err != nil {
-		p.Warn("交还被跳过的项目生命周期事件失败", zap.Error(err))
+}
+
+// sweepExhaustedLifecycleEvents retires pending rows that have no attempt budget
+// left, which the delivery path can no longer reach.
+//
+// See abandonExhaustedLifecycleEvents for why the claim-time budget predicate
+// requires this: without it an exhausted row is unclaimable AND blocks its
+// project's queue forever, because the claim refuses any project with an older
+// pending sibling.
+func (p *Project) sweepExhaustedLifecycleEvents() {
+	defer func() {
+		if r := recover(); r != nil {
+			p.Error("项目生命周期事件预算清扫 panic", zap.Any("recover", r))
+		}
+	}()
+	now := time.Now().UTC()
+	rows, err := p.db.abandonExhaustedLifecycleEvents(now,
+		"exhausted: attempts spent without a terminal outcome", lifecycleEventBatch)
+	if err != nil {
+		p.Error("清扫预算耗尽的项目生命周期事件失败", zap.Error(err))
+		return
+	}
+	for _, row := range rows {
+		lifecycleEventOutcome.WithLabelValues(row.EventType, "abandoned", "exhausted").Inc()
+		// Same severity and the same fields as the delivery-path abandon: this is
+		// not a tidier outcome for having been reached by a sweep. For a member
+		// revocation it still means the peer will never be told.
+		p.Error("项目生命周期事件预算耗尽且无终态，已清扫为放弃；对端不会收到该变更",
+			zap.Int64("id", row.ID),
+			zap.String("event_id", row.EventID),
+			zap.String("event_type", row.EventType),
+			zap.String("project_id", row.ProjectID),
+			zap.Int("attempts", row.Attempts),
+			zap.Error(errFleetTerminal))
 	}
 }
 
@@ -311,7 +331,10 @@ func (p *Project) abandonLifecycleEvent(row lifecycleEventRow, owner string, res
 		zap.String("project_id", row.ProjectID),
 		zap.Int("attempts", row.Attempts),
 		zap.String("error_class", res.Class),
-		zap.String("detail", res.Detail),
+		// truncateError, not res.Detail raw: Detail embeds the `code` parsed out of
+		// up to 8 KiB of peer response body, and truncateError is what bounds it
+		// for the database column. A log line has no column to stop it.
+		zap.String("detail", truncateError(res.Detail)),
 		zap.Error(errFleetTerminal))
 }
 

@@ -53,7 +53,7 @@ type Project struct {
 	// projectMiddleware resolves Space membership with a live uncached read and refuses first,
 	// so only the middleware-to-transaction race window produces it. A seam is the only way to
 	// drive it deterministically.
-	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, error)
+	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error)
 	disbandFn func(projectID, actorUID, spaceID string) ([]string, error)
 
 	// lifecycleEventSender is the delivery seam for the lifecycle outbox.
@@ -123,7 +123,7 @@ func New(ctx *config.Context) *Project {
 	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		return p.removeMember(projectID, spaceID, actorUID, targetUID)
 	}
-	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 		return p.updateProject(projectID, actorUID, spaceID, req)
 	}
 	p.disbandFn = func(projectID, actorUID, spaceID string) ([]string, error) {
@@ -489,7 +489,7 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	}
 
 	uid := c.GetLoginUID()
-	updated, err := p.updateFn(row.ProjectID, uid, row.SpaceID, req)
+	updated, changed, err := p.updateFn(row.ProjectID, uid, row.SpaceID, req)
 	switch {
 	case err == nil:
 	case errors.Is(err, errProjectGone):
@@ -518,7 +518,13 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		return
 	}
 
-	p.audit(auditUpdate, uid, "", row.ProjectID, row.SpaceID, "")
+	// Only when something was written. A request naming fields the project already
+	// matches succeeds with nothing changed, and auditing it would record a change
+	// that never happened — which is the argument errNoFieldsToUpdate above is
+	// made from, and it applies just as well to this branch.
+	if changed {
+		p.audit(auditUpdate, uid, "", row.ProjectID, row.SpaceID, "")
+	}
 	// The count no longer fails the response. It never should have: the update
 	// COMMITTED, and answering 500 because a display aggregate hiccuped tells the
 	// caller their write failed when it did not, which is the one thing a response

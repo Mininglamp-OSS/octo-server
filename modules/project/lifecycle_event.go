@@ -155,11 +155,18 @@ type restoredPayload struct{}
 // rows already queued. The payload — the only part the consumer fingerprints —
 // is the part that stays byte-identical.
 type lifecycleEventEnvelope struct {
-	EventID        string          `json:"event_id"`
-	EventType      string          `json:"event_type"`
-	ProjectID      string          `json:"project_id"`
-	SpaceID        string          `json:"space_id"`
-	ProjectVersion *int64          `json:"project_version,omitempty"`
+	EventID   string `json:"event_id"`
+	EventType string `json:"event_type"`
+	ProjectID string `json:"project_id"`
+	SpaceID   string `json:"space_id"`
+	// NOT omitempty. The contract says an event that does not order by version
+	// carries project_version: null (§2, §3), and an omitted key is a different
+	// wire shape from an explicit null. Go decoders map both to a nil pointer, so
+	// this looked free — but a peer validating the envelope against a schema that
+	// read §2 literally answers a plain 4xx, and a plain 4xx is TERMINAL here. The
+	// event abandoned on its first attempt would be member_revoked, which is the
+	// one loss this module treats as a security failure.
+	ProjectVersion *int64          `json:"project_version"`
 	OccurredAt     string          `json:"occurred_at"`
 	Payload        json.RawMessage `json:"payload"`
 }
@@ -177,6 +184,13 @@ type lifecycleEventRow struct {
 	Attempts       int             `db:"attempts"`
 }
 
+// lifecycleTimeLayout is RFC3339 with milliseconds, matching the contract's
+// example envelope (§2) and the DATETIME(3) column the value comes from.
+// time.RFC3339 drops the fractional part, so the millisecond was stored and then
+// discarded on the wire — and occurred_at is the business-fact timestamp a
+// consumer may order by.
+const lifecycleTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
 // envelope renders the row for transmission. occurred_at is RFC3339 in UTC
 // because the column is UTC by construction and the consumer parses a string.
 func (r lifecycleEventRow) envelope() lifecycleEventEnvelope {
@@ -186,7 +200,7 @@ func (r lifecycleEventRow) envelope() lifecycleEventEnvelope {
 		ProjectID:      r.ProjectID,
 		SpaceID:        r.SpaceID,
 		ProjectVersion: r.ProjectVersion,
-		OccurredAt:     r.OccurredAt.UTC().Format(time.RFC3339),
+		OccurredAt:     r.OccurredAt.UTC().Format(lifecycleTimeLayout),
 		Payload:        r.Payload,
 	}
 }

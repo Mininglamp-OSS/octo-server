@@ -57,6 +57,8 @@ const (
 	lifecycleErrConflict = "conflict"
 	// lifecycleErrRejected is any other 4xx: the peer will not accept this payload.
 	lifecycleErrRejected = "rejected"
+	// lifecycleErrRedirect is a 3xx, which this client refuses to follow.
+	lifecycleErrRedirect = "redirect"
 )
 
 // lifecycleDeliveryResult is what one attempt produced.
@@ -120,21 +122,46 @@ func validateLifecycleEndpoint(rawURL, secret string) error {
 	if err != nil {
 		return fmt.Errorf("project: lifecycle event url: %w", err)
 	}
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("project: lifecycle event url must be absolute, got %q", rawURL)
+	// The four predicates below are projectprovision.ValidateTarget's, not a
+	// weaker paraphrase of them. This is the third signed outbound client in the
+	// repository against the same peer and the same pkg/octosign scheme, and the
+	// first version of this function checked only that Scheme and Host were
+	// non-empty — which let `htps://peer/hook` (a one-character typo) through:
+	// it parses to Scheme "htps" with a real Host and Path, so the enqueue gate
+	// opened, every Do failed with "unsupported protocol scheme", and that is
+	// classified RETRYABLE, so every event burned its twelve attempts over half
+	// an hour and abandoned. Same end state as the query-string hole this branch
+	// already graded P1, differing only in that abandonment eventually logs.
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("project: lifecycle event url must be http or https, got %q", parsed.Scheme)
+	}
+	// Hostname(), not Host: Host keeps the ":port", so "https://:8080/events"
+	// passes a Host != "" check while having no host at all.
+	if parsed.Hostname() == "" || parsed.Opaque != "" {
+		return errors.New("project: lifecycle event url has no host")
+	}
+	if parsed.User != nil {
+		return errors.New("project: lifecycle event url must not carry userinfo")
 	}
 	// A URL with no path would sign the empty string, and the peer would verify
 	// against whatever path its router matched — the two would never agree.
 	if parsed.EscapedPath() == "" || parsed.EscapedPath() == "/" {
 		return errors.New("project: lifecycle event url must include the event path")
 	}
-	if parsed.RawQuery != "" {
+	if parsed.RawQuery != "" || parsed.ForceQuery {
 		// Refused rather than silently dropped: the signature does NOT cover the
 		// query, so anything put there is unauthenticated and an on-path rewrite
 		// of it would go undetected. Better to fail at boot than to ship a
-		// parameter the operator believes is protected.
+		// parameter the operator believes is protected. ForceQuery covers the
+		// bare trailing "?", where RawQuery is empty but the separator still
+		// reaches the wire.
 		return errors.New("project: lifecycle event url must not carry a query string; " +
 			"the signature does not cover it")
+	}
+	// A fragment is never sent, so one in configuration means the value was
+	// pasted from somewhere it did not belong.
+	if parsed.Fragment != "" {
+		return errors.New("project: lifecycle event url must not contain a fragment")
 	}
 	// A floor on the key, the same 32 bytes projectprovision.ValidateTarget
 	// requires of the provisioning secrets, and here for the same reason: HMAC's
@@ -159,6 +186,25 @@ func newLifecycleHTTPClient(rawURL, secret string, timeout time.Duration) (*life
 	if err != nil {
 		return nil, fmt.Errorf("project: lifecycle event url: %w", err)
 	}
+	// Proxy cleared, redirects refused — the same hardening
+	// projectprovision.NewClient and internal/cardactiondispatch already apply to
+	// this signing scheme, and it belongs here for two reasons rather than one.
+	//
+	// PROXY. The destination is one exact, operator-registered URL. Honouring
+	// HTTP(S)_PROXY would let an unrelated deployment-level setting interpose the
+	// entire revocation feed, silently.
+	//
+	// REDIRECTS, and this is the one that produces a wrong answer rather than a
+	// failure. Go rewrites a 301/302/303 POST into a GET and DROPS the body; if
+	// the redirect target answers 2xx, classifyLifecycleResponse reports OK, the
+	// row is marked delivered, the counter increments "delivered" and the backlog
+	// gauge falls — while the peer never saw the event. For a member revocation
+	// that is a permanent loss reported as a success, which is strictly worse
+	// than the abandonment path this module built its alerting around. A 307/308
+	// is the other half: it re-sends the signed body and X-Octo-Signature to a
+	// host the signature was not computed for.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	return &lifecycleHTTPClient{
 		url:    rawURL,
 		path:   parsed.EscapedPath(),
@@ -166,7 +212,13 @@ func newLifecycleHTTPClient(rawURL, secret string, timeout time.Duration) (*life
 		clock:  time.Now,
 		// One client, reused: a per-request client leaks a connection pool per
 		// call and defeats keep-alive against a peer this talks to constantly.
-		client: &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}, nil
 }
 
@@ -266,6 +318,18 @@ func classifyLifecycleResponse(status int, body []byte) lifecycleDeliveryResult 
 
 	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
 		return lifecycleDeliveryResult{Retryable: true, Class: lifecycleErrThrottled, Detail: detail(status, code)}
+
+	case status >= 300 && status < 400:
+		// A redirect, which this client does not follow (see newLifecycleHTTPClient).
+		// It gets its own class rather than falling into the terminal default,
+		// because the two readings want opposite handling and only one of them is
+		// recoverable: a peer migration that temporarily fronts the endpoint with
+		// a redirect self-heals, while a stale configured URL does not. Retryable
+		// for the reason 401/403 is — for a member revocation, "abandon after
+		// twelve attempts with a chance to self-heal" strictly dominates "abandon
+		// on the first", and the alert fires either way. The class is what tells
+		// an operator to check the URL rather than the peer.
+		return lifecycleDeliveryResult{Retryable: true, Class: lifecycleErrRedirect, Detail: detail(status, code)}
 
 	case status >= 500:
 		return lifecycleDeliveryResult{Retryable: true, Class: lifecycleErrServer, Detail: detail(status, code)}
