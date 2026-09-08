@@ -53,9 +53,12 @@ Reuse existing DB sessions, membership queries, errors and test helpers.
 - The extension returns `bot_context` (identity, active state, self-reported
   hosting plus report time, and Space membership) separately from
   `owner_context` (identity, active state, Space membership and answers for the
-  requested Projects). Owner membership must never be represented as the Bot's
-  own Project membership.
-- A failed context lookup sets `context_error` and omits both contexts;
+  requested Projects). Both contexts call the nested request scope
+  `requested_space_id`. Owner membership must never be represented as the Bot's
+  own Project membership, and the Bot credential may receive only the owner's
+  Project `member` and `role` facts—not capabilities or membership epochs.
+- A failed context lookup sets `context_error` and returns both contexts in an
+  empty, fail-secure form (including `projects: []`);
   disabled, cooling-off, or destroyed identities and missing Space membership
   disclose no Project roles.
 - Without `include=owner_context`, the original verifier's five fields and

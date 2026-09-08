@@ -58,27 +58,29 @@ func TestOwnedBotsMetadataMySQLContract(t *testing.T) {
 	// separate concern. No shared schema or testutil.CleanAllTables is used.
 	exec("CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status INT NOT NULL)")
 	exec("CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status INT NOT NULL, PRIMARY KEY(space_id,uid))")
-	exec("CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(40), robot INT NOT NULL, status INT NOT NULL)")
+	exec("CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(40), robot INT NOT NULL, status INT NOT NULL, is_destroy INT NOT NULL DEFAULT 0)")
 	exec("CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status INT NOT NULL, description TEXT, bot_commands TEXT, agent_platform VARCHAR(40), agent_hosting VARCHAR(40), agent_reported_hosting_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
 	exec("INSERT INTO space VALUES ('space-a',1),('space-b',1)")
 	exec("INSERT INTO space_member VALUES ('space-a','owner',1),('space-b','owner',1),('space-a','other-owner',1)")
 	for _, bot := range []struct {
-		uid, owner, space, platform, hosting         string
-		userStatus, robotStatus, memberStatus, robot int
+		uid, owner, space, platform, hosting                      string
+		userStatus, userDestroy, robotStatus, memberStatus, robot int
 	}{
-		{"local", "owner", "space-a", "OpenClaw", "self_hosted", 1, 1, 1, 1},
-		{"cloud", "owner", "space-a", "OpenClaw", "octo_hosted", 1, 1, 1, 1},
-		{"other-platform", "owner", "space-a", "Codex", "self_hosted", 1, 1, 1, 1},
-		{"no-platform", "owner", "space-a", "", "self_hosted", 1, 1, 1, 1},
-		{"unknown-platform", "owner", "space-a", "custom-runtime", "self_hosted", 1, 1, 1, 1},
-		{"foreign", "other-owner", "space-a", "OpenClaw", "self_hosted", 1, 1, 1, 1},
-		{"other-space", "owner", "space-b", "OpenClaw", "self_hosted", 1, 1, 1, 1},
-		{"disabled-user", "owner", "space-a", "OpenClaw", "self_hosted", 0, 1, 1, 1},
-		{"disabled-robot", "owner", "space-a", "OpenClaw", "self_hosted", 1, 0, 1, 1},
-		{"removed-bot", "owner", "space-a", "OpenClaw", "self_hosted", 1, 1, 0, 1},
-		{"human", "owner", "space-a", "OpenClaw", "self_hosted", 1, 1, 1, 0},
+		{"local", "owner", "space-a", "OpenClaw", "self_hosted", 1, 0, 1, 1, 1},
+		{"cloud", "owner", "space-a", "OpenClaw", "octo_hosted", 1, 0, 1, 1, 1},
+		{"other-platform", "owner", "space-a", "Codex", "self_hosted", 1, 0, 1, 1, 1},
+		{"no-platform", "owner", "space-a", "", "self_hosted", 1, 0, 1, 1, 1},
+		{"unknown-platform", "owner", "space-a", "custom-runtime", "self_hosted", 1, 0, 1, 1, 1},
+		{"foreign", "other-owner", "space-a", "OpenClaw", "self_hosted", 1, 0, 1, 1, 1},
+		{"other-space", "owner", "space-b", "OpenClaw", "self_hosted", 1, 0, 1, 1, 1},
+		{"disabled-user", "owner", "space-a", "OpenClaw", "self_hosted", 0, 0, 1, 1, 1},
+		{"destroying-user", "owner", "space-a", "OpenClaw", "self_hosted", 1, 1, 1, 1, 1},
+		{"destroyed-user", "owner", "space-a", "OpenClaw", "self_hosted", 1, 2, 1, 1, 1},
+		{"disabled-robot", "owner", "space-a", "OpenClaw", "self_hosted", 1, 0, 0, 1, 1},
+		{"removed-bot", "owner", "space-a", "OpenClaw", "self_hosted", 1, 0, 1, 0, 1},
+		{"human", "owner", "space-a", "OpenClaw", "self_hosted", 1, 0, 1, 1, 0},
 	} {
-		exec("INSERT INTO user VALUES (?,?,?,?)", bot.uid, bot.uid, bot.robot, bot.userStatus)
+		exec("INSERT INTO user VALUES (?,?,?,?,?)", bot.uid, bot.uid, bot.robot, bot.userStatus, bot.userDestroy)
 		exec("INSERT INTO robot(robot_id,creator_uid,status,description,bot_commands,agent_platform,agent_hosting,agent_reported_hosting_at) VALUES (?,?,?,'description','[]',?,?,UTC_TIMESTAMP())", bot.uid, bot.owner, bot.robotStatus, bot.platform, bot.hosting)
 		exec("INSERT INTO space_member VALUES (?,?,?)", bot.space, bot.uid, bot.memberStatus)
 	}

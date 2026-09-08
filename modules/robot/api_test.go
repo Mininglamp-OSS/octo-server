@@ -315,6 +315,7 @@ func TestOwnedBots(t *testing.T) {
 	friendBot := "owned_friend_836"
 	deletedBot := "owned_deleted_836"
 	disabledUserBot := "owned_disabled_user_858"
+	destroyedUserBot := "owned_destroyed_user_859"
 	removedBot := "owned_removed_836"
 
 	spaceIDs := []string{testSpaceID, otherSpaceID, nonMemberSpaceID, removedMemberSpaceID, disabledSpaceID}
@@ -374,6 +375,9 @@ func TestOwnedBots(t *testing.T) {
 	mkBot(deletedBot, "DeletedBot", 0, uid, testSpaceID, 1)
 	mkBot(disabledUserBot, "DisabledUserBot", 1, uid, testSpaceID, 1)
 	_, err = db.Update("user").Set("status", 0).Where("uid = ?", disabledUserBot).Exec()
+	require.NoError(t, err)
+	mkBot(destroyedUserBot, "DestroyedUserBot", 1, uid, testSpaceID, 1)
+	_, err = db.Update("user").Set("is_destroy", 2).Where("uid = ?", destroyedUserBot).Exec()
 	require.NoError(t, err)
 	mkBot(removedBot, "RemovedBot", 1, uid, testSpaceID, 0)
 

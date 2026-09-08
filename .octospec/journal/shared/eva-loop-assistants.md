@@ -18,10 +18,12 @@ source: user
   owner/Space/account filtering in the SQL predicate.
 - `verify-bot?include=owner_context` derives the owner from the validated Bot
   credential, returns Bot and owner facts separately, and answers only the
-  requested Project IDs.
+  requested Project IDs. Cross-principal Project answers expose membership and
+  role only, never owner capabilities or membership epochs.
 - Disabled, cooling-off, terminally destroyed, removed-from-Space, and
   disbanded-Space cases all deny Project facts. Context lookup errors and a row
-  disappearing between credential verification and context lookup fail closed.
+  disappearing between credential verification and context lookup fail closed
+  while preserving present-but-empty contexts and `projects: []`.
 - The default five-field `verify-bot` response remains unchanged.
 
 ## Structural learnings
@@ -32,6 +34,9 @@ source: user
   test both fields.
 - Account activity and Space membership are independent facts. Keep them
   separate on the wire, then require their conjunction before disclosing roles.
+- A Bot credential proves the Bot, not its human owner. Returning the owner's
+  role can describe routing context, but exporting the owner's executable
+  capabilities or membership epoch would cross that credential boundary.
 - A module test binary does not automatically register migrations owned by a
   sibling module. When production SQL gains such a dependency, import the
   migration owner from an external test package to avoid an import cycle.

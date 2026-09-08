@@ -17,16 +17,26 @@ type verifyBotContext struct {
 	// authorization or quota signal.
 	AgentHosting           string  `json:"agent_hosting"`
 	AgentReportedHostingAt *string `json:"agent_reported_hosting_at"`
-	SpaceID                string  `json:"space_id"`
+	RequestedSpaceID       string  `json:"requested_space_id"`
 	SpaceMember            bool    `json:"space_member"`
 }
 
 type verifyBotOwnerContext struct {
-	UID         string                `json:"uid"`
-	Active      bool                  `json:"active"`
-	SpaceID     string                `json:"space_id"`
-	SpaceMember bool                  `json:"space_member"`
-	Projects    []verifyProjectAnswer `json:"projects"`
+	UID              string                   `json:"uid"`
+	Active           bool                     `json:"active"`
+	RequestedSpaceID string                   `json:"requested_space_id"`
+	SpaceMember      bool                     `json:"space_member"`
+	Projects         []verifyBotProjectAnswer `json:"projects"`
+}
+
+// verifyBotProjectAnswer intentionally omits capabilities and member_epoch.
+// The Bot credential is not the owner's delegated credential, so this callback
+// may report the owner's membership role but must not export an executable
+// capability list or lifecycle metadata for that other principal.
+type verifyBotProjectAnswer struct {
+	ProjectID string `json:"project_id"`
+	Member    bool   `json:"member"`
+	Role      *int   `json:"role,omitempty"`
 }
 
 // Deliberately uncached. No platform/hosting filter belongs in a general identity query.
@@ -35,8 +45,11 @@ func (u *User) fillBotProjectContext(resp *authVerifyBotResp, req authVerifyBotR
 	if len(req.ProjectIDs) > maxVerifyProjectIDs {
 		return errTooManyProjectIDs
 	}
-	bot := &verifyBotContext{UID: resp.BotUID, SpaceID: req.SpaceID}
-	owner := &verifyBotOwnerContext{UID: resp.OwnerUID, SpaceID: req.SpaceID}
+	bot := &verifyBotContext{UID: resp.BotUID, RequestedSpaceID: req.SpaceID}
+	owner := &verifyBotOwnerContext{
+		UID: resp.OwnerUID, RequestedSpaceID: req.SpaceID,
+		Projects: make([]verifyBotProjectAnswer, 0),
+	}
 	resp.BotContext, resp.OwnerContext = bot, owner
 	var facts struct {
 		Hosting         string       `db:"hosting"`
@@ -48,8 +61,8 @@ func (u *User) fillBotProjectContext(resp *authVerifyBotResp, req authVerifyBotR
 	}
 	err := u.db.session.SelectBySql(
 		"SELECT IFNULL(r.agent_hosting,'') AS hosting, r.agent_reported_hosting_at AS hosting_reported_at, "+
-			"(bu.status = 1 AND bu.robot = 1 AND COALESCE(bu.is_destroy, 0) = 0) AS bot_active, "+
-			"(ou.status = 1 AND ou.robot = 0 AND COALESCE(ou.is_destroy, 0) = 0) AS owner_active, "+
+			"(COALESCE(bu.status, 0) = 1 AND COALESCE(bu.robot, 0) = 1 AND COALESCE(bu.is_destroy, 0) = 0) AS bot_active, "+
+			"(COALESCE(ou.status, 0) = 1 AND COALESCE(ou.robot, 0) = 0 AND COALESCE(ou.is_destroy, 0) = 0) AS owner_active, "+
 			"(s.space_id IS NOT NULL AND bm.uid IS NOT NULL) AS bot_member, "+
 			"(s.space_id IS NOT NULL AND om.uid IS NOT NULL) AS owner_member "+
 			"FROM robot r JOIN `user` bu ON bu.uid = r.robot_id JOIN `user` ou ON ou.uid = r.creator_uid "+
@@ -74,17 +87,36 @@ func (u *User) fillBotProjectContext(resp *authVerifyBotResp, req authVerifyBotR
 	bot.SpaceMember = facts.BotMember
 	owner.SpaceMember = facts.OwnerMember
 	if bot.Active && owner.Active && bot.SpaceMember && owner.SpaceMember {
-		owner.Projects, err = u.answerProjectMembership(owner.UID, req.SpaceID, req.ProjectIDs)
+		var answers []verifyProjectAnswer
+		answers, err = u.answerProjectMembership(owner.UID, req.SpaceID, req.ProjectIDs)
+		owner.Projects = narrowBotProjectAnswers(answers)
 		return err
 	}
-	// No role/epoch disclosure when either identity cannot access the named Space.
-	owner.Projects = make([]verifyProjectAnswer, 0, len(req.ProjectIDs))
+	// No role disclosure when either identity cannot access the named Space.
+	owner.Projects = make([]verifyBotProjectAnswer, 0, len(req.ProjectIDs))
 	seen := make(map[string]bool, len(req.ProjectIDs))
 	for _, id := range req.ProjectIDs {
 		if id != "" && !seen[id] {
 			seen[id] = true
-			owner.Projects = append(owner.Projects, verifyProjectAnswer{ProjectID: id})
+			owner.Projects = append(owner.Projects, verifyBotProjectAnswer{ProjectID: id})
 		}
 	}
 	return nil
+}
+
+func narrowBotProjectAnswers(answers []verifyProjectAnswer) []verifyBotProjectAnswer {
+	result := make([]verifyBotProjectAnswer, 0, len(answers))
+	for _, answer := range answers {
+		var role *int
+		if answer.Role != nil {
+			value := *answer.Role
+			role = &value
+		}
+		result = append(result, verifyBotProjectAnswer{
+			ProjectID: answer.ProjectID,
+			Member:    answer.Member,
+			Role:      role,
+		})
+	}
+	return result
 }

@@ -5177,10 +5177,11 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 				respondUserRequestInvalid(c, "project_ids")
 				return
 			}
-			u.Warn("authVerifyBot context lookup failed", zap.Error(err))
+			u.Warn("authVerifyBot context lookup failed",
+				zap.String("bot_uid", resp.BotUID),
+				zap.String("space_id", req.SpaceID),
+				zap.Error(err))
 			resp.ContextError = true
-			resp.BotContext = nil
-			resp.OwnerContext = nil
 		}
 	}
 	c.Response(resp)

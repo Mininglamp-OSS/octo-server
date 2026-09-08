@@ -25,8 +25,8 @@ import (
 // Pin every SQL predicate that gates owner Project facts. The tests below also
 // inject each computed boolean to exercise the Go-level fail-closed logic.
 const botContextQueryPattern = `(?s)SELECT IFNULL.*` +
-	`bu.status = 1 AND bu.robot = 1 AND COALESCE\(bu.is_destroy, 0\) = 0.*` +
-	`ou.status = 1 AND ou.robot = 0 AND COALESCE\(ou.is_destroy, 0\) = 0.*` +
+	`COALESCE\(bu.status, 0\) = 1 AND COALESCE\(bu.robot, 0\) = 1 AND COALESCE\(bu.is_destroy, 0\) = 0.*` +
+	`COALESCE\(ou.status, 0\) = 1 AND COALESCE\(ou.robot, 0\) = 0 AND COALESCE\(ou.is_destroy, 0\) = 0.*` +
 	`s.space_id = 'space' AND s.status = 1.*` +
 	`bm.uid = bu.uid AND bm.status = 1.*` +
 	`om.uid = ou.uid AND om.status = 1.*` +
@@ -91,8 +91,10 @@ func TestBotOwnerContextHTTPContract(t *testing.T) {
 				} else if tc.dbError {
 					require.Equal(t, true, response["context_included"])
 					require.Equal(t, true, response["context_error"])
-					require.NotContains(t, response, "bot_context")
-					require.NotContains(t, response, "owner_context")
+					require.Contains(t, response, "bot_context")
+					require.Contains(t, response, "owner_context")
+					ownerContext := response["owner_context"].(map[string]any)
+					require.Empty(t, ownerContext["projects"])
 				} else {
 					require.Equal(t, true, response["context_included"])
 					require.Contains(t, response, "bot_context")
@@ -102,6 +104,16 @@ func TestBotOwnerContextHTTPContract(t *testing.T) {
 					require.Equal(t, "self_hosted", botContext["agent_hosting"])
 					require.Contains(t, botContext, "agent_reported_hosting_at")
 					require.Nil(t, botContext["agent_reported_hosting_at"])
+					require.Equal(t, "space", botContext["requested_space_id"])
+					require.NotContains(t, botContext, "space_id")
+					ownerContext := response["owner_context"].(map[string]any)
+					require.Equal(t, "space", ownerContext["requested_space_id"])
+					projects := ownerContext["projects"].([]any)
+					require.Len(t, projects, 1)
+					project := projects[0].(map[string]any)
+					require.Equal(t, float64(2), project["role"])
+					require.NotContains(t, project, "capabilities")
+					require.NotContains(t, project, "member_epoch")
 				}
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -156,10 +168,8 @@ func TestBotOwnerContextPlatformNeutralAndSpaceScoped(t *testing.T) {
 			require.Equal(t, allowed, resp.OwnerContext.Projects[0].Member)
 			require.False(t, resp.OwnerContext.Projects[1].Member)
 			require.Nil(t, resp.OwnerContext.Projects[1].Role)
-			require.Nil(t, resp.OwnerContext.Projects[1].MemberEpoch)
 			if !allowed {
 				require.Nil(t, resp.OwnerContext.Projects[0].Role)
-				require.Nil(t, resp.OwnerContext.Projects[0].MemberEpoch)
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
@@ -282,8 +292,6 @@ func TestBotOwnerContextMySQLLivenessContract(t *testing.T) {
 				require.NotNil(t, resp.OwnerContext.Projects[0].Role)
 			} else {
 				require.Nil(t, resp.OwnerContext.Projects[0].Role)
-				require.Nil(t, resp.OwnerContext.Projects[0].MemberEpoch)
-				require.Empty(t, resp.OwnerContext.Projects[0].Capabilities)
 			}
 		})
 	}

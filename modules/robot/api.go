@@ -1997,6 +1997,7 @@ func (rb *Robot) ownedBots(c *wkhttp.Context) {
 		INNER JOIN user u ON u.uid = r.robot_id AND u.robot = 1
 		INNER JOIN space_member sm ON sm.uid = r.robot_id AND sm.space_id = ? AND sm.status = 1
 		WHERE r.creator_uid = ? AND r.status = 1 AND u.status = 1
+			AND COALESCE(u.is_destroy, 0) = 0
 		ORDER BY r.created_at DESC
 	`, spaceID, loginUID).Load(&bots)
 	if err != nil {

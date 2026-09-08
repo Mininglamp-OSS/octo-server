@@ -2570,3 +2570,6 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - hosting 与上报时间成对返回，并恢复「自报遥测不可用于鉴权/配额」的信任边界。
 - SQL mock 直接钉住账户、Space、membership 全部权限谓词；user/robot 定向测试、
   Project helper、Group/Robot/User error guards、build、vet、diff 检查通过。
+- 后续 review 将 Bot 凭据可见的 owner Project 答案收窄为 `member` / `role`，不再
+  跨主体暴露 capabilities 与 member epoch；DB 异常保留空的 fail-secure contexts，
+  `owned_bots` 同时排除 destroying/destroyed 用户，均补充回归覆盖。

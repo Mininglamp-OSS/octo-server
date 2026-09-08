@@ -12,7 +12,14 @@
 - Kept account activity and Space membership as separate facts while requiring
   both identities to be active members before returning owner Project roles.
 - Turned a context row disappearing after credential verification into a
-  fail-closed `context_error` path.
+  fail-closed `context_error` path that preserves present-but-empty Bot and
+  owner contexts, including `projects: []`.
+- Narrowed cross-principal Project answers exposed to a Bot credential to
+  `member` and `role`; owner capabilities and membership epochs remain private
+  to owner-authenticated APIs. Renamed the nested scope echo to
+  `requested_space_id`.
+- Excluded destroying and destroyed Bot user rows from `owned_bots`, with both
+  fixture-level and real-MySQL coverage.
 - Strengthened the existing owned-Bot integration test, pinned every SQL
   predicate that gates owner Project facts, and added an isolated MySQL matrix
   for disabled/destroyed principals, revoked memberships, and inactive scopes.
