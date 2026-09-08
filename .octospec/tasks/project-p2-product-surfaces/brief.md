@@ -229,10 +229,10 @@ one changes. This endpoint answers one question — *which groups in this projec
 it returns the identity fields the tree renders and nothing else, and the client fetches full
 state through the routes it already calls (`GET /v1/groups/:group_no`, `GET /v1/group/my`).
 
-Proposed field set, to confirm against the prototype and against Q2: `group_no`, `name`,
-`is_named`, `avatar_text`, `avatar_color`, `is_upload_avatar`, `member_count`. Anything beyond
-that needs an argument, and every field must be checked against the stub schema before it is
-frozen.
+Proposed field set, to confirm against the prototype: `group_no`, `name`, `is_named`,
+`avatar_text`, `avatar_color`, `is_upload_avatar`, `member_count`. Anything beyond that needs an
+argument. Q2 is resolved and does not narrow this — the columns are all on the one real `group`
+table, and the test suite is what proves it.
 
 **D4 — Threads are NOT nested in the response.**
 
@@ -345,13 +345,31 @@ admission transaction」, which P1 called a separate task and nobody has opened.
   `modules/group/api_manager.go:50`), or a Space admin. **Recommendation: manager console**, on
   the grounding that the badge's value is that its subject cannot grant it to themselves. Gates
   PR-4 only.
-- **Q2 — What is the `group` stub schema, exactly?** `reconcile_p1.go:191-198` asserts it exists
-  and differs, but the brief's author did not locate its DDL (`grep -ri 'create table.*\`group\`'`
-  over `modules/*/sql` finds only `modules/group/sql/20191106000002_group_legacy01.sql:5`; the
-  Go module cache was unavailable in this environment, so `octo-lib` was not searched). Resolve
-  before freezing D3's field set: if the stub carries only `group_no` / `name` / `status` /
-  `space_id` / `project_id`, the avatar fields cannot be selected from `modules/project`, and D2
-  is back on the table.
+- ~~**Q2 — What is the `group` stub schema?**~~ **RESOLVED: there is no stub in this repo, and
+  it does not constrain D3.** `reconcile_p1.go:191-198` claims that 「binaries whose migration
+  set does not include `modules/group` get a `group` STUB instead, and that one declares status
+  nullable」, and adds a defensive `g.status IS NOT NULL` on the strength of it. Chased down:
+
+  - The repo contains exactly **one** `group` DDL — `modules/group/sql/20191106000002_group_legacy01.sql:5`
+    — and it declares `status smallint not null DEFAULT 0`.
+  - `octo-lib@v0.0.0-20260811160929` contains **no `.sql` files at all** and no table-creating Go
+    code.
+  - `testutil.NewTestServer` sets `cfg.DB.Migration = false`. **Tests never run migrations**;
+    every package runs against the same externally-provisioned `test` database and
+    `CleanAllTables` only truncates. So the "binary with a partial migration set" scenario does
+    not arise in tests, which is where the divergence would have to bite.
+  - Production is a single binary: `main.go` → `internal/modules.go` blank-imports 40 modules, so
+    every migration always runs together.
+
+  The only place such a divergence could live is **another repository** — `init-db.sql` in
+  `octo-deployment` (`tools/migrate-rename/rewrite_initdb.go:15`), which is outside this repo and
+  was not inspected. If it turns out to define `group` differently from the migrations, that is a
+  deployment-seed drift bug and its own task, not a constraint on a response shape.
+
+  **Consequence for D3:** pick the field set from what the client needs, and let the test suite
+  prove the columns exist — `modules/project`'s existing tests already insert full `group` rows
+  (`reconcile_i2_test.go:36`) and pass. Leave `reconcile_p1.go`'s defensive predicate alone;
+  it is harmless and removing it is not this task's business.
 - **Q3 — Does the prototype's 群聊 tab need groups the caller is not in?** D1 says no and is
   reversible. Confirm with product before PR-1 merges, because widening later is additive while
   narrowing later is a breaking change.
