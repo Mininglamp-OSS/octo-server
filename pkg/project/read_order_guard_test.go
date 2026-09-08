@@ -129,7 +129,15 @@ func TestProjectMembershipsConjoinsTheSpaceHalf(t *testing.T) {
 	}
 }
 
-// funcSourceBody returns the source of one function in membership.go.
+// funcSourceBody returns the source of one function in membership.go, comments
+// stripped.
+//
+// The stripping is load-bearing, not cosmetic: the guards below check for the
+// PRESENCE of a table name in code (`space.ActiveMembers(`) and for the ABSENCE of
+// another (`space_member`). A doc comment inside the function mentioning the
+// absent table — which the fold fix's does, and legitimately — would otherwise fail
+// the absence check forever. Comments are prose about the code; the assertions are
+// about the code.
 func funcSourceBody(t *testing.T, name string) string {
 	t.Helper()
 	raw, err := os.ReadFile("membership.go")
@@ -145,7 +153,15 @@ func funcSourceBody(t *testing.T, name string) string {
 	if end := strings.Index(body, "\n}\n"); end > 0 {
 		body = body[:end]
 	}
-	return body
+	var kept strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = line[:idx]
+		}
+		kept.WriteString(line)
+		kept.WriteByte('\n')
+	}
+	return kept.String()
 }
 
 // TestProjectEpochsExcludesInactiveProjects pins that the epoch query filters on

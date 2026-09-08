@@ -49,12 +49,15 @@ func TestProjectMembershipsDeniesAUserRemovedFromTheSpace(t *testing.T) {
 		ownerToken, map[string]any{"uids": []string{"conjMember"}})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
-	// Baseline: both hold seats and both are in the Space.
+	// Baseline: both hold seats and both are in the Space. The roles map is keyed by
+	// projectpkg.FoldID (see FoldID): the SQL matched these uids under a
+	// case-INSENSITIVE collation, so an exact-match Go key would drop a member whose
+	// rows are spelled differently from the request.
 	_, roles, err := projectpkg.ProjectMemberships(
 		testCtx.DB(), spaceA, created.ProjectID, []string{"conjOwner", "conjMember"})
 	require.NoError(t, err)
-	require.Contains(t, roles, "conjOwner")
-	require.Contains(t, roles, "conjMember")
+	require.Contains(t, roles, projectpkg.FoldID("conjOwner"))
+	require.Contains(t, roles, projectpkg.FoldID("conjMember"))
 
 	// The window: out of the Space, cascade not yet run.
 	removeSpaceMember(t, spaceA, "conjMember")
@@ -66,10 +69,10 @@ func TestProjectMembershipsDeniesAUserRemovedFromTheSpace(t *testing.T) {
 	_, roles, err = projectpkg.ProjectMemberships(
 		testCtx.DB(), spaceA, created.ProjectID, []string{"conjOwner", "conjMember"})
 	require.NoError(t, err)
-	assert.NotContains(t, roles, "conjMember",
+	assert.NotContains(t, roles, projectpkg.FoldID("conjMember"),
 		"a user removed from the Space must not be reported as a project member; the seat "+
 			"outlives the removal by a window that is unbounded when the cascade gives up")
-	assert.Contains(t, roles, "conjOwner",
+	assert.Contains(t, roles, projectpkg.FoldID("conjOwner"),
 		"the conjunction must narrow only the removed user, not empty the answer")
 }
 
@@ -253,7 +256,8 @@ func TestSpaceBanMovesTheEpochChannelToo(t *testing.T) {
 	_, roles, err := projectpkg.ProjectMemberships(
 		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
 	require.NoError(t, err)
-	require.Contains(t, roles, "banOwner", "baseline: the owner is a member")
+	require.Contains(t, roles, projectpkg.FoldID("banOwner"),
+		"baseline: the owner is a member (keyed by the fold — see FoldID)")
 
 	// ---- ban ----
 	setSpaceStatus(t, spaceA, 2)
@@ -289,7 +293,8 @@ func TestSpaceBanMovesTheEpochChannelToo(t *testing.T) {
 	_, backRoles, err := projectpkg.ProjectMemberships(
 		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
 	require.NoError(t, err)
-	assert.Contains(t, backRoles, "banOwner", "and the answer itself must come back")
+	assert.Contains(t, backRoles, projectpkg.FoldID("banOwner"),
+		"and the answer itself must come back")
 }
 
 // TestDisbandedSpaceProjectsReadAsAbsent covers the permanent case.

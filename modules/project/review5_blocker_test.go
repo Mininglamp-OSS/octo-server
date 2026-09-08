@@ -314,11 +314,50 @@ func TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch(t *testing.T) {
 //
 // Enforced structurally rather than per call site: enumerate the tx-scoped reads of
 // octo_project_member and require each to carry FOR SHARE or FOR UPDATE.
+//
+// # The rule is about the CONTEXT, not about the table
+//
+// Everything above is specific to THIS module's write transactions, and the reason
+// is lockSpaceSeatsTx: its JOIN onto `space` is a consistent read, so the read view
+// is already assigned before anything else runs and a later plain SELECT is answered
+// from a snapshot older than the project row lock.
+//
+// A read of the same table from a transaction owned by ANOTHER module does not
+// inherit that reasoning, and one such reader now exists.
+// bumpMemberEpochForSpaceMemberTx runs inside modules/space's member-removal
+// transaction, where every statement before it is a locking read or DML — so its
+// enumeration is that transaction's FIRST consistency read and anchors the read view
+// itself, after the removal has taken `space_member ... FOR UPDATE`. Making it a
+// locking read is not the safe direction here: S locks on octo_project_member taken
+// from the removal transaction are what put it in a deadlock cycle with this
+// module's own writes, against the documented lock order.
+//
+// So the exemption is by NAMED FUNCTION rather than by widening the rule, and it
+// carries two obligations enforced below:
+//
+//   - an exempt reader must not WRITE octo_project_member. A non-locking read that
+//     authorises a write to the same table is the original defect regardless of
+//     whose transaction it sits in.
+//   - the exemption must still MATCH something. A stale entry naming a deleted
+//     function is a hole waiting for a name collision — the second of the two ways
+//     a source guard dies (the first being scope, which is what rounds 2 and 3 were
+//     about).
+func externalTxReadersOfProjectMember() map[string]string {
+	return map[string]string{
+		"bumpMemberEpochForSpaceMemberTx": "runs inside modules/space's member-removal " +
+			"transaction; every preceding statement there is a locking read or DML, so this " +
+			"enumeration anchors the read view itself, after the removal's space_member X lock. " +
+			"Locking it would re-create the deadlock cycle with this module's membership writes.",
+	}
+}
+
 func TestNoWriteAuthorisingAggregateIsANonLockingRead(t *testing.T) {
 	// The judgement is "executed on a *dbr.Tx", not "appears in the file". A plain COUNT(*) on
 	// this table is perfectly fine on a *dbr.Session — the list endpoint's member_count column
 	// and the metrics collector both do it, neither is inside a write transaction and neither
 	// authorises anything.
+	exempt := externalTxReadersOfProjectMember()
+	exemptSeen := map[string]bool{}
 	found := 0
 	for _, f := range moduleSourceFiles(t) {
 		joined := stripComments(mustRead(t, f))
@@ -327,6 +366,28 @@ func TestNoWriteAuthorisingAggregateIsANonLockingRead(t *testing.T) {
 				continue
 			}
 			found++
+
+			// Attribution failing returns "", which falls through to the STRICT rule:
+			// an unattributable read must not be able to buy itself an exemption.
+			if fn := enclosingFuncOf(joined, stmt); fn != "" && exempt[fn] != "" {
+				exemptSeen[fn] = true
+				body := funcTextByName(joined, fn)
+				for _, w := range []string{
+					"UPDATE octo_project_member",
+					"INSERT INTO octo_project_member",
+					"DELETE FROM octo_project_member",
+					`Update("octo_project_member"`,
+				} {
+					assert.NotContains(t, body, w,
+						"%s: %s is exempt from the locking-read rule because its non-locking read "+
+							"only selects WHICH rows to invalidate — but it also writes "+
+							"octo_project_member (%s). A non-locking read that authorises a write "+
+							"to the same table is exactly the defect this guard exists for, no "+
+							"matter whose transaction it runs in.", f, fn, w)
+				}
+				continue
+			}
+
 			locking := strings.Contains(stmt, "FOR SHARE") || strings.Contains(stmt, "FOR UPDATE")
 			assert.True(t, locking,
 				"%s: this transaction-scoped read of octo_project_member is not a locking read.\n"+
@@ -335,7 +396,10 @@ func TestNoWriteAuthorisingAggregateIsANonLockingRead(t *testing.T) {
 					"check, before lockActiveProjectTx — so the project row lock protects nothing "+
 					"about it. Reproduced consequences of exactly this: a project left with ZERO "+
 					"owners (unrecoverable in P0, undetected by every reconcile scan), a bypassable "+
-					"member cap, and a disband that skipped a member's cache invalidation.",
+					"member cap, and a disband that skipped a member's cache invalidation.\n"+
+					"If this read runs inside ANOTHER module's transaction, so that its read view is "+
+					"anchored differently, name it in externalTxReadersOfProjectMember with the "+
+					"owning transaction and the reason — do not weaken the rule for everyone.",
 				f, strings.TrimSpace(stmt))
 		}
 	}
@@ -343,6 +407,57 @@ func TestNoWriteAuthorisingAggregateIsANonLockingRead(t *testing.T) {
 		"expected at least the four known transaction-scoped reads of octo_project_member "+
 			"(owner count, member count, member row, disband seat list); found %d — the parser "+
 			"probably stopped matching, which would make this guard vacuous", found)
+
+	for fn := range exempt {
+		assert.True(t, exemptSeen[fn],
+			"externalTxReadersOfProjectMember names %s, but no transaction-scoped read of "+
+				"octo_project_member was attributed to it. Either it was renamed or deleted "+
+				"(drop the entry) or the parser stopped matching its read (fix the parser). A "+
+				"stale exemption silently permits the next function that reuses the name.", fn)
+	}
+}
+
+// enclosingFuncOf returns the name of the function whose body contains stmt.
+//
+// Text-scanned rather than AST-parsed, to match every other guard in this file and
+// because the input is already comment-stripped and line-joined. It returns "" when
+// it cannot tell, which fails CLOSED: the caller applies the strict rule.
+func enclosingFuncOf(joined, stmt string) string {
+	idx := strings.Index(joined, stmt)
+	if idx < 0 {
+		return ""
+	}
+	last := strings.LastIndex(joined[:idx], " func ")
+	if last < 0 {
+		return ""
+	}
+	decl := joined[last+len("\nfunc "):]
+	// Skip a method receiver: `(d *DB) name(...)`.
+	if strings.HasPrefix(decl, "(") {
+		if c := strings.Index(decl, ")"); c >= 0 {
+			decl = strings.TrimSpace(decl[c+1:])
+		}
+	}
+	if open := strings.Index(decl, "("); open >= 0 {
+		return strings.TrimSpace(decl[:open])
+	}
+	return ""
+}
+
+// funcTextByName returns one function's source text, from its declaration to the
+// next top-level `func` (stripComments has already replaced every newline
+// with a space, so the anchor is " func " and not a line start). Coarse on purpose: it only has to be wide enough to catch a
+// write statement sitting in the same function as an exempt read.
+func funcTextByName(joined, name string) string {
+	idx := strings.Index(joined, " "+name+"(")
+	if idx < 0 {
+		return ""
+	}
+	rest := joined[idx:]
+	if next := strings.Index(rest[1:], " func "); next >= 0 {
+		return rest[:next+1]
+	}
+	return rest
 }
 
 // txSelectStatements returns the SQL text of every SelectBySql executed on a *dbr.Tx, from the

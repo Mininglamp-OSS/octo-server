@@ -2,7 +2,6 @@ package project
 
 import (
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -123,130 +122,222 @@ func TestRealSpaceRemovalMovesTheEpoch(t *testing.T) {
 }
 
 // TestSpaceRemovalDoesNotDeadlockAgainstProjectMembershipWrites is the regression
-// test for the lock-order inversion.
+// test for the lock-order inversion, orchestrated DETERMINISTICALLY.
 //
-// The bump used to be ONE statement — `UPDATE octo_project p INNER JOIN
-// octo_project_member pm ...` — whose lock order is chosen by the OPTIMIZER and
-// flips with cardinality. Measured on MySQL 8.0.33 against this schema: with a
-// handful of projects it drives from `p` (project -> member, the documented order);
-// with two hundred it drives from `pm` (member -> project, inverted). The
-// production shape is the second one, and both deadlock victim directions were
-// reproduced, including the one where InnoDB rolls back the SPACE REMOVAL — which
-// this step's contract turns into a FAILED REVOCATION.
+// The bump used to be one statement — `UPDATE octo_project p INNER JOIN
+// octo_project_member pm ...` — whose lock order is not a property of the SQL at
+// all: the OPTIMIZER picks the driving table and it flips with cardinality.
+// Measured on MySQL 8.0.33 against this schema, and re-checked against the
+// fixture this test builds:
 //
-// So this test seeds the inverting cardinality and runs concurrent project
-// membership writes against a stream of removals. It asserts on the OUTCOME rather
-// than on the plan: every removal must succeed and every removed member's projects
-// must have moved. A 1213 that the retry absorbs is fine; a 1213 that reaches the
+//	3 active projects / 3 seats    -> p driving (ref)         => project -> member
+//	60 active projects / 3 seats   -> pm driving (index_merge) => member -> project
+//
+// The second is the production shape and it reverses the order documented at the
+// top of service.go. A 1213 there rolls the member removal back (this step's
+// contract), so under contention the REVOCATION FAILS.
+//
+// # Why this is orchestrated rather than raced
+//
+// The first version of this test ran a churn goroutine against a stream of
+// removals and passed against the REINTRODUCED defect three times out of three:
+// both transactions are sub-millisecond, so the interleaving that closes the cycle
+// essentially never happens by chance. It was a green test over a live deadlock —
+// worse than no test, because it reads as coverage.
+//
+// So the cycle is built explicitly, mirroring the shape reproduced by hand:
+//
+//	T2 (project side, sanctioned order):  X on octo_project(pX)  ...then...  X on octo_project_member(pX, target)
+//	T1 (removal side, INVERTED order):    S on octo_project_member(*, target)  ...then...  X on octo_project(pX)
+//
+// T1 must reach its second lock while T2 holds the first, and vice versa. With the
+// single-statement bump both halves are inside ONE statement, so InnoDB closes the
+// cycle and reports 1213 — verified by reintroducing it. With the two-statement
+// bump T1 takes no octo_project_member lock at all, so there is no cycle to close.
+//
+// The assertion is on the OUTCOME: the removal must succeed and the epoch must
+// move. A 1213 absorbed by the bounded retry is acceptable; one that reaches the
 // caller is the bug.
-//
-// Not a proof of absence — a scheduling-dependent test never is. It is a
-// regression net over the exact shape that was broken, and it fails reliably
-// against the single-statement version.
 func TestSpaceRemovalDoesNotDeadlockAgainstProjectMembershipWrites(t *testing.T) {
-	srv, p := setup(t)
+	// Enough active projects in the Space to make the optimizer drive from
+	// octo_project_member. The plan is asserted below rather than assumed, because
+	// this whole test is about a plan-dependent lock order.
+	const projectCount = 60
+
+	_, p := setup(t)
 	p.registerSpaceMemberRemovalCleanup()
 
 	seedSpace(t, spaceA, 1)
-	ownerToken := seedUser(t, "dlOwner")
+	seedUser(t, "dlOwner")
 	seedSpaceMember(t, spaceA, "dlOwner", 2, 1)
+	seedUser(t, "dlTarget")
+	seedSpaceMember(t, spaceA, "dlTarget", 0, 1)
 
-	// The cardinality that inverts the join order: many projects in the Space, each
-	// target sitting in only a few of them.
-	const projectCount = 60
+	// The quotas are raised rather than worked around: the cardinality IS the test.
+	// With the default daily cap of 20 the fixture cannot reach the shape that
+	// inverts the join order — and an earlier version of this test failed on the
+	// quota instead, i.e. it never exercised the lock order at all.
+	p.cfg.MaxDailyCreate = projectCount + 10
+	p.cfg.MaxPerCreator = projectCount + 10
+	p.cfg.MaxPerSpace = projectCount + 10
+
 	projects := make([]string, 0, projectCount)
 	for i := 0; i < projectCount; i++ {
-		created := createProjectVia(t, srv, spaceA, ownerToken,
-			"dl-project-"+strings.Repeat("x", i%3)+itoa(i))
+		created, err := p.createProject(createInput{
+			SpaceID: spaceA, Creator: "dlOwner", Name: "dl-project-" + itoa(i),
+		})
+		require.NoError(t, err, "fixture project %d", i)
 		projects = append(projects, created.ProjectID)
 	}
 
-	const targets = 8
-	targetIDs := make([]string, 0, targets)
-	for i := 0; i < targets; i++ {
-		uid := "dlTarget" + itoa(i)
-		seedUser(t, uid)
-		seedSpaceMember(t, spaceA, uid, 0, 1)
-		targetIDs = append(targetIDs, uid)
-		// Three seats each, spread across the pool so the concurrent writer and the
-		// remover contend on overlapping project rows.
-		for k := 0; k < 3; k++ {
-			admitted, err := p.addOneMember(projects[(i*3+k)%projectCount], spaceA, "dlOwner", uid)
-			require.NoError(t, err)
-			require.True(t, admitted)
-		}
+	// Three seats for the target, so the bump's enumeration returns several rows and
+	// the S locks of the inverted plan cover more than the contended project.
+	contended := projects[7]
+	for _, pid := range []string{projects[3], contended, projects[41]} {
+		admitted, err := p.addOneMember(pid, spaceA, "dlOwner", "dlTarget")
+		require.NoError(t, err)
+		require.True(t, admitted)
 	}
 
-	// A separate uid whose seats churn for the whole run: this is the transaction
-	// that takes project -> octo_project_member in the sanctioned order, i.e. the
-	// other half of the cycle.
-	seedUser(t, "dlChurn")
-	seedSpaceMember(t, spaceA, "dlChurn", 0, 1)
+	requireMemberDrivenPlan(t, spaceA, "dlTarget")
 
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
+	before := epochOf(t, contended)
+
+	// T2 — the project side, in the SANCTIONED order: the octo_project row first,
+	// the seat row second, with a gap in between for T1 to walk into.
+	t2Err := make(chan error, 1)
+	t2Holding := make(chan struct{})
+	t2Proceed := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		i := 0
-		for {
-			select {
-			case <-stop:
-				return
-			default:
+		t2Err <- func() error {
+			tx, err := testCtx.DB().Begin()
+			if err != nil {
+				return err
 			}
-			pid := projects[i%projectCount]
-			i++
-			// Add then remove, both through the module's own retry, so a deadlock the
-			// retry absorbs here does not fail the test — only one that reaches a
-			// removal caller does.
-			if _, err := p.addOneMember(pid, spaceA, "dlOwner", "dlChurn"); err != nil {
-				continue
+			defer tx.RollbackUnlessCommitted()
+
+			// X on octo_project(contended).
+			if _, err := p.db.lockActiveProjectTx(tx, contended); err != nil {
+				return err
 			}
-			_, _ = p.removeMember(pid, spaceA, "dlOwner", "dlChurn")
-		}
+			close(t2Holding)
+			<-t2Proceed
+
+			// X on octo_project_member(contended, dlTarget) — the second half of the
+			// cycle. Under the single-statement bump T1 is holding an S lock on this
+			// exact row while waiting for the octo_project row this transaction holds.
+			if _, err := tx.UpdateBySql(
+				"UPDATE octo_project_member SET updated_at = ? "+
+					"WHERE project_id = ? AND uid = ?",
+				time.Now().UTC(), contended, "dlTarget",
+			).Exec(); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}()
 	}()
 
-	var failures []string
-	for _, uid := range targetIDs {
-		removed, err := spacemod.RemoveMemberForTest(
-			testCtx, spaceA, uid, 2, "dlOwner", spacemod.MemberRemoveReasonKicked)
-		if err != nil {
-			failures = append(failures, uid+": "+err.Error())
-			continue
-		}
-		if !removed {
-			failures = append(failures, uid+": the seat was not closed")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	close(stop)
-	wg.Wait()
+	<-t2Holding
 
-	assert.Empty(t, failures,
-		"every Space removal must succeed while project membership writes run concurrently. "+
-			"A transient 1213 is absorbed by the bounded retry; one that reaches the caller "+
-			"means the epoch bump is back in a lock cycle with the project-side writes, and by "+
-			"this step's own contract that ROLLS THE REMOVAL BACK — the revocation fails, which "+
-			"is the state the step was added to prevent")
+	// T1 — the real removal transaction. Its bump is the step under test.
+	t1Err := make(chan error, 1)
+	removed := make(chan bool, 1)
+	go func() {
+		ok, err := spacemod.RemoveMemberForTest(
+			testCtx, spaceA, "dlTarget", 2, "dlOwner", spacemod.MemberRemoveReasonKicked)
+		removed <- ok
+		t1Err <- err
+	}()
+
+	// Let T1 reach its bump and block on the octo_project row T2 holds, THEN release
+	// T2 into the seat row T1 has locked. That ordering is what closes the cycle;
+	// releasing T2 earlier just serializes the two.
+	time.Sleep(400 * time.Millisecond)
+	close(t2Proceed)
+
+	select {
+	case err := <-t1Err:
+		require.NoError(t, err,
+			"the Space removal must not fail. A 1213 reaching this caller means the epoch "+
+				"bump is back in a lock cycle with the project-side writes — and by this "+
+				"step's own contract that ROLLS THE REMOVAL BACK, so the revocation fails: "+
+				"exactly the state the step was added to prevent")
+		require.True(t, <-removed, "the seat must actually have been closed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the removal never completed; the two transactions are deadlocked or stuck")
+	}
+
+	require.NoError(t, <-t2Err, "the project-side transaction must not fail either: it takes "+
+		"the documented order, so if it is InnoDB's victim the other side is the one going "+
+		"against the order")
+
+	assert.Greater(t, epochOf(t, contended), before,
+		"and the epoch must actually have moved — a removal that committed without its "+
+			"invalidation signal is the defect this whole step exists for")
+}
+
+// requireMemberDrivenPlan asserts the fixture really did produce the INVERTED join
+// order, i.e. that this test is exercising the shape it claims to.
+//
+// Without this the test is cardinality-dependent in a silent way: on a smaller
+// fixture the optimizer drives from octo_project and there is no cycle to close, so
+// the test would pass for the wrong reason on a machine where the statistics land
+// differently. It runs EXPLAIN on the single-statement form regardless of which
+// implementation is compiled in, because what it is checking is a property of the
+// schema and the data, not of the Go code.
+func requireMemberDrivenPlan(t *testing.T, spaceID, uid string) {
+	t.Helper()
+	if _, err := testCtx.DB().Exec(
+		"ANALYZE TABLE `octo_project`, `octo_project_member`"); err != nil {
+		t.Logf("ANALYZE TABLE failed (%v); the plan check below may read stale statistics", err)
+	}
+	var rows []struct {
+		Table string `db:"table"`
+	}
+	_, err := testCtx.DB().SelectBySql(
+		"EXPLAIN UPDATE octo_project p "+
+			"INNER JOIN octo_project_member pm ON pm.project_id = p.project_id "+
+			"SET p.member_epoch = p.member_epoch + 1 "+
+			"WHERE p.space_id = ? AND p.status = ? "+
+			"  AND pm.space_id = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0",
+		spaceID, StatusNormal, spaceID, uid, MemberStatusActive,
+	).Load(&rows)
+	if err != nil {
+		t.Skipf("EXPLAIN unavailable (%v); cannot confirm this fixture inverts the join order, "+
+			"and asserting on a deadlock that may not be reachable would be a flake", err)
+	}
+	require.NotEmpty(t, rows, "EXPLAIN returned no rows")
+	require.Equal(t, "pm", rows[0].Table,
+		"this fixture must make the optimizer drive from octo_project_member — that is the "+
+			"plan whose lock order is INVERTED and the only one that can deadlock against a "+
+			"project-side write. Driving from octo_project means the test would pass without "+
+			"exercising anything; raise projectCount until the plan flips")
 }
 
 // TestSpaceMemberEpochBumpSeesConcurrentAdmission pins the read-view argument the
 // two-statement bump depends on.
 //
 // The enumeration is a NON-LOCKING read (taking S locks on octo_project_member is
-// what created the inversion), so under REPEATABLE READ it reads the removal
-// transaction's snapshot. That is only safe because of a property of the OTHER
-// module's write paths: every seat admission locks the target's space_member row
-// FIRST (`FOR SHARE OF sm`), before it touches any octo_project* table. So an
-// admission that has not committed is blocked by the removal's X lock on that row,
-// and one that HAS committed did so before that lock was taken — therefore before
-// this transaction's read view was assigned.
+// what created the lock-order inversion), so under REPEATABLE READ it reads the
+// removal transaction's snapshot. That is only safe because of a property of the
+// OTHER module's write paths: every seat admission locks the target's space_member
+// row FIRST (`FOR SHARE OF sm`, lockSpaceSeatsTx) before it touches any
+// octo_project* table. So an admission that has not committed BLOCKS the removal's
+// X lock on that row, and one that HAS committed did so before that lock was
+// taken — therefore before this transaction's first consistency read, which is the
+// enumeration itself.
 //
-// If a future refactor moves the seat lock later in the admission path, that
-// argument silently stops holding and the epoch stops moving for the racing seat.
-// Nothing about this file's own code would change, which is why the property is
-// pinned here rather than described in a comment.
+// Written as a DETERMINISTIC interleaving rather than a race, because the
+// interesting order is the rare one. An earlier version of this test just launched
+// the two concurrently and skipped when the admission lost — which is the shape
+// that reports green while asserting nothing.
+//
+// The admission half is driven through this module's real statements
+// (lockSpaceSeatsTx -> admitMemberTx -> bumpMemberEpochTx, the same three
+// addOneMemberOnce runs) in a transaction the test holds open, so if a refactor
+// moves the seat lock later in that sequence this test stops proving the property
+// it claims — which is the point of pinning it here rather than describing it in a
+// comment.
 func TestSpaceMemberEpochBumpSeesConcurrentAdmission(t *testing.T) {
 	srv, p := setup(t)
 	p.registerSpaceMemberRemovalCleanup()
@@ -260,39 +351,77 @@ func TestSpaceMemberEpochBumpSeesConcurrentAdmission(t *testing.T) {
 	racing := createProjectVia(t, srv, spaceA, ownerToken, "rv-racing")
 	before := epochOf(t, racing.ProjectID)
 
-	// The admission starts first and holds the space_member S lock across a delay,
-	// so the removal below blocks on it and its read view cannot be assigned until
-	// the admission has committed.
-	admitted := make(chan error, 1)
-	started := make(chan struct{})
-	go func() {
-		close(started)
-		_, err := p.addOneMember(racing.ProjectID, spaceA, "rvOwner", "rvTarget")
-		admitted <- err
-	}()
-	<-started
-
-	removed, err := spacemod.RemoveMemberForTest(
-		testCtx, spaceA, "rvTarget", 2, "rvOwner", spacemod.MemberRemoveReasonKicked)
+	// The admission, up to but not including COMMIT. It holds the target's
+	// space_member row under FOR SHARE, which is what makes the removal below block.
+	admTx, err := testCtx.DB().Begin()
 	require.NoError(t, err)
-	require.True(t, removed)
+	defer admTx.RollbackUnlessCommitted()
 
-	require.NoError(t, <-admitted)
+	held, err := p.db.lockSpaceSeatsTx(admTx, spaceA, []string{"rvOwner", "rvTarget"})
+	require.NoError(t, err)
+	require.True(t, held["rvTarget"], "the fixture target must hold a Space seat")
 
-	// Whichever order the two committed in, the invariant is the same: if the seat
-	// exists at the end, its project's epoch must have moved. The seat outliving an
-	// unmoved epoch is the stale-grant state.
+	now := time.Now().UTC()
+	changed, err := p.db.admitMemberTx(admTx, &MemberModel{
+		ProjectID: racing.ProjectID,
+		UID:       "rvTarget",
+		SpaceID:   spaceA,
+		Role:      RoleCommon,
+		InviteUID: "rvOwner",
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, err = p.db.bumpMemberEpochTx(admTx, racing.ProjectID, now)
+	require.NoError(t, err)
+
+	// The removal starts now and MUST block: its first statement is
+	// `SELECT role ... FOR UPDATE` on the row the admission holds under FOR SHARE.
+	removalDone := make(chan error, 1)
+	go func() {
+		_, rmErr := spacemod.RemoveMemberForTest(
+			testCtx, spaceA, "rvTarget", 2, "rvOwner", spacemod.MemberRemoveReasonKicked)
+		removalDone <- rmErr
+	}()
+
+	// Give it long enough to have reached — and blocked on — that lock. If it did
+	// NOT block, the admission's seat lock is no longer where the argument needs it
+	// and the check below is what fails.
+	select {
+	case rmErr := <-removalDone:
+		t.Fatalf("the removal completed while an admission held the target's space_member "+
+			"row under FOR SHARE (err=%v). The epoch bump's non-locking enumeration is only "+
+			"safe because an in-flight admission BLOCKS the removal; if the seat lock moved "+
+			"or was dropped, a seat committing after the removal's read view is assigned goes "+
+			"live with an unmoved epoch", rmErr)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	require.NoError(t, admTx.Commit())
+
+	select {
+	case rmErr := <-removalDone:
+		require.NoError(t, rmErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the removal never completed after the admission committed")
+	}
+
+	// The seat is live (the cascade is asynchronous and has not run), so the epoch
+	// must have moved TWICE: once for the admission, once for the removal. Exactly
+	// one bump is the regression — it means the removal's enumeration read a
+	// snapshot older than the admission's commit and never saw the seat.
 	seat, err := testDB.queryMember(racing.ProjectID, "rvTarget")
 	require.NoError(t, err)
-	if seat == nil || seat.Status != MemberStatusActive || seat.Removing != 0 {
-		t.Skip("the admission lost the race and was refused; nothing to invalidate")
-	}
-	assert.Greater(t, epochOf(t, racing.ProjectID), before,
-		"a seat admitted concurrently with the Space removal is live but unreachable "+
-			"through the Space conjunction, and its epoch never moved — a peer that cached "+
-			"a grant at the old epoch keeps it. The enumeration's read view must be assigned "+
-			"AFTER the removal takes its space_member X lock; see "+
-			"bumpMemberEpochForSpaceMemberTx")
+	require.NotNil(t, seat)
+	require.Equal(t, MemberStatusActive, seat.Status)
+	require.Equal(t, 0, seat.Removing)
+
+	assert.Equal(t, before+2, epochOf(t, racing.ProjectID),
+		"the epoch must move for the admission AND for the removal. Landing on before+1 "+
+			"means the removal's enumeration missed the seat the admission had just "+
+			"committed: that seat is live, unreachable through the Space conjunction, and "+
+			"riding an epoch a peer's staleness check still agrees with")
 }
 
 // TestVerifyAnswersFoldedUIDs covers the fail-OPEN fold defect at the seam it was
