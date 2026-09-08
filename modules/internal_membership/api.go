@@ -1,6 +1,7 @@
 package internal_membership
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -340,12 +341,32 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 
 // decodeVerifyRequest reads and strictly parses the JSON body: bounded size,
 // DisallowUnknownFields so a misspelled field cannot silently be ignored, and
-// rejection of trailing garbage. Mirrors modules/internal_resolve and
-// modules/bot_mention.
+// rejection of trailing garbage.
 //
 // DisallowUnknownFields is load-bearing on an authorization endpoint: a caller
 // that sends `uid` instead of `uids` should get a 400, not a successful 200 with
 // an empty answer set that reads as "nobody is a member".
+//
+// # The trailing check inspects only buffered bytes, and must keep doing so
+//
+// The obvious way to reject a second value — a second `decoder.Decode` after the
+// first — cannot return without reading at least one more byte from the socket,
+// because that is the only way to tell "another value" from "end of input". A
+// peer or proxy that sends a complete object and then stalls, or declares a
+// Content-Length it never fills, parks the handler there indefinitely:
+// MaxBytesReader bounds BYTES, not time, and this route is served by a zero-value
+// http.Server with no ReadTimeout. The strict limiter caps arrival rate, not the
+// concurrency of never-completing requests, so goroutines and connections
+// accumulate without bound — on the authorization path, behind a single shared
+// token whose whole threat model is bounding what one leaked credential can do.
+//
+// This repository adjudicated that exact hazard once already (PR #837 P1, see the
+// "Do not restore it" note in modules/bot_api/register.go) and then solved it
+// properly in modules/bot_task: read what the decoder ALREADY buffered.
+// decoder.Buffered never waits on the socket, so a complete request returns in
+// microseconds while an already-received second value is still rejected. Nothing
+// is traded away — the strictness against trailing content is identical; only the
+// availability behaviour differs.
 func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
 	decoder := json.NewDecoder(c.Request.Body)
@@ -354,11 +375,12 @@ func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
 	if err := decoder.Decode(&req); err != nil {
 		return verifyRequest{}, err
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return verifyRequest{}, errors.New("verify request contains multiple JSON values")
-		}
+	trailing, err := io.ReadAll(decoder.Buffered())
+	if err != nil {
 		return verifyRequest{}, err
+	}
+	if len(bytes.TrimSpace(trailing)) > 0 {
+		return verifyRequest{}, errors.New("verify request contains trailing data")
 	}
 	return req, nil
 }
