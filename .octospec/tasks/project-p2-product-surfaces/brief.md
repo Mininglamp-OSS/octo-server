@@ -354,10 +354,21 @@ admission transaction」, which P1 called a separate task and nobody has opened.
     — and it declares `status smallint not null DEFAULT 0`.
   - `octo-lib@v0.0.0-20260811160929` contains **no `.sql` files at all** and no table-creating Go
     code.
-  - `testutil.NewTestServer` sets `cfg.DB.Migration = false`. **Tests never run migrations**;
-    every package runs against the same externally-provisioned `test` database and
-    `CleanAllTables` only truncates. So the "binary with a partial migration set" scenario does
-    not arise in tests, which is where the divergence would have to bite.
+  - Tests DO run migrations, per test binary, from whatever module set is registered.
+    `testutil.NewTestServer` sets `cfg.DB.Migration = false`, but that flag gates nothing here:
+    `module.Setup` calls `executeSQL` unconditionally (octo-lib `module/module.go:29`). An
+    earlier draft of this entry read the flag and concluded the opposite; running the suite
+    refuted it directly. **The per-binary divergence is real and observable**: running
+    `./modules/group/` against a database that `./modules/project/` had just migrated fails at
+    startup with `Unable to create migration plan because of 20191106000001_event_legacy01.sql:
+    unknown migration in database` — modules/project's test binary registers all 40 modules (its
+    external test package blank-imports `octo-server/internal`), modules/group's registers
+    fewer, and sql-migrate refuses a database carrying records its own source does not know.
+    Each package therefore needs a fresh `test` database.
+  - But that divergence produces a MISSING TABLE, not a different one. A binary without
+    modules/group's migrations has no `group` table at all, so a query against it fails loudly
+    with 1146 rather than quietly loading a NULL into a Go bool. The stub the comment describes
+    is a third thing, and nothing in this repo creates it.
   - Production is a single binary: `main.go` → `internal/modules.go` blank-imports 40 modules, so
     every migration always runs together.
 
@@ -367,9 +378,10 @@ admission transaction」, which P1 called a separate task and nobody has opened.
   deployment-seed drift bug and its own task, not a constraint on a response shape.
 
   **Consequence for D3:** pick the field set from what the client needs, and let the test suite
-  prove the columns exist — `modules/project`'s existing tests already insert full `group` rows
-  (`reconcile_i2_test.go:36`) and pass. Leave `reconcile_p1.go`'s defensive predicate alone;
-  it is harmless and removing it is not this task's business.
+  prove the columns exist. It now has: PR-1 selects `is_named` / `avatar_text` / `avatar_color` /
+  `is_upload_avatar` from `modules/project` and `go test -race -shuffle=on ./modules/project/`
+  is green. Leave `reconcile_p1.go`'s defensive predicate alone; it is harmless and removing it
+  is not this task's business.
 - ~~**Q3 — Does the prototype's 群聊 tab need groups the caller is not in?**~~ **RESOLVED
   2026-09-08: no — the list is the caller's own groups.** D1 stands as written and is
   implemented as the query predicate rather than as a filter over a wider result. Still

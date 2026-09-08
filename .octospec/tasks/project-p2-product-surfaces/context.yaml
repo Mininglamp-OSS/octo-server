@@ -128,13 +128,33 @@ implementation_notes:
     read boundary. It is not, and the file's stated purpose is to record that as
     a decision rather than an absence.
 
-open_verification:
+verified:
   - |
-    go test ./modules/project/ was NOT run: this environment has no MySQL, Redis
-    or WuKongIM (ports 3306/6379 refused), and testutil.NewTestServer needs all
-    three. Compile-level checks all pass - go build ./..., go vet, golangci-lint
-    (0 issues), gofmt, make i18n-extract-check, make i18n-lint. The ten new
-    cases have never executed anywhere; CI is the first run.
+    Ran against MySQL 8.0.46 (server collation utf8mb4_0900_ai_ci, `test`
+    database utf8mb4_general_ci - i.e. the production-shaped split the collation
+    guards exist for), Redis 6379, WuKongIM v2.2.4-20260313 with
+    WK_TOKENAUTHON=false:
+
+      go test -race -shuffle=on ./modules/project/   ok  63.7s
+      go test -race -shuffle=on ./modules/group/     ok  96.7s
+      go test -race -shuffle=on ./modules/thread/    ok  23.4s
+      go test -race -shuffle=on ./pkg/project/       ok   1.5s
+      go test -race -shuffle=on ./pkg/authtree/      ok   1.1s
+      go build ./... / go vet / golangci-lint (0 issues) / gofmt
+      make i18n-extract-check / make i18n-lint
+
+    All ten new cases pass, including the one that runs the REAL all-member-group
+    provisioner rather than the stand-in.
+  - |
+    Each package needs its OWN fresh `test` database. Running ./modules/group/
+    against a database ./modules/project/ had just migrated fails at startup with
+    "unknown migration in database": module.Setup migrates from the registered
+    module set, modules/project's test binary registers all 40 modules (its
+    external test package blank-imports octo-server/internal) and modules/group's
+    registers fewer. Not caused by this change - it is how the suite already
+    behaves - but anyone reproducing these runs locally needs to know.
+
+open_verification:
   - |
     No EXPLAIN was taken. The query is written to drive off group_space_project
     (space_id, project_id), whose leading column is space_id, but that plan is
