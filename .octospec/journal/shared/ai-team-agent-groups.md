@@ -2,7 +2,7 @@
 type: Journal
 title: "Journal: ai-team-agent-groups"
 description: Group the AI Team Agent list into cloud clones, personal assistants, and a reserved empty digital-employee group while retaining the existing authority and cursor contract.
-tags: ["ai-team", "bot", "wire-contract", "space", "trust-boundary", "swagger"]
+tags: ["ai-team", "bot", "wire-contract", "space", "trust-boundary"]
 timestamp: 2026-09-08T15:16:29+08:00
 # --- octospec extension fields ---
 task: ai-team-agent-groups
@@ -23,8 +23,6 @@ source: user
 - Group counts describe the full eligible set before pagination; page rows keep
   the existing descending `ai_team_agent.id` cursor and are partitioned without
   changing its bounds.
-- A standalone Swagger 2.0 document describes all 11 current AI Team routes.
-  It is deliberately not registered in octo-server.
 
 ## Load-bearing decisions
 
@@ -44,10 +42,3 @@ source: user
   passed under `-race -shuffle=on`.
 - `go test -race -shuffle=on -count=1 -timeout 12m ./modules/ai_team` passed.
 - `go build ./...`, `go vet ./...`, and `git diff --check` passed.
-- `@apidevtools/swagger-cli validate docs/ai-team-agents-swagger.yaml` passed.
-
-## Operational note
-
-The generated Swagger UI was deployed as a separate static Python service on
-the dev host at port 28088. The octo-server process on port 8091 was not changed
-or restarted; this deployment is not part of the repository runtime.

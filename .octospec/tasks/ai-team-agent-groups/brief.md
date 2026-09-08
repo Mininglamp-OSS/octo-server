@@ -20,9 +20,7 @@ Change `GET /v1/ai-team/agents` from a flat `items` page to a fixed, UI-ready
 group list matching the AI Team navigation: `cloud_clone`,
 `personal_assistant`, and `digital_employee`. Digital employees are backed by
 App Bots in the future; App Bot AI sessions are not implemented yet, so the
-wire group is defined now and remains empty. Publish a standalone Swagger 2.0
-document for all current `/v1/ai-team` routes so frontend consumers can inspect
-the complete contract without registering the document in server code.
+wire group is defined now and remains empty.
 
 ## Background
 
@@ -89,7 +87,7 @@ their presentation bucket changes.
 - Changing `agent_hosting` validation, reporting, freshness, or authorization
   semantics.
 - Front-end implementation or changing session-list APIs.
-- Registering or serving the Swagger document from octo-server itself.
+- Swagger/OpenAPI documentation changes.
 
 ## Acceptance
 
@@ -104,7 +102,5 @@ their presentation bucket changes.
   current-page items are partitioned without duplication or omission.
 - Existing cursor bounds/order, Space isolation, Bot ownership checks, and
   add/remove/session behavior remain unchanged.
-- `docs/ai-team-agents-swagger.yaml` documents all 11 current AI Team operations
-  and validates as Swagger 2.0.
 - Focused AI Team unit/API tests, `go test ./modules/ai_team/...`, `go build
   ./...`, `go vet ./...`, and `git diff --check` pass.

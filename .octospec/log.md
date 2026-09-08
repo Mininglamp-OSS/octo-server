@@ -2567,5 +2567,4 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   能力预留，本次恒为空，不从 User Bot 自报的 `agent_hosting` 推断。
 - 分页查询与总数查询复用同一套 Space、owner、User Bot 和有效席位约束；未知托管值保守归入
   个人助理，`agent_hosting` 不参与权限判断且不出现在响应中。
-- 增补涵盖全部 11 个 AI Team 路由的独立 Swagger 2.0 文档；CI 单元 lane、E2E shard 4/4、
-  AI Team race 测试、build、vet、Swagger 校验与 diff 门禁均通过。
+- CI 单元 lane、E2E shard 4/4、AI Team race 测试、build、vet 与 diff 门禁均通过。
