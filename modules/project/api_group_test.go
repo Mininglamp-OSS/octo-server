@@ -235,18 +235,27 @@ func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
 	assert.Equal(t, want, seen, "paging must cover every row exactly once")
 }
 
-// TestListProjectGroupsExcludesGroupsOutsideTheProject covers the two ways a group
+// TestListProjectGroupsExcludesGroupsOutsideTheProject covers the three ways a group
 // the caller IS in must still stay out of one project's list: it is Space-direct
-// (an empty project_id), or it belongs to a different project in the same Space.
+// (an empty project_id), it belongs to a different project in the same Space, or it
+// carries this project's id while sitting in a DIFFERENT Space.
 //
-// The second half is what the space_id + project_id predicate buys. A query that
-// filtered on project_id alone would still be correct here — and would stop being
-// correct the moment it could not use group_space_project, whose LEADING column is
-// space_id.
+// The third case is the only one that pins `g.space_id = ?`, and PR #861's review
+// found it missing: with only the first two, deleting that predicate from the DAO
+// left every case in this file green. project_id alone excludes both same-Space
+// negatives, and the cross-Space case in ...RefusalsAreIndistinguishable is refused
+// by the middleware before the query ever runs.
+//
+// It is worth pinning because nothing in the schema constrains it. `group.project_id`
+// has no foreign key, so a row can carry a project id from another Space — the DAO
+// calls that predicate the Space isolation boundary, and a refactor chasing a query
+// plan could drop it (it is also group_space_project's leading column) with nothing
+// to object.
 func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 	srv, _ := setup(t)
 	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
+	seedSpace(t, spaceB, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-scope")
@@ -254,16 +263,22 @@ func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 
 	spaceDirect := util.GenerUUID()
 	otherProject := util.GenerUUID()
+	crossSpace := util.GenerUUID()
 	seedProjectGroup(t, spaceDirect, spaceA, "")
 	seedProjectGroup(t, otherProject, spaceA, other.ProjectID)
+	// This project's id, another Space's group. Only the space_id predicate keeps
+	// it out; seeded in raw SQL because no endpoint can produce it.
+	seedProjectGroup(t, crossSpace, spaceB, created.ProjectID)
 	seedGroupMemberRow(t, spaceDirect, "owner1")
 	seedGroupMemberRow(t, otherProject, "owner1")
+	seedGroupMemberRow(t, crossSpace, "owner1")
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.Empty(t, decodeGroupList(t, w),
-		"a Space-direct group and another project's group are both groups the caller is in; "+
-			"neither belongs to THIS project's list")
+		"a Space-direct group, another project's group and a group carrying this project's "+
+			"id in another Space are all groups the caller is in; none belongs to THIS "+
+			"project's list, and only g.space_id = ? excludes the third")
 }
 
 // TestListProjectGroupsCountsActiveMembersOnly pins member_count against the same
@@ -277,6 +292,7 @@ func TestListProjectGroupsCountsActiveMembersOnly(t *testing.T) {
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	seedUser(t, "mate")
 	seedUser(t, "quitter")
+	seedUser(t, "banned")
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-count")
 
 	groupNo := util.GenerUUID()
@@ -284,12 +300,21 @@ func TestListProjectGroupsCountsActiveMembersOnly(t *testing.T) {
 	seedGroupMemberRow(t, groupNo, "owner1")
 	seedGroupMemberRow(t, groupNo, "mate")
 	seedInactiveGroupMemberRow(t, groupNo, "quitter", 1, 1)
+	// The blacklisted row is what pins the status half of the count predicate, and
+	// PR #861's review found it missing: with only the quitter, dropping
+	// `AND status = ?` from countActiveGroupMembers still read 2 and still passed.
+	// The blacklist case elsewhere in this file cannot cover it either — there the
+	// caller is the banned one, so they get an empty list and no count is observed.
+	seedInactiveGroupMemberRow(t, groupNo, "banned", 0, int(common.GroupMemberStatusBlacklist))
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	list := decodeGroupList(t, w)
 	require.Len(t, list, 1)
-	assert.Equal(t, 2, list[0].MemberCount, "the member who left must not be counted")
+	assert.Equal(t, 2, list[0].MemberCount,
+		"neither the member who left nor the blacklisted one may be counted: a count that "+
+			"disagrees with the list it sits in makes the endpoint contradict ITSELF, which "+
+			"is worse than the accepted cross-surface difference with QueryMemberCount")
 }
 
 // TestListProjectGroupsGivesANonMemberAnEmptyList pins the decision NOT to add a
