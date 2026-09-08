@@ -111,6 +111,20 @@ type memberRevokedPayload struct {
 	Reason      string `json:"reason"`
 }
 
+// archivedPayload and restoredPayload are RESERVED, not wired.
+//
+// Archive and restore are frozen in the contract (§8) and deliberately not
+// implemented this cycle, so nothing constructs either of these and nothing
+// emits LifecycleEventArchived or LifecycleEventRestored. They are declared
+// because the contract fixes their shape and a later author should implement
+// against it rather than invent a second one.
+//
+// Stated here because the alternative reading is expensive: seeing the constants
+// and the payload types, a reader could reasonably assume disband already emits
+// project.archived. It does not — disband bumps both counters and emits no
+// event at all; it converges through the epoch predicate, which drops the
+// project and answers 0. Archive is a REVERSIBLE state and disband is terminal;
+// they are not the same event.
 type archivedPayload struct {
 	Reason string `json:"reason"`
 }
@@ -129,7 +143,7 @@ type metadataUpdatedPayload struct{}
 
 // restoredPayload is deliberately an empty object rather than a null: the
 // contract says the payload key is always present, and an absent object and an
-// empty one are different bytes to a fingerprint.
+// empty one are different bytes to a fingerprint. RESERVED — see archivedPayload.
 type restoredPayload struct{}
 
 // ---------- envelope ----------

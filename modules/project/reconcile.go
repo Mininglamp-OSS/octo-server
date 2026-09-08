@@ -261,6 +261,12 @@ func (p *Project) runReconcile() {
 	// this module's tables have no collation dependency.
 	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
+	// Same shape and same placement rationale as scanEpochSanity: own tables
+	// only, so it is unaffected by the collation drift the gate exists for, and
+	// what it repairs — a project the peer answers about as nonexistent although
+	// its container was confirmed — is exactly what should not wait on an ops
+	// window. See scanUnlatchedActivations.
+	p.scanUnlatchedActivations()
 	// P1's attribution and removal-machinery scans are independent of native
 	// group membership. I3 catches a broken Project attribution; the stall scan
 	// reports cleanup machinery that stopped. Both remain report-only.

@@ -39,14 +39,27 @@
 -- project permanently invisible to the peer on the deployments that have not
 -- turned provisioning on -- which is all of them today.
 --
--- NO INDEX. Every read that consults this column already filters by
--- (space_id, project_id) or by primary key and has the row in hand; the column
--- is a post-filter on a row already selected, not a search key. The one query
--- that scans BY it is the stuck-in-provisioning census, which is a periodic
--- gauge, not a request path.
+-- ONE INDEX, and it is not for the read paths. Every read that consults this
+-- column already filters by (space_id, project_id) or by primary key and has the
+-- row in hand; there the column is a post-filter on a row already selected.
+--
+-- The index exists for the three statements that scan BY it: the awaiting count,
+-- the oldest-age gauge and the reconcile repair. An earlier version of this file
+-- argued no index was needed because those are periodic rather than request
+-- paths. That argument had the cost backwards. The gauges run on every metrics
+-- tick on every pod, and their STEADY STATE is the worst case: with nothing
+-- awaiting activation, activated_at IS NULL matches no row, so an unindexed
+-- query reads the whole table to return nothing, forever, and gets slower as the
+-- table grows. NULLs are indexed in InnoDB, so the leading column makes exactly
+-- that case an empty index range.
+--
+-- Column order follows the predicates: activated_at first because it is the
+-- selective one (almost always zero rows), then status, then created_at so the
+-- oldest-age query gets its ORDER BY from the index instead of a filesort.
 ALTER TABLE `octo_project`
   ADD COLUMN `activated_at` DATETIME(3) NULL
-  COMMENT '两阶段创建：子系统确认容器已就绪的时间（UTC，应用侧写入）。NULL=尚未确认，对端两个入站接口一律按不存在作答。单向闩锁，置位后不再清除';
+  COMMENT '两阶段创建：子系统确认容器已就绪的时间（UTC，应用侧写入）。NULL=尚未确认，对端两个入站接口一律按不存在作答。单向闩锁，置位后不再清除',
+  ADD KEY `idx_octo_project_awaiting_activation` (`activated_at`, `status`, `created_at`);
 
 -- Backfill, deliberately before anything can read the column: rows that predate
 -- the gate were confirmed by the absence of the gate.
@@ -64,4 +77,6 @@ UPDATE `octo_project` SET `activated_at` = `created_at` WHERE `activated_at` IS 
 -- semicolon as being inside a literal. The failure PAIRS UP: an even number of
 -- them can pass while an odd number fails. Do not add one back and rely on
 -- counting.
-ALTER TABLE `octo_project` DROP COLUMN `activated_at`;
+ALTER TABLE `octo_project`
+  DROP KEY `idx_octo_project_awaiting_activation`,
+  DROP COLUMN `activated_at`;

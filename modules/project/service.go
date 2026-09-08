@@ -769,34 +769,71 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 		return nil, errPermissionDenied
 	}
 
+	// NAMED and DIFFERENT, not merely named.
+	//
+	// `named` decides the 400 below; `set` decides whether anything happens. They
+	// were one map, so a client re-sending the name a project already has counted
+	// as a change: the row was rewritten with identical values, lifecycle_version
+	// advanced, and one outbox row was enqueued. That is an amplifier a project
+	// admin can drive in a loop — the delivery worker sends events SEQUENTIALLY,
+	// ten per five-second tick, one HTTP round trip each, so empty
+	// metadata_updated events queue up in front of the member_revoked events whose
+	// delivery latency this module treats as security-relevant.
+	//
+	// It also disagreed with the rule the rest of the module follows: a no-op does
+	// not move a counter. The cascade is careful about it for member_epoch
+	// precisely so a consumer can trust that a moved counter means something moved.
+	named := 0
 	set := map[string]interface{}{}
 	if req.Name != nil {
-		set["name"] = *req.Name
-		row.Name = *req.Name
+		named++
+		if *req.Name != row.Name {
+			set["name"] = *req.Name
+			row.Name = *req.Name
+		}
 	}
 	if req.Description != nil {
-		set["description"] = *req.Description
-		row.Description = *req.Description
+		named++
+		if *req.Description != row.Description {
+			set["description"] = *req.Description
+			row.Description = *req.Description
+		}
 	}
 	if req.Logo != nil {
-		set["logo"] = *req.Logo
-		row.Logo = *req.Logo
+		named++
+		if *req.Logo != row.Logo {
+			set["logo"] = *req.Logo
+			row.Logo = *req.Logo
+		}
 	}
 	if req.Discoverability != nil {
-		set["discoverability"] = *req.Discoverability
-		row.Discoverability = *req.Discoverability
+		named++
+		if *req.Discoverability != row.Discoverability {
+			set["discoverability"] = *req.Discoverability
+			row.Discoverability = *req.Discoverability
+		}
 	}
 	if req.MaxMembers != nil {
-		set["max_members"] = *req.MaxMembers
-		row.MaxMembers = *req.MaxMembers
+		named++
+		if *req.MaxMembers != row.MaxMembers {
+			set["max_members"] = *req.MaxMembers
+			row.MaxMembers = *req.MaxMembers
+		}
 	}
 	// An update naming no field is rejected rather than quietly succeeding. The previous
 	// behaviour wrote nothing to the database (updateProfileTx returns early on an empty set)
 	// but still reported `updated_at = now` and emitted an update audit entry — so the response
 	// disagreed with the very next GET, and the audit log recorded a change that never
 	// happened. Both are worse than a 400.
-	if len(set) == 0 {
+	if named == 0 {
 		return nil, errNoFieldsToUpdate
+	}
+	// Named every field, changed none. NOT a 400 — the request was well formed and
+	// the project already holds the requested state, so the honest answer is the
+	// current row. Nothing is written, so updated_at does not move either, which
+	// is the same consistency argument the 400 above is made from.
+	if len(set) == 0 {
+		return row, tx.Commit()
 	}
 	if err := p.db.updateProfileTx(tx, projectID, set, now); err != nil {
 		return nil, err

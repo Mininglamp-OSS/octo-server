@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 )
@@ -172,9 +173,34 @@ func TestOutboxWorkerDoesNotStartWhenDisabled(t *testing.T) {
 // site can forget.
 func TestTruncateErrorBoundsTheColumn(t *testing.T) {
 	if got := truncateError(strings.Repeat("x", 300)); len(got) != 255 {
-		t.Fatalf("want 255 characters, got %d", len(got))
+		t.Fatalf("want 255 bytes, got %d", len(got))
 	}
 	if got := truncateError("short"); got != "short" {
 		t.Fatalf("short values must pass through unchanged, got %q", got)
+	}
+}
+
+// TestTruncateErrorNeverSplitsARune is the case a byte slice gets wrong, and the
+// consequence is not cosmetic.
+//
+// The string reaching this function can carry the error code from a peer refusal
+// body — whatever the peer put there, not necessarily ASCII. Invalid UTF-8 is
+// rejected by MySQL in strict mode (1366), and the write it fails is the one
+// that marks the event delivered or abandoned. So the row stays pending, the
+// lease expires, and the same event is redelivered on every tick forever.
+func TestTruncateErrorNeverSplitsARune(t *testing.T) {
+	// 3 bytes per rune: some offset near 255 necessarily lands mid-rune.
+	for pad := 0; pad < 3; pad++ {
+		in := strings.Repeat("x", pad) + strings.Repeat("对", 200)
+		got := truncateError(in)
+		if !utf8.ValidString(got) {
+			t.Fatalf("pad=%d produced invalid UTF-8, which the column rejects", pad)
+		}
+		if len(got) > 255 {
+			t.Fatalf("pad=%d exceeded the column bound: %d bytes", pad, len(got))
+		}
+		if len(got) < 255-3 {
+			t.Fatalf("pad=%d cut back too far: %d bytes; at most one rune should be dropped", pad, len(got))
+		}
 	}
 }

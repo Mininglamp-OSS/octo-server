@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -99,18 +100,41 @@ type lifecycleHTTPClient struct {
 	client *http.Client
 }
 
-func newLifecycleHTTPClient(rawURL, secret string, timeout time.Duration) (*lifecycleHTTPClient, error) {
+// validateLifecycleEndpoint is the ONE definition of "this endpoint is usable".
+//
+// It exists as a separate function because two places have to agree on that
+// answer and previously did not: the client refused a bad URL or a short secret,
+// while lifecycleEventsEnabled() only checked that both strings were non-empty.
+// An operator who configured a URL with a query string, or a 20-byte secret, got
+// an integration that ENQUEUED on every write and could never build a sender —
+// and the failure is silent in the worst way. claimLifecycleEvents increments
+// attempts before delivery is attempted, so each tick burned budget on rows that
+// never reached the abandon check; the table grew without bound, the purge only
+// touches terminal rows, and not one member revocation ever left this process.
+//
+// So the gate and the client now ask the same function. A refusal here disables
+// the whole integration, which is the fail-closed direction: an outbox that
+// cannot deliver is strictly worse than one that was never written.
+func validateLifecycleEndpoint(rawURL, secret string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("project: lifecycle event url: %w", err)
+		return fmt.Errorf("project: lifecycle event url: %w", err)
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("project: lifecycle event url must be absolute, got %q", rawURL)
+		return fmt.Errorf("project: lifecycle event url must be absolute, got %q", rawURL)
 	}
 	// A URL with no path would sign the empty string, and the peer would verify
 	// against whatever path its router matched — the two would never agree.
 	if parsed.EscapedPath() == "" || parsed.EscapedPath() == "/" {
-		return nil, fmt.Errorf("project: lifecycle event url must include the event path")
+		return errors.New("project: lifecycle event url must include the event path")
+	}
+	if parsed.RawQuery != "" {
+		// Refused rather than silently dropped: the signature does NOT cover the
+		// query, so anything put there is unauthenticated and an on-path rewrite
+		// of it would go undetected. Better to fail at boot than to ship a
+		// parameter the operator believes is protected.
+		return errors.New("project: lifecycle event url must not carry a query string; " +
+			"the signature does not cover it")
 	}
 	// A floor on the key, the same 32 bytes projectprovision.ValidateTarget
 	// requires of the provisioning secrets, and here for the same reason: HMAC's
@@ -118,16 +142,22 @@ func newLifecycleHTTPClient(rawURL, secret string, timeout time.Duration) (*life
 	// one captured request. Length only — the message never reports the observed
 	// length, which would be a (small) oracle in a log.
 	if len(secret) < lifecycleEventMinSecretBytes {
-		return nil, fmt.Errorf("project: lifecycle event secret must be at least %d bytes",
+		return fmt.Errorf("project: lifecycle event secret must be at least %d bytes",
 			lifecycleEventMinSecretBytes)
 	}
-	if parsed.RawQuery != "" {
-		// Refused rather than silently dropped: the signature does NOT cover the
-		// query, so anything put there is unauthenticated and an on-path rewrite
-		// of it would go undetected. Better to fail at boot than to ship a
-		// parameter the operator believes is protected.
-		return nil, fmt.Errorf("project: lifecycle event url must not carry a query string; " +
-			"the signature does not cover it")
+	return nil
+}
+
+func newLifecycleHTTPClient(rawURL, secret string, timeout time.Duration) (*lifecycleHTTPClient, error) {
+	if err := validateLifecycleEndpoint(rawURL, secret); err != nil {
+		return nil, err
+	}
+	// Re-parsed rather than returned from the validator: the validator answers a
+	// yes/no question that the enqueue gate also asks, and handing back a parsed
+	// URL would invite a caller to use a value the gate has no use for.
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("project: lifecycle event url: %w", err)
 	}
 	return &lifecycleHTTPClient{
 		url:    rawURL,

@@ -273,3 +273,76 @@ func epochOfPayload(t *testing.T, payload string) int64 {
 	require.NoError(t, json.Unmarshal([]byte(payload), &p))
 	return p.MemberEpoch
 }
+
+// TestAnIdenticalUpdateEnqueuesNothing is the amplification guard.
+//
+// A client re-sending the name a project already has used to count as a change:
+// the row was rewritten with identical values, lifecycle_version advanced, and
+// one outbox row was enqueued. Events are delivered SEQUENTIALLY, ten per
+// five-second tick, one HTTP round trip each — so a project admin in a loop
+// could queue empty metadata_updated events in front of the member_revoked
+// events whose delivery latency this module treats as security-relevant.
+//
+// It is also the rule the rest of the module already follows for member_epoch: a
+// no-op does not move a counter, which is what lets a consumer trust that a
+// moved counter means something moved.
+func TestAnIdenticalUpdateEnqueuesNothing(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "noopUpdater")
+	seedSpaceMember(t, spaceA, "noopUpdater", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "noop-update")
+	before := lifecycleVersionOf(t, created.ProjectID)
+
+	for i := 0; i < 3; i++ {
+		w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
+			map[string]any{"name": "noop-update"})
+		require.Equal(t, http.StatusOK, w.Code,
+			"a request naming a field the project already matches is well formed, so it is "+
+				"200 with the current row — not a 400: body: %s", w.Body.String())
+	}
+
+	assert.Len(t, outboxRows(t, created.ProjectID), 1,
+		"only the creation event: three identical updates changed nothing, so there is "+
+			"nothing to tell the peer about")
+	assert.Equal(t, before, lifecycleVersionOf(t, created.ProjectID),
+		"a no-op must not move lifecycle_version; a consumer orders on it and a version that "+
+			"advances without a change makes every ordering decision meaningless")
+
+	// And a REAL change still does both.
+	w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
+		map[string]any{"name": "noop-update-really"})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Len(t, outboxRows(t, created.ProjectID), 2, "a real change still enqueues")
+	assert.Greater(t, lifecycleVersionOf(t, created.ProjectID), before, "and still bumps")
+}
+
+// TestAnUpdateNamingNoFieldIsStillRejected keeps the two cases apart. "Named
+// nothing" is a malformed request; "named fields that already match" is a well
+// formed one the project already satisfies. Folding them would either 400 a
+// legitimate idempotent retry or accept an empty body.
+func TestAnUpdateNamingNoFieldIsStillRejected(t *testing.T) {
+	_, p := setup(t)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "emptyUpdater")
+	seedSpaceMember(t, spaceA, "emptyUpdater", 0, 1)
+
+	created := createProjectOn(t, r, spaceA, token, "empty-update")
+	w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token, map[string]any{})
+	assert.NotEqual(t, http.StatusOK, w.Code,
+		"an update naming no field at all must still be refused: body: %s", w.Body.String())
+}
+
+func lifecycleVersionOf(t *testing.T, projectID string) int64 {
+	t.Helper()
+	var v []int64
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT lifecycle_version FROM `octo_project` WHERE project_id = ?", projectID).Load(&v)
+	require.NoError(t, err)
+	require.Len(t, v, 1)
+	return v[0]
+}

@@ -187,3 +187,69 @@ func TestAwaitingActivationCensusCountsOnlyLiveProjects(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, count, "a disbanded project is finished, not stuck")
 }
+
+// TestReconcileLatchesAConfirmedButUnlatchedProject covers the gap the reactive
+// path cannot: confirmProjectActive runs AFTER the provisioning job is marked
+// terminal, and terminal jobs are never re-claimed. So a pod killed between the
+// two statements — or a transient error on the latch UPDATE — left a project
+// whose container demonstrably exists permanently invisible to the peer, with a
+// gauge showing it and nothing able to act on it.
+func TestReconcileLatchesAConfirmedButUnlatchedProject(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "activate-repair")
+
+	p.processProvisioningJobs()
+	require.NotNil(t, activatedAtOf(t, created.ProjectID))
+
+	// Reproduce the crash window: the job is ready, the latch is not set.
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = NULL WHERE project_id = ?",
+		created.ProjectID).Exec()
+	require.NoError(t, err)
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition")
+
+	p.scanUnlatchedActivations()
+
+	require.NotNil(t, activatedAtOf(t, created.ProjectID),
+		"a project whose fleet job reached ready must be latched by the repair scan; "+
+			"nothing else will ever come back to a terminal job")
+}
+
+// TestReconcileDoesNotLatchAnUnconfirmedProject is the half that makes the
+// repair safe. Latching on anything short of a clean ensure would defeat the
+// gate entirely — it would just delay activation by one reconcile interval.
+func TestReconcileDoesNotLatchAnUnconfirmedProject(t *testing.T) {
+	fleet := newFakeTarget(t)
+	fleet.setStatus(500)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "activate-norepair")
+
+	p.processProvisioningJobs()
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition: the ensure failed")
+
+	p.scanUnlatchedActivations()
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"the repair scan must latch only on a READY fleet job: latching on a failed or "+
+			"pending one would make the gate a delay rather than a gate")
+}
+
+// TestDriveReadyDoesNotSatisfyTheRepair: drive is storage and says nothing about
+// whether the peer may act on the project. The repair must be as narrow as the
+// reactive path it backs up.
+func TestDriveReadyDoesNotSatisfyTheRepair(t *testing.T) {
+	fleet := newFakeTarget(t)
+	drive := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet, drive)
+	created := createVia(t, r, token, "activate-repair-drive")
+
+	p.cfg.Provisioning.Targets = []provisionTarget{driveTargetOn(drive)}
+	p.processProvisioningJobs()
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition")
+
+	p.scanUnlatchedActivations()
+
+	assert.Nil(t, activatedAtOf(t, created.ProjectID),
+		"a ready DRIVE job must not satisfy the repair either")
+}

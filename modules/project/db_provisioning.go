@@ -587,3 +587,63 @@ func truncateProvisioningError(s string) string {
 	}
 	return truncated
 }
+
+// repairConfirmedButUnlatched latches projects whose fleet job already reached
+// ready while activated_at stayed NULL.
+//
+// The gap it closes: confirmProjectActive runs AFTER finishProvisioning marks the
+// job terminal, and terminal jobs are never re-claimed. So a pod killed between
+// those two statements, or a transient error on the latch UPDATE, left a project
+// whose container demonstrably exists permanently invisible to the peer — with a
+// gauge showing it and nothing able to act on it. Ordering the two the other way
+// would only trade this for the worse failure (a project marked visible against a
+// job that still reads as unfinished), so the answer is a repair, not a reorder.
+//
+// The predicate IS the evidence: status ready on the fleet row means this
+// deployment received a clean ensure for that project. Nothing here consults the
+// provisioning table as a GATE (D12) — it is repairing a latch after the fact,
+// not answering whether a container exists right now.
+//
+// It lives in THIS file rather than beside the rest of the activation code
+// because that is what the provisioning guards require and they are right to:
+// octo_project_provisioning is named in exactly one non-test file, so the DAO
+// stays the single access point and no future edit can quietly turn a read of it
+// into a request-path gate. The query selects project_id only — never
+// container_id, which is the capability the second guard protects.
+//
+// Bounded by limit and driven from the reconcile rotation. Both tables are
+// octo_project*, same pinned collation, so the join is safe on a drifted
+// database.
+func (d *DB) repairConfirmedButUnlatched(now time.Time, limit int) ([]string, error) {
+	// SELECT then UPDATE, in two statements, because MySQL refuses LIMIT on a
+	// multi-table UPDATE (1221) — the single joined statement this started as
+	// failed at runtime, not at build time, and the repair simply never ran. An
+	// unbounded UPDATE was not an acceptable way to satisfy the parser: the row
+	// count here is a backlog, so the one time it matters is the one time it is
+	// large.
+	var ids []string
+	if _, err := d.session.SelectBySql(
+		"SELECT p.project_id FROM `octo_project` p "+
+			"INNER JOIN `octo_project_provisioning` pr "+
+			"  ON pr.project_id = p.project_id AND pr.target = ? AND pr.status = ? "+
+			"WHERE p.activated_at IS NULL AND p.status = ? "+
+			"ORDER BY p.created_at LIMIT ?",
+		TargetFleet, provisionStatusReady, StatusNormal, limit,
+	).Load(&ids); err != nil {
+		return nil, fmt.Errorf("project: find unlatched confirmed projects: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// activated_at IS NULL is repeated in the UPDATE rather than trusted from the
+	// SELECT: the reactive path may have latched a row in between, and that
+	// timestamp is the earlier and truer one.
+	if _, err := d.session.UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = ? "+
+			"WHERE project_id IN ? AND activated_at IS NULL AND status = ?",
+		now, ids, StatusNormal,
+	).Exec(); err != nil {
+		return nil, fmt.Errorf("project: repair unlatched activation: %w", err)
+	}
+	return ids, nil
+}

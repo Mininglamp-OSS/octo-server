@@ -145,3 +145,32 @@ func (p *Project) confirmProjectActive(projectID, target string) {
 			zap.String("projectId", projectID))
 	}
 }
+
+// scanUnlatchedActivations is the reconcile half of the two-phase create latch.
+//
+// Scheduled rather than reactive, because the state it repairs is only reachable
+// when the reactive path did NOT run: the pod died between marking the job ready
+// and setting the latch, or the latch UPDATE itself failed. Both leave a project
+// whose container exists but which the peer answers about as nonexistent — and
+// the provisioning job is terminal, so nothing else will ever come back to it.
+//
+// Runs unconditionally, outside the reconcile enablement gate, for the reason
+// scanEpochSanity does: it touches only this module's own tables, so the
+// collation drift the gate exists for cannot reach it — and a repair that
+// defaults to "no monitoring" is the failure that gate was itself narrowed for.
+func (p *Project) scanUnlatchedActivations() {
+	repaired, err := p.db.repairConfirmedButUnlatched(time.Now().UTC(), p.cfg.ReconcileLimit)
+	if err != nil {
+		p.Warn("修复未置位的项目激活闩锁失败", zap.Error(err))
+		return
+	}
+	if len(repaired) > 0 {
+		// Error, not Info: reaching here means the reactive latch did not run,
+		// and every one of these projects was invisible to the peer for at least
+		// one reconcile interval — its members denied on the peer side the whole
+		// time. The repair is the right outcome; needing it is not.
+		p.Error("修复了容器已确认但未置位激活闩锁的项目（此前对对端读作不存在）",
+			zap.Int("repaired", len(repaired)),
+			zap.Strings("projectIds", repaired))
+	}
+}

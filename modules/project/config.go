@@ -274,15 +274,28 @@ func (c Config) dayWindow(now time.Time) (time.Time, time.Time) {
 
 // lifecycleEventsEnabled reports whether the outbox may enqueue and deliver.
 //
-// Fail-closed on INCOMPLETE configuration, not just on the switch: an enabled
-// integration with no URL or no secret cannot deliver anything, so letting it
-// ENQUEUE would build a backlog that only grows and whose head keeps failing on
-// the same misconfiguration. Refusing at the enqueue side keeps the outbox empty
-// and leaves the misconfiguration visible in the startup log instead.
+// Fail-closed on UNUSABLE configuration, not just on the switch, and "unusable"
+// is decided by validateLifecycleEndpoint — the same function the delivery
+// client calls. That sharing is the whole point of the check.
+//
+// The earlier version tested only that the two strings were non-empty, so a URL
+// with a query string or a secret below the key floor passed the gate and failed
+// at the client. The result was an integration that enqueued on every write and
+// could never build a sender: claimLifecycleEvents increments attempts before
+// delivery is attempted, so every tick burned budget on rows that never reached
+// the abandon check, the table grew without bound (the purge only touches
+// terminal rows), and not one member revocation left the process. An outbox that
+// cannot deliver is strictly worse than one that was never written.
+//
+// Called on the enqueue path, so it re-parses a URL per write. That is a
+// url.Parse beside a database INSERT on a path that runs at project-write
+// frequency; buying it back with a cached flag would put the answer somewhere it
+// could disagree with the config it came from, which is the bug being fixed.
 func (p *Project) lifecycleEventsEnabled() bool {
-	return p.cfg.LifecycleEventsEnabled &&
-		p.cfg.LifecycleEventURL != "" &&
-		p.cfg.LifecycleEventSecret != ""
+	if !p.cfg.LifecycleEventsEnabled {
+		return false
+	}
+	return validateLifecycleEndpoint(p.cfg.LifecycleEventURL, p.cfg.LifecycleEventSecret) == nil
 }
 
 // lifecycleSecretSiblings is the set of fixed capability credentials the

@@ -79,10 +79,18 @@ func (p *Project) startLifecycleEventWorker() {
 			// unset one look identical from cfg alone (both leave it empty), and
 			// those two want opposite fixes: one is "set the env", the other is
 			// "the env is set to a value another capability already uses".
-			p.Error("项目生命周期事件已开启但配置不完整，发件箱不会入队也不会投递",
+			// Three distinguishable causes, because they want different fixes:
+			// the env is unset, the env is set to a value another capability
+			// already uses (LifecycleEventProblem), or the value is set but not
+			// usable — a URL with a query string, a secret below the key floor.
+			// The last one is what the endpoint validator now reports; before it
+			// was consulted here the integration simply enqueued forever.
+			p.Error("项目生命周期事件已开启但配置不可用，发件箱不会入队也不会投递",
 				zap.Bool("url_set", p.cfg.LifecycleEventURL != ""),
 				zap.Bool("secret_set", p.cfg.LifecycleEventSecret != ""),
-				zap.Error(p.cfg.LifecycleEventProblem))
+				zap.NamedError("secret_collision", p.cfg.LifecycleEventProblem),
+				zap.NamedError("endpoint", validateLifecycleEndpoint(
+					p.cfg.LifecycleEventURL, p.cfg.LifecycleEventSecret)))
 		}
 		return
 	}
@@ -136,16 +144,48 @@ func (p *Project) runLifecycleEventDelivery() {
 
 	sender, err := p.lifecycleSenderOrDefault()
 	if err != nil {
-		// A misconfigured endpoint cannot be fixed by retrying this tick, and the
-		// rows stay claimed only until the lease expires — so the batch is released
-		// to the next tick rather than burned through its attempt budget against a
-		// URL that will not become valid on its own. The startup log already named
-		// the problem; this is the running reminder.
+		// A misconfigured endpoint cannot be fixed by retrying this tick, so the
+		// batch is handed back with its attempt refunded rather than burned
+		// against a URL that will not become valid on its own. The enqueue gate
+		// now asks the same validator (lifecycleEventsEnabled), so reaching here
+		// means the configuration changed under a running process; the startup
+		// log named the problem, this is the running reminder.
 		p.Error("项目生命周期事件投递端点配置无效，本轮跳过", zap.Error(err))
+		if relErr := p.db.releaseUnattemptedLifecycleEvents(ids, owner); relErr != nil {
+			p.Warn("交还未投递的项目生命周期事件失败", zap.Error(relErr))
+		}
 		return
 	}
+
+	// ONE PROJECT AT A TIME, IN ORDER, AND STOP THAT PROJECT ON ITS FIRST FAILURE.
+	//
+	// The queue is ordered globally (next_attempt_at, id), but delivery is not
+	// automatically ordered PER PROJECT, and for this peer it has to be. A
+	// project.created that hits a transient 503 is rescheduled with backoff and
+	// drops behind; the next row for the same project is then sent first, and the
+	// peer answers "unknown project" — a plain 4xx, which this client classifies
+	// as terminal. So one transient failure on the creation event could
+	// permanently ABANDON the member_revoked behind it, which is the one loss this
+	// module calls a security failure rather than a stale display.
+	//
+	// Blocking is per project, not per batch: other projects in the same claim are
+	// unaffected, so a single slow peer response does not stall the queue. Rows
+	// skipped this way are released with their attempt refunded — they were never
+	// sent, and charging them would retire a project's tail without a single
+	// delivery attempt on it.
+	blocked := make(map[string]bool)
+	var skipped []int64
 	for _, row := range rows {
-		p.deliverLifecycleEvent(sender, row, owner)
+		if blocked[row.ProjectID] {
+			skipped = append(skipped, row.ID)
+			continue
+		}
+		if !p.deliverLifecycleEvent(sender, row, owner) {
+			blocked[row.ProjectID] = true
+		}
+	}
+	if err := p.db.releaseUnattemptedLifecycleEvents(skipped, owner); err != nil {
+		p.Warn("交还被跳过的项目生命周期事件失败", zap.Error(err))
 	}
 }
 
@@ -177,7 +217,14 @@ func (p *Project) startLifecycleLeaseHeartbeat(ids []int64, owner string) func()
 }
 
 // deliverLifecycleEvent sends one event and records the outcome.
-func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEventRow, owner string) {
+//
+// Returns whether this event is DONE — delivered, or terminally abandoned. A
+// false answer means the same event is still owed to the peer, which is what
+// makes the caller hold back everything queued behind it for the same project.
+// Abandoned counts as done on purpose: nothing will retry it, so holding the
+// project's queue behind a row that will never move would convert one lost event
+// into a permanently stalled project.
+func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEventRow, owner string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.LifecycleEventTimeout)
 	defer cancel()
 
@@ -189,28 +236,37 @@ func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEve
 	case res.OK:
 		held, err := p.db.completeLifecycleEvent(row.ID, owner, lifecycleEventDelivered, "", now)
 		if err != nil {
+			// The peer HAS it; only our bookkeeping failed. Reporting "not done"
+			// would hold the project's queue behind a row that will be redelivered
+			// (idempotently) next tick anyway — but that is the honest answer,
+			// because until the row is marked, this event is still in the queue
+			// ahead of the ones behind it.
 			p.Error("标记项目生命周期事件已投递失败",
 				zap.Int64("id", row.ID), zap.String("event_id", row.EventID), zap.Error(err))
-			return
+			return false
 		}
 		if !held {
 			// Delivered, but this worker no longer owned the row. The peer has
 			// the event either way — it is idempotent on event_id — so this is a
-			// lease-hygiene warning, not a delivery failure.
+			// lease-hygiene warning, not a delivery failure. Done from this
+			// project's ordering point of view: whoever holds the lease marks it.
 			p.Warn("项目生命周期事件已投递但租约已易主",
 				zap.Int64("id", row.ID), zap.String("event_id", row.EventID))
-			return
+			return true
 		}
 		lifecycleEventOutcome.WithLabelValues(row.EventType, "delivered", lifecycleErrNone).Inc()
+		return true
 
 	case !res.Retryable:
 		// Terminal refusal. Abandon immediately rather than burning the attempt
 		// budget on an answer that cannot change — the budget exists to outlast a
 		// transient peer, and spending it here only delays the alert.
 		p.abandonLifecycleEvent(row, owner, res, now)
+		return true
 
 	case row.Attempts >= lifecycleEventMaxAttempts:
 		p.abandonLifecycleEvent(row, owner, res, now)
+		return true
 
 	default:
 		backoff := time.Duration(1<<uint(row.Attempts)) * time.Second
@@ -220,12 +276,13 @@ func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEve
 		held, err := p.db.rescheduleLifecycleEvent(row.ID, owner, now.Add(backoff), res.Class+": "+res.Detail)
 		if err != nil {
 			p.Error("重排项目生命周期事件失败", zap.Int64("id", row.ID), zap.Error(err))
-			return
+			return false
 		}
 		if !held {
 			p.Warn("项目生命周期事件租约已易主，放弃重排",
 				zap.Int64("id", row.ID), zap.String("lease_owner", owner))
 		}
+		return false
 	}
 }
 

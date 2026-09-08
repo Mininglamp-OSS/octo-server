@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gocraft/dbr/v2"
+	"unicode/utf8"
 )
 
 // SQL for the project lifecycle outbox (O4).
@@ -163,6 +164,37 @@ func (d *DB) rescheduleLifecycleEvent(id int64, owner string, nextAttempt time.T
 	return affected > 0, nil
 }
 
+// releaseUnattemptedLifecycleEvents hands back rows this worker claimed but did
+// NOT send, and refunds the attempt the claim charged them.
+//
+// The refund is the point. claimLifecycleEvents increments attempts for the whole
+// batch up front, so a row released without a send would otherwise burn budget
+// for work that never happened — and with the per-project ordering rule below,
+// a project with a slow head event would retire its own tail after a dozen ticks
+// without a single delivery having been tried on it.
+//
+// Guarded on lease_owner so a row whose lease already changed hands is left
+// alone: another worker owns it and its attempt is legitimately spent.
+//
+// attempts is decremented with a floor, because a value that could go negative
+// would read as unsigned in MySQL and become a very large number — the abandon
+// check compares against it.
+func (d *DB) releaseUnattemptedLifecycleEvents(ids []int64, owner string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := d.session.UpdateBySql(
+		"UPDATE `octo_project_lifecycle_event` "+
+			"SET lease_owner = '', lease_until = NULL, "+
+			"    attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END "+
+			"WHERE id IN ? AND lease_owner = ? AND status = ?",
+		ids, owner, lifecycleEventPending,
+	).Exec(); err != nil {
+		return fmt.Errorf("project: release unattempted lifecycle events: %w", err)
+	}
+	return nil
+}
+
 // countPendingLifecycleEvents backs the backlog gauge.
 func (d *DB) countPendingLifecycleEvents() (int, error) {
 	var n int
@@ -240,5 +272,24 @@ func truncateError(s string) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max]
+	// Cut back to a RUNE boundary, not just to 255 bytes.
+	//
+	// last_error is utf8mb4 VARCHAR(255) and this string can carry peer output —
+	// the error code lifted from a refusal body, which is whatever the peer put
+	// there and may well not be ASCII. A byte slice through the middle of a
+	// multi-byte rune produces invalid UTF-8, MySQL in strict mode rejects the
+	// write with 1366, and the caller is completeLifecycleEvent /
+	// rescheduleLifecycleEvent: the row never reaches a terminal state, the lease
+	// expires, and the SAME event is delivered to the peer again on every tick,
+	// forever. A garbled tail is a cosmetic problem; an undeliverable row that
+	// cannot be marked is not.
+	//
+	// 255 BYTES is the bound rather than 255 characters, which is what the column
+	// actually allows — deliberately conservative, and it costs nothing: this is
+	// a low-cardinality failure summary, not content.
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

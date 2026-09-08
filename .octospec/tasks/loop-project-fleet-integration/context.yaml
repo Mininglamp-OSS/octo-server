@@ -672,6 +672,129 @@ increment_2:
         still contained the string. A guard a comment can satisfy reports green
         for exactly the thing it was written to catch.
 
+  review_fixes:
+    - id: R-gate-vs-client
+      finding: >
+        The enqueue gate tested only that the URL and secret were non-empty while
+        the delivery client validated their shape, so a URL with a query string or
+        a secret below the key floor enabled enqueue and could never build a
+        sender. claimLifecycleEvents charges an attempt before delivery is
+        attempted, so every tick burned budget on rows that never reached the
+        abandon check; the table grew without bound (the purge only touches
+        terminal rows) and no revocation ever left the process.
+      decision: >
+        One validateLifecycleEndpoint, called by both. Pinned by a test that
+        asserts the two agree over a table of URL/secret shapes, so a future rule
+        added to only one of them fails.
+    - id: R-per-project-ordering
+      finding: >
+        Delivery was ordered globally but not per project. A project.created
+        hitting a transient 5xx is rescheduled with backoff and drops behind the
+        events queued after it; delivering those first makes the peer answer
+        "unknown project", a plain 4xx, which this client classifies as TERMINAL.
+        One transient failure on the creation event could therefore permanently
+        abandon the member_revoked behind it.
+      decision: >
+        The loop blocks a project on its first failure and skips the rest of that
+        project's rows in the batch, releasing them with the claim attempt
+        REFUNDED. Blocking is per project, so one slow peer response does not
+        stall the queue. Abandoned counts as done: nothing retries it, so holding
+        the project behind it would turn one lost event into a stalled project.
+    - id: R-truncate-runes
+      finding: >
+        truncateError sliced by bytes, so a peer error code containing multi-byte
+        UTF-8 was cut mid-rune. MySQL strict mode rejects the write with 1366 —
+        and the write it fails is the one marking the event delivered or
+        abandoned, so the row stays pending and the same event is redelivered
+        forever.
+      decision: Cut back to a rune boundary; bound stays 255 bytes.
+    - id: R-activation-repair
+      finding: >
+        confirmProjectActive runs after finishProvisioning marks the job terminal,
+        and terminal jobs are never re-claimed. A pod killed between the two, or a
+        transient error on the latch UPDATE, left a project whose container
+        demonstrably exists permanently invisible to the peer.
+      decision: >
+        A reconcile scan latches projects whose fleet job is ready but
+        activated_at is NULL. Reordering the two statements was rejected: it
+        trades this for the worse failure, a project visible to the peer against a
+        job that still reads as unfinished. The query lives in db_provisioning.go
+        because #850's guards require that table to be named in exactly one file,
+        and it selects project_id only, never container_id.
+      note: >
+        The first version was a single joined UPDATE with LIMIT. MySQL refuses
+        LIMIT on a multi-table UPDATE (1221), so it compiled, failed at runtime,
+        logged one Warn, and never repaired anything. Caught by the test. Now
+        SELECT-then-UPDATE; dropping the LIMIT to satisfy the parser was not an
+        option, since the row count here IS the backlog.
+    - id: R-noop-update
+      finding: >
+        updateProjectOnce keyed on whether a field was NAMED, not whether it
+        CHANGED, so re-sending a project its own name bumped lifecycle_version and
+        enqueued an event. Events are delivered sequentially, ten per five-second
+        tick, one round trip each — so a project admin in a loop could queue empty
+        metadata_updated events in front of member_revoked.
+      decision: >
+        Split into `named` (decides the 400) and `set` (decides whether anything
+        happens). Named-but-identical returns the current row with nothing
+        written, which also keeps the module's own rule that a no-op does not move
+        a counter.
+    - id: R-activation-index
+      finding: >
+        The awaiting-activation census and age gauge scanned octo_project with no
+        usable index, on every metrics tick on every pod — and the STEADY STATE is
+        the worst case: with nothing awaiting activation the predicate matches no
+        row, so an unindexed query reads the whole table to return nothing.
+      decision: >
+        Index (activated_at, status, created_at) on the same unreleased migration.
+        NULLs are indexed in InnoDB, so the empty case becomes an empty range and
+        the age query gets its ORDER BY from the index.
+
+  not_fixed_here:
+    - id: R-epoch-map-key
+      what: >
+        ProjectMemberships looks up the epoch with an exact Go map key while
+        ProjectEpochsInSpace keys the map by the DB spelling under a
+        case-INSENSITIVE collation. A case-variant project id matches in SQL and
+        misses in the map, so every real member of a live project is answered
+        member:false and the project reads as nonexistent. Same defect class as
+        the P2h handler-layer fix in the previous increment; this call site was
+        missed.
+      why_not_here: >
+        Inherited from the O2/O3 increment, which another agent is driving.
+        Fail-closed (denies rather than grants), but it sits on the peer's
+        authorization path. Raised with the owner rather than fixed silently in a
+        branch built on top of it.
+    - id: R-lock-order
+      what: >
+        bumpMemberEpochForSpaceMemberTx takes octo_project_member locks before
+        octo_project locks, the opposite of every other transaction in
+        modules/project, inside a user-facing Space-removal transaction that has
+        no retryOnLockConflict wrapper.
+      why_not_here: same as above.
+    - id: R-epoch-repair-per-row
+      what: scanEpochSanity repairs the absent-epoch sentinel one UPDATE per row.
+      why_not_here: same as above.
+    - id: R-credential-registry-copies
+      what: >
+        The fixed internal-token registry is hand-copied across main.go,
+        modules/internal_membership and modules/project, re-spelling constants
+        that were exported to prevent the copies.
+      why_not_here: >
+        A cross-module refactor (the registry belongs in one leaf package), not a
+        defect: the copies are held in lockstep by
+        TestModuleLocalRefusalsCoverTheCentralRegistry and
+        TestSiblingListCoversTheCentralRegistry. Worth its own task.
+    - id: R-migration-naming
+      what: >
+        The review read the four new migration filenames as violating CLAUDE.md's
+        documented `<yyyyMMdd>-<seq>_<name>.sql`.
+      why_not_here: >
+        Checked: 212 of 212 migration files in this repository use the
+        concatenated form and none use the hyphenated one. The documentation is
+        what is wrong, and fixing it is a repo-wide doc change rather than
+        something to smuggle into this branch.
+
   open_questions:
     - id: Q-409-codes
       what: >
