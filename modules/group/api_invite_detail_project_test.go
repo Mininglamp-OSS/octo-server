@@ -99,3 +99,61 @@ func TestGroupInviteDetailNeverLeaksProjectID(t *testing.T) {
 		"and not under any other key either — asserted on the raw body so a rename "+
 			"of the field cannot slip the value through")
 }
+
+// TestGetGroupsCarriesTheProjectIDFromTheRow covers the one line PR-2 actually
+// depends on, through the path production uses.
+//
+// The sidebar's project_id is produced by exactly one assignment —
+// `ProjectID: m.ProjectID` in toInfoResp — and every case in modules/message
+// reaches SidebarItem.ProjectID either from a map the test built itself or through
+// a fake GetGroups returning hand-written InfoResp literals. So all five of those
+// assertions stay green with that assignment deleted, and the field ships empty to
+// every client. Reviewer yujiawei found the gap; this is the mutation kill for it.
+//
+// Deliberately driven through Service.GetGroups rather than toInfoResp directly:
+// the fake it replaces implements that method, so this asserts the same seam the
+// sidebar calls, over a real `group` row, rather than a helper one refactor away
+// from no longer being on the path.
+//
+// The absent case is half the assertion. A mapping that hardcoded a non-empty
+// value would satisfy the positive half alone, and "" is the column's own sentinel
+// for a Space-direct group — the value the sidebar's omitempty depends on.
+func TestGetGroupsCarriesTheProjectIDFromTheRow(t *testing.T) {
+	_, ctx := newTestServer(t)
+	f := New(ctx)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+
+	const (
+		spaceID       = "space-getgroups-project"
+		projectGroup  = "g-getgroups-in-project"
+		directGroup   = "g-getgroups-space-direct"
+		wantProjectID = "p-getgroups"
+	)
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: projectGroup, Name: "项目群", Creator: testutil.UID, Status: 1,
+		SpaceID: spaceID, ProjectID: wantProjectID,
+	}))
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: directGroup, Name: "空间直属群", Creator: testutil.UID, Status: 1,
+		SpaceID: spaceID,
+	}))
+
+	infos, err := NewService(ctx).GetGroups([]string{projectGroup, directGroup})
+	require.NoError(t, err)
+
+	byNo := make(map[string]*InfoResp, len(infos))
+	for _, info := range infos {
+		byNo[info.GroupNo] = info
+	}
+	require.Contains(t, byNo, projectGroup)
+	require.Contains(t, byNo, directGroup)
+
+	assert.Equal(t, wantProjectID, byNo[projectGroup].ProjectID,
+		"InfoResp.ProjectID must carry the group row's project_id — this is the only "+
+			"link between the `group` table and the sidebar's project_id, and the "+
+			"sidebar tests all run against a fake that bypasses it")
+	assert.Empty(t, byNo[directGroup].ProjectID,
+		"and a Space-direct group must read empty rather than inheriting a neighbour, "+
+			"since that empty string is what omitempty drops from the payload")
+}
