@@ -8,6 +8,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
@@ -107,9 +108,9 @@ func (ba *BotAPI) botResolveTargets(c *wkhttp.Context) {
 		// exact (un-wildcarded) name match first, then a stable group_no order.
 		_, err := ba.ctx.DB().SelectBySql(
 			"SELECT g.group_no, g.name FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no "+
-				"WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.name LIKE ? "+
+				"WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose <> ? AND g.name LIKE ? "+
 				"ORDER BY (g.name = ?) DESC, g.group_no ASC LIMIT ?",
-			robotID, pattern, name, limit+1,
+			robotID, aiteampkg.GroupPurpose, pattern, name, limit+1,
 		).Load(&rows)
 		if err != nil {
 			ba.Error("resolve targets: query groups failed", zap.Error(err), zap.String("robotID", robotID))
@@ -164,9 +165,9 @@ func (ba *BotAPI) botResolveTargets(c *wkhttp.Context) {
 			"SELECT t.group_no, t.short_id, t.name, g.name AS parent_name FROM thread t "+
 				"INNER JOIN group_member gm ON gm.group_no = t.group_no COLLATE utf8mb4_general_ci AND gm.uid = ? AND gm.is_deleted = 0 "+
 				"INNER JOIN `group` g ON g.group_no = t.group_no COLLATE utf8mb4_general_ci "+
-				"WHERE t.status IN (1, 2) AND t.name LIKE ? "+
+				"WHERE t.status IN (1, 2) AND g.purpose <> ? AND t.name LIKE ? "+
 				"ORDER BY (t.name = ? COLLATE utf8mb4_general_ci) DESC, t.status ASC, t.group_no ASC, t.short_id ASC LIMIT ?",
-			robotID, pattern, name, limit+1,
+			robotID, aiteampkg.GroupPurpose, pattern, name, limit+1,
 		).Load(&rows)
 		if err != nil {
 			ba.Error("resolve targets: query threads failed", zap.Error(err), zap.String("robotID", robotID))

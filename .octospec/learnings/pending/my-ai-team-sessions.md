@@ -1,8 +1,8 @@
 ---
 type: Learning
-title: Synchronize asynchronous cleanup tests on completion evidence
-description: Claim-time counters do not prove callback or cascade completion
-tags: [testing, concurrency, async, cleanup]
+title: Lifecycle cleanup must synchronize and validate its authority
+description: Completion evidence and target validation are both required around destructive asynchronous cleanup
+tags: [testing, concurrency, async, cleanup, authorization, lifecycle]
 timestamp: 2026-09-08T09:34:00+08:00
 task: my-ai-team-sessions
 source: self
@@ -15,3 +15,10 @@ that callbacks or downstream effects completed. Wait on evidence written after
 the complete execution phase, and use atomics or channels for any callback state
 observed across goroutines. Run the regression with both `-race` and shuffled
 test order so the synchronization contract is executable.
+
+Before a privileged endpoint invokes a cleanup helper that accepts a raw
+identifier, first resolve the identifier as the expected entity type. Authorization
+of the operator does not prove the target is a Bot rather than a human user. Cleanup
+wrappers must also preserve intentional no-op outcomes from their shared primitive
+(for example, creator membership cannot be removed) instead of turning them into a
+misleading hard failure after earlier destructive steps have committed.

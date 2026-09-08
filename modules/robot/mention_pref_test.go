@@ -1,15 +1,19 @@
 package robot
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDecideOwnership covers the creator-ownership decision used by the
@@ -114,7 +118,7 @@ const (
 // setupOwnerMentionList builds a real Robot module on a clean DB with a bot
 // owned by testutil.UID that is a member of one group, and seeds that group's
 // allow_no_mention. Returns the router so owner endpoints can be exercised.
-func setupOwnerMentionList(t *testing.T, groupAllowNoMention, ownerNoMention int) http.Handler {
+func setupOwnerMentionList(t *testing.T, groupAllowNoMention, ownerNoMention int) (http.Handler, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	assert.NoError(t, testutil.CleanAllTables(ctx))
@@ -148,7 +152,7 @@ func setupOwnerMentionList(t *testing.T, groupAllowNoMention, ownerNoMention int
 		assert.NoError(t, err)
 	}
 
-	return s.GetRoute()
+	return s.GetRoute(), ctx
 }
 
 // TestListGroups_CarriesGroupAllowNoMention pins that the owner list endpoint
@@ -156,7 +160,7 @@ func setupOwnerMentionList(t *testing.T, groupAllowNoMention, ownerNoMention int
 // so the bot owner UI can show the "I enabled it but the group owner disabled
 // it" state (YUJ-2996).
 func TestListGroups_CarriesGroupAllowNoMention(t *testing.T) {
-	handler := setupOwnerMentionList(t, 0 /* group blocks */, 1 /* owner enabled */)
+	handler, _ := setupOwnerMentionList(t, 0 /* group blocks */, 1 /* owner enabled */)
 
 	w := httptest.NewRecorder()
 	req, err := http.NewRequest("GET", "/v1/robot/"+ownerListRobotID+"/groups", nil)
@@ -183,7 +187,7 @@ func TestListGroups_CarriesGroupAllowNoMention(t *testing.T) {
 // returns both no_mention and group_allow_no_mention, and that a missing group
 // row falls back to allow=1 (zero regression).
 func TestGetMentionPref_OwnerCarriesGroupAllow(t *testing.T) {
-	handler := setupOwnerMentionList(t, 0 /* group blocks */, 1 /* owner enabled */)
+	handler, _ := setupOwnerMentionList(t, 0 /* group blocks */, 1 /* owner enabled */)
 
 	w := httptest.NewRecorder()
 	req, err := http.NewRequest("GET", "/v1/robot/"+ownerListRobotID+"/groups/"+ownerListGroupNo+"/mention_pref", nil)
@@ -199,4 +203,66 @@ func TestGetMentionPref_OwnerCarriesGroupAllow(t *testing.T) {
 	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, 1, resp.NoMention)
 	assert.Equal(t, 0, resp.GroupAllowNoMention)
+}
+
+func TestMentionPrefSurfacesExcludeAIContainers(t *testing.T) {
+	handler, ctx := setupOwnerMentionList(t, 1, 0)
+	const protectedGroupNo = "g_owner_ai_container"
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, status, version, purpose) VALUES (?, ?, 1, 1, ?)",
+		protectedGroupNo, "hidden AI container", aiteam.GroupPurpose,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, vercode, is_deleted, status, version) VALUES (?, ?, ?, 0, 1, 1)",
+		protectedGroupNo, ownerListRobotID, util.GenerUUID(),
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO bot_mention_pref (robot_id, group_no, no_mention) VALUES (?, ?, 1)",
+		ownerListRobotID, protectedGroupNo,
+	).Exec()
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest(http.MethodGet, "/v1/robot/"+ownerListRobotID+"/groups", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", token)
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var listResp struct {
+		List []groupListItem `json:"list"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &listResp))
+	require.Len(t, listResp.List, 1)
+	assert.Equal(t, ownerListGroupNo, listResp.List[0].GroupNo)
+
+	for _, tc := range []struct {
+		method string
+		body   []byte
+	}{
+		{method: http.MethodGet},
+		{method: http.MethodPut, body: []byte(`{"no_mention":0}`)},
+		{method: http.MethodDelete},
+	} {
+		w = httptest.NewRecorder()
+		req, err = http.NewRequest(tc.method,
+			"/v1/robot/"+ownerListRobotID+"/groups/"+protectedGroupNo+"/mention_pref",
+			bytes.NewReader(tc.body))
+		require.NoError(t, err)
+		req.Header.Set("token", token)
+		if tc.method == http.MethodPut {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		handler.ServeHTTP(w, req)
+		require.Equal(t, http.StatusBadRequest, w.Code, "%s body=%s", tc.method, w.Body.String())
+		assert.Contains(t, w.Body.String(), "This AI session container cannot be changed through group APIs.")
+	}
+
+	var noMention int
+	err = ctx.DB().Select("no_mention").From("bot_mention_pref").
+		Where("robot_id=? AND group_no=?", ownerListRobotID, protectedGroupNo).LoadOne(&noMention)
+	require.NoError(t, err)
+	assert.Equal(t, 1, noMention, "protected mention preference must remain unchanged")
 }

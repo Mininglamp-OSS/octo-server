@@ -106,3 +106,17 @@ source: self
   has run. This removes both the ordering flake and the callback counter data race.
 - The focused regression and the complete `modules/project` package passed with the
   CI-equivalent race detector and shuffled execution.
+
+## Destructive lifecycle and hidden-surface closure
+
+- The super-admin Bot deletion path now validates the persisted robot row before
+  entering group cleanup, preventing a mistyped human UID from triggering a
+  destructive membership cascade.
+- Lifecycle cleanup preserves the shared removal primitive's intentional creator
+  no-op as a warning rather than converting it into a permanent 500. New ownership
+  transfers reject Bot targets, preventing creation of that unreachable owner state.
+- Owner mention-preference endpoints, Bot target resolution, and manager group
+  listings now reject or hide AI containers; target resolution also hides their
+  thread channels.
+- DB-backed focused tests and the complete affected `group`, `robot`, and `bot_api`
+  packages passed, followed by build, vet, i18n, and diff gates.

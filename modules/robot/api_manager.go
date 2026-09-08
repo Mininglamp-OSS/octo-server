@@ -336,6 +336,16 @@ func (m *Manager) robotDelete(c *wkhttp.Context) {
 		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
+	robot, err := m.db.queryRobotWithRobtID(robotID)
+	if err != nil {
+		m.Error("查询待删除机器人失败", zap.String("robotID", robotID), zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if robot == nil {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
+		return
+	}
 	if err := m.groupService.RemoveUserFromGroupsForLifecycleCleanup(robotID); err != nil {
 		m.Error("清理机器人群成员失败", zap.String("robotID", robotID), zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)

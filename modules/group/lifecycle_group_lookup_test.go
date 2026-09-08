@@ -35,3 +35,24 @@ func TestGetGroupsWithMemberUIDForLifecycleCleanupIncludesAITeamContainers(t *te
 		[]string{lifecycleGroups[0].GroupNo, lifecycleGroups[1].GroupNo},
 	)
 }
+
+func TestRemoveUserFromGroupsForLifecycleCleanupSkipsGroupCreator(t *testing.T) {
+	svc, _, ctx := setupServiceTestWithCtx(t)
+	const botUID = "bot_lifecycle_creator"
+	const groupNo = "group_lifecycle_creator"
+
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		GroupNo: groupNo, Name: "bot-owned legacy group", Creator: botUID, Status: GroupStatusNormal,
+	}))
+	require.NoError(t, NewDB(ctx).InsertMember(&MemberModel{
+		GroupNo: groupNo, UID: botUID, Role: MemberRoleCreator,
+		Status: int(common.GroupMemberStatusNormal), Robot: 1, Version: 1,
+	}))
+
+	require.NoError(t, svc.RemoveUserFromGroupsForLifecycleCleanup(botUID))
+	member, err := NewDB(ctx).QueryMemberWithUID(botUID, groupNo)
+	require.NoError(t, err)
+	require.NotNil(t, member)
+	require.Equal(t, MemberRoleCreator, member.Role)
+	require.Zero(t, member.IsDeleted, "creator membership is intentionally retained without failing teardown")
+}

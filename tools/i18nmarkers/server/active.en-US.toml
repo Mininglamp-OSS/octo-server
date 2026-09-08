@@ -417,6 +417,9 @@ other = "The authorization code is invalid or has expired."
 ["err.server.group.auth_code_user_mismatch"]
 other = "The authorization code does not match the current user."
 
+["err.server.group.bot_cannot_be_owner"]
+other = "Group ownership cannot be transferred to a bot."
+
 ["err.server.group.bot_not_in_space"]
 other = "This bot does not belong to your space."
 

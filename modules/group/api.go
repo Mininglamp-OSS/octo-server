@@ -2897,6 +2897,10 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupTransferTargetNotFound, nil, nil)
 		return
 	}
+	if toUser.Robot == 1 {
+		httperr.ResponseErrorL(c, errcode.ErrGroupBotCannotBeOwner, nil, nil)
+		return
+	}
 
 	/**
 	判断转让的用户是否在群内,只有在群内才能转让

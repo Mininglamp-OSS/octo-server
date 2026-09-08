@@ -66,6 +66,34 @@ callback and the persisted release error that is written after all cleanup steps
 - `go test -race -count=1 ./modules/project -run '^TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails$'`: PASS.
 - `go test -race -shuffle=on -count=1 ./modules/project`: PASS (72.847s).
 
+## Final review-blocker follow-up on 2026-09-08
+
+The two blocking findings at reviewed head `b35c9f23` are closed: the
+super-admin delete route now proves `robot_id` resolves to a robot before any
+membership cleanup, and lifecycle cleanup treats the group-creator no-op as a
+warn-and-skip outcome. Ownership transfer now rejects Bot targets so the state
+cannot be newly created through the product API.
+
+The carried visibility gaps are also closed: owner mention-preference routes,
+Bot resolve-target search, and manager group listings exclude protected AI
+containers (and resolve-target search also excludes their threads).
+
+Checks run against freshly recreated local `test` databases where applicable:
+
+- Focused `modules/group` lifecycle/transfer/manager-list regressions: PASS.
+- Focused `modules/robot` manager-delete and mention-preference regressions: PASS.
+- Focused `modules/bot_api` resolve-target regression: PASS.
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/group`: PASS (31.352s).
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/robot`: PASS (7.030s).
+- `OCTO_MASTER_KEY=<32-byte-test-key> go test -count=1 ./modules/bot_api`: PASS (51.036s).
+- `make i18n-extract`, `make i18n-extract-check`, `make i18n-lint`,
+  `go build ./...`, `go vet ./...`, and `git diff --check`: PASS.
+
+The complete unit and four MySQL/Redis/WuKongIM API/E2E shards had passed at
+the preceding pushed head. They are intentionally delegated to the new GitHub
+CI run after this blocker-fix commit; `check-sprint` is project-board metadata
+and is explicitly outside this repair scope.
+
 Focused commands run on 2026-09-08 against freshly recreated test databases:
 
 - `go test -count=1 ./modules/group`: PASS.

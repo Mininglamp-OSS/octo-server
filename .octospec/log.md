@@ -2542,3 +2542,10 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
   稳定暴露竞态；而 callback 对普通 `int` 的跨 goroutine 读写本身也没有同步保证。
 - 测试改用原子计数确认失败步骤确实执行，并等待 worker 跑完所有步骤后才写入的 `last_error`，再检查群成员
   删除结果。目标用例及完整 `modules/project` 包均在 `-race` 与 shuffle 下通过。
+
+## 2026-09-08 — my-ai-team-sessions（PR #848 最终 blocker 收敛）
+
+- 超管删除 Bot 先验证 robot 实体，再进入破坏性的群成员清理，错误的人类 UID 不再触发级联删除。
+- 生命周期清理把群主不可删除视为带告警的预期 no-op，并禁止以后把普通群群主转让给 Bot。
+- mention preference、Bot target resolve 与管理端群列表均隐藏/拒绝 AI 容器；resolve 同时过滤其 thread。
+- 新增 DB/HTTP 回归，完整 `group`、`robot`、`bot_api` 包以及 build、vet、i18n、diff 门禁通过。

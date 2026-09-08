@@ -5,11 +5,56 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestManagerGroupQueriesExcludeAIContainers(t *testing.T) {
+	_, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	managerDB := newManagerDB(ctx.DB())
+
+	for _, model := range []*Model{
+		{GroupNo: "manager-visible", Name: "manager query", Status: GroupStatusNormal},
+		{GroupNo: "manager-hidden-ai", Name: "manager query", Status: GroupStatusNormal, Purpose: aiteam.GroupPurpose},
+	} {
+		require.NoError(t, db.Insert(model))
+	}
+
+	list, err := managerDB.listWithPage(10, 1)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "manager-visible", list[0].GroupNo)
+
+	list, err = managerDB.listWithPageAndKeyword("manager query", 10, 1)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "manager-visible", list[0].GroupNo)
+
+	count, err := managerDB.queryGroupCountWithKeyWord("manager query")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count)
+	count, err = managerDB.queryGroupCountWithStatus(GroupStatusNormal)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count)
+
+	list, err = managerDB.queryGroupsWithStatus(GroupStatusNormal, 10, 1)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "manager-visible", list[0].GroupNo)
+
+	today := time.Now().Format("2006-01-02")
+	list, err = managerDB.queryRegisterCountWithDateSpace(today, today)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "manager-visible", list[0].GroupNo)
+}
 
 func TestGroupList(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")

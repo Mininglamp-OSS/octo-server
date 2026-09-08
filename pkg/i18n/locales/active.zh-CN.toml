@@ -503,6 +503,9 @@ other = "不能将外部成员设为管理员。"
 ["err.server.group.external_cannot_be_owner"]
 other = "不能将群主转让给外部成员。"
 
+["err.server.group.bot_cannot_be_owner"]
+other = "不能将群主转让给机器人。"
+
 ["err.server.group.external_join_forbidden"]
 other = "该群已禁止外部成员加入，请联系群管理员。"
 

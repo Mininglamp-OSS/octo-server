@@ -147,6 +147,11 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "Group ownership cannot be transferred to an external member.",
 	})
+	ErrGroupBotCannotBeOwner = register(codes.Code{
+		ID:             "err.server.group.bot_cannot_be_owner",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Group ownership cannot be transferred to a bot.",
+	})
 	ErrGroupExternalJoinForbidden = register(codes.Code{
 		ID:             "err.server.group.external_join_forbidden",
 		HTTPStatus:     http.StatusForbidden,

@@ -250,7 +250,9 @@ func (s *Service) GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*Info
 // RemoveUserFromGroupsForLifecycleCleanup is the authoritative account-teardown
 // path for group membership. It deliberately sees AI containers that ordinary
 // product lists hide, and only enables protected removal for rows whose persisted
-// purpose proves they are lifecycle-managed containers.
+// purpose proves they are lifecycle-managed containers. Creator memberships are
+// reported and skipped: RemoveGroupMembers intentionally cannot remove a creator,
+// and that outcome must not turn otherwise-convergent account teardown into a 500.
 func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
 	groups, err := s.GetGroupsWithMemberUIDForLifecycleCleanup(uid)
 	if err != nil {
@@ -261,6 +263,11 @@ func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
 	for _, group := range groups {
 		// Disbanded groups retain member rows by existing lifecycle semantics.
 		if group.Status == GroupStatusDisband {
+			continue
+		}
+		if group.Creator == uid {
+			s.Warn("生命周期清理跳过群主成员",
+				zap.String("uid", uid), zap.String("group_no", group.GroupNo))
 			continue
 		}
 		result, removeErr := s.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
@@ -286,7 +293,11 @@ func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
 			}
 		}
 		if !removed {
-			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: membership was not removed", uid, group.GroupNo))
+			// A concurrent ownership transfer may promote the target after the
+			// lifecycle lookup. RemoveGroupMembers deliberately skips creators;
+			// preserve that non-fatal contract and leave an operator-visible trace.
+			s.Warn("生命周期清理未移除成员（可能已成为群主）",
+				zap.String("uid", uid), zap.String("group_no", group.GroupNo))
 		}
 	}
 	return errors.Join(cleanupErrs...)
