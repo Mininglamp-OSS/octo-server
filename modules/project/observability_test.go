@@ -38,6 +38,12 @@ func (r *auditRecorder) byAction(action string) []AuditEntry {
 // TestEveryWritePathEmitsAnAuditEntry covers create / disband / member add / member remove
 // / role change, each carrying the actor, the target and (where the action has one) the
 // reason.
+//
+// P2 registered one more membership write here: the agent seats the create transaction
+// writes for the creator's own agents (D2/D3). They are member adds with no members/add
+// request behind them, so leaving them out of this enumeration would let the guard shrink
+// silently — it would still pass, on the paths it already knew about. The brief lists this
+// registration as load-bearing for exactly that reason.
 func TestEveryWritePathEmitsAnAuditEntry(t *testing.T) {
 	_, p := setup(t)
 	rec := &auditRecorder{}
@@ -52,10 +58,18 @@ func TestEveryWritePathEmitsAnAuditEntry(t *testing.T) {
 	seedUser(t, "m2")
 	seedSpaceMember(t, spaceA, "m2", 0, 1)
 
+	// owner1's own agent, carried in on the create. Owned by owner1, who neither
+	// leaves nor is removed in this case, so the removal reasons asserted below stay
+	// what they were.
+	seedAgent(t, spaceA, "bot_owner1", "owner1", "octo_hosted")
+
 	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", ownerTok,
-		map[string]any{"name": "audited"})
+		map[string]any{"name": "audited", "agent_uids": []string{"bot_owner1"}})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	created := decodeResp(t, w)
+	require.True(t, auditHasTarget(rec.entries, auditMemberAdd, "bot_owner1"),
+		"the agent seat written inside the create transaction is a membership write and "+
+			"must be audited like any other")
 
 	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
 		map[string]any{"uids": []string{"m1", "m2"}})

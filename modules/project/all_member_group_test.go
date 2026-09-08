@@ -56,6 +56,23 @@ type allMemberGroupStub struct {
 	seeds          []AllMemberGroupSeed
 	ownerSyncs     []string
 	renames        []string
+	// provisionedInsideTx records that the provisioner saw NO committed project
+	// row -- i.e. it was called from inside the create transaction, which is the
+	// lock-order inversion the registry contract exists to prevent.
+	provisionedInsideTx bool
+	provisionOrderErr   error
+}
+
+// assertProvisionedAfterCommit fails the case if any provisioning ran before the
+// project transaction committed. Registered as a cleanup by stubAllMemberGroup so
+// every stubbed case carries the check without restating it.
+func (s *allMemberGroupStub) assertProvisionedAfterCommit(t *testing.T) {
+	t.Helper()
+	require.NoError(t, s.provisionOrderErr, "the ordering probe itself failed")
+	require.False(t, s.provisionedInsideTx,
+		"the provisioner ran while the create transaction was still open: it would take "+
+			"`group` / `group_member` locks under the project row lock and invert the "+
+			"declared lock order")
 }
 
 func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
@@ -79,6 +96,26 @@ func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
 	RegisterAllMemberGroupProvisioner(func(_ *config.Context, seed AllMemberGroupSeed) (string, error) {
 		s.provisionCalls++
 		s.seeds = append(s.seeds, seed)
+		// The registry contract's first clause, checked on EVERY stubbed
+		// provisioning rather than in one dedicated case: the hook runs after the
+		// project transaction has COMMITTED.
+		//
+		// This read goes out on a pooled connection that is not the create's
+		// transaction, so the project row is visible here only if that transaction
+		// is already committed. That ordering is not a nicety -- it is what keeps
+		// the declared lock order (space_member -> space -> project -> group ->
+		// group_member -> octo_project_member) intact, because everything this hook
+		// goes on to do touches `group` and `group_member`. A hook called from
+		// inside the project transaction would take those locks under the project
+		// row lock and invert the order for every concurrent group write.
+		var seen int
+		if qerr := testCtx.DB().SelectBySql(
+			"SELECT COUNT(*) FROM `octo_project` WHERE project_id = ?", seed.ProjectID,
+		).LoadOne(&seen); qerr != nil {
+			s.provisionOrderErr = qerr
+		} else if seen == 0 {
+			s.provisionedInsideTx = true
+		}
 		if s.provisionErr != nil {
 			return "", s.provisionErr
 		}
@@ -116,6 +153,7 @@ func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
 		s.renames = append(s.renames, name)
 		return nil
 	})
+	t.Cleanup(func() { s.assertProvisionedAfterCommit(t) })
 	return s
 }
 

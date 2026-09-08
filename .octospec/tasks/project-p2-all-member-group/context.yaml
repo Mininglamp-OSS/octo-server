@@ -431,6 +431,121 @@ review_round_3_fixed:
       SafeDetailKeys. Declaration moved back under its own comment, and the new code
       now says explicitly why it carries no detail keys.
 
+# octospec Verify phase. Each injected rule re-read and checked against the diff,
+# then the brief's Acceptance walked line by line.
+verify:
+  rules_rechecked:
+    - id: space-isolation
+      verdict: complies
+      evidence: |
+        `go list -deps ./modules/project | grep -c modules/group` = 0. pkg/project
+        imports no modules/* and does not read `robot`. Agent eligibility is
+        decided inside the create transaction against space_member rows locked in
+        the same statement position as the creator's (lockSpaceSeatRowsTx), never
+        from the client's list. D13 matches agents on robot.creator_uid, the field
+        the group side already uses. The new bot_api guard sits AFTER that
+        handler's existing bot-ownership and group-admin checks.
+    - id: error-handling
+      verdict: complies
+      evidence: |
+        All four new codes are 4xx with Internal unset; every new response goes
+        through httperr. make i18n-extract-check, make i18n-lint, golangci-lint on
+        all six touched trees: clean. The bot_api refusal uses
+        ResponseErrorLWithStatus, matching the three 403 refusals already in that
+        same handler rather than diverging from D14.
+      note: |
+        The brief expected TestGroupNoLegacyResponseError / TestProjectNoLegacyResponseError
+        to be hard-coded file lists needing new entries. Both DISCOVER their files
+        from the directory, so the new files were already covered. Nothing to do,
+        recorded because the brief says otherwise.
+    - id: rate-limit
+      verdict: complies
+      evidence: |
+        No new route. The only Redis call added anywhere in the diff is
+        InvalidateMembershipCache in CloseAllSpaceSeats -- cache invalidation, not
+        a counter. The D4 lease is a CAS on a table column.
+    - id: trust-boundary
+      verdict: complies
+      evidence: |
+        agent_uids bounded by MemberBatchMax before the transaction. The six agent
+        ineligibility reasons still collapse to one code -- and the round-3 fix
+        narrowed what that code echoes to the ineligible subset, which is strictly
+        less than it echoed before.
+    - id: testing
+      verdict: complies-with-note
+      evidence: |
+        Seven pre-existing test files are touched and every edit is additive
+        registration into a hard-coded enumeration -- the shape the brief itself
+        requires ("否则两个守卫静默缩水"). No existing assertion was weakened or
+        removed. The two added in this phase are listed below.
+    - id: commit-style
+      verdict: complies
+
+  # Gaps the Verify pass found and closed.
+  fixed_in_verify:
+    - id: audit-guard-did-not-enumerate-the-agent-seat-write
+      where: modules/project/observability_test.go
+      what: |
+        The brief lists registering the create-with-agents path in
+        TestEveryWritePathEmitsAnAuditEntry as load-bearing. Round 3 added the
+        audit entries and covered them in a NEW case, which leaves the
+        enumeration guard passing on the paths it already knew about -- exactly
+        the silent shrink the brief names.
+      fix: "that case now creates its project with agent_uids and asserts the agent seat is audited."
+    - id: actor-seat-guard-stopped-at-the-requireSpaceSeatsTx-callers
+      where: modules/project/review4_actorseat_test.go
+      what: |
+        createProject takes its space_member locks directly (lockSpaceSeatRowTx
+        for the creator, lockSpaceSeatRowsTx for the agents) instead of through
+        requireSpaceSeatsTx, so a guard scoped to that function's callers could
+        not see the path the brief names as load-bearing.
+      fix: "a seventh leg drives createProject with agent_uids under a seatless actor; the guard's scope is now every write that takes a space_member lock."
+    - id: hook-ordering-was-asserted-nowhere
+      where: modules/project/all_member_group_test.go
+      what: |
+        The brief asks for a case pinning that the provisioner runs only after the
+        project transaction commits. Nothing checked it.
+      fix: |
+        The stand-in provisioner now reads octo_project on a POOLED connection --
+        visible only if the create transaction committed -- and stubAllMemberGroup
+        registers a cleanup that fails the case if it ever was not. Every stubbed
+        case carries the check rather than one dedicated case carrying it.
+    - id: d9-daily-quota-bypass-was-untested
+      where: modules/project/all_member_group_e2e_test.go
+      fix: |
+        TestAllMemberGroupDoesNotConsumeTheDailyGroupQuota sets
+        Group.SameDayCreateMaxCount to ZERO (so it cannot pass by the cap being
+        generous) and asserts the all-member group is still built. It holds
+        because the cap lives in the HTTP handler and the provisioner enters at
+        the service layer; a refactor pushing the cap down would break it, which
+        is the point.
+
+  # Delivered differently from the brief, on purpose.
+  declared_deviations:
+    - id: i4-scan-b-does-not-exempt-banned-spaces
+      brief_line: "扫描 B 的豁免：... 被封禁 Space 的项目"
+      what_was_done: "the exemption was not implemented; the other two (grace window, system bots) are, plus removing = 1."
+      why: |
+        P1's I2 scan needs it because CheckMembershipForCleanup deliberately leaves
+        a banned Space's seats alone, so the group rows are EXPECTED to remain --
+        that is the ⊆ direction. Scan B is the ⊇ direction and the state it would
+        suppress cannot arise: in a banned Space the cascade leaves BOTH sides
+        alone, so seat and group row are either both present or both closing (and
+        `removing = 1` already exempts the latter). Every other path that could
+        strip a group row without touching the seat is now refused by D7. The
+        exemption would be a `space` lookup per examined row that can never fire.
+        A genuine admitter failure inside a banned Space stays reportable, which
+        is the behaviour worth having.
+    - id: p2-scan-bounds-guard-is-its-own-file
+      brief_line: "纳入 TestReconcileQueriesAreBounded / TestReconcilePageQueriesExamineBoundedRows"
+      what_was_done: "reconcile_p2_bounds_test.go re-applies both rules to reconcile_p2.go."
+      why: |
+        Those two guards read reconcile.go by name. P1 hit the same wall and
+        answered it the same way (reconcile_p1_bounds_test.go), so this follows the
+        precedent rather than widening the P0 guards and loosening them for
+        everyone. The P2 file declares its own two exemptions next to their
+        arguments.
+
 # Cannot be verified from here; must be checked before merge.
 open_verification:
   - "The three items in the brief's 'must check before merge' section: the client
@@ -454,3 +569,10 @@ open_verification:
      modules/user has an order-dependent failure in its VerifyPasswordByUID family
      that appears on the clean tree too and passes when that family is run alone;
      nothing in this change touches modules/user."
+  - "That the all-member group's IM channel subscriber list equals its member set.
+     modules/group creates the channel inside CreateGroup and rolls the group back
+     if it fails, and the end-to-end cases exercise that path, but nothing in this
+     repository can READ a channel's subscribers back from WuKongIM -- there is no
+     such call anywhere in octo-server or octo-lib -- so the equality itself is not
+     assertable from a test. Same class as the EXPLAIN items above: check it
+     against a running broker before merge."

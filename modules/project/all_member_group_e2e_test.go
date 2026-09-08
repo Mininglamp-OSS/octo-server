@@ -510,3 +510,43 @@ func TestDeletingAnAgentClosesItsProjectSeatAndRemovesItFromTheGroup(t *testing.
 		"and it must be out of the all-member group. current members: %v",
 		liveGroupMembers(t, ctx, groupNo))
 }
+
+// TestAllMemberGroupDoesNotConsumeTheDailyGroupQuota pins D9 against the real
+// provisioner.
+//
+// The daily cap (Group.SameDayCreateMaxCount) is a rule about a PERSON creating
+// groups by hand; the all-member group is created by the platform on their behalf.
+// Charging it to the creator's daily quota would mean a user near their cap could
+// create a project and silently get one with no group — the failure mode D4 makes
+// survivable but that nobody should be walked into by a quota they did not spend.
+//
+// Set to zero, which refuses even the first manual create, so the assertion cannot
+// pass by the quota simply being generous. The provisioner reaches CreateGroup at
+// the SERVICE layer and the cap lives in the HTTP handler, which is what makes this
+// hold; a future refactor that pushed the cap down into the service would break it,
+// and this case is what would say so.
+func TestAllMemberGroupDoesNotConsumeTheDailyGroupQuota(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID = "e2e_quota_space"
+		owner   = "e2e_quota_owner"
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, owner)
+	exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 2, 1)", spaceID, owner)
+	exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", owner, owner, owner)
+
+	cfg := ctx.GetConfig()
+	restore := cfg.Group.SameDayCreateMaxCount
+	cfg.Group.SameDayCreateMaxCount = 0
+	t.Cleanup(func() { cfg.Group.SameDayCreateMaxCount = restore })
+
+	token := seedToken(t, ctx, owner)
+	resp := createProjectE2E(t, srv, spaceID, token, map[string]any{"name": "quota-free"})
+
+	groupNo, _ := resp["all_member_group_no"].(string)
+	require.NotEmpty(t, groupNo,
+		"the all-member group must be built even with the daily manual-create cap at zero: %v", resp)
+	require.NotNil(t, groupRowE2E(t, ctx, groupNo), "and the group must really exist")
+}
