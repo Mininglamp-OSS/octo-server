@@ -1,7 +1,9 @@
 package internal_membership
 
 import (
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -103,8 +105,14 @@ func TestVerifyDoesNotWaitOnTheSocketAfterACompleteBody(t *testing.T) {
 // TestVerifyStillRejectsTrailingContent pins that the availability fix cost
 // nothing on the strictness side.
 //
-// Both shapes below arrive complete, so decoder.Buffered already holds the tail
-// and no socket read is needed to see it.
+// Read the coverage narrowly, because it is narrower than it looks: every body
+// here is an in-memory reader, so the tail is ALWAYS already buffered and the
+// assertion cannot fail for the reason that matters on a real socket. A tail
+// arriving in a later TCP segment is accepted by decoder.Buffered and no test
+// here would notice. That is the deliberate half of the trade recorded on
+// decodeVerifyRequest — trailing content is rejected when it has arrived, and
+// waiting to find out whether more is coming is the hang the shape exists to
+// avoid.
 func TestVerifyStillRejectsTrailingContent(t *testing.T) {
 	cases := map[string][]byte{
 		"a second object":    []byte(`{"space_id":"s","project_id":"p","uids":["u1"]}{}`),
@@ -167,5 +175,71 @@ func TestDecodeVerifyRequestNeverDecodesTwice(t *testing.T) {
 	if !strings.Contains(body, "decoder.Buffered()") {
 		t.Error("the trailing check must inspect decoder.Buffered(), which cannot wait on the " +
 			"socket; that is the shape modules/bot_task settled on after PR #837")
+	}
+}
+
+// TestVerifyDoesNotWaitForeverOnAnIncompleteBody covers the OTHER read that can
+// park the handler: the first Decode, on a body that never finishes.
+//
+// decoder.Buffered fixes the trailing check and does nothing for this one — a
+// caller that sends `{"space_id":"a` and stops leaves Decode blocked on the
+// socket. It is bounded by a read deadline, and that deadline only reaches the
+// connection through a REAL server: httptest.ResponseRecorder has no connection,
+// so SetReadDeadline returns ErrNotSupported and the in-process tests above
+// cannot see this property at all. Hence a real listener.
+func TestVerifyDoesNotWaitForeverOnAnIncompleteBody(t *testing.T) {
+	if readBodyTimeout > 20*time.Second {
+		t.Skipf("readBodyTimeout is %s; this test would outlive the suite", readBodyTimeout)
+	}
+
+	router := newRouter(newTestModule(&stubStore{}))
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// A Content-Length the client never satisfies — the shape a stalled peer or a
+	// buffering proxy produces without any malice.
+	head := "POST " + verifyPath + " HTTP/1.1\r\n" +
+		"Host: " + strings.TrimPrefix(srv.URL, "http://") + "\r\n" +
+		"Content-Type: application/json\r\n" +
+		internalTokenHeader + ": " + testInternalToken + "\r\n" +
+		"Content-Length: 200\r\n\r\n" +
+		`{"space_id":"a`
+	if _, err := io.WriteString(conn, head); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The handler must give up on its own. Read with a ceiling comfortably past
+	// the deadline but well short of "forever", so a regression fails rather than
+	// hangs the suite.
+	if err := conn.SetReadDeadline(time.Now().Add(readBodyTimeout + 10*time.Second)); err != nil {
+		t.Fatalf("set client deadline: %v", err)
+	}
+	start := time.Now()
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	elapsed := time.Since(start)
+
+	if err != nil && n == 0 {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			t.Fatalf("the server never answered and never closed the connection after %s: an "+
+				"incomplete body parks the handler goroutine and its connection for as long as "+
+				"the peer holds the socket. MaxBytesReader bounds bytes, not time, and this "+
+				"route has no ReadTimeout — see boundBodyReadTime.", elapsed)
+		}
+		// A reset/EOF is the server dropping the stalled connection: also bounded.
+		t.Logf("server closed the stalled connection after %s (%v)", elapsed, err)
+		return
+	}
+	t.Logf("server answered after %s: %q", elapsed, strings.SplitN(string(buf[:n]), "\r\n", 2)[0])
+
+	if store := (&stubStore{}); store.memberCalls != 0 {
+		t.Fatal("an incomplete body must never reach the store")
 	}
 }

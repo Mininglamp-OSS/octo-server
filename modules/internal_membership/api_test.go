@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 )
 
 // testInternalToken is exactly minInternalTokenBytes long so every auth test
@@ -624,5 +627,135 @@ func TestParseIDListDeduplicatesBeforeCountingTheLimit(t *testing.T) {
 	}
 	if len(ids) != 2 {
 		t.Fatalf("want 2 unique ids, got %v", ids)
+	}
+}
+
+// TestSentinelAnomalyFailsClosedAndIsIndistinguishable pins how the module
+// handles the one store failure that is a DATA anomaly rather than an outage.
+//
+// pkg/project refuses to serve an ACTIVE project that holds the contract's
+// absent-epoch sentinel, because serving it lets a consumer cache a grant keyed
+// on 0 that a later disband can never invalidate — 0 is also the answer for a
+// project that is gone, so the staleness check agrees forever.
+//
+// Two properties, and they pull in opposite directions on purpose:
+//
+//   - on the WIRE it must be the ordinary 500, byte-identical to a database
+//     outage. A caller that could tell them apart would learn that a specific
+//     project exists and is mid-rollout;
+//   - in the LOG it must be distinguishable, because it is the one case an
+//     operator can act on (the reconcile loop repairs it; if the loop is off,
+//     nothing does).
+func TestSentinelAnomalyFailsClosedAndIsIndistinguishable(t *testing.T) {
+	anomaly := fmt.Errorf("%w: p-42", projectpkg.ErrLiveProjectOnAbsentSentinel)
+	outage := errors.New("dial tcp: connection refused")
+
+	t.Run("epochs", func(t *testing.T) {
+		anomalyW := doGet(t, newRouter(newTestModule(&stubStore{epochErr: anomaly})),
+			testInternalToken, "?space_id=s&project_ids=p-42")
+		outageW := doGet(t, newRouter(newTestModule(&stubStore{epochErr: outage})),
+			testInternalToken, "?space_id=s&project_ids=p-42")
+
+		if anomalyW.Code != http.StatusInternalServerError {
+			t.Fatalf("want 500 for the sentinel anomaly, got %d (%s)", anomalyW.Code, anomalyW.Body.String())
+		}
+		if anomalyW.Body.String() != outageW.Body.String() {
+			t.Errorf("a data anomaly must answer byte-identically to an outage, or the caller "+
+				"learns that a specific project exists:\n anomaly: %s\n outage:  %s",
+				anomalyW.Body.String(), outageW.Body.String())
+		}
+		if strings.Contains(anomalyW.Body.String(), "p-42") {
+			t.Error("the response leaked the project id from the wrapped error")
+		}
+	})
+
+	t.Run("verify", func(t *testing.T) {
+		s := &stubStore{memErr: anomaly}
+		w := doPost(t, newRouter(newTestModule(s)), testInternalToken,
+			verifyRequest{SpaceID: "s", ProjectID: "p-42", UIDs: []string{"u1"}})
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("want 500, got %d (%s)", w.Code, w.Body.String())
+		}
+		// Never a 200 that reports the users as members at epoch 0 — that answer
+		// is the whole defect.
+		if strings.Contains(w.Body.String(), "member_epoch") {
+			t.Error("the refusal must not carry an epoch of any kind")
+		}
+	})
+}
+
+// TestLookupFailureLoggingSeparatesTheAnomaly is the log half of the property
+// above: the wire is uniform, the log is not.
+func TestLookupFailureLoggingSeparatesTheAnomaly(t *testing.T) {
+	src, err := os.ReadFile("api.go")
+	if err != nil {
+		t.Fatalf("read api.go: %v", err)
+	}
+	body := string(src)
+	start := strings.Index(body, "func (m *Module) logLookupFailure(")
+	if start < 0 {
+		t.Fatal("logLookupFailure not found — if it moved, point this guard at it rather than deleting it")
+	}
+	if end := strings.Index(body[start:], "\n}\n"); end > 0 {
+		body = body[start : start+end]
+	}
+	if !strings.Contains(body, "ErrLiveProjectOnAbsentSentinel") {
+		t.Error("the sentinel anomaly must get its own log line: it is the only store failure an " +
+			"operator can act on, and with the reconcile loop disabled it is the only signal that " +
+			"the endpoint is refusing rather than the database being down")
+	}
+	// Both branches must reach a logger. A silent return would make the endpoint
+	// answer 500 with nothing anywhere saying why.
+	if strings.Count(body, "m.Error(") != 2 {
+		t.Error("both failure branches must log; found a different number of m.Error calls")
+	}
+}
+
+// TestBothEndpointsAgreeAboutSpaceID pins the two endpoints treating the same
+// field name the same way.
+//
+// They disagreed for a round: verify rejected a padded space_id while epochs
+// trimmed it. The separator-syntax rationale that justifies trimming project_ids
+// (a comma-separated list, where the whitespace is punctuation) does not extend
+// to a single-valued parameter, where the whitespace can only be part of the
+// value. A field name meaning two things across two endpoints of one contract is
+// the kind of divergence a consumer discovers in production.
+func TestBothEndpointsAgreeAboutSpaceID(t *testing.T) {
+	padded := []string{" sp1", "sp1 ", " sp1 ", "\tsp1"}
+	for _, value := range padded {
+		t.Run(fmt.Sprintf("%q", value), func(t *testing.T) {
+			epochsStore := &stubStore{epochs: map[string]int64{"p1": 1}}
+			w := doGet(t, newRouter(newTestModule(epochsStore)), testInternalToken,
+				"?space_id="+url.QueryEscape(value)+"&project_ids=p1")
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("epochs: want 400 for a padded space_id, got %d (%s)", w.Code, w.Body.String())
+			}
+			if epochsStore.epochCalls != 0 {
+				t.Error("epochs: a padded space_id reached the store")
+			}
+
+			verifyStore := &stubStore{epoch: 1, roles: map[string]int{}}
+			w = doPost(t, newRouter(newTestModule(verifyStore)), testInternalToken,
+				verifyRequest{SpaceID: value, ProjectID: "p1", UIDs: []string{"u1"}})
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("verify: want 400 for a padded space_id, got %d (%s)", w.Code, w.Body.String())
+			}
+			if verifyStore.memberCalls != 0 {
+				t.Error("verify: a padded space_id reached the store")
+			}
+		})
+	}
+
+	// The clean value still works on both, so the check is a rejection of padding
+	// and not a rejection of the field.
+	epochsStore := &stubStore{epochs: map[string]int64{"p1": 1}}
+	if w := doGet(t, newRouter(newTestModule(epochsStore)), testInternalToken,
+		"?space_id=sp1&project_ids=p1"); w.Code != http.StatusOK {
+		t.Fatalf("epochs: a clean space_id must be accepted, got %d (%s)", w.Code, w.Body.String())
+	}
+	verifyStore := &stubStore{epoch: 1, roles: map[string]int{}}
+	if w := doPost(t, newRouter(newTestModule(verifyStore)), testInternalToken,
+		verifyRequest{SpaceID: "sp1", ProjectID: "p1", UIDs: []string{"u1"}}); w.Code != http.StatusOK {
+		t.Fatalf("verify: a clean space_id must be accepted, got %d (%s)", w.Code, w.Body.String())
 	}
 }

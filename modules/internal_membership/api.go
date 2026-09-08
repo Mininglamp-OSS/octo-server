@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
@@ -85,6 +87,12 @@ func (m *Module) Route(r *wkhttp.WKHttp) {
 // +Inf / non-positive typo cannot silently disable the control — ParseRPSFromEnv
 // lets both NaN and +Inf through, and they surface as Lua script errors that the
 // limiter treats as fail-open.
+// Lifecycle: the client below is never closed, because Route() runs exactly once
+// per process and the limiter it builds lives as long as the router. A module
+// with a Stop hook (cardActionDispatchRuntime) closes its client; this one has
+// none to hang the close on. If a Stop hook is ever added here, the client goes
+// with it — repeated construction in a test or a hot reload would otherwise leak
+// a pool per call.
 func (m *Module) ipRateLimit(r *wkhttp.WKHttp) wkhttp.HandlerFunc {
 	rlRedis := octoredis.NewInstrumentedClient(m.ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
@@ -143,19 +151,32 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 // and a consumer caching a grant under epoch 0 kept it forever. See
 // modules/project migration 20260908000001.
 //
-// "Kept off it" rather than "cannot reach it", deliberately. Three writers keep
-// the invariant, and only the first two are synchronous:
+// "Kept off it" rather than "cannot reach it", deliberately. Four mechanisms
+// keep the invariant, and only the last two run on every request:
 //
 //   - the create path bumps the epoch, so new projects start at 1;
 //   - the migration lifted every row that was already at 0;
 //   - modules/project's reconcile scan repairs any row that lands back on 0
 //     afterwards — a not-yet-upgraded pod mid-rollout, or a rolled-back binary,
-//     both of which restore the zero-inserting create path.
+//     both of which restore the zero-inserting create path;
+//   - and, because the first three are all one-shots or scheduled, the READ
+//     layer refuses to serve an ACTIVE project found on the sentinel at all
+//     (pkg/project.ErrLiveProjectOnAbsentSentinel → 500 here).
 //
-// So the window is bounded by the scan interval, not closed outright, and the
-// direction of the residue is the availability one (a brand new project reads as
-// "does not exist" until the scan passes) rather than the stale-grant one. See
-// modules/project.repairAbsentSentinelEpoch.
+// The last one is what makes the claim structural instead of a statement about
+// scan latency, and an earlier version of this comment got the reason wrong. It
+// said the residue during the window was "the availability direction" only. That
+// is false: serving a live project at 0 lets the peer cache a positive grant
+// keyed on 0, and if the project is then disbanded before the scan repairs it —
+// disband bumps the epoch and then flips status, so the row leaves the epochs
+// predicate and the answer becomes 0 again — the consumer's staleness check
+// agrees with its own cached 0 and the grant never expires. Reproduced against
+// the engine; see TestRolloutSentinelIsRefusedRatherThanServed.
+//
+// So the window now costs availability (500, retry, repaired within one scan
+// rotation) rather than a permanent grant. It also means the rollback runbook no
+// longer DEPENDS on the reconcile loop being enabled: with the loop off the
+// endpoint refuses instead of quietly handing out the collision.
 type epochsResponse struct {
 	Projects map[string]int64 `json:"projects"`
 }
@@ -176,8 +197,12 @@ type epochsResponse struct {
 // a consumer cache an authorization decision against a value that says nothing
 // about that user.
 func (m *Module) membershipEpochs(c *wkhttp.Context) {
-	spaceID := strings.TrimSpace(c.Query("space_id"))
-	if spaceID == "" {
+	// space_id is single-valued, so — unlike project_ids — there is no separator
+	// syntax for whitespace to belong to and a padded value is malformed. Taken
+	// verbatim here so both endpoints agree about the same field name; the verify
+	// endpoint made this choice first and the two disagreeing was the bug.
+	spaceID := c.Query("space_id")
+	if spaceID == "" || spaceID != strings.TrimSpace(spaceID) {
 		respondInvalidParam(c, "space_id")
 		return
 	}
@@ -189,8 +214,7 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 
 	found, err := m.store.Epochs(spaceID, projectIDs)
 	if err != nil {
-		m.Error("membership epochs: lookup failed",
-			zap.Error(err), zap.String("space_id", spaceID), zap.Int("count", len(projectIDs)))
+		m.logLookupFailure("membership epochs", err, spaceID, len(projectIDs))
 		respondInternal(c)
 		return
 	}
@@ -218,12 +242,18 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 // thousands of ids. Parsing them all just to answer 400 would be a free
 // amplification on an endpoint whose rate limit is deliberately generous.
 //
-// "Without materializing it" is why the comma split is a strings.Cut loop rather
-// than strings.Split: Split allocates a slice for the WHOLE group before the
-// limit is ever consulted, so one `?project_ids=` value with a hundred thousand
-// commas allocated a hundred thousand strings on the way to a 400. Cutting one
-// field at a time means the early return actually returns early. (The claim was
-// in this comment for a round before the code did it.)
+// The comma split is a strings.Cut loop rather than strings.Split so THIS
+// function does not allocate a slice for the whole group before the limit is
+// consulted: one `?project_ids=` value with a hundred thousand commas used to
+// allocate a hundred thousand strings on the way to a 400.
+//
+// Scoped honestly, because an earlier version of this comment claimed more than
+// it delivered. The query string is ALREADY materialized before this is reached
+// — gin's c.QueryArray goes through url.ParseQuery — so the saving is one
+// allocation pass, not the whole input; and the loop still walks every duplicate
+// and empty field past the limit, since only UNIQUE ids count against it. Both
+// are bounded by the server's request-line/header limits and both sit behind
+// token auth, so what is left is a constant factor, not a hazard.
 //
 // Whitespace around a comma is SEPARATOR syntax here, so it is trimmed: a caller
 // that builds the query with `strings.Join(ids, ", ")` means the ids, not the
@@ -360,9 +390,8 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 
 	epoch, roles, err := m.store.Memberships(spaceID, projectID, uids)
 	if err != nil {
-		m.Error("verify project memberships: lookup failed",
-			zap.Error(err), zap.String("space_id", spaceID),
-			zap.String("project_id", projectID), zap.Int("count", len(uids)))
+		m.logLookupFailure("verify project memberships", err, spaceID, len(uids),
+			zap.String("project_id", projectID))
 		respondInternal(c)
 		return
 	}
@@ -380,6 +409,34 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 	c.Response(verifyResponse{ProjectID: projectID, MemberEpoch: epoch, Members: answers})
 }
 
+// logLookupFailure reports a store failure, separating the one failure mode an
+// operator has to ACT on from the ordinary ones.
+//
+// ErrLiveProjectOnAbsentSentinel is not a database problem: it means an active
+// project is carrying the value the integration contract reserves for "does not
+// exist", which only happens while a not-yet-upgraded pod or a rolled-back
+// binary is still inserting at the column default. The endpoint refuses rather
+// than serving it (see pkg/project.ProjectEpochsInSpace), and the reconcile scan
+// repairs the row on its next rotation — but if the scan is disabled, this line
+// is the only thing telling the operator why the peer is getting 500s. It names
+// the project id, which the wrapped error carries.
+//
+// Both cases answer the same 500 on the wire. The caller must not be able to
+// tell a data anomaly from a database outage.
+func (m *Module) logLookupFailure(op string, err error, spaceID string, count int, extra ...zap.Field) {
+	fields := append([]zap.Field{
+		zap.Error(err), zap.String("space_id", spaceID), zap.Int("count", count),
+	}, extra...)
+	if errors.Is(err, projectpkg.ErrLiveProjectOnAbsentSentinel) {
+		m.Error(op+": refused — an ACTIVE project holds the contract's absent-epoch sentinel; "+
+			"serving it would let a consumer cache a grant that never expires. This clears itself "+
+			"once the project reconcile scan repairs the row; if that loop is disabled, enable it.",
+			fields...)
+		return
+	}
+	m.Error(op+": lookup failed", fields...)
+}
+
 // decodeVerifyRequest reads and strictly parses the JSON body: bounded size,
 // DisallowUnknownFields so a misspelled field cannot silently be ignored, and
 // rejection of trailing garbage.
@@ -388,27 +445,38 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 // that sends `uid` instead of `uids` should get a 400, not a successful 200 with
 // an empty answer set that reads as "nobody is a member".
 //
-// # The trailing check inspects only buffered bytes, and must keep doing so
+// # Neither read may wait on the socket without a bound
 //
-// The obvious way to reject a second value — a second `decoder.Decode` after the
-// first — cannot return without reading at least one more byte from the socket,
-// because that is the only way to tell "another value" from "end of input". A
-// peer or proxy that sends a complete object and then stalls, or declares a
-// Content-Length it never fills, parks the handler there indefinitely:
-// MaxBytesReader bounds BYTES, not time, and this route is served by a zero-value
-// http.Server with no ReadTimeout. The strict limiter caps arrival rate, not the
-// concurrency of never-completing requests, so goroutines and connections
-// accumulate without bound — on the authorization path, behind a single shared
-// token whose whole threat model is bounding what one leaked credential can do.
+// This route is served by a zero-value http.Server, so there is no ReadTimeout;
+// MaxBytesReader bounds BYTES, not time; and the strict limiter caps arrival
+// rate, not the concurrency of requests that never complete. A peer or proxy
+// that stalls mid-body — paged out, buffering, or declaring a Content-Length it
+// never fills — therefore parks a handler goroutine and a connection for as long
+// as it holds the socket. No malice required, and on the authorization path,
+// behind a single shared token whose whole threat model is bounding what one
+// leaked credential can do.
 //
-// This repository adjudicated that exact hazard once already (PR #837 P1, see the
-// "Do not restore it" note in modules/bot_api/register.go) and then solved it
-// properly in modules/bot_task: read what the decoder ALREADY buffered.
-// decoder.Buffered never waits on the socket, so a complete request returns in
-// microseconds while an already-received second value is still rejected. Nothing
-// is traded away — the strictness against trailing content is identical; only the
-// availability behaviour differs.
+// Two separate reads can wait, and each needs its own answer:
+//
+//   - The TRAILING check. The obvious way to reject a second value — a second
+//     decoder.Decode — cannot return without reading at least one more byte,
+//     because that is the only way to tell "another value" from "end of input".
+//     This repository adjudicated that hazard once already (PR #837 P1, see the
+//     "Do not restore it" note in modules/bot_api/register.go) and solved it in
+//     modules/bot_task: inspect what the decoder ALREADY buffered.
+//     decoder.Buffered never touches the socket. Nothing is traded away —
+//     rejection of trailing content is identical; only the availability
+//     behaviour differs. What it CANNOT see is a tail that arrives in a later
+//     TCP segment, which is accepted; that is the deliberate half of the trade,
+//     and the tests cannot exercise it because an in-memory body is always
+//     already buffered.
+//   - The FIRST decode, on an INCOMPLETE body. `{"space_id":"a` then silence
+//     parks it just as long, and decoder.Buffered does nothing about that. It is
+//     bounded here with a read deadline rather than left to the caller's
+//     goodwill: the largest legitimate body is maxRequestBodyBytes, so a peer
+//     that cannot finish sending it inside readBodyTimeout is stalled, not slow.
 func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
+	boundBodyReadTime(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
 	decoder := json.NewDecoder(c.Request.Body)
 	decoder.DisallowUnknownFields()
@@ -424,4 +492,23 @@ func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
 		return verifyRequest{}, errors.New("verify request contains trailing data")
 	}
 	return req, nil
+}
+
+// boundBodyReadTime puts a wall clock on reading this request's body.
+//
+// Best-effort by construction: SetReadDeadline reaches the connection through the
+// ResponseWriter chain, and a writer that does not support it (an
+// httptest.ResponseRecorder, or a future middleware that wraps without Unwrap)
+// returns ErrNotSupported. That is ignored rather than failed on — the deadline
+// bounds a hazard, it is not a correctness precondition, and refusing real
+// requests because a wrapper lacks a method would be the worse failure.
+//
+// The value is generous on purpose. maxRequestBodyBytes is 16 KiB, so any real
+// peer finishes in milliseconds; readBodyTimeout is not a latency budget, it is
+// the line past which a connection is stalled rather than slow.
+func boundBodyReadTime(c *wkhttp.Context) {
+	if c.Request == nil || c.Writer == nil {
+		return
+	}
+	_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now().Add(readBodyTimeout))
 }

@@ -157,6 +157,40 @@ review_fixes:
       claimed 0 was unreachable (endpoint doc, migration comment, journal) now
       state which of the three writers enforces what.
     touches: modules/project (reconcile.go, db.go), docs/project-member-epoch-rollout.md
+  - id: P1e
+    finding: >
+      P1b's continuous enforcement bounded the window but did not close the
+      stale-grant direction inside it, and the comment shipped with it claimed it
+      had. Reproduced against the engine: an old pod creates P at epoch 0 with
+      status 1; the peer verifies and caches a positive grant keyed on 0; P is
+      disbanded before the scan reaches it (disband bumps the epoch and THEN
+      flips status, so the row leaves the epochs predicate); the peer re-reads
+      and is answered 0; 0 == 0, the staleness check agrees, the grant never
+      expires. The repair scan cannot undo it afterwards — its predicate needs
+      status = 1 and the row is disbanded forever.
+    decision: >
+      The read layer now REFUSES to serve an active project found on the
+      sentinel, rather than relying on scan latency. pkg/project returns
+      ErrLiveProjectOnAbsentSentinel and both endpoints answer 500 — byte
+      identical to a database outage on the wire, distinguishable in the log,
+      which names the project id. The window costs availability instead of a
+      permanent grant, and the rollback runbook no longer DEPENDS on the
+      reconcile loop being enabled: with the loop off the endpoint refuses
+      instead of quietly serving the collision.
+    touches: pkg/project/membership.go, modules/internal_membership/api.go
+  - id: P2e
+    finding: >
+      The trailing-content fix (P1d) addressed the SECOND read but left the
+      FIRST one unbounded: a body that never completes parks the first Decode
+      just as long, and the comment read as a general solution.
+    decision: >
+      A read deadline is set on the connection before the decode
+      (boundBodyReadTime, readBodyTimeout = 15s), best-effort because
+      SetReadDeadline is unsupported on a ResponseRecorder. Verified over a real
+      socket: an unfinished Content-Length answers 400 after the deadline instead
+      of parking forever. The comment now scopes both reads and states what the
+      buffered check cannot see (a tail in a later TCP segment).
+    touches: modules/internal_membership/api.go, config.go
   - id: P1c
     finding: >
       ProjectMemberships answered from the project seat alone. The Space to

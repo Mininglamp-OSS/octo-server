@@ -1,6 +1,7 @@
 package project
 
 import (
+	"errors"
 	"net/http"
 	"testing"
 
@@ -144,4 +145,72 @@ func TestProjectMembershipsAndEpochsFoldTheAbsentCases(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, epoch)
 	assert.Empty(t, roles)
+}
+
+// TestRolloutSentinelIsRefusedRatherThanServed is the reproduction of the
+// stale-grant path that a rollout- or rollback-created row opens, and the proof
+// that the read layer now closes it.
+//
+// The steps are the ones a deployment actually walks, not a contrivance:
+//
+//  1. a not-yet-upgraded pod (or a rolled-back binary) creates P at the column
+//     default: member_epoch 0, status 1;
+//  2. the peer verifies a user in P and is told "member, epoch 0", so it caches
+//     a positive grant keyed on 0;
+//  3. P is disbanded before the reconcile scan reaches it. Disband bumps the
+//     epoch and THEN flips status, so the row ends at epoch 1, status 0;
+//  4. the peer re-reads the epoch. The status filter drops P and the answer is
+//     the contract's absent sentinel, 0;
+//  5. 0 == 0. The staleness check agrees and the grant never expires.
+//
+// Measured before the fix, against this engine: step 2 served epoch 0 with
+// member true, step 4 answered 0, and step 5 agreed. The repair scan cannot
+// undo it after step 3 — its predicate needs status = 1, and the row is
+// disbanded forever.
+//
+// The fix refuses the sentinel at step 2 instead. That costs availability for
+// the length of one scan rotation, which is the direction this module trades in
+// everywhere else.
+func TestRolloutSentinelIsRefusedRatherThanServed(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "sentinelOwner")
+	seedSpaceMember(t, spaceA, "sentinelOwner", 0, 1)
+
+	created := createProjectVia(t, srv, spaceA, token, "rollout-sentinel")
+	forceAbsentSentinelEpoch(t, created.ProjectID)
+
+	row, err := testDB.queryByProjectID(created.ProjectID)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, row.MemberEpoch, "the hazard must actually be staged")
+	require.Equal(t, StatusNormal, row.Status, "and the project must still be ACTIVE — that is the point")
+
+	// Step 2 must not produce a servable answer at all.
+	_, _, err = projectpkg.ProjectMemberships(
+		testCtx.DB(), spaceA, created.ProjectID, []string{"sentinelOwner"})
+	require.Error(t, err, "an ACTIVE project on the reserved sentinel must not be served")
+	assert.True(t, errors.Is(err, projectpkg.ErrLiveProjectOnAbsentSentinel),
+		"the refusal must be the distinguished error, so the handler can log which project it was: %v", err)
+
+	_, err = projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.Error(t, err, "the epochs endpoint must refuse for the same row")
+	assert.True(t, errors.Is(err, projectpkg.ErrLiveProjectOnAbsentSentinel))
+
+	// One anomalous row poisons the whole batch, deliberately: the response has
+	// no per-key error channel, so answering the healthy ids and omitting this
+	// one would hand the caller the sentinel through the absent-key path — the
+	// same collision by another route.
+	healthy := createProjectVia(t, srv, spaceA, token, "rollout-sentinel-healthy")
+	_, err = projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA,
+		[]string{healthy.ProjectID, created.ProjectID})
+	require.Error(t, err, "a batch containing an anomalous row must fail, not answer partially")
+
+	// And once the reconcile scan has repaired it, service resumes — the refusal
+	// is a window, not a latch.
+	repaired, err := testDB.repairAbsentSentinelEpoch(created.ProjectID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, repaired)
+	epochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.NoError(t, err, "after the repair the project must be servable again")
+	assert.EqualValues(t, 1, epochs[created.ProjectID])
 }

@@ -21,6 +21,8 @@
 package project
 
 import (
+	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -337,6 +339,23 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 	return out, nil
 }
 
+// AbsentEpochSentinel is the value the membership integration contract reserves
+// for "this project does not exist or is not visible".
+//
+// It is a value in the same domain as a real epoch, which is what makes
+// ErrLiveProjectOnAbsentSentinel necessary.
+const AbsentEpochSentinel = 0
+
+// ErrLiveProjectOnAbsentSentinel is returned when an ACTIVE project is found
+// holding the reserved value, i.e. when the answer these functions would give is
+// indistinguishable from "gone" for a project that is not.
+//
+// Callers MUST fail the request rather than serve the value. See
+// ProjectEpochsInSpace for why the row can exist at all and why the read layer
+// is where it has to be refused.
+var ErrLiveProjectOnAbsentSentinel = errors.New(
+	"project: an active project holds the reserved absent-epoch sentinel")
+
 // ProjectEpochsInSpace returns member_epoch for each named ACTIVE project in
 // spaceID, keyed by project_id.
 //
@@ -348,6 +367,36 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 // `status = 1` is what makes disband converge without a separate event: a
 // disbanded project drops out of this result, the caller reads 0, and an
 // authorization snapshot taken against the old epoch stops matching.
+//
+// # An ACTIVE project on the sentinel is refused, not served
+//
+// That whole scheme rests on a live project never holding 0, and it is enforced
+// by three writers in modules/project — creation bumps the epoch, a migration
+// lifted the existing rows, and the reconcile scan repairs regressions. The
+// first two are one-shots, so there is a window: a not-yet-upgraded pod mid
+// rollout, or a rolled-back binary, inserts at the column default again, and the
+// scan closes that only on its next rotation.
+//
+// Serving such a row is NOT merely an availability problem, which an earlier
+// version of this reasoning claimed. It is the stale-grant direction, reachable
+// in that window and permanent once it happens:
+//
+//  1. an old pod creates P at member_epoch 0, status 1;
+//  2. the peer verifies, is told epoch 0, and caches a positive grant at 0;
+//  3. P is disbanded before the scan reaches it — disband bumps the epoch and
+//     then flips status, so the row becomes epoch 1, status 0;
+//  4. the peer re-reads: the status filter drops P, and the answer is 0;
+//  5. 0 == 0, so the staleness check AGREES and the grant never expires.
+//
+// The repair scan cannot fix this after the fact: its predicate needs
+// status = 1, and by step 3 the row is disbanded forever.
+//
+// So the sentinel is refused at the read layer. The window then costs
+// availability (the peer gets a 500 and retries, and the scan repairs the row
+// within one rotation) instead of costing a permanent grant, which is the trade
+// this whole module makes everywhere else. It also removes the rollback
+// runbook's dependency on the reconcile loop still being enabled: with the loop
+// off, the endpoint refuses instead of silently handing out the collision.
 func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []string) (map[string]int64, error) {
 	out := make(map[string]int64, len(projectIDs))
 	if spaceID == "" || len(projectIDs) == 0 {
@@ -370,6 +419,11 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 		return nil, err
 	}
 	for _, r := range rows {
+		// Every row here is status = 1 by the predicate above, so an epoch on the
+		// sentinel is a live project wearing the value that means "gone".
+		if r.MemberEpoch == AbsentEpochSentinel {
+			return nil, fmt.Errorf("%w: %s", ErrLiveProjectOnAbsentSentinel, r.ProjectID)
+		}
 		out[r.ProjectID] = r.MemberEpoch
 	}
 	return out, nil

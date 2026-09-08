@@ -226,7 +226,9 @@ func refusedEnvs(t *testing.T, file, marker string) map[string]bool {
 	for _, m := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(region, -1) {
 		out[m[1]] = true
 	}
-	for _, m := range regexp.MustCompile(`(?m)^\s*(\w+),\s*$`).FindAllStringSubmatch(region, -1) {
+	// A trailing `// comment` after the entry is allowed: the alternative is a
+	// spurious CI failure the first time someone annotates one of these lines.
+	for _, m := range regexp.MustCompile(`(?m)^\s*(\w+),\s*(?://.*)?$`).FindAllStringSubmatch(region, -1) {
 		if lit, ok := consts[m[1]]; ok {
 			out[lit] = true
 		}

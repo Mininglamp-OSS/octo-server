@@ -2,6 +2,7 @@ package internal_membership
 
 import (
 	"errors"
+	"time"
 )
 
 // Environment knobs and wire constants.
@@ -56,6 +57,12 @@ const (
 	// credentials (modules/internal_resolve, modules/bot_mention). A one-byte
 	// value would otherwise enable the capability.
 	minInternalTokenBytes = 32
+
+	// readBodyTimeout bounds the TIME spent reading a request body, which the byte
+	// cap below does not: MaxBytesReader stops at 16 KiB but waits forever for
+	// them. See boundBodyReadTime — 15 s is far beyond any real peer sending
+	// <=16 KiB, so crossing it means the connection is stalled, not slow.
+	readBodyTimeout = 15 * time.Second
 
 	// maxRequestBodyBytes bounds the verify body. The largest legitimate request
 	// is maxBatchUIDs uids plus two ids; 16 KiB leaves generous headroom while
