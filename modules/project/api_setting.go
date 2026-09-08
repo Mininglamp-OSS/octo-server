@@ -54,7 +54,12 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 
 	var req settingReq
-	if err := c.BindJSON(&req); err != nil {
+	// ShouldBindJSON, not BindJSON, and api_i18n.go says why: BindJSON calls gin's
+	// AbortWithError(400), so the status is gin's rather than ours and the envelope
+	// lands underneath it. Invisible today because ResponseErrorL pins the wire
+	// status to 400 anyway, and not invisible the day this module moves to
+	// ResponseErrorLWithStatus. Every other handler here binds the same way.
+	if err := c.ShouldBindJSON(&req); err != nil {
 		respondProjectRequestInvalid(c, "body")
 		return
 	}

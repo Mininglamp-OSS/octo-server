@@ -323,7 +323,7 @@ type GroupResp struct {
 	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
 	//
 	// On THIS endpoint the value is therefore always 0: modules/group hardcodes
-	// IsNamed: 0 on every create (service.go:223, :1278) and 1 exists only where
+	// IsNamed: 0 at BOTH create sites in modules/group/service.go, and 1 exists only where
 	// the #500 migration backfilled it, which no project group can be. It is
 	// shipped anyway so the avatar fallback chain is evaluated by the same code
 	// on every surface rather than special-cased here — a client that hardcodes

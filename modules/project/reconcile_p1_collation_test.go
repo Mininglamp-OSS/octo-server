@@ -43,6 +43,10 @@ var p1ProbeTables = []struct {
 	{"octo_project", false},
 	{"octo_project_member", false},
 	{"octo_project_member_removal_cleanup", false},
+	// PR #861's pin table. Its own statements are octo_project*-only today, but the
+	// probe is what makes that checkable rather than asserted: a future join from it
+	// into a legacy table has to fail here instead of in production.
+	{"octo_project_user_setting", false},
 	{"space_member_removal_cleanup", false}, // migration-created, explicitly general_ci
 	{"space", true},
 	{"group", true},

@@ -647,3 +647,33 @@ func TestACommittedPinIsNotReportedAsAFailure(t *testing.T) {
 	require.NotNil(t, row)
 	assert.Equal(t, "pin-failsoft-renamed", row.Name)
 }
+
+// TestAMemberOfAnUnlistedProjectStillSpendsAPinSlot is the POSITIVE branch of the
+// quota's visibility predicate, which the two trap cases do not cover.
+//
+// Those assert the predicate EXCLUDING: unlisted plus no membership. This asserts
+// it ADMITTING through its other arm — unlisted, but the caller is a member, so the
+// project is in their list and they can unpin it, so it must count. Without this a
+// predicate that dropped every unlisted project would pass both trap cases while
+// handing members of unlisted projects an unbounded pin budget.
+func TestAMemberOfAnUnlistedProjectStillSpendsAPinSlot(t *testing.T) {
+	srv, _ := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+
+	created := createProjectVia(t, srv, spaceA, ownerTok, "unlisted-member-pin")
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, ownerTok, true).Code)
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID, ownerTok,
+		map[string]any{"discoverability": DiscoverabilityUnlisted}).Code)
+	flushProjectCache(t, testCtx)
+
+	assert.Equal(t, 1, countPinnedForTest(t, spaceA, "owner1"),
+		"the owner is a member, so an unlisted project is still in their list and still "+
+			"unpinnable — it must keep counting, or membership of unlisted projects "+
+			"becomes an unbounded pin budget")
+	assert.True(t, pinnedFlags(t, srv, spaceA, ownerTok)[created.ProjectID],
+		"and it is still on their list, which is the property the count mirrors")
+}

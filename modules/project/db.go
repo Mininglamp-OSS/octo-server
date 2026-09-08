@@ -281,8 +281,11 @@ func (d *DB) countCreatedInWindowTx(tx *dbr.Tx, creator string, from, to time.Ti
 	return count, nil
 }
 
-// listVisibleInSpace returns the projects in spaceID that uid may see, newest first, with the
-// caller's role attached.
+// listVisibleInSpace returns the projects in spaceID that uid may see — the caller's
+// own pinned ones first, then newest first — with the caller's role attached.
+//
+// "newest first" alone was true until PR #861 added pinning and left this line
+// behind; the ORDER BY below is the authority and now says three keys, not one.
 //
 // Visibility is one SQL statement rather than a filter in Go so an unlisted project can never
 // transit the process boundary: a space_listed project is visible to any Space member, an
