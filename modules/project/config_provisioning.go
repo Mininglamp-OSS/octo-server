@@ -120,10 +120,19 @@ const (
 	// every one of them so a single leaked value cannot grant two capabilities.
 	// Same intra-set guard as modules/internal_resolve/config.go; the dynamic
 	// route-level credentials are covered centrally in main.go (see above).
+	//
+	// The membership token is here for the reason main.go's registry comment
+	// gives: an OUTBOUND secret equal to an INBOUND token is the worse half of
+	// the collision, because handing it to a peer hands the peer a credential
+	// that authenticates back to us. The central check sees this pair, but it
+	// only LOGS — leaving both capabilities live — so the refusal has to exist on
+	// at least one of the two sides. It exists on both; the reciprocal entry is
+	// modules/internal_membership's siblingFixedTokenEnvs.
 	siblingNotifyTokenEnv     = "NOTIFY_INTERNAL_TOKEN"
 	siblingDocsNotifyTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
 	siblingBotMentionTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	siblingDriveInternalToken = "OCTO_DRIVE_INTERNAL_TOKEN"
+	siblingMembershipTokenEnv = "OCTO_MEMBERSHIP_INTERNAL_TOKEN"
 )
 
 // Provisioning defaults.
@@ -386,6 +395,7 @@ func checkSecretExclusivity(getenv func(string) string, name, secret string, alr
 		siblingDocsNotifyTokenEnv,
 		siblingBotMentionTokenEnv,
 		siblingDriveInternalToken,
+		siblingMembershipTokenEnv,
 	} {
 		if sibling := getenv(siblingEnv); sibling != "" && sibling == secret {
 			return fmt.Errorf("project provisioning: %s secret must differ from %s", name, siblingEnv)

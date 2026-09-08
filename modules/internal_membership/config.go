@@ -24,17 +24,28 @@ const (
 	// Sibling fixed internal-token envs this module refuses to collide with, so
 	// one leaked value can never grant two capabilities.
 	//
-	// This local check is DEFENCE IN DEPTH, not the complete guarantee. Each
-	// module historically hand-rolls its own subset (notify checks one sibling,
-	// bot_mention two, internal_resolve three), so the set of pairs actually
-	// covered is asymmetric. main.go performs the exhaustive pairwise check
-	// across every fixed internal-token env at startup; that is what makes the
-	// invariant hold. Keep both: this one fails the capability closed, the
-	// startup one fails the process loudly.
+	// This local check is DEFENCE IN DEPTH, not the complete guarantee, and the
+	// limits of the other layer are worth stating exactly rather than implying.
+	// main.go's registry (fixedInternalTokenEnvs) does check every pair across
+	// the credentials that live in ONE env var — but it REPORTS collisions at
+	// ERROR level rather than refusing to boot, and it does not see
+	// modules/bot_task's per-source bearer tokens (they live inside the
+	// OCTO_BOT_TASK_SOURCES JSON registry, which dedupes only within itself) or
+	// TS_GRPC_AUTH_TOKEN. So the unconditional claim "one leaked value can never
+	// grant two capabilities" holds for the envs listed below and for the
+	// registry's set; it does not hold binary-wide.
+	//
+	// That is why this list must cover EVERY env in main.go's registry, including
+	// the two outbound provisioning secrets: the local check is the layer that
+	// fails this capability CLOSED, and a pair only the central check sees leaves
+	// both capabilities live with nothing but a log line. modules/project's
+	// checkSecretExclusivity carries the reciprocal entry.
 	notifyInternalTokenEnv     = "NOTIFY_INTERNAL_TOKEN"
 	docsNotifyInternalTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
 	botMentionInternalTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	driveInternalTokenEnv      = "OCTO_DRIVE_INTERNAL_TOKEN"
+	provisionFleetSecretEnv    = "OCTO_PROJECT_PROVISION_FLEET_SECRET"
+	provisionDriveSecretEnv    = "OCTO_PROJECT_PROVISION_DRIVE_SECRET"
 
 	// internalTokenHeader is the wire header carrying the credential. Same
 	// value as modules/notify, modules/bot_mention and modules/internal_resolve
@@ -83,11 +94,44 @@ const (
 	// calls per second from a small set of egress IPs. 20 rps with burst 400
 	// absorbs a cold-cache reconcile spike without the operator having to know
 	// these numbers exist.
+	//
+	// KNOWN TENSION, recorded rather than papered over. The bucket is consumed
+	// BEFORE the token is checked — deliberately, so token probing cannot fall
+	// back to the far wider global bucket — which means the quota is spent by
+	// whoever shares the peer's observed source IP, not by whoever holds the
+	// credential. Behind a shared NAT or ingress, an unauthenticated stranger can
+	// drain the burst with garbage tokens and produce exactly the outcome this
+	// sizing was chosen to avoid: the peer fails authorization closed and denies
+	// end users.
+	//
+	// Loosening the numbers does not fix it, it only raises the cost of the
+	// attack. The fix is a SECOND quota, keyed on the credential and applied
+	// AFTER auth, which invalid-token traffic cannot touch — the pre-auth bucket
+	// then only has to be an abuse floor. That is not built here: it needs a
+	// per-consumer identity the current one-shared-token contract does not have,
+	// which is the same open question as per-consumer scoping (see the brief).
+	// Until then the assumption this sizing rests on is that the peer's egress is
+	// not shared with untrusted traffic, and that is a deployment property, not a
+	// code property.
 	envMembershipIPRPS   = "DM_MEMBERSHIP_INTERNAL_IP_RPS"
 	envMembershipIPBurst = "DM_MEMBERSHIP_INTERNAL_IP_BURST"
 	defMembershipIPRPS   = 20.0
 	defMembershipIPBurst = 400
 )
+
+// siblingFixedTokenEnvs is the list this module refuses to share a value with.
+//
+// It must stay equal to main.go's fixedInternalTokenEnvs minus this module's own
+// env; TestSiblingListCoversTheCentralRegistry pins that, so adding a credential
+// centrally cannot silently leave this local refusal a subset again.
+var siblingFixedTokenEnvs = []string{
+	notifyInternalTokenEnv,
+	docsNotifyInternalTokenEnv,
+	botMentionInternalTokenEnv,
+	driveInternalTokenEnv,
+	provisionFleetSecretEnv,
+	provisionDriveSecretEnv,
+}
 
 // resolveMembershipInternalToken loads the token and refuses to enable the
 // capability when it is unset, too short, or equal to a sibling fixed internal
@@ -108,12 +152,7 @@ func resolveMembershipInternalToken(getenv func(string) string) (string, error) 
 	if len(token) < minInternalTokenBytes {
 		return "", errors.New(MembershipInternalTokenEnv + " must be at least 32 bytes; membership internal API disabled")
 	}
-	for _, sibling := range []string{
-		notifyInternalTokenEnv,
-		docsNotifyInternalTokenEnv,
-		botMentionInternalTokenEnv,
-		driveInternalTokenEnv,
-	} {
+	for _, sibling := range siblingFixedTokenEnvs {
 		if token == getenv(sibling) {
 			return "", errors.New(MembershipInternalTokenEnv + " must differ from " + sibling + "; membership internal API disabled")
 		}

@@ -36,6 +36,13 @@ func New(ctx *config.Context) *Module {
 	logger := log.NewTLog("InternalMembership")
 	token, tokenErr := resolveMembershipInternalToken(os.Getenv)
 	if tokenErr != nil {
+		// Cleared explicitly rather than relying on every error path in
+		// resolveMembershipInternalToken returning "". They all do today, and
+		// the middleware refuses on an empty token — but that makes fail-closed
+		// a property of four separate return statements instead of one line
+		// here. One future path returning a partially-validated value would
+		// enable the capability with an error already logged.
+		token = ""
 		logger.Error(tokenErr.Error())
 	}
 	return &Module{ctx: ctx, store: dbStore{ctx: ctx}, internalToken: token, Log: logger}
@@ -120,6 +127,13 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 // a missing key cannot tell "this project has no membership changes" from "my
 // id never made it into the response", and the two demand opposite reactions.
 //
+// "Requested id" means the id after separator whitespace is trimmed, because the
+// ids arrive in a comma-separated query parameter where that whitespace is
+// syntax (see parseIDList). For a caller sending canonical ids — the contract's
+// form — trimmed and sent are the same string. The verify endpoint takes its ids
+// from a JSON body, where there is no separator to absorb, and rejects a padded
+// id rather than answering under a different key.
+//
 // Zero is the sentinel the integration contract assigns to "does not exist or
 // not visible", and it is fail-closed ONLY BECAUSE an active project is kept off
 // it: projects are created at member_epoch 1 and the column is never written by
@@ -203,21 +217,43 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 // does not apply here; only the request-line limit does, which still admits
 // thousands of ids. Parsing them all just to answer 400 would be a free
 // amplification on an endpoint whose rate limit is deliberately generous.
+//
+// "Without materializing it" is why the comma split is a strings.Cut loop rather
+// than strings.Split: Split allocates a slice for the WHOLE group before the
+// limit is ever consulted, so one `?project_ids=` value with a hundred thousand
+// commas allocated a hundred thousand strings on the way to a 400. Cutting one
+// field at a time means the early return actually returns early. (The claim was
+// in this comment for a round before the code did it.)
+//
+// Whitespace around a comma is SEPARATOR syntax here, so it is trimmed: a caller
+// that builds the query with `strings.Join(ids, ", ")` means the ids, not the
+// spaces. The consequence is that the answer is keyed by the TRIMMED id, which is
+// what the caller's own id was in that shape. An id whose value genuinely
+// contains surrounding whitespace is therefore not round-tripped — but such an id
+// is outside the contract's canonical-uuid form, and the verify endpoint, whose
+// uids arrive in a JSON array where whitespace is unambiguously part of the
+// value, rejects that shape outright rather than trimming it.
 func parseIDList(raw []string, limit int) (ids []string, overLimit bool) {
 	out := make([]string, 0, limit)
 	seen := make(map[string]bool, limit)
 	for _, group := range raw {
-		for _, part := range strings.Split(group, ",") {
+		rest := group
+		for {
+			part, after, more := strings.Cut(rest, ",")
 			v := strings.TrimSpace(part)
-			if v == "" || seen[v] {
-				continue
-			}
-			if len(out) >= limit {
+			switch {
+			case v == "" || seen[v]:
+			case len(out) >= limit:
 				// One past the limit is all the caller needs to know.
 				return out, true
+			default:
+				seen[v] = true
+				out = append(out, v)
 			}
-			seen[v] = true
-			out = append(out, v)
+			if !more {
+				break
+			}
+			rest = after
 		}
 	}
 	return out, false
@@ -291,13 +327,18 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 		respondInvalidParam(c, "body")
 		return
 	}
-	spaceID := strings.TrimSpace(req.SpaceID)
-	if spaceID == "" {
+	// Every field of a JSON body is the value itself: unlike the query string,
+	// there is no separator syntax for whitespace to belong to. So a padded value
+	// is a malformed one and is refused rather than silently rewritten — which
+	// also keeps the response honest, since it echoes project_id and every uid
+	// back and a caller keying on their own strings must find them there.
+	spaceID := req.SpaceID
+	if spaceID == "" || spaceID != strings.TrimSpace(spaceID) {
 		respondInvalidParam(c, "space_id")
 		return
 	}
-	projectID := strings.TrimSpace(req.ProjectID)
-	if projectID == "" {
+	projectID := req.ProjectID
+	if projectID == "" || projectID != strings.TrimSpace(projectID) {
 		respondInvalidParam(c, "project_id")
 		return
 	}
@@ -308,8 +349,8 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 	uids := make([]string, 0, len(req.UIDs))
 	seen := make(map[string]bool, len(req.UIDs))
 	for _, raw := range req.UIDs {
-		uid := strings.TrimSpace(raw)
-		if uid == "" || seen[uid] {
+		uid := raw
+		if uid == "" || uid != strings.TrimSpace(uid) || seen[uid] {
 			respondInvalidParam(c, "uids")
 			return
 		}

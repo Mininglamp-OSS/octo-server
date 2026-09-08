@@ -58,17 +58,20 @@ func TestTokenRefusedWhenTooShort(t *testing.T) {
 	}
 }
 
-// TestTokenRefusedOnSiblingCollision covers every sibling capability. One
-// credential must grant exactly one capability, so sharing a value with any of
-// them disables this one.
+// TestTokenRefusedOnSiblingCollision covers every sibling capability.
+//
+// It iterates siblingFixedTokenEnvs rather than a copy of it, on purpose: the
+// previous version listed four envs while the central registry had grown to
+// seven, so the suite certified a list that was already a subset — the test
+// looked like coverage and was actually a snapshot. Iterating the real list means
+// adding a sibling adds a case for free, and forgetting to add one is caught in
+// main's TestModuleLocalRefusalsCoverTheCentralRegistry instead of here.
 func TestTokenRefusedOnSiblingCollision(t *testing.T) {
-	siblings := []string{
-		notifyInternalTokenEnv,
-		docsNotifyInternalTokenEnv,
-		botMentionInternalTokenEnv,
-		driveInternalTokenEnv,
+	if len(siblingFixedTokenEnvs) < 6 {
+		t.Fatalf("siblingFixedTokenEnvs shrank to %d entries; it must cover main.go's registry "+
+			"minus this module's own env", len(siblingFixedTokenEnvs))
 	}
-	for _, sibling := range siblings {
+	for _, sibling := range siblingFixedTokenEnvs {
 		t.Run(sibling, func(t *testing.T) {
 			_, err := resolveMembershipInternalToken(envMap(map[string]string{
 				MembershipInternalTokenEnv: goodToken,

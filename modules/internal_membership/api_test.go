@@ -523,15 +523,45 @@ func TestVerifyFailsClosedOnStoreError(t *testing.T) {
 	}
 }
 
-func TestVerifyTrimsAndForwardsIdentifiers(t *testing.T) {
+func TestVerifyForwardsIdentifiersVerbatim(t *testing.T) {
 	s := &stubStore{epoch: 1, roles: map[string]int{}}
 	doPost(t, newRouter(newTestModule(s)), testInternalToken,
-		verifyRequest{SpaceID: " sp1 ", ProjectID: " p1 ", UIDs: []string{" u1 "}})
+		verifyRequest{SpaceID: "sp1", ProjectID: "p1", UIDs: []string{"u1"}})
 	if s.lastSpaceID != "sp1" || s.lastProject != "p1" {
-		t.Fatalf("identifiers not trimmed: space=%q project=%q", s.lastSpaceID, s.lastProject)
+		t.Fatalf("identifiers not forwarded: space=%q project=%q", s.lastSpaceID, s.lastProject)
 	}
 	if len(s.lastUIDs) != 1 || s.lastUIDs[0] != "u1" {
-		t.Fatalf("uids not trimmed: %v", s.lastUIDs)
+		t.Fatalf("uids not forwarded: %v", s.lastUIDs)
+	}
+}
+
+// TestVerifyRejectsPaddedIdentifiers pins that the body's values are taken
+// verbatim, not silently rewritten.
+//
+// A JSON field carries the value itself: there is no separator syntax for the
+// whitespace to belong to, unlike the epochs endpoint's comma-separated query
+// parameter. So a padded id is malformed, and trimming it would ANSWER UNDER A
+// DIFFERENT KEY than the caller asked about — the response echoes project_id and
+// every uid, and a consumer keying the answers by its own strings would find a
+// missing entry and read it as "no verdict returned". 400 says what happened.
+func TestVerifyRejectsPaddedIdentifiers(t *testing.T) {
+	cases := map[string]verifyRequest{
+		"space_id":   {SpaceID: " sp1 ", ProjectID: "p1", UIDs: []string{"u1"}},
+		"project_id": {SpaceID: "sp1", ProjectID: " p1 ", UIDs: []string{"u1"}},
+		"uid":        {SpaceID: "sp1", ProjectID: "p1", UIDs: []string{" u1 "}},
+		"tab in uid": {SpaceID: "sp1", ProjectID: "p1", UIDs: []string{"u1\t"}},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := &stubStore{epoch: 1, roles: map[string]int{}}
+			w := doPost(t, newRouter(newTestModule(s)), testInternalToken, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d (%s)", w.Code, w.Body.String())
+			}
+			if s.memberCalls != 0 {
+				t.Fatal("a padded identifier reached the store")
+			}
+		})
 	}
 }
 

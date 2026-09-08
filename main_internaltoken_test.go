@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -121,4 +123,113 @@ func TestFixedInternalTokenEnvsCoversEveryKnownCapability(t *testing.T) {
 			t.Errorf("fixedInternalTokenEnvs is missing %s", e)
 		}
 	}
+}
+
+// TestModuleLocalRefusalsCoverTheCentralRegistry closes the gap between the two
+// layers, in the direction that matters.
+//
+// The central check DETECTS every pair but only logs, so a collision it finds
+// leaves BOTH capabilities live. The module-local check is the layer that fails a
+// capability CLOSED. A pair that only the central check sees is therefore a pair
+// where a single leaked value grants two capabilities with nothing but an ERROR
+// line standing in the way.
+//
+// The rebase that added the two provisioning secrets to the registry grew that
+// gap without anything noticing: modules/internal_membership refused four
+// siblings out of six, and modules/project's checkSecretExclusivity mirrored the
+// omission from the other side. Both are complete now, and this is what keeps
+// them complete when the registry next grows.
+//
+// Scope: only the two modules whose credentials this PR introduced or pairs
+// with. The older modules (notify, bot_mention, internal_resolve) remain
+// asymmetric — that is the documented pre-existing norm, and widening them is a
+// change to those modules, not to this list.
+func TestModuleLocalRefusalsCoverTheCentralRegistry(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		// marker anchors the refusal LIST, so a constant that is declared and
+		// never used does not satisfy the check.
+		marker string
+		// own is the module's own env, which it obviously does not list as a sibling.
+		own []string
+	}{
+		{
+			name:   "internal_membership",
+			file:   "modules/internal_membership/config.go",
+			marker: "var siblingFixedTokenEnvs = []string{",
+			own:    []string{internal_membership.MembershipInternalTokenEnv},
+		},
+		{
+			name:   "project provisioning",
+			file:   "modules/project/config_provisioning.go",
+			marker: "for _, siblingEnv := range []string{",
+			own:    []string{project.ProvisionFleetSecretEnv, project.ProvisionDriveSecretEnv},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			refused := refusedEnvs(t, tc.file, tc.marker)
+			// Not vacuous: an empty or mis-anchored region would pass every
+			// membership check below by simply having nothing to disagree with.
+			if len(refused) < 4 {
+				t.Fatalf("%s: found only %d refused envs (%v) — the region anchor %q is probably "+
+					"stale, and a guard that reads nothing passes for the wrong reason",
+					tc.file, len(refused), refused, tc.marker)
+			}
+			mine := make(map[string]bool, len(tc.own))
+			for _, e := range tc.own {
+				mine[e] = true
+			}
+			for _, env := range fixedInternalTokenEnvs {
+				if mine[env] || refused[env] {
+					continue
+				}
+				t.Errorf("%s does not refuse a collision with %s. The central registry only "+
+					"LOGS that pair, so both capabilities would stay live on one leaked "+
+					"value — the module-local refusal is the layer that fails closed.",
+					tc.file, env)
+			}
+		})
+	}
+}
+
+// refusedEnvs returns the env NAMES a module's refusal list actually names.
+//
+// It reads the list REGION rather than the whole file, and resolves the
+// identifiers in it through the file's own `ident = "LITERAL"` declarations. A
+// whole-file grep would pass on a file that declares a constant and never uses
+// it — which is precisely the shape a careless edit leaves behind.
+func refusedEnvs(t *testing.T, file, marker string) map[string]bool {
+	t.Helper()
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	src := string(raw)
+
+	consts := map[string]string{}
+	for _, m := range regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*"([^"]+)"`).FindAllStringSubmatch(src, -1) {
+		consts[m[1]] = m[2]
+	}
+
+	at := strings.Index(src, marker)
+	if at < 0 {
+		t.Fatalf("%s: refusal-list anchor %q not found; point this guard at the new one rather than deleting it", file, marker)
+	}
+	region := src[at+len(marker):]
+	if end := strings.Index(region, "}"); end >= 0 {
+		region = region[:end]
+	}
+
+	out := map[string]bool{}
+	for _, m := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(region, -1) {
+		out[m[1]] = true
+	}
+	for _, m := range regexp.MustCompile(`(?m)^\s*(\w+),\s*$`).FindAllStringSubmatch(region, -1) {
+		if lit, ok := consts[m[1]]; ok {
+			out[lit] = true
+		}
+	}
+	return out
 }
