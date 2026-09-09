@@ -514,6 +514,10 @@ golangci-lint run ./...
 - `TestUnpinningProjectRemovesItFromFollowAndRepinningRestoresIt` — an explicit
   unpin hides the retained section even while the caller remains an active
   Project member; repeated reads do not undo the opt-out, and re-pin restores it.
+- `TestUnpinningSomethingNeverPinnedPersistsOptOut` and
+  `TestUnpinningNeverPinnedMemberStaysOutOfFollow` — the first explicit
+  `pinned=false` from an auto-provisioned member writes the durable tombstone;
+  two consecutive reads cannot resurrect the section.
 - A hook failure warns and does **not** roll back the Project write.
 
 **D5 — old endpoints stay consistent**

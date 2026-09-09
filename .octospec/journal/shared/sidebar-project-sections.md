@@ -20,18 +20,25 @@ source: self
   assignments for Project-owned groups.
 - Added authenticated, UID-rate-limited list/sort endpoints for unified sidebar
   sections. Existing category list/sort endpoints now read/write the same order.
+  The legacy category sort reuses the category slots already present in the
+  mixed sequence, so it cannot displace an interleaved Project.
 - Added best-effort post-commit Project section provisioning for Project create,
   member admission, and successful #861 pin. The read path repairs missed hooks.
   A Space-listed Project pinned by a non-member appears with `groups: []`; pinning
   does not grant a Project seat or group access.
 - Made explicit unpin a durable personal opt-out, including for active Project
-  members. It retains the ordering row as hidden, prevents read repair from
-  immediately restoring it, and lets a later pin reactivate the previous position.
+  members who never previously pinned. The first `pinned=false` persists a
+  tombstone, retains the ordering row as hidden, prevents read repair from
+  restoring it, and lets a later pin reactivate the previous position.
 - Added `project_name` wherever this task emits a Sidebar-facing non-empty
   `project_id`. `/v1/sidebar/sync` resolves distinct IDs with one Space-scoped
   query and fails soft by omitting names if that lookup fails.
-- Rejected manual categorization of Project groups with a registered localized
-  error, preserving the Project/category mutual-exclusion invariant.
+- Rejected simultaneous non-empty `project_id` / `category_id` on group create
+  and manual categorization of Project groups with localized errors. An empty
+  category target remains available to repair historical invalid assignments.
+- Replaced per-Project sidebar loading with one membership-scoped group query
+  plus one grouped member-count query, while preserving the 50-group cap per
+  Project. Sort validation now reads section metadata without rendering groups.
 
 ## Load-bearing notes
 
@@ -49,12 +56,18 @@ source: self
 ## Verification
 
 - Local MySQL, Redis, and WuKongIM health checks passed.
-- Against an isolated local MySQL 8.0.33 schema, with Redis/WuKongIM live:
+- Against an isolated local MySQL schema, with Redis/WuKongIM live:
   `go test -race -shuffle=on -count=1` passed for
-  `./modules/category/...`, `./modules/project/...`, `./modules/space/...`, and
-  `./modules/message/...` (each package reset independently, matching CI).
+  `./modules/category`, `./modules/project`, `./modules/group`,
+  `./modules/space`, and `./modules/message` (each database-backed package reset
+  independently, matching CI).
+- The never-pinned unpin regression was captured RED before the fix, then passed
+  with race detection after `pinned=0` persistence was added.
+- Both the single-Project and batched Project-group SQL statements passed live
+  EXPLAIN guards without full table scans.
 - `make i18n-extract`, `make i18n-extract-check`, and `make i18n-lint` passed.
-- `golangci-lint run ./...` reported 0 issues; `git diff --check` passed.
+- `go vet ./...` passed; `golangci-lint run ./...` reported 0 issues;
+  `git diff --check` passed.
 - Standalone `octospec-lint` is not installed in this workspace. Frontmatter was
   written against existing valid Journal/Learning examples and checked manually.
 

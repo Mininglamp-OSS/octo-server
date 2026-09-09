@@ -18,6 +18,12 @@ change-log convention (§7). Newest first.
 
 ## 2026-09-09 — sidebar-project-sections
 
+- **Review closure** — group creation now rejects simultaneous Project/category
+  attribution while an empty category target can still repair old violations;
+  legacy category sorting preserves occupied category slots; Project group
+  rendering is batched into two queries; sort validation no longer renders
+  groups; and a never-before-pinned member's explicit unpin persists the
+  `pinned=0` opt-out required by read repair.
 - **Follow-up** — explicit Project unpin now removes the retained section from
   关注 even for an active Project member. The `pinned=0` setting suppresses both
   rendering and membership repair, `status=2` preserves the old position, and a
