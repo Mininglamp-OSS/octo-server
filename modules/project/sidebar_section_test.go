@@ -83,6 +83,22 @@ func TestUnpinningProjectRemovesItFromFollowAndRepinningRestoresIt(t *testing.T)
 	assertProjectSidebarSection(t, created.ProjectID, "sidebar-unpin-owner", 1)
 }
 
+func TestUnpinningNeverPinnedMemberStaysOutOfFollow(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "sidebar-never-pinned-owner")
+	seedSpaceMember(t, spaceA, "sidebar-never-pinned-owner", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerToken, "sidebar never pinned")
+
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, true)
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, ownerToken, false).Code)
+
+	// Both reads exercise the repair path. The first explicit false write must
+	// survive even though this member never had a pinned=true setting row.
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, false)
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, false)
+}
+
 func TestProjectSidebarProvisionFailureDoesNotRollbackProject(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)

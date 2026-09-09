@@ -592,13 +592,13 @@ func countPinnedForTest(t *testing.T, spaceID, uid string) int {
 	return n
 }
 
-// TestUnpinningSomethingNeverPinnedWritesNoRow pins the tombstone fix.
+// TestUnpinningSomethingNeverPinnedPersistsOptOut pins the durable Follow opt-out.
 //
-// The unpin path used to run the same upsert with pinned = 0, so unpinning
-// something that was never pinned INSERTED a row, and nothing anywhere deletes
-// those. One read now serves both directions, so an operation that changes nothing
-// writes nothing.
-func TestUnpinningSomethingNeverPinnedWritesNoRow(t *testing.T) {
+// A Project member has no settings row until they explicitly touch the pin
+// preference. Their first pinned=false write therefore cannot be treated as a
+// no-op: the sidebar repair path needs the persisted zero to distinguish an
+// explicit opt-out from the default unpinned state.
+func TestUnpinningSomethingNeverPinnedPersistsOptOut(t *testing.T) {
 	srv, _ := setup(t)
 	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
@@ -609,12 +609,11 @@ func TestUnpinningSomethingNeverPinnedWritesNoRow(t *testing.T) {
 	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, tok, false).Code,
 		"unpinning something never pinned is a no-op, not an error")
 
-	var n int
+	var pinned int
 	require.NoError(t, testCtx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
-		created.ProjectID, "owner1").LoadOne(&n))
-	assert.Zero(t, n, "no row may be written for a preference that was already at its "+
-		"default; nothing in the tree cleans such rows up")
+		"SELECT pinned FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		created.ProjectID, "owner1").LoadOne(&pinned))
+	assert.Zero(t, pinned, "the explicit unpin must persist a durable opt-out")
 }
 
 // TestACommittedPinIsNotReportedAsAFailure is the regression for the defect PR
