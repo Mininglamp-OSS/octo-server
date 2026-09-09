@@ -122,6 +122,7 @@ func TestProjectGroupRefusesANonProjectMember(t *testing.T) {
 		// the I2 guarantee these two exist to assert, and the lists cannot see it
 		// on their own.
 		AdmissionEntryAllMemberGroup,
+		AdmissionEntryAITeamGroup,
 	}
 	for _, entry := range entries {
 		t.Run(entry, func(t *testing.T) {

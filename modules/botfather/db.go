@@ -18,12 +18,65 @@ type botfatherDB struct {
 var errCreateBotSpaceDenied = errors.New("bot creation Space authorization denied")
 var errCreateBotSpaceBindingFailed = errors.New("bot creation Space binding failed")
 var errCreateBotPersistenceFailed = errors.New("bot creation persistence failed")
+var errHostedBotAlreadyExists = errors.New("hosted bot already exists for creator")
+
+// hostedBotCreationLock serializes the globally limited hosted-bot creation
+// path for one real creator UID. The user row is the stable lock anchor: unlike
+// robot rows it exists before the first Bot is inserted, so it also closes the
+// empty-result race.
+type hostedBotCreationLock struct {
+	tx *dbr.Tx
+}
 
 func newBotfatherDB(ctx *config.Context) *botfatherDB {
 	return &botfatherDB{
 		ctx:     ctx,
 		session: ctx.DB(),
 	}
+}
+
+// lockHostedBotCreation locks the creator's authoritative user row and checks
+// the global (not Space-scoped) hosted Bot quota. Callers must keep the lock
+// until the newly created robot row has committed, then release it with commit.
+func (d *botfatherDB) lockHostedBotCreation(creatorUID string) (*hostedBotCreationLock, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin hosted Bot creation lock: %w", err)
+	}
+
+	var lockedUID string
+	err = tx.SelectBySql("SELECT uid FROM user WHERE uid=? FOR UPDATE", creatorUID).LoadOne(&lockedUID)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("lock hosted Bot creator: %w", err)
+	}
+
+	var count int
+	err = tx.SelectBySql(
+		"SELECT COUNT(*) FROM robot WHERE creator_uid=? AND status=1 AND agent_hosting=?",
+		creatorUID, agentHostingOctoHosted,
+	).LoadOne(&count)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("check hosted Bot quota: %w", err)
+	}
+	if count > 0 {
+		_ = tx.Rollback()
+		return nil, errHostedBotAlreadyExists
+	}
+	return &hostedBotCreationLock{tx: tx}, nil
+}
+
+func (l *hostedBotCreationLock) release(commit bool) error {
+	if l == nil || l.tx == nil {
+		return nil
+	}
+	tx := l.tx
+	l.tx = nil
+	if commit {
+		return tx.Commit()
+	}
+	return tx.Rollback()
 }
 
 type robotModel struct {
@@ -50,9 +103,9 @@ type robotModel struct {
 	// BoundAt 占用时间；timestamp NULL，未占用时无效。用 NullTime 承接 NULL，
 	// 否则 Select("*") 把 NULL bound_at 扫进 string 会报错，殃及所有 robot 查询。
 	BoundAt dbr.NullTime
-	// AgentHosting Agent 自报托管形态，小写 slug（self_hosted / octo_hosted /
-	// <vendor>_hosted）；空=未上报。写入在 modules/bot_api 的 register，这里只读。
-	// 自报值，不可用于鉴权。
+	// AgentHosting 托管形态，小写 slug（self_hosted / octo_hosted /
+	// <vendor>_hosted）；空=未上报。创建路径对 octo_hosted 施加全局配额；
+	// 运行时上报仍是展示与排障遥测。
 	AgentHosting string
 	// AgentReportedHostingAt 最近一次收到 **agent_hosting** 上报的时间；
 	// timestamp NULL，从未上报时无效。只在 hosting 被上报时前进（见
@@ -83,6 +136,19 @@ func (d *botfatherDB) queryRobotsByCreatorUID(creatorUID string) ([]*robotModel,
 	var list []*robotModel
 	_, err := d.session.Select("*").From("robot").Where("creator_uid=? and status=1", creatorUID).Load(&list)
 	return list, err
+}
+
+// queryActiveHostedBotByCreatorUID returns one deterministic existing hosted
+// Bot for an owner. Historical duplicate rows are deliberately not repaired by
+// this read; the oldest active row is the credential returned to the owner.
+func (d *botfatherDB) queryActiveHostedBotByCreatorUID(creatorUID string) (*robotModel, error) {
+	var m *robotModel
+	_, err := d.session.Select("*").From("robot").
+		Where("creator_uid=? AND status=1 AND agent_hosting=?", creatorUID, agentHostingOctoHosted).
+		OrderAsc("created_at").
+		Limit(1).
+		Load(&m)
+	return m, err
 }
 
 // queryRobotsByCreatorUIDAndSpaceID 查询某用户在指定 Space 下创建的机器人
@@ -306,11 +372,11 @@ func (d *botfatherDB) insertRobotTx(m *robotModel, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("robot").Columns(
 		"app_id", "robot_id", "username", "token", "version", "status",
 		"creator_uid", "description", "bot_token", "im_token_cache", "bot_commands",
-		"auto_approve",
+		"auto_approve", "agent_hosting",
 	).Values(
 		m.AppID, m.RobotID, m.Username, m.Token, m.Version, m.Status,
 		m.CreatorUID, m.Description, m.BotToken, m.IMTokenCache, m.BotCommands,
-		m.AutoApprove,
+		m.AutoApprove, m.AgentHosting,
 	).Exec()
 	return err
 }

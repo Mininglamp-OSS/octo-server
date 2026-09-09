@@ -1520,6 +1520,37 @@ func TestOpanalyticsAIContainerHiddenFromGroupSurfaces(t *testing.T) {
 	}
 }
 
+func TestOpanalyticsAITeamGroupHiddenFromGroupSurfaces(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	_, err := ctx.DB().Update("group").Set("purpose", aiteam.TeamGroupPurpose).
+		Where("group_no=?", "g1").Exec()
+	require.NoError(t, err)
+
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+	var overview overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview"+rng), &overview)
+	assert.Equal(t, int64(1), overview.GroupTotal)
+
+	var channels struct {
+		Count int64             `json:"count"`
+		List  []channelListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces/s1/channels"+rng), &channels)
+	assert.Zero(t, channels.Count)
+	assert.Empty(t, channels.List)
+	assert.Equal(t, "err.server.opanalytics.not_found",
+		errorCode(t, opaGet(t, route, "/v1/manager/dashboard/channels/g1/members"+rng)))
+
+	groups, err := newETLDB(ctx).queryGroupsForDim()
+	require.NoError(t, err)
+	for _, item := range groups {
+		assert.NotEqual(t, "g1", item.GroupNo)
+	}
+}
+
 // TestOpanalyticsSpaceNameLikeEscape 验收 P2：表一 name 过滤把 % _ 当字面量(转义)而非通配符。
 func TestOpanalyticsSpaceNameLikeEscape(t *testing.T) {
 	ctx, route, etl := opaSetup(t)

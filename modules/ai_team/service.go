@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -14,9 +15,12 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
+
+const aiTeamMutationRetryAttempts = 3
 
 type Service struct {
 	ctx           *config.Context
@@ -55,15 +59,20 @@ func (s *Service) validateAuthority(spaceID, userUID, botID string) (string, err
 }
 
 func validateAuthorityTx(tx *dbr.Tx, spaceID, userUID, botID string) error {
+	ownerActive, err := group.IsAITeamOwnerActiveTx(tx, spaceID, userUID)
+	if err != nil {
+		return err
+	}
+	if !ownerActive {
+		return errForbidden
+	}
 	var count int
-	err := tx.SelectBySql(`
+	err = tx.SelectBySql(`
 		SELECT COUNT(*)
 		FROM robot r
 		JOIN user u ON u.uid=r.robot_id AND u.status=1 AND u.is_destroy<>2
-		JOIN space sp ON sp.space_id=? AND sp.status=1
-		JOIN space_member human_sm ON human_sm.space_id=sp.space_id AND human_sm.uid=? AND human_sm.status=1
-		JOIN space_member bot_sm ON bot_sm.space_id=sp.space_id AND bot_sm.uid=r.robot_id AND bot_sm.status=1
-		WHERE r.robot_id=? AND r.creator_uid=? AND r.status=1`, spaceID, userUID, botID, userUID).LoadOne(&count)
+		JOIN space_member bot_sm ON bot_sm.space_id=? AND bot_sm.uid=r.robot_id AND bot_sm.status=1
+		WHERE r.robot_id=? AND r.creator_uid=? AND r.status=1`, spaceID, botID, userUID).LoadOne(&count)
 	if err != nil {
 		return err
 	}
@@ -74,7 +83,58 @@ func validateAuthorityTx(tx *dbr.Tx, spaceID, userUID, botID string) error {
 }
 
 func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
-	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
+	var agent *Agent
+	err := retryAITeamMutation(func() error {
+		var attemptErr error
+		agent, attemptErr = s.addAgentOnce(spaceID, userUID, botID)
+		return attemptErr
+	})
+	return agent, err
+}
+
+// addAgentOnce performs one idempotent activation attempt. Keeping the entire
+// orchestration behind the retry boundary matters: a lock conflict can occur in
+// the private-container transaction or while projecting the team-group roster.
+func (s *Service) addAgentOnce(spaceID, userUID, botID string) (*Agent, error) {
+	if _, err := s.ensureAgentContainer(spaceID, userUID, botID, true); err != nil {
+		return nil, err
+	}
+	if err := s.reconcileActiveAgentContainers(spaceID, userUID); err != nil {
+		return nil, err
+	}
+	if _, err := s.ensureTeamGroup(spaceID, userUID, true); err != nil {
+		return nil, err
+	}
+	return s.getAgent(spaceID, userUID, botID, false)
+}
+
+func retryAITeamMutation(fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < aiTeamMutationRetryAttempts; attempt++ {
+		err := fn()
+		if err == nil || !isRetryableAITeamMutationError(err) {
+			return err
+		}
+		lastErr = err
+		if attempt+1 < aiTeamMutationRetryAttempts {
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("ai team: mutation retries exhausted: %w", lastErr)
+}
+
+func isRetryableAITeamMutationError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+}
+
+// ensureAgentContainer is the idempotent half of Agent activation that owns the
+// private two-member group. It deliberately does not recurse into team-group
+// reconciliation, allowing a caller to repair every Agent first and project the
+// complete roster exactly once afterwards.
+func (s *Service) ensureAgentContainer(spaceID, userUID, botID string, forceIM bool) (*Agent, error) {
+	botName, err := s.validateAuthority(spaceID, userUID, botID)
+	if err != nil {
 		return nil, err
 	}
 	tx, err := s.ctx.DB().Begin()
@@ -101,48 +161,48 @@ func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
 	if agent == nil {
 		return nil, errNotFound
 	}
-
-	containerNeedsReconcile := false
-	if agent.GroupNo != "" {
-		repaired, repairErr := s.admitContainerMembersTx(tx, agent.GroupNo, spaceID, userUID, botID)
-		if repairErr != nil {
-			return nil, repairErr
-		}
-		containerNeedsReconcile = repaired || agent.ContainerState != containerReady
-		if containerNeedsReconcile {
-			if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
-				return nil, err
-			}
-		}
+	groupNo, containerNeedsReconcile, err := s.ensureContainerTx(tx, agent, botName, spaceID, userUID, botID)
+	if err != nil {
+		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	if containerNeedsReconcile {
-		if err = s.ensureContainerIMReady(agent.ID, agent.GroupNo, userUID, botID); err != nil {
-			s.markContainerFailure(agent.ID, err)
-			return nil, fmt.Errorf("%w: reconcile IM channels: %v", errIMUnavailable, err)
-		}
-		readyTx, beginErr := s.ctx.DB().Begin()
-		if beginErr != nil {
-			return nil, beginErr
-		}
-		defer readyTx.RollbackUnlessCommitted()
-		if err = validateAuthorityTx(readyTx, spaceID, userUID, botID); err != nil {
-			s.markContainerFailure(agent.ID, err)
-			return nil, err
-		}
-		if _, err = readyTx.Update("ai_team_agent").Set("container_state", containerReady).Where("id=?", agent.ID).Exec(); err != nil {
-			return nil, err
-		}
-		if err = readyTx.Commit(); err != nil {
-			return nil, err
-		}
+	// Explicit AddAgent is a repair operation and always replays the idempotent
+	// IM upserts. List-triggered reconciliation only does external work when the
+	// DB state or membership repair says the container is not ready.
+	if !forceIM && !containerNeedsReconcile {
+		return s.getAgent(spaceID, userUID, botID, false)
+	}
+	if err = s.ensureContainerIMReady(agent.ID, groupNo, spaceID, userUID, botID); err != nil {
+		s.markContainerFailure(agent.ID, err)
+		return nil, fmt.Errorf("%w: reconcile IM channels: %v", errIMUnavailable, err)
+	}
+	readyTx, beginErr := s.ctx.DB().Begin()
+	if beginErr != nil {
+		return nil, beginErr
+	}
+	defer readyTx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(readyTx, spaceID, userUID, botID); err != nil {
+		s.markContainerFailure(agent.ID, err)
+		return nil, err
+	}
+	if _, err = readyTx.Update("ai_team_agent").Set("container_state", containerReady).Where("id=?", agent.ID).Exec(); err != nil {
+		return nil, err
+	}
+	if err = readyTx.Commit(); err != nil {
+		return nil, err
 	}
 	return s.getAgent(spaceID, userUID, botID, false)
 }
 
 func (s *Service) RemoveAgent(spaceID, userUID, botID string) error {
+	return retryAITeamMutation(func() error {
+		return s.removeAgentOnce(spaceID, userUID, botID)
+	})
+}
+
+func (s *Service) removeAgentOnce(spaceID, userUID, botID string) error {
 	if _, err := s.validateAuthority(spaceID, userUID, botID); err != nil {
 		return err
 	}
@@ -153,6 +213,22 @@ func (s *Service) RemoveAgent(spaceID, userUID, botID string) error {
 		Where("space_id=? AND user_uid=? AND bot_id=?", spaceID, userUID, botID).Exec()
 	if err != nil {
 		return err
+	}
+	// An explicit removal is also an explicit repair attempt. Bypass the
+	// read-path cooldown so a retry cannot report success while subscriber
+	// revocation is still pending.
+	if _, reconcileErr := s.ensureTeamGroup(spaceID, userUID, true); reconcileErr != nil {
+		s.Warn("AI Agent removed but team-group projection is pending",
+			zap.Error(reconcileErr), zap.String("space_id", spaceID), zap.String("uid", userUID), zap.String("bot_id", botID))
+		// The durable is_added=0 mutation is intentionally retained, but the API
+		// must surface the degraded projection so the caller retries until the Bot
+		// is also removed from the external channel subscriber set.
+		return reconcileErr
+	}
+	if reconcileErr := s.removeAgentFromCustomTeams(spaceID, userUID, botID); reconcileErr != nil {
+		s.Warn("AI Agent removed but custom-team projection is pending",
+			zap.Error(reconcileErr), zap.String("space_id", spaceID), zap.String("uid", userUID), zap.String("bot_id", botID))
+		return reconcileErr
 	}
 	return nil
 }
@@ -195,6 +271,16 @@ func (s *Service) eligibleAgentsQuery(spaceID, userUID string, columns ...string
 }
 
 func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int) (*AgentPage, error) {
+	err := retryAITeamMutation(func() error {
+		_, attemptErr := s.reconcileTeam(spaceID, userUID)
+		return attemptErr
+	})
+	if err != nil {
+		// The list is the lazy repair trigger, but it remains a read surface. A
+		// degraded IM projection must be visible through persisted state instead
+		// of blanking the whole AI-team page with a 503.
+		s.Warn("AI-team lazy reconciliation is pending", zap.Error(err), zap.String("space_id", spaceID), zap.String("uid", userUID))
+	}
 	if limit <= 0 || limit > maxPageSize {
 		limit = defaultPageSize
 	}
@@ -208,7 +294,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 		q = q.Where("a.id<?", beforeID)
 	}
 	rows := make([]*Agent, 0)
-	_, err := q.Load(&rows)
+	_, err = q.Load(&rows)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +344,55 @@ func (s *Service) admitContainerMembersTx(tx *dbr.Tx, groupNo, spaceID, userUID,
 	return group.AdmitAITeamContainerMembersTx(s.ctx, tx, groupNo, spaceID, userUID, botID)
 }
 
+// ensureContainerTx creates or repairs the private parent group while the
+// caller holds the ai_team_agent row lock. It deliberately provisions no
+// thread: adding an Agent makes the owner+Bot group ready, while sessions stay
+// an explicit follow-up action.
+func (s *Service) ensureContainerTx(
+	tx *dbr.Tx,
+	agent *lockedAgent,
+	botName, spaceID, userUID, botID string,
+) (string, bool, error) {
+	groupNo := agent.GroupNo
+	if groupNo == "" {
+		groupNo = util.GenerUUID()
+		groupName := strings.TrimSpace(botName)
+		if groupName == "" {
+			groupName = botID
+		}
+		groupName += " · AI"
+		if r := []rune(groupName); len(r) > group.MaxGroupNameLen {
+			groupName = string(r[:group.MaxGroupNameLen])
+		}
+		version, err := s.ctx.GenSeq(common.GroupSeqKey)
+		if err != nil {
+			return "", false, err
+		}
+		if _, err = tx.InsertBySql("INSERT INTO `group` (group_no,name,creator,status,version,allow_view_history_msg,space_id,allow_external,allow_no_mention,purpose) VALUES (?,?,?,?,?,?,?,?,?,?)",
+			groupNo, groupName, userUID, group.GroupStatusNormal, version, 1, spaceID, 0, 1, aiteampkg.GroupPurpose).Exec(); err != nil {
+			return "", false, err
+		}
+		if _, err = tx.Update("ai_team_agent").Set("group_no", groupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+			return "", false, err
+		}
+		agent.GroupNo = groupNo
+		agent.ContainerState = containerProvisioning
+	}
+
+	membershipRepaired, err := s.admitContainerMembersTx(tx, groupNo, spaceID, userUID, botID)
+	if err != nil {
+		return "", false, err
+	}
+	containerNeedsReconcile := agent.ContainerState != containerReady || membershipRepaired
+	if containerNeedsReconcile && agent.ContainerState != containerProvisioning {
+		if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
+			return "", false, err
+		}
+		agent.ContainerState = containerProvisioning
+	}
+	return groupNo, containerNeedsReconcile, nil
+}
+
 func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name string) (*Session, error) {
 	botName, err := s.validateAuthority(spaceID, userUID, botID)
 	if err != nil {
@@ -288,42 +423,9 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		return nil, errNotFound
 	}
 
-	groupNo := agent.GroupNo
-	if groupNo == "" {
-		groupNo = util.GenerUUID()
-		groupName := strings.TrimSpace(botName)
-		if groupName == "" {
-			groupName = botID
-		}
-		groupName += " · AI"
-		if r := []rune(groupName); len(r) > group.MaxGroupNameLen {
-			groupName = string(r[:group.MaxGroupNameLen])
-		}
-		version, genErr := s.ctx.GenSeq(common.GroupSeqKey)
-		if genErr != nil {
-			return nil, genErr
-		}
-		_, err = tx.InsertBySql("INSERT INTO `group` (group_no,name,creator,status,version,allow_view_history_msg,space_id,allow_external,allow_no_mention,purpose) VALUES (?,?,?,?,?,?,?,?,?,?)",
-			groupNo, groupName, userUID, group.GroupStatusNormal, version, 1, spaceID, 0, 1, aiteampkg.GroupPurpose).Exec()
-		if err != nil {
-			return nil, err
-		}
-		_, err = tx.Update("ai_team_agent").Set("group_no", groupNo).Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec()
-		if err != nil {
-			return nil, err
-		}
-		agent.ContainerState = containerProvisioning
-	}
-
-	membershipRepaired, err := s.admitContainerMembersTx(tx, groupNo, spaceID, userUID, botID)
+	groupNo, containerNeedsReconcile, err := s.ensureContainerTx(tx, agent, botName, spaceID, userUID, botID)
 	if err != nil {
 		return nil, err
-	}
-	containerNeedsReconcile := agent.ContainerState != containerReady || membershipRepaired
-	if membershipRepaired && agent.ContainerState == containerReady {
-		if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
-			return nil, err
-		}
 	}
 
 	var existing *Session
@@ -380,9 +482,9 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 
 	if existing.State != sessionReady || containerNeedsReconcile {
 		if containerNeedsReconcile {
-			err = s.ensureContainerIMReady(agent.ID, groupNo, userUID, botID)
+			err = s.ensureContainerIMReady(agent.ID, groupNo, spaceID, userUID, botID)
 		} else {
-			err = s.ensureIMReady(groupNo, existing.ShortID, userUID, botID)
+			err = s.ensureIMReady(spaceID, groupNo, existing.ShortID, userUID, botID)
 		}
 		if err != nil {
 			s.markProvisionFailure(agent.ID, existing.ShortID, err)
@@ -409,21 +511,25 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 	return s.GetSession(spaceID, userUID, existing.ShortID)
 }
 
-func (s *Service) ensureIMReady(groupNo, shortID, userUID, botID string) error {
+func (s *Service) ensureIMReady(spaceID, groupNo, shortID, userUID, botID string) error {
 	subscribers := []string{userUID, botID}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers}); err != nil {
-		return err
+	if err := s.validateContainerParticipants(spaceID, userUID, botID); err != nil {
+		return errors.Join(err, s.removeContainerSubscribers(groupNo, []string{shortID}, subscribers))
 	}
-	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers})
+	var projectionErr error
+	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers}); err != nil {
+		projectionErr = err
+	} else if err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers}); err != nil {
+		projectionErr = err
+	}
+	if err := s.validateContainerParticipants(spaceID, userUID, botID); err != nil {
+		return errors.Join(projectionErr, err, s.removeContainerSubscribers(groupNo, []string{shortID}, subscribers))
+	}
+	return projectionErr
 }
 
-func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID string) error {
+func (s *Service) ensureContainerIMReady(agentID int64, groupNo, spaceID, userUID, botID string) error {
 	subscribers := []string{userUID, botID}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
-	}); err != nil {
-		return err
-	}
 	var shortIDs []string
 	_, err := s.ctx.DB().SelectBySql(`SELECT ats.short_id FROM ai_team_session ats
 		JOIN thread t ON t.short_id=ats.short_id AND t.group_no=? AND t.status<>3
@@ -431,14 +537,79 @@ func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID 
 	if err != nil {
 		return err
 	}
-	for _, shortID := range shortIDs {
-		if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-			ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
-		}); err != nil {
-			return err
+	if err = s.validateContainerProjection(agentID, groupNo, spaceID, userUID, botID); err != nil {
+		return errors.Join(err, s.removeContainerSubscribers(groupNo, shortIDs, subscribers))
+	}
+	var projectionErr error
+	if err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
+	}); err != nil {
+		projectionErr = err
+	} else {
+		for _, shortID := range shortIDs {
+			if err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+				ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
+			}); err != nil {
+				projectionErr = err
+				break
+			}
 		}
 	}
-	return nil
+	if err = s.validateContainerProjection(agentID, groupNo, spaceID, userUID, botID); err != nil {
+		return errors.Join(projectionErr, err, s.removeContainerSubscribers(groupNo, shortIDs, subscribers))
+	}
+	return projectionErr
+}
+
+func (s *Service) validateContainerParticipants(spaceID, userUID, botID string) error {
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(tx, spaceID, userUID, botID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Service) validateContainerProjection(agentID int64, groupNo, spaceID, userUID, botID string) error {
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(tx, spaceID, userUID, botID); err != nil {
+		return err
+	}
+	var count int
+	if err = tx.SelectBySql(`SELECT COUNT(*) FROM ai_team_agent
+		WHERE id=? AND space_id=? AND user_uid=? AND bot_id=? AND group_no=?`,
+		agentID, spaceID, userUID, botID, groupNo).LoadOne(&count); err != nil {
+		return err
+	}
+	if count != 1 {
+		return errForbidden
+	}
+	return tx.Commit()
+}
+
+func (s *Service) removeContainerSubscribers(groupNo string, shortIDs, subscribers []string) error {
+	var errs []error
+	if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
+	}); err != nil {
+		errs = append(errs, err)
+	}
+	for _, shortID := range shortIDs {
+		if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+			ChannelID:   thread.BuildChannelID(groupNo, shortID),
+			ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
+		}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Service) markProvisionFailure(agentID int64, shortID string, cause error) {

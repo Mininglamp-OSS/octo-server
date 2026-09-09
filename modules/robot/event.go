@@ -511,16 +511,9 @@ func (rb *Robot) maybeSetAISessionTitle(target *aiteampkg.SessionTarget, content
 	if target == nil || target.ManualTitle != 0 {
 		return
 	}
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return
-	}
-	runes := []rune(content)
-	if len(runes) > 100 {
-		content = string(runes[:100])
-	}
-	if _, err := rb.ctx.DB().Update("thread").Set("name", content).
-		Where("group_no=? AND short_id=? AND name=?", target.GroupNo, target.ShortID, aiteampkg.DefaultSessionName).Exec(); err != nil {
+	if err := aiteampkg.MaybeSetDefaultSessionTitle(
+		rb.ctx.DB(), target.GroupNo, target.ShortID, target.UserUID, content,
+	); err != nil {
 		rb.Warn("update initial AI session title failed", zap.Error(err), zap.String("short_id", target.ShortID))
 	}
 }

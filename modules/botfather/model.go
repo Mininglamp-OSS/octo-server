@@ -131,6 +131,10 @@ type CreateBotReq struct {
 	Username    string  `json:"username"`
 	Description *string `json:"description"`
 	SpaceID     string  `json:"space_id"` // 可选，指定 Bot 加入的 Space
+	// AgentHosting is a server-recognized creation intent, not the runtime's
+	// self-reported telemetry field. The only supported non-empty value is
+	// octo_hosted, which is globally limited per creator.
+	AgentHosting string `json:"agent_hosting"`
 }
 
 // CreateBotResp 创建Bot响应
@@ -141,6 +145,18 @@ type CreateBotResp struct {
 	Description string `json:"description"`
 	BotToken    string `json:"bot_token"`
 	CreatedAt   string `json:"created_at"`
+}
+
+// HostedBotResp is the owner-only global lookup response for the single
+// server-created hosted Bot. It intentionally omits any Space membership: a
+// caller may retrieve only its own credential, not cross-Space topology.
+type HostedBotResp struct {
+	Exists      bool   `json:"exists"`
+	RobotID     string `json:"robot_id,omitempty"`
+	Username    string `json:"username,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	BotToken    string `json:"bot_token,omitempty"`
 }
 
 // UpdateBotReq 更新Bot请求

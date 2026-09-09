@@ -546,13 +546,13 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	// Check the server-owned purpose only after membership succeeds so a caller
 	// cannot use this route to distinguish an inaccessible group from a private
 	// AI container whose identifier they guessed.
-	protected, err := aiteampkg.IsProtectedGroup(c.ctx.DB(), groupNo)
+	purpose, err := aiteampkg.Purpose(c.ctx.DB(), groupNo)
 	if err != nil {
 		c.Error("查询AI容器用途失败", zap.Error(err), zap.String("group_no", groupNo))
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
-	if protected {
+	if aiteampkg.IsProtectedPurpose(purpose) {
 		httperr.ResponseErrorL(ctx, errcode.ErrAITeamContainerProtected, nil, nil)
 		return
 	}

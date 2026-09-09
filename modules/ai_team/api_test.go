@@ -2,6 +2,7 @@ package ai_team_test
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -20,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
 	aiteammod "github.com/Mininglamp-OSS/octo-server/modules/ai_team"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
@@ -127,6 +131,36 @@ func decodeJSON(t *testing.T, w *httptest.ResponseRecorder, out any) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), out), "body=%s", w.Body.String())
 }
 
+func automaticTeamGroupNo(t *testing.T, f fixture) string {
+	t.Helper()
+	w := request(t, f, http.MethodGet, "/v1/ai-team/teams", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var page aiteammod.TeamPage
+	decodeJSON(t, w, &page)
+	require.NotEmpty(t, page.Items)
+	assert.Equal(t, aiteammod.TeamTypeAllAgents, page.Items[0].Type)
+	require.NotEmpty(t, page.Items[0].GroupNo)
+	return page.Items[0].GroupNo
+}
+
+func storedAutomaticTeamGroupNo(t *testing.T, f fixture) string {
+	t.Helper()
+	var groupNo string
+	require.NoError(t, testContext.DB().Select("group_no").From(dbr.I("group")).
+		Where("space_id=? AND creator=? AND purpose=? AND status=?",
+			f.spaceID, f.uid, aiteampkg.TeamGroupPurpose, group.GroupStatusNormal).
+		LoadOne(&groupNo))
+	require.NotEmpty(t, groupNo)
+	return groupNo
+}
+
+func forceAutomaticTeamRosterRepair(t *testing.T, f fixture, groupNo string) {
+	t.Helper()
+	_, err := testContext.DB().Update("group_member").Set("is_deleted", 1).
+		Where("group_no=? AND uid=?", groupNo, f.botID).Exec()
+	require.NoError(t, err)
+}
+
 func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	f := seedFixture(t)
 	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
@@ -137,24 +171,57 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	assert.Equal(t, aiteammod.AgentGroupTypeCloudClone, emptyPage.Groups[0].Type)
 	assert.Equal(t, aiteammod.AgentGroupTypePersonalAssistant, emptyPage.Groups[1].Type)
 	assert.Equal(t, aiteammod.AgentGroupTypeDigitalEmployee, emptyPage.Groups[2].Type)
-	for _, group := range emptyPage.Groups {
-		assert.Zero(t, group.Count)
-		assert.NotNil(t, group.Items)
-		assert.Empty(t, group.Items)
-	}
+	assert.Zero(t, emptyPage.Groups[0].Count)
+	assert.EqualValues(t, 1, emptyPage.Groups[1].Count)
+	assert.Equal(t, []string{f.botID}, agentBotIDs(emptyPage.Groups[1].Items))
+	assert.Zero(t, emptyPage.Groups[2].Count)
+	assert.NotContains(t, w.Body.String(), `"team_group"`)
+	teamGroupNo := automaticTeamGroupNo(t, f)
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var first struct {
-		BotID   string `json:"bot_id"`
-		GroupNo string `json:"group_no"`
+		BotID          string `json:"bot_id"`
+		GroupNo        string `json:"group_no"`
+		ContainerState int    `json:"container_state"`
 	}
 	decodeJSON(t, w, &first)
 	assert.Equal(t, f.botID, first.BotID)
-	assert.Empty(t, first.GroupNo, "adding an AI must not eagerly create a group")
+	require.NotEmpty(t, first.GroupNo, "adding an AI must eagerly create its private group")
+	assert.Equal(t, 2, first.ContainerState)
+
+	var teamMembers []string
+	_, err := testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", teamGroupNo).
+		OrderBy("uid").Load(&teamMembers)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.botID, f.uid}, teamMembers)
+
+	var eagerGroupCount, eagerMemberCount, eagerSessionCount, eagerThreadCount int
+	var eagerMemberUIDs []string
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("`group`").
+		Where("group_no=? AND space_id=? AND creator=? AND purpose=?", first.GroupNo, f.spaceID, f.uid, "ai_session_container").
+		LoadOne(&eagerGroupCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", first.GroupNo).LoadOne(&eagerMemberCount))
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", first.GroupNo).OrderBy("uid").Load(&eagerMemberUIDs)
+	require.NoError(t, err)
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("ai_team_session").LoadOne(&eagerSessionCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("thread").Where("group_no=?", first.GroupNo).LoadOne(&eagerThreadCount))
+	assert.Equal(t, 1, eagerGroupCount)
+	assert.Equal(t, 2, eagerMemberCount)
+	assert.Equal(t, []string{f.botID, f.uid}, eagerMemberUIDs)
+	assert.Zero(t, eagerSessionCount)
+	assert.Zero(t, eagerThreadCount)
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var repeated struct {
+		GroupNo string `json:"group_no"`
+	}
+	decodeJSON(t, w, &repeated)
+	assert.Equal(t, first.GroupNo, repeated.GroupNo)
 	w = request(t, f, http.MethodGet, "/v1/ai-team/agents/"+f.botID+"/sessions", "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), `"items":[]`)
@@ -169,6 +236,7 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	decodeJSON(t, w, &session1)
 	require.NotEmpty(t, session1.SessionID)
 	require.NotEmpty(t, session1.GroupNo)
+	assert.Equal(t, first.GroupNo, session1.GroupNo)
 	assert.Equal(t, session1.GroupNo+"____"+session1.SessionID, session1.ChannelID)
 
 	target, err := aiteampkg.LookupReadySessionTarget(testContext.DB(), session1.ChannelID, f.uid)
@@ -226,6 +294,12 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 
 	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	teamMembers = nil
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", teamGroupNo).
+		OrderBy("uid").Load(&teamMembers)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.uid}, teamMembers)
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var restored struct {
@@ -233,6 +307,12 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	}
 	decodeJSON(t, w, &restored)
 	assert.Equal(t, session1.GroupNo, restored.GroupNo)
+	teamMembers = nil
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND status=1 AND is_deleted=0", teamGroupNo).
+		OrderBy("uid").Load(&teamMembers)
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.botID, f.uid}, teamMembers)
 
 	// Model the authoritative Space-removal aftermath: the owner and their Bot
 	// have been soft-removed from the parent while the durable agent/session rows
@@ -284,6 +364,460 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	mu.Unlock()
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.GroupNo])
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.ChannelID])
+}
+
+func TestAITeamGroupAndAgentContainersConvergeTogether(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"team_group"`)
+	teamGroupNo := automaticTeamGroupNo(t, f)
+
+	secondBot := "ai_bot_" + util.GenerUUID()[:8]
+	_, err := testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)",
+		secondBot, "Second assistant", secondBot).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO robot (robot_id,creator_uid,status) VALUES (?,?,1)", secondBot, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, secondBot).Exec()
+	require.NoError(t, err)
+
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+secondBot, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var second aiteammod.Agent
+	decodeJSON(t, w, &second)
+	require.NotEmpty(t, second.GroupNo)
+
+	assertMembers := func(groupNo string, want []string) {
+		t.Helper()
+		var got []string
+		_, queryErr := testContext.DB().Select("uid").From("group_member").
+			Where("group_no=? AND status=1 AND is_deleted=0", groupNo).OrderBy("uid").Load(&got)
+		require.NoError(t, queryErr)
+		assert.ElementsMatch(t, want, got)
+	}
+	assertMembers(second.GroupNo, []string{f.uid, secondBot})
+	assertMembers(teamGroupNo, []string{f.botID, secondBot, f.uid})
+
+	outsider := "outsider_" + util.GenerUUID()[:8]
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)",
+		outsider, "Outsider", outsider).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, outsider).Exec()
+	require.NoError(t, err)
+	_, err = group.NewService(testContext).AddGroupMembers(&group.AddGroupMembersServiceReq{
+		GroupNo: teamGroupNo, Members: []string{outsider}, OperatorUID: f.uid,
+	})
+	require.ErrorIs(t, err, aiteampkg.ErrContainerProtected)
+	assertMembers(teamGroupNo, []string{f.botID, secondBot, f.uid})
+
+	w = request(t, f, http.MethodPut, "/v1/groups/"+teamGroupNo+"/setting", "", map[string]any{"mute": 1})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodPut, "/v1/groups/"+teamGroupNo+"/setting", "", map[string]any{"allow_no_mention": 0})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var allowNoMention int
+	require.NoError(t, testContext.DB().Select("allow_no_mention").From("`group`").
+		Where("group_no=?", teamGroupNo).LoadOne(&allowNoMention))
+	assert.Zero(t, allowNoMention)
+	w = request(t, f, http.MethodPut, "/v1/groups/"+teamGroupNo+"/setting", "", map[string]any{"allow_external": 1})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.container_protected")
+
+	// A bypassed/stale row and a missing desired member are both repaired by the
+	// same exact-roster projection on the next AI-team list call.
+	groupDB := group.NewDB(testContext)
+	require.NoError(t, groupDB.InsertMember(&group.MemberModel{
+		GroupNo: teamGroupNo, UID: outsider, Role: group.MemberRoleCommon,
+		Status: 1, Version: 1, Vercode: outsider + "@1",
+	}))
+	_, err = testContext.DB().Update("group_member").Set("is_deleted", 1).
+		Where("group_no=? AND uid=?", teamGroupNo, f.botID).Exec()
+	require.NoError(t, err)
+	w = request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(teamGroupNo, []string{f.botID, secondBot, f.uid})
+
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+secondBot, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(teamGroupNo, []string{f.botID, f.uid})
+	assertMembers(second.GroupNo, []string{f.uid, secondBot})
+}
+
+func TestCustomAITeamsAreIndependentSelectionsAndAllAgentGroupStaysAutomatic(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"team_group"`)
+	teamGroupNo := automaticTeamGroupNo(t, f)
+
+	create := func(key, name string, botIDs []string) aiteammod.Team {
+		t.Helper()
+		resp := request(t, f, http.MethodPost, "/v1/ai-team/teams", key, map[string]any{
+			"name": name, "bot_ids": botIDs,
+		})
+		require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
+		var team aiteammod.Team
+		decodeJSON(t, resp, &team)
+		return team
+	}
+
+	first := create("custom-team-1", "产品团队", []string{f.botID})
+	second := create("custom-team-2", "内容团队", []string{f.botID})
+	require.NotEqual(t, first.GroupNo, second.GroupNo)
+	assert.Equal(t, aiteammod.TeamTypeCustom, first.Type)
+	assert.True(t, first.Editable)
+	assert.True(t, first.MembersEditable)
+	assert.Equal(t, int64(1), first.MemberCount)
+	assert.Equal(t, int64(1), second.MemberCount)
+
+	assertMembers := func(groupNo string, want []string) {
+		t.Helper()
+		var got []string
+		_, err := testContext.DB().Select("uid").From("group_member").
+			Where("group_no=? AND status=1 AND is_deleted=0", groupNo).OrderAsc("uid").Load(&got)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, want, got)
+	}
+	assertMembers(first.GroupNo, []string{f.uid, f.botID})
+	assertMembers(second.GroupNo, []string{f.uid, f.botID})
+
+	var purpose string
+	require.NoError(t, testContext.DB().Select("purpose").From("`group`").Where("group_no=?", first.GroupNo).LoadOne(&purpose))
+	assert.Equal(t, aiteampkg.CustomTeamPurpose, purpose)
+	var allowNoMention int
+	require.NoError(t, testContext.DB().Select("allow_no_mention").From("`group`").Where("group_no=?", first.GroupNo).LoadOne(&allowNoMention))
+	assert.Zero(t, allowNoMention, "custom AI teams require an explicit mention by default")
+	w = request(t, f, http.MethodPost, "/v1/groups/"+first.GroupNo+"/threads", "", map[string]any{"name": "方案讨论"})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var createdThread struct {
+		ShortID string `json:"short_id"`
+	}
+	decodeJSON(t, w, &createdThread)
+	assert.NotEmpty(t, createdThread.ShortID, "custom AI teams support ordinary subareas")
+
+	// Ordinary member APIs remain sealed: the AI-only endpoint owns the roster.
+	outsider := "human_" + util.GenerUUID()[:8]
+	_, err := testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)", outsider, "Human", outsider).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, outsider).Exec()
+	require.NoError(t, err)
+	w = request(t, f, http.MethodPost, "/v1/groups/"+first.GroupNo+"/members", "", map[string]any{"members": []string{outsider}})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.container_protected")
+	w = request(t, f, http.MethodPost, "/v1/ai-team/teams/"+first.GroupNo+"/members", "", map[string]any{"bot_ids": []string{outsider}})
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	assertMembers(first.GroupNo, []string{f.uid, f.botID})
+
+	secondBot := "ai_bot_" + util.GenerUUID()[:8]
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)", secondBot, "Second assistant", secondBot).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO robot (robot_id,creator_uid,status) VALUES (?,?,1)", secondBot, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, secondBot).Exec()
+	require.NoError(t, err)
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+secondBot, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// Agent creation updates only the immutable all-agent group.
+	assertMembers(teamGroupNo, []string{f.uid, f.botID, secondBot})
+	assertMembers(first.GroupNo, []string{f.uid, f.botID})
+	w = request(t, f, http.MethodPost, "/v1/ai-team/teams/"+first.GroupNo+"/members", "", map[string]any{"bot_ids": []string{secondBot}})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(first.GroupNo, []string{f.uid, f.botID, secondBot})
+
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/teams/"+first.GroupNo+"/members", "", map[string]any{"bot_ids": []string{f.botID}})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(first.GroupNo, []string{f.uid, secondBot})
+	assertMembers(second.GroupNo, []string{f.uid, f.botID})
+	assertMembers(teamGroupNo, []string{f.uid, f.botID, secondBot})
+
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var page aiteammod.TeamPage
+	decodeJSON(t, w, &page)
+	require.Len(t, page.Items, 3)
+	assert.Equal(t, teamGroupNo, page.Items[0].GroupNo)
+	assert.Equal(t, aiteammod.TeamTypeAllAgents, page.Items[0].Type)
+	assert.False(t, page.Items[0].Editable)
+	assert.False(t, page.Items[0].MembersEditable)
+	for _, item := range page.Items[1:] {
+		assert.Equal(t, aiteammod.TeamTypeCustom, item.Type)
+		assert.True(t, item.Editable)
+		assert.True(t, item.MembersEditable)
+	}
+
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams?limit=1", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var firstPage aiteammod.TeamPage
+	decodeJSON(t, w, &firstPage)
+	require.Len(t, firstPage.Items, 1)
+	assert.Equal(t, aiteammod.TeamTypeAllAgents, firstPage.Items[0].Type)
+	require.NotEmpty(t, firstPage.NextCursor)
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams?limit=1&cursor="+firstPage.NextCursor, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var nextPage aiteammod.TeamPage
+	decodeJSON(t, w, &nextPage)
+	require.Len(t, nextPage.Items, 1)
+	assert.Equal(t, aiteammod.TeamTypeCustom, nextPage.Items[0].Type)
+
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams/"+teamGroupNo, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var allAgentsTeam aiteammod.Team
+	decodeJSON(t, w, &allAgentsTeam)
+	assert.Equal(t, aiteammod.TeamTypeAllAgents, allAgentsTeam.Type)
+	assert.False(t, allAgentsTeam.Editable)
+	assert.False(t, allAgentsTeam.MembersEditable)
+	assert.Equal(t, int64(2), allAgentsTeam.MemberCount)
+	require.Len(t, allAgentsTeam.Agents, 2)
+
+	// Custom teams are visible through ordinary group surfaces; the automatic
+	// all-agent group and private pair containers remain hidden there.
+	visible, err := group.NewService(testContext).GetGroupsWithMemberUID(f.uid)
+	require.NoError(t, err)
+	visibleNos := make([]string, 0, len(visible))
+	for _, item := range visible {
+		visibleNos = append(visibleNos, item.GroupNo)
+	}
+	assert.ElementsMatch(t, []string{first.GroupNo, second.GroupNo}, visibleNos)
+
+	newName := "产品与内容团队"
+	w = request(t, f, http.MethodPut, "/v1/ai-team/teams/"+first.GroupNo, "", map[string]any{"name": newName})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var updated aiteammod.Team
+	decodeJSON(t, w, &updated)
+	assert.Equal(t, newName, updated.Name)
+
+	// Deactivating an Agent removes it from the automatic all-agent group and
+	// every custom selection without disturbing the other selected Agents.
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assertMembers(first.GroupNo, []string{f.uid, secondBot})
+	assertMembers(second.GroupNo, []string{f.uid})
+	assertMembers(teamGroupNo, []string{f.uid, secondBot})
+	var selectedCount int
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From(dbr.I("group_member").As("gm")).
+		Join(dbr.I("group").As("g"), "g.group_no=gm.group_no").
+		Where("g.purpose=? AND gm.uid=? AND gm.is_deleted=0", aiteampkg.CustomTeamPurpose, f.botID).
+		LoadOne(&selectedCount))
+	assert.Zero(t, selectedCount)
+
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/teams/"+second.GroupNo, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams/"+second.GroupNo, "", nil)
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+}
+
+func TestTeamListIncludesAndLazilyCreatesTheAutomaticAllAgentTeam(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/teams", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var page aiteammod.TeamPage
+	decodeJSON(t, w, &page)
+	require.Len(t, page.Items, 1)
+	team := page.Items[0]
+	assert.Equal(t, aiteammod.TeamTypeAllAgents, team.Type)
+	assert.False(t, team.Editable)
+	assert.False(t, team.MembersEditable)
+	assert.Equal(t, int64(1), team.MemberCount)
+	assert.NotEmpty(t, team.GroupNo)
+	assert.Equal(t, "我的 OPT", team.Name)
+
+	_, err := testContext.DB().Update("group").Set("name", "我的AI团队").Where("group_no=?", team.GroupNo).Exec()
+	require.NoError(t, err)
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var repaired aiteammod.TeamPage
+	decodeJSON(t, w, &repaired)
+	require.Len(t, repaired.Items, 1)
+	assert.Equal(t, "我的 OPT", repaired.Items[0].Name)
+	var storedName string
+	require.NoError(t, testContext.DB().Select("name").From(dbr.I("group")).Where("group_no=?", team.GroupNo).LoadOne(&storedName))
+	assert.Equal(t, "我的 OPT", storedName)
+}
+
+func TestCustomAITeamConcurrentCreateProducesIndependentGroups(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	const workers = 5
+	groupNos := make(chan string, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			team, err := aiteammod.NewService(testContext).CreateTeam(
+				f.spaceID, f.uid,
+				&aiteammod.CreateTeamRequest{Name: "并发团队", BotIDs: []string{f.botID}},
+			)
+			if err != nil {
+				errs <- err
+				return
+			}
+			groupNos <- team.GroupNo
+		}()
+	}
+	wg.Wait()
+	close(groupNos)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	seen := make(map[string]struct{}, workers)
+	for groupNo := range groupNos {
+		assert.NotEmpty(t, groupNo)
+		_, duplicate := seen[groupNo]
+		assert.False(t, duplicate)
+		seen[groupNo] = struct{}{}
+	}
+	assert.Len(t, seen, workers)
+	var groupCount int
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("`group`").
+		Where("space_id=? AND creator=? AND purpose=?", f.spaceID, f.uid, aiteampkg.CustomTeamPurpose).LoadOne(&groupCount))
+	assert.Equal(t, workers, groupCount)
+}
+
+func TestCustomAITeamRejectsInvalidSelectionAndCrossOwnerAccess(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodGet, "/v1/ai-team/teams?cursor=invalid", "", nil)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "blank name", body: map[string]any{"name": "  ", "bot_ids": []string{f.botID}}},
+		{name: "empty selection", body: map[string]any{"name": "team", "bot_ids": []string{}}},
+		{name: "duplicate selection", body: map[string]any{"name": "team", "bot_ids": []string{f.botID, f.botID}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := request(t, f, http.MethodPost, "/v1/ai-team/teams", "invalid-"+tc.name, tc.body)
+			assert.Equal(t, http.StatusBadRequest, resp.Code, resp.Body.String())
+		})
+	}
+
+	w = request(t, f, http.MethodPost, "/v1/ai-team/teams", "owned-team", map[string]any{
+		"name": "Owned team", "bot_ids": []string{f.botID},
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var team aiteammod.Team
+	decodeJSON(t, w, &team)
+
+	otherUID := "other_" + util.GenerUUID()[:8]
+	otherToken := "token_" + util.GenerUUID()[:8]
+	_, err := testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)", otherUID, "Other", otherUID).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, otherUID).Exec()
+	require.NoError(t, err)
+	require.NoError(t, testContext.Cache().Set(testContext.GetConfig().Cache.TokenCachePrefix+otherToken, otherUID+"@test"))
+	other := fixture{uid: otherUID, spaceID: f.spaceID, token: otherToken}
+
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		var body any
+		if method == http.MethodPut {
+			body = map[string]any{"name": "stolen"}
+		}
+		resp := request(t, other, method, "/v1/ai-team/teams/"+team.GroupNo, "", body)
+		assert.Equal(t, http.StatusNotFound, resp.Code, resp.Body.String())
+	}
+
+	otherSpace := "other_space_" + util.GenerUUID()[:8]
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO `space` (space_id,name,creator,status) VALUES (?,?,?,1)", otherSpace, "Other space", f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", otherSpace, f.uid).Exec()
+	require.NoError(t, err)
+	wrongSpace := f
+	wrongSpace.spaceID = otherSpace
+	w = request(t, wrongSpace, http.MethodGet, "/v1/ai-team/teams/"+team.GroupNo, "", nil)
+	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+}
+
+func TestCustomAITeamConcurrentMemberChangesDoNotLoseEitherChange(t *testing.T) {
+	f := seedFixture(t)
+	svc := aiteammod.NewService(testContext)
+	_, err := svc.AddAgent(f.spaceID, f.uid, f.botID)
+	require.NoError(t, err)
+
+	secondBot := "ai_bot_" + util.GenerUUID()[:8]
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,short_no,status,is_destroy) VALUES (?,?,?,1,0)", secondBot, "Second assistant", secondBot).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO robot (robot_id,creator_uid,status) VALUES (?,?,1)", secondBot, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", f.spaceID, secondBot).Exec()
+	require.NoError(t, err)
+	_, err = svc.AddAgent(f.spaceID, f.uid, secondBot)
+	require.NoError(t, err)
+
+	team, err := svc.CreateTeam(f.spaceID, f.uid, &aiteammod.CreateTeamRequest{
+		Name: "Concurrent members", BotIDs: []string{f.botID},
+	})
+	require.NoError(t, err)
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- svc.AddTeamMembers(f.spaceID, f.uid, team.GroupNo, []string{secondBot}) }()
+	go func() { errCh <- svc.RemoveTeamMembers(f.spaceID, f.uid, team.GroupNo, []string{f.botID}) }()
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+
+	var selected []string
+	_, err = testContext.DB().Select("uid").From("group_member").
+		Where("group_no=? AND is_deleted=0 AND uid<>?", team.GroupNo, f.uid).OrderAsc("uid").Load(&selected)
+	require.NoError(t, err)
+	assert.Equal(t, []string{secondBot}, selected)
+}
+
+func TestAITeamConcurrentAgentActivationCreatesOnePairAndOneTeamGroup(t *testing.T) {
+	f := seedFixture(t)
+	svc := aiteammod.NewService(testContext)
+
+	const workers = 6
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.AddAgent(f.spaceID, f.uid, f.botID)
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	var agentCount, pairGroupCount, teamGroupCount int
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&agentCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("`group`").
+		Where("creator=? AND space_id=? AND purpose=?", f.uid, f.spaceID, aiteampkg.GroupPurpose).LoadOne(&pairGroupCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("`group`").
+		Where("creator=? AND space_id=? AND purpose=?", f.uid, f.spaceID, aiteampkg.TeamGroupPurpose).LoadOne(&teamGroupCount))
+	assert.Equal(t, 1, agentCount)
+	assert.Equal(t, 1, pairGroupCount)
+	assert.Equal(t, 1, teamGroupCount)
 }
 
 func TestAITeamListAgentsGroupsByHostingAndKeepsCursorTotals(t *testing.T) {
@@ -541,6 +1075,617 @@ func TestAITeamSessionProvisionFailureDoesNotPoisonReadyContainer(t *testing.T) 
 	assert.Equal(t, 2, containerState, "one failed thread must not downgrade a ready parent")
 }
 
+func TestAITeamAddAgentProvisionFailureIsRetryable(t *testing.T) {
+	f := seedFixture(t)
+	failingIM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "forced IM failure", http.StatusInternalServerError)
+	}))
+	defer failingIM.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = failingIM.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.im_unavailable")
+
+	var persisted struct {
+		GroupNo        string `db:"group_no"`
+		ContainerState int    `db:"container_state"`
+	}
+	var sessionCount, threadCount int
+	require.NoError(t, testContext.DB().Select("group_no", "container_state").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).
+		LoadOne(&persisted))
+	require.NotEmpty(t, persisted.GroupNo)
+	assert.Equal(t, 3, persisted.ContainerState)
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("ai_team_session").LoadOne(&sessionCount))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("thread").Where("group_no=?", persisted.GroupNo).LoadOne(&threadCount))
+	assert.Zero(t, sessionCount)
+	assert.Zero(t, threadCount)
+
+	var provisioned []config.ChannelCreateReq
+	successIM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" {
+			var req config.ChannelCreateReq
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			provisioned = append(provisioned, req)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer successIM.Close()
+	cfg.WuKongIM.APIURL = successIM.URL
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var retried struct {
+		GroupNo        string `json:"group_no"`
+		ContainerState int    `json:"container_state"`
+	}
+	decodeJSON(t, w, &retried)
+	assert.Equal(t, persisted.GroupNo, retried.GroupNo)
+	assert.Equal(t, 2, retried.ContainerState)
+	var privateGroup *config.ChannelCreateReq
+	for i := range provisioned {
+		if provisioned[i].ChannelID == persisted.GroupNo {
+			privateGroup = &provisioned[i]
+			break
+		}
+	}
+	require.NotNil(t, privateGroup)
+	assert.Equal(t, common.ChannelTypeGroup.Uint8(), privateGroup.ChannelType)
+	assert.ElementsMatch(t, []string{f.uid, f.botID}, privateGroup.Subscribers)
+}
+
+func TestAITeamManagedGroupsDoNotConsumeDailyGroupCreationQuota(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	cfg := testContext.GetConfig()
+	previousLimit := cfg.Group.SameDayCreateMaxCount
+	cfg.Group.SameDayCreateMaxCount = 1
+	t.Cleanup(func() { cfg.Group.SameDayCreateMaxCount = previousLimit })
+
+	w = request(t, f, http.MethodPost, "/v1/group/create", "", map[string]any{
+		"name": "ordinary group after AI provisioning", "members": []string{f.botID}, "space_id": f.spaceID,
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+func TestAITeamListSkipsReadyIMReplayAndDegradesRepairFailure(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var calls int
+	failingIM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		http.Error(w, "forced IM failure", http.StatusInternalServerError)
+	}))
+	defer failingIM.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = failingIM.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	// A fully ready page load remains a read: no external IM replay at all.
+	w = request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Zero(t, calls)
+
+	// A persisted failed state triggers repair, but an unavailable IM service
+	// must not blank the list. The degraded state is returned to the client.
+	_, err := testContext.DB().Update("ai_team_agent").Set("container_state", 3).
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).Exec()
+	require.NoError(t, err)
+	w = request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Positive(t, calls)
+	var page aiteammod.AgentPage
+	decodeJSON(t, w, &page)
+	require.Len(t, page.Groups[1].Items, 1)
+	assert.Equal(t, 3, page.Groups[1].Items[0].ContainerState)
+}
+
+func TestAITeamProjectionReleasesDBBeforeIMAndReplaysStaleRoster(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	teamGroupNo := storedAutomaticTeamGroupNo(t, f)
+
+	var channelCalls atomic.Int32
+	var rosterMu sync.Mutex
+	var appliedRosters [][]string
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" {
+			var channel config.ChannelCreateReq
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&channel))
+			call := channelCalls.Add(1)
+			if call == 1 {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+			rosterMu.Lock()
+			appliedRosters = append(appliedRosters, append([]string(nil), channel.Subscribers...))
+			rosterMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	forceAutomaticTeamRosterRepair(t, f, teamGroupNo)
+
+	db := testContext.DB().Connection
+	previousMaxOpen := db.Stats().MaxOpenConnections
+	db.SetMaxOpenConns(1)
+	defer db.SetMaxOpenConns(previousMaxOpen)
+
+	req, err := http.NewRequest(http.MethodGet, "/v1/ai-team/agents", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection did not reach WuKongIM; a DB connection may still be pinned by the projection lock")
+	}
+
+	queryCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var versionDuringHTTP uint64
+	err = db.QueryRowContext(queryCtx, `SELECT COALESCE(MAX(version),0) FROM group_member
+		WHERE group_no=?`, teamGroupNo).Scan(&versionDuringHTTP)
+	require.NoError(t, err, "WuKongIM HTTP must not hold the only pooled DB connection")
+
+	// Drive a real concurrent roster change. Its DB transaction and newer IM
+	// projection must both complete while the older IM call is still blocked.
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection did not replay and converge after the stale HTTP request completed")
+	}
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.EqualValues(t, 3, channelCalls.Load(), "the stale HTTP completion must replay the newer roster")
+	rosterMu.Lock()
+	require.Len(t, appliedRosters, 3)
+	assert.ElementsMatch(t, []string{f.uid}, appliedRosters[0], "the concurrent removal projects first")
+	assert.ElementsMatch(t, []string{f.uid, f.botID}, appliedRosters[1], "the blocked stale roster lands later")
+	assert.ElementsMatch(t, []string{f.uid}, appliedRosters[2], "the stale caller must restore the latest roster")
+	rosterMu.Unlock()
+
+	var finalVersion uint64
+	require.NoError(t, testContext.DB().Select("COALESCE(MAX(version),0)").From("group_member").
+		Where("group_no=?", teamGroupNo).LoadOne(&finalVersion))
+	assert.Greater(t, finalVersion, versionDuringHTTP)
+
+	var isAdded, activeMember int
+	require.NoError(t, testContext.DB().Select("is_added").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&isAdded))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("group_member").
+		Where("group_no=? AND uid=? AND is_deleted=0 AND status=1", teamGroupNo, f.botID).LoadOne(&activeMember))
+	assert.Zero(t, isAdded)
+	assert.Zero(t, activeMember)
+}
+
+func TestAITeamProjectionRechecksEligibilityBeforeMarkingReady(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	teamGroupNo := storedAutomaticTeamGroupNo(t, f)
+
+	var channelCalls atomic.Int32
+	var rosterMu sync.Mutex
+	var appliedRosters [][]string
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" {
+			var channel config.ChannelCreateReq
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&channel))
+			if channelCalls.Add(1) == 1 {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+			rosterMu.Lock()
+			appliedRosters = append(appliedRosters, append([]string(nil), channel.Subscribers...))
+			rosterMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	forceAutomaticTeamRosterRepair(t, f, teamGroupNo)
+
+	req, err := http.NewRequest(http.MethodGet, "/v1/ai-team/agents", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("projection did not reach WuKongIM")
+	}
+	// Eligibility is part of the authoritative roster even when no group-member
+	// version changes. The post-IM check must re-read it.
+	_, err = testContext.DB().Update("robot").Set("status", 0).Where("robot_id=?", f.botID).Exec()
+	require.NoError(t, err)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection did not replay after eligibility changed")
+	}
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.EqualValues(t, 2, channelCalls.Load())
+	rosterMu.Lock()
+	require.Len(t, appliedRosters, 2)
+	assert.ElementsMatch(t, []string{f.uid, f.botID}, appliedRosters[0])
+	assert.ElementsMatch(t, []string{f.uid}, appliedRosters[1])
+	rosterMu.Unlock()
+
+}
+
+func TestAITeamLifecycleRemovalCannotBeOverwrittenByStaleProjection(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	teamGroupNo := storedAutomaticTeamGroupNo(t, f)
+
+	var channelCalls atomic.Int32
+	var rosterMu sync.Mutex
+	var appliedRosters [][]string
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" {
+			var channel config.ChannelCreateReq
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&channel))
+			if channelCalls.Add(1) == 1 {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+			rosterMu.Lock()
+			appliedRosters = append(appliedRosters, append([]string(nil), channel.Subscribers...))
+			rosterMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	forceAutomaticTeamRosterRepair(t, f, teamGroupNo)
+	var initialVersion uint64
+	require.NoError(t, testContext.DB().Select("COALESCE(MAX(version),0)").From("group_member").
+		Where("group_no=?", teamGroupNo).LoadOne(&initialVersion))
+
+	req, err := http.NewRequest(http.MethodGet, "/v1/ai-team/agents", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("projection did not reach WuKongIM")
+	}
+	require.NoError(t, group.NewService(testContext).RemoveUserFromGroupsForLifecycleCleanup(f.botID))
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale projection did not replay after lifecycle cleanup")
+	}
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.EqualValues(t, 2, channelCalls.Load())
+	rosterMu.Lock()
+	require.Len(t, appliedRosters, 2)
+	assert.ElementsMatch(t, []string{f.uid, f.botID}, appliedRosters[0])
+	assert.ElementsMatch(t, []string{f.uid}, appliedRosters[1])
+	rosterMu.Unlock()
+
+	var finalVersion uint64
+	require.NoError(t, testContext.DB().Select("COALESCE(MAX(version),0)").From("group_member").
+		Where("group_no=?", teamGroupNo).LoadOne(&finalVersion))
+	assert.Greater(t, finalVersion, initialVersion)
+	var isAdded int
+	require.NoError(t, testContext.DB().Select("is_added").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&isAdded))
+	assert.Zero(t, isAdded)
+}
+
+func TestAITeamOwnerRemovalCannotBeOverwrittenByStaleTeamProjection(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	teamGroupNo := storedAutomaticTeamGroupNo(t, f)
+	const shortID = "owner-removal-subarea"
+	_, err := testContext.DB().InsertBySql(`INSERT INTO thread
+		(short_id,group_no,name,creator_uid,status,version) VALUES (?,?,?,?,1,1)`,
+		shortID, teamGroupNo, "Subarea", f.uid).Exec()
+	require.NoError(t, err)
+
+	type imEvent struct {
+		Path        string
+		ChannelID   string
+		Subscribers []string
+	}
+	var eventsMu sync.Mutex
+	var events []imEvent
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" || r.URL.Path == "/channel/subscriber_add" || r.URL.Path == "/channel/subscriber_remove" {
+			var payload struct {
+				ChannelID   string   `json:"channel_id"`
+				Subscribers []string `json:"subscribers"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			if r.URL.Path == "/channel" && payload.ChannelID == teamGroupNo {
+				enteredOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+			eventsMu.Lock()
+			events = append(events, imEvent{Path: r.URL.Path, ChannelID: payload.ChannelID, Subscribers: payload.Subscribers})
+			eventsMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	forceAutomaticTeamRosterRepair(t, f, teamGroupNo)
+	req, err := http.NewRequest(http.MethodGet, "/v1/ai-team/agents", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("team projection did not reach WuKongIM")
+	}
+
+	_, err = testContext.DB().Update("space_member").Set("status", 0).
+		Where("space_id=? AND uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().Update("group_member").Set("role", group.MemberRoleCommon).
+		Where("group_no=? AND uid=? AND is_deleted=0", teamGroupNo, f.uid).Exec()
+	require.NoError(t, err)
+	removed, err := group.NewService(testContext).RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
+		GroupNo: teamGroupNo, Members: []string{f.uid}, OperatorUID: "space-admin",
+		OperatorName: "Space admin", SuppressRemoveNotice: true, SuppressBotCascadeTip: true,
+		AllowProtected: true,
+	})
+	require.NoError(t, err)
+	require.Positive(t, removed.Removed)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale team projection did not converge after owner removal")
+	}
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, channelID := range []string{teamGroupNo, teamGroupNo + "____" + shortID} {
+		var last *imEvent
+		for i := range events {
+			if events[i].ChannelID == channelID {
+				last = &events[i]
+			}
+		}
+		require.NotNil(t, last, "expected a terminal projection event for %s", channelID)
+		assert.Equal(t, "/channel/subscriber_remove", last.Path)
+		assert.ElementsMatch(t, []string{f.uid, f.botID}, last.Subscribers)
+	}
+	var activeMembers int
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("group_member").
+		Where("group_no=? AND is_deleted=0 AND status=1", teamGroupNo).LoadOne(&activeMembers))
+	assert.Zero(t, activeMembers)
+}
+
+func TestAITeamOwnerRemovalCannotBeOverwrittenByStaleContainerProjection(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID+"/sessions", "owner-removal-session", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var session struct {
+		GroupNo   string `json:"group_no"`
+		ShortID   string `json:"session_id"`
+		ChannelID string `json:"channel_id"`
+	}
+	decodeJSON(t, w, &session)
+	require.NotEmpty(t, session.GroupNo)
+	require.NotEmpty(t, session.ShortID)
+
+	type imEvent struct {
+		Path        string
+		ChannelID   string
+		Subscribers []string
+	}
+	var eventsMu sync.Mutex
+	var events []imEvent
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" || r.URL.Path == "/channel/subscriber_remove" {
+			var payload struct {
+				ChannelID   string   `json:"channel_id"`
+				Subscribers []string `json:"subscribers"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			if r.URL.Path == "/channel" && payload.ChannelID == session.GroupNo {
+				enteredOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+			eventsMu.Lock()
+			events = append(events, imEvent{Path: r.URL.Path, ChannelID: payload.ChannelID, Subscribers: payload.Subscribers})
+			eventsMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	req, err := http.NewRequest(http.MethodPost, "/v1/ai-team/agents/"+f.botID, nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("container projection did not reach WuKongIM")
+	}
+
+	_, err = testContext.DB().Update("space_member").Set("status", 0).
+		Where("space_id=? AND uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().Update("group_member").Set("role", group.MemberRoleCommon).
+		Where("group_no=? AND uid=? AND is_deleted=0", session.GroupNo, f.uid).Exec()
+	require.NoError(t, err)
+	removed, err := group.NewService(testContext).RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
+		GroupNo: session.GroupNo, Members: []string{f.uid}, OperatorUID: "space-admin",
+		OperatorName: "Space admin", SuppressRemoveNotice: true, SuppressBotCascadeTip: true,
+		AllowProtected: true,
+	})
+	require.NoError(t, err)
+	require.Positive(t, removed.Removed)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale container projection did not finish after owner removal")
+	}
+	require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, channelID := range []string{session.GroupNo, session.ChannelID} {
+		var last *imEvent
+		for i := range events {
+			if events[i].ChannelID == channelID {
+				last = &events[i]
+			}
+		}
+		require.NotNil(t, last, "expected a terminal container event for %s", channelID)
+		assert.Equal(t, "/channel/subscriber_remove", last.Path)
+		assert.ElementsMatch(t, []string{f.uid, f.botID}, last.Subscribers)
+	}
+	var containerState int
+	require.NoError(t, testContext.DB().Select("container_state").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&containerState))
+	assert.Equal(t, 3, containerState)
+}
+
+func TestAITeamRemoveSurfacesPendingProjectionAfterDurableMutation(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var calls atomic.Int32
+	failingIM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "forced IM failure", http.StatusInternalServerError)
+	}))
+	defer failingIM.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = failingIM.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.im_unavailable")
+	var isAdded int
+	require.NoError(t, testContext.DB().Select("is_added").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&isAdded))
+	assert.Zero(t, isAdded)
+	firstCalls := calls.Load()
+	require.Positive(t, firstCalls)
+
+	// Explicit retries must bypass the read cooldown and must not acknowledge
+	// completion while the external subscriber revocation is still pending.
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.im_unavailable")
+	assert.Greater(t, calls.Load(), firstCalls)
+}
+
 func TestAITeamRejectsMissingSpaceForeignBotAndOrdinaryMutation(t *testing.T) {
 	f := seedFixture(t)
 
@@ -564,12 +1709,18 @@ func TestAITeamRejectsMissingSpaceForeignBotAndOrdinaryMutation(t *testing.T) {
 
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	teamGroupNo := storedAutomaticTeamGroupNo(t, f)
 	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID+"/sessions", "guard-key", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var created struct {
 		GroupNo string `json:"group_no"`
 	}
 	decodeJSON(t, w, &created)
+	for _, groupNo := range []string{created.GroupNo, teamGroupNo} {
+		w = request(t, f, http.MethodPost, fmt.Sprintf("/v1/groups/%s/members", groupNo), "", map[string]any{"members": []string{foreignBot}})
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "err.server.ai_team.container_protected")
+	}
 
 	w = request(t, f, http.MethodPost, fmt.Sprintf("/v1/groups/%s/members_delete", created.GroupNo), "", map[string]any{"members": []string{f.botID}})
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
@@ -654,12 +1805,13 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	// thread and the new AI tables explicitly use general_ci. Keep this drift
 	// deliberate: a same-collation CI database cannot catch MySQL error 1267.
 	for _, ddl := range []string{
+		"CREATE TABLE `seq` (id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `key` VARCHAR(100) NOT NULL DEFAULT '', min_seq BIGINT NOT NULL DEFAULT 1000000, step INTEGER NOT NULL DEFAULT 1000, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY seq_uidx (`key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		`CREATE TABLE system_setting (category VARCHAR(64), key_name VARCHAR(128), value TEXT, value_type VARCHAR(16), description VARCHAR(255), UNIQUE KEY uk_category_key(category,key_name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status TINYINT, agent_hosting VARCHAR(64) NOT NULL DEFAULT '', KEY idx_robot_creator(creator_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(100), status TINYINT, is_destroy TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE space (space_id VARCHAR(40) PRIMARY KEY, status TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE space_member (space_id VARCHAR(40), uid VARCHAR(40), status TINYINT, UNIQUE KEY uk_space_member(space_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-		"CREATE TABLE `group` (group_no VARCHAR(40) PRIMARY KEY, creator VARCHAR(40), space_id VARCHAR(40), project_id VARCHAR(40) NOT NULL DEFAULT '', purpose VARCHAR(32), status TINYINT, KEY idx_group_purpose(purpose)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE `group` (group_no VARCHAR(40) PRIMARY KEY, name VARCHAR(50) NOT NULL DEFAULT '', creator VARCHAR(40), space_id VARCHAR(40), project_id VARCHAR(40) NOT NULL DEFAULT '', purpose VARCHAR(32), status TINYINT, version BIGINT NOT NULL DEFAULT 0, allow_view_history_msg TINYINT NOT NULL DEFAULT 1, allow_external TINYINT NOT NULL DEFAULT 0, allow_no_mention TINYINT NOT NULL DEFAULT 1, KEY idx_group_purpose(purpose)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		`CREATE TABLE group_member (group_no VARCHAR(40), uid VARCHAR(40), remark VARCHAR(100) NOT NULL DEFAULT '', role TINYINT, version BIGINT, status TINYINT, vercode VARCHAR(80), is_deleted TINYINT NOT NULL DEFAULT 0, invite_uid VARCHAR(40), robot TINYINT, bot_admin TINYINT NOT NULL DEFAULT 0, forbidden_expir_time BIGINT NOT NULL DEFAULT 0, is_external TINYINT NOT NULL DEFAULT 0, source_space_id VARCHAR(40) NOT NULL DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY uk_group_member(group_no,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE thread (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, short_id VARCHAR(32), group_no VARCHAR(40), name VARCHAR(100), status TINYINT, message_count BIGINT DEFAULT 0, last_message_content TEXT, last_message_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uk_thread_short(short_id), KEY idx_thread_group(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
 		`CREATE TABLE thread_setting (group_no VARCHAR(40), short_id VARCHAR(32), uid VARCHAR(40), mute TINYINT NOT NULL DEFAULT 0, UNIQUE KEY uk_thread_setting(group_no,short_id,uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
@@ -671,14 +1823,14 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	_, err = migrate.Exec(db, "mysql", &migrate.FileMigrationSource{Dir: "sql"}, migrate.Up)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`INSERT INTO user(uid,name,status,is_destroy) VALUES ('human','Human',1,0),('bot','Bot',1,0);
-		INSERT INTO robot(robot_id,creator_uid,status) VALUES ('bot','human',1);
+	_, err = db.Exec(`INSERT INTO user(uid,name,status,is_destroy) VALUES ('human','Human',1,0),('bot_bot','Bot',1,0),('bot2_bot','Bot 2',1,0);
+		INSERT INTO robot(robot_id,creator_uid,status) VALUES ('bot_bot','human',1),('bot2_bot','human',1);
 		INSERT INTO space(space_id,status) VALUES ('space',1);
-		INSERT INTO space_member(space_id,uid,status) VALUES ('space','human',1),('space','bot',1);
-		INSERT INTO ` + "`group`" + `(group_no,creator,space_id,purpose,status) VALUES ('parent','human','space','ai_session_container',1);
-		INSERT INTO group_member(group_no,uid,role,version,status,vercode,invite_uid,robot) VALUES ('parent','human',1,1,1,'human@1','human',0),('parent','bot',0,2,1,'bot@1','human',1);
+		INSERT INTO space_member(space_id,uid,status) VALUES ('space','human',1),('space','bot_bot',1),('space','bot2_bot',1);
+		INSERT INTO ` + "`group`" + `(group_no,name,creator,space_id,purpose,status) VALUES ('parent','Bot AI','human','space','ai_session_container',1),('team','我的 OPT','human','space','ai_team_group',1);
+		INSERT INTO group_member(group_no,uid,role,version,status,vercode,invite_uid,robot) VALUES ('parent','human',1,1,1,'human@1','human',0),('parent','bot_bot',0,2,1,'bot@1','human',1),('team','human',1,3,1,'human@2','human',0),('team','bot_bot',0,4,1,'bot@2','human',1);
 		INSERT INTO thread(short_id,group_no,name,status,last_message_content) VALUES ('session','parent','Session',1,'');
-		INSERT INTO ai_team_agent(space_id,user_uid,bot_id,group_no,is_added,container_state) VALUES ('space','human','bot','parent',1,2);
+		INSERT INTO ai_team_agent(space_id,user_uid,bot_id,group_no,is_added,container_state) VALUES ('space','human','bot_bot','parent',1,2);
 		INSERT INTO ai_team_session(agent_id,short_id,idempotency_key,request_hash,state) SELECT id,'session','key','hash',2 FROM ai_team_agent;`)
 	require.NoError(t, err)
 
@@ -688,7 +1840,7 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	target, err := aiteampkg.LookupReadySessionTarget(conn.NewSession(nil), "parent____session", "human")
 	require.NoError(t, err)
 	require.NotNil(t, target)
-	assert.Equal(t, "bot", target.BotID)
+	assert.Equal(t, "bot_bot", target.BotID)
 
 	// Exercise the shipped service query families rather than a test-owned copy.
 	cfg := config.New()
@@ -697,13 +1849,16 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	ctx := config.NewContext(cfg)
 	t.Cleanup(func() { _ = ctx.DB().Close() })
 	svc := aiteammod.NewService(ctx)
-	agent, err := svc.AddAgent("space", "human", "bot")
+	agent, err := svc.AddAgent("space", "human", "bot_bot")
 	require.NoError(t, err)
 	assert.Equal(t, "parent", agent.GroupNo)
+	secondAgent, err := svc.AddAgent("space", "human", "bot2_bot")
+	require.NoError(t, err, "authorization must compare Bot identities as a set, independent of MySQL collation order")
+	require.NotEmpty(t, secondAgent.GroupNo)
 	agents, err := svc.ListAgents("space", "human", 0, 20)
 	require.NoError(t, err)
 	require.Len(t, agents.Groups, 3)
-	require.Len(t, agents.Groups[1].Items, 1)
+	require.Len(t, agents.Groups[1].Items, 2)
 	gotSession, err := svc.GetSession("space", "human", "session")
 	require.NoError(t, err)
 	assert.Equal(t, "parent____session", gotSession.ChannelID)

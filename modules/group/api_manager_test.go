@@ -23,9 +23,13 @@ func TestManagerGroupQueriesExcludeAIContainers(t *testing.T) {
 	for _, model := range []*Model{
 		{GroupNo: "manager-visible", Name: "manager query", Status: GroupStatusNormal},
 		{GroupNo: "manager-hidden-ai", Name: "manager query", Status: GroupStatusNormal, Purpose: aiteam.GroupPurpose},
+		{GroupNo: "manager-hidden-ai-team", Name: "manager query", Status: GroupStatusNormal, Purpose: aiteam.TeamGroupPurpose},
 	} {
 		require.NoError(t, db.Insert(model))
 	}
+	today := time.Now().Format("2006-01-02")
+	_, err := ctx.DB().UpdateBySql("UPDATE `group` SET created_at=?", today+" 12:00:00").Exec()
+	require.NoError(t, err)
 
 	list, err := managerDB.listWithPage(10, 1)
 	require.NoError(t, err)
@@ -52,7 +56,6 @@ func TestManagerGroupQueriesExcludeAIContainers(t *testing.T) {
 	require.Len(t, list, 1)
 	assert.Equal(t, "manager-visible", list[0].GroupNo)
 
-	today := time.Now().Format("2006-01-02")
 	list, err = managerDB.queryRegisterCountWithDateSpace(today, today)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
