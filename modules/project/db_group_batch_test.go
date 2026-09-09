@@ -22,7 +22,7 @@ func TestListMyProjectGroupResponsesByProjectIDsUsesTwoQueries(t *testing.T) {
 	var queries []string
 	rawDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(recordingQueryMatcher{queries: &queries}))
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, rawDB.Close()) })
+	t.Cleanup(func() { _ = rawDB.Close() })
 
 	conn := &dbr.Connection{DB: rawDB, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
 	db := &DB{session: conn.NewSession(nil)}

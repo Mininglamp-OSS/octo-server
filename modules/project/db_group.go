@@ -79,6 +79,7 @@ const sqlListMyProjectGroups = "SELECT g.group_no, g.name, g.is_named, g.avatar_
 // colour from group_no), IsNamed is a plain int because its migration ends by
 // tightening the column to NOT NULL DEFAULT 0.
 type projectGroupRow struct {
+	ProjectID      string `db:"project_id"`
 	GroupNo        string `db:"group_no"`
 	Name           string `db:"name"`
 	IsNamed        int    `db:"is_named"`
@@ -86,6 +87,14 @@ type projectGroupRow struct {
 	AvatarColor    *int   `db:"avatar_color"`
 	IsUploadAvatar int    `db:"is_upload_avatar"`
 }
+
+const sqlListMyProjectGroupsByProjectIDs = "SELECT g.project_id, g.group_no, g.name, g.is_named, g.avatar_text, " +
+	"g.avatar_color, g.is_upload_avatar " +
+	"FROM `group` g " +
+	"INNER JOIN `group_member` gm ON gm.group_no = g.group_no " +
+	"WHERE g.space_id = ? AND g.project_id IN ? AND g.status <> ? " +
+	"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? " +
+	"ORDER BY g.project_id ASC, g.id ASC"
 
 // listMyProjectGroups returns the LIVE groups of one project that uid is an
 // active member of, oldest first.
@@ -239,6 +248,60 @@ func (d *DB) listMyProjectGroupResponses(spaceID, projectID, uid string, offset,
 	return result, nil
 }
 
+// listMyProjectGroupResponsesByProjectIDs returns the same membership-scoped
+// projection as listMyProjectGroupResponses for multiple Projects. It executes
+// one group query and one grouped member-count query regardless of Project
+// count, then applies the endpoint's per-Project page limit in memory.
+func (d *DB) listMyProjectGroupResponsesByProjectIDs(spaceID, uid string, projectIDs []string, limit int) (map[string][]*GroupResp, error) {
+	result := make(map[string][]*GroupResp, len(projectIDs))
+	for _, projectID := range projectIDs {
+		result[projectID] = make([]*GroupResp, 0)
+	}
+	if spaceID == "" || uid == "" || len(projectIDs) == 0 || limit <= 0 {
+		return result, nil
+	}
+
+	var rows []*projectGroupRow
+	_, err := d.session.SelectBySql(
+		sqlListMyProjectGroupsByProjectIDs,
+		spaceID, projectIDs, groupStatusDisband, uid, int(common.GroupMemberStatusNormal),
+	).Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("project: list my project groups in batch: %w", err)
+	}
+
+	selected := make(map[string][]*projectGroupRow, len(projectIDs))
+	groupNos := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if _, requested := result[row.ProjectID]; !requested || len(selected[row.ProjectID]) >= limit {
+			continue
+		}
+		selected[row.ProjectID] = append(selected[row.ProjectID], row)
+		groupNos = append(groupNos, row.GroupNo)
+	}
+	counts, err := d.countActiveGroupMembers(groupNos)
+	if err != nil {
+		return nil, err
+	}
+
+	for projectID, projectRows := range selected {
+		groups := make([]*GroupResp, 0, len(projectRows))
+		for _, row := range projectRows {
+			groups = append(groups, &GroupResp{
+				GroupNo:        row.GroupNo,
+				Name:           row.Name,
+				IsNamed:        row.IsNamed,
+				AvatarText:     row.AvatarText,
+				AvatarColor:    row.AvatarColor,
+				IsUploadAvatar: row.IsUploadAvatar,
+				MemberCount:    counts[row.GroupNo],
+			})
+		}
+		result[projectID] = groups
+	}
+	return result, nil
+}
+
 // ListMyProjectGroups is the in-process equivalent of
 // GET /v1/projects/:project_id/groups. Category uses it for a Project sidebar
 // section rather than copying this modules membership, blacklist, and disband
@@ -252,4 +315,15 @@ func ListMyProjectGroups(ctx *config.Context, spaceID, projectID, uid string) ([
 	}
 	db := NewDB(ctx)
 	return db.listMyProjectGroupResponses(spaceID, projectID, uid, 0, projectDefaultPageLimit)
+}
+
+// ListMyProjectGroupsByProjectIDs is the batched sidebar equivalent of
+// ListMyProjectGroups. Each Project keeps the endpoint's default 50-row page
+// bound while the database cost remains two queries for the whole request.
+func ListMyProjectGroupsByProjectIDs(ctx *config.Context, spaceID, uid string, projectIDs []string) (map[string][]*GroupResp, error) {
+	if ctx == nil {
+		return map[string][]*GroupResp{}, nil
+	}
+	db := NewDB(ctx)
+	return db.listMyProjectGroupResponsesByProjectIDs(spaceID, uid, projectIDs, projectDefaultPageLimit)
 }

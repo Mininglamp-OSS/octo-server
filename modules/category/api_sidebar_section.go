@@ -45,7 +45,7 @@ func (c *Category) sortSidebarSections(ctx *wkhttp.Context) {
 		return
 	}
 
-	current, err := c.sidebarSections(uid, spaceID)
+	current, err := c.sidebarSectionKeys(uid, spaceID)
 	if err != nil {
 		c.Error("读取侧边栏分区排序前态失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
@@ -57,8 +57,8 @@ func (c *Category) sortSidebarSections(ctx *wkhttp.Context) {
 	}
 
 	currentByKey := make(map[string]struct{}, len(current))
-	for _, section := range current {
-		currentByKey[sidebarSectionKey(section.Type, section.ID)] = struct{}{}
+	for _, key := range current {
+		currentByKey[key] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(req.Items))
 	for _, item := range req.Items {
@@ -143,17 +143,21 @@ func (c *Category) sidebarSections(uid, spaceID string) ([]sidebarSectionResp, e
 		}
 	}
 	projectByID := make(map[string]*sidebarProjectSectionResp, len(projects))
+	projectIDs := make([]string, 0, len(projects))
 	for _, section := range projects {
-		groups, err := projectmod.ListMyProjectGroups(c.ctx, spaceID, section.ProjectID, uid)
-		if err != nil {
-			return nil, fmt.Errorf("list project groups for sidebar section %s: %w", section.ProjectID, err)
-		}
+		projectIDs = append(projectIDs, section.ProjectID)
+	}
+	groupsByProject, err := projectmod.ListMyProjectGroupsByProjectIDs(c.ctx, spaceID, uid, projectIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list project groups for sidebar sections: %w", err)
+	}
+	for _, section := range projects {
 		projectByID[section.ProjectID] = &sidebarProjectSectionResp{
 			ProjectID:        section.ProjectID,
 			ProjectName:      section.Name,
 			Logo:             section.Logo,
 			AllMemberGroupNo: section.AllMemberGroupNo,
-			Groups:           groups,
+			Groups:           groupsByProject[section.ProjectID],
 		}
 	}
 
@@ -182,6 +186,64 @@ func (c *Category) sidebarSections(uid, spaceID string) ([]sidebarSectionResp, e
 		}
 	}
 	return result, nil
+}
+
+// sidebarSectionKeys returns exactly the visible (type,id) set accepted by the
+// sort endpoint without loading category contents or Project groups. It keeps
+// the same repair and visibility gates as sidebarSections so stale clients get
+// a list-mismatch response instead of sorting hidden or foreign rows.
+func (c *Category) sidebarSectionKeys(uid, spaceID string) ([]string, error) {
+	if err := EnsureDefaultCategory(c.ctx, uid, spaceID); err != nil {
+		c.Warn("确保默认分类失败（降级继续）", zap.Error(err), zap.String("uid", uid), zap.String("spaceID", spaceID))
+	}
+	rawCategories, err := c.db.queryRawCategoryModels(uid, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.db.ensureCategorySidebarSections(rawCategories); err != nil {
+		return nil, err
+	}
+	if err := c.db.ensureActiveProjectSidebarSections(uid, spaceID); err != nil {
+		return nil, err
+	}
+	categories, err := c.db.queryCategoryModelsForSidebar(uid, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	projects, err := c.db.querySidebarProjectSections(uid, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	order, err := c.db.querySidebarSectionOrder(uid, spaceID)
+	if err != nil {
+		return nil, err
+	}
+
+	visible := make(map[string]struct{}, len(categories)+len(projects))
+	for _, category := range categories {
+		visible[sidebarSectionKey(sidebarSectionAPITypeCategory, category.CategoryID)] = struct{}{}
+	}
+	for _, project := range projects {
+		visible[sidebarSectionKey(sidebarSectionAPITypeProject, project.ProjectID)] = struct{}{}
+	}
+
+	keys := make([]string, 0, len(visible))
+	for _, row := range order {
+		var sectionType string
+		switch row.SectionType {
+		case sidebarSectionTypeCategory:
+			sectionType = sidebarSectionAPITypeCategory
+		case sidebarSectionTypeProject:
+			sectionType = sidebarSectionAPITypeProject
+		default:
+			continue
+		}
+		key := sidebarSectionKey(sectionType, row.RefID)
+		if _, ok := visible[key]; ok {
+			keys = append(keys, key)
+		}
+	}
+	return keys, nil
 }
 
 func sidebarSectionTypeFromAPI(sectionType string) int {
