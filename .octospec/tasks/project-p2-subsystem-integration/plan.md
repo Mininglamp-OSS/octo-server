@@ -293,11 +293,13 @@ env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关�
 
 1. **P-2（子系统侧服务身份）已经就绪。** 否则每个新项目都会产出一条在 **~23.5 分钟**后
    走到 `abandoned` 的行，而 `abandoned` 没有任何自动重驱动。
-2. **该子系统的 ensure 端点已经跑通 4 条一致性向量**
+2. **该子系统的 ensure 端点已经跑通 4 条一致性向量，且成功请求精确返回
+   `200` 和回显的 `container_id`。**
    （`internal/projectprovision/conformance.go`：valid / stale_timestamp / tampered_body /
    wrong_secret）。这不是形式主义 —— 三条 MUST 里，canonical string 写错会 fail closed
    会自己暴露，而**时间戳校验写松了 fail open 且完全静默**，本仓没有任何东西能发现它。
-   向量就是把「已评审」变成一个可执行动作。
+   向量就是把「已评审」变成一个可执行动作；成功响应形状另做一次真实
+   ensure 探针，因为签名向量本身不覆盖响应。
 
 **retention purge 由 per-target 开关门住，两个都默认 off：**
 
@@ -472,7 +474,8 @@ SELECT p.project_id, p.space_id, 'fleet',
    >    > 回滚步骤本身是对的，错的是它让人去看哪段代码。）本文件早期
    >    > 版本写的 `sql-migrate down -limit=1 -env=<env>` **在本仓根本跑不起来** —— 而一个
    >    > 跑不通的补救步骤，恰恰会把操作者推回同一段落禁止的手工 DDL。如果将来引入了
-   >    > dbconfig，再换回 Down 段调用；在那之前，上面那个事务就是等价物。
+   >    > dbconfig，再换回 Down 段调用；在那之前，上面的**两条顺序语句**就是等价物，第二条失败
+   >    > 时仍须立刻重试，不能依赖事务回滚。
    >
    >    （对照：migration 的 Down 段本身写的是 `DROP TABLE IF EXISTS
    >    octo_project_provisioning`，与上面第一条语句一致。）

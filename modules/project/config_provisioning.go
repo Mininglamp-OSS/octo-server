@@ -367,7 +367,7 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		target := provisionTarget{
 			Target: projectprovision.Target{
 				Name:      name,
-				EnsureURL: strings.TrimSpace(getenv(envs.url)),
+				EnsureURL: getenv(envs.url),
 				Secret:    secret,
 				Timeout:   cfg.Timeout,
 			},

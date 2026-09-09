@@ -169,8 +169,9 @@ type EnsureResponse struct {
 type EnsureError struct {
 	Category string
 	Status   int
-	// Detail is a bounded transport-layer reason, and it is set at exactly the two
-	// sites where it can be derived WITHOUT reading anything we sent.
+	// Detail is a bounded, container-id-free reason. It is either derived from a
+	// transport inner error or a fixed response-classification constant; it is
+	// never derived from a request or a response body.
 	//
 	// It exists because category-plus-status is empty for the failure an operator hits
 	// first. A target that is down produced `last_error = "transport_failed:
@@ -186,10 +187,11 @@ type EnsureError struct {
 	// function of OUR request — encode_failed wraps a json.Marshal error over an
 	// EnsureRequest, which carries the container id. json.Marshal of an all-string struct
 	// cannot realistically fail, but "cannot realistically" is not the bar for a value the
-	// package comment calls a capability. Detail is only ever filled from the transport
-	// error's INNER error, which describes the network and structurally cannot contain the
-	// request. The container-id-freedom of last_error stays a property of construction, not
-	// an argument about stdlib formatting.
+	// package comment calls a capability. Transport-derived Detail comes only from the
+	// transport error's INNER error, which describes the network and structurally cannot
+	// contain the request. Response classifications use fixed constants rather than parsing
+	// errors, because a parser error can quote response-body bytes. The container-id-freedom
+	// of last_error stays a property of construction, not an argument about stdlib formatting.
 	Detail string
 	cause  error
 }
@@ -504,7 +506,7 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		// STRICTLY 200, not any 2xx, because the published contract
-		// (.octospec/tasks/project-p2-subsystem-integration/brief.md §"接口契约")
+		// (.octospec/tasks/project-p2-subsystem-integration/brief.md, "Target endpoint contracts")
 		// specifies a SYNCHRONOUS 200 carrying container_id, and the difference
 		// between 200 and 202 is exactly the thing this call has to know: 202 means
 		// the peer accepted the request and will act on it later, so treating it as
@@ -536,26 +538,25 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	var out EnsureResponse
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes))
 	if err := decoder.Decode(&out); err != nil {
-		// Status is recorded even though the body did not parse: a 200 carrying an
-		// HTML error page and a 500 carrying the same page are different problems,
-		// and last_error is the only durable per-row evidence there is.
+		// Status is necessarily 200 here: the gate above returned every other status.
+		// Keep the durable reason a fixed constant, not err.Error(), because a JSON
+		// parsing error can quote response-body bytes including the container id.
 		return EnsureResponse{}, &EnsureError{
-			Category: "invalid_response", Status: response.StatusCode, cause: err,
+			Category: "invalid_response",
+			Detail:   "response body was not valid JSON",
+			cause:    err,
 		}
 	}
-	if out.ContainerID == "" {
+	if strings.TrimSpace(out.ContainerID) == "" {
 		// A MISSING id is a malformed response, not evidence the peer owns a
 		// different container — the two must not share a category, because one is
 		// retryable and the other is terminal on the first attempt.
 		//
 		// This is the shape a peer serves while its ensure endpoint is still being
-		// rolled out. The REACHABLE set is exactly `{}`, `{"container_id":""}` and
-		// `null` — an empty or whitespace-only body does NOT arrive here, because
-		// Decode returns io.EOF on it and the branch above catches that with a
-		// different error shape. An earlier version of this comment offered "a proxy
-		// returning an empty body with a 200" as an example, which cannot happen;
-		// it is corrected rather than deleted because A-1, one of the findings this
-		// commit closes, is a comment that described a path the code did not take.
+		// rolled out. The REACHABLE set is `{}`, `{"container_id":""}`,
+		// whitespace-only container_id values, and `null` — an empty or whitespace-only
+		// BODY does NOT arrive here, because Decode returns io.EOF and the branch above
+		// catches that different error shape.
 		//
 		// Classifying any of them as a mismatch abandons the row immediately, and
 		// abandoned has no automatic re-drive — so a transient state on the other

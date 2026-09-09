@@ -101,6 +101,13 @@ rejects, and the whole ~23.5-minute retry budget burns as indistinguishable
 Preferred fix is to **reject** leading/trailing whitespace rather than trim it
 silently: trimming hides a broken mount that will surprise someone again.
 
+**P2-8 — the URL rejection must be reached from config load.**
+The same reject-not-trim rule is meaningless if `loadProvisioningConfig` trims
+`OCTO_PROJECT_PROVISION_*_URL` before `ValidateTarget` sees it. A whitespace-
+wrapped URL must be dropped, reported through `Problems`, and counted in
+`Misconfigured`, just as a whitespace-wrapped secret is; otherwise an operator
+gets a silent config repair instead of the stated deployment signal.
+
 **A-5 — the empty-fragment case regressed a fix a sibling already documented.**
 `internal/projectprovision/client.go:351` checks `parsed.Fragment != ""`, so
 `https://host/ensure#` passes. `internal/cardactiondispatch/registry.go:338-341`
@@ -142,7 +149,7 @@ survives someone checking. (An earlier draft said `Migration()` has **no non-tes
 caller in this repository** — and `testutil.NewTestServer` sets
 `cfg.DB.Migration = false`. Module SQL is applied by `module.Setup`, i.e.
 octo-lib `module/module.go:88`. The rollback instructions are correct; the
-pointer sends whoever follows them to dead code.
+pointer sends whoever follows them to dead code.)
 
 ## Load-bearing list
 
@@ -204,12 +211,17 @@ acceptance criteria and are checked against the implementation.
 - [x] A-5: `https://host/ensure#` is refused, by the same mechanism
       `internal/cardactiondispatch` uses; a test pins the empty-fragment case.
 - [x] A-3: an empty or absent `container_id` in the echo classifies as
-      `invalid_response` (retryable); a genuinely different id stays
-      `container_id_mismatch` (permanent). Both pinned.
+      `invalid_response` (retryable); a whitespace-only id does too, while a
+      genuinely different id stays `container_id_mismatch` (permanent). Both pinned.
 - [x] A-1: the `Enabled()` comment states that the disband write is
       unconditional and why, so "add a gate here" fails review rather than
       passing it.
-- [x] A-6: all four provisioning timers are jittered, matching `reconcile.go`.
+- [x] A-6: all four provisioning timers are jittered, matching `reconcile.go`,
+      with a source guard that pins all four `Schedule(jitter(...))` calls.
+- [x] P2-8: whitespace around a configured ensure URL is REJECTED at config
+      load; the target is dropped, marked `Misconfigured`, and reported through
+      `Problems`. The loader test covers the deployed environment path rather
+      than only a hand-built `Target`.
 - [x] P2-5: `plan.md` §3.5 names `module.Setup` / octo-lib `module/module.go`,
       and says the rollback ordering it already gets right.
 - [x] P2-A (bundled at #850's close, not one of the six): §3.5's "put the DROP

@@ -310,8 +310,8 @@ func (p *Project) processProvisioningJobs() {
 	// other, and the client's short timeout does NOT prevent that — the arithmetic was
 	// simply wrong. With fleet down and a due backlog, every one of a 20-row batch costs
 	// the full 10s timeout, so a batch runs for up to 200s; provisioningRunning makes
-	// every 15s tick in that window a no-op, so healthy drive rows wait behind fleet's
-	// timeouts for minutes.
+	// every scheduled claim tick in that window a no-op, so healthy drive rows wait
+	// behind fleet's timeouts for minutes.
 	//
 	// A per-target quota alone would only BOUND that wait. Separate goroutines remove it:
 	// each target advances at its own pace and an unhealthy one delays nobody. Two

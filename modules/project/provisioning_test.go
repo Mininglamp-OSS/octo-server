@@ -1641,6 +1641,22 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		assert.False(t, cfg.Enabled())
 	})
 
+	// The URL is configuration too. ValidateTarget rejects surrounding whitespace,
+	// so the loader must pass the raw value through rather than silently repairing a
+	// configmap typo before validation can report it.
+	t.Run("a whitespace-wrapped ensure URL is dropped at config load", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:     "fleet",
+			envProvisionFleetURL:    " https://fleet.internal/ensure ",
+			ProvisionFleetSecretEnv: okSecretA,
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "whitespace")
+		assert.Empty(t, cfg.Targets)
+		assert.Equal(t, []string{TargetFleet}, cfg.Misconfigured)
+		assert.False(t, cfg.Enabled())
+	})
+
 	t.Run("a bad target is dropped, not fatal", func(t *testing.T) {
 		cfg, problems := loadProvisioningConfig(env(map[string]string{
 			envProvisionTargets:     "fleet,drive",

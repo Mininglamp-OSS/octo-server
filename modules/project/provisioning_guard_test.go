@@ -707,6 +707,19 @@ func provisioningDocFiles(t *testing.T) []string {
 		}
 		files = append(files, matched...)
 	}
+	present := make(map[string]bool, len(files))
+	for _, file := range files {
+		present[file] = true
+	}
+	for _, rel := range []string{
+		".octospec/tasks/project-p2-subsystem-integration/brief.md",
+		".octospec/tasks/project-p2-subsystem-integration/plan.md",
+		".octospec/tasks/project-provisioning-followups/brief.md",
+	} {
+		if !present[filepath.Join(root, rel)] {
+			t.Fatalf("required provisioning handover document %s is not enrolled; update provisioningDocFiles", rel)
+		}
+	}
 	// The floor has to sit ABOVE the count that survives losing the task documents, which
 	// are the file class both historical defects occurred in. At 12 it did not: the globs
 	// matched 15, three of them the handover documents, and deleting that directory left
@@ -1067,5 +1080,22 @@ func TestInvalidResponseStaysRetryable(t *testing.T) {
 	if !isPermanentProvisioningOutcome("container_id_mismatch") {
 		t.Fatal("container_id_mismatch must be permanent; if this fails the guard above " +
 			"is passing because the map is empty")
+	}
+}
+
+// TestProvisioningTimersStayJittered pins A-6 at the scheduling call sites.
+// A behavioural test cannot reliably wait for all four long-running timers, so
+// this source guard covers the exact regression: removing one jitter wrapper.
+func TestProvisioningTimersStayJittered(t *testing.T) {
+	src := readStripped(t, "provisioning_worker.go")
+	for _, want := range []string{
+		"p.ctx.Schedule(jitter(p.cfg.Provisioning.Interval), p.processProvisioningJobs)",
+		"p.ctx.Schedule(jitter(provisioningSweepInterval), p.sweepExhaustedProvisioningJobs)",
+		"p.ctx.Schedule(jitter(provisioningPurgeInterval), p.purgeProvisioningJobs)",
+		"p.ctx.Schedule(jitter(p.cfg.MetricsInterval), p.refreshProvisioningMetrics)",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("provisioning timer lost jitter: %s", want)
+		}
 	}
 }
