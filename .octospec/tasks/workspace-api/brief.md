@@ -34,6 +34,9 @@ The Workspace server and group-owned relation/creation contracts described here 
 - Group creation prepares request configuration and every required `GenSeq` value before opening its write transaction. `MemberUIDs` is the complete active current-read Workspace set; `EligibleMemberUIDs` is the prepared active destination-seat and eligible-account subset used for the final one-time group membership. Candidate expansion is bounded at three total attempts, including the initial attempt.
 - Creator and explicit candidates retain native Group policy, including valid explicit external members; an absent, inactive, or otherwise invalid explicit member fails the request atomically. Workspace changes after creation do not synchronize the group membership.
 - Workspace and Group relation keyword searches use SQL-mode-independent literal matching for `%`, `_`, and `!`.
+- Space-seat removal asynchronously deactivates non-owner Workspace memberships through the shared durable cleanup registry; restoring a Space seat does not restore prior Workspace roles without explicit re-admission.
+- Ordinary Group creation retains its existing missing/destroyed-member filtering and batched Space-membership classification; strict all-or-none candidate validation remains scoped to Workspace-backed creation.
+- Outbox enqueue persists every registered target independent of current credentials. Delivery waits while a target is unavailable, and Redis stream appends do not evict older entries by raw length.
 - Verification passed on an isolated candidate: full `modules/workspace` and `modules/group` package suites, repository build/vet, i18n extraction and lint checks, and real TCP HTTP/DB/IM smoke. Group suite and HTTP smoke were rerun after moving relation reads into `Service`. Dependencies were dedicated MySQL 8.0.46, Redis 7, and WuKongIM instances. The full Space suite still reports member-removal cleanup-worker failures, also observed in the pre-fix snapshot; individual cases can pass independently and the failing set varies. Candidate Space source matches that snapshot. The Space suite is not reported as passing.
 - Sequence smoke passed all four ordinary/Workspace × cold/refill scenarios, each in a fresh process and schema. Creation ran with `MaxOpenConns=1`, including Bot. Cold runs observed absent `group`/`groupMember` sequence rows followed by `min_seq=1001000`, step `1000`; refill runs exhausted each block and observed both rows advance to `1002000`. Persisted group/member versions, membership, Bot policy, external-member mapping, and the real IM channel were checked.
 - Cross-module lock smoke passed all three scenarios with exactly two application-pool connections: a real Workspace member write interleaved with Space metadata PUT; unrelated Space-member removal completed while prepared Workspace seats remained locked; and Space dissolution waited on the observed seat lock, then completed with subsequent Workspace access denied. `EXPLAIN` selected `spacemember_spaceid_uid`; an independent connection queried only `performance_schema` to observe lock waits.
@@ -58,7 +61,8 @@ registered localized error envelope and the semantic status in
   derived from the authoritative resource ID, with optional `X-Space-Id` only as
   a consistency assertion.
 - Active organization membership, banned/revoked membership, Workspace member
-  status, and Workspace role checks on every read and write.
+  status, and Workspace role checks on every read and write; Space-seat removal
+  deactivates non-owner Workspace memberships through the durable cleanup chain.
 - Exactly one active Workspace Owner; Owner transfer is atomic and leaves the
   previous Owner as active Admin. Owner cannot be removed or self-exit.
 - Partial metadata PUT (submitted fields only), read-only field protection,
@@ -81,6 +85,9 @@ registered localized error envelope and the semantic status in
   coherent and the underlying cleanup cause is returned without claiming
   rollback success. Later Workspace membership changes do not synchronize to
   that Group.
+- Domain-event intent is transactionally persisted for every registered target;
+  runtime credentials gate delivery rather than enqueue, and the Redis stream is
+  not truncated independently of consumer progress.
 - Registered server error codes and runtime zh-CN translations, including safe
   internal/dependency handling; group relation fields must not leak through
   ordinary `GroupResp`.

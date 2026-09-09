@@ -152,10 +152,10 @@ func (s *Service) createGroupBeforeIM(req *CreateGroupServiceReq) (*createGroupS
 		return nil, errors.New("failed to query member info")
 	}
 	userByUID := indexCreateGroupUsers(users)
-	if err := validateCreateGroupRequiredUsers(userByUID, allUserCandidates, false); err != nil {
-		return nil, err
-	}
 	orderedUsers := orderedCreateGroupUsers(allUserCandidates, userByUID)
+	if workspaceID == "" {
+		orderedUsers = liveCreateGroupUsers(orderedUsers)
+	}
 	if len(orderedUsers) == 0 {
 		return nil, errors.New("no valid member found")
 	}
@@ -221,7 +221,11 @@ func (s *Service) createRegularGroupBeforeIM(base *createGroupBase, memberUsers 
 		return nil, err
 	}
 
-	candidateUIDs := prepareCreateGroupCandidates(base.creator, base.explicit, base.botUID)
+	candidateUIDs := make([]string, 0, len(memberUsers)+1)
+	for _, memberUser := range memberUsers {
+		candidateUIDs = append(candidateUIDs, memberUser.UID)
+	}
+	candidateUIDs = appendCreateGroupCandidates(candidateUIDs, base.botUID)
 	memberVersions, err := s.allocateCreateGroupMemberVersions(candidateUIDs)
 	if err != nil {
 		return nil, err
@@ -544,37 +548,23 @@ func (s *Service) prepareGroupSpaceExternal(spaceID, creator, botUID string, exp
 	if spaceID == "" {
 		return externalMap, sourceSpaceMap, nil
 	}
-	if strict && botUID != "" {
-		botOK, err := spacepkg.CheckMembership(s.ctx.DB(), spaceID, botUID)
-		if err != nil {
-			s.Error("check bot space membership failed", zap.Error(err))
-			return nil, nil, errors.New("failed to check space membership")
-		}
-		if !botOK {
-			return nil, nil, errors.New("bot is not a member of this space")
-		}
+	candidates := prepareCreateGroupCandidates(creator, explicit, botUID)
+	active, err := spacepkg.ActiveMembers(s.ctx.DB(), spaceID, candidates)
+	if err != nil {
+		s.Error("check group space memberships failed", zap.Error(err))
+		return nil, nil, errors.New("failed to check space membership")
 	}
 	if strict {
-		creatorOK, err := spacepkg.CheckMembership(s.ctx.DB(), spaceID, creator)
-		if err != nil {
-			s.Error("check creator space membership failed", zap.Error(err))
-			return nil, nil, errors.New("failed to check space membership")
-		}
-		if !creatorOK {
+		if !active[creator] {
 			return nil, nil, errors.New("creator is not a member of this space")
+		}
+		if botUID != "" && !active[botUID] {
+			return nil, nil, errors.New("bot is not a member of this space")
 		}
 	}
 	for _, uid := range explicit {
 		uid = strings.TrimSpace(uid)
-		if uid == "" {
-			continue
-		}
-		ok, err := spacepkg.CheckMembership(s.ctx.DB(), spaceID, uid)
-		if err != nil {
-			s.Error("check member space membership failed", zap.Error(err), zap.String("uid", uid))
-			return nil, nil, errors.New("failed to check space membership")
-		}
-		if ok {
+		if uid == "" || active[uid] {
 			continue
 		}
 		externalMap[uid] = true
@@ -612,6 +602,16 @@ func orderedCreateGroupUsers(uids []string, byUID map[string]*user.Model) []*use
 		users = append(users, model)
 	}
 	return users
+}
+
+func liveCreateGroupUsers(users []*user.Model) []*user.Model {
+	live := make([]*user.Model, 0, len(users))
+	for _, model := range users {
+		if model != nil && model.IsDestroy != user.IsDestroyDone {
+			live = append(live, model)
+		}
+	}
+	return live
 }
 
 func validateCreateGroupRequiredUsers(byUID map[string]*user.Model, required []string, requireActive bool) error {

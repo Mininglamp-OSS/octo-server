@@ -23,9 +23,6 @@ const (
 	// ScanIntervalEnv controls the interval used by the outbox fallback worker.
 	ScanIntervalEnv = "DM_EVENT_OUTBOX_SCAN_MINUTES"
 
-	// DefaultMaxLen is the approximate maximum number of entries retained in a
-	// Redis stream for one domain/target pair.
-	DefaultMaxLen int64 = 10000
 	// DefaultDeliveredRetention is how long delivered rows remain available for
 	// audit and troubleshooting.
 	DefaultDeliveredRetention time.Duration = 7 * 24 * time.Hour
@@ -42,10 +39,9 @@ const (
 )
 
 var (
-	// MaxLen, DeliveredRetention, ClaimBatchSize, and LeaseDuration are package
-	// knobs for deployments and focused tests. Non-positive values resolve to
-	// their corresponding defaults at use time.
-	MaxLen             int64         = DefaultMaxLen
+	// DeliveredRetention, ClaimBatchSize, and LeaseDuration are set-once package
+	// knobs for deployments and focused tests. Configure them before RunWorker;
+	// non-positive values resolve to their corresponding defaults at use time.
 	DeliveredRetention time.Duration = DefaultDeliveredRetention
 	ClaimBatchSize     int           = DefaultClaimBatchSize
 	LeaseDuration      time.Duration = DefaultLeaseDuration
@@ -70,9 +66,9 @@ type Event struct {
 	Data       map[string]any
 }
 
-// Target is a registered subscriber. A nil Enabled callback means enabled;
-// callers that need deployment/configuration gating should provide a callback
-// that returns false while the target is unavailable.
+// Target is a registered subscriber. Enabled gates delivery only: enqueueing
+// always persists the target's intent so a temporary credential outage cannot
+// create an unrecoverable event gap. A nil callback means enabled.
 type Target struct {
 	Service string
 	Enabled func() bool
@@ -161,10 +157,10 @@ func Init(ctx *config.Context) {
 	stateMu.Unlock()
 }
 
-// EnqueueTx writes one pending row per enabled target into the caller's
-// transaction. It never touches Redis. A caller that commits the transaction
-// must invoke DeliverNow with the returned event ID; a rollback removes all
-// rows atomically with the business mutation.
+// EnqueueTx writes one pending row per registered target into the caller's
+// transaction. It never touches Redis or runtime target credentials. A caller
+// that commits the transaction must invoke DeliverNow with the returned event
+// ID; a rollback removes all rows atomically with the business mutation.
 func EnqueueTx(tx *dbr.Tx, event Event) (string, error) {
 	if tx == nil {
 		return "", fmt.Errorf("%w: transaction is nil", ErrInvalidEvent)
@@ -174,7 +170,7 @@ func EnqueueTx(tx *dbr.Tx, event Event) (string, error) {
 	}
 
 	eventID := uuid.New().String()
-	targets := enabledTargets(event.Domain)
+	targets := registeredTargets(event.Domain)
 	if len(targets) == 0 {
 		return eventID, nil
 	}
@@ -225,35 +221,25 @@ func validateEvent(event Event) error {
 	return nil
 }
 
-func enabledTargets(domain string) []Target {
+func registeredTargets(domain string) []Target {
 	stateMu.RLock()
-	registered := append([]Target(nil), targetRegistry[domain]...)
-	stateMu.RUnlock()
+	defer stateMu.RUnlock()
+	return append([]Target(nil), targetRegistry[domain]...)
+}
 
-	targets := make([]Target, 0, len(registered))
-	for _, target := range registered {
-		if target.Service == "" {
-			continue
+func targetEnabled(domain, service string) bool {
+	for _, target := range registeredTargets(domain) {
+		if target.Service == service {
+			return target.Enabled == nil || target.Enabled()
 		}
-		if target.Enabled != nil && !target.Enabled() {
-			continue
-		}
-		targets = append(targets, target)
 	}
-	return targets
+	return false
 }
 
 func snapshotState() (*dbr.Session, *redis.Client) {
 	stateMu.RLock()
 	defer stateMu.RUnlock()
 	return dbSession, redisClient
-}
-
-func effectiveMaxLen() int64 {
-	if MaxLen > 0 {
-		return MaxLen
-	}
-	return DefaultMaxLen
 }
 
 func effectiveDeliveredRetention() time.Duration {

@@ -1252,15 +1252,6 @@ func storageRole(role string) int {
 	return MemberRoleMember
 }
 
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
-}
-
 // InternalGet returns an active Workspace in the service-facing projection.
 // It performs no caller or Space membership authorization; the internal API
 // authenticates the calling platform service instead.

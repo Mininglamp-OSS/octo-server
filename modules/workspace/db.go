@@ -1,6 +1,8 @@
 package workspace
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"sort"
@@ -964,47 +966,57 @@ func (d *DB) listInternalWorkspaces(spaceID string, page Page) (*Pagination[Inte
 	if err := d.ensureSession(); err != nil {
 		return nil, err
 	}
+	tx, err := d.session.BeginTx(context.Background(), &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("workspace: begin internal workspace list: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
 	where := "status = 1"
 	args := make([]interface{}, 0, 1)
 	if spaceID != "" {
 		where += " AND space_id = ?"
 		args = append(args, spaceID)
 	}
-	if err := d.session.SelectBySql(
+	if err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM `octo_workspace` WHERE "+where,
 		args...,
 	).LoadOne(&result.Count); err != nil {
 		return nil, fmt.Errorf("workspace: count internal workspaces: %w", err)
 	}
 	offset, limit, ok := pageWindow(page)
-	if !ok {
-		return result, nil
-	}
-	query := "SELECT workspace_id, space_id, name, description, logo, owner_uid, status, created_at, updated_at, " +
-		"(SELECT COUNT(*) FROM `octo_workspace_member` wm WHERE wm.workspace_id = w.workspace_id AND wm.status = 1) AS member_count " +
-		"FROM `octo_workspace` w WHERE " + where +
-		" ORDER BY created_at ASC, workspace_id ASC LIMIT ? OFFSET ?"
-	pageArgs := append(append([]interface{}{}, args...), limit, offset)
-	var rows []*internalWorkspaceListModel
-	if _, err := d.session.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
-		return nil, fmt.Errorf("workspace: list internal workspaces: %w", err)
-	}
-	for _, row := range rows {
-		if row == nil {
-			continue
+	if ok {
+		query := "SELECT workspace_id, space_id, name, description, logo, owner_uid, status, created_at, updated_at, " +
+			"(SELECT COUNT(*) FROM `octo_workspace_member` wm WHERE wm.workspace_id = w.workspace_id AND wm.status = 1) AS member_count " +
+			"FROM `octo_workspace` w WHERE " + where +
+			" ORDER BY created_at ASC, workspace_id ASC LIMIT ? OFFSET ?"
+		pageArgs := append(append([]interface{}{}, args...), limit, offset)
+		var rows []*internalWorkspaceListModel
+		if _, err := tx.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
+			return nil, fmt.Errorf("workspace: list internal workspaces: %w", err)
 		}
-		result.List = append(result.List, InternalWorkspace{
-			WorkspaceID: row.WorkspaceID,
-			SpaceID:     row.SpaceID,
-			Name:        row.Name,
-			Description: row.Description,
-			Logo:        row.Logo,
-			OwnerUID:    row.OwnerUID,
-			MemberCount: row.MemberCount,
-			Status:      row.Status,
-			CreatedAt:   formatWorkspaceTime(row.CreatedAt),
-			UpdatedAt:   formatWorkspaceTime(row.UpdatedAt),
-		})
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			result.List = append(result.List, InternalWorkspace{
+				WorkspaceID: row.WorkspaceID,
+				SpaceID:     row.SpaceID,
+				Name:        row.Name,
+				Description: row.Description,
+				Logo:        row.Logo,
+				OwnerUID:    row.OwnerUID,
+				MemberCount: row.MemberCount,
+				Status:      row.Status,
+				CreatedAt:   formatWorkspaceTime(row.CreatedAt),
+				UpdatedAt:   formatWorkspaceTime(row.UpdatedAt),
+			})
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("workspace: commit internal workspace list: %w", err)
 	}
 	return result, nil
 }

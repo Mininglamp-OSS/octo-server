@@ -35,7 +35,8 @@ const outboxTestDDL = `CREATE TABLE IF NOT EXISTS event_outbox (
   delivered_at DATETIME(3) NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_event_outbox_event_target (event_id, target_service),
-  KEY idx_event_outbox_pending (status, next_attempt_at, lease_until)
+  KEY idx_event_outbox_pending (status, next_attempt_at, lease_until),
+  KEY idx_event_outbox_delivered (status, delivered_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`
 
 type outboxTestEnvelope struct {
@@ -82,7 +83,6 @@ func setupOutboxTest(t *testing.T) *config.Context {
 	redisClient = client
 	targetRegistry = nil
 	stateMu.Unlock()
-	MaxLen = DefaultMaxLen
 	DeliveredRetention = DefaultDeliveredRetention
 	ClaimBatchSize = DefaultClaimBatchSize
 	LeaseDuration = DefaultLeaseDuration
@@ -159,14 +159,39 @@ func TestEnqueueTxRollsBackWithBusinessTransaction(t *testing.T) {
 	require.Equal(t, 0, n)
 }
 
-func TestEnqueueTxWithNoEnabledTargetsWritesNoRows(t *testing.T) {
+func TestEnqueueTxPersistsRegisteredTargetsWhileDisabled(t *testing.T) {
 	setupOutboxTest(t)
 	registerTestTarget(false)
 	id := enqueueTestEvent(t, Event{Domain: "workspace", ResourceID: "ws-none", EventType: "workspace.updated", Data: map[string]any{"workspace_id": "ws-none"}})
 	require.NotEmpty(t, id)
-	require.Equal(t, 0, countOutbox(t, "WHERE event_id=?", id))
+	require.Equal(t, 1, countOutbox(t, "WHERE event_id=? AND target_service=?", id, "loop"))
 }
 
+func TestWorkerKeepsDisabledTargetPendingUntilEnabled(t *testing.T) {
+	setupOutboxTest(t)
+	enabled := false
+	RegisterTargets("workspace", Target{Service: "loop", Enabled: func() bool { return enabled }})
+	id := enqueueTestEvent(t, Event{Domain: "workspace", ResourceID: "ws-disabled", EventType: "workspace.updated", Data: map[string]any{"workspace_id": "ws-disabled"}})
+
+	require.NoError(t, runWorkerOnce(context.Background(), time.Minute))
+	status, attempts, _ := loadOutboxState(t, id)
+	require.Equal(t, outboxStatusPending, status)
+	require.Zero(t, attempts)
+	length, err := redisClient.XLen("event_queue:workspace:loop").Result()
+	require.NoError(t, err)
+	require.Zero(t, length)
+
+	enabled = true
+	_, err = dbSession.UpdateBySql("UPDATE event_outbox SET next_attempt_at=? WHERE event_id=?", time.Now().UTC().Add(-time.Second), id).Exec()
+	require.NoError(t, err)
+	require.NoError(t, runWorkerOnce(context.Background(), time.Minute))
+	status, attempts, _ = loadOutboxState(t, id)
+	require.Equal(t, outboxStatusDelivered, status)
+	require.Zero(t, attempts)
+	length, err = redisClient.XLen("event_queue:workspace:loop").Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, length)
+}
 func TestEnqueueTxRejectsUnserializablePayload(t *testing.T) {
 	setupOutboxTest(t)
 	registerTestTarget(true)
@@ -297,7 +322,7 @@ func TestWorkerAllowsDuplicateDeliveryWindow(t *testing.T) {
 	id := enqueueTestEvent(t, Event{Domain: "workspace", ResourceID: "ws-duplicate", EventType: "workspace.updated", Data: map[string]any{"workspace_id": "ws-duplicate"}})
 	DeliverNow(id)
 	payload := `{"event_id":"` + id + `","domain":"workspace","resource_id":"ws-duplicate","event_type":"workspace.updated","occurred_at":"2026-09-09T00:00:00Z","data":{"workspace_id":"ws-duplicate"}}`
-	_, err := redisClient.XAdd(&rd.XAddArgs{Stream: "event_queue:workspace:loop", MaxLenApprox: MaxLen, Values: map[string]interface{}{"event_json": payload}}).Result()
+	_, err := redisClient.XAdd(&rd.XAddArgs{Stream: "event_queue:workspace:loop", Values: map[string]interface{}{"event_json": payload}}).Result()
 	require.NoError(t, err)
 	_, err = dbSession.UpdateBySql("UPDATE event_outbox SET status=0, delivered_at=NULL, next_attempt_at=? WHERE event_id=?", time.Now().UTC().Add(-time.Second), id).Exec()
 	require.NoError(t, err)
@@ -339,19 +364,17 @@ func TestCleanupDeliveredOnlyRemovesExpiredRows(t *testing.T) {
 	require.Equal(t, 1, countOutbox(t, "WHERE event_id=?", pendingID))
 }
 
-func TestMaxLenKeepsStreamBounded(t *testing.T) {
+func TestDeliveryDoesNotEvictOlderStreamEntries(t *testing.T) {
 	setupOutboxTest(t)
 	registerTestTarget(true)
-	old := MaxLen
-	MaxLen = 2
-	t.Cleanup(func() { MaxLen = old })
-	for i := 0; i < 8; i++ {
-		id := enqueueTestEvent(t, Event{Domain: "workspace", ResourceID: "ws-maxlen-" + uuid.New().String(), EventType: "workspace.updated", Data: map[string]any{"n": i}})
+	const eventCount = 8
+	for i := range eventCount {
+		id := enqueueTestEvent(t, Event{Domain: "workspace", ResourceID: "ws-retained-" + uuid.New().String(), EventType: "workspace.updated", Data: map[string]any{"n": i}})
 		DeliverNow(id)
 	}
 	length, err := redisClient.XLen("event_queue:workspace:loop").Result()
 	require.NoError(t, err)
-	require.LessOrEqual(t, length, int64(2))
+	require.EqualValues(t, eventCount, length)
 }
 
 func TestScanIntervalFromEnv(t *testing.T) {

@@ -519,3 +519,27 @@ func TestCreateRegularGroupWithOneConnection(t *testing.T) {
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{owner, member}, workspaceCreateMemberUIDs(members))
 }
+
+func TestCreateRegularGroupSkipsMissingAndDestroyedMembers(t *testing.T) {
+	_, ctx, g := setupGroupWorkspaceContract(t)
+	const (
+		owner     = "gw-reg-filter-owner"
+		active    = "gw-reg-filter-active"
+		destroyed = "gw-reg-filter-destroyed"
+		missing   = "gw-reg-filter-missing"
+	)
+	seedGroupWorkspaceUsers(t, g, owner, active, destroyed)
+	_, err := ctx.DB().Update("user").Set("is_destroy", 2).Where("uid=?", destroyed).Exec()
+	require.NoError(t, err)
+
+	resp, err := g.groupService.CreateGroup(&CreateGroupServiceReq{
+		Creator: owner,
+		Members: []string{active, destroyed, missing},
+		Name:    "regular filtered members",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	members, err := g.db.QueryMembersFirstNine(resp.GroupNo)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{owner, active}, workspaceCreateMemberUIDs(members))
+}

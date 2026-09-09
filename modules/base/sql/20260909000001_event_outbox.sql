@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS `event_outbox` (
   `delivered_at` DATETIME(3) NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_event_outbox_event_target` (`event_id`, `target_service`),
-  KEY `idx_event_outbox_pending` (`status`, `next_attempt_at`, `lease_until`)
+  KEY `idx_event_outbox_pending` (`status`, `next_attempt_at`, `lease_until`),
+  KEY `idx_event_outbox_delivered` (`status`, `delivered_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- +migrate Down

@@ -40,6 +40,8 @@ func (a *API) workspaceInternalIPRateLimit(r *wkhttp.WKHttp) wkhttp.HandlerFunc 
 	return r.StrictIPRateLimitMiddleware(context.Background(), rlRedis, workspaceInternalRateLimitTag, rps, burst)
 }
 
+// Both credentials authorize the same read-only internal Workspace surface;
+// they identify peer deployments, not distinct capabilities.
 func (a *API) internalAuthMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		token := c.GetHeader(workspaceInternalTokenHeader)

@@ -26,8 +26,8 @@ func enqueueWorkspaceEventTx(tx *dbr.Tx, eventType, workspaceID string) (string,
 }
 
 // RegisterEventTargets registers the Workspace subscribers used by the event
-// outbox. Credentials are evaluated when each event is written so changing a
-// deployment's environment does not require rebuilding the target registry.
+// outbox. Every mutation is persisted for both targets; credentials gate
+// delivery so temporary configuration outages remain recoverable.
 func RegisterEventTargets() {
 	outbox.RegisterTargets("workspace",
 		outbox.Target{

@@ -96,6 +96,9 @@ func DeliverNow(eventID string) {
 		return
 	}
 	for _, row := range rows {
+		if !targetEnabled(row.Domain, row.TargetService) {
+			continue
+		}
 		if err := addToStream(client, row); err != nil {
 			logDeliveryError(row, err)
 			continue
@@ -127,6 +130,12 @@ func runWorkerOnce(ctx context.Context, interval time.Duration) error {
 
 	var firstErr error
 	for _, row := range rows {
+		if !targetEnabled(row.Domain, row.TargetService) {
+			if releaseErr := releaseUnavailableWithSession(ctx, db, row, owner, interval, time.Now().UTC()); releaseErr != nil && firstErr == nil {
+				firstErr = releaseErr
+			}
+			continue
+		}
 		if err := addToStream(client, row); err != nil {
 			logDeliveryError(row, err)
 			if releaseErr := releaseFailedWithSession(ctx, db, row, owner, err, interval, time.Now().UTC()); releaseErr != nil {
@@ -248,20 +257,11 @@ func addToStream(client *redis.Client, row outboxRow) error {
 		return errors.New("outbox: row has empty payload")
 	}
 	stream := streamKey(row.Domain, row.TargetService)
-	_, err := client.XAdd(&redis.XAddArgs{
-		Stream:       stream,
-		MaxLenApprox: effectiveMaxLen(),
-		Values:       map[string]interface{}{"event_json": row.Payload},
-	}).Result()
-	if err != nil {
+	if _, err := client.XAdd(&redis.XAddArgs{
+		Stream: stream,
+		Values: map[string]interface{}{"event_json": row.Payload},
+	}).Result(); err != nil {
 		return fmt.Errorf("xadd %s: %w", stream, err)
-	}
-	// Redis's approximate MAXLEN may retain an entire radix-tree node above the
-	// requested size (especially for very small test/configured limits). Trim
-	// after a successful append so MaxLen remains a real upper bound. A trim
-	// failure must not turn an already-delivered event back into pending.
-	if _, trimErr := client.XTrim(stream, effectiveMaxLen()).Result(); trimErr != nil {
-		outboxLog.Warn("event stream exact trim failed", zap.String("stream", stream), zap.Error(trimErr))
 	}
 	return nil
 }
@@ -300,6 +300,26 @@ func markDeliveredWithSession(ctx context.Context, db *dbr.Session, id uint64, _
 		// status predicate makes this transition one-way and prevents any stale
 		// failure from moving it back to pending.
 		return nil
+	}
+	return nil
+}
+
+func releaseUnavailableWithSession(ctx context.Context, db *dbr.Session, row outboxRow, owner string, interval time.Duration, now time.Time) error {
+	if db == nil {
+		return errOutboxNotInitialized
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := db.UpdateBySql(
+		"UPDATE event_outbox SET next_attempt_at=?,lease_owner=NULL,lease_until=NULL WHERE id=? AND status=? AND lease_owner=?",
+		now.Add(normalizeInterval(interval)), row.ID, outboxStatusPending, owner,
+	).ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("outbox: release unavailable target row: %w", err)
+	}
+	if _, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("outbox: read unavailable target release result: %w", err)
 	}
 	return nil
 }

@@ -12,10 +12,12 @@ var sqlFS embed.FS
 
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
+		workspaceContext := ctx.(*config.Context)
+		registerSpaceMemberRemovalCleanup()
 		return register.Module{
 			Name: "workspace",
 			SetupAPI: func() register.APIRouter {
-				return New(ctx.(*config.Context))
+				return New(workspaceContext)
 			},
 			SQLDir: register.NewSQLFS(sqlFS),
 		}
