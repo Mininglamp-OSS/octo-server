@@ -209,7 +209,10 @@ func (s *Service) removeAgentOnce(spaceID, userUID, botID string) error {
 	if err != nil {
 		return err
 	}
-	if _, reconcileErr := s.ensureTeamGroup(spaceID, userUID, false); reconcileErr != nil {
+	// An explicit removal is also an explicit repair attempt. Bypass the
+	// read-path cooldown so a retry cannot report success while subscriber
+	// revocation is still pending.
+	if _, reconcileErr := s.ensureTeamGroup(spaceID, userUID, true); reconcileErr != nil {
 		s.Warn("AI Agent removed but team-group projection is pending",
 			zap.Error(reconcileErr), zap.String("space_id", spaceID), zap.String("uid", userUID), zap.String("bot_id", botID))
 		// The durable is_added=0 mutation is intentionally retained, but the API

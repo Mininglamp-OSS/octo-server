@@ -96,9 +96,16 @@ Final blocker remediation checks:
   roster version before removing membership.
 - Managed groups no longer count against the owner's daily manual group quota.
 - `DELETE /v1/ai-team/agents/:bot_id` surfaces an unavailable subscriber
-  projection as a retryable 503 while retaining the durable removal.
+  projection as a retryable 503 while retaining the durable removal. A second
+  DELETE during the read cooldown retries the external revocation and remains
+  503 if the projection is still unavailable.
 - `go test ./modules/ai_team -run 'TestAITeamManagedGroupsDoNotConsumeDailyGroupCreationQuota|TestAITeamProjectionRechecksEligibilityBeforeMarkingReady|TestAITeamLifecycleRemovalCannotBeOverwrittenByStaleProjection|TestAITeamRemoveSurfacesPendingProjectionAfterDurableMutation|TestAITeamQueriesSurviveProductionCollationShape' -count=1`
 - `go test -c ./modules/group` and `go test -c ./modules/ai_team`
+- `go test ./modules/ai_team -run 'TestAITeam(RemoveSurfacesPendingProjectionAfterDurableMutation|FailedTeamProjectionUsesReadCooldown)$' -count=1`
+- `go test ./modules/ai_team -count=1`
+- `go build ./...`
+- `go vet ./...`
+- `make i18n-extract-check && make i18n-lint`
 
 The AI Team integration suite used the local MySQL, Redis, and WuKongIM test
 services. It covers eager pair-group creation, exact team-group projection,

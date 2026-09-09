@@ -421,7 +421,7 @@ func (s *Service) syncTeamGroupProjection(
 			return nil
 		}
 	}
-	err := fmt.Errorf("AI-team group projection roster did not stabilize")
+	err := fmt.Errorf("%w: AI-team group projection roster did not stabilize", errIMUnavailable)
 	s.markTeamGroupFailure(spaceID, userUID, groupNo, failureVersion, err)
 	return err
 }
@@ -443,7 +443,7 @@ func (s *Service) prepareTeamProjectionSnapshot(spaceID, userUID, groupNo string
 		return nil, err
 	}
 	if count != 1 || locked.GroupNo == "" || locked.GroupNo != groupNo {
-		return nil, fmt.Errorf("AI-team group projection target changed")
+		return nil, fmt.Errorf("%w: AI-team group projection target changed", errIMUnavailable)
 	}
 
 	desiredBots, err := desiredTeamBotIDsTx(tx, spaceID, userUID)

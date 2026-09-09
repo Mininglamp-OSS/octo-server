@@ -90,7 +90,9 @@ message, the shared AI Team helper atomically replaces that default title with a
   accounting now includes only ordinary `purpose=''` rows.
 - Durable removal and external revocation are separate outcomes. If subscriber
   reconciliation fails, the removal remains durable but the API returns the
-  retryable error instead of reporting complete success.
+  retryable error instead of reporting complete success. Explicit mutation
+  retries bypass the read-path cooldown so they retry revocation rather than
+  acknowledging a still-degraded projection.
 
 ## Verification
 

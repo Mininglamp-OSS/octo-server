@@ -1136,7 +1136,9 @@ func TestAITeamRemoveSurfacesPendingProjectionAfterDurableMutation(t *testing.T)
 	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
+	var calls atomic.Int32
 	failingIM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
 		http.Error(w, "forced IM failure", http.StatusInternalServerError)
 	}))
 	defer failingIM.Close()
@@ -1154,6 +1156,18 @@ func TestAITeamRemoveSurfacesPendingProjectionAfterDurableMutation(t *testing.T)
 	require.NoError(t, testContext.DB().Select("state").From("ai_team_group").
 		Where("space_id=? AND user_uid=?", f.spaceID, f.uid).LoadOne(&state))
 	assert.Zero(t, isAdded)
+	assert.Equal(t, 3, state)
+	firstCalls := calls.Load()
+	require.Positive(t, firstCalls)
+
+	// Explicit retries must bypass the read cooldown and must not acknowledge
+	// completion while the external subscriber revocation is still pending.
+	w = request(t, f, http.MethodDelete, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.ai_team.im_unavailable")
+	assert.Greater(t, calls.Load(), firstCalls)
+	require.NoError(t, testContext.DB().Select("state").From("ai_team_group").
+		Where("space_id=? AND user_uid=?", f.spaceID, f.uid).LoadOne(&state))
 	assert.Equal(t, 3, state)
 }
 
