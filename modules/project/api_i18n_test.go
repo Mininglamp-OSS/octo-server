@@ -127,8 +127,8 @@ func TestProjectNoLegacyResponseError(t *testing.T) {
 // best-effort anomaly counter is a diagnostic, not the guarantee.
 func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 	found := false
-	assignment := regexp.MustCompile(`member_epoch\s*=`)
-	increment := regexp.MustCompile(`member_epoch\s*=\s*member_epoch\s*\+\s*1`)
+	assignment := regexp.MustCompile(`\bmember_epoch\b\s*=`)
+	increment := regexp.MustCompile(`\bmember_epoch\b\s*=\s*\bmember_epoch\b\s*\+\s*1`)
 	setCall := regexp.MustCompile(`Set\(\s*"member_epoch"`)
 	setMap := regexp.MustCompile(`"member_epoch"\s*:`)
 
@@ -170,10 +170,10 @@ func TestMemberEpochOnlyEverIncrements(t *testing.T) {
 // in an error string is fine; that is why this does not simply ban the identifier.
 func TestIsOfficialHasNoWriter(t *testing.T) {
 	for _, col := range projectInsertColumns {
-		if col == "is_official" || col == "active_name" || col == "member_epoch" {
+		if col == "is_official" || col == "active_name" || col == "member_epoch" || col == "collaboration_role_epoch" {
 			t.Errorf("projectInsertColumns contains %q; is_official has no P0 writer (D6), "+
-				"active_name is a generated column (MySQL 3105), and member_epoch may only be "+
-				"written as member_epoch + 1", col)
+				"active_name is a generated column (MySQL 3105), and epochs may only be "+
+				"written through their atomic increment statements", col)
 		}
 	}
 

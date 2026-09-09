@@ -20,30 +20,40 @@ const metricNamespace = "project"
 // you that one of them forgot to check I1. Adding a path without adding its entry
 // value here is the failure this label exists to expose.
 const (
-	entryMemberAdd      = "member_add"
-	entryRoleChange     = "role_change"
-	entryCreateOwner    = "create_owner_seat"
-	entryLeave          = "leave"
-	entryMemberRemove   = "member_remove"
-	entryProjectCreate  = "project_create"
-	entryProjectUpdate  = "project_update"
-	entryProjectDisband = "project_disband"
-	entryProjectSetting = "project_setting"
+	entryMemberAdd               = "member_add"
+	entryRoleChange              = "role_change"
+	entryCreateOwner             = "create_owner_seat"
+	entryLeave                   = "leave"
+	entryMemberRemove            = "member_remove"
+	entryProjectCreate           = "project_create"
+	entryProjectUpdate           = "project_update"
+	entryProjectDisband          = "project_disband"
+	entryProjectSetting          = "project_setting"
+	entryCollaborationRoleCreate = "collaboration_role_create"
+	entryCollaborationRoleRename = "collaboration_role_rename"
+	entryCollaborationRoleDelete = "collaboration_role_delete"
+	entryCollaborationRoleBind   = "collaboration_role_bind"
 )
 
 // Rejection reasons. Low-cardinality enum; never a free-form message.
 const (
-	reasonNotSpaceMember   = "not_space_member"
-	reasonQuotaMembers     = "quota_members"
-	reasonQuotaPerSpace    = "quota_per_space"
-	reasonQuotaPerCreator  = "quota_per_creator"
-	reasonQuotaDailyCreate = "quota_daily_create"
-	reasonQuotaPinned      = "quota_pinned"
-	reasonProjectDisbanded = "project_disbanded"
-	reasonFlagOff          = "flag_off"
-	reasonPermissionDenied = "permission_denied"
-	reasonLastOwner        = "last_owner"
-	reasonNameDuplicated   = "name_duplicated"
+	reasonNotSpaceMember                 = "not_space_member"
+	reasonQuotaMembers                   = "quota_members"
+	reasonQuotaPerSpace                  = "quota_per_space"
+	reasonQuotaPerCreator                = "quota_per_creator"
+	reasonQuotaDailyCreate               = "quota_daily_create"
+	reasonQuotaPinned                    = "quota_pinned"
+	reasonProjectDisbanded               = "project_disbanded"
+	reasonFlagOff                        = "flag_off"
+	reasonPermissionDenied               = "permission_denied"
+	reasonLastOwner                      = "last_owner"
+	reasonNameDuplicated                 = "name_duplicated"
+	reasonCollaborationRoleNameInvalid   = "collaboration_role_name_invalid"
+	reasonCollaborationRoleInvalid       = "collaboration_role_invalid"
+	reasonCollaborationRoleTargetInvalid = "collaboration_role_target_invalid"
+	reasonCollaborationRoleDuplicated    = "collaboration_role_duplicated"
+	reasonQuotaCollaborationRoles        = "quota_collaboration_roles"
+	reasonQuotaMemberCollaborationRoles  = "quota_member_collaboration_roles"
 	// reasonProvisioningEnqueue is the outbox-write failure inside project creation.
 	// Separate from a generic store failure because this slice is what made create
 	// depend on that write at all; see errProvisioningEnqueueFailed.
@@ -52,6 +62,12 @@ const (
 	// (D3/D15). One reason label, matching the single error code: splitting it
 	// here would put on a dashboard the distinctions the wire deliberately hides.
 	reasonAgentNotEligible = "agent_not_eligible"
+)
+
+const (
+	collaborationRoleOutcomeChanged  = "changed"
+	collaborationRoleOutcomeNoop     = "noop"
+	collaborationRoleOutcomeRejected = "rejected"
 )
 
 var (
@@ -66,6 +82,32 @@ var (
 		Help: "Refused project writes, labeled by entry point and reason. " +
 			"The entry breakdown is what exposes a write path that skipped invariant I1.",
 	}, []string{"entry", "reason"})
+
+	collaborationRoleWrites = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "collaboration_role_writes_total",
+		Help:      "Project collaboration-role write attempts by bounded action and outcome.",
+	}, []string{"action", "outcome"})
+	collaborationRoleBackfillPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "collaboration_role_backfill_pending",
+		Help:      "Active projects missing built-in collaboration roles in the latest bounded page.",
+	})
+	collaborationRoleBackfilled = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "collaboration_role_backfilled_total",
+		Help:      "Projects whose built-in collaboration-role catalog was repaired by the bounded backfill.",
+	})
+	collaborationRoleIntegrityViolations = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "collaboration_role_integrity_violations",
+		Help:      "Orphan collaboration-role bindings or bindings on inactive seats across the latest completed bounded cursor rotation.",
+	})
+	collaborationRoleMaintenanceFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "collaboration_role_maintenance_failures_total",
+		Help:      "Failed collaboration-role backfill or integrity-scan operations.",
+	}, []string{"operation"})
 
 	// projectTotal / memberTotal are refreshed on the sparse metrics tick.
 	projectTotal = promauto.NewGauge(prometheus.GaugeOpts{
@@ -194,6 +236,10 @@ var (
 // observeRejected records one refused write.
 func observeRejected(entry, reason string) {
 	writeRejected.WithLabelValues(entry, reason).Inc()
+}
+
+func observeCollaborationRoleWrite(action, outcome string) {
+	collaborationRoleWrites.WithLabelValues(action, outcome).Inc()
 }
 
 // ---------------------------------------------------------------------------
