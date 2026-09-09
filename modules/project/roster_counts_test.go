@@ -2,9 +2,16 @@ package project
 
 // D16 的三个计数字段，在**列表路由**上的口径。
 //
-// 详情路由的分裂由 TestCreateProjectSeatsTheCreatorsAgents 覆盖；列表路由一直没有用例，
-// 而它恰恰是唯一一条两个数来自**两条语句**的路径（页查询的 seat_count + fillMemberCounts
-// 的人数），也是 toResp 为什么用 humans+agents 推导总数、而不是再读第三个计数的原因。
+// 详情路由的分裂由 TestCreateProjectSeatsTheCreatorsAgents 覆盖，列表路由一直没有用例。
+//
+// 上一版这里写的立论是「列表路由的两个数来自两条语句」——**那已经不成立了**：PR-5 把
+// seat_count 挪进了 fillMemberCounts，两个数现在出自同一次名册读取（见 db.go 上
+// fillMemberCounts 的注释，本 PR 自己也在 api.go 里这么写）。同一个 PR 里两处注释对同一个
+// 函数说了相反的话，正是本 PR 在别处修的那一类漂移。PR #868 的 review，P2-4。
+//
+// 真正的立论更简单，也仍然成立：两条路由必须给出同一套口径，而它们的两个数由**不同的
+// 代码**算出来（详情走 countActiveSeatsByKind，列表走 fillMemberCounts）。下面最后那三行
+// ——列表与详情逐字段相等——是这个文件真正值钱的地方。
 //
 // 三个字段的含义在 GA 前被改回来了：member_count 是全部席位（D16 之前的含义，也是
 // modules/opanalytics 对同名字段的含义），人/分身的拆分放在 human_member_count 与
@@ -21,8 +28,7 @@ import (
 
 func TestListRouteSplitsTheRosterAndTheThreeCountsAddUp(t *testing.T) {
 	srv, p := setup(t)
-	stub := stubAllMemberGroup(t, "grp_counts_1")
-	_ = stub
+	stubAllMemberGroup(t, "grp_counts_1") // registers its own t.Cleanup restore
 	r := mountProject(t, p)
 	_ = srv
 
@@ -60,8 +66,8 @@ func TestListRouteSplitsTheRosterAndTheThreeCountsAddUp(t *testing.T) {
 			"modules/opanalytics 用同名字段表示总数——一个服务两个含义，"+
 			"客户端读错不会有任何东西报错。GA 前改回来是免费的")
 	assert.Equal(t, row.HumanMemberCount+row.AgentMemberCount, row.MemberCount,
-		"三个数必须加得起来。列表路由的两个半数来自两条语句、两个读视图，所以总数是"+
-			"由两半推导出来的，而不是再读第三个计数——否则并发写会让三个数互相矛盾")
+		"三个数必须加得起来。总数由两半推导，而不是再读第三个计数——那样它就会在另一个"+
+			"读视图下算出来，并发写会让三个数互相矛盾")
 
 	// 详情路由必须给出同一套答案，否则同一个字段在两个端点上又是两个意思。
 	w = doOn(t, r, http.MethodGet, "/v1/projects/"+created.ProjectID, owner, nil)

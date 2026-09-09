@@ -249,8 +249,11 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 
 // countActiveSeatsByKind 分别数活跃席位里的人和分身（D16）。
 //
-// 两个数必须自洽：member_count + agent_count 要等于配额所数的席位总数，否则客户端
-// 拿这两个数去减就会得到负值。上一版靠"条件聚合，同一次扫描、同一个读视图"做到这
+// 两个数必须自洽：human_member_count + agent_member_count 要等于 member_count，也就是
+// 配额所数的席位总数，否则客户端拿这两个数去减就会得到负值。（字段名在 PR #868 改回
+// 了仓库既有口径：member_count 是总数，拆分放在另外两个字段上；这句话上一版还写着
+// 已经不存在的 agent_count，等于在说 seats + agents == seats——第八轮 review 已经因为
+// 同一段注释描述了不存在的语句纠正过一次。）上一版靠"条件聚合，同一次扫描、同一个读视图"做到这
 // 一点；现在靠的是**同一份名册快照**——席位 uid 只读一次，其中每一个要么是 bot 要么
 // 不是，所以两个数按算术相加就等于 len(uids)。性质没变，理由变了（第八轮 review：
 // 注释还在描述已经不存在的那条语句）。

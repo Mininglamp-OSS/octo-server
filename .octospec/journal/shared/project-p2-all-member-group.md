@@ -603,6 +603,55 @@ client should DISPLAY. It was answered by changing what the server MEANS. Those 
 adjacent enough to substitute for each other without anyone noticing, and the substitution
 costs a name.
 
+### A guard can draw its line on spelling and explain it in semantics
+
+The census matched a literal `"status": 0`. Two live endpoints turn a bot off without one
+— one assigns a parsed parameter to a struct field, the other puts the value in a
+caller-supplied map — and the write that reaches the database from the first is
+byte-identical to the write the guard classifies as a deletion primitive. The only
+difference between "primitive" and "invisible" was where the zero was typed.
+
+What made it durable rather than merely wrong was the comment. It said the non-match was
+*correct*, because those endpoints are "a reversible disable, not a deletion". That
+sentence is about meaning; the behaviour it explained was about syntax. And the primitive
+it contrasted against — `deleteRobotSoft` — is exactly as reversible, so the distinction
+did not even hold on its own terms. A reader checking the guard would have found a reason
+and stopped.
+
+A justification written for behaviour you did not verify is worse than no justification:
+absence invites the next reader to look, and a plausible reason tells them not to.
+
+### A matcher branch with no example is a branch that has already stopped working
+
+Round 11 found the census passing for the wrong reason: an exempt primitive matched
+through an unrelated fallback, so the branch meant to catch its real spelling was never
+exercised. The fix added three branches. A reviewer then deleted each of the three and
+found the suite still green — nothing in the tree spells those shapes today.
+
+So the fix had the property it was fixing, one level up. The outcome assertion ("every
+door routes or is exempt") cannot see this, because it is true of a matcher that detects
+nothing as long as the tree contains nothing to detect. The two things are only
+independent if something exercises the detection paths directly, and in this case that
+means fixtures parsed from source strings — the tree cannot supply an example of a shape
+whose whole point is that the tree does not contain it yet.
+
+Worth stating as a rule, because this chain has now produced the same shape at three
+levels: **guards should assert their own detection paths, not only their outcomes.**
+
+### Widening a matcher tells you what it was quietly filing away
+
+Making the rule effect-based immediately produced a false positive — a function that
+hands `SetMap` a map it builds itself, all `agent_*` columns, never `status`. The first
+rule said "not a literal", which is not the same as "the caller's": a locally built map
+has knowable columns, a parameter does not.
+
+The correction narrowed the rule to `SetMap(p)` where `p` is one of the function's own
+parameters, and that narrowing removed a class of accusation the old rule was already
+making — callers of `setDescription`, `updateBotCommands`, `updateRobotIMTokenCache`
+could be reported as bot-deletion doors and told to call `CloseAllSpaceSeats`, which for
+them is actively wrong advice. The false positive was not a cost of widening; it was
+already there, hidden behind a narrower trigger.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

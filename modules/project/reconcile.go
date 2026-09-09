@@ -279,9 +279,15 @@ func (p *Project) runReconcile() {
 		p.scanOrphanProjects()
 	}
 
-	// These two touch only this module's own tables, so they are unaffected by the drift and run
-	// unconditionally. Keeping them outside the gate matters: scanOwnerlessProjects detects a
-	// state P0 cannot repair, which is precisely what should not be waiting on an ops window.
+	// Ungated, along with the three P1 scans below. The general reason covers all five:
+	// every comparison any of them makes that crosses into the pinned schema carries an
+	// explicit COLLATE, so they survive the drift the gate exists for. These two happen also
+	// to touch only this module's own tables, which is the narrower reason this comment used
+	// to give — and giving the narrow one is how review8_reconcile_gate_test.go's header ended
+	// up asserting a smaller set than the code had. PR #868s review, P2-5.
+	//
+	// Keeping them outside the gate matters: scanOwnerlessProjects detects a state P0 cannot
+	// repair, which is precisely what should not be waiting on an ops window.
 	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
 	// P1: the group-binding invariants. I2 is the one with teeth — there is no

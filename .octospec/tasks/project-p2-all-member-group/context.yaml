@@ -1699,7 +1699,9 @@ pr_855_round_11_fixed:
       historical row count for one (space_id, uid) is unbounded.
     fix: |
       A spent budget no longer asks for a retry: it counts a new metric reason
-      (owner_budget_spent), logs the resume cursor, and returns nil. What is given up is
+      counter of its own (project_all_member_group_owner_convergence_incomplete_total, NOT a
+      kind on the sync-failure counter -- see the entry below for why that was rejected), logs
+      the resume cursor, and returns nil. What is given up is
       stated in the code: the projects past the budget are not converged this time, and
       wait for their own next kick / leave / role change -- all three of which already call
       the same sync. Persisting the cursor would need a column on
@@ -1855,6 +1857,106 @@ pr_855_member_count_realigned:
       Done before the module's first GA, which is the only time it is free. After that,
       restoring member_count and renaming agent_count are two breaking changes rather than
       one field rename in an integration that has not shipped.
+
+# PR #868 收到三份 review：两票 APPROVE，一票 CHANGES_REQUESTED（Octo-Q，1 个 P1）。
+# 门禁状态最终是 approved，但那条 P1 成立，连同 yujiawei 的 P2-1/P2-2 是同一类，一并修。
+pr_868_review_fixed:
+  - id: the-census-drew-its-line-on-spelling-and-called-it-semantics
+    severity: high
+    reported_by: "mochashanyao P1; yujiawei P2-1 found the same class from another angle"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The one-hop rule keyed on a literal `"status": 0` in the CALLER, so it could not see
+      either live endpoint that turns a bot off:
+        updateRobotStatus  PUT /robot/status/{id}/{status}  robot.Status = int(status)
+                           -> updateRobot -> UPDATE robot SET version=?, status=?
+        robotUpdate        PUT /robots/{id}                 fields["status"] = *req.Status
+                           -> updateRobotInfo
+      updateRobot's write is BYTE-IDENTICAL to deleteRobotSoft's, which this file classifies
+      as a deletion primitive whose doors must route through D14. The only difference is that
+      one spells the zero as a literal. And the first door's zero is the DEFAULT for a
+      malformed path parameter, so it is reachable by accident.
+      Worse than the miss: my step-0 comment justified it -- "correct, it is a reversible
+      disable, not a deletion". deleteRobotSoft is exactly as reversible. That was a semantic
+      story told about a syntactic behaviour, and it would have taught the next reader that
+      the gap was a decision.
+      yujiawei's angle: the `.Set("status", 0)` chain (182 uses in the tree) was unmatched too,
+      and such a function landed in the benign-helper set -- so the guard did not merely miss
+      the door, it filed it under harmless and then used it to accuse that door's callers.
+    fix: |
+      The rule is now effect-based. A function that writes the robot table's status column
+      with ANY value -- literal, variable, or a caller-supplied field map -- is STATUS-CAPABLE,
+      and every caller of one is a door candidate. Both dbr spellings of a literal zero
+      (SetMap entry and Set chain) now make a function a primitive.
+      What happens to the two doors is a DECISION recorded in d14ExemptDoors with its residue
+      spelled out, not an omission in a matcher: disable is not delete (reversible, releases no
+      username, rotates no token), and round 11 already ruled that whether a disable should
+      release the project seat is a PRODUCT question. Recording the exemption is the honest
+      move; routing them through D14 would be answering that question myself.
+    a-false-positive-the-widening-produced-and-what-it-taught: |
+      The first widening flagged bot_api's applyAgentReport, because it hands SetMap a map it
+      builds itself. "Not a literal" is not the same as "the caller's": a locally built map has
+      knowable columns (all agent_*, never status), a parameter does not. Narrowed to
+      `SetMap(p)` where p is one of the function's own parameters -- which also narrows what
+      used to be flagged, so callers of setDescription / updateBotCommands /
+      updateRobotIMTokenCache are no longer accused of being bot-deletion doors (yujiawei P2-6).
+    mutation: |
+      Five probes, each killing exactly one fixture: remove the Set-chain branch; remove the
+      dbr hard-delete branch; remove the raw-SQL hard-delete branch; remove the SetMap-param
+      branch; and widen SetMap back to "any non-literal" (the false-positive regression).
+  - id: the-matchers-that-close-the-blind-spots-were-themselves-unguarded
+    severity: medium
+    reported_by: "yujiawei P2-2 -- the one he said he would fix before merge"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The census asserts an OUTCOME over the tree. It says nothing about whether each matcher
+      branch can still SEE its shape. yujiawei verified by deletion: remove the hard-delete
+      branch, or step 0, or the uncalled-primitive rule, and the suite stays green -- because
+      nothing in the tree spells those shapes today. That is the same defect the PR was fixing
+      (round 11: the census passed for the wrong reason), moved one abstraction level up.
+    fix: |
+      TestCensusMatcherSeesEverySpellingItClaimsTo -- ten fixtures parsed from source strings,
+      one per matched shape plus three that must NOT match (status zero on another table, a
+      locally built map, a table whose name merely starts with robot). Source strings rather
+      than the repository, because a branch covering a shape the tree does not contain can only
+      be exercised that way. The scanner was split into censusFuncsIn so both drivers share one
+      classifier.
+    note: |
+      This is the exit criterion yujiawei proposes for the whole chain, and it is the right one:
+      guards that assert their own detection paths, not just their outcomes.
+  - id: four-comments-and-two-records-left-stale-by-this-work
+    severity: low
+    reported_by: "yujiawei P2-4/P2-5, mochashanyao P2 x2"
+    fix: |
+      - db_agent.go: the identity read "member_count + agent_count == seats", i.e. after #868
+        "seats + agents == seats", naming a field that no longer exists. Now stated as
+        human_member_count + agent_member_count == member_count. The eighth review had already
+        corrected this same comment once.
+      - roster_counts_test.go: justified itself on the list route being "the only path where the
+        two numbers come from TWO statements". PR-5 moved seat_count into fillMemberCounts, so
+        both come from one roster read -- which this PR's own db.go and api.go comments say. Two
+        comments in one PR stating opposite facts about one function. Re-argued on what is
+        actually true: the two routes compute their halves in DIFFERENT CODE and must agree.
+      - reconcile.go: said the ungated pair "touch only this module's own tables", the narrower
+        of the two reasons -- and giving the narrow one is how the gate test's header ended up
+        asserting a smaller set than the code had.
+      - context.yaml: recorded the budget-spent event as "a new metric reason
+        (owner_budget_spent)" while the code ships a dedicated counter, with the same block
+        recording that the kind was REJECTED. An operator writing an alert from it would have
+        queried a series that does not exist.
+      - project-p2-product-surfaces/brief.md: still recorded member_count as humans-only, and
+        that paragraph is explicitly earmarked as the source for the not-yet-written Swagger
+        contract -- so leaving it would have written the retired semantics into the contract at
+        the moment it was created.
+  - id: the-pr-description-claimed-coverage-that-was-not-committed
+    severity: low
+    reported_by: "both reviewers, independently"
+    what: |
+      The Testing section said the census guard "executes against both of the reviewer's own
+      probes and against an inline-deletion door". Those were throwaway mutations I ran, not
+      committed fixtures. Overstating coverage in the description of a PR whose subject is a
+      guard that passed for the wrong reason.
+    fix: "description corrected, and the fixtures now actually exist (entry above)."
 
 verify:
   rules_rechecked:
