@@ -345,12 +345,7 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		// Same reasoning as the retired reclaim env below: an operator who followed the
 		// runbook has to learn that the instruction did nothing, and a startup problem is
 		// the channel that survives a restart loop.
-		if cfg.RequeueProjectID != "" {
-			problems = append(problems, fmt.Errorf(
-				"project provisioning: %s is set but %s enables no target, so no row will be requeued; "+
-					"enable the target that owns the stuck row, or clear the requeue env",
-				envProvisionRequeueProjectID, envProvisionTargets))
-		}
+		problems = appendDisabledRequeueProblem(problems, cfg)
 		cfg.Problems = problems
 		return cfg, problems
 	}
@@ -386,8 +381,22 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		secrets[name] = secret
 		cfg.Targets = append(cfg.Targets, target)
 	}
+	problems = appendDisabledRequeueProblem(problems, cfg)
 	cfg.Problems = problems
 	return cfg, problems
+}
+
+// appendDisabledRequeueProblem reports a rescue instruction that cannot execute.
+// startProvisioningWorker returns before requeueing whenever no VALID target survived
+// configuration, whether the target list was empty or every requested target was rejected.
+func appendDisabledRequeueProblem(problems []error, cfg ProvisioningConfig) []error {
+	if cfg.RequeueProjectID == "" || cfg.Enabled() {
+		return problems
+	}
+	return append(problems, fmt.Errorf(
+		"project provisioning: %s is set but %s leaves no valid target enabled, so no row will be requeued; "+
+			"configure and enable the target that owns the stuck row, or clear the requeue env",
+		envProvisionRequeueProjectID, envProvisionTargets))
 }
 
 // parseMaxAttempts resolves the retry budget, refusing a value outside
