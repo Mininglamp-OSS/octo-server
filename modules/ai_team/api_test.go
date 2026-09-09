@@ -1093,6 +1093,225 @@ func TestAITeamLifecycleRemovalCannotBeOverwrittenByStaleProjection(t *testing.T
 	assert.Zero(t, isAdded)
 }
 
+func TestAITeamOwnerRemovalCannotBeOverwrittenByStaleTeamProjection(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var teamGroupNo string
+	require.NoError(t, testContext.DB().Select("group_no").From("ai_team_group").
+		Where("space_id=? AND user_uid=?", f.spaceID, f.uid).LoadOne(&teamGroupNo))
+	const shortID = "owner-removal-subarea"
+	_, err := testContext.DB().InsertBySql(`INSERT INTO thread
+		(short_id,group_no,name,creator_uid,status,version) VALUES (?,?,?,?,1,1)`,
+		shortID, teamGroupNo, "Subarea", f.uid).Exec()
+	require.NoError(t, err)
+
+	type imEvent struct {
+		Path        string
+		ChannelID   string
+		Subscribers []string
+	}
+	var eventsMu sync.Mutex
+	var events []imEvent
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" || r.URL.Path == "/channel/subscriber_add" || r.URL.Path == "/channel/subscriber_remove" {
+			var payload struct {
+				ChannelID   string   `json:"channel_id"`
+				Subscribers []string `json:"subscribers"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			if r.URL.Path == "/channel" && payload.ChannelID == teamGroupNo {
+				enteredOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+			eventsMu.Lock()
+			events = append(events, imEvent{Path: r.URL.Path, ChannelID: payload.ChannelID, Subscribers: payload.Subscribers})
+			eventsMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	_, err = testContext.DB().Update("ai_team_group").Set("state", 3).Set("retry_after", nil).
+		Where("space_id=? AND user_uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodGet, "/v1/ai-team/agents", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("team projection did not reach WuKongIM")
+	}
+
+	_, err = testContext.DB().Update("space_member").Set("status", 0).
+		Where("space_id=? AND uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().Update("group_member").Set("role", group.MemberRoleCommon).
+		Where("group_no=? AND uid=? AND is_deleted=0", teamGroupNo, f.uid).Exec()
+	require.NoError(t, err)
+	removed, err := group.NewService(testContext).RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
+		GroupNo: teamGroupNo, Members: []string{f.uid}, OperatorUID: "space-admin",
+		OperatorName: "Space admin", SuppressRemoveNotice: true, SuppressBotCascadeTip: true,
+		AllowProtected: true,
+	})
+	require.NoError(t, err)
+	require.Positive(t, removed.Removed)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale team projection did not converge after owner removal")
+	}
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, channelID := range []string{teamGroupNo, teamGroupNo + "____" + shortID} {
+		var last *imEvent
+		for i := range events {
+			if events[i].ChannelID == channelID {
+				last = &events[i]
+			}
+		}
+		require.NotNil(t, last, "expected a terminal projection event for %s", channelID)
+		assert.Equal(t, "/channel/subscriber_remove", last.Path)
+		assert.ElementsMatch(t, []string{f.uid, f.botID}, last.Subscribers)
+	}
+	var finalState, activeMembers int
+	require.NoError(t, testContext.DB().Select("state").From("ai_team_group").
+		Where("space_id=? AND user_uid=?", f.spaceID, f.uid).LoadOne(&finalState))
+	require.NoError(t, testContext.DB().Select("COUNT(*)").From("group_member").
+		Where("group_no=? AND is_deleted=0 AND status=1", teamGroupNo).LoadOne(&activeMembers))
+	assert.Equal(t, 2, finalState)
+	assert.Zero(t, activeMembers)
+}
+
+func TestAITeamOwnerRemovalCannotBeOverwrittenByStaleContainerProjection(t *testing.T) {
+	f := seedFixture(t)
+	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID+"/sessions", "owner-removal-session", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var session struct {
+		GroupNo   string `json:"group_no"`
+		ShortID   string `json:"session_id"`
+		ChannelID string `json:"channel_id"`
+	}
+	decodeJSON(t, w, &session)
+	require.NotEmpty(t, session.GroupNo)
+	require.NotEmpty(t, session.ShortID)
+
+	type imEvent struct {
+		Path        string
+		ChannelID   string
+		Subscribers []string
+	}
+	var eventsMu sync.Mutex
+	var events []imEvent
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channel" || r.URL.Path == "/channel/subscriber_remove" {
+			var payload struct {
+				ChannelID   string   `json:"channel_id"`
+				Subscribers []string `json:"subscribers"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			if r.URL.Path == "/channel" && payload.ChannelID == session.GroupNo {
+				enteredOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+			eventsMu.Lock()
+			events = append(events, imEvent{Path: r.URL.Path, ChannelID: payload.ChannelID, Subscribers: payload.Subscribers})
+			eventsMu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	cfg := testContext.GetConfig()
+	previousURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = stub.URL
+	defer func() { cfg.WuKongIM.APIURL = previousURL }()
+
+	req, err := http.NewRequest(http.MethodPost, "/v1/ai-team/agents/"+f.botID, nil)
+	require.NoError(t, err)
+	req.Header.Set("token", f.token)
+	req.Header.Set("X-Space-ID", f.spaceID)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		testServer.GetRoute().ServeHTTP(response, req)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("container projection did not reach WuKongIM")
+	}
+
+	_, err = testContext.DB().Update("space_member").Set("status", 0).
+		Where("space_id=? AND uid=?", f.spaceID, f.uid).Exec()
+	require.NoError(t, err)
+	_, err = testContext.DB().Update("group_member").Set("role", group.MemberRoleCommon).
+		Where("group_no=? AND uid=? AND is_deleted=0", session.GroupNo, f.uid).Exec()
+	require.NoError(t, err)
+	removed, err := group.NewService(testContext).RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
+		GroupNo: session.GroupNo, Members: []string{f.uid}, OperatorUID: "space-admin",
+		OperatorName: "Space admin", SuppressRemoveNotice: true, SuppressBotCascadeTip: true,
+		AllowProtected: true,
+	})
+	require.NoError(t, err)
+	require.Positive(t, removed.Removed)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale container projection did not finish after owner removal")
+	}
+	require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, channelID := range []string{session.GroupNo, session.ChannelID} {
+		var last *imEvent
+		for i := range events {
+			if events[i].ChannelID == channelID {
+				last = &events[i]
+			}
+		}
+		require.NotNil(t, last, "expected a terminal container event for %s", channelID)
+		assert.Equal(t, "/channel/subscriber_remove", last.Path)
+		assert.ElementsMatch(t, []string{f.uid, f.botID}, last.Subscribers)
+	}
+	var containerState int
+	require.NoError(t, testContext.DB().Select("container_state").From("ai_team_agent").
+		Where("space_id=? AND user_uid=? AND bot_id=?", f.spaceID, f.uid, f.botID).LoadOne(&containerState))
+	assert.Equal(t, 3, containerState)
+}
+
 func TestAITeamFailedTeamProjectionUsesReadCooldown(t *testing.T) {
 	f := seedFixture(t)
 	w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+f.botID, "", nil)
@@ -1293,6 +1512,7 @@ func TestAITeamQueriesSurviveProductionCollationShape(t *testing.T) {
 	// thread and the new AI tables explicitly use general_ci. Keep this drift
 	// deliberate: a same-collation CI database cannot catch MySQL error 1267.
 	for _, ddl := range []string{
+		"CREATE TABLE `seq` (id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `key` VARCHAR(100) NOT NULL DEFAULT '', min_seq BIGINT NOT NULL DEFAULT 1000000, step INTEGER NOT NULL DEFAULT 1000, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY seq_uidx (`key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		`CREATE TABLE system_setting (category VARCHAR(64), key_name VARCHAR(128), value TEXT, value_type VARCHAR(16), description VARCHAR(255), UNIQUE KEY uk_category_key(category,key_name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE robot (robot_id VARCHAR(40) PRIMARY KEY, creator_uid VARCHAR(40), status TINYINT, agent_hosting VARCHAR(64) NOT NULL DEFAULT '', KEY idx_robot_creator(creator_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		`CREATE TABLE user (uid VARCHAR(40) PRIMARY KEY, name VARCHAR(100), status TINYINT, is_destroy TINYINT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,

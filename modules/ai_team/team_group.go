@@ -229,6 +229,24 @@ func desiredTeamBotIDsTx(tx *dbr.Tx, spaceID, userUID string) ([]string, error) 
 	return botIDs, err
 }
 
+func desiredTeamRosterTx(tx *dbr.Tx, spaceID, userUID string) ([]string, error) {
+	ownerActive, err := group.IsAITeamOwnerActiveTx(tx, spaceID, userUID)
+	if err != nil {
+		return nil, err
+	}
+	if !ownerActive {
+		return []string{}, nil
+	}
+	botIDs, err := desiredTeamBotIDsTx(tx, spaceID, userUID)
+	if err != nil {
+		return nil, err
+	}
+	desired := make([]string, 0, len(botIDs)+1)
+	desired = append(desired, userUID)
+	desired = append(desired, botIDs...)
+	return desired, nil
+}
+
 func (s *Service) ensureTeamGroup(spaceID, userUID string, forceIM bool) (*TeamGroup, error) {
 	botIDs, err := s.desiredTeamBotIDs(spaceID, userUID)
 	if err != nil {
@@ -365,6 +383,12 @@ func markLifecycleRosterRemovalTx(
 	case aiteampkg.TeamGroupPurpose:
 		owners = append(owners, &ownerKey{SpaceID: spaceID, UserUID: ownerUID})
 	case aiteampkg.GroupPurpose:
+		for _, uid := range removedUIDs {
+			if uid == ownerUID {
+				owners = append(owners, &ownerKey{SpaceID: spaceID, UserUID: ownerUID})
+				break
+			}
+		}
 		if _, err := tx.Select("DISTINCT space_id", "user_uid").From("ai_team_agent").
 			Where("group_no=? AND bot_id IN ?", groupNo, removedUIDs).Load(&owners); err != nil {
 			return fmt.Errorf("query affected AI-team owners: %w", err)
@@ -372,11 +396,27 @@ func markLifecycleRosterRemovalTx(
 	default:
 		return nil
 	}
+	seenOwners := make(map[ownerKey]struct{}, len(owners))
 	for _, owner := range owners {
+		key := ownerKey{SpaceID: owner.SpaceID, UserUID: owner.UserUID}
+		if _, seen := seenOwners[key]; seen {
+			continue
+		}
+		seenOwners[key] = struct{}{}
 		if _, err := tx.UpdateBySql(`UPDATE ai_team_group
 			SET state=?,last_error='',roster_version=roster_version+1,retry_after=CURRENT_TIMESTAMP
 			WHERE space_id=? AND user_uid=?`, containerProvisioning, owner.SpaceID, owner.UserUID).Exec(); err != nil {
 			return fmt.Errorf("advance AI-team roster version after lifecycle removal: %w", err)
+		}
+		for _, uid := range removedUIDs {
+			if uid != owner.UserUID {
+				continue
+			}
+			if _, err := tx.Update("ai_team_agent").Set("container_state", containerProvisioning).
+				Where("space_id=? AND user_uid=? AND is_added=1", owner.SpaceID, owner.UserUID).Exec(); err != nil {
+				return fmt.Errorf("mark owner-revoked AI-team containers pending: %w", err)
+			}
+			break
 		}
 		if _, err := tx.Update("ai_team_agent").Set("is_added", 0).
 			Where("space_id=? AND user_uid=? AND bot_id IN ?", owner.SpaceID, owner.UserUID, removedUIDs).Exec(); err != nil {
@@ -446,7 +486,7 @@ func (s *Service) prepareTeamProjectionSnapshot(spaceID, userUID, groupNo string
 		return nil, fmt.Errorf("%w: AI-team group projection target changed", errIMUnavailable)
 	}
 
-	desiredBots, err := desiredTeamBotIDsTx(tx, spaceID, userUID)
+	desired, err := desiredTeamRosterTx(tx, spaceID, userUID)
 	if err != nil {
 		return nil, err
 	}
@@ -457,20 +497,14 @@ func (s *Service) prepareTeamProjectionSnapshot(spaceID, userUID, groupNo string
 	}
 	var historicalMembers []string
 	if _, err = tx.SelectBySql(`SELECT uid FROM group_member
-		WHERE group_no=? AND uid<>? ORDER BY uid FOR UPDATE`, groupNo, userUID).Load(&historicalMembers); err != nil {
+		WHERE group_no=? ORDER BY uid FOR UPDATE`, groupNo).Load(&historicalMembers); err != nil {
 		return nil, err
 	}
+	knownBots = append(knownBots, userUID)
 	knownBots = append(knownBots, historicalMembers...)
-	desiredSet := make(map[string]struct{}, len(desiredBots)+1)
-	desired := make([]string, 0, len(desiredBots)+1)
-	desired = append(desired, userUID)
-	desiredSet[userUID] = struct{}{}
-	for _, uid := range desiredBots {
-		if _, ok := desiredSet[uid]; ok {
-			continue
-		}
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, uid := range desired {
 		desiredSet[uid] = struct{}{}
-		desired = append(desired, uid)
 	}
 	excludedSet := make(map[string]struct{}, len(knownBots))
 	excluded := make([]string, 0, len(knownBots))
@@ -522,13 +556,10 @@ func (s *Service) markTeamProjectionReadyIfCurrent(
 	if count != 1 || row.GroupNo != groupNo || row.RosterVersion != expectedVersion {
 		return false, nil
 	}
-	botIDs, err := desiredTeamBotIDsTx(tx, spaceID, userUID)
+	currentDesired, err := desiredTeamRosterTx(tx, spaceID, userUID)
 	if err != nil {
 		return false, err
 	}
-	currentDesired := make([]string, 0, len(botIDs)+1)
-	currentDesired = append(currentDesired, userUID)
-	currentDesired = append(currentDesired, botIDs...)
 	if !sameStringSet(currentDesired, expectedDesired) {
 		return false, nil
 	}

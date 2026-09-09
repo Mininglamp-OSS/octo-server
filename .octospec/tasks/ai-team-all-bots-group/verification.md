@@ -70,6 +70,22 @@ Final round-4 review remediation checks:
 - `go build ./...`
 - `go vet ./...`
 - `make i18n-extract-check && make i18n-lint`
+
+Owner lifecycle projection checks:
+
+- aggregate snapshots and ready CAS checks use the same owner Space-liveness
+  predicate as managed-group admission;
+- owner removal racing a blocked aggregate projection ends with empty parent
+  and subarea subscriptions and a converged persisted state;
+- owner removal racing a blocked private-container projection compensates the
+  stale upsert by removing both participants from the parent and every session
+  channel, while leaving Agent activation intent available for a later rejoin;
+- `go test -race ./modules/ai_team -run '^TestAITeamOwnerRemovalCannotBeOverwrittenByStale(Team|Container)Projection$' -count=1`
+- `go test ./modules/ai_team -count=1`
+- `go test ./modules/group -run '^$' -count=1`
+- `go build ./...`
+- `go vet ./...`
+- `make i18n-extract-check && make i18n-lint`
 - GeelyOcto production build: `pnpm --filter @octo/web build`
 - Browser E2E: opening My AI Team now clears a stale right pane; clicking New
   Session creates `新对话`; the first no-mention text renamed both the list row

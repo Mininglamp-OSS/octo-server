@@ -93,6 +93,12 @@ message, the shared AI Team helper atomically replaces that default title with a
   retryable error instead of reporting complete success. Explicit mutation
   retries bypass the read-path cooldown so they retry revocation rather than
   acknowledging a still-degraded projection.
+- The owner is part of the projected authority, not an unconditional member.
+  Aggregate snapshots and ready CAS checks gate the owner through one shared
+  Space-liveness predicate and explicitly revoke the owner when it fails.
+  Private-container writes validate the same authority before and after IM I/O;
+  a lifecycle race is compensated by removing both participants from the parent
+  and every session channel while preserving the Agent's durable rejoin intent.
 
 ## Verification
 

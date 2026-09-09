@@ -407,6 +407,21 @@ func hasExactAITeamMembers(members []*aiTeamActiveMember, ownerUID, botUID strin
 	return foundOwner && foundBot
 }
 
+// IsAITeamOwnerActiveTx is the shared authority check for every managed AI
+// group projection. Callers that project members or external subscribers must
+// use this predicate so a revoked owner cannot remain in one projection while
+// another has already removed them.
+func IsAITeamOwnerActiveTx(tx *dbr.Tx, spaceID, ownerUID string) (bool, error) {
+	var ownerCount int
+	if err := tx.SelectBySql(`SELECT COUNT(*) FROM user u
+		JOIN space sp ON sp.space_id=? AND sp.status=1
+		JOIN space_member sm ON sm.space_id=sp.space_id AND sm.uid=u.uid AND sm.status=1
+		WHERE u.uid=? AND u.status=1 AND u.is_destroy<>2`, spaceID, ownerUID).LoadOne(&ownerCount); err != nil {
+		return false, fmt.Errorf("group: validate AI-team group owner: %w", err)
+	}
+	return ownerCount == 1, nil
+}
+
 // SyncAITeamGroupMembersTx projects the authoritative AI-agent roster into the
 // visible "我的AI团队" group. Unlike ordinary admission, this bridge owns the
 // complete set: it restores missing desired members and soft-deletes every
@@ -441,14 +456,11 @@ func SyncAITeamGroupMembersTx(
 		return false, errors.New("group: AI-team group projection target mismatch")
 	}
 
-	var ownerCount int
-	if err = tx.SelectBySql(`SELECT COUNT(*) FROM user u
-		JOIN space sp ON sp.space_id=? AND sp.status=1
-		JOIN space_member sm ON sm.space_id=sp.space_id AND sm.uid=u.uid AND sm.status=1
-		WHERE u.uid=? AND u.status=1 AND u.is_destroy<>2`, spaceID, ownerUID).LoadOne(&ownerCount); err != nil {
-		return false, fmt.Errorf("group: validate AI-team group owner: %w", err)
+	ownerActive, err := IsAITeamOwnerActiveTx(tx, spaceID, ownerUID)
+	if err != nil {
+		return false, err
 	}
-	if ownerCount != 1 {
+	if !ownerActive {
 		return false, errors.New("group: AI-team group owner is not active in space")
 	}
 

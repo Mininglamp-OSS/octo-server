@@ -59,15 +59,20 @@ func (s *Service) validateAuthority(spaceID, userUID, botID string) (string, err
 }
 
 func validateAuthorityTx(tx *dbr.Tx, spaceID, userUID, botID string) error {
+	ownerActive, err := group.IsAITeamOwnerActiveTx(tx, spaceID, userUID)
+	if err != nil {
+		return err
+	}
+	if !ownerActive {
+		return errForbidden
+	}
 	var count int
-	err := tx.SelectBySql(`
+	err = tx.SelectBySql(`
 		SELECT COUNT(*)
 		FROM robot r
 		JOIN user u ON u.uid=r.robot_id AND u.status=1 AND u.is_destroy<>2
-		JOIN space sp ON sp.space_id=? AND sp.status=1
-		JOIN space_member human_sm ON human_sm.space_id=sp.space_id AND human_sm.uid=? AND human_sm.status=1
-		JOIN space_member bot_sm ON bot_sm.space_id=sp.space_id AND bot_sm.uid=r.robot_id AND bot_sm.status=1
-		WHERE r.robot_id=? AND r.creator_uid=? AND r.status=1`, spaceID, userUID, botID, userUID).LoadOne(&count)
+		JOIN space_member bot_sm ON bot_sm.space_id=? AND bot_sm.uid=r.robot_id AND bot_sm.status=1
+		WHERE r.robot_id=? AND r.creator_uid=? AND r.status=1`, spaceID, botID, userUID).LoadOne(&count)
 	if err != nil {
 		return err
 	}
@@ -169,7 +174,7 @@ func (s *Service) ensureAgentContainer(spaceID, userUID, botID string, forceIM b
 	if !forceIM && !containerNeedsReconcile {
 		return s.getAgent(spaceID, userUID, botID, false)
 	}
-	if err = s.ensureContainerIMReady(agent.ID, groupNo, userUID, botID); err != nil {
+	if err = s.ensureContainerIMReady(agent.ID, groupNo, spaceID, userUID, botID); err != nil {
 		s.markContainerFailure(agent.ID, err)
 		return nil, fmt.Errorf("%w: reconcile IM channels: %v", errIMUnavailable, err)
 	}
@@ -475,9 +480,9 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 
 	if existing.State != sessionReady || containerNeedsReconcile {
 		if containerNeedsReconcile {
-			err = s.ensureContainerIMReady(agent.ID, groupNo, userUID, botID)
+			err = s.ensureContainerIMReady(agent.ID, groupNo, spaceID, userUID, botID)
 		} else {
-			err = s.ensureIMReady(groupNo, existing.ShortID, userUID, botID)
+			err = s.ensureIMReady(spaceID, groupNo, existing.ShortID, userUID, botID)
 		}
 		if err != nil {
 			s.markProvisionFailure(agent.ID, existing.ShortID, err)
@@ -504,21 +509,25 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 	return s.GetSession(spaceID, userUID, existing.ShortID)
 }
 
-func (s *Service) ensureIMReady(groupNo, shortID, userUID, botID string) error {
+func (s *Service) ensureIMReady(spaceID, groupNo, shortID, userUID, botID string) error {
 	subscribers := []string{userUID, botID}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers}); err != nil {
-		return err
+	if err := s.validateContainerParticipants(spaceID, userUID, botID); err != nil {
+		return errors.Join(err, s.removeContainerSubscribers(groupNo, []string{shortID}, subscribers))
 	}
-	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers})
+	var projectionErr error
+	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers}); err != nil {
+		projectionErr = err
+	} else if err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers}); err != nil {
+		projectionErr = err
+	}
+	if err := s.validateContainerParticipants(spaceID, userUID, botID); err != nil {
+		return errors.Join(projectionErr, err, s.removeContainerSubscribers(groupNo, []string{shortID}, subscribers))
+	}
+	return projectionErr
 }
 
-func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID string) error {
+func (s *Service) ensureContainerIMReady(agentID int64, groupNo, spaceID, userUID, botID string) error {
 	subscribers := []string{userUID, botID}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
-	}); err != nil {
-		return err
-	}
 	var shortIDs []string
 	_, err := s.ctx.DB().SelectBySql(`SELECT ats.short_id FROM ai_team_session ats
 		JOIN thread t ON t.short_id=ats.short_id AND t.group_no=? AND t.status<>3
@@ -526,14 +535,79 @@ func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID 
 	if err != nil {
 		return err
 	}
-	for _, shortID := range shortIDs {
-		if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-			ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
-		}); err != nil {
-			return err
+	if err = s.validateContainerProjection(agentID, groupNo, spaceID, userUID, botID); err != nil {
+		return errors.Join(err, s.removeContainerSubscribers(groupNo, shortIDs, subscribers))
+	}
+	var projectionErr error
+	if err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
+	}); err != nil {
+		projectionErr = err
+	} else {
+		for _, shortID := range shortIDs {
+			if err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+				ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
+			}); err != nil {
+				projectionErr = err
+				break
+			}
 		}
 	}
-	return nil
+	if err = s.validateContainerProjection(agentID, groupNo, spaceID, userUID, botID); err != nil {
+		return errors.Join(projectionErr, err, s.removeContainerSubscribers(groupNo, shortIDs, subscribers))
+	}
+	return projectionErr
+}
+
+func (s *Service) validateContainerParticipants(spaceID, userUID, botID string) error {
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(tx, spaceID, userUID, botID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Service) validateContainerProjection(agentID int64, groupNo, spaceID, userUID, botID string) error {
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err = validateAuthorityTx(tx, spaceID, userUID, botID); err != nil {
+		return err
+	}
+	var count int
+	if err = tx.SelectBySql(`SELECT COUNT(*) FROM ai_team_agent
+		WHERE id=? AND space_id=? AND user_uid=? AND bot_id=? AND group_no=?`,
+		agentID, spaceID, userUID, botID, groupNo).LoadOne(&count); err != nil {
+		return err
+	}
+	if count != 1 {
+		return errForbidden
+	}
+	return tx.Commit()
+}
+
+func (s *Service) removeContainerSubscribers(groupNo string, shortIDs, subscribers []string) error {
+	var errs []error
+	if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
+	}); err != nil {
+		errs = append(errs, err)
+	}
+	for _, shortID := range shortIDs {
+		if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+			ChannelID:   thread.BuildChannelID(groupNo, shortID),
+			ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
+		}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Service) markProvisionFailure(agentID int64, shortID string, cause error) {
