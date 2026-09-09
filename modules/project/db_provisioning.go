@@ -368,6 +368,69 @@ func (d *DB) abandonExhaustedProvisioningJobs(targets []string, maxAttempts uint
 	return affected, nil
 }
 
+// requeueAbandonedProvisioningJobs moves `abandoned` rows back to `pending` so the
+// worker retries them. This is the manual re-drive the module has always said it
+// needed and never had: without it, one project whose ensure call exhausted its
+// retry budget is permanently invisible to the peer, with no recovery path.
+//
+// Scoped to ONE project on purpose, and there is no all-projects mode. Exhaustion
+// usually means the peer was genuinely down, so a blanket re-drive of every parked
+// row would re-issue the same doomed calls and walk the whole backlog to
+// `abandoned` a second time — the operator has to name what they believe is fixed.
+//
+// attempts is RESET to 0, which is what makes the retry budget mean "attempts since
+// someone decided to retry" rather than "attempts ever". Leaving it at max would
+// have the sweep re-abandon the row on its next tick without a single outbound call.
+//
+// container_id is deliberately NOT reissued: it is the peer's idempotency key, and a
+// fresh id would orphan whatever container the previous attempts may already have
+// created (ensure is at-least-once, so a lost response leaves a real container
+// behind a row that never reached `ready`).
+//
+// last_error is APPENDED to, matching abandonExhaustedProvisioningJobs: the reason
+// provisioning gave up is the operator's only durable evidence, and the requeue
+// marker is what distinguishes "gave up once" from "gave up, was retried, gave up
+// again". LEFT(...) bounds it at the column width for the same reason as there.
+func (d *DB) requeueAbandonedProvisioningJobs(projectID string, targets []string, now time.Time) (int64, error) {
+	if strings.TrimSpace(projectID) == "" || len(targets) == 0 {
+		return 0, nil
+	}
+	// SELECT then primary-key UPDATE, not a ranged UPDATE: the same ERROR 1205 that
+	// abandonExhaustedProvisioningJobs records — a ranged UPDATE here takes gap locks
+	// that collide with the enqueue INSERT inside the fail-closed create transaction,
+	// i.e. a backlog would make project creation fail at random.
+	var ids []uint64
+	if _, err := d.session.SelectBySql(
+		"SELECT id FROM `octo_project_provisioning` "+
+			"WHERE project_id = ? AND target IN ? AND status = ?",
+		projectID, targets, provisionStatusAbandoned,
+	).Load(&ids); err != nil {
+		return 0, fmt.Errorf("project: select abandoned provisioning jobs: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	// The UPDATE re-checks status, so two concurrent requeues (two pods reading the same
+	// env value) cannot both move the same row: the second matches nothing. That is what
+	// makes this safe to run more than once rather than merely unlikely to be.
+	result, err := d.session.UpdateBySql(
+		"UPDATE `octo_project_provisioning` "+
+			"SET status = ?, attempts = 0, next_attempt_at = ?, "+
+			"    lease_owner = '', lease_until = NULL, finished_at = NULL, "+
+			"    last_error = LEFT(CONCAT(IF(last_error = '', '', CONCAT(last_error, ' | ')), ?), 255) "+
+			"WHERE id IN ? AND status = ?",
+		provisionStatusPending, now, "requeued by operator", ids, provisionStatusAbandoned,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: requeue abandoned provisioning jobs: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: read provisioning requeue result: %w", err)
+	}
+	return affected, nil
+}
+
 // provisioningRetention is how long a disband_pending row is kept before purge.
 //
 // Only disband_pending is ever purged. `ready` rows are kept indefinitely on
