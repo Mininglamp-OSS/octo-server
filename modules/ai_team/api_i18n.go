@@ -19,8 +19,12 @@ func respondInvalid(c *wkhttp.Context, field string) {
 
 func respondServiceError(c *wkhttp.Context, err error) {
 	switch {
+	case errors.Is(err, errInvalid):
+		respondInvalid(c, "body")
 	case errors.Is(err, errForbidden):
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamForbidden, nil, nil)
+	case errors.Is(err, errTeamCreateLimit):
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrGroupDailyCreateLimit, nil, nil)
 	case errors.Is(err, errNotFound):
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamNotFound, nil, nil)
 	case errors.Is(err, errIdempotencyConflict):

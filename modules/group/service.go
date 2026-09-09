@@ -29,6 +29,8 @@ type IService interface {
 	GetAllGroupCount() (int64, error)
 	// 查询某天的新建群数量
 	GetCreatedCountWithDate(date string) (int64, error)
+	// 查询指定用户某天创建、且计入用户建群配额的群数量
+	GetSameDayCreatedCountWithUID(uid, date string) (int, error)
 	// 添加一个群
 	AddGroup(model *AddGroupReq) error
 	// 某个时间段的建群数据
@@ -223,6 +225,16 @@ func (s *Service) GetCreatedCountWithDate(date string) (int64, error) {
 	return s.db.queryCreatedCountWithDate(date)
 }
 
+// GetSameDayCreatedCountWithUID returns the same per-user quota count used by
+// the ordinary group creation endpoint. User-created custom AI teams count;
+// server-managed AI containers do not.
+func (s *Service) GetSameDayCreatedCountWithUID(uid, date string) (int, error) {
+	if uid == "" || date == "" {
+		return 0, errors.New("user and date are required")
+	}
+	return s.db.querySameDayCreateCountWitUID(uid, date)
+}
+
 // AddGroup 添加一个群
 func (s *Service) AddGroup(model *AddGroupReq) error {
 	// 新建群一律 is_named=0 → 默认头像双人图标（产品 2026-06-29 改版，与 CreateGroup 口径
@@ -275,7 +287,7 @@ func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
 			Members:              []string{uid},
 			OperatorUID:          uid,
 			SuppressRemoveNotice: true,
-			AllowProtected:       group.Purpose == aiteampkg.GroupPurpose,
+			AllowProtected:       aiteampkg.IsProtectedPurpose(group.Purpose),
 		})
 		if removeErr != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: %w", uid, group.GroupNo, removeErr))
@@ -1927,6 +1939,19 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		return nil, errors.New("failed to begin transaction")
 	}
 	defer tx.RollbackUnlessCommitted()
+	if req.AllowProtected && aiteampkg.IsProtectedPurpose(groupModel.Purpose) {
+		lifecycleUIDs := make([]string, 0, len(removableMembers))
+		for _, member := range removableMembers {
+			lifecycleUIDs = append(lifecycleUIDs, member.UID)
+		}
+		if err := aiteampkg.MarkLifecycleRosterRemovalTx(
+			tx, groupModel.Purpose, groupModel.GroupNo, groupModel.SpaceID, groupModel.Creator, lifecycleUIDs,
+		); err != nil {
+			s.Error("mark AI-team lifecycle roster removal failed", zap.Error(err),
+				zap.String("group_no", req.GroupNo), zap.Strings("removed_uids", lifecycleUIDs))
+			return nil, errors.New("failed to mark AI-team lifecycle roster removal")
+		}
+	}
 
 	var removedUIDs []string
 	var removedVos []*config.UserBaseVo

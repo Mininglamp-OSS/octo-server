@@ -266,3 +266,34 @@ func TestMentionPrefSurfacesExcludeAIContainers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, noMention, "protected mention preference must remain unchanged")
 }
+
+func TestMentionPrefAllowsAggregateAITeamGroup(t *testing.T) {
+	handler, ctx := setupOwnerMentionList(t, 1, 1)
+	const teamGroupNo = "g_owner_ai_team"
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, status, version, purpose, allow_no_mention) VALUES (?, ?, 1, 1, ?, 1)",
+		teamGroupNo, aiteam.TeamGroupName, aiteam.TeamGroupPurpose,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, vercode, is_deleted, status, version) VALUES (?, ?, ?, 0, 1, 1)",
+		teamGroupNo, ownerListRobotID, util.GenerUUID(),
+	).Exec()
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest(http.MethodPut,
+		"/v1/robot/"+ownerListRobotID+"/groups/"+teamGroupNo+"/mention_pref",
+		bytes.NewReader([]byte(`{"no_mention":1}`)))
+	require.NoError(t, err)
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var noMention int
+	require.NoError(t, ctx.DB().Select("no_mention").From("bot_mention_pref").
+		Where("robot_id=? AND group_no=?", ownerListRobotID, teamGroupNo).LoadOne(&noMention))
+	assert.Equal(t, 1, noMention)
+}

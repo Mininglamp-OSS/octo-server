@@ -44,6 +44,13 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 	g.PUT("/sessions/:short_id/setting", a.requireEnabled, a.updateSessionSetting)
 	g.POST("/sessions/:short_id/archive", a.requireEnabled, a.archiveSession)
 	g.POST("/sessions/:short_id/unarchive", a.requireEnabled, a.unarchiveSession)
+	g.GET("/teams", a.requireEnabled, a.listTeams)
+	g.POST("/teams", a.requireEnabled, a.createTeam)
+	g.GET("/teams/:group_no", a.requireEnabled, a.getTeam)
+	g.PUT("/teams/:group_no", a.requireEnabled, a.updateTeam)
+	g.DELETE("/teams/:group_no", a.requireEnabled, a.deleteTeam)
+	g.POST("/teams/:group_no/members", a.requireEnabled, a.addTeamMembers)
+	g.DELETE("/teams/:group_no/members", a.requireEnabled, a.removeTeamMembers)
 }
 
 func (a *API) requireEnabled(c *wkhttp.Context) {
@@ -87,6 +94,95 @@ func (a *API) listAgents(c *wkhttp.Context) {
 		return
 	}
 	c.Response(page)
+}
+
+func (a *API) createTeam(c *wkhttp.Context) {
+	var req CreateTeamRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondInvalid(c, "body")
+		return
+	}
+	team, err := a.service.CreateTeam(spacepkg.GetSpaceID(c), c.GetLoginUID(), &req)
+	if err != nil {
+		a.respond(c, "create team", err)
+		return
+	}
+	c.Response(team)
+}
+
+func (a *API) listTeams(c *wkhttp.Context) {
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	page, err := a.service.ListTeams(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Query("cursor")), limit)
+	if err != nil {
+		a.respond(c, "list teams", err)
+		return
+	}
+	c.Response(page)
+}
+
+func (a *API) getTeam(c *wkhttp.Context) {
+	team, err := a.service.GetTeam(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Param("group_no")))
+	if err != nil {
+		a.respond(c, "get team", err)
+		return
+	}
+	c.Response(team)
+}
+
+func (a *API) updateTeam(c *wkhttp.Context) {
+	var req UpdateTeamRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondInvalid(c, "body")
+		return
+	}
+	team, err := a.service.UpdateTeam(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Param("group_no")), &req)
+	if err != nil {
+		a.respond(c, "update team", err)
+		return
+	}
+	c.Response(team)
+}
+
+func (a *API) deleteTeam(c *wkhttp.Context) {
+	if err := a.service.DeleteTeam(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Param("group_no"))); err != nil {
+		a.respond(c, "delete team", err)
+		return
+	}
+	c.Response(map[string]interface{}{"ok": true})
+}
+
+func (a *API) addTeamMembers(c *wkhttp.Context) {
+	a.mutateTeamMembers(c, true)
+}
+
+func (a *API) removeTeamMembers(c *wkhttp.Context) {
+	a.mutateTeamMembers(c, false)
+}
+
+func (a *API) mutateTeamMembers(c *wkhttp.Context, add bool) {
+	var req struct {
+		BotIDs []string `json:"bot_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.BotIDs) == 0 {
+		respondInvalid(c, "bot_ids")
+		return
+	}
+	var err error
+	if add {
+		err = a.service.AddTeamMembers(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Param("group_no")), req.BotIDs)
+	} else {
+		err = a.service.RemoveTeamMembers(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Param("group_no")), req.BotIDs)
+	}
+	if err != nil {
+		a.respond(c, "change team members", err)
+		return
+	}
+	team, err := a.service.GetTeam(spacepkg.GetSpaceID(c), c.GetLoginUID(), strings.TrimSpace(c.Param("group_no")))
+	if err != nil {
+		a.respond(c, "get changed team", err)
+		return
+	}
+	c.Response(team)
 }
 
 func (a *API) createSession(c *wkhttp.Context) {

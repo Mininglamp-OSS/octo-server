@@ -934,7 +934,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 	visibleGroups := groups[:0]
 	for _, info := range groups {
-		if info.Purpose != aiteampkg.GroupPurpose {
+		if !aiteampkg.IsHiddenPurpose(info.Purpose) {
 			visibleGroups = append(visibleGroups, info)
 		}
 	}
@@ -960,7 +960,7 @@ func isAITeamConversation(channelID string, channelType uint8, groups map[string
 		groupNo = parent
 	}
 	info := groups[groupNo]
-	return info != nil && info.Purpose == aiteampkg.GroupPurpose
+	return info != nil && aiteampkg.IsHiddenPurpose(info.Purpose)
 }
 
 // filterRecentConversations drops conversations whose per-channel-type activity
@@ -1263,7 +1263,7 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 			for _, detail := range groupDetails {
 				info := &group.GroupResp{GroupNo: detail.GroupNo, Purpose: detail.Purpose}
 				groupMap[detail.GroupNo] = info
-				if info.Purpose != aiteampkg.GroupPurpose {
+				if !aiteampkg.IsHiddenPurpose(info.Purpose) {
 					groupResps = append(groupResps, groupResp{}.from(detail))
 				}
 			}

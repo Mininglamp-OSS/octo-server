@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
@@ -21,6 +22,9 @@ import (
 //   - group_allow_no_mention: group-level switch owned by the group
 //     creator/manager (group.allow_no_mention, no group row → default 1)
 //   - effective = (no_mention==1 && group_allow_no_mention==1)
+//
+// AI session containers are the one exception, decided by the server rather
+// than by the two axes — see resolveEffectiveNoMention.
 //
 // When effective is false the bot must be @mentioned in this group.
 func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
@@ -58,12 +62,15 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 	}
 
 	// group_allow_no_mention: 群级总开关；无群记录回退默认 1（允许），零回归。
-	groupAllow := 1
-	err = ba.db.session.Select("allow_no_mention").From("`group`").
-		Where("group_no=?", groupNo).LoadOne(&groupAllow)
+	// purpose 与它同一行取回：判定需要它，而这是 per-message 热路径，多一次
+	// 往返换不到任何东西。
+	groupRow := mentionPrefGroupRow{AllowNoMention: 1}
+	err = ba.db.session.
+		Select("IFNULL(allow_no_mention,1) AS allow_no_mention", "IFNULL(purpose,'') AS purpose").
+		From("`group`").Where("group_no=?", groupNo).LoadOne(&groupRow)
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
-			groupAllow = 1
+			groupRow = mentionPrefGroupRow{AllowNoMention: 1}
 		} else {
 			ba.Error("查询 group.allow_no_mention 失败", zap.Error(err),
 				zap.String("robot_id", robotID), zap.String("group_no", groupNo))
@@ -71,8 +78,9 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 			return
 		}
 	}
+	groupAllow := groupRow.AllowNoMention
 
-	effective := computeEffectiveNoMention(noMention, groupAllow)
+	effective := resolveEffectiveNoMention(noMention, groupAllow, groupRow.Purpose)
 
 	// Adapter-facing contract (YUJ-2996 Blocking 1, design option A): the
 	// `no_mention` field carries the AND-combined final decision, identical to
@@ -85,11 +93,25 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 	// Note: this differs from the owner endpoints (modules/robot/mention_pref.go),
 	// which intentionally keep no_mention as the bot owner's raw intent so the
 	// owner UI can show "I enabled it but the group disabled it".
+	//
+	// For an AI session container `group_allow_no_mention` stays the RAW column
+	// value even though `effective` no longer derives from it. Containers are
+	// created with allow_no_mention=1 (modules/ai_team/service.go) so the two
+	// agree in practice; if a hand-edited row ever makes them disagree, the raw
+	// value is what a debugger needs to see. The adapter gates on `effective`
+	// only (openclaw-channel-octo src/api-fetch.ts).
 	c.Response(map[string]interface{}{
 		"no_mention":             boolToInt(effective),
 		"group_allow_no_mention": groupAllow,
 		"effective":              effective,
 	})
+}
+
+// mentionPrefGroupRow is the one-round-trip projection of the `group` row that
+// the decision needs.
+type mentionPrefGroupRow struct {
+	AllowNoMention int    `db:"allow_no_mention"`
+	Purpose        string `db:"purpose"`
 }
 
 // boolToInt maps the effective decision back to the legacy 0/1 integer shape of
@@ -107,4 +129,40 @@ func boolToInt(b bool) int {
 // function so the 4-combination truth table is unit-testable without a DB.
 func computeEffectiveNoMention(noMention, groupAllow int) bool {
 	return noMention == 1 && groupAllow == 1
+}
+
+// resolveEffectiveNoMention is the SINGLE decision for "may this bot answer
+// without being @mentioned in this group". Ordinary groups get the two-axis AND
+// above; AI session containers are decided by the server.
+//
+// Why a container short-circuits to true: inside a container every message in a
+// session thread is already routed to exactly one bot, resolved from the
+// persisted ai_team_agent association rather than from the payload
+// (aiteam.LookupReadySessionTarget, consumed in modules/robot/event.go). The @
+// carries no routing information there — it is a token the user would have to
+// type for nothing. Without this branch the adapter's own mention gate (whose
+// isGroup covers CommunityTopic, i.e. session threads) files every non-@
+// message as history context and the session never answers, which reads to the
+// user as "my AI is broken".
+//
+// Deliberately NOT gated on aiteam.Enabled(). That flag gates rollout of the AI
+// team API; flipping it off must not change how an ALREADY-created container
+// behaves — the same stance aiteam.IsProtectedGroup takes, and for the same
+// reason: a container that suddenly demands an @ looks like a broken session,
+// not a disabled feature.
+//
+// The bot axis is not consulted for a container either. The owner endpoints
+// reject mention_pref writes for these groups
+// (modules/robot/mention_pref.go rejectAIContainerMentionPref), so
+// bot_mention_pref can never legitimately hold a row for one; reading it could
+// only ever contribute a 0, which is exactly the answer that must not win here.
+//
+// Kept as a pure function, and kept as the ONLY place the container rule lives,
+// so the truth table is unit-testable without a DB and no sibling caller can
+// grow a second, drifting copy of the rule.
+func resolveEffectiveNoMention(noMention, groupAllow int, groupPurpose string) bool {
+	if groupPurpose == aiteampkg.GroupPurpose {
+		return true
+	}
+	return computeEffectiveNoMention(noMention, groupAllow)
 }

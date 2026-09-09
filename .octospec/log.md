@@ -29,6 +29,56 @@ change-log convention (§7). Newest first.
   [journal](journal/shared/project-collaboration-roles.md); reusable pagination guidance
   is staged in [learnings/pending](learnings/pending/project-collaboration-roles.md).
 
+## 2026-09-09 — ai-team-all-bots-group projection resource fix
+
+- **Fixed** — removed the connection-scoped MySQL named lock from aggregate
+  roster projection, so a stalled WuKongIM request no longer pins a shared DB
+  connection or permanently wedges that owner's projection.
+- **Hardened** — the existing monotonic `group_member.version` detects stale
+  HTTP completions and replays the latest roster without an extra coordination
+  table.
+- **Tested** — a single-connection integration test blocks the old IM request,
+  completes a real concurrent Agent removal, then verifies that the stale
+  roster lands late and is repaired by a final current-version replay.
+
+## 2026-09-09 — ai-team-all-bots-group review remediation
+
+- **Fixed** — AI-team roster projection now explicitly adds/removes WuKongIM
+  subscribers on both the aggregate parent and every existing subarea, with the
+  owner's existing Space-member row as the creation serialization fence.
+- **Hardened** — converged list reads skip external replay; committed Agent
+  removal reports a retryable error when external projection is incomplete.
+- **Aligned** — aggregate no-mention controls remain configurable, while
+  category and operational-analytics surfaces hide every managed AI purpose.
+- **Simplified** — first-message title mutation has one message-listener writer.
+
+## 2026-09-08 — ai-team-all-bots-group
+
+- **Added** — One visible “我的 OPT” group per Space/user, projected exactly
+  from active `ai_team_agent` rows after all private two-member containers are
+  ready. Existing owned Bots are lazily backfilled; all three production User
+  Bot creation paths trigger the same idempotent activation orchestration.
+- **Protected** — Ordinary human, manager, Bot API, invite/scan, org-directory,
+  transfer, exit, and disband paths cannot change either AI-managed group type;
+  personal settings remain available on the visible team group.
+- **Hardened** — Add/remove/list convergence retries complete idempotent
+  operations for MySQL 1213, with concurrent real-MySQL and race coverage.
+  See [journal](journal/shared/ai-team-all-bots-group.md).
+
+## 2026-09-08 — assistant-eager-ai-group
+
+- **Changed** — `POST /v1/ai-team/agents/{bot_id}` now creates or repairs the
+  protected owner+Bot group and its WuKongIM parent channel before returning,
+  while creating no thread/session. `CreateSession` reuses the shared container
+  helper and keeps legacy empty-`group_no` recovery.
+- **Integrated** — Assistant auto-connect now registers the new Bot through
+  the authenticated, Space-scoped Agent endpoint before persisting/enabling the
+  local Bot; existing Bot records with Bot/Space identifiers are reconciled too.
+- **Learned** — a database `ready` bit cannot prove external IM state still
+  exists, so explicit idempotent registration must replay external upserts. See
+  [journal](journal/shared/assistant-eager-ai-group.md) and
+  [learning](learnings/pending/external-readiness-needs-reconciliation.md).
+
 ## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
 
 - **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的
@@ -2774,3 +2824,60 @@ Lessons from that task and its review:
 - **接受 2xx 而契约写的是 200** —— `Ensure` 收 202 当成功，就会把 `ready`
   （「我们成功建好了容器」）写在一个**可能还不存在**的容器上；后面每一处读 `ready` 的判断
   都在把承诺当事实读。改成严格 200，且判**可重试**而非终态——对端正在灰度不该烧掉一行。
+
+## 2026-09-09 — ai-team-all-bots-group（专属入口与按需会话）
+
+- 二人父群与“我的 OPT”总群统一从普通最近、关注、通讯录、用户群列表及管理端列表隐藏；
+  专属 AI Team 页面仍可按权威 ID 打开，总群允许普通子区，二人父群只允许 session API 建子区。
+- 助理创建只准备父群，不预建会话；用户点击“新会话”才创建默认名为“新对话”的 thread。
+- 首条非空 owner 消息经统一消息 listener 原子更新默认标题，手动标题与后续消息不会覆盖；
+  本地 CUA 已验证侧栏、聊天标题和输入目标同步刷新。
+- 在不包含嵌套 worktree 的快照中，将每个 Go 包放到重建后的独占 `test` 库执行，全仓包级测试通过。
+
+## 2026-09-09 — ai-team-all-bots-group（PR #865 第四轮并发收敛）
+
+- 多表资格校验的锁定读收窄为 `FOR UPDATE OF a/r`，不再把 Space、成员、Robot、User 纳入
+  AI Team 投影的锁序。
+- 全员群首次创建由已有 Space 成员行锁串行；名册快照与 thread 状态清理在短事务内提交，
+  WuKongIM HTTP 期间不持有行锁，投影后以新快照比较并在变化时重放。
+- 稳定态 Agent 列表先做纯读完整性检查，已收敛时不再启动写事务或调用 IM。
+- 首消息标题写回限定在 Robot 的 AI session 目标路径；本地页面验证“无初始会话 → 点击新会话
+  创建新对话 → 首条消息更新标题”，并收到真实 OpenClaw 回复。
+
+## 2026-09-09 — ai-team-all-bots-group（PR #865 最终 blocker 修复）
+
+- Bot 名册授权改为集合比较，消除 Go 字节序与 MySQL collation 排序不同导致的合法 Bot 拒绝。
+- 投影完成检查同时复核有效名册和 `group_member.version`；生命周期清理在移除受保护群成员的
+  事务内停用 Agent，避免旧投影重新订阅已删除 Bot。
+- AI 托管群不再占用用户每日手工建群额度；Agent 删除后的 IM 投影失败明确返回可重试错误。
+- 回归覆盖生产 collation 双 Bot、资格变化重放、生命周期并发删除和建群额度隔离。
+
+## 2026-09-09 — ai-team-all-bots-group（PR #865 删除重试收敛）
+
+- 显式 Agent 删除的第二次 DELETE 会真正重试外部订阅撤销；投影仍失败时继续
+  返回可重试 503，不再把尚未完成的权限撤销误报为成功。
+- 名册持续变化和投影目标变化统一归类为临时 IM 不可用，客户端收到可重试 503。
+- AI Team 聚焦回归与整包测试、build、vet、i18n 和 diff 检查通过；共享测试库仍保留已记录的
+  跨包 migration 状态限制。
+
+## 2026-09-09 — ai-team-all-bots-group（PR #865 群主撤销收敛）
+
+- 总群名册把群主有效性纳入快照与完成检查，群主失去 Space 席位时目标订阅集为空，并显式
+  撤销父群和子区中的群主/Bot 订阅。
+- 二人容器在 IM 写入前后复核同一权限；生命周期撤销与慢请求竞态时，过期写之后会补发父群和
+  所有会话子区退订，同时保留重新加入后的 Agent 恢复语义。
+- 新增总群与二人容器两条真实并发回归，并补齐生产 collation fixture 的独立序列表定义；race、
+  AI Team 整包、group 编译、build、vet 与 i18n 门禁通过。
+
+## 2026-09-09 — multi-ai-teams
+
+- 保留自动且不可编辑的 AI 全员群，新增可创建多个、显式选择自有有效 Agent 的自定义 AI 群；
+  列表接口统一返回两类团队并给出明确能力字段。
+- 自动全员群和自定义团队均直接复用 `group` / `group_member`，不新增团队表、成员镜像表或
+  数据库迁移；普通群、
+  Bot API 和生命周期替代入口均维护唯一人类成员、Space 隔离和 AI-only 准入，并同步父群及
+  已有子区订阅。
+- GeelyOcto 增加正式团队列表、创建和编辑页面；CUA 验证创建、改名、成员增删、最近/通讯录可见性、
+  自动群隐藏、显式 @ 回复和 OpenClaw session 全流程。
+- Server 聚焦测试、build、vet、i18n 和 Web 76 条聚焦测试、i18n、CSS lint、生产构建通过；
+  本地认证、LLM、端口及依赖产物均未纳入提交。

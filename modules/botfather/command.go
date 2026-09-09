@@ -930,6 +930,10 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 		}
 		return errCreateBotSpaceBindingFailed
 	}
+	if provisionErr := provisionAITeam(h.ctx, targetSpaceID, creatorUID, robotID); provisionErr != nil {
+		h.Warn("Bot已创建但AI团队群同步失败，将由后续AI团队请求重试",
+			zap.String("robotID", robotID), zap.String("spaceID", targetSpaceID), zap.Error(provisionErr))
+	}
 
 	// 兼容：仍添加好友关系（过渡期）
 	err = h.userService.AddFriend(creatorUID, &user.FriendReq{

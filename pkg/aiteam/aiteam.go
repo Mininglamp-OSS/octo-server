@@ -6,16 +6,43 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gocraft/dbr/v2"
 )
 
 const (
 	GroupPurpose       = "ai_session_container"
+	TeamGroupPurpose   = "ai_team_group"
+	CustomTeamPurpose  = "ai_custom_team_group"
+	TeamGroupName      = "我的 OPT"
 	DefaultSessionName = "新对话"
 )
 
 var ErrContainerProtected = errors.New("ai session container is protected")
+
+type LifecycleRosterMarker func(
+	tx *dbr.Tx,
+	purpose, groupNo, spaceID, ownerUID string,
+	removedUIDs []string,
+) error
+
+var lifecycleRosterMarker LifecycleRosterMarker
+
+func RegisterLifecycleRosterMarker(marker LifecycleRosterMarker) {
+	lifecycleRosterMarker = marker
+}
+
+func MarkLifecycleRosterRemovalTx(
+	tx *dbr.Tx,
+	purpose, groupNo, spaceID, ownerUID string,
+	removedUIDs []string,
+) error {
+	if lifecycleRosterMarker == nil {
+		return nil
+	}
+	return lifecycleRosterMarker(tx, purpose, groupNo, spaceID, ownerUID, removedUIDs)
+}
 
 // Enabled gates AI routing as well as the public API. Container ACL protection
 // intentionally does not use this flag: disabling rollout must never reopen an
@@ -39,10 +66,74 @@ func IsProtectedGroup(session *dbr.Session, groupNo string) (bool, error) {
 	if session == nil || strings.TrimSpace(groupNo) == "" {
 		return false, nil
 	}
-	var count int
-	err := session.Select("COUNT(*)").From("`group`").
-		Where("group_no=? AND purpose=?", groupNo, GroupPurpose).LoadOne(&count)
-	return count > 0, err
+	purpose, err := Purpose(session, groupNo)
+	return IsProtectedPurpose(purpose), err
+}
+
+// IsProtectedPurpose reports whether membership and ownership of a group are
+// server-managed by AI Team rather than by ordinary group APIs.
+func IsProtectedPurpose(purpose string) bool {
+	return purpose == GroupPurpose || purpose == TeamGroupPurpose || purpose == CustomTeamPurpose
+}
+
+// IsHiddenPurpose identifies server-managed AI containers which must stay out
+// of ordinary group and conversation surfaces. User-created custom AI teams are
+// intentionally visible like ordinary groups.
+func IsHiddenPurpose(purpose string) bool {
+	return purpose == GroupPurpose || purpose == TeamGroupPurpose
+}
+
+// IsImmutablePurpose identifies AI groups whose metadata and roster are fully
+// server-managed. A custom AI team has a protected roster but user-managed
+// metadata, so it is intentionally excluded.
+func IsImmutablePurpose(purpose string) bool {
+	return purpose == GroupPurpose || purpose == TeamGroupPurpose
+}
+
+// IsDedicatedSessionPurpose reports whether a group is the private owner+Bot
+// container. Unlike the AI-team aggregate group, this parent and its threads
+// may only be mutated through the AI Team session API.
+func IsDedicatedSessionPurpose(purpose string) bool {
+	return purpose == GroupPurpose
+}
+
+// MaybeSetDefaultSessionTitle replaces the generated title with the first
+// non-empty message sent by the owning user. The ai_team_session join prevents
+// an ordinary thread named "新对话" from being renamed by this AI-only rule.
+// Manual titles and subsequent messages are intentionally left untouched.
+func MaybeSetDefaultSessionTitle(session *dbr.Session, groupNo, shortID, senderUID, content string) error {
+	if session == nil || groupNo == "" || shortID == "" || senderUID == "" {
+		return nil
+	}
+	title := strings.TrimSpace(content)
+	if title == "" {
+		return nil
+	}
+	if utf8.RuneCountInString(title) > 100 {
+		title = string([]rune(title)[:100])
+	}
+	_, err := session.UpdateBySql(`
+		UPDATE thread t
+		JOIN ai_team_session s ON s.short_id=t.short_id AND s.manual_title=0
+		JOIN ai_team_agent a ON a.id=s.agent_id AND a.user_uid=?
+		SET t.name=?
+		WHERE t.group_no=? AND t.short_id=? AND t.name=?`,
+		senderUID, title, groupNo, shortID, DefaultSessionName).Exec()
+	return err
+}
+
+// Purpose returns the persisted server-managed purpose, or an empty string for
+// an ordinary or unknown group.
+func Purpose(session *dbr.Session, groupNo string) (string, error) {
+	if session == nil || strings.TrimSpace(groupNo) == "" {
+		return "", nil
+	}
+	var purposes []string
+	_, err := session.Select("purpose").From("`group`").Where("group_no=?", groupNo).Limit(1).Load(&purposes)
+	if err != nil || len(purposes) == 0 {
+		return "", err
+	}
+	return purposes[0], nil
 }
 
 // LookupReadySessionTarget resolves automatic Bot delivery exclusively from
@@ -110,7 +201,7 @@ func ExcludeProtectedItems(session *dbr.Session, items [][2]string) (map[string]
 		GroupNo string `db:"group_no"`
 	}
 	_, err := session.Select("group_no").From("`group`").
-		Where("group_no IN ? AND purpose=?", groupNos, GroupPurpose).Load(&rows)
+		Where("group_no IN ? AND purpose IN ?", groupNos, []string{GroupPurpose, TeamGroupPurpose}).Load(&rows)
 	if err != nil {
 		return nil, err
 	}

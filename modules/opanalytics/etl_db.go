@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -257,7 +256,7 @@ func (d *etlDB) queryGroupsForDim() ([]*groupDimRow, error) {
 	_, err := d.session.
 		Select("group_no", "name", "space_id", "status", "IFNULL(UNIX_TIMESTAMP(created_at),0) AS created_at_sec").
 		From("`group`").
-		Where("purpose<>?", aiteampkg.GroupPurpose).
+		Where("purpose=''").
 		Load(&rows)
 	return rows, err
 }

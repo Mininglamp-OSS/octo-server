@@ -2,7 +2,6 @@ package group
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
-	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -21,21 +20,21 @@ func newManagerDB(session *dbr.Session) *managerDB {
 // 查询群列表
 func (m *managerDB) listWithPage(pageSize, page uint64) ([]*managerGroupModel, error) {
 	var list []*managerGroupModel
-	_, err := m.session.Select("*").From("`group`").Where("purpose<>?", aiteampkg.GroupPurpose).Offset((page-1)*pageSize).Limit(pageSize).OrderDir("created_at", false).Load(&list)
+	_, err := m.session.Select("*").From("`group`").Where("purpose=''").Offset((page-1)*pageSize).Limit(pageSize).OrderDir("created_at", false).Load(&list)
 	return list, err
 }
 
 // 模糊查询群列表
 func (m *managerDB) listWithPageAndKeyword(keyword string, pageSize, page uint64) ([]*managerGroupModel, error) {
 	var list []*managerGroupModel
-	_, err := m.session.Select("*").From("`group`").Where("(name like ? or group_no like ?) and purpose<>?", "%"+keyword+"%", "%"+keyword+"%", aiteampkg.GroupPurpose).Offset((page-1)*pageSize).Limit(pageSize).OrderDir("created_at", false).Load(&list)
+	_, err := m.session.Select("*").From("`group`").Where("(name like ? or group_no like ?) and purpose=''", "%"+keyword+"%", "%"+keyword+"%").Offset((page-1)*pageSize).Limit(pageSize).OrderDir("created_at", false).Load(&list)
 	return list, err
 }
 
 // 通过关键字查询群总数
 func (m *managerDB) queryGroupCountWithKeyWord(keyword string) (int64, error) {
 	var count int64
-	_, err := m.session.Select("count(*)").From("`group`").Where("(name like ? or group_no like ?) and purpose<>?", "%"+keyword+"%", "%"+keyword+"%", aiteampkg.GroupPurpose).Load(&count)
+	_, err := m.session.Select("count(*)").From("`group`").Where("(name like ? or group_no like ?) and purpose=''", "%"+keyword+"%", "%"+keyword+"%").Load(&count)
 	return count, err
 }
 
@@ -49,21 +48,21 @@ func (m *managerDB) queryGroupsMemberCount(groupNos []string) ([]*managerGroupCo
 // 查询群总数
 func (m *managerDB) queryGroupCountWithStatus(status int) (int64, error) {
 	var count int64
-	_, err := m.session.Select("count(*)").From("`group`").Where("status=? and purpose<>?", status, aiteampkg.GroupPurpose).Load(&count)
+	_, err := m.session.Select("count(*)").From("`group`").Where("status=? and purpose=''", status).Load(&count)
 	return count, err
 }
 
 // 通过status查询群列表
 func (m *managerDB) queryGroupsWithStatus(status int, pageSize, pageIndex uint64) ([]*managerGroupModel, error) {
 	var list []*managerGroupModel
-	_, err := m.session.Select("*").From("`group`").Where("status=? and purpose<>?", status, aiteampkg.GroupPurpose).Offset((pageIndex-1)*pageSize).Limit(pageSize).OrderDir("created_at", false).Load(&list)
+	_, err := m.session.Select("*").From("`group`").Where("status=? and purpose=''", status).Offset((pageIndex-1)*pageSize).Limit(pageSize).OrderDir("created_at", false).Load(&list)
 	return list, err
 }
 
 // 查询某个区间的注册数量
 func (m *managerDB) queryRegisterCountWithDateSpace(startDate, endDate string) ([]*managerGroupModel, error) {
 	var models []*managerGroupModel
-	_, err := m.session.Select("*").From("`group`").Where("date_format(created_at,'%Y-%m-%d')>=? and date_format(created_at,'%Y-%m-%d')<=? and purpose<>?", startDate, endDate, aiteampkg.GroupPurpose).OrderDir("created_at", false).Load(&models)
+	_, err := m.session.Select("*").From("`group`").Where("date_format(created_at,'%Y-%m-%d')>=? and date_format(created_at,'%Y-%m-%d')<=? and purpose=''", startDate, endDate).OrderDir("created_at", false).Load(&models)
 	return models, err
 }
 
