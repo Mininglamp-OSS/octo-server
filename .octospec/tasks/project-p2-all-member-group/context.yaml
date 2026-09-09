@@ -1795,7 +1795,12 @@ pr_855_round_11_fixed:
       reached were converged. Any alert summing that counter across kinds would page on a
       normal event -- and telling that it was normal would require already knowing this kind
       exists, which defeats the alert.
-    fix: "its own counter, all_member_group_owner_convergence_incomplete_total."
+    fix: |
+      its own counter, all_member_group_owner_convergence_incomplete_total.
+      Scope, added in round 3: this was caught in the working tree BEFORE the first commit on
+      this branch -- `git log -S owner_budget_spent --all -- modules/project` is empty, so no
+      commit anywhere ever carried that kind. Recording it is right; describing it as a defect
+      the PR repaired in shipped code is not, and the PR description said exactly that.
   - id: one-metric-shipped-under-a-different-namespace-from-its-six-siblings
     severity: low
     reported_by: "self, while checking a merge-impact list"
@@ -1957,6 +1962,88 @@ pr_868_review_fixed:
       committed fixtures. Overstating coverage in the description of a PR whose subject is a
       guard that passed for the wrong reason.
     fix: "description corrected, and the fixtures now actually exist (entry above)."
+
+pr_868_round_3_fixed:
+  - id: the-exemptions-were-config-that-nothing-checked
+    severity: high
+    reported_by: "yujiawei (review 5149568590, the APPROVE); mochashanyao reproduced the same mutation independently"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 made the census EFFECT-based and recorded updateRobotStatus / robotUpdate in
+      d14ExemptDoors. Both reviewers then deleted the status-capable door loop and the whole
+      suite stayed green: the door set drops from 6 to 4 and those two endpoints simply leave
+      the census. Nothing noticed, because neither is reachable through a primitive, and the
+      known-door anti-vacuity list names only the three that are.
+      So the entire mechanism round 2 added was deletable while green, and the exemption
+      entries -- which read like assertions -- were config that nothing consumed. An exemption
+      nothing checks is indistinguishable from a matcher that was deleted.
+    fix: |
+      Every key in d14ExemptDoors must appear in the door set the census actually found; a
+      recorded exemption for a door the matcher can no longer see is now an error, with the
+      two readings (renamed/removed vs matcher regressed) named in the message. Plus the
+      matching anti-vacuity loop on statusCapableWriters for updateRobot / updateRobotInfo,
+      since those two are what make the endpoints visible in the first place.
+    mutation: |
+      deleting the status-capable door loop now reddens TWO cases -- the exemption-consumption
+      assertion in the census, and the assembly fixture below. Verified.
+  - id: the-classifier-was-fixtured-but-the-assembly-was-not
+    severity: high
+    reported_by: "yujiawei P?; mochashanyao, same round"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2's answer to "a branch with no example quietly stops working" was fixtures for
+      censusFuncsIn -- the CLASSIFIER. The door ASSEMBLY was still driven only by whatever the
+      repository happens to contain, and both branches there have the same property: delete the
+      uncalled-primitive rule and the door set is byte-identical, because all three real
+      primitives have callers today.
+      That is the third recurrence of one defect at a third level: the census (round 11), the
+      classifier branches (round 1), the assembly (round 2).
+    fix: |
+      assembleCensus extracted from the test body and driven by synthetic packages in
+      TestCensusDoorAssemblyIsPinned -- four cases: a caller of a status-capable writer is a
+      door; a primitive nothing calls is its own door; a primitive WITH a caller makes the
+      caller the door and not itself; a writer that never touches status leaves its callers
+      alone.
+    mutation: "deleting the uncalled-primitive rule now reddens the inline-handler case. Verified."
+  - id: the-Set-chain-branch-still-had-no-fixture-of-its-own
+    severity: medium
+    reported_by: "yujiawei, same round"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 added `cf.writesStatusColumn = true` on the `.Set("status", ...)` chain, but the
+      only chain fixture wrote a literal zero -- which setsStatusZero already covers. Deleting
+      the writesStatusColumn line left the fixture passing, so the status-capable half of that
+      branch was untested.
+    fix: 'a `.Set("status", v)` fixture with a VARIABLE, asserted wantStatusCapable.'
+    mutation: "deleting that line now reddens exactly that case. Verified."
+  - id: the-fixture-header-claimed-a-precision-it-did-not-have
+    severity: low
+    reported_by: "self, while mutation-verifying the three above"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The header said "deleting any single detection branch turns exactly one case below red".
+      Measured across all nine branches: true for eight, false for the ninth. The
+      `Update("robot")` table guard reddens five, because it is not a spelling but the
+      precondition every robot-table shape is built on.
+    fix: |
+      Header now states the measurement instead of the slogan, including the exception. The
+      property that matters -- no branch is deletable while green -- is stated separately and
+      is what was actually verified.
+  - id: the-description-listed-a-defect-that-never-shipped
+    severity: low
+    reported_by: "self, checking the description against git history"
+    where: PR #868 description; this file, the-budget-spent-signal-was-filed-as-a-failure
+    what: |
+      The Changes list said "`owner_budget_spent` was filed as a `kind` on the sync-FAILURE
+      counter ... It has its own counter", which reads as a defect this PR repaired in shipped
+      code. `git log -S owner_budget_spent --all -- modules/project` is empty: no commit ever
+      carried that kind. It existed only in this branch's working tree, and /code-review
+      caught it before the first commit.
+      Small, but it is the second description-overstatement in one PR, in a PR whose subject is
+      guards that claim more than they check.
+    fix: |
+      The bullet now says what is true -- the counter is new, and the kind it briefly was
+      never left this branch. Description and this file corrected together.
 
 verify:
   rules_rechecked:

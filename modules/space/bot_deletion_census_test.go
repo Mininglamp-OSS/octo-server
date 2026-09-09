@@ -322,17 +322,21 @@ func (c *censusFunc) disablesBotAccount() bool {
 
 func (c *censusFunc) String() string { return c.file + ":" + c.name }
 
-func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	require.NoError(t, err)
-
-	funcs := scanRepoFuncs(t, repoRoot, "modules", "pkg", "internal")
-
-	// Step 0: STATUS-CAPABLE writers — functions that write the robot table's status
-	// column, whatever value they write.
+// assembleCensus turns classified functions into the three sets the census asserts on.
+//
+// Extracted from the test body so it can be driven by fixtures as well as by the tree.
+// That split is the whole point: censusFuncsIn (the CLASSIFIER) was already fixtured,
+// and the reviews then showed the ASSEMBLY was not — deleting the status-capable door
+// loop, or the uncalled-primitive rule, left every test green, because both branches
+// only ever fire on what the repository happens to contain. A branch exercised solely
+// by the tree stops working the day the tree stops containing an example, which is the
+// failure this file exists to prevent. PR #868s second review round.
+func assembleCensus(funcs []*censusFunc) (map[string]*censusFunc, map[string]bool, []*censusFunc) {
+	// STATUS-CAPABLE writers — functions that write the robot table's status column,
+	// whatever value they write.
 	//
-	// The old rule keyed on a literal `"status": 0` in the caller. It drew the line at
-	// the wrong place, and the review proved it with the two doors it misses:
+	// The rule used to key on a literal `"status": 0` in the caller. It drew the line at
+	// the wrong place, and the review proved it with the two doors it missed:
 	//
 	//	updateRobotStatus  PUT /robot/status/{id}/{status}  robot.Status = int(status)
 	//	                                                    -> updateRobot
@@ -343,10 +347,10 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 	// updateRobot's write is BYTE-IDENTICAL to deleteRobotSoft's, which this file
 	// classifies as a deletion primitive. The only difference is that one spells the
 	// zero as a literal and the other holds it in a variable — and the first door's
-	// zero is a malformed-parameter DEFAULT, so it is reachable by accident. The
-	// previous version of this comment justified the non-match by calling those
-	// endpoints "a reversible disable, not a deletion"; deleteRobotSoft is exactly as
-	// reversible, so that was a semantic story told about a syntactic behaviour.
+	// zero is a malformed-parameter DEFAULT, so it is reachable by accident. The old
+	// comment justified the non-match by calling those endpoints "a reversible disable,
+	// not a deletion"; deleteRobotSoft is exactly as reversible, so that was a semantic
+	// story told about a syntactic behaviour.
 	//
 	// So: a function that can put a bot's status to zero is status-capable, and every
 	// caller of one is a door candidate. What happens next is a DECISION recorded in
@@ -365,42 +369,21 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 		}
 	}
 
-	// Step 1: the primitives — everything that turns a bot account off or removes it.
+	// The primitives — everything that turns a bot account off or removes it.
 	primitives := map[string]*censusFunc{}
 	for _, f := range funcs {
 		if f.disablesBotAccount() {
 			primitives[f.name] = f
 		}
 	}
-	names := make([]string, 0, len(primitives))
-	for n := range primitives {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	t.Logf("bot-disabling primitives found: %v", names)
 
-	// The scanner must keep finding the primitives we know about. Without this the
-	// census degrades silently into a test that asserts nothing the day someone
-	// rewrites one of these with a spelling the matcher misses — the exact shape of
-	// vacuity this PR has already been caught on twice.
-	for _, known := range []string{"deleteRobot", "deleteRobotSoft", "deleteCreatedBotArtifacts"} {
-		assert.Contains(t, primitives, known,
-			"the scanner no longer recognises %s as a bot-disabling primitive; either it was "+
-				"renamed (update this list) or it was rewritten in a spelling disablesBotAccount "+
-				"does not match (fix the matcher) — until then the census below is blind to it",
-			known)
+	called := map[string]bool{}
+	for _, f := range funcs {
+		for name := range f.calls {
+			called[name] = true
+		}
 	}
 
-	// Step 2: the doors — every function that calls a non-exempt primitive, plus every
-	// function that spells the disable across two hops (step 0).
-	//
-	// The split-spelling function is a DOOR, not a primitive, and getting that wrong is
-	// how the first attempt at this fix passed its own mutation: classified as a
-	// primitive it was skipped by the "a primitive is not a door onto itself" rule, and
-	// since nothing called it, nothing was ever asserted about it. The classification is
-	// not cosmetic — in that shape the deletion site IS the function holding the
-	// literal, because the `.Update("robot")` it borrows lives in a generic helper that
-	// is not itself a deletion.
 	var doors []*censusFunc
 	seen := map[string]bool{}
 	addDoor := func(f *censusFunc) {
@@ -410,22 +393,14 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 		seen[f.String()] = true
 		doors = append(doors, f)
 	}
-	called := map[string]bool{}
-	for _, f := range funcs {
-		for name := range primitives {
-			if f.name != name && f.calls[name] {
-				called[name] = true
-			}
-		}
-	}
+
 	// A primitive NOTHING calls is its own door.
 	//
 	// "A primitive is not a door onto itself" assumes primitives are db-layer helpers
 	// with a handler above them — true of all three today. It is false for a handler
 	// that does the deletion inline, and the failure is silent in the worst way: the
 	// function is classified, excluded from the door set by that rule, and then checked
-	// by nothing. That is the same shape as the split-spelling fix's first attempt, one
-	// level over, and it is why this rule is stated rather than assumed.
+	// by nothing.
 	for name, f := range primitives {
 		if _, exempt := d14ExemptPrimitives[name]; exempt {
 			continue
@@ -434,6 +409,7 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			addDoor(f)
 		}
 	}
+
 	for _, f := range funcs {
 		if primitives[f.name] == nil {
 			for name := range primitives {
@@ -449,6 +425,9 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 		if f.disablesBotAccount() {
 			continue
 		}
+		// The split-spelling door: the deletion site is the function holding the
+		// intent, because the UPDATE it borrows lives in a generic helper that is not
+		// itself a deletion.
 		for writer := range statusCapableWriters {
 			if f.calls[writer] {
 				addDoor(f)
@@ -456,6 +435,51 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			}
 		}
 	}
+	return primitives, statusCapableWriters, doors
+}
+
+func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+
+	funcs := scanRepoFuncs(t, repoRoot, "modules", "pkg", "internal")
+
+	primitives, statusCapableWriters, doors := assembleCensus(funcs)
+
+	names := make([]string, 0, len(primitives))
+	for n := range primitives {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	t.Logf("bot-disabling primitives found: %v", names)
+	writerNames := make([]string, 0, len(statusCapableWriters))
+	for n := range statusCapableWriters {
+		writerNames = append(writerNames, n)
+	}
+	sort.Strings(writerNames)
+	t.Logf("status-capable robot writers found: %v", writerNames)
+
+	// The scanner must keep finding the primitives we know about. Without this the
+	// census degrades silently into a test that asserts nothing the day someone
+	// rewrites one of these with a spelling the matcher misses — the exact shape of
+	// vacuity this file has already been caught on twice.
+	for _, known := range []string{"deleteRobot", "deleteRobotSoft", "deleteCreatedBotArtifacts"} {
+		assert.Contains(t, primitives, known,
+			"the scanner no longer recognises %s as a bot-disabling primitive; either it was "+
+				"renamed (update this list) or it was rewritten in a spelling disablesBotAccount "+
+				"does not match (fix the matcher) — until then the census below is blind to it",
+			known)
+	}
+	// Same for the two status-capable writers. They are what make the two live disable
+	// endpoints visible at all, and neither endpoint is reachable through a primitive.
+	for _, known := range []string{"updateRobot", "updateRobotInfo"} {
+		assert.Contains(t, statusCapableWriters, known,
+			"the scanner no longer recognises %s as status-capable. Its callers stop being "+
+				"door candidates, and since neither of them calls a primitive, they leave the "+
+				"census entirely — silently, because their exemption entries are not assertions",
+			known)
+	}
+
 	require.NotEmpty(t, doors,
 		"no bot-deletion entry point found at all — the census cannot be vacuous and pass")
 	doorNames := make([]string, 0, len(doors))
@@ -478,6 +502,23 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			"%s is no longer recognised as a bot-deletion entry point — if it was renamed or "+
 				"restructured, this list has to follow it, or the census stops covering that door",
 			known)
+	}
+
+	// Every recorded exemption must correspond to a door that was actually FOUND.
+	//
+	// This is the assertion that makes the exemptions load-bearing, and without it the
+	// whole status-capable mechanism is deletable while the suite stays green: remove
+	// the door loop and updateRobotStatus / robotUpdate simply vanish from the door
+	// set — nothing asserts their presence, because neither is reachable through a
+	// primitive, and the known-door list below is satisfied by the three that are.
+	// Both reviewers reproduced exactly that, independently, and both named this as the
+	// fix. An exemption nothing checks is indistinguishable from a deleted matcher.
+	for key := range d14ExemptDoors {
+		assert.Contains(t, doorNames, key,
+			"%s is recorded in d14ExemptDoors but the census did not find it as a door. Either "+
+				"it was renamed or removed (drop the exemption), or the matcher stopped seeing "+
+				"the shape that made it a door — and in that case the exemption is now dead "+
+				"config describing a decision nothing enforces", key)
 	}
 
 	// Step 3: every door routes through D14, unless it is a recorded exemption.
@@ -522,7 +563,11 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 // gets a fixture here, parsed from source rather than from the repository, which is
 // also the only way to cover a shape the tree does not currently contain.
 //
-// Deleting any single detection branch turns exactly one case below red.
+// Measured, not asserted: each of the nine detection branches in censusFuncsIn was
+// deleted in turn and the table below re-run. No branch is deletable while green.
+// Eight of the nine redden exactly one case — the case named after that spelling. The
+// ninth, the `Update("robot")` table guard, reddens five, because it is not a spelling
+// of its own but the precondition every robot-table shape is built on.
 func TestCensusMatcherSeesEverySpellingItClaimsTo(t *testing.T) {
 	cases := []struct {
 		name string
@@ -575,6 +620,15 @@ func probe(s S, id string) error {
 	return err
 }`,
 			wantDisables: true,
+		},
+		{
+			name: "status-capable: .Set chain with a variable — pins the chain's non-literal half",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.Update("robot").Set("status", v).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
 		},
 		{
 			name: "status-capable: writes status from a variable — the updateRobot shape",
@@ -648,4 +702,89 @@ func probe(s S, id string) error {
 					"it too far and innocent callers get told to call CloseAllSpaceSeats")
 		})
 	}
+}
+
+// TestCensusDoorAssemblyIsPinned guards the half the fixtures above do not reach.
+//
+// TestCensusMatcherSeesEverySpellingItClaimsTo covers the CLASSIFIER — what each
+// function is. This covers the ASSEMBLY — which of them become doors. Both reviews
+// found that half unguarded, independently and by the same method: delete the
+// status-capable door loop and the two live disable endpoints vanish from the door set
+// with every test still green; delete the uncalled-primitive rule and nothing changes,
+// because all three primitives happen to have callers today.
+//
+// Both branches only ever fired on what the repository contains. That is the exact
+// failure this file exists to prevent, and it had now recurred at three levels: the
+// census (round 11), the classifier branches (round 1 of this PR), and the assembly
+// (round 2). Fixtures here so there is no fourth.
+func TestCensusDoorAssemblyIsPinned(t *testing.T) {
+	// One synthetic package per case, classified through the same censusFuncsIn the
+	// census uses, then assembled through the same assembleCensus.
+	assemble := func(t *testing.T, src string) (map[string]bool, []string) {
+		t.Helper()
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "probe.go", src, 0)
+		require.NoError(t, err)
+		_, writers, doors := assembleCensus(censusFuncsIn(f, "probe.go"))
+		names := make([]string, 0, len(doors))
+		for _, d := range doors {
+			names = append(names, d.name)
+		}
+		sort.Strings(names)
+		return writers, names
+	}
+
+	t.Run("a caller of a status-capable writer is a door", func(t *testing.T) {
+		writers, doors := assemble(t, `package p
+func writeRobotFields(s S, id string, fields map[string]interface{}) error {
+	_, err := s.Update("robot").SetMap(fields).Where("robot_id=?", id).Exec()
+	return err
+}
+func handler(s S, id string) error {
+	return writeRobotFields(s, id, map[string]interface{}{"status": 0})
+}`)
+		assert.True(t, writers["writeRobotFields"], "the writer must be recognised as status-capable")
+		assert.Equal(t, []string{"handler"}, doors,
+			"the caller of a status-capable writer must be a door. Delete that loop and the "+
+				"two live disable endpoints leave the census silently — they reach it through "+
+				"no primitive, so nothing else would notice")
+	})
+
+	t.Run("a primitive nothing calls is its own door", func(t *testing.T) {
+		_, doors := assemble(t, `package p
+func inlineHandler(s S, id string) error {
+	_, err := s.Update("robot").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}`)
+		assert.Equal(t, []string{"inlineHandler"}, doors,
+			"a handler that deletes INLINE is a primitive, and 'a primitive is not a door onto "+
+				"itself' would then exclude it from every check. All three real primitives have "+
+				"callers today, so this branch fires for nobody in the tree — which is why it "+
+				"needs a fixture rather than a comment")
+	})
+
+	t.Run("a primitive with a caller makes the CALLER the door, not itself", func(t *testing.T) {
+		_, doors := assemble(t, `package p
+func deleteRow(s S, id string) error {
+	_, err := s.Update("robot").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}
+func handler(s S, id string) error { return deleteRow(s, id) }`)
+		assert.Equal(t, []string{"handler"}, doors,
+			"the db-layer helper is not the entry point; its caller is. Getting this backwards "+
+				"is what made the split-spelling fix pass its own mutation the first time")
+	})
+
+	t.Run("a writer that never touches status leaves its callers alone", func(t *testing.T) {
+		writers, doors := assemble(t, `package p
+func setDescription(s S, id string, d string) error {
+	_, err := s.Update("robot").Set("description", d).Where("robot_id=?", id).Exec()
+	return err
+}
+func handler(s S, id string) error { return setDescription(s, id, "hello") }`)
+		assert.Empty(t, writers, "touching another column must not make a writer status-capable")
+		assert.Empty(t, doors,
+			"and its callers must not be accused of deleting a bot — the failure message would "+
+				"tell them to call CloseAllSpaceSeats, which for this function is wrong advice")
+	})
 }
