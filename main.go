@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/project"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -698,6 +699,12 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// modules/internal_resolve/main_wiring_test.go asserts this argument
 		// stays present so a future refactor cannot delete it silently.
 		os.Getenv(internal_resolve.DriveInternalTokenEnv),
+		// Same reasoning for the marketplace internal token: it authorizes
+		// reading any uid's role in any Space, so if it ever equalled a route's
+		// notify_token_env value one leaked credential would grant both the
+		// Space role lookup AND route notify. Registered by qualified constant,
+		// not a literal, so main_wiring_test.go can assert it stays present.
+		os.Getenv(space.MarketplaceInternalTokenEnv),
 		// The two project provisioning secrets, for the same reason and with the same
 		// limitation: modules/project can check them against each other and against the
 		// four FIXED internal-token envs, but it cannot see the dynamic route-scoped
@@ -713,6 +720,15 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// exist, which defeats the only purpose the comment has.)
 		os.Getenv(project.ProvisionFleetSecretEnv),
 		os.Getenv(project.ProvisionDriveSecretEnv),
+		// NOT covered here, stated because the absence is otherwise invisible:
+		// modules/bot_task's per-source bearer tokens live inside the
+		// OCTO_BOT_TASK_SOURCES JSON registry rather than in a single env, so no
+		// os.Getenv can reach them and they cannot be passed to this call. They are
+		// deduped only WITHIN that registry, which means a value shared between a
+		// bot_task source and any credential named here is detected by nothing.
+		// Closing it needs that module to expose its configured token values — a
+		// change there, not here. Recorded at the call site because this is where a
+		// reader counts the arguments and concludes the set is complete.
 	); err != nil {
 		return nil, err
 	}

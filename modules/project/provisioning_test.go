@@ -3,6 +3,7 @@ package project
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1610,6 +1611,32 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		assert.Equal(t, "p-123", cfg.RequeueProjectID)
 	})
 
+	t.Run("the requeue env is refused when all requested targets are rejected", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:                         "fleet",
+			envProvisionFleetURL:                        "not-a-url",
+			ProvisionFleetSecretEnv:                     okSecretA,
+			"OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID": "p-123",
+		}))
+		require.Len(t, problems, 2)
+		assert.Contains(t, problems[0].Error(), "ensure url")
+		assert.Contains(t, problems[1].Error(), "OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID")
+		assert.False(t, cfg.Enabled())
+		assert.Equal(t, []string{TargetFleet}, cfg.Misconfigured)
+		assert.Equal(t, problems, cfg.Problems,
+			"the requeue diagnostic must reach the startup logger, not only the return value")
+	})
+
+	t.Run("the disabled requeue diagnostic preserves existing problems", func(t *testing.T) {
+		existing := errors.New("existing target problem")
+		problems := appendDisabledRequeueProblem([]error{existing}, ProvisioningConfig{
+			RequeueProjectID: "p-123",
+		})
+		require.Len(t, problems, 2)
+		assert.ErrorIs(t, problems[0], existing)
+		assert.Contains(t, problems[1].Error(), "OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID")
+	})
+
 	t.Run("the retired process-global reclaim env is refused, not ignored", func(t *testing.T) {
 		cfg, problems := loadProvisioningConfig(env(map[string]string{
 			"OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE": "true",
@@ -1618,6 +1645,43 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		assert.Contains(t, problems[0].Error(), "OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE")
 		assert.Empty(t, cfg.ReclaimTargets,
 			"the retired global switch must not authorize purging any target")
+	})
+
+	// A-4 at the LOADER, not only at ValidateTarget. The acceptance item is about
+	// what happens at config load — the target is dropped, recorded in
+	// Misconfigured, and reported through Problems — and that consequence was
+	// covered only by the generic bad-target case below.
+	t.Run("a whitespace-wrapped secret is dropped at config load", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:     "fleet",
+			envProvisionFleetURL:    "https://fleet.internal/ensure",
+			ProvisionFleetSecretEnv: okSecretA + "\n", // the file-mounted shape
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "whitespace",
+			"the reason must survive to the boot log; zap.Error prints this verbatim")
+		assert.Empty(t, cfg.Targets,
+			"a secret the peer will reject must not produce a live target: every request "+
+				"would 401 for the whole retry budget and the row would land in abandoned")
+		assert.Equal(t, []string{TargetFleet}, cfg.Misconfigured,
+			"and the gauge must be able to name it")
+		assert.False(t, cfg.Enabled())
+	})
+
+	// The URL is configuration too. ValidateTarget rejects surrounding whitespace,
+	// so the loader must pass the raw value through rather than silently repairing a
+	// configmap typo before validation can report it.
+	t.Run("a whitespace-wrapped ensure URL is dropped at config load", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:     "fleet",
+			envProvisionFleetURL:    " https://fleet.internal/ensure ",
+			ProvisionFleetSecretEnv: okSecretA,
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "whitespace")
+		assert.Empty(t, cfg.Targets)
+		assert.Equal(t, []string{TargetFleet}, cfg.Misconfigured)
+		assert.False(t, cfg.Enabled())
 	})
 
 	t.Run("a bad target is dropped, not fatal", func(t *testing.T) {

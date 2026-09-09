@@ -2722,6 +2722,46 @@ SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖�
 - Review 后将分页 items 与总数统计统一到同一个 SQL 分类表达式，避免后续新增 hosting slug 时
   两套条件漂移；独立 Swagger 文档不进入 PR。
 
+## 2026-09-08 — project-provisioning-followups
+
+PR #850 merged as one squash commit whose message describes the slice rather than
+its seven review rounds, so a cross-workstream design decision (the fleet container
+id is provisional and becomes project_id once the peer-side narrowing lands) and six
+deliberately-open P2 findings existed only in a closed PR thread. Recorded as an
+actionable brief, then **all six were fixed in the same task** — the record turned
+out to be the cheaper half. See
+`.octospec/tasks/project-provisioning-followups/brief.md`.
+
+Lessons from that task and its review:
+
+- **一份「记录用」的文档，行号会指向修复而不是缺陷** —— brief 里六条 finding 的
+  `file:line` 全部钉在 `origin/main` `5dd80d4`，而同一个 PR 随后把它们修了。
+  最锋利的一条：brief 让读者去看 `config_provisioning.go:227-229`「这里写着 completely
+  inert，是错的」，而那几行现在写着「**NOT** completely inert」。
+  **把读者送去看缺陷、而那一行里装着修复**，比行号漂移更糟。修法不是重钉，是说清楚
+  这些引用属于哪棵树。
+- **PR 长出第二个 commit 时，标题和正文不会自己跟上** —— 三位 reviewer 独立判同一件事：
+  标题还是 `docs(project):`，正文还写着「No behaviour change」，而 head 改了一个
+  信任边界校验器和一条「重试 vs 放弃」的分类。本仓 squash 合并，**这个标题会变成
+  main 上的永久 commit subject**——正是这个 PR 声称要修复的那件事，在下一个 PR 上重演。
+  而且 PR 挂着 `needs-human-review`：给人工门递一个假前提，是这里面最不该发生的。
+- **MySQL 的 DDL 会隐式提交，「放进同一个事务」是空头承诺** —— 回滚手册要求把
+  `DROP TABLE` 和删账本行放进一个事务。实测（8.0.46）：
+  `START TRANSACTION; DROP TABLE t; DELETE …; ROLLBACK;` **两样都没恢复**。
+  「实测走通」本身不假——按顺序执行到底确实到达终态；假的是它暗示的**原子性**。
+  真实风险是 DROP 成功而 DELETE 失败，正好落在这段自己警告的状态里。
+- **「已记录在某处」是一句可以被 grep 证伪的断言** —— brief 写着 bot_task 的 per-source
+  token「recorded in that registry's own comment」。穷举 grep：调用点、
+  `ValidateNotifyTokenExclusions` 的文档与函数体、bot_task 自己的注释，**任何拼写都没有**。
+  用「已经记过了」来论证「本文不必记」，而那份记录不存在，结果是这件事哪儿都没记——
+  正是这个 PR 要终结的那种丢失。补法是把注释真的写到 main.go 的调用点。
+- **验证锚点要跟着引用一起走** —— brief 声称「每一条都对着 `origin/main` 5dd80d4 核过」，
+  却引用了 `.octospec/tasks/loop-project-fleet-integration/`——那个目录只存在于**未合并**的
+  PR #852 分支上。守卫抓不到这一类：它的路径正则只认
+  `modules|internal|pkg|tools|cmd` 开头，`.octospec/` 不在它的取值域里。
+- **接受 2xx 而契约写的是 200** —— `Ensure` 收 202 当成功，就会把 `ready`
+  （「我们成功建好了容器」）写在一个**可能还不存在**的容器上；后面每一处读 `ready` 的判断
+  都在把承诺当事实读。改成严格 200，且判**可重试**而非终态——对端正在灰度不该烧掉一行。
 ## 2026-09-08 — project-p2-all-member-group（第十一轮 review 的 fast-follow）
 
 PR #855 已合入（`566e625`）。第十一轮 review 给了 APPROVE，同时留下三个 P2、一个 nit 和一处

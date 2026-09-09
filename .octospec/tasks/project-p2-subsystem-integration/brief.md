@@ -328,7 +328,7 @@ Headers on both:
   X-Octo-Signature   v1=<hmac-sha256 over CanonicalRequest(POST, path, ts, event-id, body)>
 ```
 
-**Three things the receiver MUST do**, added 2026-09-07 because the original sketch
+**Four things the receiver MUST do**, added 2026-09-07 because the original sketch
 specified how the request is signed and not what verifying it requires — and the first
 two have no enforcement on octo-server's side at all:
 
@@ -342,6 +342,10 @@ two have no enforcement on octo-server's side at all:
    receiver's.
 3. **Treat `container_id` as the idempotency key** (get-first / create /
    duplicate-key downgrade). Delivery is at-least-once by construction.
+4. **Reply synchronously with exactly `200` and the echoed `container_id`** only
+   after the container exists. `202`, another 2xx, or a missing echo is not a
+   successful ensure: octo-server retries it and must not record `ready` against
+   a promise.
 
 **`X-Octo-Event-ID` carries sha256(container_id), not the id.** Bodies are almost never
 logged; headers routinely are (a proxy's custom log format, an APM agent's default

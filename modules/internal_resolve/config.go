@@ -36,6 +36,18 @@ const (
 	notifyInternalTokenEnv  = "NOTIFY_INTERNAL_TOKEN"
 	docsNotifyInternalToken = "OCTO_DOCS_NOTIFY_TOKEN"
 	botMentionInternalToken = "OCTO_DOCS_BOT_MENTION_TOKEN"
+	// marketplaceInternalToken is modules/space.MarketplaceInternalTokenEnv,
+	// which gates GET /v1/internal/spaces/:space_id/members/:uid/role.
+	// Duplicated as a literal (like the three above) rather than imported, so
+	// this module keeps zero production dependencies on modules/space;
+	// api_test.go pins the two spellings together so they cannot drift.
+	//
+	// The check is symmetric on purpose — modules/space, modules/notify and
+	// modules/bot_mention all run the mirror-image comparison. With only one
+	// half, a deployment that set two tokens to the same value would disable
+	// exactly one of the capabilities (an arbitrary winner) instead of failing
+	// both closed.
+	marketplaceInternalToken = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 
 	// internalTokenHeader is the wire header carrying the credential. Same
 	// value as modules/notify.InternalTokenHeader and modules/bot_mention's
@@ -112,6 +124,8 @@ func resolveDriveInternalToken(getenv func(string) string) (string, error) {
 		return "", errors.New("OCTO_DRIVE_INTERNAL_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; drive internal API disabled")
 	case token == getenv(botMentionInternalToken):
 		return "", errors.New("OCTO_DRIVE_INTERNAL_TOKEN must differ from OCTO_DOCS_BOT_MENTION_TOKEN; drive internal API disabled")
+	case token == getenv(marketplaceInternalToken):
+		return "", errors.New("OCTO_DRIVE_INTERNAL_TOKEN must differ from OCTO_MARKETPLACE_INTERNAL_TOKEN; drive internal API disabled")
 	default:
 		return token, nil
 	}

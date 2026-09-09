@@ -257,8 +257,16 @@ type ProvisioningConfig struct {
 }
 
 // Enabled reports whether any target is live. When false, createProjectOnce
-// enqueues nothing and the worker does not start, so the provisioning slice is
-// completely inert — which is its default state.
+// enqueues nothing and the worker does not start.
+//
+// NOT completely inert, and the exception is deliberate rather than an
+// oversight: markProvisioningDisbandPendingTx runs UNCONDITIONALLY on the
+// disband path. Gating that on Enabled() would mean a target that was enabled,
+// produced rows, and was later disabled stops marking its containers
+// reclaimable — a real leak, with no local record that anything was left behind.
+//
+// This comment is what a future reader consults immediately before "tidying up"
+// by adding that gate, so it says so here rather than only in the runbook.
 func (c ProvisioningConfig) Enabled() bool { return len(c.Targets) > 0 }
 
 // TargetByName returns the resolved target, or false when it is not enabled.
@@ -337,12 +345,7 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		// Same reasoning as the retired reclaim env below: an operator who followed the
 		// runbook has to learn that the instruction did nothing, and a startup problem is
 		// the channel that survives a restart loop.
-		if cfg.RequeueProjectID != "" {
-			problems = append(problems, fmt.Errorf(
-				"project provisioning: %s is set but %s enables no target, so no row will be requeued; "+
-					"enable the target that owns the stuck row, or clear the requeue env",
-				envProvisionRequeueProjectID, envProvisionTargets))
-		}
+		problems = appendDisabledRequeueProblem(problems, cfg)
 		cfg.Problems = problems
 		return cfg, problems
 	}
@@ -359,7 +362,7 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		target := provisionTarget{
 			Target: projectprovision.Target{
 				Name:      name,
-				EnsureURL: strings.TrimSpace(getenv(envs.url)),
+				EnsureURL: getenv(envs.url),
 				Secret:    secret,
 				Timeout:   cfg.Timeout,
 			},
@@ -378,8 +381,22 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		secrets[name] = secret
 		cfg.Targets = append(cfg.Targets, target)
 	}
+	problems = appendDisabledRequeueProblem(problems, cfg)
 	cfg.Problems = problems
 	return cfg, problems
+}
+
+// appendDisabledRequeueProblem reports a rescue instruction that cannot execute.
+// startProvisioningWorker returns before requeueing whenever no VALID target survived
+// configuration, whether the target list was empty or every requested target was rejected.
+func appendDisabledRequeueProblem(problems []error, cfg ProvisioningConfig) []error {
+	if cfg.RequeueProjectID == "" || cfg.Enabled() {
+		return problems
+	}
+	return append(problems, fmt.Errorf(
+		"project provisioning: %s is set but %s leaves no valid target enabled, so no row will be requeued; "+
+			"configure and enable the target that owns the stuck row, or clear the requeue env",
+		envProvisionRequeueProjectID, envProvisionTargets))
 }
 
 // parseMaxAttempts resolves the retry budget, refusing a value outside

@@ -111,6 +111,64 @@ func TestContainerEventIDIsAOneWayStableDerivation(t *testing.T) {
 	}
 }
 
+// TestEnsureTreatsAnAbsentContainerIDAsRetryable separates the two shapes that
+// used to share one category.
+//
+// A MISSING id is a malformed response; a DIFFERENT id is evidence the peer owns
+// a container we do not know about. Only the second is terminal, and the
+// difference is not cosmetic: container_id_mismatch is abandoned on the FIRST
+// attempt, and abandoned has no automatic re-drive.
+//
+// The missing shape is what a peer serves while its ensure endpoint is still
+// rolling out — a stub answering {}. That
+// is precisely the window in which the first target gets enabled, so filing it
+// as terminal would need a human to requeue every row created during it.
+func TestEnsureTreatsAnAbsentContainerIDAsRetryable(t *testing.T) {
+	// The reachable set, exactly: an empty or whitespace-only body does NOT reach
+	// this branch — Decode returns io.EOF on it and the decode-failure branch
+	// catches it first. `null` is here because the corrected comment names it and
+	// the earlier test did not pin it.
+	for _, body := range []string{`{}`, `{"container_id":""}`, `{"container_id":" "}`, `{"container_id":"\t\n"}`, `null`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			_, err := NewClient(nil, nil).Ensure(context.Background(), testTarget(server.URL+"/ensure"), EnsureRequest{
+				ContainerID: "octows-deadbeef", ProjectID: "p1", OctoSpaceID: "s1",
+			})
+			if got := Category(err); got != "invalid_response" {
+				t.Fatalf("category = %q, want invalid_response — an absent id is a malformed "+
+					"response, not proof the peer owns a different container (err=%v)", got, err)
+			}
+		})
+	}
+}
+
+// TestEnsureDecodeFailureHasSafeDetail keeps a malformed 200 response actionable
+// without persisting response bytes, which can contain the container capability.
+func TestEnsureDecodeFailureHasSafeDetail(t *testing.T) {
+	const containerID = "octows-deadbeef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("<html>" + containerID + "</html>"))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(nil, nil).Ensure(context.Background(), testTarget(server.URL+"/ensure"), EnsureRequest{
+		ContainerID: containerID, ProjectID: "p1", OctoSpaceID: "s1",
+	})
+	if got := Category(err); got != "invalid_response" {
+		t.Fatalf("category = %q, want invalid_response (err=%v)", got, err)
+	}
+	if got, want := Summary(err), "response body was not valid JSON"; got != want {
+		t.Fatalf("Summary = %q, want %q", got, want)
+	}
+	if strings.Contains(Summary(err), containerID) {
+		t.Fatalf("Summary leaks container id: %q", Summary(err))
+	}
+}
+
 // TestEnsureRejectsAMismatchedContainerID pins the fail-loud-and-permanent branch.
 // A target that answers with a different id means our mapping row points at a
 // container nobody owns, and no number of retries repairs that.
@@ -281,6 +339,18 @@ func TestValidateTarget(t *testing.T) {
 		// the wire, so ForceQuery has to be checked too.
 		{"force_query", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure?", Secret: testSecret}, true},
 		{"fragment", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure#frag", Secret: testSecret}, true},
+		// The EMPTY fragment. url.Parse leaves Fragment == "" for a bare trailing
+		// "#", so a parsed.Fragment check passes it while the separator is still in
+		// the configured value. cardactiondispatch documents this case and checks the
+		// raw string; this package claimed alignment and had the weaker check.
+		{"empty_fragment", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure#", Secret: testSecret}, true},
+		// A secret mounted from a file carries a trailing newline. Refused rather
+		// than trimmed: trimming lets a subtly wrong mount work, and the failure it
+		// otherwise produces is a whole retry budget of 401s indistinguishable from a
+		// rotated secret, ending in abandoned, which has no automatic re-drive.
+		{"secret_trailing_newline", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure", Secret: testSecret + "\n"}, true},
+		{"secret_leading_space", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure", Secret: " " + testSecret}, true},
+		{"secret_trailing_space", Target{Name: "fleet", EnsureURL: "https://fleet.internal/ensure", Secret: testSecret + " "}, true},
 		// Host alone keeps the ":port", so a host-less URL with a port would pass a
 		// `Host != ""` check; Hostname() is what actually rejects it.
 		{"port_without_host", Target{Name: "fleet", EnsureURL: "http://:8080/ensure", Secret: testSecret}, true},
@@ -628,5 +698,63 @@ func TestConformanceEpochLabelMatchesTheConstant(t *testing.T) {
 	if got := string(m[1]); got != want {
 		t.Errorf("comment says %s, conformanceNow is %s — fix the COMMENT, not the constant "+
 			"(the published signatures were computed over it)", got, want)
+	}
+}
+
+// TestEnsureRefusesANonOKSuccessStatus pins P2-C: the published contract
+// specifies a SYNCHRONOUS 200 carrying container_id, and this client used to
+// accept any 2xx.
+//
+// 202 is the case that matters. It means the peer accepted the request and will
+// act on it later, so treating it as success writes status=ready — "we
+// successfully created the container" — against a container that may not exist.
+// Every later decision that reads ready would be reading a promise as a fact.
+//
+// It retries rather than being terminal: unlike a 4xx, nothing here says the peer
+// will answer this way forever, and a mid-rollout peer should not burn a row.
+func TestEnsureRefusesANonOKSuccessStatus(t *testing.T) {
+	for _, status := range []int{http.StatusAccepted, http.StatusCreated, http.StatusNoContent} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				// A VALID body, so the refusal is about the status and nothing else.
+				_, _ = w.Write([]byte(`{"container_id":"octows-deadbeef"}`))
+			}))
+			defer server.Close()
+
+			_, err := NewClient(nil, nil).Ensure(context.Background(), testTarget(server.URL+"/ensure"), EnsureRequest{
+				ContainerID: "octows-deadbeef", ProjectID: "p1", OctoSpaceID: "s1",
+			})
+			if err == nil {
+				t.Fatalf("%d with a valid body must NOT be accepted: the contract requires a "+
+					"synchronous 200, and 202 means the container may not exist yet", status)
+			}
+			if got := Category(err); got != "invalid_response" {
+				t.Fatalf("category = %q, want invalid_response (err=%v)", got, err)
+			}
+			if summary := Summary(err); !strings.Contains(summary, "synchronous 200") {
+				t.Errorf("last_error must say what the peer got wrong, got %q", summary)
+			}
+		})
+	}
+}
+
+// TestValidateTargetRefusesAnUntrimmedURL is P2-8: "reject, do not trim" applied
+// to one of the two configured values is a principle with a hole in it. The
+// sibling validator refuses an untrimmed raw value before parsing, and this one
+// now does too.
+func TestValidateTargetRefusesAnUntrimmedURL(t *testing.T) {
+	for _, raw := range []string{
+		"https://peer.invalid/ensure ",
+		" https://peer.invalid/ensure",
+		"https://peer.invalid/ensure\n",
+		"",
+	} {
+		tgt := testTarget(raw)
+		tgt.EnsureURL = raw
+		if err := ValidateTarget(tgt); err == nil {
+			t.Errorf("%q must be refused: it survives url.Parse, reaches EscapedPath() as %%20, "+
+				"signature and wire path agree, and the peer answers 404 — retried to abandoned", raw)
+		}
 	}
 }

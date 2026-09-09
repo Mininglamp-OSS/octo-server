@@ -68,6 +68,29 @@ func containerIDPrefix(target string) (string, bool) {
 // randomize must never be written. Returning a fallback (a counter, a timestamp,
 // the project id) is the one outcome that silently reintroduces derivability at
 // the exact moment the entropy source is broken.
+// PROVISIONAL FOR THE FLEET TARGET. Non-derivability is a mitigation with a
+// planned end, not a permanent property, and the plan lives outside this
+// repository — so it is recorded here rather than only in a merged pull request.
+//
+// It exists because the fleet workspace gate currently admits on octo Space
+// membership alone and then materialises the caller as a member permanently,
+// which turns a readable project_id into permanent membership of every
+// project's workspace. The Loop integration narrows that gate: for
+// octo-server-owned projects the fleet side stops reading its own member table
+// and asks octo-server instead, requiring Space member AND Project member. The
+// two inbound endpoints that make that possible are PR #852.
+//
+// When that narrowing ships, the agreed change is:
+//
+//	the FLEET container id becomes project_id (one canonical UUID, no mapping),
+//	and the non-derivability guard narrows to apply to DRIVE ONLY.
+//
+// Drive is NOT carried along by that decision — its threat model is separate and
+// this argument may still hold there, so it gets re-decided on its own evidence.
+//
+// Until then nothing changes, and nothing may: no target can be enabled before
+// the precondition this slice already records. See
+// .octospec/tasks/project-provisioning-followups/brief.md (D-1).
 func newContainerID(target string) (string, error) {
 	prefix, ok := containerIDPrefix(target)
 	if !ok {

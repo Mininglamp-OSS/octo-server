@@ -15,20 +15,59 @@ import (
 	"go.uber.org/zap"
 )
 
-func (n *Notify) deliverApprovalCardNotification(req *NotifyReq, capability cardactiondispatch.NotifyCapability) (*NotifyResp, error) {
+// prepareApprovalCard runs every ApprovalCard check that does NOT depend on the
+// recipient set, and returns the rendered card document.
+//
+// It exists so those checks can run BEFORE role-targeted recipient resolution
+// (sendNotify) as well as during delivery, from one definition. Splitting them
+// out matters because resolveRoleTargets short-circuits a zero-admin Space as a
+// 200; if validation lived only downstream of that, a malformed card would be
+// rejected or accepted depending on the membership of the Space it names.
+//
+// The rendered document doubles as the schema check — cardtmpl.Build… is where
+// an over-long action list or an empty custom-actions slice is caught — which is
+// why the build happens here rather than after memberCache.verify as it used to.
+// That ordering is the same C1 policy the summary and docs card paths already
+// follow (docs/platform-card-base.md §10): a caller contract violation must be a
+// 400 with zero delivery, and must not be silently skipped by a request whose
+// recipients all turn out to be non-members.
+//
+// Deliberately NOT checked here: len(req.Targets) == 0. On the role path the
+// slice is still empty at pre-validation time (resolution has not run yet), so
+// the empty check belongs to the caller that knows whether resolution has
+// happened. The upper bound IS checked, because exceeding it is a caller error
+// on the explicit-targets path and unreachable on the role path (resolution
+// truncates at the same constant).
+func (n *Notify) prepareApprovalCard(req *NotifyReq, capability cardactiondispatch.NotifyCapability) ([]byte, error) {
 	if req == nil || req.ApprovalCard == nil || n.actionService == nil ||
 		!n.actionService.CanNotify(capability, req.ApprovalCard.ActionType) {
 		return nil, errNotifyCardNotAllowed
 	}
 	card := req.ApprovalCard
-	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) == 0 || len(req.Targets) > 200 ||
+	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) > maxNotifyTargets ||
 		strings.TrimSpace(card.Title) == "" {
 		return nil, errNotifyCardInvalid
 	}
-	sender := n.actionSenders[capability]
-	if sender == nil || !cardmsg.Enabled() {
+	if n.actionSenders[capability] == nil || !cardmsg.Enabled() {
 		return nil, errors.New("notify: action card producer unavailable")
 	}
+	document, err := n.buildApprovalRequestCard(card, capability, i18n.OutboundLanguage(context.Background()))
+	if err != nil {
+		return nil, errNotifyCardInvalid
+	}
+	return document, nil
+}
+
+func (n *Notify) deliverApprovalCardNotification(req *NotifyReq, capability cardactiondispatch.NotifyCapability) (*NotifyResp, error) {
+	document, err := n.prepareApprovalCard(req, capability)
+	if err != nil {
+		return nil, err
+	}
+	card := req.ApprovalCard
+	if len(req.Targets) == 0 {
+		return nil, errNotifyCardInvalid
+	}
+	sender := n.actionSenders[capability]
 	targets := dedupTargets(req.Targets)
 	if req.ActorUID != "" {
 		filtered := make([]string, 0, len(targets))
@@ -49,10 +88,6 @@ func (n *Notify) deliverApprovalCardNotification(req *NotifyReq, capability card
 	n.ensureNotifyBotReady()
 	if !n.botOK.Load() {
 		return nil, errors.New("notification bot unavailable")
-	}
-	document, err := n.buildApprovalRequestCard(card, capability, i18n.OutboundLanguage(context.Background()))
-	if err != nil {
-		return nil, errNotifyCardInvalid
 	}
 
 	type sendResult struct {
