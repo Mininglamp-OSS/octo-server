@@ -101,13 +101,6 @@ rejects, and the whole ~23.5-minute retry budget burns as indistinguishable
 Preferred fix is to **reject** leading/trailing whitespace rather than trim it
 silently: trimming hides a broken mount that will surprise someone again.
 
-**P2-8 — the URL rejection must be reached from config load.**
-The same reject-not-trim rule is meaningless if `loadProvisioningConfig` trims
-`OCTO_PROJECT_PROVISION_*_URL` before `ValidateTarget` sees it. A whitespace-
-wrapped URL must be dropped, reported through `Problems`, and counted in
-`Misconfigured`, just as a whitespace-wrapped secret is; otherwise an operator
-gets a silent config repair instead of the stated deployment signal.
-
 **A-5 — the empty-fragment case regressed a fix a sibling already documented.**
 `internal/projectprovision/client.go:351` checks `parsed.Fragment != ""`, so
 `https://host/ensure#` passes. `internal/cardactiondispatch/registry.go:338-341`
@@ -151,9 +144,21 @@ caller in this repository** — and `testutil.NewTestServer` sets
 octo-lib `module/module.go:88`. The rollback instructions are correct; the
 pointer sends whoever follows them to dead code.)
 
+### Follow-up found while fixing A-4 — also FIXED in this task
+
+**P2-8 — the URL rejection must be reached from config load.**
+This was not one of the six findings left open by #850; it was found while
+implementing A-4. The same reject-not-trim rule is meaningless if
+`loadProvisioningConfig` trims `OCTO_PROJECT_PROVISION_*_URL` before
+`ValidateTarget` sees it. A whitespace-wrapped URL must be dropped, reported
+through `Problems`, and counted in `Misconfigured`, just as a whitespace-wrapped
+secret is; otherwise an operator gets a silent config repair instead of the
+stated deployment signal.
+
 ## Load-bearing list
 
-- **The enablement gate is what makes all six safe.** Any change here must keep
+- **The enablement gate made five of the six safe before these fixes.** A-6's
+  census timer was already live without the gate. Any change here must keep
   `OCTO_PROJECT_PROVISION_TARGETS` empty-by-default semantics, and must not be
   read as permission to enable a target — that still waits on the peer-side
   precondition #850 records.
@@ -218,12 +223,16 @@ acceptance criteria and are checked against the implementation.
       passing it.
 - [x] A-6: all four provisioning timers are jittered, matching `reconcile.go`,
       with a source guard that pins all four `Schedule(jitter(...))` calls.
+- [x] P2-5: `plan.md` §3.5 names `module.Setup` / octo-lib `module/module.go`,
+      and says the rollback ordering it already gets right.
+
+The following additional findings were discovered while fixing or reviewing
+those six and are also fixed:
+
 - [x] P2-8: whitespace around a configured ensure URL is REJECTED at config
       load; the target is dropped, marked `Misconfigured`, and reported through
       `Problems`. The loader test covers the deployed environment path rather
       than only a hand-built `Target`.
-- [x] P2-5: `plan.md` §3.5 names `module.Setup` / octo-lib `module/module.go`,
-      and says the rollback ordering it already gets right.
 - [x] P2-A (bundled at #850's close, not one of the six): §3.5's "put the DROP
       and the ledger DELETE in one transaction" is corrected. MySQL commits DDL
       implicitly, so the transaction bought no atomicity — measured on 8.0.46:

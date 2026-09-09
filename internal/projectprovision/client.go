@@ -347,11 +347,13 @@ func ValidateTarget(t Target) error {
 	// The same rule as the secret above, and it belongs here for the same reason
 	// the sibling validator applies it (internal/cardactiondispatch/registry.go
 	// refuses an untrimmed raw value before parsing): "reject, do not trim" applied
-	// to one of the two configured values is a principle with a hole in it. The
-	// loader happens to trim this one today, so the gap is reachable only through a
-	// hand-built Target — and there a trailing space is not a control byte,
-	// url.Parse accepts it, it survives into EscapedPath() as %20, the signature
-	// and the wire path agree, and the peer answers 404, which retries to abandoned.
+	// to one of the two configured values is a principle with a hole in it.
+	// loadProvisioningConfig deliberately passes the raw env value through, so a
+	// whitespace-wrapped URL is rejected here, the target is dropped, and boot
+	// reports it through Problems and Misconfigured. Direct callers get the same
+	// refusal because Ensure revalidates the Target before constructing a request.
+	// Before this check, a trailing space could survive as %20 in EscapedPath and
+	// reach the peer; it can no longer take that request path.
 	if strings.TrimSpace(t.EnsureURL) != t.EnsureURL || t.EnsureURL == "" {
 		return fmt.Errorf("projectprovision: %s ensure url must not be empty or carry "+
 			"leading or trailing whitespace", t.Name)
