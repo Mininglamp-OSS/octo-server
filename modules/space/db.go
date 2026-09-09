@@ -464,7 +464,13 @@ func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
 		if affected == 0 {
 			return tx.Commit()
 		}
-		if err = runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+		// 标识符也来自数据库：见 seatref.go。上面那条 UPDATE 是在 space_member 自己的
+		// collation 下匹配的，而步骤要拿这个标识符去查 collation 更严的 octo_project_member。
+		seat, err := ResolveSeatTx(tx, spaceId, uid)
+		if err != nil {
+			return err
+		}
+		if err = runMemberReactivationTxSteps(tx, seat); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -906,7 +912,12 @@ func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, max
 		return err
 	}
 	if affected > 0 {
-		if err = runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+		// 同 reactivateMember：标识符取自库里那一行，不用调用方拼写。
+		seat, rerr := ResolveSeatTx(tx, spaceId, uid)
+		if rerr != nil {
+			return rerr
+		}
+		if err = runMemberReactivationTxSteps(tx, seat); err != nil {
 			return err
 		}
 	}
@@ -1014,7 +1025,30 @@ const (
 //
 // 邀请码在事务内**重新读取**，而不是沿用调用方在 CAS 之前读到的那份快照：
 // 并发重申可能已经把这行改成了另一个码，沿用旧快照会记账到错码上（round 2 P2-1）。
+// 有界的 1213/1205 重试，与另外两条重新激活路径对称。
+//
+// 补这个包装是因为**同一轮**给上面第 2 步加了 FOR UPDATE：这条路径此前只有 CAS 一处
+// 当前读，加锁定读把「瞬时死锁」从不可能变成可能，而它是四条重新激活门里唯一没有重试
+// 包装的一条——1213 会直接冒泡给审批人，表现为一次无理由失败的审批。两位 reviewer 分别
+// 提了「加 FOR UPDATE」和「这条路径没有重试包装（既有问题、本次未变）」，但没人把两者
+// 连起来：单独做前者会让后者从潜在缺陷变成实际缺陷。
+//
+// 从 BEGIN 重跑是安全的：失败的那次已被 InnoDB 完整回滚，CAS 会在重跑时重新判定，
+// 落空则返回 approveAlreadyHandled——与并发审批的既有语义一致。
 func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, maxUsers int) (approveOutcome, string, error) {
+	var (
+		outcome approveOutcome
+		code    string
+	)
+	err := dbpkg.RetryOnLockConflict(func() error {
+		var runErr error
+		outcome, code, runErr = d.approveJoinApplyAtomicOnce(applyID, reviewerUID, spaceId, maxUsers)
+		return runErr
+	})
+	return outcome, code, err
+}
+
+func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId string, maxUsers int) (approveOutcome, string, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return approveFailed, "", err
@@ -1042,8 +1076,15 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 		UID        string
 		InviteCode string
 	}
+	// FOR UPDATE, not a plain SELECT. Step 1's CAS already holds X on this row, so this
+	// takes no NEW lock and cannot deadlock — but in REPEATABLE READ the transaction's
+	// read view is assigned by the first CONSISTENT read, and a plain SELECT here would
+	// be that read. Everything after it, including the reactivation enumeration below,
+	// would then see a snapshot taken BEFORE the seat's X lock, which is exactly what
+	// the comment further down claims is not the case. One word, and it makes that
+	// comment true instead of aspirational.
 	if _, err = tx.SelectBySql(
-		"SELECT uid, invite_code FROM space_join_apply WHERE id=?", applyID,
+		"SELECT uid, invite_code FROM space_join_apply WHERE id=? FOR UPDATE", applyID,
 	).Load(&row); err != nil {
 		return approveFailed, "", err
 	}
@@ -1154,7 +1195,13 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 	// 锁上下文与另外三条路径一致：本事务已在第 3 步对这一行取过 FOR UPDATE，所以步骤里
 	// 那条枚举读的视图晚于该 X 锁。
 	if reopened > 0 {
-		if err = runMemberReactivationTxSteps(tx, spaceId, row.UID); err != nil {
+		// row.UID 是 space_join_apply 的拼写——**第三张表**，又一次可能与 space_member
+		// 存的字节不同。所以这里同样把标识符换成 space_member 自己的那串。
+		seat, rerr := ResolveSeatTx(tx, spaceId, row.UID)
+		if rerr != nil {
+			return approveFailed, "", rerr
+		}
+		if err = runMemberReactivationTxSteps(tx, seat); err != nil {
 			return approveFailed, "", err
 		}
 	}

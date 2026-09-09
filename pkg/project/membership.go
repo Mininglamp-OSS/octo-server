@@ -502,6 +502,34 @@ func FoldedHas(set map[string]bool, want string) bool {
 	return false
 }
 
+// FoldedLookup is FoldedHas that also returns the DATABASE's spelling.
+//
+// Callers that go on to WRITE the uid into another table need this rather than the
+// boolean: the two tables do not share a collation (octo_* are pinned
+// utf8mb4_general_ci, the dump-imported legacy tables are utf8mb4_0900_ai_ci in
+// production), so a row written with the caller's spelling can be unreachable from a
+// query that resolved the same person through the other table. Storing what the
+// database returned keeps the two byte sequences identical instead of relying on a
+// collation to bridge them.
+//
+// The miss direction is unchanged and still fail-closed: FoldID is ASCII-only, so a
+// spelling that only the looser collation considers equal does not match here and the
+// caller refuses. That refusal is what keeps non-canonical spellings out of the octo_*
+// tables today; returning the canonical one is what stops that from being the only
+// thing keeping them out.
+func FoldedLookup(set map[string]bool, want string) (string, bool) {
+	if set[want] {
+		return want, true
+	}
+	folded := FoldID(want)
+	for key, ok := range set {
+		if ok && FoldID(key) == folded {
+			return key, true
+		}
+	}
+	return "", false
+}
+
 // ProjectEpochsInSpace returns member_epoch for each named ACTIVE project in
 // spaceID, keyed by FoldID(project_id) — NOT by the spelling the caller sent and
 // NOT by the spelling the database returned. Callers look up with FoldID too; see

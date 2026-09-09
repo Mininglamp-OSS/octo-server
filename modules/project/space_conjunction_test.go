@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -389,7 +390,8 @@ func TestSpaceRemovalMovesTheEpochAtCommit(t *testing.T) {
 		"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?",
 		spaceA, "epochRemTarget").Exec()
 	require.NoError(t, err)
-	require.NoError(t, p.bumpEpochsOnSpaceMemberRemoval(tx, spaceA, "epochRemTarget"))
+	require.NoError(t, p.bumpEpochsOnSpaceMemberRemoval(
+		tx, spacemod.NewSeatRefFromStored(spaceA, "epochRemTarget")))
 	require.NoError(t, tx.Commit())
 
 	seat, err := testDB.queryMember(inA.ProjectID, "epochRemTarget")

@@ -575,7 +575,7 @@ func TestProjectMigrationFilesCoverTheDirectory(t *testing.T) {
 	require.GreaterOrEqual(t, len(projectMigrationFiles), 4,
 		"the module shipped four migrations when this was written; a shorter list means the "+
 			"derivation stopped seeing files, which is how the Down/Up lap rebuilds a stale schema")
-	require.Contains(t, projectMigrationFiles, "sql/20260908000001_project_member_epoch_base_one.sql")
+	require.Contains(t, projectMigrationFiles, "sql/20260908000002_project_member_epoch_base_one.sql")
 }
 
 // applyProjectMigration executes one section of every migration file this module

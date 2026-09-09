@@ -296,7 +296,7 @@ func TestMigrationBackfillLiftsOnlyTheSentinelRows(t *testing.T) {
 // this test cannot drift from what the deployment actually runs.
 func migrationBackfillStatement(t *testing.T) string {
 	t.Helper()
-	raw, err := sqlFS.ReadFile("sql/20260908000001_project_member_epoch_base_one.sql")
+	raw, err := sqlFS.ReadFile("sql/20260908000002_project_member_epoch_base_one.sql")
 	require.NoError(t, err)
 	body := string(raw)
 	up := body[:mustIndex(t, body, "-- +migrate Down")]

@@ -81,8 +81,13 @@ func (p *Project) registerSpaceMemberRemovalCleanup() {
 // projects is identical — the seats that survived the removal window. Sharing
 // bumpMemberEpochForSpaceMemberTx keeps the lock order, the chunking and the
 // non-locking-enumeration argument in one place rather than in two that can drift.
-func (p *Project) bumpEpochsOnSpaceMemberRejoin(tx *dbr.Tx, spaceID, uid string) error {
-	return p.db.bumpMemberEpochForSpaceMemberTx(tx, spaceID, uid)
+// Takes a spacemod.SeatRef rather than two strings: the uid inside it is the spelling
+// `space_member` STORES, which is the only thing that can be matched against
+// `octo_project_member` — that table is pinned utf8mb4_general_ci while space_member is
+// utf8mb4_0900_ai_ci in production, and the latter's equivalence classes are strictly
+// coarser for compatibility characters. See modules/space/seatref.go.
+func (p *Project) bumpEpochsOnSpaceMemberRejoin(tx *dbr.Tx, seat spacemod.SeatRef) error {
+	return p.db.bumpMemberEpochForSpaceMemberTx(tx, seat.SpaceID(), seat.UID())
 }
 
 // bumpEpochsOnSpaceMemberRemoval moves member_epoch for every project the removed
@@ -93,8 +98,8 @@ func (p *Project) bumpEpochsOnSpaceMemberRejoin(tx *dbr.Tx, spaceID, uid string)
 // whose invalidation signal did not fire hands a peer an authorization it cannot
 // detect as stale, and the async compensation has no upper bound once its job is
 // abandoned.
-func (p *Project) bumpEpochsOnSpaceMemberRemoval(tx *dbr.Tx, spaceID, uid string) error {
-	return p.db.bumpMemberEpochForSpaceMemberTx(tx, spaceID, uid)
+func (p *Project) bumpEpochsOnSpaceMemberRemoval(tx *dbr.Tx, seat spacemod.SeatRef) error {
+	return p.db.bumpMemberEpochForSpaceMemberTx(tx, seat.SpaceID(), seat.UID())
 }
 
 // allMemberGroupOwnerFinalizerName is the finalizer's name, which also prefixes the

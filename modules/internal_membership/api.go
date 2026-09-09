@@ -621,10 +621,21 @@ func decodeVerifyRequest(c *wkhttp.Context) (verifyRequest, error) {
 // drain path, which is exactly the "caps arrival rate, not the concurrency of
 // requests that never complete" distinction drawn on decodeVerifyRequest.
 //
-// Installed first, the deadline is already on the connection when that drain
-// runs, so the abort paths are covered too. It does not leak into the next
-// keep-alive request: net/http re-sets the per-request read deadline from
+// Installed first on THIS route group, the deadline is already on the connection
+// when that drain runs, so this module's own abort paths — its strict IP bucket,
+// its auth failure, its decode failure — are covered. It does not leak into the
+// next keep-alive request: net/http re-sets the per-request read deadline from
 // ReadTimeout, which is zero here, and that clears it.
+//
+// SCOPE, corrected across three review rounds: "the abort paths are covered too"
+// is NOT true of every abort. The GLOBAL per-IP limiter is mounted on the root
+// router in main.go (route.Use), so it runs BEFORE any route-local middleware
+// including this one. A request rejected there takes its 429 and the same
+// unbounded drain, with no deadline installed. Nothing in this module can change
+// that — the fix would be a ReadTimeout on the server, or installing the deadline
+// in a root-level middleware ahead of the limiter, and both are outside this
+// module's boundary. Recorded rather than fixed, and recorded HERE because the
+// unqualified sentence read as a completed argument for three rounds.
 //
 // # Best-effort by construction
 //

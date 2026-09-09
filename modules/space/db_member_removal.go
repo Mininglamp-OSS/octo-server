@@ -49,10 +49,16 @@ type memberRemovalCleanupJob struct {
 // enqueueMemberRemovalCleanupTx 在成员移除的同一事务内写出清理工单（transactional
 // outbox）。调用方必须已经确认这次移除真的改动了成员行——对不存在 / 已移除的成员
 // 入队会产出一条永远无事可做的工单。
-func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, spaceID, uid, operatorUID, reason string) error {
-	if spaceID == "" || uid == "" {
+//
+// 收 SeatRef 而不是裸 uid：这条工单里的 uid 会被异步级联拿去查 octo_project_member
+// （collation 更严），所以它必须是 space_member 存的那串字节。用调用方的拼写，级联
+// 会先用松 collation 匹配上 Space 成员、再枚举到 0 个项目席位，然后**成功**收工——
+// 席位永久孤儿，而且看起来一切正常。见 seatref.go。
+func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, seat SeatRef, operatorUID, reason string) error {
+	if seat.IsZero() {
 		return errors.New("space: removal cleanup requires space_id and uid")
 	}
+	spaceID, uid := seat.SpaceID(), seat.UID()
 	if !IsMemberRemoveReason(reason) {
 		return fmt.Errorf("space: unknown member removal reason %q", reason)
 	}

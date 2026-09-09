@@ -49,7 +49,7 @@ func memberStatus(t *testing.T, spaceID, uid string) (int, bool) {
 func restoreTxSteps(t *testing.T, name string) {
 	t.Helper()
 	t.Cleanup(func() {
-		RegisterMemberRemovalTxStep(name, func(*dbr.Tx, string, string) error { return nil })
+		RegisterMemberRemovalTxStep(name, func(*dbr.Tx, SeatRef) error { return nil })
 	})
 }
 
@@ -66,7 +66,8 @@ func TestMemberRemovalTxStepRunsInsideTheTransaction(t *testing.T) {
 		gotUID    string
 		sawMember bool
 	)
-	RegisterMemberRemovalTxStep(name, func(tx *dbr.Tx, spaceID, uid string) error {
+	RegisterMemberRemovalTxStep(name, func(tx *dbr.Tx, seat SeatRef) error {
+		spaceID, uid := seat.SpaceID(), seat.UID()
 		calls++
 		gotSpace, gotUID = spaceID, uid
 		// Read through the SAME transaction: this is what proves the step is
@@ -112,7 +113,7 @@ func TestMemberRemovalTxStepFailureRollsBackTheRemoval(t *testing.T) {
 	restoreTxSteps(t, name)
 
 	boom := errors.New("tx step refused")
-	RegisterMemberRemovalTxStep(name, func(*dbr.Tx, string, string) error { return boom })
+	RegisterMemberRemovalTxStep(name, func(*dbr.Tx, SeatRef) error { return boom })
 
 	seedRemovalFixture(t, "tx-step-space-2", "u-owner-tx2", "u-target-tx2")
 	removed, err := removeMemberLocked(testCtx.DB(), "tx-step-space-2", "u-target-tx2", 2, "u-owner-tx2", MemberRemoveReasonForceRemoved)

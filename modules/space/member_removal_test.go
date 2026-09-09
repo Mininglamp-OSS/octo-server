@@ -171,9 +171,12 @@ func TestEnqueueRejectsUnknownReason(t *testing.T) {
 	tx, err := f.db.session.Begin()
 	require.NoError(t, err)
 	defer tx.RollbackUnlessCommitted()
-	assert.Error(t, enqueueMemberRemovalCleanupTx(tx, "s", "u", "op", "typo_reason"))
-	assert.Error(t, enqueueMemberRemovalCleanupTx(tx, "", "u", "op", MemberRemoveReasonKicked))
-	assert.Error(t, enqueueMemberRemovalCleanupTx(tx, "s", "", "op", MemberRemoveReasonKicked))
+	assert.Error(t, enqueueMemberRemovalCleanupTx(
+		tx, NewSeatRefFromStored("s", "u"), "op", "typo_reason"))
+	assert.Error(t, enqueueMemberRemovalCleanupTx(
+		tx, NewSeatRefFromStored("", "u"), "op", MemberRemoveReasonKicked))
+	assert.Error(t, enqueueMemberRemovalCleanupTx(
+		tx, NewSeatRefFromStored("s", ""), "op", MemberRemoveReasonKicked))
 }
 
 // TestCleanupWorkerRunsStepsAndCompletes 正常路径：认领 → 跑完所有步骤 → 置 done。

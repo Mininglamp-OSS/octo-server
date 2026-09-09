@@ -1184,9 +1184,29 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	// cannot commit between the check and the write; the actor gets the same guarantee (see
 	// requireSpaceSeatsTx), and taking them together is what keeps this path out of the
 	// row-level 1213 cycle with the disband scan.
-	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, uid); err != nil {
+	held, err := p.lockSeatsTx(tx, spaceID, actorUID, []string{uid}, nil)
+	if err != nil {
 		return false, err
 	}
+	// The uid that gets WRITTEN is the one `space_member` stores, not the one the
+	// caller sent. `held` is keyed by the database's spelling, and the two can differ
+	// under space_member's case- and accent-insensitive collation.
+	//
+	// This is the admission half of the identity rule modules/space/seatref.go states
+	// for the removal half: both tables must end up holding the same bytes, because
+	// `octo_project_member` is pinned to a STRICTER collation than `space_member` and
+	// a seat written under one spelling can be unreachable from a query that resolved
+	// the person through the other. Relying on general_ci's case-insensitivity to
+	// bridge them works today only because FoldID is ASCII-only and refuses every
+	// spelling that actually diverges — an argument that spans two packages and breaks
+	// silently if FoldID is ever widened.
+	//
+	// The lookup cannot miss here: lockSeatsTx already refused unless it hit.
+	seatUID, ok := projectpkg.FoldedLookup(held, uid)
+	if !ok {
+		return false, errNotSpaceMember
+	}
+	uid = seatUID
 
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {

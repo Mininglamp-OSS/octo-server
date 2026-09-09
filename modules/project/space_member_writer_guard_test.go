@@ -76,11 +76,28 @@ import (
 
 // spaceMemberWrite matches any write to space_member: SQL text or dbr builder.
 //
-// Deliberately over-broad. It also catches `SET status=1` (re-admission, which
-// needs no bump) and the disband paths (covered by the read-time fold), because
-// the cost of a false positive is one line in the baseline with a reason, and the
-// cost of a false negative is a fourth axis of an authorization fact that outlives
-// its revocation.
+// Deliberately over-broad, because the cost of a false positive is one line in the
+// baseline with a reason, and the cost of a false negative is an authorization fact
+// that outlives its revocation.
+//
+// It catches the disband paths, which need no bump — an inactive parent Space folds
+// every one of its projects into the absent answer at READ time
+// (pkg/project.ProjectEpochsInSpace), so the answer and the invalidation channel move
+// together with no write.
+//
+// It also catches `SET status=1`, and that one is NOT an exemption. This header used
+// to list re-admission as an example of a match needing no bump; that was exactly
+// backwards. Reopening a seat makes a SURVIVING project seat reachable again through
+// the Space conjunction with no project-side write, so nothing else moves the epoch and
+// a consumer's cached DENIAL keeps agreeing with it. It is the reason all four
+// reactivation doors run a tx step, and rounds 8 through 12 each found another instance
+// of that same class. A written exemption for it, in the header of the load-bearing
+// instrument for the class, is how the next round finds door five.
+//
+// Recorded rather than quietly corrected: the commit that fixed the two baseline
+// entries below CLAIMED this correction in its message and never made the edit, and
+// three reviewers over two rounds read the claim before one of them checked the bytes.
+// A commit message is not a change.
 //
 // Written as alternatives rather than one clever pattern so a new call style
 // (a builder, a raw statement, a heredoc) fails to match only ITS alternative
@@ -321,17 +338,101 @@ func TestEverySpaceMemberWriterIsAccountedFor(t *testing.T) {
 // swallowed writer reads as no writer. Over-stripping is safe for a guard asserting
 // presence; it is not safe for one counting occurrences.
 //
-// A string literal containing "//" would be truncated. None of the swept SQL has one, and
-// a real lexer is not worth it for a guard whose remaining failure mode is over-counting
-// (which shows up as a baseline mismatch, not as silence).
+// QUOTE-AWARE, because the alternative was a caveat rather than a property. The previous
+// version cut at the first "//" on a line and documented that a string literal containing
+// one would be truncated, with the reason "none of the swept SQL has one". That is the
+// same shape of claim this branch has been burned by three times, and the failure
+// direction is the bad one: a truncated literal drops the SQL after it, so a real writer
+// reads as no writer. It costs about ten lines to make it true instead of asserted.
+//
+// Block comments remain unhandled ON PURPOSE — see above. The two are not symmetric: an
+// unpaired "/*" inside a line comment is a real shape in this tree, and handling block
+// comments naively is what deleted a live INSERT.
+//
+// TestStripLineCommentsKeepsStringLiterals pins both halves.
 func stripLineComments(src string) string {
 	var out strings.Builder
 	for _, line := range strings.Split(src, "\n") {
-		if idx := strings.Index(line, "//"); idx >= 0 {
-			line = line[:idx]
+		var (
+			quote  byte // 0 = outside a literal, else the opening delimiter
+			escape bool
+		)
+		cut := -1
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if quote != 0 {
+				switch {
+				case escape:
+					escape = false
+				case c == '\\' && quote != '`': // no escapes inside a raw string
+					escape = true
+				case c == quote:
+					quote = 0
+				}
+				continue
+			}
+			if c == '"' || c == '`' || c == '\'' {
+				quote = c
+				continue
+			}
+			if c == '/' && i+1 < len(line) && line[i+1] == '/' {
+				cut = i
+				break
+			}
+		}
+		if cut >= 0 {
+			line = line[:cut]
 		}
 		out.WriteString(line)
 		out.WriteByte('\n')
 	}
 	return out.String()
+}
+
+// TestStripLineCommentsKeepsStringLiterals pins the census stripper's two halves: it
+// removes prose about code, and it does NOT remove code that merely looks like prose.
+//
+// The second half is the one worth a test. A swept file whose SQL contains "//" — a URL
+// in a comment on the same line as a statement, say — used to lose everything after it,
+// and a census that loses a writer reports zero writers, which reads as green.
+func TestStripLineCommentsKeepsStringLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "a real line comment is removed",
+			src:  `x := 1 // UPDATE space_member SET status=0`,
+			want: "x := 1 ",
+		},
+		{
+			name: "a double slash INSIDE a literal is kept, and so is the code after it",
+			src:  "q := \"https://x\" + \"UPDATE space_member SET status=0\"",
+			want: "q := \"https://x\" + \"UPDATE space_member SET status=0\"",
+		},
+		{
+			name: "raw string literals too",
+			src:  "q := `https://x UPDATE space_member SET status=0`",
+			want: "q := `https://x UPDATE space_member SET status=0`",
+		},
+		{
+			name: "an escaped quote does not end the literal early",
+			src:  `q := "he said \"//\" then UPDATE space_member SET status=0"`,
+			want: `q := "he said \"//\" then UPDATE space_member SET status=0"`,
+		},
+		{
+			name: "a comment AFTER a literal is still removed",
+			src:  `q := "UPDATE space_member SET status=0" // and prose here`,
+			want: `q := "UPDATE space_member SET status=0" `,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.TrimSuffix(stripLineComments(tc.src), "\n")
+			if got != tc.want {
+				t.Errorf("stripLineComments(%q)\n got  %q\n want %q", tc.src, got, tc.want)
+			}
+		})
+	}
 }

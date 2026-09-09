@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -98,7 +99,7 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 		if spaceID == "" {
 			continue
 		}
-		ok, err := closeOneSeatAndEnqueueTx(ctx, spaceID, uid, operatorUID, reason)
+		ok, err := closeOneSeatAndEnqueueTx(session, spaceID, uid, operatorUID, reason)
 		if err != nil {
 			// 单个 Space 失败不中断其余 Space：已提交的那些工单已经落库，
 			// 中断反而会让后面那些 Space 连工单都没有。
@@ -127,8 +128,12 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 // 返回 false 表示这次没有改动成员行（席位本来就不在），此时**不入队**——对着一个
 // 不存在的席位入队会产出一条永远无事可做的工单，还会让别人的会话面清理被触发一次。
 // 这是 removeMemberLocked 与 forceRemove 都遵守的规矩，见 db_manager.go 的注释。
-func closeOneSeatAndEnqueueTx(ctx *config.Context, spaceID, uid, operatorUID, reason string) (bool, error) {
-	tx, err := ctx.DB().Begin()
+// Takes the session rather than the *config.Context it used to: the only thing it
+// wanted from the context was DB(), and a session parameter is what lets the
+// collation-drift probe drive this door against a deliberately drifted schema.
+// removeMemberLocked already has this shape for the same reason.
+func closeOneSeatAndEnqueueTx(session *dbr.Session, spaceID, uid, operatorUID, reason string) (bool, error) {
+	tx, err := session.Begin()
 	if err != nil {
 		return false, fmt.Errorf("space: begin close seat: %w", err)
 	}
@@ -170,7 +175,13 @@ func closeOneSeatAndEnqueueTx(ctx *config.Context, spaceID, uid, operatorUID, re
 		return false, nil
 	}
 
-	if err := enqueueMemberRemovalCleanupTx(tx, spaceID, uid, operatorUID, reason); err != nil {
+	// 标识符取自库里那一行：本事务已在上面对它取过 FOR UPDATE，而 uid 是调用方
+	// （BotFather 删 Bot）传来的拼写。见 seatref.go。
+	seat, err := ResolveSeatTx(tx, spaceID, uid)
+	if err != nil {
+		return false, err
+	}
+	if err := enqueueMemberRemovalCleanupTx(tx, seat, operatorUID, reason); err != nil {
 		return false, err
 	}
 	// 事务内步骤，和 outbox 入队并列、但理由相反：入队让清理**最终**发生，这一步让一个
@@ -188,7 +199,7 @@ func closeOneSeatAndEnqueueTx(ctx *config.Context, spaceID, uid, operatorUID, re
 	//
 	// 失败会让这个 Space 的关席位回滚。调用方按 Space 逐个提交，所以已经成功的那些保留，
 	// 失败的这个由 err 报告——与本函数原有的部分成功语义一致。
-	if err := runMemberRemovalTxSteps(tx, spaceID, uid); err != nil {
+	if err := runMemberRemovalTxSteps(tx, seat); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

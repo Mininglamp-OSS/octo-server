@@ -339,9 +339,12 @@ func TestBulkUpsertTakesEverySeatLockInOneStatement(t *testing.T) {
 	lockAt := strings.Index(body, "FOR UPDATE")
 	loopAt := strings.Index(body, "for _, uid := range uids")
 	require.Positive(t, lockAt,
-		"upsertMembersOnce must take the seat locks with a LOCKING read: it needs each row's "+
-			"prior status, and reading it without a lock lets a concurrent write change it "+
-			"between the read and the upsert")
+		"upsertMembersOnce must take the seat locks with a LOCKING read. The reason is the "+
+			"LOCK ORDER asserted just below, not the row's prior status — that read is "+
+			"lock-only now and the function says so in its own words; the prior status comes "+
+			"from the predicated UPDATE. The earlier wording here outlived the code it "+
+			"described, which is the third instance on this branch of a green guard whose "+
+			"stated reason had become false.")
 	require.Positive(t, loopAt, "the per-uid loop must still be there")
 	assert.Less(t, lockAt, loopAt,
 		"the seat lock must be taken BEFORE the loop, not inside it. Inside, iteration i+1 asks "+

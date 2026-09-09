@@ -838,7 +838,10 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 // use a separate query, being rooted at an octo_* table where `JOIN user` is error 1267 in
 // production and green in CI.
 //
-// TestSeatLockStatementLetsInnoDBChooseTheRowOrder pins the plan so the join cannot come back.
+// TestSeatLockStatementHasNoUserJoin pins the statement so the join cannot come back.
+// (This used to name TestSeatLockStatementLetsInnoDBChooseTheRowOrder, deleted in round 9
+// for being distribution-dependent: it asserted an EXPLAIN plan, which the optimizer is
+// free to change on different data. The surviving guard asserts the STATEMENT instead.)
 //
 // The read view that JOIN opens is no longer load-bearing, because every aggregate that authorises
 // a write is now a locking read (see countActiveOwnersTx).

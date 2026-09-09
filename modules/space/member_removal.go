@@ -119,7 +119,12 @@ func RegisterMemberRemovalCleanupStep(name string, fn MemberRemovalCleanupStep) 
 //   - 返回 error 会让整次成员移除失败。这是刻意的：宁可这次移除失败让调用方重试，
 //     也不要提交一次没有失效信号的移除。
 //   - 必须幂等：调用方可能重试整个移除。
-type MemberRemovalTxStep func(tx *dbr.Tx, spaceID, uid string) error
+//   - 收 SeatRef 而不是 (spaceID, uid string)：这一步要把标识符拿去匹配另一张
+//     collation 更严的表，所以它必须收到 `space_member` **存的**那串字节，而不是
+//     调用方发来的。SeatRef 的字段不可导出，没有从 string 的转换，因此「把调用方
+//     的拼写传进来」是编译不过的——这是前四轮修复靠纪律维持、靠 review 发现的性质。
+//     见 seatref.go。
+type MemberRemovalTxStep func(tx *dbr.Tx, seat SeatRef) error
 
 var (
 	txStepsMu sync.RWMutex
@@ -157,13 +162,13 @@ func RegisterMemberRemovalTxStep(name string, fn MemberRemovalTxStep) {
 // 第一个失败即返回，**不继续执行后续步骤**——与异步清理相反。异步那边步骤之间互不
 // 阻塞，因为整条工单会重跑；这边一旦有步骤失败，事务就要回滚，继续跑余下的步骤只是
 // 在做注定被丢弃的工作。
-func runMemberRemovalTxSteps(tx *dbr.Tx, spaceID, uid string) error {
+func runMemberRemovalTxSteps(tx *dbr.Tx, seat SeatRef) error {
 	txStepsMu.RLock()
 	steps := make([]namedTxStep, len(txSteps))
 	copy(steps, txSteps)
 	txStepsMu.RUnlock()
 	for _, step := range steps {
-		if err := step.fn(tx, spaceID, uid); err != nil {
+		if err := step.fn(tx, seat); err != nil {
 			return fmt.Errorf("space: member removal tx step %s: %w", step.name, err)
 		}
 	}
@@ -185,7 +190,7 @@ func runMemberRemovalTxSteps(tx *dbr.Tx, spaceID, uid string) error {
 //
 // 契约与 MemberRemovalTxStep 逐字相同：一条语句量级、幂等、返回 error 会让整次
 // 重新加入回滚（宁可这次失败让调用方重试，也不要提交一次没发失效信号的加入）。
-type MemberReactivationTxStep func(tx *dbr.Tx, spaceID, uid string) error
+type MemberReactivationTxStep func(tx *dbr.Tx, seat SeatRef) error
 
 var (
 	rejoinStepsMu sync.RWMutex
@@ -216,13 +221,13 @@ func RegisterMemberReactivationTxStep(name string, fn MemberReactivationTxStep) 
 
 // runMemberReactivationTxSteps 在重新加入事务内依次执行已注册的同步步骤。
 // 第一个失败即返回，理由同 runMemberRemovalTxSteps。
-func runMemberReactivationTxSteps(tx *dbr.Tx, spaceID, uid string) error {
+func runMemberReactivationTxSteps(tx *dbr.Tx, seat SeatRef) error {
 	rejoinStepsMu.RLock()
 	steps := make([]namedRejoinStep, len(rejoinSteps))
 	copy(steps, rejoinSteps)
 	rejoinStepsMu.RUnlock()
 	for _, step := range steps {
-		if err := step.fn(tx, spaceID, uid); err != nil {
+		if err := step.fn(tx, seat); err != nil {
 			return fmt.Errorf("space: member reactivation tx step %s: %w", step.name, err)
 		}
 	}

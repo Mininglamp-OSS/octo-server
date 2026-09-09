@@ -529,7 +529,14 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 			continue
 		}
 
-		if err := runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+		// 判据来自写入（上面那条带谓词的 UPDATE），**标识符也必须来自数据库**。
+		// 上一轮到此为止：布尔值搬进了库，标识符还是调用方那串字节，而它接着要去匹配
+		// collation 更严的 octo_project_member。见 seatref.go。
+		seat, err := ResolveSeatTx(tx, spaceId, uid)
+		if err != nil {
+			return err
+		}
+		if err := runMemberReactivationTxSteps(tx, seat); err != nil {
 			return err
 		}
 	}
@@ -626,13 +633,19 @@ func (d *managerDB) removeMembersForceOnce(spaceId string, uids []string, operat
 		if affected == 0 {
 			continue
 		}
-		if err := enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved); err != nil {
+		// 循环变量 uid 是**调用方**的拼写，而这一行是在 space_member 自己的 collation
+		// 下被匹配到的。工单与事务步骤都要拿它去查更严的表，所以先换成库里存的那串。
+		seat, err := ResolveSeatTx(tx, spaceId, uid)
+		if err != nil {
+			return nil, err
+		}
+		if err := enqueueMemberRemovalCleanupTx(tx, seat, operatorUID, MemberRemoveReasonForceRemoved); err != nil {
 			return nil, err
 		}
 		// Synchronous steps, beside the outbox enqueue and for the opposite reason:
 		// the enqueue makes the cleanup EVENTUAL, these make a fact TRUE AT COMMIT.
 		// A failure here rolls the removal back on purpose — see MemberRemovalTxStep.
-		if err := runMemberRemovalTxSteps(tx, spaceId, uid); err != nil {
+		if err := runMemberRemovalTxSteps(tx, seat); err != nil {
 			return nil, err
 		}
 		removed = append(removed, uid)
@@ -756,12 +769,17 @@ func removeMemberLockedOnce(sess *dbr.Session, spaceId, uid string, rejectRoleAt
 		Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
 		return false, err
 	}
-	if err = enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, reason); err != nil {
+	// 标识符取自库里那一行，理由同上：本事务已在上面对它取过 FOR UPDATE。
+	seat, err := ResolveSeatTx(tx, spaceId, uid)
+	if err != nil {
+		return false, err
+	}
+	if err = enqueueMemberRemovalCleanupTx(tx, seat, operatorUID, reason); err != nil {
 		return false, err
 	}
 	// See the sibling call site: synchronous steps run beside the outbox enqueue,
 	// and their failure rolls the removal back.
-	if err = runMemberRemovalTxSteps(tx, spaceId, uid); err != nil {
+	if err = runMemberRemovalTxSteps(tx, seat); err != nil {
 		return false, err
 	}
 	if err = tx.Commit(); err != nil {
