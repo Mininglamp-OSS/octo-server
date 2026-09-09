@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 func primeRegisterModulesForSharedTestDB() {
 	cfg := config.New()
 	cfg.Test = true
-	cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true"
+	cfg.DB.MySQLAddr = categoryTestMySQLAddr()
 	cfg.DB.Migration = false
 	ctx := config.NewContext(cfg)
 	s := server.New(ctx)
@@ -60,44 +60,27 @@ func primeRegisterModulesForSharedTestDB() {
 // `go test ./...` (which runs package binaries concurrently).
 const toctouDefaultDB = "octo_toctou_test"
 
-// newToctouTestServer mirrors testutil.NewTestServer but reads the MySQL DSN
-// from OCTO_TEST_MYSQL_ADDR so local podman / docker setups with different
-// credentials can run these tests without patching the testutil hardcoded
-// DSN. Default uses an isolated DB name (toctouDefaultDB) which the helper
-// CREATEs lazily if missing, so CI's mysql:8 service doesn't need any
-// MYSQL_DATABASE config beyond what the existing Test job already gives us.
+// newToctouTestServer mirrors testutil.NewTestServer but reads MySQL
+// connection parameters from OCTO_TEST_MYSQL_ADDR, so local podman / docker
+// setups with different credentials can run these tests without patching the
+// testutil hardcoded DSN. The database name from that variable is deliberately
+// ignored: this helper owns only toctouDefaultDB and must never reset the
+// shared test database.
 //
 // Returns the test server, context, and a fresh *Category bound to ctx so
 // callers can poke its db helpers (seedSpace, seedGroup) in the same way the
 // existing api_test.go helpers do.
 func newToctouTestServer(t *testing.T) (*server.Server, *config.Context, *Category) {
 	t.Helper()
-	addr := os.Getenv("OCTO_TEST_MYSQL_ADDR")
-	if addr == "" {
-		addr = "root:demo@tcp(127.0.0.1)/" + toctouDefaultDB + "?charset=utf8mb4&parseTime=true"
-	}
-	ensureToctouDB(t, addr)
+	addr := toctouTestDSN(t)
+	resetToctouDB(t, addr)
 
 	cfg := config.New()
 	cfg.Test = true
 	cfg.DB.MySQLAddr = addr
 	cfg.DB.Migration = false
 	ctx := config.NewContext(cfg)
-
-	// Drop all tables in OUR isolated DB (including gorp_migrations) so
-	// module.Setup re-creates the schema from scratch every test. Safe
-	// because `(SELECT DATABASE())` resolves to whichever DB the helper
-	// connected to, and the default is the isolated one — never the shared
-	// `test` DB the rest of the project uses.
-	var dropSqls []string
-	_, err := ctx.DB().SelectBySql(
-		"SELECT CONCAT('DROP TABLE IF EXISTS ','`', table_name,'`') FROM information_schema.tables WHERE table_schema = (SELECT DATABASE())",
-	).Load(&dropSqls)
-	require.NoError(t, err, "list tables")
-	for _, stmt := range dropSqls {
-		_, err = ctx.DB().UpdateBySql(stmt).Exec()
-		require.NoError(t, err, "drop table: "+stmt)
-	}
+	t.Cleanup(func() { require.NoError(t, ctx.DB().Close(), "close isolated database") })
 
 	require.NoError(t, ctx.Cache().Set(cfg.Cache.TokenCachePrefix+testutil.Token, testutil.UID+"@test"), "seed token")
 
@@ -115,26 +98,45 @@ func newToctouTestServer(t *testing.T) (*server.Server, *config.Context, *Catego
 	return s, ctx, f
 }
 
-// ensureToctouDB parses the DSN, opens a connection WITHOUT a DB name, and
-// runs CREATE DATABASE IF NOT EXISTS for the target DB. This lets a fresh
-// MySQL (e.g. CI's mysql:8 service container, or a freshly-restarted local
-// podman container) bootstrap the isolated DB without operator intervention.
-// Idempotent.
-func ensureToctouDB(t *testing.T, addr string) {
+// toctouTestDSN preserves optional credentials and driver settings from
+// OCTO_TEST_MYSQL_ADDR but pins the database name to the one isolated schema
+// this helper owns. In particular, the conventional shared `/test` DSN is
+// safe to pass here.
+func toctouTestDSN(t *testing.T) string {
 	t.Helper()
+	addr := categoryTestMySQLAddr()
 	parsed, err := mysqldriver.ParseDSN(addr)
 	require.NoError(t, err, "parse DSN")
-	dbName := parsed.DBName
-	if dbName == "" {
-		return
+	parsed.DBName = toctouDefaultDB
+	return parsed.FormatDSN()
+}
+
+func categoryTestMySQLAddr() string {
+	if addr := os.Getenv("OCTO_TEST_MYSQL_ADDR"); addr != "" {
+		return addr
 	}
+	return "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+}
+
+// resetToctouDB drops and recreates the one database this test helper owns.
+// Rebuilding the database instead of issuing unordered DROP TABLE statements
+// is required once the migration registry includes tables linked by foreign
+// keys. It also leaves the shared `test` database untouched under all DSN
+// configurations.
+func resetToctouDB(t *testing.T, addr string) {
+	t.Helper()
+	parsed, err := mysqldriver.ParseDSN(addr)
+	require.NoError(t, err, "parse isolated DSN")
+	require.Equal(t, toctouDefaultDB, parsed.DBName, "refuse to reset a database not owned by this helper")
 	parsed.DBName = ""
 	bootstrapAddr := parsed.FormatDSN()
 	boot, err := sql.Open("mysql", bootstrapAddr)
 	require.NoError(t, err, "open bootstrap conn")
 	defer boot.Close()
-	_, err = boot.Exec("CREATE DATABASE IF NOT EXISTS `" + dbName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
-	require.NoError(t, err, "create isolated DB %s", dbName)
+	_, err = boot.Exec("DROP DATABASE IF EXISTS `" + toctouDefaultDB + "`")
+	require.NoError(t, err, "drop isolated DB")
+	_, err = boot.Exec("CREATE DATABASE `" + toctouDefaultDB + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	require.NoError(t, err, "create isolated DB")
 }
 
 // toctouDoRequest mirrors doRequest from api_test.go — kept local to avoid

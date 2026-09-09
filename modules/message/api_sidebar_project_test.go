@@ -174,6 +174,21 @@ func TestProjectIDShipsOnlyOnTheSpaceScopedPath(t *testing.T) {
 			"turned into a silent feature kill")
 }
 
+func TestApplySidebarProjectNamesPairsOnlyExistingProjectIDs(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "group", ProjectID: "project-1"},
+		{TargetID: "thread", ProjectID: "project-1"},
+		{TargetID: "unknown", ProjectID: "project-2"},
+		{TargetID: "direct"},
+	}
+	applySidebarProjectNames(items, map[string]string{"project-1": "项目一"})
+
+	assert.Equal(t, "项目一", items[0].ProjectName)
+	assert.Equal(t, "项目一", items[1].ProjectName, "threads inherit the same Project name as their parent group")
+	assert.Empty(t, items[2].ProjectName, "a missing Project row must not fabricate a name")
+	assert.Empty(t, items[3].ProjectName, "a direct-Space item has no project_id and no project_name")
+}
+
 // TestTheSidebarAppliesTheProjectScopeGate pins that the handler actually calls it.
 //
 // The gate is one line in a 400-line function; a refactor that drops it leaves

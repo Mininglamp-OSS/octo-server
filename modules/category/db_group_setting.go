@@ -59,7 +59,7 @@ func (d *categoryDB) queryUserGroupsInSpace(uid, spaceID string) ([]*userGroupIn
 		FROM `+"`group`"+` g
 		INNER JOIN group_member gm ON g.group_no = gm.group_no
 		LEFT JOIN group_setting gs ON g.group_no = gs.group_no AND gs.uid = ?
-		WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose <> ?
+			WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.project_id = '' AND g.purpose <> ?
 		GROUP BY g.group_no
 		ORDER BY gs.category_sort ASC
 	`, uid, uid, spaceID, aiteampkg.GroupPurpose).Load(&results)

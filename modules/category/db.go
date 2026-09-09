@@ -24,12 +24,7 @@ func (d *categoryDB) insertCategory(m *CategoryModel) error {
 }
 
 func (d *categoryDB) queryCategoriesByUIDAndSpaceID(uid, spaceID string) ([]*CategoryModel, error) {
-	var models []*CategoryModel
-	_, err := d.session.Select("*").From("group_category").
-		Where("uid=? and space_id=? and status=1", uid, spaceID).
-		OrderAsc("sort").
-		Load(&models)
-	return models, err
+	return d.queryCategoryModelsForSidebar(uid, spaceID)
 }
 
 func (d *categoryDB) queryDefaultCategory(uid, spaceID string) (*CategoryModel, error) {
@@ -68,11 +63,7 @@ func (d *categoryDB) countCategoriesByUIDAndSpaceID(uid, spaceID string) (int, e
 }
 
 func (d *categoryDB) maxSortByUIDAndSpaceID(uid, spaceID string) (int, error) {
-	var maxSort int
-	_, err := d.session.Select("IFNULL(max(sort),-1)").From("group_category").
-		Where("uid=? and space_id=? and status=1", uid, spaceID).
-		Load(&maxSort)
-	return maxSort, err
+	return d.maxSidebarSectionSort(uid, spaceID)
 }
 
 func (d *categoryDB) updateCategoryName(categoryID, name string) error {

@@ -226,7 +226,7 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 // 1205 is unambiguous.
 func probeSpaceMemberUpdateBlocks(t *testing.T, spaceID, uid string) bool {
 	t.Helper()
-	conn, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true")
+	conn, err := sql.Open("mysql", projectTestMySQLAddr())
 	require.NoError(t, err)
 	defer conn.Close()
 	conn.SetMaxOpenConns(1)

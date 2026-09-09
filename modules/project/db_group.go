@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 )
 
 // The project-scoped group read view.
@@ -204,4 +205,51 @@ func (d *DB) countActiveGroupMembers(groupNos []string) (map[string]int, error) 
 		counts[r.GroupNo] = r.MemberCount
 	}
 	return counts, nil
+}
+
+// listMyProjectGroupResponses owns the complete response construction used by
+// both the HTTP endpoint and the sidebar. Keeping the mapper beside the
+// membership-scoped query prevents the two surfaces from drifting on fields,
+// visibility, or member counts.
+func (d *DB) listMyProjectGroupResponses(spaceID, projectID, uid string, offset, limit int) ([]*GroupResp, error) {
+	rows, err := d.listMyProjectGroups(spaceID, projectID, uid, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	groupNos := make([]string, 0, len(rows))
+	for _, row := range rows {
+		groupNos = append(groupNos, row.GroupNo)
+	}
+	counts, err := d.countActiveGroupMembers(groupNos)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*GroupResp, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, &GroupResp{
+			GroupNo:        row.GroupNo,
+			Name:           row.Name,
+			IsNamed:        row.IsNamed,
+			AvatarText:     row.AvatarText,
+			AvatarColor:    row.AvatarColor,
+			IsUploadAvatar: row.IsUploadAvatar,
+			MemberCount:    counts[row.GroupNo],
+		})
+	}
+	return result, nil
+}
+
+// ListMyProjectGroups is the in-process equivalent of
+// GET /v1/projects/:project_id/groups. Category uses it for a Project sidebar
+// section rather than copying this modules membership, blacklist, and disband
+// predicates into a second query.
+//
+// It follows that endpoint's default page, including its 50-row bound. A
+// sidebar section is not a bypass for the endpoint's pagination contract.
+func ListMyProjectGroups(ctx *config.Context, spaceID, projectID, uid string) ([]*GroupResp, error) {
+	if ctx == nil || spaceID == "" || projectID == "" || uid == "" {
+		return []*GroupResp{}, nil
+	}
+	db := NewDB(ctx)
+	return db.listMyProjectGroupResponses(spaceID, projectID, uid, 0, projectDefaultPageLimit)
 }

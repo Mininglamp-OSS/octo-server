@@ -16,6 +16,25 @@ change-log convention (§7). Newest first.
   visible-bot predicate is staged in
   [learnings/pending](learnings/pending/space-directory-octo-hosted-only.md).
 
+## 2026-09-09 — sidebar-project-sections
+
+- **Implemented** — one per-user Sidebar order now interleaves manual categories
+  and Projects; Project create, member admission, and #861 pin provision the
+  personal Project entry, with a read-path repair backstop.
+- **Guarded** — Space membership remains the outer read boundary, Project
+  membership remains the group-content boundary, and a non-member Space-listed
+  pin renders an empty group list without granting access.
+- **Aligned** — every Sidebar-facing non-empty `project_id` added or touched by
+  this task carries `project_name`; legacy category list/sort uses the unified
+  order, and Project groups can no longer be manually categorized.
+- **Verified** — category/project/space/message packages passed local
+  MySQL/Redis/WuKongIM tests with race detection and shuffle, using one clean
+  database per package; i18n checks, golangci-lint, and diff checks passed.
+- **Learned** — tests that exhaust shared Redis state must clean on exit, and DB
+  tests must own their schema instead of relying on another package's migrations.
+  See [journal](journal/shared/sidebar-project-sections.md) and
+  [learning](learnings/pending/sidebar-project-sections.md).
+
 ## 2026-09-09 — project-collaboration-roles
 
 - Added project-scoped, multi-select collaboration roles for human members while

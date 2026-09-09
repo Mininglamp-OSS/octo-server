@@ -52,36 +52,12 @@ func (p *Project) listProjectGroupsHandler(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 
 	offset, limit := pageParams(c)
-	rows, err := p.db.listMyProjectGroups(row.SpaceID, row.ProjectID, uid, offset, limit)
+	resps, err := p.db.listMyProjectGroupResponses(row.SpaceID, row.ProjectID, uid, offset, limit)
 	if err != nil {
 		p.Error("查询项目群列表失败", zap.Error(err),
 			zap.String("projectId", row.ProjectID), zap.String("spaceId", row.SpaceID))
 		respondQueryFailed(c)
 		return
-	}
-
-	groupNos := make([]string, 0, len(rows))
-	for _, g := range rows {
-		groupNos = append(groupNos, g.GroupNo)
-	}
-	counts, err := p.db.countActiveGroupMembers(groupNos)
-	if err != nil {
-		p.Error("统计项目群成员数失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-
-	resps := make([]*GroupResp, 0, len(rows))
-	for _, g := range rows {
-		resps = append(resps, &GroupResp{
-			GroupNo:        g.GroupNo,
-			Name:           g.Name,
-			IsNamed:        g.IsNamed,
-			AvatarText:     g.AvatarText,
-			AvatarColor:    g.AvatarColor,
-			IsUploadAvatar: g.IsUploadAvatar,
-			MemberCount:    counts[g.GroupNo],
-		})
 	}
 	c.Response(resps)
 }

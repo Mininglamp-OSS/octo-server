@@ -363,6 +363,9 @@ other = "Category not found."
 ["err.server.category.permission_denied"]
 other = "You do not have permission to operate on this category."
 
+["err.server.category.project_group_cannot_categorize"]
+other = "A Project group cannot be placed in a manual category."
+
 ["err.server.category.query_failed"]
 other = "Failed to query category data."
 

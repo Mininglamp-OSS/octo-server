@@ -86,6 +86,14 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 			respondStoreFailed(c)
 			return
 		}
+		if *req.Pinned {
+			// applyPin commits before this best-effort hook runs. A pin is an
+			// explicit request to surface the Project in the caller's personal
+			// Follow sidebar, including for a Space-listed Project the caller can
+			// see without holding a Project seat. The list path repairs a transient
+			// failure, so a sidebar write must not turn a committed pin into a 5xx.
+			p.provisionSidebarSection(row.ProjectID, row.SpaceID, uid)
+		}
 	}
 
 	// Respond with the project as the caller now sees it, so the client can render
