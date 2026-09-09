@@ -112,6 +112,16 @@
 //     Project seat either, and every Project route's gate is the caller's own Space
 //     membership.
 //
+// GET /v1/projects/:project_id/groups is a NEW route inside that same block, and
+// it is the first Project route to return another module's resource. Recorded
+// because a reader could take it for the moment Project became a read boundary,
+// and it is not: the route mounts the same projectMiddleware as its siblings, so
+// the caller's Space membership is verified before the handler runs, and the
+// query is then scoped to groups the CALLER is already an active member of. It
+// narrows what a caller can already reach; it grants nothing, and it answers an
+// empty list — never a refusal — to someone with no groups in that project. Same
+// tree treatment as the rest of the block: none.
+//
 // P1 added a Project dimension to two EXISTING session routes, and neither
 // changes the picture above — recorded so the absence of a census entry is a
 // decision rather than an oversight:

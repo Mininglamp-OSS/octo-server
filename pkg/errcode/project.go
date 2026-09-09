@@ -132,6 +132,21 @@ var (
 
 	// ---- quotas (403) --------------------------------------------------------
 
+	// ErrProjectQuotaPinned covers the per-Space cap on pinned projects.
+	//
+	// A quota rather than an eviction: silently unpinning the oldest to make room
+	// would be data loss the caller did not ask for and cannot see, and "why did my
+	// pin disappear" is a support ticket nobody can answer from logs.
+	//
+	// Carries max so the client can say WHICH limit was hit without hardcoding the
+	// number and drifting from the server.
+	ErrProjectQuotaPinned = register(codes.Code{
+		ID:             "err.server.project.quota_pinned",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You have pinned the maximum number of projects.",
+		SafeDetailKeys: []string{"max"},
+	})
+
 	// ErrProjectQuotaPerSpace covers the per-Space project cap.
 	ErrProjectQuotaPerSpace = register(codes.Code{
 		ID:             "err.server.project.quota_per_space",

@@ -85,7 +85,7 @@ func TestSpaceID_Round2_Finding2_DBOnlyThreadInheritsParentSpace(t *testing.T) {
 	}
 
 	items := mergeThreadEntries(nil, extRows, aliveThread("g_db_parent____th9", nil),
-		categorySetting, nil, groupSpaceMap, nil, "", nil, nil)
+		categorySetting, nil, groupSpaceMap, nil, nil, "", nil, nil)
 
 	require.Len(t, items, 1)
 	assert.Equal(t, "spaceX", items[0].SpaceID,
@@ -118,7 +118,7 @@ func TestSpaceID_Round2_Finding3_BuildFollowItems_ExternalGroupMySource(t *testi
 		"g_external": "spaceA",
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, groupSpaceMap, externalGroupMap, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, groupSpaceMap, nil, externalGroupMap, "")
 
 	byID := map[string]*SidebarItem{}
 	for _, it := range items {
@@ -152,7 +152,7 @@ func TestSpaceID_Round2_Finding3_BuildRecentItems_ExternalGroupMySource(t *testi
 	groupSpaceMap := map[string]string{"g_external": "spaceB"}
 	externalGroupMap := map[string]string{"g_external": "spaceA"}
 
-	items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, externalGroupMap, "")
+	items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, nil, externalGroupMap, "")
 
 	byID := map[string]*SidebarItem{}
 	for _, it := range items {
@@ -182,7 +182,7 @@ func TestSpaceID_Round2_Finding3_MergeThreadEntries_ExternalGroupMySource(t *tes
 
 	result := mergeThreadEntries(nil, threadExtRows,
 		aliveThread("g_external____alive", nil),
-		categorySetting, nil, groupSpaceMap, externalGroupMap, "", nil, nil)
+		categorySetting, nil, groupSpaceMap, nil, externalGroupMap, "", nil, nil)
 
 	require.Len(t, result, 1)
 	assert.Equal(t, "spaceB", result[0].SpaceID)

@@ -28,6 +28,7 @@ const (
 	entryProjectCreate  = "project_create"
 	entryProjectUpdate  = "project_update"
 	entryProjectDisband = "project_disband"
+	entryProjectSetting = "project_setting"
 )
 
 // Rejection reasons. Low-cardinality enum; never a free-form message.
@@ -37,6 +38,7 @@ const (
 	reasonQuotaPerSpace    = "quota_per_space"
 	reasonQuotaPerCreator  = "quota_per_creator"
 	reasonQuotaDailyCreate = "quota_daily_create"
+	reasonQuotaPinned      = "quota_pinned"
 	reasonProjectDisbanded = "project_disbanded"
 	reasonFlagOff          = "flag_off"
 	reasonPermissionDenied = "permission_denied"
@@ -83,6 +85,32 @@ var (
 		Name:      "member_count",
 		Help:      "Per-project active member count, sampled on the metrics tick.",
 		Buckets:   []float64{1, 5, 10, 25, 50, 100, 200, 500, 1000},
+	})
+
+	// spaceProjectCountDistribution is the detector for a condition PR-5 named and
+	// could not otherwise see.
+	//
+	// PR-5's ORDER BY sorts by a per-caller pin, which no index can serve, so
+	// listVisibleInSpace now sorts every project visible to the caller in the Space
+	// before LIMIT applies (measured in TestTheProjectListReachesItsRowsByAnIndex:
+	// 0.28ms before, 7.9ms at 2000 visible projects). The escalation condition is
+	// "a Space reaches the thousands", and without this histogram it would arrive
+	// as user-visible latency rather than as a signal.
+	//
+	// Projects per Space, not the sort input itself: the sort input is the subset
+	// one caller can see, which cannot be sampled without a per-caller query, and
+	// this bounds it from above. Conservative in the right direction — if no Space
+	// is near the threshold then no caller's page can be. Sampled on the sparse
+	// metrics tick, so it costs the request path nothing.
+	//
+	// Buckets run past the measured 2000 so the top one means "the escalation
+	// condition in the plan guard has arrived".
+	spaceProjectCountDistribution = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricNamespace,
+		Name:      "space_project_count",
+		Help: "Active projects per Space, sampled on the metrics tick. Bounds the row count " +
+			"the project list must sort per page; see the plan guard for the escalation condition.",
+		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
 	})
 
 	// i1Violations is the reconcile verdict AFTER the in-flight exemption. A

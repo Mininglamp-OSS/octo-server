@@ -858,6 +858,9 @@ other = "You have reached your project limit in this space."
 ["err.server.project.quota_per_space"]
 other = "This space has reached its project limit."
 
+["err.server.project.quota_pinned"]
+other = "You have pinned the maximum number of projects."
+
 ["err.server.project.request_invalid"]
 other = "Invalid request."
 

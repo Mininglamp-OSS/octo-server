@@ -193,6 +193,14 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		projectScoped.PUT("/:project_id", p.updateProjectHandler)
 		projectScoped.DELETE("/:project_id", p.disbandProjectHandler)
 
+		// Read-only, and gated by the caller's own group membership rather than by
+		// a role check — see listProjectGroupsHandler.
+		projectScoped.GET("/:project_id/groups", p.listProjectGroupsHandler)
+
+		// Personal preferences for one project (pinning). A settings bag rather
+		// than /pin + /unpin, mirroring PUT /v1/groups/:group_no/setting.
+		projectScoped.PUT("/:project_id/setting", p.updateSettingHandler)
+
 		projectScoped.GET("/:project_id/members", p.listMembersHandler)
 		projectScoped.POST("/:project_id/members/add", p.addMembersHandler)
 		projectScoped.POST("/:project_id/members/remove", p.removeMembersHandler)
@@ -339,7 +347,10 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 	// only ever widens READ visibility, which does not apply to a response about a project
 	// the caller owns.
 	humans, agents := p.splitSeatCounts(model.ProjectID)
-	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, humans, agents))
+	// pinned is false and that is provable, not assumed: this project id was
+	// generated inside the transaction that just committed, so no settings row
+	// for it can exist yet.
+	c.Response(p.toResp(model, RoleOwner, spacepkg.MemberRoleCommon, humans, agents, false))
 }
 
 // respondCreateError maps the create sentinels onto registered codes. Kept separate
@@ -462,12 +473,15 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 	resps := make([]*Resp, 0, len(rows))
 	for _, row := range rows {
 		model := row.Model
-		// The split comes from the list query itself (two bounded correlated
-		// subqueries), so a list card and the detail route agree about what
-		// member_count means. Reporting the full seat count here while the detail
-		// route reported humans only would have been D16's own bug, one endpoint
-		// away.
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount()))
+		// Both halves of the split come from fillMemberCounts, out of one roster
+		// read, so a list card and the detail route agree about what member_count
+		// means. Reporting the full seat count here while the detail route
+		// reported humans only would have been D16's own bug, one endpoint away.
+		//
+		// This used to say "two bounded correlated subqueries", which was one too
+		// many after #855 removed member_count's and zero too many after PR-5
+		// removed seat_count's.
+		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount(), row.Pinned == 1))
 	}
 	c.Response(resps)
 }
@@ -480,7 +494,8 @@ func (p *Project) getProjectHandler(c *wkhttp.Context) {
 		return
 	}
 	humans, agents := p.splitSeatCounts(row.ProjectID)
-	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents))
+	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents,
+		p.pinnedOrFalse(row.ProjectID, c.GetLoginUID())))
 }
 
 func (p *Project) listMembersHandler(c *wkhttp.Context) {
@@ -611,7 +626,13 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	// caller their write failed when it did not, which is the one thing a response
 	// after a successful write must not do.
 	humans, agents := p.splitSeatCounts(updated.ProjectID)
-	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents))
+	// The pin survives a rename, so it has to be re-read rather than defaulted:
+	// reporting false here would make the caller watch their own card leave the
+	// pinned section until the next list fetch. Read the SAME way the counts above
+	// are — fail-soft — because the sentence directly above applies to it word for
+	// word, and the first cut of this line did exactly what that sentence forbids.
+	c.Response(p.toResp(updated, requestProjectRole(c), requestSpaceRole(c), humans, agents,
+		p.pinnedOrFalse(updated.ProjectID, uid)))
 }
 
 func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
@@ -660,7 +681,15 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 // toResp renders a project. memberCount counts HUMANS and agentCount counts AI
 // agents (D16); MaxMembers still bounds the two together, because a seat is a
 // seat regardless of who sits in it.
-func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int) *Resp {
+// toResp shapes one project for the wire.
+//
+// pinned is a parameter rather than a field on Model because it is a fact about
+// the CALLER, not about the project: the same row is pinned for one user and not
+// for the next. Every call site must therefore supply it truthfully — a default of
+// false would make the update route report a project as un-pinned right after the
+// caller renamed it, and the client would watch its own card jump out of the
+// pinned section until the next list fetch.
+func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int, pinned bool) *Resp {
 	return &Resp{
 		ProjectID:        m.ProjectID,
 		SpaceID:          m.SpaceID,
@@ -675,6 +704,7 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount in
 		MemberEpoch:      m.MemberEpoch,
 		Status:           m.Status,
 		AllMemberGroupNo: m.AllMemberGroupNo,
+		Pinned:           pinned,
 		MyRole:           myRole,
 		Capabilities:     capabilitiesFor(myRole, spaceRole),
 		CreatedAt:        formatTime(m.CreatedAt),
@@ -721,6 +751,27 @@ func (p *Project) splitSeatCounts(projectID string) (humans, agents int) {
 		return 0, 0
 	}
 	return total, 0
+}
+
+// pinnedOrFalse reads the caller's pin, degrading to false rather than failing.
+//
+// Same contract as splitSeatCounts, and for the same reason stated at the update
+// handler: a display field must never turn a COMMITTED write into a 500. The first
+// cut of the pin work put a hard failure directly beneath the comment that forbids
+// it, so a transient read error made a successful rename answer "your write
+// failed". PR #861's review caught it.
+//
+// Degrading to false is the right default, not merely the convenient one: an
+// unpinned card is the state every project starts in and the one every client can
+// already render, and the next list fetch corrects it.
+func (p *Project) pinnedOrFalse(projectID, uid string) bool {
+	pinned, err := p.db.queryProjectPinned(projectID, uid)
+	if err != nil {
+		p.Warn("查询项目置顶状态失败，按未置顶下发",
+			zap.Error(err), zap.String("projectId", projectID))
+		return false
+	}
+	return pinned
 }
 
 // pageParams parses offset/limit with bounds. An unbounded limit on a roster or a project

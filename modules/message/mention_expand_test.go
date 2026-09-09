@@ -19,9 +19,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/stretchr/testify/assert"
 )
 

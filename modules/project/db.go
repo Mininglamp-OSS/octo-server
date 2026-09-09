@@ -480,8 +480,93 @@ func (d *DB) countCreatedInWindowTx(tx *dbr.Tx, creator string, from, to time.Ti
 	return count, nil
 }
 
-// listVisibleInSpace returns the projects in spaceID that uid may see, newest first, with the
-// caller's role attached.
+// sqlListVisibleInSpace is the statement listVisibleInSpace runs.
+//
+// A named constant for the same reason sqlListMyProjectGroups is one: the plan
+// guard EXPLAINs the string production executes rather than a copy of it, and a
+// copy passes forever once the two drift.
+const sqlListVisibleInSpace = "SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, " +
+	"p.discoverability, p.max_members, p.member_epoch, p.status, " +
+	// all_member_group_no on the LIST route too. The wire contract defines
+	// "" as "no group provisioned", so omitting the column here made every
+	// listed project claim it has none — the detail route and the list route
+	// disagreeing about the same project, and a client hiding the entry
+	// point to a group that exists.
+	"p.all_member_group_no, " +
+	"p.created_at, p.updated_at, " +
+	"IFNULL(pm.role, ?) AS my_role, " +
+	// D16's two counts are BOTH computed after the page loads, by
+	// fillMemberCounts, out of one roster read. Neither is in this
+	// statement, and the reason each left is different:
+	//
+	//   - member_count was a correlated join into `user` with a COLLATE on
+	//     the driving side — twenty `user` probes per page that the
+	//     production collation shape turns into twenty scans. PR #855's
+	//     eighth review.
+	//   - seat_count was a correlated aggregate, which was nearly free
+	//     while LIMIT 20 short-circuited the scan and stopped being free
+	//     the moment PR-5's ORDER BY made this statement sort every
+	//     visible project in the Space: it then ran once per SORTED row,
+	//     not once per returned row. Measured on 2000 visible projects,
+	//     4000 seats: 1667 subquery loops and 13.5ms with it here, 7.9ms
+	//     without. See fillMemberCounts for where it went and ORDER BY
+	//     below for what remains.
+	//
+	// Keeping seat_count here and member_count there would also have kept
+	// them under two different read views, which is what the previous round
+	// had to document as an inexactness. One read, one arithmetic.
+	"IFNULL(s.pinned, 0) AS pinned " +
+	"FROM `octo_project` p " +
+	// `removing = 0` on the JOIN as well as on the count: without it a member
+	// whose seat is closing keeps my_role, and — worse — keeps
+	// `pm.uid IS NOT NULL`, which is the clause that reveals UNLISTED
+	// projects. So a departing member would go on seeing projects they are
+	// not supposed to be able to enumerate, for the whole cascade window,
+	// while the member_count beside them already excluded them.
+	"LEFT JOIN `octo_project_member` pm " +
+	"  ON pm.project_id = p.project_id AND pm.uid = ? AND pm.status = 1 " +
+	"     AND pm.removing = 0 " +
+	// The caller-specific pin. A LEFT JOIN rather than a correlated
+	// subquery because it also drives the ORDER BY, and it costs one
+	// equality probe on uk_octo_project_user_setting (project_id, uid) —
+	// the same key the upsert is idempotent on, which is why this table
+	// needs no second index.
+	"LEFT JOIN `octo_project_user_setting` s " +
+	// Both sides are octo_project*, i.e. both general_ci. No COLLATE: one
+	// between two same-collation columns is not free — an explicit COLLATE
+	// has coercibility 0, so the other side is converted per row and its
+	// index stops serving the predicate. PR #855 measured that exact cost
+	// on this schema.
+	"  ON s.project_id = p.project_id AND s.uid = ? " +
+	"WHERE p.space_id = ? AND p.status = ? " +
+	"  AND (p.discoverability = ? OR pm.uid IS NOT NULL) " +
+	// Pinned first, most recently pinned before the rest, then the
+	// pre-existing order UNCHANGED. Two properties are load-bearing:
+	//
+	//   - Totality. p.id is unique, so the three keys together are a total
+	//     order however the first two tie. OFFSET pagination silently drops
+	//     and duplicates rows across pages under a non-total ORDER BY, and
+	//     this list is paginated.
+	//
+	//     Totality is not stability, and the two are easy to conflate. pinned
+	//     and pinned_at are MUTABLE between page requests, so a pin from
+	//     another device between page 1 and page 2 still moves rows across the
+	//     offset boundary — the same exposure every OFFSET-paginated list in
+	//     this module has. Totality only rules out the ordering ITSELF being
+	//     the cause.
+	//   - IFNULL rather than relying on NULL ordering. An unpinned project
+	//     has no row here, so s.pinned is NULL; MySQL sorts NULL lowest, so
+	//     plain DESC would happen to be right today. Writing it out means a
+	//     reader does not have to know that, and a future port to a database
+	//     that orders NULLs the other way does not silently invert the list.
+	"ORDER BY IFNULL(s.pinned, 0) DESC, s.pinned_at DESC, p.id DESC " +
+	"LIMIT ? OFFSET ?"
+
+// listVisibleInSpace returns the projects in spaceID that uid may see — the caller's
+// own pinned ones first, then newest first — with the caller's role attached.
+//
+// "newest first" alone was true until PR #861 added pinning and left this line
+// behind; the ORDER BY below is the authority and now says three keys, not one.
 //
 // Visibility is one SQL statement rather than a filter in Go so an unlisted project can never
 // transit the process boundary: a space_listed project is visible to any Space member, an
@@ -495,55 +580,8 @@ func (d *DB) countCreatedInWindowTx(tx *dbr.Tx, creator string, from, to time.Ti
 // says on the one route where users read it.
 func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*listRow, error) {
 	var rows []*listRow
-	_, err := d.session.SelectBySql(
-		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, "+
-			"p.discoverability, p.max_members, p.member_epoch, p.status, "+
-			// all_member_group_no on the LIST route too. The wire contract defines
-			// "" as "no group provisioned", so omitting the column here made every
-			// listed project claim it has none — the detail route and the list route
-			// disagreeing about the same project, and a client hiding the entry
-			// point to a group that exists.
-			"p.all_member_group_no, "+
-			"p.created_at, p.updated_at, "+
-			"IFNULL(pm.role, ?) AS my_role, "+
-			// D16 — humans and agents counted separately, on the LIST route too.
-			//
-			// One aggregate for both would make member_count mean "humans" on the
-			// detail route and "every seat" here, i.e. a list card over-counting a
-			// project by exactly the agents in it — the thing D16 exists to stop.
-			//
-			// The statement counts SEATS only. Humans are classified afterwards, by
-			// fillMemberCounts, in two single-table reads.
-			//
-			// This subquery used to carry a second one beside it that joined `user`
-			// with a COLLATE on the driving side — the shape PR #855 was blocked on
-			// twice and removed twice, and this was its third and worst instance:
-			// correlated on p.project_id, so a page of 20 projects paid up to twenty
-			// `user` probes that the production collation shape turns into twenty
-			// scans, on a route that is NOT behind the create gate. The eighth review
-			// found it; the comment that used to sit here argued for keeping it, on
-			// an assumption ("each subquery dives into `user` once per member row")
-			// that the shape itself invalidates.
-			//
-			// Seats are index-only on (project_id, status, removing), so this one
-			// stays in the statement.
-			"(SELECT COUNT(*) FROM `octo_project_member` sc "+
-			"  WHERE sc.project_id = p.project_id AND sc.status = 1 AND sc.removing = 0"+
-			"  ) AS seat_count "+
-			"FROM `octo_project` p "+
-			// `removing = 0` on the JOIN as well as on the count: without it a member
-			// whose seat is closing keeps my_role, and — worse — keeps
-			// `pm.uid IS NOT NULL`, which is the clause that reveals UNLISTED
-			// projects. So a departing member would go on seeing projects they are
-			// not supposed to be able to enumerate, for the whole cascade window,
-			// while the member_count beside them already excluded them.
-			"LEFT JOIN `octo_project_member` pm "+
-			"  ON pm.project_id = p.project_id AND pm.uid = ? AND pm.status = 1 "+
-			"     AND pm.removing = 0 "+
-			"WHERE p.space_id = ? AND p.status = ? "+
-			"  AND (p.discoverability = ? OR pm.uid IS NOT NULL) "+
-			"ORDER BY p.id DESC LIMIT ? OFFSET ?",
-		roleNonMember, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed, limit, offset,
+	_, err := d.session.SelectBySql(sqlListVisibleInSpace,
+		roleNonMember, uid, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed, limit, offset,
 	).Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("project: list projects in space: %w", err)
@@ -554,21 +592,27 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	return rows, nil
 }
 
-// fillMemberCounts sets MemberCount (humans) on each listed project.
+// fillMemberCounts sets SeatCount (every active seat) and MemberCount (the human
+// half) on each listed project.
 //
 // Two single-table reads for the whole page, not one join per card: read the
-// active seat uids for the listed projects, then ask `user` which of those uids
+// active seat rows for the listed projects, then ask `user` which of those uids
 // are bots. Neither statement crosses the pinned/legacy schema boundary, so
 // neither needs a COLLATE and neither can lose an index to one — which is the
 // whole reason the join that used to do this was removed. PR #855s eighth review.
 //
-// Within THIS function the arithmetic is exact: one roster read, and every uid in
-// it is either a bot or not, so humans + agents == len(seats) for the set these two
-// statements see. What that does not give is exactness against SeatCount, which the
-// page statement already computed under an earlier read view — see AgentCount for
-// what the difference can be and why the clamp is what handles it. The previous
-// version of this comment claimed a single snapshot across both, which is one
-// statement too many. PR #855's tenth review.
+// Both counts come from THE SAME roster read, which is what makes the arithmetic
+// exact: every uid in it is either a bot or not, so humans + agents == seats by
+// construction rather than by two aggregates hoping to agree. seat_count used to
+// be computed by the page statement instead, i.e. under a different read view —
+// the inexactness the previous round had to document. PR-5 moved it here for a
+// second reason, cost: its ORDER BY makes the page statement sort every visible
+// project in the Space, so a correlated aggregate in that statement runs once per
+// SORTED row rather than once per returned row (measured: 1667 loops on a
+// 2000-project Space).
+//
+// The seats read is per PAGE, not per Space, so it stays proportional to what the
+// client asked for.
 func (d *DB) fillMemberCounts(rows []*listRow) error {
 	if len(rows) == 0 {
 		return nil
@@ -613,13 +657,16 @@ func (d *DB) fillMemberCounts(rows []*listRow) error {
 	}
 
 	humans := make(map[string]int, len(rows))
+	total := make(map[string]int, len(rows))
 	for _, seat := range seats {
+		total[seat.ProjectID]++
 		if _, isBot := bots[seat.UID]; !isBot {
 			humans[seat.ProjectID]++
 		}
 	}
 	for _, row := range rows {
 		row.MemberCount = humans[row.ProjectID]
+		row.SeatCount = total[row.ProjectID]
 	}
 	return nil
 }
@@ -638,28 +685,33 @@ type listRow struct {
 	MemberCount int
 	// SeatCount is every active seat, humans and agents together. Agents are the
 	// DIFFERENCE rather than a third count: see the query for the measurement
-	// behind that choice. Computed by the page statement, i.e. under a DIFFERENT
-	// read view from MemberCount — see AgentCount.
-	SeatCount int `db:"seat_count"`
+	// behind that choice.
+	//
+	// Filled by fillMemberCounts out of the same roster read as MemberCount, so
+	// the two agree by construction rather than across two read views.
+	SeatCount int
+	// Pinned is the CALLER's pin, not a property of the project — the same row
+	// reads 1 for one user and 0 for the next. It comes from the LEFT JOIN, so an
+	// unpinned project reads 0 rather than dropping out of the list.
+	Pinned int `db:"pinned"`
 }
 
 // AgentCount is the agent half of D16's split, derived from the two counts.
 //
-// The clamp is LOAD-BEARING, not a defensive flourish, and the previous version of
-// this comment said the opposite. SeatCount comes from the correlated subquery
-// inside listVisibleInSpace; MemberCount comes from fillMemberCounts, a separate
-// statement issued after that page has loaded. Two statements, no enclosing
-// transaction, two read views — so a member added between them is counted by the
-// second and not the first, and `MemberCount > SeatCount` is reachable in normal
-// operation, not only after a future edit that gave the two different predicates.
+// The race this comment used to describe is gone, and the history is worth keeping
+// because it decides what the clamp is for. SeatCount was computed by the page
+// statement while MemberCount came from fillMemberCounts afterwards — two
+// statements, no enclosing transaction, two read views, so a member added between
+// them made `MemberCount > SeatCount` reachable in normal operation and the clamp
+// load-bearing. PR #855's tenth review established that. PR-5 then had to move
+// seat_count into fillMemberCounts for cost (see the statement), and one roster
+// read for both counts removes the race as a side effect: humans + agents == seats
+// by construction now, so `member_count + agent_count == seat_count` holds on the
+// wire rather than holding usually.
 //
-// What the clamp buys, then, is that the wire never carries a negative agent count.
-// What it does NOT buy is `member_count + agent_count == seat_count`: in that race
-// the response is internally inconsistent by one, briefly, and the next list call
-// agrees again. That is the accepted cost of not putting the classification back
-// into the statement — doing so means re-adding the COLLATE'd join into `user` at
-// one join per listed project, which is exactly what the eighth review had removed.
-// PR #855's tenth review, P2-4.
+// So the clamp is back to being defensive, and stays: it costs nothing, and a
+// future edit that gives the two counts different predicates would otherwise put a
+// negative agent count on the wire, which a client renders as "-3 agents".
 func (r *listRow) AgentCount() int {
 	if r.SeatCount <= r.MemberCount {
 		return 0

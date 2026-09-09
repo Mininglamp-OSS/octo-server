@@ -172,6 +172,22 @@ type updateReq struct {
 	MaxMembers      *int    `json:"max_members"`
 }
 
+// settingReq is the caller's personal preferences for one project.
+//
+// Shaped as a settings bag with pointer fields rather than as /pin and /unpin
+// routes, following PUT /v1/groups/:group_no/setting, which carries top / mute /
+// save / remark through one endpoint. Two verb routes look simpler while there is
+// one preference and stop looking simpler at the second: a preference then costs a
+// key here, not two routes and two handlers.
+//
+// A pointer distinguishes "not mentioned" from "set to false", so a client that
+// learns about a future preference does not have to send every field to change
+// one. A body that names no preference (`{}`) is a no-op, not a reset — a
+// zero-byte body is a 400, see updateSettingHandler.
+type settingReq struct {
+	Pinned *bool `json:"pinned"`
+}
+
 type membersReq struct {
 	UIDs []string `json:"uids"`
 }
@@ -235,6 +251,12 @@ type Resp struct {
 	// none yet (provisioning failed and has not been retried; see D4). A client
 	// showing an entry point to the group must handle "" rather than assuming.
 	AllMemberGroupNo string `json:"all_member_group_no"`
+	// Pinned is the CALLER's own pin, not a property of the project: the same
+	// project reads true for one user and false for the next. It is on the list
+	// AND the detail route, because a field present on one and absent on the other
+	// makes the two disagree about the same project — the defect
+	// all_member_group_no already had to be fixed for once.
+	Pinned bool `json:"pinned"`
 	// MyRole is the caller's project role, or -1 when the caller is not a member
 	// (a Space admin reading a project they have not joined).
 	MyRole       int          `json:"my_role"`
@@ -275,6 +297,51 @@ type MemberResp struct {
 	// to nest an agent under its owner.
 	OwnerUID  string `json:"owner_uid"`
 	CreatedAt string `json:"created_at"`
+}
+
+// GroupResp is one row of the project group list.
+//
+// Deliberately NARROW, and not a copy of modules/group's GroupResp. That struct
+// is forty-odd fields of per-user group state, and it is served by the routes a
+// client already calls for exactly that (GET /v1/group/my, GET /v1/groups/:group_no).
+// Restating it here would create a second wire contract for one piece of state,
+// and the two would drift the first time either changed — while this module,
+// which cannot import modules/group, would have no compiler to notice.
+//
+// So this answers one question — which groups in this project am I in — with the
+// fields the tree renders, and the client fetches everything else where it
+// already does. The avatar fields travel together because they are one decision
+// on the client: avatar_text/avatar_color override, is_upload_avatar wins over
+// both, and is_named decides the fallback when none is set. Shipping a subset
+// would make the list render group avatars differently from every other surface.
+type GroupResp struct {
+	GroupNo string `json:"group_no"`
+	Name    string `json:"name"`
+	// IsNamed is 1 for a group created BEFORE the 2026-06-29 avatar revamp and 0
+	// for one created after: legacy groups render the group name's first two
+	// characters into the default avatar, new ones fall back to the two-person
+	// icon. NOT "the user chose this name" — that was the column's original
+	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
+	//
+	// On THIS endpoint the value is therefore always 0: modules/group hardcodes
+	// IsNamed: 0 at BOTH create sites in modules/group/service.go, and 1 exists only where
+	// the #500 migration backfilled it, which no project group can be. It is
+	// shipped anyway so the avatar fallback chain is evaluated by the same code
+	// on every surface rather than special-cased here — a client that hardcodes
+	// the fallback for this list is the drift the field exists to prevent.
+	IsNamed int `json:"is_named"`
+	// AvatarText is the custom avatar text; "" falls back per IsNamed.
+	AvatarText string `json:"avatar_text"`
+	// AvatarColor is the custom palette index; null derives it from group_no.
+	// A pointer because the column is nullable and null is NOT index 0.
+	AvatarColor    *int `json:"avatar_color"`
+	IsUploadAvatar int  `json:"is_upload_avatar"`
+	// MemberCount counts active members (is_deleted = 0 AND status = 1),
+	// everyone in the group — unlike the project's own member_count, which #855
+	// narrowed to humans. These are different populations, so the same name
+	// meaning different things is a hazard the client teams need to know about:
+	// a project group's count includes the agents seated in it.
+	MemberCount int `json:"member_count"`
 }
 
 // memberRosterModel is the member roster joined to `user` for display names.

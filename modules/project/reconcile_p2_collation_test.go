@@ -111,6 +111,20 @@ func TestP2StatementsSurviveCollationDrift(t *testing.T) {
 			_, err := projectpkg.PickActiveOwner(p.db.session, probeProject)
 			return err
 		},
+		// The project group list and its member count. Both are legacy-to-legacy
+		// today (`group` join `group_member`, everything else a bind parameter),
+		// so db_group.go's header argues they need no COLLATE — and that argument
+		// is exactly the kind this file exists to stop being free. Pinned here so
+		// the day someone joins octo_project* into either one, CI fails instead of
+		// production 500ing on a user-facing GET.
+		"listMyProjectGroups": func() error {
+			_, err := p.db.listMyProjectGroups("s", probeProject, "u", 0, 10)
+			return err
+		},
+		"countActiveGroupMembers": func() error {
+			_, err := p.db.countActiveGroupMembers([]string{probeGroup})
+			return err
+		},
 	}
 
 	for name, run := range statements {

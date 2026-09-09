@@ -93,4 +93,26 @@ func (p *Project) refreshDistributionMetrics() {
 	for _, row := range rows {
 		memberCountDistribution.Observe(float64(row.MemberCount))
 	}
+
+	// Projects per Space. Bounded by the same ReconcileLimit as every other read on
+	// this tick, and grouped rather than per-Space-per-query for the same reason.
+	// See spaceProjectCountDistribution for why this is sampled at all: it is the
+	// only thing that sees the project list's sort input growing before users do.
+	var spaceRows []*spaceProjectCountRow
+	if _, err := p.db.session.SelectBySql(
+		"SELECT COUNT(*) AS project_count FROM `octo_project` "+
+			"WHERE status = ? GROUP BY space_id LIMIT ?",
+		StatusNormal, p.cfg.ReconcileLimit,
+	).Load(&spaceRows); err != nil {
+		p.Warn("采集 Space 项目数分布失败", zap.Error(err))
+		return
+	}
+	for _, row := range spaceRows {
+		spaceProjectCountDistribution.Observe(float64(row.ProjectCount))
+	}
+}
+
+// spaceProjectCountRow is one Space's active project count.
+type spaceProjectCountRow struct {
+	ProjectCount int `db:"project_count"`
 }

@@ -805,11 +805,19 @@ type InfoResp struct {
 	AllowViewHistoryMsg int       `json:"allow_view_history_msg"` // 是否允许新成员查看历史记录
 	CreatedAt           string    `json:"created_at"`
 	UpdatedAt           string    `json:"updated_at"`
-	Version             int64     `json:"version"`           // 群数据版本
-	SpaceID             string    `json:"space_id"`          // Space ID
-	IsExternalGroup     int       `json:"is_external_group"` // 是否外部群
-	AllowExternal       int       `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
-	AllowNoMention      int       `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
+	Version             int64     `json:"version"`  // 群数据版本
+	SpaceID             string    `json:"space_id"` // Space ID
+	// ProjectID 群所属项目；空串 = 直属 Space。与 GroupResp.ProjectID 同一列、
+	// 同一含义（P2 开始下发）。加在这里是因为 InfoResp 是模块间的批量读形状：
+	// sidebar 靠 GetGroups 一次拿回整页会话的群信息，没有它就只能为 project_id
+	// 再发一轮查询，而那是热读路径上的一次额外往返。
+	//
+	// 数据本来就在手里——QueryWithGroupNos 取的是整行，Model.ProjectID 一直都在，
+	// 只是没有被映射出来。
+	ProjectID       string `json:"project_id"`        // 所属项目 ID（空串=直属 Space）
+	IsExternalGroup int    `json:"is_external_group"` // 是否外部群
+	AllowExternal   int    `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention  int    `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
 }
 
 func toInfoResp(m *Model) *InfoResp {
@@ -829,6 +837,7 @@ func toInfoResp(m *Model) *InfoResp {
 		UpdatedAt:           m.UpdatedAt.String(),
 		Version:             m.Version,
 		SpaceID:             m.SpaceID,
+		ProjectID:           m.ProjectID,
 		IsExternalGroup:     m.IsExternalGroup,
 		AllowExternal:       m.AllowExternal,
 		AllowNoMention:      m.AllowNoMention,
