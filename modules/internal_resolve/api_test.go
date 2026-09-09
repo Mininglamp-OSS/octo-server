@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
@@ -419,6 +420,7 @@ func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 		{"notify", notifyInternalTokenEnv},
 		{"docs-notify", docsNotifyInternalToken},
 		{"bot-mention", botMentionInternalToken},
+		{"marketplace", marketplaceInternalToken},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,6 +435,20 @@ func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 				t.Fatalf("expected error when %s == %s", DriveInternalTokenEnv, tc.sibling)
 			}
 		})
+	}
+}
+
+// TestMarketplaceInternalTokenLiteralMatchesSpaceConstant pins the duplicated
+// env-name literal in config.go to the exported constant that owns it. The
+// literal exists so this module has no production dependency on modules/space;
+// the cost is that a rename over there would silently turn our collision check
+// into a comparison against an env nobody sets. This test converts that silent
+// failure into a build-time-visible one.
+func TestMarketplaceInternalTokenLiteralMatchesSpaceConstant(t *testing.T) {
+	if marketplaceInternalToken != space.MarketplaceInternalTokenEnv {
+		t.Fatalf("marketplaceInternalToken = %q, want %q (modules/space renamed the env; "+
+			"update config.go or the intra-set collision check silently stops working)",
+			marketplaceInternalToken, space.MarketplaceInternalTokenEnv)
 	}
 }
 

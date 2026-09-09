@@ -293,11 +293,13 @@ env 走 configmap，两个方向都需要滚动重启（与 P0 的两个开关�
 
 1. **P-2（子系统侧服务身份）已经就绪。** 否则每个新项目都会产出一条在 **~23.5 分钟**后
    走到 `abandoned` 的行，而 `abandoned` 没有任何自动重驱动。
-2. **该子系统的 ensure 端点已经跑通 4 条一致性向量**
+2. **该子系统的 ensure 端点已经跑通 4 条一致性向量，且成功请求精确返回
+   `200` 和回显的 `container_id`。**
    （`internal/projectprovision/conformance.go`：valid / stale_timestamp / tampered_body /
    wrong_secret）。这不是形式主义 —— 三条 MUST 里，canonical string 写错会 fail closed
    会自己暴露，而**时间戳校验写松了 fail open 且完全静默**，本仓没有任何东西能发现它。
-   向量就是把「已评审」变成一个可执行动作。
+   向量就是把「已评审」变成一个可执行动作；成功响应形状另做一次真实
+   ensure 探针，因为签名向量本身不覆盖响应。
 
 **retention purge 由 per-target 开关门住，两个都默认 off：**
 
@@ -427,8 +429,8 @@ SELECT p.project_id, p.space_id, 'fleet',
    >   target 就再也不会把自己的容器标成可回收，那是真泄漏。代价是：只要还有一个旧二进制
    >   在服务，表一旦不存在，**每一次项目解散**都会拿到 `Error 1146` →
    >   `disbandProjectOnce` 报错 → **500**，而且是在一条与被回滚功能毫无关系的路径上。
-   > - **手工 drop 不会自愈。** 迁移在启动时由 `pkg/db/mysql.go` 的
-   >   `migrate.Exec(..., migrate.Up)` 应用，手工 drop 会把 `gorp_migrations` 里
+   > - **手工 drop 不会自愈。** 模块迁移在启动时由 `module.Setup` 应用（octo-lib
+   >   `module/module.go:88` 的 `migrate.Exec(..., migrate.Up)`），手工 drop 会把 `gorp_migrations` 里
    >   `20260907000001` 那条账本行留在原地 —— sql-migrate 认为它已应用，**重启不会重建
    >   表**。解散会一直坏着，直到有人再手工删账本行。
    >
@@ -436,24 +438,44 @@ SELECT p.project_id, p.space_id, 'fleet',
    >
    > 1. **先把二进制回退**到不含本迁移的版本（或至少不含 `modules/project` 本切片的版本），
    >    滚动重启完成、确认没有旧 Pod 还在服务。此时已经没有任何代码路径引用本表。
-   > 2. 再退表。**必须把删表和删账本行放进同一个事务**：
+   > 2. 再退表。**两条语句必须都执行，但它们无法放进同一个事务** —— 顺序如下：
    >    ```sql
-   >    START TRANSACTION;
+   >    -- 注意：DROP TABLE 会触发隐式提交，把它包进事务不会得到原子性。
    >    DROP TABLE IF EXISTS `octo_project_provisioning`;
    >    DELETE FROM `gorp_migrations` WHERE id = '20260907000001_project_provisioning.sql';
-   >    COMMIT;
    >    ```
    >    账本行才是关键的那一半，也是「手工 drop」之所以被禁止的全部理由 —— 只 drop 不删
-   >    账本，sql-migrate 认为这条迁移已应用，**重启不会重建表**；两条一起做，则以后重新
-   >    部署新二进制时会干净地重建。**已在本地 MySQL 8.0.46 实测走通**：两条执行后表和账本
-   >    行都消失，再启动一次进程，两者都按预期回来。
+   >    账本，sql-migrate 认为这条迁移已应用，**重启不会重建表**；两条都做，则以后重新
+   >    部署新二进制时会干净地重建。
+   >
+   >    > ⚠️ **本文件早先把这两条包在 `START TRANSACTION; … COMMIT;` 里，并称「必须放进
+   >    > 同一个事务」。那是错的**，而且错在一个会误导操作者的方向上：MySQL 的 DDL 会
+   >    > **隐式提交**，所以 `DROP TABLE` 一执行事务就已经结束了，后面的 `DELETE` 属于另一个
+   >    > 事务。实测（本地 MySQL 8.0.46，`START TRANSACTION; DROP TABLE t; DELETE …; ROLLBACK;`）：
+   >    > 回滚**两样都没恢复** —— 表没回来，账本行也没回来。
+   >    >
+   >    > 早先那句「已实测走通」本身不假：两条**按顺序执行到底**确实到达预期终态，这也是
+   >    > 它被评为 P2 而不是阻塞项的原因。假的是它暗示的**原子性**。真实风险是：`DROP` 成功
+   >    > 而 `DELETE` 失败（连接断开、权限、手误）时，你恰好落在本段自己警告的那个状态 ——
+   >    > 表没了、账本行还在、重启不会重建。所以第二条语句失败时必须**立刻重试**，不要靠
+   >    > 事务回滚，因为没有可回滚的东西。
    >
    >    > ⚠️ 本仓**没有** `dbconfig.yml`，也没有 Makefile 的迁移目标：迁移是由
-   >    > `pkg/db/mysql.go` 的 `migrate.Exec(..., migrate.Up)` 在**进程启动时**对各模块
-   >    > `go:embed` 的 SQL 目录施加的，没有可用的 `sql-migrate` 命令行入口。本文件早期
+   >    > `module.Setup` → octo-lib `module/module.go:88` 的 `migrate.Exec(..., migrate.Up)` 在**进程启动时**对各模块
+   >    > `go:embed` 的 SQL 目录施加的，没有可用的 `sql-migrate` 命令行入口。
+   >    > （本文件早先指向 `pkg/db/mysql.go`。那个文件**确实**有 `migrate.Exec`，但它在
+   >    > `Migration()` 里，而这条链是死的 —— 只是死在比早先说法更上一层：`Migration()`
+   >    > **确实有**一个非测试调用方（`pkg/db/mysql.go:32`，在 `NewMySQL` 内），但
+   >    > `pkg/db.NewMySQL` 自己**零调用方**：全仓唯一写着 `db.NewMySQL(` 的地方
+   >    > （`session_rollout_cmd.go:276`）按它第 46 行的 import 解析到的是 **octo-lib 的
+   >    > 同名函数**，签名都不同（4 个参数 vs 3 个）。所以那不是引用不精确，是指向了一条根本
+   >    > 不执行的路径。（早先还引用了 `testutil` 显式设 `cfg.DB.Migration = false` 作为佐证：
+   >    > 这句字面为真，但那个开关在本仓和锁定版 octo-lib 里都没有非测试消费方，它什么也没门。）
+   >    > 回滚步骤本身是对的，错的是它让人去看哪段代码。）本文件早期
    >    > 版本写的 `sql-migrate down -limit=1 -env=<env>` **在本仓根本跑不起来** —— 而一个
    >    > 跑不通的补救步骤，恰恰会把操作者推回同一段落禁止的手工 DDL。如果将来引入了
-   >    > dbconfig，再换回 Down 段调用；在那之前，上面那个事务就是等价物。
+   >    > dbconfig，再换回 Down 段调用；在那之前，上面的**两条顺序语句**就是等价物，第二条失败
+   >    > 时仍须立刻重试，不能依赖事务回滚。
    >
    >    （对照：migration 的 Down 段本身写的是 `DROP TABLE IF EXISTS
    >    octo_project_provisioning`，与上面第一条语句一致。）

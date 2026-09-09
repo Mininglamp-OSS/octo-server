@@ -152,6 +152,23 @@ func mentionClaimLogHash(claimKey string) string {
 	return hex.EncodeToString(sum[:6])
 }
 
+// resolveBotMentionInternalToken loads OCTO_DOCS_BOT_MENTION_TOKEN and refuses
+// to enable the capability when it is unset or collides with a sibling *fixed*
+// internal-token env, so one leaked value can never grant two capabilities.
+//
+// OCTO_MARKETPLACE_INTERNAL_TOKEN is the newest member of that set
+// (modules/space.MarketplaceInternalTokenEnv). modules/space rejects a value
+// shared with this module's token, so the branch below is the mirror-image
+// half: a deployment that sets one value for both fails BOTH capabilities
+// closed instead of picking an arbitrary winner. The other, pre-existing pairs
+// are left exactly as they were.
+//
+// The env names are duplicated as literals rather than imported from their
+// owning packages, matching modules/internal_resolve/config.go: no module
+// should take a production dependency on another just to learn a string.
+// config_test.go pins the spellings.
+//
+// Returned error messages are logger-safe (they never contain token values).
 func resolveBotMentionInternalToken(getenv func(string) string) (string, error) {
 	if getenv == nil {
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN lookup unavailable; bot mention capability disabled")
@@ -164,6 +181,8 @@ func resolveBotMentionInternalToken(getenv func(string) string) (string, error) 
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; bot mention capability disabled")
 	case token == getenv("OCTO_DOCS_NOTIFY_TOKEN"):
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; bot mention capability disabled")
+	case token == getenv("OCTO_MARKETPLACE_INTERNAL_TOKEN"):
+		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_MARKETPLACE_INTERNAL_TOKEN; bot mention capability disabled")
 	default:
 		return token, nil
 	}

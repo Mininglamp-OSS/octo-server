@@ -164,9 +164,18 @@ func (p *Project) startProvisioningWorker() {
 		// Before the timers, so rows this moves back to `pending` are visible to the
 		// first claim tick rather than waiting a full interval.
 		p.requeueAbandonedProvisioningAtBoot()
-		p.ctx.Schedule(p.cfg.Provisioning.Interval, p.processProvisioningJobs)
-		p.ctx.Schedule(provisioningSweepInterval, p.sweepExhaustedProvisioningJobs)
-		p.ctx.Schedule(provisioningPurgeInterval, p.purgeProvisioningJobs)
+		// Jittered, like reconcile.go's two timers. Without it every replica wakes on
+		// the same tick, so the three timers scheduled HERE — the claim query, the
+		// sweep and the purge — contend at once across the fleet.
+		//
+		// The census is a fourth timer and it is NOT one of these: it lives in
+		// startProvisioningMetrics, outside the enablement gate, and that function
+		// carries its own account of why. An earlier version of this comment named
+		// the census here instead of the purge, which put a true sentence on the
+		// wrong function.
+		p.ctx.Schedule(jitter(p.cfg.Provisioning.Interval), p.processProvisioningJobs)
+		p.ctx.Schedule(jitter(provisioningSweepInterval), p.sweepExhaustedProvisioningJobs)
+		p.ctx.Schedule(jitter(provisioningPurgeInterval), p.purgeProvisioningJobs)
 	})
 }
 
@@ -225,7 +234,7 @@ func (p *Project) requeueAbandonedProvisioningAtBoot() {
 // over a table that is empty in the default state.
 func (p *Project) startProvisioningMetrics() {
 	provisioningMetricsOnce.Do(func() {
-		p.ctx.Schedule(p.cfg.MetricsInterval, p.refreshProvisioningMetrics)
+		p.ctx.Schedule(jitter(p.cfg.MetricsInterval), p.refreshProvisioningMetrics)
 	})
 }
 
@@ -301,8 +310,8 @@ func (p *Project) processProvisioningJobs() {
 	// other, and the client's short timeout does NOT prevent that — the arithmetic was
 	// simply wrong. With fleet down and a due backlog, every one of a 20-row batch costs
 	// the full 10s timeout, so a batch runs for up to 200s; provisioningRunning makes
-	// every 15s tick in that window a no-op, so healthy drive rows wait behind fleet's
-	// timeouts for minutes.
+	// every scheduled claim tick in that window a no-op, so healthy drive rows wait
+	// behind fleet's timeouts for minutes.
 	//
 	// A per-target quota alone would only BOUND that wait. Separate goroutines remove it:
 	// each target advances at its own pace and an unhealthy one delays nobody. Two
