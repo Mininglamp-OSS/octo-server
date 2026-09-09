@@ -191,6 +191,23 @@ func TestSidebarSectionsOrderInterleavesTypesAndOldCategoriesKeepRelativeOrder(t
 	require.Len(t, categories, 2)
 	require.Equal(t, categoryA, categories[0]["category_id"])
 	require.Equal(t, categoryB, categories[1]["category_id"])
+
+	// A legacy category-only client cannot name the Project entry, but sorting
+	// the categories must still preserve the slots occupied by Project sections.
+	// Even a no-op category order used to collapse categoryB onto the Project's
+	// sort value and move the Project behind categoryB through the id tie-break.
+	w = doRequest(t, s.GetRoute(), http.MethodPut, "/v1/spaces/"+spaceID+"/categories/sort", map[string]any{
+		"category_ids": []string{categoryA, categoryB},
+	})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	w = doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/sidebar-sections", nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	sections = parseJSONArray(t, w)
+	require.Len(t, sections, 3)
+	require.Equal(t, categoryA, sections[0]["id"])
+	require.Equal(t, projectID, sections[1]["id"], "legacy category sort must preserve the Project slot")
+	require.Equal(t, categoryB, sections[2]["id"])
 }
 
 func TestOldCategoriesSortWritesSidebarSectionTable(t *testing.T) {
@@ -327,6 +344,16 @@ func TestMoveGroupToCategoryRejectsProjectGroup(t *testing.T) {
 	require.NotNil(t, setting)
 	require.NotNil(t, setting.CategoryID)
 	require.Equal(t, categoryA, *setting.CategoryID, "rejection must not modify the existing manual assignment")
+
+	// Historical bad rows (including ones created before the mutual-exclusion
+	// guard existed) must remain repairable through the public API. Clearing a
+	// category does not categorize the Project group and is therefore allowed.
+	w = doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": ""})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	setting, err = c.db.queryGroupSettingForCategory(groupNo, testutil.UID)
+	require.NoError(t, err)
+	require.NotNil(t, setting)
+	require.Nil(t, setting.CategoryID)
 }
 
 func TestSidebarSectionMigrationBackfillsOrderProjectsAndProjectGroupCleanup(t *testing.T) {
