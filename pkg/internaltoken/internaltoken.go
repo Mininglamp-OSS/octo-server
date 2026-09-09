@@ -26,7 +26,9 @@
 // # Registration order is a precedence order
 //
 // Resolve compares the env being resolved against every env registered BEFORE
-// it, and the junior side is the one that yields. Two consequences:
+// it, and the junior side is the one that yields. (One env opts out — see
+// Spec.Mutual — but precedence is the default and the rest of this section
+// describes it.) Two consequences:
 //
 //   - Coverage is complete by construction. Every unordered pair {i, j} is
 //     compared exactly once — by whichever of the two was registered later — so
@@ -43,6 +45,15 @@
 //
 // So append new Specs to the END of the registry. Reordering it silently
 // changes which live capability a misconfigured deployment loses.
+//
+// A genuinely new capability may instead want its pairs symmetric — "fail both
+// closed rather than pick an arbitrary winner" — which is safe precisely
+// because no deployment can yet depend on the other side staying up. That is
+// what Spec.Mutual expresses, and OCTO_MARKETPLACE_INTERNAL_TOKEN (#827) is
+// the entry that made the case: it shipped the mirror-image branch in all four
+// existing modules by hand, while deliberately leaving every pre-existing pair
+// on precedence. Registering it here replaced five hand-written copies of that
+// decision with one field.
 //
 // # What a collision does
 //
@@ -92,6 +103,12 @@ const (
 	// modules/internal_resolve. The docs-auto-mount polling loop in octo-drive
 	// presents this token on every call.
 	DriveInternalTokenEnv = "OCTO_DRIVE_INTERNAL_TOKEN"
+
+	// MarketplaceInternalTokenEnv gates the Space role lookup in modules/space
+	// (GET /v1/internal/spaces/:space_id/members/:uid/role). It authorizes
+	// reading any uid's role in any Space, which is why its collisions are
+	// Mutual rather than precedence-ordered — see the Spec.Mutual doc.
+	MarketplaceInternalTokenEnv = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 )
 
 // DefaultMinBytes is the repository-wide length floor for internal-route
@@ -117,6 +134,27 @@ type Spec struct {
 	// into reasons as "<Env> ...; <Capability> disabled", so keep it a noun
 	// phrase.
 	Capability string
+	// Mutual makes this env's collisions symmetric: a shared value disables
+	// BOTH sides, not just the junior one.
+	//
+	// The default (false) is the precedence rule described above — the
+	// incumbent keeps serving, the newcomer yields — which is what the four
+	// original envs had already built by hand and what a refactor must not
+	// silently change for a live deployment.
+	//
+	// Mutual is for an env whose owner deliberately chose "fail both closed
+	// rather than pick an arbitrary winner" AND is new enough that no
+	// deployment can already be relying on the other side staying up. That is
+	// exactly the trade-off #827 made for MarketplaceInternalTokenEnv: it added
+	// the mirror-image branch to all four existing modules precisely because it
+	// was introducing the pair, while leaving every pre-existing pair alone for
+	// the same reason the default is precedence.
+	//
+	// Set it only with that justification. Flipping an existing entry from
+	// false to true takes a currently-serving ingress down on the next deploy
+	// of any installation carrying the collision.
+	Mutual bool
+
 	// MinBytes is the length floor enforced on the value. Zero means no floor.
 	//
 	// New capabilities MUST use DefaultMinBytes. The three legacy envs below
@@ -136,6 +174,7 @@ var registry = []Spec{
 	{Env: DocsNotifyTokenEnv, Capability: "docs notification capability", MinBytes: 0},
 	{Env: BotMentionTokenEnv, Capability: "bot mention capability", MinBytes: 0},
 	{Env: DriveInternalTokenEnv, Capability: "drive internal API", MinBytes: DefaultMinBytes},
+	{Env: MarketplaceInternalTokenEnv, Capability: "Space role lookup", MinBytes: DefaultMinBytes, Mutual: true},
 }
 
 // Reason classifies why Resolve refused a token, so callers can pick a log
@@ -203,10 +242,44 @@ func lookup(env string) (Spec, int, bool) {
 	return Spec{}, 0, false
 }
 
+// yieldsTo reports whether subject gives up its token on a shared value with
+// other. otherIsSenior says whether other is registered before subject.
+//
+// Precedence is the default: the junior yields, the incumbent keeps serving.
+// Either side being Mutual makes the pair symmetric instead, so both are
+// disabled — see Spec.Mutual for when that is the right choice.
+func yieldsTo(subject, other Spec, otherIsSenior bool) bool {
+	return otherIsSenior || subject.Mutual || other.Mutual
+}
+
+// Yields reports whether resolving subject is refused when its value is shared
+// with other — i.e. whether subject is the side that gets disabled.
+//
+// It exists so a module's own tests can branch on the rule instead of restating
+// it. A test that hard-codes "every other env disables me" passes only while
+// its subject happens to be registered last, and goes red the moment the
+// registry grows; one that asks Yields stays correct through an append and
+// through a Spec being marked Mutual.
+//
+// Unregistered names yield false: Resolve refuses them outright, so there is no
+// pair to speak of.
+func Yields(subject, other string) bool {
+	subjectSpec, subjectIndex, ok := lookup(subject)
+	if !ok {
+		return false
+	}
+	otherSpec, otherIndex, ok := lookup(other)
+	if !ok || subject == other {
+		return false
+	}
+	return yieldsTo(subjectSpec, otherSpec, otherIndex < subjectIndex)
+}
+
 // Resolve loads env and returns its value only when the value can grant
 // exactly one capability: it must be set, clear the spec's length floor, and
-// differ from the value of every env registered BEFORE it (see "Registration
-// order is a precedence order" in the package doc).
+// differ from the value of every env it yields to — by default the ones
+// registered BEFORE it (see "Registration order is a precedence order" in the
+// package doc), plus, in either direction, any env marked Mutual.
 //
 // On refusal it returns ("", *Error) — the empty token is what makes the
 // caller's auth middleware fail closed. Callers log the error and carry on;
@@ -249,14 +322,20 @@ func Resolve(env string, getenv func(string) string) (string, error) {
 				spec.Env, spec.MinBytes, spec.Capability),
 		}
 	}
-	for _, senior := range registry[:index] {
-		if token == getenv(senior.Env) {
+	for i, other := range registry {
+		if i == index {
+			continue
+		}
+		if !yieldsTo(spec, other, i < index) {
+			continue
+		}
+		if token == getenv(other.Env) {
 			return "", &Error{
 				Env:    env,
 				Reason: ReasonCollision,
-				Other:  senior.Env,
+				Other:  other.Env,
 				msg: fmt.Sprintf("%s must differ from %s; %s disabled",
-					spec.Env, senior.Env, spec.Capability),
+					spec.Env, other.Env, spec.Capability),
 			}
 		}
 	}

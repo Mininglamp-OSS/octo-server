@@ -38,6 +38,12 @@ func TestResolveCoversEveryRegisteredPair(t *testing.T) {
 	for juniorIndex, junior := range envs {
 		for _, senior := range envs[:juniorIndex] {
 			pairs++
+			if Yields(senior, junior) {
+				// A Mutual env makes the pair symmetric, so there is no
+				// survivor to assert; TestMutualCollisionsDisableBothSides
+				// covers those.
+				continue
+			}
 			t.Run(junior+"_yields_to_"+senior, func(t *testing.T) {
 				getenv := envMap(map[string]string{junior: shared, senior: shared})
 
@@ -79,7 +85,7 @@ func TestResolveCoversEveryRegisteredPair(t *testing.T) {
 		}
 	}
 	if want := len(envs) * (len(envs) - 1) / 2; pairs != want {
-		t.Fatalf("exercised %d unordered pairs, want %d — every pair must be covered exactly once", pairs, want)
+		t.Fatalf("visited %d unordered pairs, want %d — every pair must be covered exactly once", pairs, want)
 	}
 }
 
@@ -240,6 +246,7 @@ func TestRegistryPrecedenceOrderIsStable(t *testing.T) {
 		DocsNotifyTokenEnv,
 		BotMentionTokenEnv,
 		DriveInternalTokenEnv,
+		MarketplaceInternalTokenEnv,
 	}
 	got := Envs()
 	if len(got) < len(want) {
@@ -414,6 +421,62 @@ func TestCollisionsIgnoreUnsetEnvs(t *testing.T) {
 	for _, spec := range Specs() {
 		if _, err := Resolve(spec.Env, envMap(nil)); err == nil {
 			t.Fatalf("Resolve(%s) accepted an unset value", spec.Env)
+		}
+	}
+}
+
+// TestMutualCollisionsDisableBothSides pins the opt-out from precedence.
+//
+// A Mutual env's pairs are symmetric in both directions: it yields to every
+// other entry, and every other entry yields to it regardless of registration
+// order. That is the behaviour #827 shipped as a hand-written mirror branch in
+// four modules; expressing it as one flag is only correct if it reproduces both
+// halves, so both are asserted here.
+func TestMutualCollisionsDisableBothSides(t *testing.T) {
+	shared := longEnough("s")
+	mutual := 0
+	for _, spec := range Specs() {
+		if !spec.Mutual {
+			continue
+		}
+		mutual++
+		for _, other := range Envs() {
+			if other == spec.Env {
+				continue
+			}
+			getenv := envMap(map[string]string{spec.Env: shared, other: shared})
+			t.Run(spec.Env+"_and_"+other, func(t *testing.T) {
+				if !Yields(spec.Env, other) || !Yields(other, spec.Env) {
+					t.Fatalf("Yields is not symmetric for the Mutual pair (%s, %s)", spec.Env, other)
+				}
+				if token, err := Resolve(spec.Env, getenv); err == nil || token != "" {
+					t.Fatalf("Resolve(%s) = %q, %v; the Mutual env must be disabled", spec.Env, token, err)
+				}
+				if token, err := Resolve(other, getenv); err == nil || token != "" {
+					t.Fatalf("Resolve(%s) = %q, %v; a Mutual pair disables BOTH sides, "+
+						"including an env registered earlier", other, token, err)
+				}
+			})
+		}
+	}
+	if mutual == 0 {
+		t.Skip("no Mutual entry in the registry; nothing to assert")
+	}
+}
+
+// TestMutualIsOptInAndJustified keeps the flag from spreading by habit. Marking
+// a pre-existing env Mutual takes a currently-serving ingress down on the next
+// deploy of any installation carrying the collision, so the list is pinned.
+func TestMutualIsOptInAndJustified(t *testing.T) {
+	allowed := map[string]bool{MarketplaceInternalTokenEnv: true}
+	for _, spec := range Specs() {
+		if spec.Mutual && !allowed[spec.Env] {
+			t.Fatalf("%s is marked Mutual but is not in the reviewed list; flipping an existing "+
+				"env to Mutual disables a serving capability on the next deploy", spec.Env)
+		}
+		if !spec.Mutual && allowed[spec.Env] {
+			t.Fatalf("%s lost its Mutual flag; #827 requires that pair to fail BOTH sides closed",
+				spec.Env)
 		}
 	}
 }

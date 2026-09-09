@@ -1,8 +1,6 @@
 package internal_resolve
 
 import (
-	"errors"
-
 	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
@@ -36,11 +34,6 @@ const (
 	// Re-exported from the shared registry so callers (main.go, this module's
 	// tests) keep a single name for it and no second literal can drift.
 	DriveInternalTokenEnv = internaltoken.DriveInternalTokenEnv
-
-	// marketplaceInternalToken is modules/space.MarketplaceInternalTokenEnv.
-	// Kept as a local literal (and a local check below) only until that env is
-	// absorbed into pkg/internaltoken; see the follow-up commit on PR #853.
-	marketplaceInternalToken = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 
 	// internalTokenHeader is the wire header carrying the credential. Owned by
 	// pkg/internaltoken alongside the env names — one convention across every
@@ -100,16 +93,5 @@ const (
 // Returned error messages are logger-safe (no token values) — pinned by
 // pkg/internaltoken's TestErrorsNeverContainTokenValue.
 func resolveDriveInternalToken(getenv func(string) string) (string, error) {
-	token, err := internaltoken.Resolve(DriveInternalTokenEnv, getenv)
-	if err != nil {
-		return "", err
-	}
-	// Mirror-image half for OCTO_MARKETPLACE_INTERNAL_TOKEN (#827). That env is
-	// registered AFTER this one, so the registry's precedence rule alone would
-	// leave this capability serving; #827 made that pair symmetric on purpose.
-	// Absorbed into the registry by the next commit.
-	if getenv(marketplaceInternalToken) == token {
-		return "", errors.New("OCTO_DRIVE_INTERNAL_TOKEN must differ from OCTO_MARKETPLACE_INTERNAL_TOKEN; drive internal API disabled")
-	}
-	return token, nil
+	return internaltoken.Resolve(DriveInternalTokenEnv, getenv)
 }

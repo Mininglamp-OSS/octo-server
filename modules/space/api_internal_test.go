@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -322,29 +323,55 @@ func TestResolveMarketplaceInternalTokenChecksLengthBeforeCollision(t *testing.T
 }
 
 func TestResolveMarketplaceInternalTokenRejectsSiblingCollision(t *testing.T) {
+	// Enumerate the shared registry instead of a hand-written sibling list.
+	// This env is registered last AND marked Mutual, so it yields to every
+	// other entry — but the assertion asks internaltoken.Yields rather than
+	// assuming that, so it stays honest if the registry ever changes shape.
 	sharedSecret := strings.Repeat("s", minMarketplaceInternalTokenBytes)
-	cases := []struct {
-		name    string
-		sibling string
-	}{
-		{"notify", notifyInternalTokenEnv},
-		{"docs-notify", docsNotifyInternalTokenEnv},
-		{"bot-mention", botMentionInternalTokenEnv},
-		{"drive", driveInternalTokenEnvForExclusion},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	yielding := 0
+	for _, sibling := range internaltoken.Envs() {
+		if sibling == MarketplaceInternalTokenEnv {
+			continue
+		}
+		if !internaltoken.Yields(MarketplaceInternalTokenEnv, sibling) {
+			continue
+		}
+		yielding++
+		t.Run(sibling, func(t *testing.T) {
 			getenv := func(k string) string {
-				if k == MarketplaceInternalTokenEnv || k == tc.sibling {
+				if k == MarketplaceInternalTokenEnv || k == sibling {
 					return sharedSecret
 				}
 				return ""
 			}
 			_, err := resolveMarketplaceInternalToken(getenv)
 			require.Error(t, err, "expected error when %s == %s",
-				MarketplaceInternalTokenEnv, tc.sibling)
+				MarketplaceInternalTokenEnv, sibling)
+			assert.Contains(t, err.Error(), sibling, "the reason must name the colliding env")
 			assert.NotContains(t, err.Error(), sharedSecret,
 				"error messages must never contain token values")
+		})
+	}
+	if yielding == 0 {
+		t.Fatal("this token yields to nothing; the cross-capability guard would be vacuous")
+	}
+}
+
+// The Mutual flag on this env is what makes its pairs symmetric: the four
+// pre-existing capabilities are registered BEFORE it, so precedence alone would
+// leave them serving on a shared value. #827 introduced that mirror-image
+// behaviour as four hand-written branches; this asserts the registry still
+// produces it from the one flag.
+func TestMarketplaceTokenCollisionAlsoDisablesTheSeniorCapability(t *testing.T) {
+	for _, senior := range internaltoken.Envs() {
+		if senior == MarketplaceInternalTokenEnv {
+			continue
+		}
+		t.Run(senior, func(t *testing.T) {
+			assert.True(t, internaltoken.Yields(senior, MarketplaceInternalTokenEnv),
+				"%s must yield to %s even though it is registered earlier — that is the "+
+					"Mutual flag, and dropping it silently leaves a leaked value serving here",
+				senior, MarketplaceInternalTokenEnv)
 		})
 	}
 }

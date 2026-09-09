@@ -117,21 +117,11 @@ func TestResolveNotifyTokenCollisionDisablesTheJuniorCapability(t *testing.T) {
 // disabling itself.
 func TestResolveNotifyTokenCoversEverySibling(t *testing.T) {
 	const shared = "shared-internal-token-value-0000"
-	envs := internaltoken.Envs()
+	owned := []string{internaltoken.NotifyInternalTokenEnv, internaltoken.DocsNotifyTokenEnv}
 
-	index := func(target string) int {
-		for i, env := range envs {
-			if env == target {
-				return i
-			}
-		}
-		t.Fatalf("%s missing from internaltoken.Envs() = %v", target, envs)
-		return -1
-	}
-
-	for _, subject := range []string{internaltoken.NotifyInternalTokenEnv, internaltoken.DocsNotifyTokenEnv} {
-		subjectIndex := index(subject)
-		for siblingIndex, sibling := range envs {
+	yielding := 0
+	for _, subject := range owned {
+		for _, sibling := range internaltoken.Envs() {
 			if sibling == subject {
 				continue
 			}
@@ -141,10 +131,15 @@ func TestResolveNotifyTokenCoversEverySibling(t *testing.T) {
 				}
 				return ""
 			}
-			if siblingIndex < subjectIndex {
+			// Branch on the registry's own rule. NOTIFY_INTERNAL_TOKEN is
+			// registered first, so it yields to nothing by precedence — but it
+			// still yields to a Mutual env, which is how #827's marketplace
+			// pair behaves and why this cannot be a "seniors only" test.
+			if internaltoken.Yields(subject, sibling) {
+				yielding++
 				t.Run(subject+"_yields_to_"+sibling, func(t *testing.T) {
 					if got := resolveOne(t, subject, getenv); got != "" {
-						t.Fatalf("%s = %q while sharing a value with the senior env %s; want it disabled",
+						t.Fatalf("%s = %q while sharing a value with %s; want it disabled",
 							subject, got, sibling)
 					}
 				})
@@ -153,17 +148,16 @@ func TestResolveNotifyTokenCoversEverySibling(t *testing.T) {
 			t.Run(subject+"_outranks_"+sibling, func(t *testing.T) {
 				if got := resolveOne(t, subject, getenv); got != shared {
 					t.Fatalf("%s = %q while sharing a value with the junior env %s; the senior "+
-						"capability must keep serving (%s is the side that gets disabled)",
-						subject, got, sibling, sibling)
+						"capability must keep serving", subject, got, sibling)
 				}
 			})
 		}
 	}
+	if yielding == 0 {
+		t.Fatal("neither notify env yields to anything; the guard would be vacuous")
+	}
 }
 
-// TestNotifyOwnsItsEnvsInTheSharedRegistry keeps the module and the registry
-// from drifting apart: an env this module reads but nobody registered would
-// silently skip every cross-capability comparison.
 func TestNotifyOwnsItsEnvsInTheSharedRegistry(t *testing.T) {
 	for _, env := range []string{internaltoken.NotifyInternalTokenEnv, internaltoken.DocsNotifyTokenEnv} {
 		if !internaltoken.Registered(env) {

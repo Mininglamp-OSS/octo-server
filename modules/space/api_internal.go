@@ -2,13 +2,13 @@ package space
 
 import (
 	"crypto/subtle"
-	"errors"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	"go.uber.org/zap"
 )
@@ -71,35 +71,18 @@ const (
 	// env name that describes a capability the process does not have is a
 	// standing invitation to misconfigure it. The name now matches its sibling
 	// OCTO_DRIVE_INTERNAL_TOKEN (one consumer, one internal capability set).
-	MarketplaceInternalTokenEnv = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
-
-	// Sibling *fixed* internal-token envs we forbid intra-set collision with,
-	// so one leaked value can never grant two fixed capabilities. Mirrors the
-	// same local const set in modules/internal_resolve/config.go,
-	// modules/bot_mention/config.go and modules/notify/config.go — the names
-	// are duplicated on purpose rather than imported, so no module has to
-	// depend on another just to know a string. Every one of those modules runs
-	// the mirror-image comparison, so a shared value fails ALL the colliding
-	// capabilities closed instead of picking an arbitrary winner.
-	//
-	// Collision with the *dynamic* per-route notify tokens / callback secrets
-	// loaded from OCTO_CARD_ACTION_ROUTES cannot be seen from here; that check
-	// happens centrally in main.go (see MarketplaceInternalTokenEnv above).
-	notifyInternalTokenEnv            = "NOTIFY_INTERNAL_TOKEN"
-	docsNotifyInternalTokenEnv        = "OCTO_DOCS_NOTIFY_TOKEN"
-	botMentionInternalTokenEnv        = "OCTO_DOCS_BOT_MENTION_TOKEN"
-	driveInternalTokenEnvForExclusion = "OCTO_DRIVE_INTERNAL_TOKEN"
+	MarketplaceInternalTokenEnv = internaltoken.MarketplaceInternalTokenEnv
 
 	// marketplaceInternalTokenHeader is the wire header carrying the
 	// credential. Same value as modules/notify.InternalTokenHeader and
 	// modules/internal_resolve's internalTokenHeader — one convention across
 	// octo-server internal APIs.
-	marketplaceInternalTokenHeader = "X-Internal-Token"
+	marketplaceInternalTokenHeader = internaltoken.Header
 
 	// minMarketplaceInternalTokenBytes is the repository-wide 32-byte floor
 	// for internal-route credentials (see modules/internal_resolve and
 	// modules/notify). A one-byte value would otherwise enable the endpoint.
-	minMarketplaceInternalTokenBytes = 32
+	minMarketplaceInternalTokenBytes = internaltoken.DefaultMinBytes
 
 	// maxSpaceIDBytes matches the space.space_id / space_member.space_id
 	// column width (VARCHAR(40), modules/space/sql/20260307000002). Anything
@@ -149,41 +132,7 @@ const (
 //
 // Returned error messages are logger-safe: they never contain token values.
 func resolveMarketplaceInternalToken(getenv func(string) string) (string, error) {
-	if getenv == nil {
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" lookup unavailable; space internal API disabled")
-	}
-	token := getenv(MarketplaceInternalTokenEnv)
-	switch {
-	case token == "":
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" not set; space internal API will reject all requests")
-	case len(token) < minMarketplaceInternalTokenBytes:
-		// Length check goes BEFORE the collision checks: a short token is
-		// unusable regardless of whether it happens to collide, and we must
-		// not leak "your token collides with X" for a value that could never
-		// authenticate anyway.
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" must be at least 32 bytes; space internal API disabled")
-	case token == getenv(notifyInternalTokenEnv):
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" must differ from " + notifyInternalTokenEnv +
-			"; space internal API disabled")
-	case token == getenv(docsNotifyInternalTokenEnv):
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" must differ from " + docsNotifyInternalTokenEnv +
-			"; space internal API disabled")
-	case token == getenv(botMentionInternalTokenEnv):
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" must differ from " + botMentionInternalTokenEnv +
-			"; space internal API disabled")
-	case token == getenv(driveInternalTokenEnvForExclusion):
-		return "", errors.New(MarketplaceInternalTokenEnv +
-			" must differ from " + driveInternalTokenEnvForExclusion +
-			"; space internal API disabled")
-	default:
-		return token, nil
-	}
+	return internaltoken.Resolve(MarketplaceInternalTokenEnv, getenv)
 }
 
 // sanitizedSpaceMemberRoleRPS / sanitizedSpaceMemberRoleBurst resolve the

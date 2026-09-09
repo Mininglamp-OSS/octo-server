@@ -148,28 +148,15 @@ func TestResolveBotMentionInternalTokenLeavesPreExistingPairsAlone(t *testing.T)
 
 // TestResolveBotMentionInternalTokenCoversEverySibling pins what the shared
 // registry buys this module: the mention token is compared against every env
-// registered BEFORE it, not just the two the original hand-rolled switch
-// happened to list. Enumerating internaltoken.Envs() means a capability
-// registered later is covered with no edit to this file — from the other
-// direction, by that junior capability disabling itself.
+// it yields to — its seniors, plus any env marked Mutual regardless of
+// registration order — not just the two the original hand-rolled switch
+// happened to list. Enumerating internaltoken.Envs() and branching on
+// internaltoken.Yields means an appended Spec, or an existing one newly marked
+// Mutual, is covered with no edit to this file.
 func TestResolveBotMentionInternalTokenCoversEverySibling(t *testing.T) {
 	const shared = "shared-internal-token-value-0000"
-	envs := internaltoken.Envs()
-	subjectIndex := -1
-	for i, env := range envs {
-		if env == internalTokenEnv {
-			subjectIndex = i
-		}
-	}
-	if subjectIndex < 0 {
-		t.Fatalf("%s missing from internaltoken.Envs() = %v", internalTokenEnv, envs)
-	}
-	if subjectIndex == 0 {
-		t.Fatalf("%s is first in the registry, so it yields to nothing; this test would be vacuous",
-			internalTokenEnv)
-	}
-
-	for siblingIndex, sibling := range envs {
+	yielding := 0
+	for _, sibling := range internaltoken.Envs() {
 		if sibling == internalTokenEnv {
 			continue
 		}
@@ -179,11 +166,15 @@ func TestResolveBotMentionInternalTokenCoversEverySibling(t *testing.T) {
 			}
 			return ""
 		}
-		if siblingIndex < subjectIndex {
+		// Ask the registry which side yields rather than restating the rule:
+		// this token yields to its seniors AND to any Mutual env whatever the
+		// order. Both shapes are live today.
+		if internaltoken.Yields(internalTokenEnv, sibling) {
+			yielding++
 			t.Run("yields_to_"+sibling, func(t *testing.T) {
 				token, err := resolveBotMentionInternalToken(getenv)
 				if err == nil {
-					t.Fatalf("expected a refusal when %s == the senior env %s", internalTokenEnv, sibling)
+					t.Fatalf("expected a refusal when %s == %s", internalTokenEnv, sibling)
 				}
 				if token != "" {
 					t.Fatalf("token = %q on collision; must be empty so the ingress fails closed", token)
@@ -198,9 +189,6 @@ func TestResolveBotMentionInternalTokenCoversEverySibling(t *testing.T) {
 			continue
 		}
 		t.Run("outranks_"+sibling, func(t *testing.T) {
-			// The junior env is the side that gets disabled, so this ingress
-			// keeps serving. Verified from this module so a future reordering
-			// of the registry shows up as a behaviour change here too.
 			token, err := resolveBotMentionInternalToken(getenv)
 			if err != nil {
 				t.Fatalf("unexpected refusal when the junior env %s duplicates this token: %v", sibling, err)
@@ -209,6 +197,9 @@ func TestResolveBotMentionInternalTokenCoversEverySibling(t *testing.T) {
 				t.Fatalf("token = %q, want the configured value", token)
 			}
 		})
+	}
+	if yielding == 0 {
+		t.Fatal("registry exposed no env this token yields to; the guard would be vacuous")
 	}
 }
 

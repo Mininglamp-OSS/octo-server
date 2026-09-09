@@ -13,7 +13,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
-	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
@@ -411,40 +410,23 @@ func TestResolveDriveInternalTokenRejectsShortValue(t *testing.T) {
 }
 
 func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
-	// Enumerate the shared registry rather than a hand-written sibling list.
+	// Enumerate the shared registry rather than a hand-written sibling list,
+	// and branch on internaltoken.Yields rather than on the precedence index.
 	//
-	// The guard is directional: the drive token yields to every env registered
-	// BEFORE it; envs registered after it are covered from the other direction,
-	// by that junior capability disabling itself. Branching on the precedence
-	// index rather than asserting refusal against every sibling is what makes
-	// this test survive an appended Spec — asserting the symmetric shape would
-	// go red the moment the registry grows, and the cheapest way out of a red
-	// assertion is to delete it.
-	//
-	// OCTO_MARKETPLACE_INTERNAL_TOKEN is checked separately below: it is not in
-	// the registry yet, and #827 made that pair symmetric rather than
-	// precedence-ordered.
+	// The guard is directional and not uniform: the drive token yields to every
+	// env registered BEFORE it, AND to any env marked Mutual regardless of
+	// order (OCTO_MARKETPLACE_INTERNAL_TOKEN is one — #827 made that pair
+	// symmetric on purpose). Asking the registry which way a pair falls is what
+	// keeps this test correct through an appended Spec and through a Spec being
+	// marked Mutual; hard-coding either shape passes only by accident of the
+	// current ordering, and the cheapest way out of a red assertion is to
+	// delete it.
 	//
 	// Use a 32-byte shared value so the length gate passes and we exercise the
 	// collision path.
 	sharedSecret := strings.Repeat("s", minInternalTokenBytes)
-	envs := internaltoken.Envs()
-	subjectIndex := -1
-	for i, env := range envs {
-		if env == DriveInternalTokenEnv {
-			subjectIndex = i
-		}
-	}
-	if subjectIndex < 0 {
-		t.Fatalf("%s missing from internaltoken.Envs() = %v", DriveInternalTokenEnv, envs)
-	}
-	if subjectIndex == 0 {
-		t.Fatalf("%s is first in the registry, so it yields to nothing; this test would be vacuous",
-			DriveInternalTokenEnv)
-	}
-
-	seniors := 0
-	for siblingIndex, sibling := range envs {
+	yielding, outranking := 0, 0
+	for _, sibling := range internaltoken.Envs() {
 		if sibling == DriveInternalTokenEnv {
 			continue
 		}
@@ -454,12 +436,12 @@ func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 			}
 			return ""
 		}
-		if siblingIndex < subjectIndex {
-			seniors++
+		if internaltoken.Yields(DriveInternalTokenEnv, sibling) {
+			yielding++
 			t.Run("yields_to_"+sibling, func(t *testing.T) {
 				token, err := resolveDriveInternalToken(getenv)
 				if err == nil {
-					t.Fatalf("expected a refusal when %s == the senior env %s", DriveInternalTokenEnv, sibling)
+					t.Fatalf("expected a refusal when %s == %s", DriveInternalTokenEnv, sibling)
 				}
 				if token != "" {
 					t.Fatalf("token = %q on collision; must be empty so the auth middleware fails closed", token)
@@ -473,10 +455,12 @@ func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 			})
 			continue
 		}
+		outranking++
 		t.Run("outranks_"+sibling, func(t *testing.T) {
-			// The junior env is the side that gets disabled, so this endpoint
-			// keeps serving. Asserted from this module so a future reordering of
-			// the registry shows up as a behaviour change here too.
+			// A junior, non-Mutual env is the side that gets disabled, so this
+			// endpoint keeps serving. Asserted from this module so a registry
+			// reorder — or a Spec newly marked Mutual — surfaces as a behaviour
+			// change here too.
 			token, err := resolveDriveInternalToken(getenv)
 			if err != nil {
 				t.Fatalf("unexpected refusal when the junior env %s duplicates this token: %v", sibling, err)
@@ -486,41 +470,10 @@ func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
 			}
 		})
 	}
-	if seniors == 0 {
-		t.Fatal("registry exposed no senior envs; the cross-capability guard would be vacuous")
+	if yielding == 0 {
+		t.Fatal("registry exposed no env this token yields to; the cross-capability guard would be vacuous")
 	}
-
-	// The marketplace pair is symmetric by #827's design, so it is asserted
-	// explicitly rather than through the precedence branches above.
-	t.Run("symmetric_"+marketplaceInternalToken, func(t *testing.T) {
-		getenv := func(k string) string {
-			if k == DriveInternalTokenEnv || k == marketplaceInternalToken {
-				return sharedSecret
-			}
-			return ""
-		}
-		token, err := resolveDriveInternalToken(getenv)
-		if err == nil {
-			t.Fatalf("expected a refusal when %s == %s", DriveInternalTokenEnv, marketplaceInternalToken)
-		}
-		if token != "" {
-			t.Fatalf("token = %q on collision; must be empty", token)
-		}
-	})
-}
-
-// TestMarketplaceInternalTokenLiteralMatchesSpaceConstant pins the duplicated
-// env-name literal in config.go to the exported constant that owns it. The
-// literal exists so this module has no production dependency on modules/space;
-// the cost is that a rename over there would silently turn our collision check
-// into a comparison against an env nobody sets. This test converts that silent
-// failure into a build-time-visible one.
-func TestMarketplaceInternalTokenLiteralMatchesSpaceConstant(t *testing.T) {
-	if marketplaceInternalToken != space.MarketplaceInternalTokenEnv {
-		t.Fatalf("marketplaceInternalToken = %q, want %q (modules/space renamed the env; "+
-			"update config.go or the intra-set collision check silently stops working)",
-			marketplaceInternalToken, space.MarketplaceInternalTokenEnv)
-	}
+	_ = outranking
 }
 
 func TestResolveDriveInternalTokenAcceptsUnique(t *testing.T) {

@@ -27,9 +27,6 @@ const (
 	// from the shared registry so the name cannot drift from the entry that
 	// the cross-capability check compares against.
 	internalTokenEnv = internaltoken.BotMentionTokenEnv
-	// marketplaceInternalTokenEnv is modules/space.MarketplaceInternalTokenEnv;
-	// a local literal only until that env joins the registry (PR #853 follow-up).
-	marketplaceInternalTokenEnv = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 	// internalTokenHeader is owned by pkg/internaltoken so the credential
 	// family has one spelling across every internal ingress.
 	internalTokenHeader        = internaltoken.Header
@@ -170,21 +167,15 @@ func mentionClaimLogHash(claimKey string) string {
 // one is the side that yields, disabling itself rather than this ingress.
 // Refusal returns the empty string, which fails the ingress closed.
 //
-// OCTO_MARKETPLACE_INTERNAL_TOKEN (#827) is the exception: it is registered
-// after this env, but that pair was deliberately made symmetric, so the
-// mirror-image branch below stays until the env is absorbed into the registry.
+// OCTO_MARKETPLACE_INTERNAL_TOKEN (#827) is the exception, and it is now the
+// registry's exception rather than this file's: that Spec is marked Mutual, so
+// Resolve disables this capability on a shared value even though the
+// marketplace env is registered later.
 //
 // Refusal returns the empty string, which fails the ingress closed. Error
 // messages are logger-safe: env names only, never a token value.
 func resolveBotMentionInternalToken(getenv func(string) string) (string, error) {
-	token, err := internaltoken.Resolve(internalTokenEnv, getenv)
-	if err != nil {
-		return "", err
-	}
-	if getenv(marketplaceInternalTokenEnv) == token {
-		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_MARKETPLACE_INTERNAL_TOKEN; bot mention capability disabled")
-	}
-	return token, nil
+	return internaltoken.Resolve(internalTokenEnv, getenv)
 }
 
 type featureGate struct {
