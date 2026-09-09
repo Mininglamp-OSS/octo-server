@@ -900,6 +900,17 @@ var fixedInternalTokenEnvs = []string{
 	"TS_WEBHOOK_SECRET_KEY",
 	"OCTO_MAIL_GATEWAY_SECRET",
 	"TS_GRPC_AUTH_TOKEN",
+	// The Space internal API's token, added when main's #827 landed it. It arrived
+	// already wired into the notify-token exclusion call above but not into THIS
+	// list, which is the asymmetry that list exists to remove: it authorizes reading
+	// any uid's role in any Space, so a value shared with the membership token means
+	// one leaked credential grants the Space role lookup AND project membership reads.
+	//
+	// Found by the sweep test rather than by review — and specifically by CI, because
+	// the local regression runs on this branch covered modules/... and pkg/... but not
+	// the ROOT package where that test lives. A merge is exactly when this check earns
+	// its keep: both sides were fine, the combination was not.
+	space.MarketplaceInternalTokenEnv,
 }
 
 // fixedInternalTokenCollisions reports every pair of fixed internal-token envs

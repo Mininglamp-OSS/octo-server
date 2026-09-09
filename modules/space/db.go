@@ -26,13 +26,29 @@ func NewDB(ctx *config.Context) *DB {
 }
 
 // isSpaceActive 检查空间是否处于活跃状态
-func (d *DB) isSpaceActive(spaceId string) (bool, error) {
-	var count int
-	_, err := d.session.SelectBySql("SELECT COUNT(*) FROM space WHERE space_id=? AND status=1", spaceId).Load(&count)
+// isSpaceActive answers "is this Space live", and returns the space_id the row STORES.
+//
+// It used to COUNT(*) and throw the identifier away. That is the same shape as three
+// other reads on this branch that had the authoritative row in hand and kept only a
+// boolean — and it is the shape that matters here, because the handlers then insert the
+// caller's URL parameter into space_member / space_invitation. `space` and space_member
+// are utf8mb4_0900_ai_ci in production while octo_* are pinned utf8mb4_general_ci, so a
+// drifted spelling passes this check, gets stored, and is afterwards invisible to the
+// project-side enumeration that the membership epoch depends on — the seat funnel then
+// faithfully propagates poisoned bytes and member_epoch freezes while membership moves.
+//
+// Returning the column costs nothing on a read that already found the row.
+func (d *DB) isSpaceActive(spaceId string) (string, bool, error) {
+	var stored []string
+	_, err := d.session.SelectBySql(
+		"SELECT space_id FROM space WHERE space_id=? AND status=1 LIMIT 1", spaceId).Load(&stored)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return count > 0, nil
+	if len(stored) == 0 {
+		return "", false, nil
+	}
+	return stored[0], true, nil
 }
 
 // ---------- Space CRUD ----------

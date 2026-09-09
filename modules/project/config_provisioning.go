@@ -164,6 +164,7 @@ const (
 	siblingWebhookSecretEnv   = "TS_WEBHOOK_SECRET_KEY"
 	siblingMailGatewaySecret  = "OCTO_MAIL_GATEWAY_SECRET"
 	siblingGRPCAuthTokenEnv   = "TS_GRPC_AUTH_TOKEN"
+	siblingMarketplaceToken   = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 )
 
 // Provisioning defaults.
@@ -472,6 +473,7 @@ func checkSecretExclusivity(getenv func(string) string, name, secret string, alr
 		siblingWebhookSecretEnv,
 		siblingMailGatewaySecret,
 		siblingGRPCAuthTokenEnv,
+		siblingMarketplaceToken,
 	} {
 		if sibling := getenv(siblingEnv); sibling != "" && sibling == secret {
 			return fmt.Errorf("project provisioning: %s secret must differ from %s", name, siblingEnv)

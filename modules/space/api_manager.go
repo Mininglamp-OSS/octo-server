@@ -653,6 +653,13 @@ func (m *Manager) addMembers(c *wkhttp.Context) {
 		respondSpaceBatchTooLarge(c, managerMaxBatchUIDs)
 		return
 	}
+	// The space row's own spelling from here on, not the URL parameter. These handlers
+	// write space_member, and a parameter that merely matches the row under the loose
+	// production collation is not the same bytes — a seat stored under the caller's
+	// version is unreachable from the project-side epoch enumeration, which compares
+	// under a stricter one. The row is already loaded; using it costs nothing.
+	// See modules/space.isSpaceActive for the same correction on the non-manager routes.
+	spaceId = sp.SpaceId
 	if err := m.managerDB.upsertMembers(spaceId, uids); err != nil {
 		m.Error("添加成员失败", zap.Error(err), zap.String("spaceId", spaceId), zap.Strings("uids", uids))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
@@ -705,6 +712,13 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 		return
 	}
 	operator := c.GetLoginUID()
+	// The space row's own spelling from here on, not the URL parameter. These handlers
+	// write space_member, and a parameter that merely matches the row under the loose
+	// production collation is not the same bytes — a seat stored under the caller's
+	// version is unreachable from the project-side epoch enumeration, which compares
+	// under a stricter one. The row is already loaded; using it costs nothing.
+	// See modules/space.isSpaceActive for the same correction on the non-manager routes.
+	spaceId = sp.SpaceId
 	removed, err := m.managerDB.removeMembersForce(spaceId, uids, operator)
 	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {

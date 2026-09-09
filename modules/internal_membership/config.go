@@ -50,6 +50,7 @@ const (
 	webhookSecretEnv           = "TS_WEBHOOK_SECRET_KEY"
 	mailGatewaySecretEnv       = "OCTO_MAIL_GATEWAY_SECRET"
 	grpcAuthTokenEnv           = "TS_GRPC_AUTH_TOKEN"
+	marketplaceTokenEnv        = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 
 	// internalTokenHeader is the wire header carrying the credential. Same
 	// value as modules/notify, modules/bot_mention and modules/internal_resolve
@@ -161,6 +162,11 @@ var siblingFixedTokenEnvs = []string{
 	webhookSecretEnv,
 	mailGatewaySecretEnv,
 	grpcAuthTokenEnv,
+	// The Space internal API's token, which main's #827 added centrally without
+	// reaching either module-local refusal list. It authorizes reading any uid's
+	// role in any Space; shared with this module's token, one leaked value grants
+	// the Space role lookup AND project membership reads.
+	marketplaceTokenEnv,
 }
 
 // resolveMembershipInternalToken loads the token and refuses to enable the

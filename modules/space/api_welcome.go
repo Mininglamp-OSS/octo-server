@@ -73,7 +73,8 @@ type welcomeConfigResp struct {
 // caller uid and ok=false when a response was already written.
 func (s *Space) authorizeSpaceAdmin(c *wkhttp.Context, spaceId string) (loginUID string, ok bool) {
 	loginUID = c.GetLoginUID()
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return "", false
 	}
 	if s.requireSpaceAdmin(c, spaceId, loginUID) {

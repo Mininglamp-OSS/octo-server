@@ -31,7 +31,8 @@ func (s *Space) createMemberEmailInvite(c *wkhttp.Context) {
 	if s.requireSpaceAdmin(c, spaceId, loginUID) {
 		return
 	}
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
