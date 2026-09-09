@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,19 @@ import (
 )
 
 const projectGroupsEndpointDefaultLimit = 50
+
+func TestSidebarSortValidationDoesNotRenderProjectContents(t *testing.T) {
+	raw, err := os.ReadFile("api_sidebar_section.go")
+	require.NoError(t, err)
+	source := string(raw)
+	start := strings.Index(source, "func (c *Category) sortSidebarSections(")
+	require.GreaterOrEqual(t, start, 0)
+	end := strings.Index(source[start:], "\n}\n")
+	require.Positive(t, end)
+	body := source[start : start+end]
+	require.NotContains(t, body, "c.sidebarSections(",
+		"sorting must validate lightweight section metadata without loading every Project's groups")
+}
 
 func TestSidebarSectionsListsJoinedProjectsAndOwnCategories(t *testing.T) {
 	s, ctx := newCategoryTestServer()
