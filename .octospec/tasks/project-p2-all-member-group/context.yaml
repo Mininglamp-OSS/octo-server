@@ -2501,6 +2501,56 @@ pr_868_round_5_fixed:
       each. That is a mechanism change to the assembly, and this round already changed the
       classifier; doing both at once is how the last four rounds each produced the next round.
 
+pr_868_round_6_fixed:
+  - id: the-exemption-consumption-rule-was-only-built-on-one-of-the-two-maps
+    severity: medium
+    reported_by: "yujiawei P2 (maintainability), review 5153473178"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 3 made d14ExemptDoors load-bearing: every key must appear in the door set the census
+      actually found. d14ExemptPrimitives never got the same rule -- its keys were only ever read
+      to SKIP a primitive, so a key naming a function that no longer exists exempts nothing while
+      still reading like a decision. That is the exact vacuity class this file exists to catch,
+      missing from the half of the mechanism built to catch it.
+      Masked today only by coincidence: the single key also appears in the hardcoded
+      known-primitives list, so a RENAME is caught -- but by the routing assertion firing on the
+      newly un-exempted primitive, not by anything checking the exemption itself.
+    fix: "the symmetric loop: every d14ExemptPrimitives key must be found as a primitive."
+    mutation: |
+      The first mutation I tried did NOT isolate it: renaming the key also un-exempts a real
+      primitive, so the D14-routing assertion fires and the test is red with or without the new
+      loop. The mutation that isolates it is a STALE key -- one naming no function at all, which
+      is the scenario the finding describes. With the loop: red, naming the key. Without: green.
+      Verified both ways. Worth recording because the first mutation looked like it confirmed the
+      fix and confirmed nothing.
+  - id: the-status-capable-predicate-was-hand-copied-into-the-fixture-test
+    severity: low
+    reported_by: "yujiawei nit, same review"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      assembleCensus and the fixture table each spelled out "updates robot AND not a primitive AND
+      (writes status OR takes a field map)". A change to the assembly's rule would have been
+      caught only by the assembly test, leaving the fixture table asserting a rule the census no
+      longer uses -- while presenting itself as the authoritative list of what the matcher sees.
+    fix: |
+      One method, isStatusCapableWriter, called from both. Same reason the raw-SQL matchers were
+      merged into matchRawSQL this round: two copies of a rule drift, and this file has now had
+      that happen twice.
+    mutation: |
+      Narrowing the shared predicate (dropping takesFieldMapParam) now reddens all three tests --
+      the census, the fixture table and the assembly. Before the extraction it would have reddened
+      the fixture table only by coincidence of the two copies agreeing.
+  - id: merged-main-rather-than-rebasing
+    severity: low
+    reported_by: "self"
+    what: |
+      main moved to c69995af (#827, #854) while round 5 was in review, and the branch went
+      mergeable_state=dirty. The conflict was ONE file, .octospec/log.md, where both sides had
+      appended entries; no code file overlapped between main's two commits and this branch.
+      Resolved by keeping both blocks, main's entry first. Verified by set-difference against both
+      parents that no line from either side was lost, rather than by reading the result -- the
+      check that would have caught the log.md truncation this branch already made once.
+
 open_verification:
   - "modules/robot/api_manager.go updateRobotStatus writes an unvalidated path segment into
      robot.Status: ParseInt64OrDefault(param, 0) means a malformed segment silently DISABLES the

@@ -427,6 +427,24 @@ func (c *censusFunc) disablesBotAccount() bool {
 	return c.rawDisablesRobot || c.deletesRobotRow || (c.updatesRobotTable && c.setsStatusZero)
 }
 
+// isStatusCapableWriter reports whether this function can put a bot's status column
+// to any value without being a deletion primitive itself — which is what makes its
+// CALLERS door candidates.
+//
+// One definition, called from both assembleCensus and the fixture table. It used to be
+// written out in each, and a hand-copied predicate drifts: a change to the assembly's
+// rule would have been caught only by the assembly test, leaving the fixture table
+// asserting a rule the census no longer uses while still presenting itself as the
+// authoritative list. PR #868's sixth review, filed as a nit and worth taking, because
+// two copies of a rule is the same shape as two copies of the raw-SQL matchers that
+// this file already had to merge.
+func (c *censusFunc) isStatusCapableWriter() bool {
+	if !c.updatesRobotTable || c.disablesBotAccount() {
+		return false
+	}
+	return c.writesStatusColumn || c.takesFieldMapParam
+}
+
 func (c *censusFunc) String() string { return c.file + ":" + c.name }
 
 // assembleCensus turns classified functions into the three sets the census asserts on.
@@ -468,10 +486,7 @@ func assembleCensus(funcs []*censusFunc) (map[string]*censusFunc, map[string]boo
 	// set, so their callers are no longer accused of being bot-deletion doors.
 	statusCapableWriters := map[string]bool{}
 	for _, f := range funcs {
-		if !f.updatesRobotTable || f.disablesBotAccount() {
-			continue
-		}
-		if f.writesStatusColumn || f.takesFieldMapParam {
+		if f.isStatusCapableWriter() {
 			statusCapableWriters[f.name] = true
 		}
 	}
@@ -609,6 +624,23 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			"%s is no longer recognised as a bot-deletion entry point — if it was renamed or "+
 				"restructured, this list has to follow it, or the census stops covering that door",
 			known)
+	}
+
+	// The same consumption rule for the PRIMITIVE exemptions, which had only half of it.
+	//
+	// d14ExemptDoors keys were asserted present; d14ExemptPrimitives keys were only ever
+	// read to SKIP a primitive, so a renamed or removed one becomes a silent dead key —
+	// the exact vacuity class this file exists to catch, asymmetrically missing from the
+	// mechanism built to catch it. It is masked today only because the single key also
+	// appears in the hardcoded known-primitives list above, i.e. by a coincidence of
+	// there being one entry, not by anything checking. PR #868's sixth review.
+	for name := range d14ExemptPrimitives {
+		assert.Contains(t, primitives, name,
+			"%s is recorded in d14ExemptPrimitives but the scanner did not classify it as a "+
+				"bot-disabling primitive. Either it was renamed or removed (drop the exemption), "+
+				"or the matcher stopped seeing its spelling — and in that case the exemption is "+
+				"now dead config that silently exempts nothing while reading like a decision",
+			name)
 	}
 
 	// Every recorded exemption must correspond to a door that was actually FOUND.
@@ -924,10 +956,7 @@ func probe(s S, id string) error {
 				"disablesBotAccount is what promotes a function to a deletion PRIMITIVE, "+
 					"and every door of a non-exempt primitive must route through D14. A "+
 					"spelling it cannot see is a deletion the census reports nothing about")
-			statusCapable := probe.updatesRobotTable &&
-				!probe.disablesBotAccount() &&
-				(probe.writesStatusColumn || probe.takesFieldMapParam)
-			assert.Equal(t, tc.wantStatusCapable, statusCapable,
+			assert.Equal(t, tc.wantStatusCapable, probe.isStatusCapableWriter(),
 				"status-capable writers are what make their CALLERS door candidates. Miss "+
 					"one and an endpoint that puts a bot into status 0 is invisible; widen "+
 					"it too far and innocent callers get told to call CloseAllSpaceSeats")
