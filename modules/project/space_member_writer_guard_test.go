@@ -355,11 +355,20 @@ func TestEverySpaceMemberWriterIsAccountedFor(t *testing.T) {
 // TestStripLineCommentsKeepsStringLiterals pins both halves.
 func stripLineComments(src string) string {
 	var out strings.Builder
+	// quote lives OUTSIDE the line loop: a raw string literal legitimately spans lines,
+	// and resetting at every line boundary loses that state — a `//` inside a multi-line
+	// backtick literal would then be treated as a comment and everything after it on that
+	// line dropped. Under-count is the direction that hides a writer, so this is the
+	// direction worth being right about. Interpreted (") and rune (') literals cannot
+	// span lines in Go, so those are reset per line below: carrying THEM across would let
+	// one unbalanced quote swallow the rest of the file, which is the block-comment
+	// failure this stripper exists to avoid.
+	var quote byte // 0 = outside a literal, else the opening delimiter
 	for _, line := range strings.Split(src, "\n") {
-		var (
-			quote  byte // 0 = outside a literal, else the opening delimiter
-			escape bool
-		)
+		if quote == '"' || quote == '\'' {
+			quote = 0
+		}
+		escape := false
 		cut := -1
 		for i := 0; i < len(line); i++ {
 			c := line[i]
@@ -428,6 +437,23 @@ func TestStripLineCommentsKeepsStringLiterals(t *testing.T) {
 			name: "a comment AFTER a literal is still removed",
 			src:  `q := "UPDATE space_member SET status=0" // and prose here`,
 			want: `q := "UPDATE space_member SET status=0" `,
+		},
+		{
+			// The line-spanning case. Quote state has to survive the newline or the
+			// second line reads as code, its `//` reads as a comment, and the writer
+			// after it disappears from the census — an under-count, which is the
+			// direction that reports a real writer as no writer.
+			name: "a raw string literal spanning lines keeps its state",
+			src:  "q := `see https://x\nUPDATE space_member SET status=0`",
+			want: "q := `see https://x\nUPDATE space_member SET status=0`",
+		},
+		{
+			// And the opposite direction: an interpreted literal cannot span lines in
+			// Go, so its state must NOT carry across one, or a single stray quote
+			// swallows the rest of the file — the block-comment failure mode again.
+			name: "an interpreted literal does not carry its state across lines",
+			src:  "q := \"unterminated\nx := 1 // prose",
+			want: "q := \"unterminated\nx := 1 ",
 		},
 	}
 	for _, tc := range cases {

@@ -925,7 +925,7 @@ func (p *Project) scanEpochSanity() {
 				continue
 			}
 			if row.Status == StatusNormal && row.MemberEpoch == absentEpochSentinel {
-				// The invariant migration 20260908000001 establishes is re-breakable by a
+				// The invariant migration 20260908000002 establishes is re-breakable by a
 				// rolling deploy and by the rollback its own Down section prescribes, so it
 				// is enforced here continuously instead of only at that migration's boot.
 				// See repairAbsentSentinelEpoch for both windows.

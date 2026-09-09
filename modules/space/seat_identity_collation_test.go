@@ -136,58 +136,103 @@ func newSeatIdentityProbe(t *testing.T) *dbr.Session {
 // on purpose: one width form, one letterlike symbol, so a fix that special-cases
 // fullwidth cannot pass.
 var seatIdentityDrifts = []struct {
-	name    string
-	stored  string
-	drifted string
+	name string
+	// marker is an ASCII byte the fixtures must contain; replacement is a code point
+	// that utf8mb4_0900_ai_ci folds to it and utf8mb4_general_ci does not.
+	//
+	// A substitution rather than two literal spellings, because BOTH identity columns
+	// have to be drifted and they are built differently — the uid is a constant here,
+	// the space_id is composed per door.
+	marker      byte
+	replacement string
+	storedUID   string
 }{
-	// The drifted spellings are written as EXPLICIT \u escapes, never as literal
-	// characters. These code points are invisible or near-invisible in every editor
-	// and diff view, and a copy-paste that silently degrades U+212A to ASCII "K"
-	// turns the case into ordinary case drift — which BOTH collations fold, so the
-	// test still passes while testing nothing. That happened once while writing
-	// this file and was caught only by the control assertion below; the escapes are
-	// so it cannot happen silently again.
-	{"fullwidth", "sidriftwide", "\uFF53idriftwide"},      // U+FF53 FULLWIDTH LATIN SMALL S
-	{"letterlike", "sidriftkelvin", "sidrift\u212Aelvin"}, // U+212A KELVIN SIGN, for the k
+	// The replacements are EXPLICIT \u escapes, never literal characters. These code
+	// points are invisible or near-invisible in every editor and diff view, and a
+	// copy-paste that silently degrades U+212A to ASCII "K" turns the case into
+	// ordinary case drift — which BOTH collations fold, so the test still passes while
+	// testing nothing. That happened once while writing this file and was caught only
+	// by the control assertion below; the escapes are so it cannot happen again.
+	{"fullwidth", 's', "\uFF53", "sidriftwide"},    // U+FF53 FULLWIDTH LATIN SMALL S
+	{"letterlike", 'k', "\u212A", "sidriftkelvin"}, // U+212A KELVIN SIGN
+}
+
+// driftFirst substitutes the family's marker byte, and FAILS if the fixture does not
+// contain it.
+//
+// The failure matters more than the substitution. A fixture renamed so that it no
+// longer contains the marker would drift NOTHING, the door would be driven with the
+// canonical spelling, and every assertion below would pass while testing the trivial
+// case. That is the same vacuity this file's control assertion exists to catch, one
+// level up.
+func driftFirst(t *testing.T, s string, marker byte, replacement string) string {
+	t.Helper()
+	i := strings.IndexByte(s, marker)
+	require.GreaterOrEqual(t, i, 0,
+		"fixture %q must contain %q so a drifted spelling can be built from it; without it "+
+			"the case drives the door with the canonical bytes and proves nothing", s, string(marker))
+	return s[:i] + replacement + s[i+1:]
 }
 
 // assertProbeReproducesTheDrift is a control. Without it every case below could pass
 // against a database with no drift at all, which is exactly how CI reads as green.
-func assertProbeReproducesTheDrift(t *testing.T, sess *dbr.Session, spaceID, stored, drifted string) {
+func assertProbeReproducesTheDrift(
+	t *testing.T, sess *dbr.Session, storedSpace, storedUID, driftedSpace, driftedUID string,
+) {
 	t.Helper()
+	// Both identity columns at once: the seat row must be reachable with BOTH drifted,
+	// which is what the doors below are driven with.
 	var loose []string
 	_, err := sess.SelectBySql(
-		"SELECT uid FROM space_member WHERE space_id = ? AND uid = ?", spaceID, drifted).Load(&loose)
+		"SELECT uid FROM space_member WHERE space_id = ? AND uid = ?",
+		driftedSpace, driftedUID).Load(&loose)
 	require.NoError(t, err)
-	require.Equal(t, []string{stored}, loose,
+	require.Equal(t, []string{storedUID}, loose,
 		"the probe database must reproduce production's drift: under "+
 			"utf8mb4_0900_ai_ci the drifted spelling has to MATCH the stored row. If this "+
 			"fails the fixture is not drifted and every assertion below is vacuous.")
 
-	var strict []int
-	_, err = sess.SelectBySql(
-		"SELECT 1 FROM space_member WHERE space_id = ? AND uid = ? COLLATE utf8mb4_general_ci",
-		spaceID, drifted).Load(&strict)
-	require.NoError(t, err)
-	require.Empty(t, strict,
-		"and under octo_project_member's collation the same spelling must NOT match — "+
-			"that gap is the whole defect this file exists for")
+	// And each column independently must be invisible under the STRICTER collation —
+	// which is where the epoch step and the cascade look. Asserted per column rather
+	// than on the pair, because a fix on one axis and not the other is exactly the
+	// state this file failed to detect when it drifted only the uid.
+	for _, probe := range []struct {
+		axis string
+		sql  string
+		args []interface{}
+	}{
+		{"space_id", "SELECT 1 FROM space_member WHERE space_id = ? COLLATE utf8mb4_general_ci AND uid = ?",
+			[]interface{}{driftedSpace, storedUID}},
+		{"uid", "SELECT 1 FROM space_member WHERE space_id = ? AND uid = ? COLLATE utf8mb4_general_ci",
+			[]interface{}{storedSpace, driftedUID}},
+	} {
+		var strict []int
+		_, err = sess.SelectBySql(probe.sql, probe.args...).Load(&strict)
+		require.NoError(t, err)
+		require.Empty(t, strict,
+			"under octo_project_member's collation the drifted %s must NOT match — "+
+				"that gap is the whole defect this file exists for", probe.axis)
+	}
 }
 
 // recordSeatIdentities installs recording tx steps and returns the identifiers they
 // were handed. Registration is latest-wins by name with no unregister, so both
 // registries are restored with no-ops on cleanup.
-func recordSeatIdentities(t *testing.T, removals, rejoins *[]string) {
+func recordSeatIdentities(t *testing.T, removals, rejoins *[]SeatRef) {
 	t.Helper()
 	const name = "seat_identity_probe"
 	// ONE registry, and the direction arrives as data. That is also what this
 	// recording step pins: a door that flips a seat must reach the single step with
 	// the right Opened value — there is no second registry it could be missing from.
+	//
+	// The WHOLE SeatRef is recorded, not just its uid. Recording one column is how the
+	// earlier version of this file stayed green while the space_id axis was open: the
+	// assertion could only see what the fixture bothered to capture.
 	RegisterSeatTransitionTxStep(name, func(_ *dbr.Tx, tr SeatTransition) error {
 		if tr.Opened {
-			*rejoins = append(*rejoins, tr.Seat.UID())
+			*rejoins = append(*rejoins, tr.Seat)
 		} else {
-			*removals = append(*removals, tr.Seat.UID())
+			*removals = append(*removals, tr.Seat)
 		}
 		return nil
 	})
@@ -303,17 +348,32 @@ func TestSeatTransitionsHandTheStoredSpellingToTheirTxSteps(t *testing.T) {
 
 			for i, door := range doors {
 				t.Run(door.name, func(t *testing.T) {
-					// Short and positional: space_id is VARCHAR(40) and the door names
-					// are longer than that once the family prefix is on them.
-					spaceID := fmt.Sprintf("sid-%s-%d", drift.name, i)
-					seedProbeSpace(t, sess, spaceID)
-					seedProbeSeat(t, sess, spaceID, drift.stored, door.seat)
-					assertProbeReproducesTheDrift(t, sess, spaceID, drift.stored, drift.drifted)
+					// The "sk-" prefix carries EVERY family's marker byte on purpose, so
+					// the space_id can be drifted by any of them. driftFirst fails loudly
+					// if that ever stops being true — it already caught a fixture name
+					// that had no marker, which would have driven the door with the
+					// canonical space_id and proved nothing.
+					//
+					// Short and positional because space_id is VARCHAR(40) and the door
+					// names are longer than that once a family prefix is on them.
+					spaceID := fmt.Sprintf("sk-%s-%d", drift.name, i)
+					driftedSpace := driftFirst(t, spaceID, drift.marker, drift.replacement)
+					driftedUID := driftFirst(t, drift.storedUID, drift.marker, drift.replacement)
 
-					var removals, rejoins []string
+					seedProbeSpace(t, sess, spaceID)
+					seedProbeSeat(t, sess, spaceID, drift.storedUID, door.seat)
+					assertProbeReproducesTheDrift(
+						t, sess, spaceID, drift.storedUID, driftedSpace, driftedUID)
+
+					var removals, rejoins []SeatRef
 					recordSeatIdentities(t, &removals, &rejoins)
 
-					door.drive(t, spaceID, drift.drifted)
+					// BOTH identity columns drifted. A seat row has two, and the epoch
+					// step matches on both — `WHERE space_id = ? AND uid = ?` against
+					// octo_project_member — so canonicalising one and not the other
+					// leaves the signal just as dead. Driving both at once is what makes
+					// this matrix able to fail on either axis.
+					door.drive(t, driftedSpace, driftedUID)
 
 					// The transition really happened: without this a door that no-ops
 					// hands over nothing and would pass on an empty slice.
@@ -321,7 +381,7 @@ func TestSeatTransitionsHandTheStoredSpellingToTheirTxSteps(t *testing.T) {
 					if door.rejoin {
 						want = 1
 					}
-					require.Equal(t, want, probeSeatStatus(t, sess, spaceID, drift.stored),
+					require.Equal(t, want, probeSeatStatus(t, sess, spaceID, drift.storedUID),
 						"the seat must have flipped — the drifted spelling matches it under "+
 							"space_member's collation, which is precisely why the epoch step "+
 							"must be told about it")
@@ -331,13 +391,13 @@ func TestSeatTransitionsHandTheStoredSpellingToTheirTxSteps(t *testing.T) {
 						got = rejoins
 					}
 					require.Len(t, got, 1, "the transition must run exactly one tx step")
-					assert.Equal(t, drift.stored, got[0],
-						"the tx step must be handed the spelling space_member STORES, not the "+
-							"one the caller sent. It matches that identifier against "+
-							"octo_project_member under utf8mb4_general_ci, where the caller's "+
-							"drifted spelling enumerates NOTHING — the seat moves and "+
-							"member_epoch does not, so a peer's cached decision keeps agreeing "+
-							"with an epoch that never changed.")
+					const why = "the tx step must be handed the %s that space_member STORES, not " +
+						"the one the caller sent. It matches that identifier against " +
+						"octo_project_member under utf8mb4_general_ci, where the caller's drifted " +
+						"spelling enumerates NOTHING — the seat moves and member_epoch does not, " +
+						"so a peer's cached decision keeps agreeing with an epoch that never changed."
+					assert.Equal(t, drift.storedUID, got[0].UID(), why, "uid")
+					assert.Equal(t, spaceID, got[0].SpaceID(), why, "space_id")
 				})
 			}
 		})
@@ -356,29 +416,45 @@ func TestRemovalOutboxCarriesTheStoredSpelling(t *testing.T) {
 
 	for _, drift := range seatIdentityDrifts {
 		t.Run(drift.name, func(t *testing.T) {
-			spaceID := "oid-" + drift.name
-			seedProbeSpace(t, sess, spaceID)
-			seedProbeSeat(t, sess, spaceID, drift.stored, 1)
-			assertProbeReproducesTheDrift(t, sess, spaceID, drift.stored, drift.drifted)
+			spaceID := "sk-out-" + drift.name
+			driftedSpace := driftFirst(t, spaceID, drift.marker, drift.replacement)
+			driftedUID := driftFirst(t, drift.storedUID, drift.marker, drift.replacement)
 
-			var removals, rejoins []string
+			seedProbeSpace(t, sess, spaceID)
+			seedProbeSeat(t, sess, spaceID, drift.storedUID, 1)
+			assertProbeReproducesTheDrift(
+				t, sess, spaceID, drift.storedUID, driftedSpace, driftedUID)
+
+			var removals, rejoins []SeatRef
 			recordSeatIdentities(t, &removals, &rejoins)
 
 			removed, rerr := removeMemberLocked(
-				sess, spaceID, drift.drifted, 999, "probeop", MemberRemoveReasonKicked)
+				sess, driftedSpace, driftedUID, 999, "probeop", MemberRemoveReasonKicked)
 			require.NoError(t, rerr)
 			require.True(t, removed)
 
-			var queued []string
-			_, err := sess.SelectBySql(
-				"SELECT uid FROM space_member_removal_cleanup WHERE space_id = ?", spaceID).Load(&queued)
-			require.NoError(t, err)
-			require.Len(t, queued, 1)
-			assert.Equal(t, drift.stored, queued[0],
-				"the cleanup outbox must carry the spelling space_member stores. With the "+
-					"caller's spelling the cascade's project-seat enumeration returns zero rows "+
-					"and the work order completes as a no-op, so the async path is not a "+
-					"backstop for the synchronous gap — it has the identical gap.")
+			// Read the row back by INSERT ORDER, not by a predicate on either identity
+			// column. A predicate would be asking the drifted question: this table is
+			// pinned general_ci like octo_project_member, so `WHERE space_id = <stored>`
+			// silently returns nothing when the row carries drifted bytes — the failure
+			// would read as "no work order was written" rather than "the work order is
+			// unusable", which is a different and less accurate finding.
+			var row struct {
+				SpaceID string `db:"space_id"`
+				UID     string `db:"uid"`
+			}
+			require.NoError(t, sess.SelectBySql(
+				"SELECT space_id, uid FROM space_member_removal_cleanup ORDER BY id DESC LIMIT 1",
+			).LoadOne(&row))
+
+			const why = "the cleanup outbox must carry the %s that space_member stores. With " +
+				"the caller's spelling the cascade re-checks Space membership under the LOOSE " +
+				"collation (matches, so it proceeds), enumerates project seats under the STRICT " +
+				"one (zero rows), and completes SUCCESSFULLY as a documented no-op — the seat is " +
+				"orphaned permanently and the async path is not a backstop for the synchronous " +
+				"gap, it has the identical gap."
+			assert.Equal(t, drift.storedUID, row.UID, why, "uid")
+			assert.Equal(t, spaceID, row.SpaceID, why, "space_id")
 		})
 	}
 }

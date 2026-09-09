@@ -14,7 +14,7 @@
 | 机制 | 触发时机 | 覆盖范围 |
 |---|---|---|
 | 建项目时 `bumpMemberEpochTx` | 每次创建 | 新二进制创建的项目从 1 开始 |
-| 迁移 `20260908000001` 回填 | 每个部署启动执行一次（记账在 `gorp_migrations`） | 已存在的 0 值行，一次性抬到 1 |
+| 迁移 `20260908000002` 回填 | 每个部署启动执行一次（记账在 `gorp_migrations`） | 已存在的 0 值行，一次性抬到 1 |
 | 对账扫描 `repairAbsentSentinelEpoch` | 每轮对账（`scanEpochSanity`，不受 `OCTO_PROJECT_RECONCILE_ENABLED` 门控） | **持续**修复重新落回 0 的活跃项目 |
 | **读取层拒绝** `ErrLiveProjectOnAbsentSentinel` | 每次请求 | 发现活跃项目落在 0 上就**拒绝服务**（500），绝不把哨兵值发出去 |
 
@@ -100,7 +100,7 @@ CrashLoopBackOff**，不是幂等跳过。
 1. **把副本数降到 1**（或确认 `maxSurge=0`，即滚动更新一次只起一个 pod）。
    `kubectl rollout restart`、节点 drain、`maxSurge > 1` 都会并发起 pod。
 2. 部署新镜像，**等这一个 pod 就绪**。大表上它的就绪会明显变慢，那就是回填在跑。
-3. 确认迁移账本里已有 `20260908000001`：
+3. 确认迁移账本里已有 `20260908000002`：
    `SELECT id, applied_at FROM gorp_migrations WHERE id LIKE '%project_member_epoch_base_one%';`
    有记录才说明回填已提交，后续 pod 会跳过它。
 4. **确认没有活跃项目还落在 0 上**：
@@ -196,13 +196,29 @@ collation 更严的表。
 也不是兜底：工单里存的是同一串漂移拼写，级联先用松 collation 匹配上 Space 成员、再枚举到
 0 个项目席位，然后**成功**收工 —— 项目席位永久孤儿。
 
+**一行席位有两个身份列，两个都要。** 第十三轮 review（两位再次独立汇聚）发现上一轮的
+`SeatRef` 只规范化了 `uid`，`space_id` 仍是调用方的字节 —— 而 epoch 步骤匹配的是**这一对**
+（`WHERE space_id = ? AND uid = ?`）。规范化一列而放过另一列，失效信号一样是死的。
+
+`space_id` 不比 `uid` 安全：它虽然是服务端生成的，但**每次移除/踢人/退出/重新邀请请求都由
+调用方带上来**，而 ID 里可能出现的每个 ASCII 字符都有对应的全角形（实测：数字、十六进制
+字母、下划线全部 `0900_ai_ci` 折叠而 `general_ci` 不折）。漂移的 `space_id` 能通过 Space
+中间件（它 JOIN 的 `space_member`/`space` 都是松 collation）、翻转席位、然后走到步骤这里。
+
+**门矩阵此前对这条轴结构性失明** —— 它只漂移 uid，`space_id` 在每个用例里都是规范的。现在
+两列一起漂移、两列一起断言。
+
 **落地方式是类型而不是纪律**（`modules/space/seatref.go`）：
 
 - `SeatRef` 字段不可导出，没有从 `string` 的转换 —— 想构造只能经 `ResolveSeatTx`，
-  它在写入命中那一行之后、锁还握着的时候把规范拼写读回来。
+  它在写入命中那一行之后、锁还握着的时候把 `space_id` 和 `uid` **两列**一起读回来。
 - 事务步骤注册表、outbox 入队都只收 `SeatRef`。**把调用方的字符串传进去编译不过。**
-- 准入侧同样：`octo_project_member` 写入的 uid 取自 `space_member` 返回的拼写
-  （`pkg/project.FoldedLookup`），所以两张表存的字节一致，而不是靠某个 collation 去弥合。
+- 准入侧同样，而且也是两列：`octo_project_member.uid` 取自 `space_member` 返回的拼写
+  （`pkg/project.FoldedLookup`）；`octo_project.space_id` 取自 `lockSpaceRowTx` 锁住的
+  `space` 行、`octo_project_member.space_id` 取自锁住的项目行、`octo_project.creator`
+  取自 `lockSpaceSeatRowTx` 锁住的席位行。这三处此前都是 `SELECT 1`／直接用请求参数，
+  等于把权威表已经握在手里的字节丢掉。所以两张表存的字节一致，而不是靠某个 collation
+  去弥合。
 
 准入侧那一条不是可选的。两位 reviewer 都写了「由不变量 I1 保证规范拼写天然匹配」——
 **这个论证不成立**：I1 说的是成员关系，不是字节相等。真正挡住漂移拼写进入

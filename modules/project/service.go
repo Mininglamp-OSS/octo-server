@@ -406,7 +406,7 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 // active, visible, had a real member, and reported the same epoch as a project
 // that had been disbanded. A consumer caching an authorization answer under
 // epoch 0 kept it forever, because the disbanded project answers 0 too and the
-// staleness check therefore agreed. See migration 20260908000001.
+// staleness check therefore agreed. See migration 20260908000002.
 //
 // Removing the exemption is also the more honest reading of the rule: creation
 // writes the owner seat into octo_project_member, which IS a membership write,
@@ -456,13 +456,20 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	//     answered from it — six concurrent creates all passed MaxPerSpace=1 that way. The
 	//     Space's activeness is rechecked under the exclusive lock immediately below, so
 	//     nothing is lost. See lockSpaceSeatRowTx.
-	creatorIsMember, err := p.db.lockSpaceSeatRowTx(tx, in.SpaceID, in.Creator)
+	storedCreator, creatorIsMember, err := p.db.lockSpaceSeatRowTx(tx, in.SpaceID, in.Creator)
 	if err != nil {
 		return nil, err
 	}
 	if !creatorIsMember {
 		return nil, errNotSpaceMember
 	}
+	// The creator's uid is rebound to the spelling `space_member` stores, because every
+	// octo_* row below denormalises it: octo_project.creator, the owner seat's
+	// octo_project_member.uid, and the invite_uid on the creator's agent seats. The epoch
+	// step matches that column under utf8mb4_general_ci while this lock resolved it under
+	// space_member's looser collation — the same one-hop gap the seat funnel closes on the
+	// removal side, here on the admission side.
+	in.Creator = storedCreator
 
 	// The agents' Space seats, locked in the SAME position in the lock order as the
 	// creator's — before the `space` row, never after (see the deadlock argument above;
@@ -548,9 +555,16 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	//      already joins on space.status = 1, but it read that under a shared lock on
 	//      space_member only, so a ban or disband could still commit in between — this is the
 	//      authoritative recheck, and it is why it stays.
-	spaceActive, err := p.db.lockSpaceRowTx(tx, in.SpaceID)
+	storedSpaceID, spaceActive, err := p.db.lockSpaceRowTx(tx, in.SpaceID)
 	if err != nil {
 		return nil, err
+	}
+	// Every octo_* row below is denormalised with the SPACE row's spelling, not the
+	// request's. The epoch step matches octo_project_member on (space_id, uid) under a
+	// stricter collation than the one that resolved this lock, so bytes that differ
+	// here are bytes the invalidation signal cannot find later.
+	if spaceActive {
+		in.SpaceID = storedSpaceID
 	}
 	if !spaceActive {
 		// Deliberately the same answer as "you hold no seat here", which renders as
@@ -708,7 +722,7 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	// The affected-row count is CHECKED here and ignored everywhere else, because this is
 	// the one call site where a silent no-op is a security state rather than the intended
 	// behaviour: it would leave a fresh project on the reserved absent-epoch sentinel
-	// while the response below reports 1 — the exact state migration 20260908000001
+	// while the response below reports 1 — the exact state migration 20260908000002
 	// exists to remove. It holds today because the insert above writes StatusNormal in
 	// this same transaction; it stops holding the moment a two-phase create (O6) gives a
 	// project a non-normal initial status, and this turns that from a silent wrong answer
@@ -1386,7 +1400,10 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	changed, err := p.db.admitMemberTx(tx, &MemberModel{
 		ProjectID: projectID,
 		UID:       uid,
-		SpaceID:   spaceID,
+		// row.SpaceID, not the request's: the seat belongs to this project, so its
+		// denormalised space_id has to be the project row's own bytes or the epoch
+		// step's `WHERE space_id = ?` enumeration cannot reach it.
+		SpaceID:   row.SpaceID,
 		Role:      RoleCommon,
 		InviteUID: actorUID,
 		CreatedAt: now,

@@ -9,6 +9,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
+
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"go.uber.org/zap"
 )
 
@@ -98,7 +100,19 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 		if spaceID == "" {
 			continue
 		}
-		ok, err := closeOneSeatAndEnqueueTx(session, spaceID, uid, operatorUID, reason)
+		// 有界的 1213/1205 重试，与另外几扇席位门一致。
+		//
+		// 这条门此前是七扇里唯一没有包装的：它在同一事务内按 space_member -> octo_project
+		// 的顺序取锁（epoch 步骤所在），和其它关席位路径完全同形，所以死锁的可能性也同形。
+		// 失败模式此前是有界且可见的（逐 Space 提交、首个错误返回给调用方，而 BotFather
+		// 删 Bot 会因此中止并可重试），所以两位 reviewer 都评为 P2 而非阻塞——但既然
+		// 是一次瞬时失败，让它在这里重试比让整次 Bot 删除失败要好。
+		var ok bool
+		err := dbpkg.RetryOnLockConflict(func() error {
+			var runErr error
+			ok, runErr = closeOneSeatAndEnqueueTx(session, spaceID, uid, operatorUID, reason)
+			return runErr
+		})
 		if err != nil {
 			// 单个 Space 失败不中断其余 Space：已提交的那些工单已经落库，
 			// 中断反而会让后面那些 Space 连工单都没有。

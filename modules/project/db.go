@@ -222,7 +222,7 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 // ignore it — a no-op on a disbanded project is the intended behaviour there.
 // createProjectOnce cannot: a silent zero-row bump would leave a fresh project on
 // the reserved absent sentinel while the create response reports 1, which is the
-// exact state migration 20260908000001 exists to remove.
+// exact state migration 20260908000002 exists to remove.
 func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) (int64, error) {
 	_ = now // the statement is clock-free now; the parameter stays for call-site stability
 	// updated_at is deliberately NOT written here: it is the field a client diffs to decide
@@ -249,7 +249,7 @@ func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) (int
 // for "project does not exist or is not visible".
 //
 // It is spelled out here rather than written as a bare 0 because the whole point
-// of migration 20260908000001 is that this value must never be reachable by a
+// of migration 20260908000002 is that this value must never be reachable by a
 // real, active project. Naming it makes the two places that care — the repair
 // predicate below and the reconcile scan that drives it — obviously the same
 // value as the contract's.
@@ -258,7 +258,7 @@ const absentEpochSentinel = 0
 // repairAbsentSentinelEpoch lifts ONE active project off the absent-sentinel
 // value, and reports whether it actually had to.
 //
-// Why this exists even though migration 20260908000001 already backfilled every
+// Why this exists even though migration 20260908000002 already backfilled every
 // row: the migration enforces the invariant at ONE INSTANT — the boot that runs
 // it. Two windows re-open it afterwards, and neither is hypothetical:
 //
@@ -769,18 +769,32 @@ func (d *DB) countActiveMembersTx(tx *dbr.Tx, projectID string) (int, error) {
 // called; see createProjectOnce for why that direction and not the reverse.
 //
 // Returns false when the Space does not exist or is not active.
-func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
+// Returns the space_id the `space` row STORES, not the one the caller sent.
+//
+// It used to select `1` and discard it, which left every octo_* row this transaction
+// writes carrying the request's bytes. Those rows are later matched under
+// utf8mb4_general_ci by the epoch step, while `space` and `space_member` are
+// utf8mb4_0900_ai_ci in production — so a drifted space_id passes this lock, gets
+// denormalised into octo_project / octo_project_member, and is then unreachable from
+// the spelling a seat transition resolves out of space_member. Same defect as the uid
+// axis, one table up; see modules/space/seatref.go for the measurements.
+//
+// The row is under an exclusive lock either way, so reading the column costs nothing.
+func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (string, bool, error) {
 	if spaceID == "" {
-		return false, nil
+		return "", false, nil
 	}
-	var found []int
+	var found []string
 	_, err := tx.SelectBySql(
-		"SELECT 1 FROM `space` WHERE space_id = ? AND status = 1 FOR UPDATE", spaceID,
+		"SELECT space_id FROM `space` WHERE space_id = ? AND status = 1 FOR UPDATE", spaceID,
 	).Load(&found)
 	if err != nil {
-		return false, fmt.Errorf("project: lock space row: %w", err)
+		return "", false, fmt.Errorf("project: lock space row: %w", err)
 	}
-	return len(found) > 0, nil
+	if len(found) == 0 {
+		return "", false, nil
+	}
+	return found[0], true, nil
 }
 
 // lockSpaceSeatsTx takes the shared lock on SEVERAL space_member rows in ONE statement and
@@ -960,20 +974,27 @@ func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[st
 // strongly than the JOIN checked it — under an exclusive lock rather than in a snapshot.
 // Callers that do NOT lock the `space` row must keep using
 // lockSpaceSeatsTx, whose JOIN is their only activeness check.
-func (d *DB) lockSpaceSeatRowTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
+// Returns the uid the `space_member` row STORES, for the same reason lockSpaceRowTx
+// returns the stored space_id: the caller goes on to WRITE that identifier into octo_*
+// tables, which the epoch step later matches under a stricter collation. Selecting `1`
+// and discarding the column left createProject denormalising the request's spelling.
+func (d *DB) lockSpaceSeatRowTx(tx *dbr.Tx, spaceID, uid string) (string, bool, error) {
 	if spaceID == "" || uid == "" {
-		return false, nil
+		return "", false, nil
 	}
-	var found []int
+	var found []string
 	_, err := tx.SelectBySql(
-		"SELECT 1 FROM `space_member` WHERE uid = ? AND space_id = ? AND status = 1 "+
+		"SELECT uid FROM `space_member` WHERE uid = ? AND space_id = ? AND status = 1 "+
 			"LIMIT 1 FOR SHARE",
 		uid, spaceID,
 	).Load(&found)
 	if err != nil {
-		return false, fmt.Errorf("project: lock space seat row: %w", err)
+		return "", false, fmt.Errorf("project: lock space seat row: %w", err)
 	}
-	return len(found) > 0, nil
+	if len(found) == 0 {
+		return "", false, nil
+	}
+	return found[0], true, nil
 }
 
 // checkSpaceSeatForCleanupTx answers "does uid still hold their Space seat, so cleanup must

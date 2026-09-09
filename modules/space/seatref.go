@@ -88,11 +88,33 @@ func ResolveSeatTx(tx *dbr.Tx, spaceID, callerUID string) (SeatRef, error) {
 	if spaceID == "" || callerUID == "" {
 		return SeatRef{}, fmt.Errorf("%w: empty space_id or uid", ErrSeatNotFound)
 	}
-	var stored []string
+	// BOTH identity columns, not just the uid.
+	//
+	// A seat row is identified by a PAIR, and the epoch step matches on the pair:
+	// `WHERE space_id = ? AND uid = ?` against octo_project_member. Canonicalising one
+	// column and passing the caller's bytes for the other leaves the signal exactly as
+	// dead — the enumeration finds nothing, member_epoch does not move, and the outbox
+	// row carries the drifted spelling so the async cascade completes as a successful
+	// no-op. The first version of this function returned the caller's space_id verbatim
+	// and was reviewed twice before that was caught, because the door matrix drifted
+	// only the uid and was therefore blind to the other axis by construction.
+	//
+	// Nothing about the space_id makes it safer than the uid. It is a server-generated
+	// identifier, but the CALLER supplies it on every remove/kick/leave/re-invite
+	// request, and every ASCII character an id can contain has a fullwidth form that
+	// utf8mb4_0900_ai_ci folds and utf8mb4_general_ci does not — measured on MySQL
+	// 8.0.33 for digits, hex letters and the underscore alike. So a drifted space_id
+	// passes the Space middleware (which joins space_member and space, both loose),
+	// flips the seat, and reaches here.
+	var stored []struct {
+		SpaceID string `db:"space_id"`
+		UID     string `db:"uid"`
+	}
 	if _, err := tx.SelectBySql(
-		"SELECT uid FROM space_member WHERE space_id = ? AND uid = ?", spaceID, callerUID,
+		"SELECT space_id, uid FROM space_member WHERE space_id = ? AND uid = ?",
+		spaceID, callerUID,
 	).Load(&stored); err != nil {
-		return SeatRef{}, fmt.Errorf("space: resolve seat uid: %w", err)
+		return SeatRef{}, fmt.Errorf("space: resolve seat identity: %w", err)
 	}
 	if len(stored) == 0 {
 		return SeatRef{}, fmt.Errorf("%w: space_id=%s", ErrSeatNotFound, spaceID)
@@ -100,5 +122,5 @@ func ResolveSeatTx(tx *dbr.Tx, spaceID, callerUID string) (SeatRef, error) {
 	// More than one row is impossible through the unique index on (space_id, uid) —
 	// under EITHER collation, since both are case- and accent-insensitive and the
 	// index enforces its own. Taking the first is therefore not a choice.
-	return SeatRef{spaceID: spaceID, uid: stored[0]}, nil
+	return SeatRef{spaceID: stored[0].SpaceID, uid: stored[0].UID}, nil
 }

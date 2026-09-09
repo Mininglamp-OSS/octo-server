@@ -165,7 +165,7 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 // coincidence about the numbers — while creation left the epoch at the column
 // default of 0, a fresh solo project reported the same value as a disbanded one,
 // and a consumer caching a grant under epoch 0 kept it forever. See
-// modules/project migration 20260908000001.
+// modules/project migration 20260908000002.
 //
 // "Kept off it" rather than "cannot reach it", deliberately. Four mechanisms
 // keep the invariant, and only the last two run on every request:

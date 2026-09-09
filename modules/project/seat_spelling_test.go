@@ -32,6 +32,7 @@ package project
 // spelling removes the dependency instead of documenting it.
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -86,4 +87,57 @@ func TestAdmissionStoresTheSpaceMemberSpelling(t *testing.T) {
 			"identifier enumerates nothing and the seat is orphaned with no epoch movement. "+
 			"Today general_ci's case-insensitivity happens to bridge this particular gap — the "+
 			"assertion is that the bytes agree, not that a collation rescues them.")
+}
+
+// TestCreateStoresTheSpaceSpelling is the space_id half of the same rule.
+//
+// The seat-transition funnel resolves a seat's space_id out of `space_member` before
+// handing it to the epoch step. That resolution only finds project seats if the octo_*
+// rows carry the same bytes — and both `octo_project.space_id` and
+// `octo_project_member.space_id` were written from whatever space_id the REQUEST
+// carried. `lockSpaceRowTx` had the Space row under an exclusive lock and selected
+// `1` from it, discarding the one thing that would have made the write canonical.
+//
+// ASCII case drift is the probe here for the same reason it is on the uid side: it is
+// what reaches this code on a schema where every table agrees. Under production's
+// split the reachable class is wider (fullwidth digits, hex letters and the underscore
+// all fold under 0900_ai_ci and not under general_ci — measured), which is why the
+// assertion is that the BYTES agree rather than that some collation bridges them.
+func TestCreateStoresTheSpaceSpelling(t *testing.T) {
+	srv, p := setup(t)
+
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "csOwner")
+	seedSpaceMember(t, spaceA, "csOwner", 2, 1)
+	seedUser(t, "csTarget")
+	seedSpaceMember(t, spaceA, "csTarget", 0, 1)
+
+	drifted := strings.ToUpper(spaceA)
+	require.NotEqual(t, spaceA, drifted, "the probe needs a spelling that differs in bytes")
+
+	proj := createProjectVia(t, srv, drifted, ownerToken, "space-spelling")
+
+	var projectSpace string
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT space_id FROM `octo_project` WHERE project_id = ?", proj.ProjectID).LoadOne(&projectSpace))
+	assert.Equal(t, spaceA, projectSpace,
+		"octo_project.space_id must be the spelling the `space` row stores. The seat "+
+			"transition resolves its space_id out of space_member; if the project row holds "+
+			"different bytes, that resolved identifier enumerates nothing and the epoch never "+
+			"moves for this project.")
+
+	admitted, err := p.addOneMember(proj.ProjectID, drifted, "csOwner", "csTarget")
+	require.NoError(t, err)
+	require.True(t, admitted)
+
+	var seatSpaces []string
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT space_id FROM `octo_project_member` WHERE project_id = ?", proj.ProjectID).Load(&seatSpaces)
+	require.NoError(t, err)
+	require.NotEmpty(t, seatSpaces)
+	for _, got := range seatSpaces {
+		assert.Equal(t, spaceA, got,
+			"every octo_project_member.space_id must be the stored spelling too — that column "+
+				"is what the epoch step's enumeration matches on")
+	}
 }
