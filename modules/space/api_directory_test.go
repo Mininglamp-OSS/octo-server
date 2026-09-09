@@ -188,14 +188,20 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	seedDirectoryBot(t, spaceID, testutil.UID, "bot-unreported", "Unreported", "no report", "", nil, 1, 1)
 	seedDirectoryBot(t, spaceID, testutil.UID, "bot-withdrawn", "Withdrawn", "was reported", "", &withdrawnAt, 1, 1)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-octo", "Octo Bot", "cloud", "octo_hosted", &reportedAt, 1, 1)
+	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-octo-null-ts", "Octo Null TS", "cloud no ts", "octo_hosted", nil, 1, 1)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-vendor", "Vendor Bot", "third party", "vendor_hosted", &reportedAt, 1, 1)
-	seedDirectoryFriend(t, testutil.UID, "bot-vendor")
+	seedDirectoryFriend(t, testutil.UID, "bot-octo")
 
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-local", "Local", "excluded", "self_hosted", &reportedAt, 1, 1)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-inactive", "Inactive", "excluded", "octo_hosted", &reportedAt, 0, 1)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-removed", "Removed", "excluded", "octo_hosted", &reportedAt, 1, 0)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-outside", "Outside", "excluded", "octo_hosted", &reportedAt, 1, -1)
 	seedDirectoryBot(t, spaceID, "owner-missing", "bot-orphan", "Orphan", "excluded", "octo_hosted", &reportedAt, 1, 1)
+
+	// Creator is itself a bot: octo_hosted but not owned by a human.
+	seedDirectoryUser(t, "bot-as-owner", "Bot As Owner", 1, 1, 0)
+	seedDirectoryMember(t, spaceID, "bot-as-owner", 0, 1)
+	seedDirectoryBot(t, spaceID, "bot-as-owner", "bot-nested", "Nested", "excluded", "octo_hosted", &reportedAt, 1, 1)
 
 	seedDirectoryUser(t, "owner-inactive", "Inactive Owner", 0, 0, 0)
 	seedDirectoryMember(t, spaceID, "owner-inactive", 0, 1)
@@ -212,14 +218,9 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	require.Len(t, resp.Data, 4, "only active non-system humans are directory rows")
 
 	caller := findDirectoryMember(t, resp.Data, testutil.UID)
-	require.Equal(t, int64(2), caller.AgentCount)
+	require.Equal(t, int64(0), caller.AgentCount, "empty and retracted hosting must not count as cloud agents")
 	require.False(t, caller.AgentsTruncated)
-	require.Len(t, caller.Agents, 2)
-	require.Nil(t, findDirectoryAgent(t, caller.Agents, "bot-unreported").HostingReportedAt)
-	withdrawn := findDirectoryAgent(t, caller.Agents, "bot-withdrawn")
-	require.Equal(t, "", withdrawn.Hosting)
-	require.NotNil(t, withdrawn.HostingReportedAt)
-	require.Equal(t, "2026-09-04 11:00:00", *withdrawn.HostingReportedAt)
+	require.Empty(t, caller.Agents)
 
 	owner := findDirectoryMember(t, resp.Data, "owner-real-name")
 	require.Equal(t, "Real Name", owner.Name, "directory name must follow MemberDetailModel.DisplayName")
@@ -227,12 +228,16 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 		"directory and members endpoints must share the display-name fallback chain")
 	require.Equal(t, int64(2), owner.AgentCount)
 	require.Len(t, owner.Agents, 2)
-	vendor := findDirectoryAgent(t, owner.Agents, "bot-vendor")
-	require.True(t, vendor.IsFriend)
-	require.Equal(t, "vendor_hosted", vendor.Hosting)
-	require.NotNil(t, vendor.HostingReportedAt)
-	require.Equal(t, "2026-09-03 10:00:00", *vendor.HostingReportedAt)
-	require.Equal(t, "cloud", findDirectoryAgent(t, owner.Agents, "bot-octo").Description)
+	octo := findDirectoryAgent(t, owner.Agents, "bot-octo")
+	require.True(t, octo.IsFriend)
+	require.Equal(t, "octo_hosted", octo.Hosting)
+	require.Equal(t, "cloud", octo.Description)
+	require.NotNil(t, octo.HostingReportedAt)
+	require.Equal(t, "2026-09-03 10:00:00", *octo.HostingReportedAt)
+	nullTS := findDirectoryAgent(t, owner.Agents, "bot-octo-null-ts")
+	require.False(t, nullTS.IsFriend)
+	require.Equal(t, "octo_hosted", nullTS.Hosting)
+	require.Nil(t, nullTS.HostingReportedAt)
 
 	placeholder := findDirectoryMember(t, resp.Data, "owner-placeholder")
 	require.Equal(t, memberDisplayNamePlaceholderPrefix+"owner-placeholder", placeholder.Name)
@@ -247,8 +252,15 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 
 	for _, member := range resp.Data {
 		require.NotEqual(t, "fileHelper", member.UID)
+		require.NotEqual(t, "bot-as-owner", member.UID, "a bot must not appear as a directory owner row")
 		for _, agent := range member.Agents {
-			require.NotContains(t, []string{"bot-local", "bot-inactive", "bot-removed", "bot-outside", "bot-orphan", "bot-inactive-owner", "bot-destroyed-owner", "bot-empty-owner"}, agent.UID)
+			require.NotContains(t, []string{
+				"bot-unreported", "bot-withdrawn", "bot-vendor", "bot-local",
+				"bot-inactive", "bot-removed", "bot-outside", "bot-orphan",
+				"bot-nested", "bot-as-owner",
+				"bot-inactive-owner", "bot-destroyed-owner", "bot-empty-owner",
+			}, agent.UID)
+			require.Equal(t, "octo_hosted", agent.Hosting)
 		}
 	}
 
@@ -265,10 +277,9 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	}, testutil.Token)
 	require.Equal(t, http.StatusOK, onlyWithAgents.Code, onlyWithAgents.Body.String())
 	filtered := decodeDirectoryResponse(t, onlyWithAgents)
-	require.Len(t, filtered.Data, 2)
-	for _, member := range filtered.Data {
-		require.Positive(t, member.AgentCount)
-	}
+	require.Len(t, filtered.Data, 1, "only humans who own octo_hosted bots remain")
+	require.Equal(t, "owner-real-name", filtered.Data[0].UID)
+	require.Positive(t, filtered.Data[0].AgentCount)
 }
 
 func TestSpaceDirectoryKeywordFiltersHumanAndVisibleBotNames(t *testing.T) {
@@ -288,6 +299,18 @@ func TestSpaceDirectoryKeywordFiltersHumanAndVisibleBotNames(t *testing.T) {
 	seedDirectoryUser(t, "owner-local-only", "Carol", 0, 1, 0)
 	seedDirectoryMember(t, spaceID, "owner-local-only", 0, 1)
 	seedDirectoryBot(t, spaceID, "owner-local-only", "bot-local-keyword", "Needle Local", "", "self_hosted", nil, 1, 1)
+
+	seedDirectoryUser(t, "owner-vendor-only", "Dave", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-vendor-only", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-vendor-only", "bot-vendor-keyword", "Needle Vendor", "", "vendor_hosted", nil, 1, 1)
+
+	seedDirectoryUser(t, "owner-empty-only", "Eve", 0, 1, 0)
+	seedDirectoryMember(t, spaceID, "owner-empty-only", 0, 1)
+	seedDirectoryBot(t, spaceID, "owner-empty-only", "bot-empty-keyword", "Needle Empty", "", "", nil, 1, 1)
+
+	seedDirectoryUser(t, "bot-as-owner-kw", "Bot Owner", 1, 1, 0)
+	seedDirectoryMember(t, spaceID, "bot-as-owner-kw", 0, 1)
+	seedDirectoryBot(t, spaceID, "bot-as-owner-kw", "bot-nested-keyword", "Needle Nested", "", "octo_hosted", nil, 1, 1)
 
 	seedDirectoryUser(t, "owner-literal", "Literal Owner", 0, 1, 0)
 	seedDirectoryMember(t, spaceID, "owner-literal", 0, 1)
@@ -333,6 +356,27 @@ func TestSpaceDirectoryKeywordFiltersHumanAndVisibleBotNames(t *testing.T) {
 	}, testutil.Token)
 	require.Equal(t, http.StatusOK, localBotName.Code, localBotName.Body.String())
 	require.Empty(t, decodeDirectoryResponse(t, localBotName).Data, "self-hosted Bot names must not match")
+
+	vendorBotName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"Needle Vendor"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, vendorBotName.Code, vendorBotName.Body.String())
+	require.Empty(t, decodeDirectoryResponse(t, vendorBotName).Data, "vendor-hosted Bot names must not match")
+
+	emptyBotName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"Needle Empty"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, emptyBotName.Code, emptyBotName.Body.String())
+	require.Empty(t, decodeDirectoryResponse(t, emptyBotName).Data, "unreported Bot names must not match")
+
+	nestedBotName := getSpaceDirectory(t, srv, testCtx, url.Values{
+		"space_id": {spaceID},
+		"keyword":  {"Needle Nested"},
+	}, testutil.Token)
+	require.Equal(t, http.StatusOK, nestedBotName.Code, nestedBotName.Body.String())
+	require.Empty(t, decodeDirectoryResponse(t, nestedBotName).Data, "bots owned by another bot must not match")
 
 	literalName := getSpaceDirectory(t, srv, testCtx, url.Values{
 		"space_id": {spaceID},

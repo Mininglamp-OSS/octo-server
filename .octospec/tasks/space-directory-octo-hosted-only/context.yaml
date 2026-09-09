@@ -1,0 +1,13 @@
+injected:
+  - id: space-isolation
+    source: repo
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/space-directory-octo-hosted-only/brief.md
+notes: project eligibility is out of scope; this task only changes GET /v1/space/directory.

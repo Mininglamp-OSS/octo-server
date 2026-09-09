@@ -4,6 +4,18 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-09 — space-directory-octo-hosted-only
+
+- Tightened `GET /v1/space/directory` so `agents` / `agent_count` /
+  `only_with_agents` / `keyword` count only `octo_hosted` bots owned by an
+  eligible human in the same Space.
+- Copied the agent-query owner join onto the keyword subquery so a bot whose
+  creator is itself a bot cannot surface anyone.
+- Recorded the contract change in
+  [journal](journal/shared/space-directory-octo-hosted-only.md); the dual-SQL
+  visible-bot predicate is staged in
+  [learnings/pending](learnings/pending/space-directory-octo-hosted-only.md).
+
 ## 2026-09-09 — project-collaboration-roles
 
 - Added project-scoped, multi-select collaboration roles for human members while
