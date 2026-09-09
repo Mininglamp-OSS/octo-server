@@ -64,12 +64,17 @@ import (
 // by comparing group_no against the all_member_group_no it already has
 // from the project detail, which is right in both cases. Position is a
 // convenience, never the contract.
-const sqlListMyProjectGroups = "SELECT g.group_no, g.name, g.is_named, g.avatar_text, " +
-	"g.avatar_color, g.is_upload_avatar " +
-	"FROM `group` g " +
-	"INNER JOIN `group_member` gm ON gm.group_no = g.group_no " +
-	"WHERE g.space_id = ? AND g.project_id = ? AND g.status <> ? " +
-	"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? " +
+const projectGroupSelectColumns = "g.group_no, g.name, g.is_named, g.avatar_text, " +
+	"g.avatar_color, g.is_upload_avatar"
+
+const projectGroupFrom = " FROM `group` g " +
+	"INNER JOIN `group_member` gm ON gm.group_no = g.group_no "
+
+const projectGroupActiveMembershipPredicate = " AND g.status <> ? " +
+	"AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? "
+
+const sqlListMyProjectGroups = "SELECT " + projectGroupSelectColumns + projectGroupFrom +
+	"WHERE g.space_id = ? AND g.project_id = ?" + projectGroupActiveMembershipPredicate +
 	"ORDER BY g.id ASC LIMIT ? OFFSET ?"
 
 // projectGroupRow is one row of the project group list.
@@ -88,12 +93,8 @@ type projectGroupRow struct {
 	IsUploadAvatar int    `db:"is_upload_avatar"`
 }
 
-const sqlListMyProjectGroupsByProjectIDs = "SELECT g.project_id, g.group_no, g.name, g.is_named, g.avatar_text, " +
-	"g.avatar_color, g.is_upload_avatar " +
-	"FROM `group` g " +
-	"INNER JOIN `group_member` gm ON gm.group_no = g.group_no " +
-	"WHERE g.space_id = ? AND g.project_id IN ? AND g.status <> ? " +
-	"  AND gm.uid = ? AND gm.is_deleted = 0 AND gm.status = ? " +
+const sqlListMyProjectGroupsByProjectIDs = "SELECT g.project_id, " + projectGroupSelectColumns + projectGroupFrom +
+	"WHERE g.space_id = ? AND g.project_id IN ?" + projectGroupActiveMembershipPredicate +
 	"ORDER BY g.project_id ASC, g.id ASC"
 
 // listMyProjectGroups returns the LIVE groups of one project that uid is an
@@ -235,17 +236,21 @@ func (d *DB) listMyProjectGroupResponses(spaceID, projectID, uid string, offset,
 	}
 	result := make([]*GroupResp, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, &GroupResp{
-			GroupNo:        row.GroupNo,
-			Name:           row.Name,
-			IsNamed:        row.IsNamed,
-			AvatarText:     row.AvatarText,
-			AvatarColor:    row.AvatarColor,
-			IsUploadAvatar: row.IsUploadAvatar,
-			MemberCount:    counts[row.GroupNo],
-		})
+		result = append(result, projectGroupResponse(row, counts[row.GroupNo]))
 	}
 	return result, nil
+}
+
+func projectGroupResponse(row *projectGroupRow, memberCount int) *GroupResp {
+	return &GroupResp{
+		GroupNo:        row.GroupNo,
+		Name:           row.Name,
+		IsNamed:        row.IsNamed,
+		AvatarText:     row.AvatarText,
+		AvatarColor:    row.AvatarColor,
+		IsUploadAvatar: row.IsUploadAvatar,
+		MemberCount:    memberCount,
+	}
 }
 
 // listMyProjectGroupResponsesByProjectIDs returns the same membership-scoped
@@ -287,15 +292,7 @@ func (d *DB) listMyProjectGroupResponsesByProjectIDs(spaceID, uid string, projec
 	for projectID, projectRows := range selected {
 		groups := make([]*GroupResp, 0, len(projectRows))
 		for _, row := range projectRows {
-			groups = append(groups, &GroupResp{
-				GroupNo:        row.GroupNo,
-				Name:           row.Name,
-				IsNamed:        row.IsNamed,
-				AvatarText:     row.AvatarText,
-				AvatarColor:    row.AvatarColor,
-				IsUploadAvatar: row.IsUploadAvatar,
-				MemberCount:    counts[row.GroupNo],
-			})
+			groups = append(groups, projectGroupResponse(row, counts[row.GroupNo]))
 		}
 		result[projectID] = groups
 	}

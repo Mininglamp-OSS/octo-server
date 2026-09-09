@@ -7,14 +7,21 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGroupCreateRejectsProjectAndCategoryTogether(t *testing.T) {
-	s, _ := newTestServer(t)
-	wireI18nRendererForGroupTest(s)
+	route := wkhttp.New()
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	group := &Group{}
+	route.POST("/v1/group/create", func(c *wkhttp.Context) {
+		c.Set("uid", testutil.UID)
+		group.groupCreate(c)
+	})
 
 	w := httptest.NewRecorder()
 	req, err := http.NewRequest(http.MethodPost, "/v1/group/create", bytes.NewReader([]byte(util.ToJson(map[string]any{
@@ -26,7 +33,7 @@ func TestGroupCreateRejectsProjectAndCategoryTogether(t *testing.T) {
 	}))))
 	require.NoError(t, err)
 	req.Header.Set("token", testutil.Token)
-	s.GetRoute().ServeHTTP(w, req)
+	route.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
 	env := decodeEnvelope(t, w.Body.Bytes())
