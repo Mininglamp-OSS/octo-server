@@ -146,18 +146,21 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 // operation that changes nothing — the shape of bug where turning a toggle on
 // twice fails the second time.
 func (p *Project) applyPin(row *Model, uid string, pinned bool) error {
-	// One read serves both directions, and it is what keeps either direction from
-	// writing a row that changes nothing: unpinning something never pinned used to
-	// INSERT a pinned = 0 tombstone, and nothing anywhere deletes those.
+	// An explicit false is not equivalent to the absence of a setting row. Active
+	// Project members are followed by default, so the sidebar repair path needs a
+	// pinned=0 tombstone to distinguish an opt-out from "never chose". Always
+	// upserting here also makes the first unpin durable for auto-provisioned members.
+	if !pinned {
+		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
+	}
+
+	// A repeated pin is a true no-op and must not consume quota again.
 	already, err := p.db.queryProjectPinned(row.ProjectID, uid)
 	if err != nil {
 		return err
 	}
-	if already == pinned {
+	if already {
 		return nil
-	}
-	if !pinned {
-		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
 	}
 
 	tx, err := p.db.session.Begin()
