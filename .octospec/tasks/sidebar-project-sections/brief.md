@@ -248,9 +248,9 @@ matching `octo_project_user_setting`'s rule in
    rejection the *default* — a Project's `ref_id` is simply never a valid
    `category_id`.
 
-**D2 — A Project entry's group list is the shipped
-`listMyProjectGroups`, called in-process. Not re-implemented, not proxied over
-HTTP. RECOMMENDED.**
+**D2 — A Project entry's group list preserves the shipped
+`listMyProjectGroups` semantics through a Project-owned batch reader. Not
+re-implemented in category, not proxied over HTTP. RECOMMENDED.**
 
 `modules/project/db_group.go:148` already encodes four decisions this task
 would otherwise have to re-derive and could get subtly wrong: membership-scoped
@@ -260,7 +260,12 @@ blacklisted the caller** (`db_group.go:120-136`, pinned by
 `TestListProjectGroupsHidesAGroupThatBlacklistedMe`), and an index-driven plan
 pinned by `TestTheProjectGroupListReachesItsRowsByAnIndex`. A second copy of
 that predicate is a copy that will drift — the exact failure mode
-`project-p2-product-surfaces` documents for `GroupResp`'s two mappers.
+`project-p2-product-surfaces` documents for `GroupResp`'s two mappers. The
+unified sidebar therefore calls `ListMyProjectGroupsByProjectIDs` once for all
+visible Projects. The Project module performs one membership-scoped group query
+and one grouped member-count query, partitions in memory, and preserves the
+same 50-row limit per Project. Sort validation uses section metadata only and
+never renders Project contents.
 
 Sub-question to settle in implementation, not a product call: **which module
 owns the unified-list handler.** `modules/category` is the natural home (it
@@ -272,12 +277,15 @@ rather than by whichever file gets opened first.
 2026-09-09).**
 
 A group belonging to a Project appears **only** under that Project's entry.
-It cannot be dragged into a manual category. Two parts:
+It cannot be dragged into a manual category. Three parts:
 
-1. **Forward**: `PUT /v1/groups/:group_no/category` rejects a target group
-   whose `project_id != ''`, via a new `pkg/errcode` code and the module's
-   `respondCategoryXxx` helper pattern.
-2. **Existing data**: a migration clears `category_id` and `category_sort` on
+1. **Create**: `POST /v1/group/create` rejects a request that supplies both
+   non-empty `project_id` and `category_id` before either resource is queried.
+2. **Move**: `PUT /v1/groups/:group_no/category` rejects a non-empty category
+   target when the group has `project_id != ''`, via a new `pkg/errcode` code
+   and the module's `respondCategoryXxx` helper pattern. An empty
+   `category_id` remains allowed so historical violating rows can be repaired.
+3. **Existing data**: a migration clears `category_id` and `category_sort` on
    any `group_setting` row whose group has `project_id != ''`. It must not
    touch rows for 直属 Space groups — over-clearing would silently destroy real
    user organization, so that non-effect needs its own test, not just the
@@ -327,7 +335,9 @@ keep reading and writing `group_category.sort`, a drag in the unified list and
 a drag in any surviving category-only surface write two different numbers and
 the views desync permanently. Concretely: `category.list`'s ordering moves to a
 join against the new table; `category.sort` (`modules/category/api.go:418`)
-writes `section_type=category` rows instead of `group_category.sort`.
+writes `section_type=category` rows instead of `group_category.sort`. Because
+the legacy request cannot name Project entries, it reassigns categories only
+within their currently occupied unified-order slots; Project slots stay fixed.
 
 They stay rather than being deleted because a category-only list is still the
 right data source for a category-only surface — notably the picker behind
@@ -464,6 +474,11 @@ golangci-lint run ./...
 - `TestSidebarSectionProjectContentMatchesProjectGroupsEndpoint` — a Project
   entry's groups are identical to `GET /v1/projects/:project_id/groups` for the
   same caller (pins D2's "same query, not a second copy").
+- `TestListMyProjectGroupResponsesByProjectIDsUsesTwoQueries` — multiple
+  Projects cost one group query plus one member-count query, with the per-Project
+  response cap applied before counts are loaded.
+- `TestSidebarSortValidationDoesNotRenderProjectContents` — sorting validates
+  only visible section metadata and cannot invoke the full Project-group render.
 - `TestSidebarSectionsOrderInterleavesTypesAndOldCategoriesKeepRelativeOrder`
   — sort a Project between two categories, re-read, order holds; the legacy
   category-only view preserves the remaining categories' relative order.
@@ -475,7 +490,11 @@ golangci-lint run ./...
 **D3 — mutual exclusion**
 
 - `TestMoveGroupToCategoryRejectsProjectGroup` — new error envelope,
-  `group_setting.category_id` unchanged.
+  `group_setting.category_id` unchanged for a non-empty target; an empty target
+  successfully clears a historical assignment.
+- `TestGroupCreateRejectsProjectAndCategoryTogether` and
+  `TestGroupReqCheckRejectsProjectAndCategoryTogether` — the create endpoint
+  rejects simultaneous non-empty `project_id` and `category_id` before writes.
 - `TestSidebarSectionMigrationBackfillsOrderProjectsAndProjectGroupCleanup` also
   proves a Project group's assignment is cleared while a 直属 Space group's
   assignment in the same category is **untouched**.
@@ -501,9 +520,9 @@ golangci-lint run ./...
 
 - `TestSidebarSectionsOrderInterleavesTypesAndOldCategoriesKeepRelativeOrder`
   — after a drag through the new endpoint, the old list reflects the same
-  relative order.
+  relative order; a later legacy category sort keeps Project slots unchanged.
 - `TestOldCategoriesSortWritesSidebarSectionTable` — the old sort endpoint
-  updates the new table.
+  updates the new table without densifying the existing category slots.
 
 **D6 — `SidebarItem.ProjectID *string`** (only once Q2 is answered)
 

@@ -297,8 +297,9 @@ interface SidebarItemProjectFields {
 
 ### `PUT /v1/spaces/{space_id}/categories/sort`
 
-请求和响应结构不变，但写入目标已切换到统一排序表。该接口仅适合旧的纯分类页面；
-新的混合关注页必须使用 `/sidebar-sections/sort`，否则无法表达 Project 与分类的交错顺序。
+请求和响应结构不变，但写入目标已切换到统一排序表。服务端只会在分类当前占据的
+槽位内重排分类，不会移动夹在分类之间的 Project。该接口仍不能表达 Project 与分类之间
+的相对拖动；新的混合关注页必须使用 `/sidebar-sections/sort`。
 
 ### `PUT /v1/groups/{group_no}/category`
 
@@ -308,7 +309,7 @@ interface SidebarItemProjectFields {
 {"category_id": "category-001"}
 ```
 
-如果目标群属于 Project，现在会拒绝操作：
+如果目标群属于 Project，非空 `category_id` 会被拒绝：
 
 ```json
 {
@@ -325,6 +326,14 @@ interface SidebarItemProjectFields {
 
 兼容期内 HTTP transport status 仍为 `400`；客户端应优先读取
 `error.code` 和 `error.http_status`。
+
+`{"category_id":""}` 表示移出分类。即使目标群属于 Project，该清理请求也允许，
+用于修复升级前遗留的异常分类关系。
+
+### `POST /v1/group/create`
+
+`project_id` 与 `category_id` 互斥。两者同时为非空时请求返回
+`err.server.group.request_invalid`，不会创建群或写入分类关系。
 
 ## 8. Sidebar Sections 错误码
 
