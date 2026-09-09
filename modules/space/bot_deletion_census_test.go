@@ -117,6 +117,24 @@ var d14Seam = map[string]bool{
 // rawRobotDisable matches the raw-SQL spelling of "turn this bot's account off".
 var rawRobotDisable = regexp.MustCompile(`(?is)update\s+` + "`?robot`?" + `\s+set\s+status\s*=\s*0`)
 
+// rawRobotSetClause captures a raw-SQL UPDATE's SET clause on the robot table, so the
+// status column can be looked for THERE and not in the WHERE.
+//
+// The dbr side has had a non-literal status write since round 2 (`.Set("status", v)`,
+// `SetMap(param)`); the raw side only ever matched the literal zero, so
+// `UpdateBySql("UPDATE robot SET status=? ...")` was neither a primitive nor
+// status-capable. No live miss today — every raw write to this table was enumerated in
+// PR #868's review, P2-4 — but "no example today" is the exact condition this file
+// exists to stop relying on.
+//
+// The capture is what keeps it honest: two live statements write bound_agent_ref with
+// `status=1` in their WHERE, and a regex that just looked for `status\s*=` anywhere in
+// the string would call both of them bot disables.
+var rawRobotSetClause = regexp.MustCompile(`(?is)update\s+` + "`?robot`?" + `\s+set\s+(.*?)(?:\swhere\s|$)`)
+
+// rawStatusAssignment matches a status assignment inside such a SET clause.
+var rawStatusAssignment = regexp.MustCompile(`(?is)\bstatus\s*=`)
+
 // rawRobotDelete matches the raw-SQL spelling of "remove the bot's account row".
 var rawRobotDelete = regexp.MustCompile(`(?is)delete\s+from\s+` + "`?robot`?" + `\b`)
 
@@ -256,6 +274,14 @@ func censusFuncsIn(f *ast.File, file string) []*censusFunc {
 				}
 				if rawRobotDisable.MatchString(v.Value) {
 					cf.rawDisablesRobot = true
+				}
+				// Raw UPDATE whose SET clause assigns status any value. Status-capable,
+				// not a primitive — same line the dbr side draws.
+				for _, m := range rawRobotSetClause.FindAllStringSubmatch(v.Value, -1) {
+					if rawStatusAssignment.MatchString(m[1]) {
+						cf.updatesRobotTable = true
+						cf.writesStatusColumn = true
+					}
 				}
 				if rawRobotDelete.MatchString(v.Value) {
 					cf.deletesRobotRow = true
@@ -576,15 +602,20 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 // gets a fixture here, parsed from source rather than from the repository, which is
 // also the only way to cover a shape the tree does not currently contain.
 //
-// Measured, not asserted: each of the nine detection branches in censusFuncsIn was
+// Measured, not asserted: each of the ten detection branches in censusFuncsIn was
 // deleted in turn and the table below re-run. No branch is deletable while green —
 // that is the property this test exists for, and it is the one that was checked.
 //
-// Seven of the nine redden exactly one case, the one named after that spelling. Two
+// Eight of the ten redden exactly one case, the one named after that spelling. Two
 // redden more, both for the same reason — they are not spellings but shapes that
 // several fixtures are built out of: `Update("robot")` (six) is the table precondition
 // under every robot-table case, and the key-value `"status": 0` (two) is shared by the
 // SetMap composite literal and the over-match case at the end.
+//
+// The raw-SQL SET-clause capture is mutated separately, since deleting the branch and
+// widening it are different failures: matching `status =` anywhere in the string rather
+// than inside the captured SET clause reddens the WHERE-clause case, which is the live
+// shape (two statements write bound_agent_ref guarded by status=1).
 func TestCensusMatcherSeesEverySpellingItClaimsTo(t *testing.T) {
 	cases := []struct {
 		name string
@@ -688,6 +719,26 @@ func probe(s S, id string) error {
 			src: `package p
 func probe(s S, id string) error {
 	_, err := s.UpdateBySql("DELETE FROM robot_menu WHERE robot_id=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			name: "status-capable, raw SQL: a bound status in the SET clause",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.UpdateBySql("UPDATE robot SET status=? WHERE robot_id=?", v, id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			// The live shape this branch must NOT match: two statements write
+			// bound_agent_ref with status=1 as a GUARD. A regex looking for
+			// `status =` anywhere in the string would call both bot disables.
+			name: "NOT a match, raw SQL: status appears only in the WHERE",
+			src: `package p
+func probe(s S, id string, ref string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET bound_agent_ref=? WHERE robot_id=? AND status=1", ref, id).Exec()
 	return err
 }`,
 		},

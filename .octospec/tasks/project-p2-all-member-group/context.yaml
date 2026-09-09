@@ -2128,6 +2128,50 @@ pr_868_round_3_advisory_taken:
       own.
     fix: "header re-measured and rewritten. The invariant claim -- none deletable while green -- is unchanged and still verified."
 
+pr_868_round_3_superseded_review_items:
+  - id: the-raw-sql-side-never-got-round-2s-widening
+    severity: medium
+    reported_by: "yujiawei P2-4 in the superseding review (5149568590); first-pass found it independently"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 taught the dbr side to see a status write with any value (`.Set("status", v)`,
+      `SetMap(param)`). The raw-SQL side was left matching only the literal zero, so
+      `UpdateBySql("UPDATE robot SET status=? ...")` was neither a primitive nor status-capable.
+      The reviewer enumerated every raw write to the table and confirmed no live miss today --
+      which is precisely the condition this file exists to stop depending on.
+    fix: |
+      rawRobotSetClause captures the SET clause and rawStatusAssignment looks for the status
+      column THERE. The capture is load-bearing, not cosmetic: two live statements write
+      bound_agent_ref with status=1 in their WHERE, and a regex matching `status =` anywhere in
+      the string would call both of them bot disables. Two fixtures: the bound status write
+      (status-capable) and the WHERE-only guard (no match).
+    mutation: |
+      deleting the branch reddens the bound-status fixture; widening the match from the capture
+      back to the whole string reddens the WHERE-only fixture. Both verified. Door and
+      status-capable sets on the tree are unchanged, matching the reviewer's enumeration.
+  - id: the-counter-help-read-as-a-guarantee
+    severity: low
+    reported_by: "yujiawei P2-3 in the superseding review"
+    where: modules/project/metrics_all_member_group.go
+    what: |
+      The Help said the unvisited projects "are picked up by their own next membership change".
+      That is a guarantee about an event that may never come, on a counter that -- per the same
+      review's own finding -- is the only signal the state exists at all.
+    fix: |
+      Help now names the residue (a possible D6 violation D7 blocks repair of and no scan
+      reports), states the convergence as conditional on one of that project's own members being
+      removed / leaving / changing role, says this counter is the only signal, and points at
+      resumeAfterProjectId on the accompanying warning as the manual resume point.
+  - id: the-branch-sweep-moved-again
+    severity: low
+    reported_by: "self, after adding the raw-SQL branch"
+    where: modules/space/bot_deletion_census_test.go
+    what: "ten branches now, not nine; eight redden exactly one case, not seven."
+    fix: |
+      Header re-measured a third time this round. Also states why the SET-clause capture is
+      mutated separately from the branch: deleting it and widening it are different failures,
+      and only the second one reaches the live WHERE-clause shape.
+
 verify:
   rules_rechecked:
     - id: space-isolation

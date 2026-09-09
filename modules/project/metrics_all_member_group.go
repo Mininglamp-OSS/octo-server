@@ -154,8 +154,12 @@ var allMemberGroupConvergenceIncomplete = promauto.NewCounter(prometheus.Counter
 	Namespace: metricNamespace,
 	Name:      "all_member_group_owner_convergence_incomplete_total",
 	Help: "Space-removal owner convergences that spent their page budget with projects " +
-		"left unvisited. Not a failure: the projects reached were converged, and the rest " +
-		"are picked up by their own next membership change.",
+		"left unvisited. Not a failure: the projects reached were converged. The rest are " +
+		"left holding a possible D6 violation (an all-member group whose creator is not a " +
+		"project owner) that D7 blocks manual repair of and no scan reports; they converge " +
+		"only if one of their own members is next removed, leaves, or changes role. This " +
+		"counter is the only signal that state exists. The resume point is logged as " +
+		"resumeAfterProjectId on the accompanying warning.",
 })
 
 // observeAllMemberGroupConvergenceIncomplete 记一次没走完的收敛。
