@@ -100,13 +100,14 @@ var (
 // Prometheus retains every label value it has ever seen, so a typo'd list would leave a
 // permanent series behind on every deploy. The operator still gets the actual name in the
 // Error log written at construction.
+//
+// The enum is the target registry, so a new subsystem is labelled by its own name
+// instead of silently collapsing into "unknown".
 func provisioningTargetLabel(name string) string {
-	switch name {
-	case TargetFleet, TargetDrive:
+	if _, ok := lookupProvisionTarget(name); ok {
 		return name
-	default:
-		return "unknown"
 	}
+	return "unknown"
 }
 
 // provisioningStatusLabel maps a status to its metric label. A switch rather than

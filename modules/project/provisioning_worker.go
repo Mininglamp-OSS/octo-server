@@ -161,10 +161,54 @@ func (p *Project) startProvisioningWorker() {
 		return
 	}
 	provisioningWorkerOnce.Do(func() {
+		// Before the timers, so rows this moves back to `pending` are visible to the
+		// first claim tick rather than waiting a full interval.
+		p.requeueAbandonedProvisioningAtBoot()
 		p.ctx.Schedule(p.cfg.Provisioning.Interval, p.processProvisioningJobs)
 		p.ctx.Schedule(provisioningSweepInterval, p.sweepExhaustedProvisioningJobs)
 		p.ctx.Schedule(provisioningPurgeInterval, p.purgeProvisioningJobs)
 	})
+}
+
+// requeueAbandonedProvisioningAtBoot applies OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID.
+//
+// Inside the Enabled() gate: re-driving rows for a target nothing will claim would move
+// them to `pending` and leave them there, which reads on the dashboard as a live backlog
+// rather than as the no-op it is.
+//
+// Every outcome is logged at Info or above INCLUDING zero rows, because zero is the
+// answer an operator most needs to see: it means the project id was wrong, or the rows
+// were already requeued by an earlier restart, or provisioning never gave up on this
+// project at all. A silent no-op here would look identical to a successful re-drive.
+func (p *Project) requeueAbandonedProvisioningAtBoot() {
+	projectID := p.cfg.Provisioning.RequeueProjectID
+	if projectID == "" {
+		return
+	}
+	// Scoped to the ENABLED targets, matching the claim path: re-driving a row whose
+	// target is switched off would park it in `pending` with no executor.
+	targets := make([]string, 0, len(p.cfg.Provisioning.Targets))
+	for _, t := range p.cfg.Provisioning.Targets {
+		targets = append(targets, t.Name)
+	}
+	moved, err := p.db.requeueAbandonedProvisioningJobs(projectID, targets, time.Now())
+	if err != nil {
+		p.Error("project provisioning requeue failed; the abandoned rows are unchanged",
+			zap.String("project_id", projectID), zap.Strings("targets", targets), zap.Error(err))
+		return
+	}
+	if moved == 0 {
+		p.Warn("project provisioning requeue matched no abandoned row; check the project id, "+
+			"or it was already requeued by an earlier boot with this env still set",
+			zap.String("project_id", projectID), zap.Strings("targets", targets),
+			zap.String("env", envProvisionRequeueProjectID))
+		return
+	}
+	p.Info("project provisioning requeued; the worker will retry these rows",
+		zap.String("project_id", projectID), zap.Strings("targets", targets),
+		zap.Int64("rows", moved),
+		zap.String("reminder", "clear "+envProvisionRequeueProjectID+" once the rows reach ready; "+
+			"a leftover value re-drives them again if they end up abandoned a second time"))
 }
 
 // startProvisioningMetrics schedules the row census, INDEPENDENTLY of whether any target is
@@ -576,7 +620,7 @@ func (p *Project) refreshProvisioningMetrics() {
 		observed[row.Target][provisioningStatusLabel(row.Status)] = row.Rows
 	}
 	statuses := []string{"pending", "ready", "abandoned", "disband_pending"}
-	for _, target := range []string{TargetFleet, TargetDrive} {
+	for _, target := range allProvisionTargetNames() {
 		for _, status := range statuses {
 			provisioningRows.WithLabelValues(target, status).Set(float64(observed[target][status]))
 		}

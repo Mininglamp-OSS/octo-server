@@ -111,6 +111,34 @@ const (
 	// name it once at boot than to explain a growing table later.
 	envProvisionRetiredReclaimConsumerLive = "OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE"
 
+	// envProvisionRequeueProjectID names ONE project whose `abandoned` provisioning
+	// rows are moved back to `pending` at boot, i.e. the manual re-drive for a project
+	// that would otherwise be permanently invisible to the peer.
+	//
+	// An env rather than an endpoint or a CLI command because the deployment channel
+	// available here is the configmap. Two consequences the operator has to know, both
+	// inherent to that channel rather than to this implementation:
+	//
+	//  1. It takes effect on RESTART, because env is read once at boot. Re-driving a
+	//     second project means editing the configmap and restarting again.
+	//  2. The value PERSISTS in the configmap after it has been applied. Every later
+	//     restart — a deploy, a node drain, an autoscale event — reads it again.
+	//
+	// (2) is what makes a naive reading of this env unsafe, so the requeue is NOT
+	// unconditional on the value being present: requeueAbandonedProvisioningJobs only
+	// matches rows currently in `abandoned`, so a second run over an already-requeued
+	// project matches nothing and is a no-op. The row's own state is the idempotency
+	// record — deliberately, because the alternative is a "we already handled this
+	// value" ledger, which is a second source of truth about a decision the row
+	// already encodes. A row that reached `abandoned` AGAIN after a requeue will be
+	// re-driven by the next restart, which is the correct reading of an operator who
+	// has left the instruction in place.
+	//
+	// Multi-replica: every pod runs this at boot and they race on the same rows. The
+	// UPDATE re-checks `status = abandoned`, so exactly one pod moves each row and the
+	// others match nothing — the log line reports 0 for them.
+	envProvisionRequeueProjectID = "OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID"
+
 	envProvisionInterval    = "OCTO_PROJECT_PROVISION_INTERVAL"
 	envProvisionTimeout     = "OCTO_PROJECT_PROVISION_TIMEOUT"
 	envProvisionMaxAttempts = "OCTO_PROJECT_PROVISION_MAX_ATTEMPTS"
@@ -222,6 +250,10 @@ type ProvisioningConfig struct {
 	// Deliberately NOT a subset of Targets: enablement governs what we create, this governs
 	// what we may forget, and a target disabled after use still has containers to reclaim.
 	ReclaimTargets []string
+	// RequeueProjectID is the project whose abandoned rows are re-driven at boot, or
+	// empty. See envProvisionRequeueProjectID for why this is boot-time and why a
+	// leftover value is safe.
+	RequeueProjectID string
 }
 
 // Enabled reports whether any target is live. When false, createProjectOnce
@@ -287,6 +319,11 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 	reclaimTargets, reclaimProblems := resolveReclaimTargets(getenv)
 	cfg.ReclaimTargets = reclaimTargets
 	problems = append(problems, reclaimProblems...)
+
+	// Resolved before the early return too: an operator who set the requeue env while the
+	// target list happens to be empty gets told it will do nothing, rather than restarting
+	// and finding no trace of it either way.
+	cfg.RequeueProjectID = strings.TrimSpace(getenv(envProvisionRequeueProjectID))
 
 	requested := parseTargetList(getenv(envProvisionTargets))
 	if len(requested) == 0 {
@@ -404,35 +441,99 @@ type provisionTargetEnvs struct {
 	reclaimConsumerLive string
 }
 
+// provisionTargetSpec is everything this build knows about one subsystem: its
+// name, its four envs, and its container-id prefix.
+//
+// One table, five former dispatch sites. Before this, adding a third subsystem
+// meant editing allProvisionTargetNames, targetEnvNames's switch,
+// containerIDPrefix's switch, refreshProvisioningMetrics's literal slice and
+// provisioningTargetLabel's switch — five places, and the last two were pure
+// omission risk: a target missing from them provisions correctly and is simply
+// invisible on the dashboards that the slice's own security argument rests on.
+// Now the table is the single place, and provisionTargetRegistry below is the
+// only source any of them reads.
+//
+// Still a HARDCODED table rather than operator-supplied config, and that is the
+// point: an unknown name in OCTO_PROJECT_PROVISION_TARGETS is rejected at boot
+// (loadProvisioningConfig) precisely because the known set is compiled in. Making
+// the set configurable would need its own validator for prefix shape, secret
+// floor, requiredness and visibility participation — replacing one rejection that
+// already works with four that would have to be written.
+type provisionTargetSpec struct {
+	// name is the enum value that reaches the `target` column, metric labels and
+	// log lines.
+	name string
+	// envs are the four per-target environment variables.
+	envs provisionTargetEnvs
+	// containerPrefix is the human-readable container-id prefix. Constant per
+	// target and carries no project information — see containerIDPrefix.
+	containerPrefix string
+}
+
+// provisionTargetRegistry is every target this build knows about, enabled or not.
+//
+// Order is fixed and load-bearing: resolveReclaimTargets iterates it to build an
+// IN () predicate, and a stable order keeps that predicate identical across
+// processes.
+//
+// To add a subsystem: append one entry here and declare its four envs above.
+// Nothing else in this package should need to learn the name.
+var provisionTargetRegistry = []provisionTargetSpec{
+	{
+		name: TargetFleet,
+		envs: provisionTargetEnvs{
+			url:                 envProvisionFleetURL,
+			secret:              ProvisionFleetSecretEnv,
+			narrowed:            envProvisionFleetNarrowed,
+			reclaimConsumerLive: envProvisionFleetReclaimConsumerLive,
+		},
+		containerPrefix: "octows-",
+	},
+	{
+		name: TargetDrive,
+		envs: provisionTargetEnvs{
+			url:                 envProvisionDriveURL,
+			secret:              ProvisionDriveSecretEnv,
+			narrowed:            envProvisionDriveNarrowed,
+			reclaimConsumerLive: envProvisionDriveReclaimConsumerLive,
+		},
+		containerPrefix: "octods-",
+	},
+}
+
 // allProvisionTargetNames is every target this build knows about, enabled or not.
 //
 // The purge and the misconfiguration census both need to reason about a target that is
 // absent from OCTO_PROJECT_PROVISION_TARGETS, so the known set cannot be derived from the
 // enabled set.
-func allProvisionTargetNames() []string { return []string{TargetFleet, TargetDrive} }
+func allProvisionTargetNames() []string {
+	names := make([]string, 0, len(provisionTargetRegistry))
+	for _, spec := range provisionTargetRegistry {
+		names = append(names, spec.name)
+	}
+	return names
+}
 
-// targetEnvNames maps a target name to its envs. A switch rather than string
-// concatenation so an unknown name is rejected instead of silently resolving to a set of
-// envs nobody sets.
+// lookupProvisionTarget returns the registry entry for a name.
+//
+// A table lookup rather than string concatenation so an unknown name is rejected
+// instead of silently resolving to a set of envs nobody sets.
+func lookupProvisionTarget(name string) (provisionTargetSpec, bool) {
+	for _, spec := range provisionTargetRegistry {
+		if spec.name == name {
+			return spec, true
+		}
+	}
+	return provisionTargetSpec{}, false
+}
+
+// targetEnvNames maps a target name to its envs.
 func targetEnvNames(name string) (provisionTargetEnvs, bool) {
-	switch name {
-	case TargetFleet:
-		return provisionTargetEnvs{
-			url:                 envProvisionFleetURL,
-			secret:              ProvisionFleetSecretEnv,
-			narrowed:            envProvisionFleetNarrowed,
-			reclaimConsumerLive: envProvisionFleetReclaimConsumerLive,
-		}, true
-	case TargetDrive:
-		return provisionTargetEnvs{
-			url:                 envProvisionDriveURL,
-			secret:              ProvisionDriveSecretEnv,
-			narrowed:            envProvisionDriveNarrowed,
-			reclaimConsumerLive: envProvisionDriveReclaimConsumerLive,
-		}, true
-	default:
+	spec, ok := lookupProvisionTarget(name)
+	if !ok {
 		return provisionTargetEnvs{}, false
 	}
+	return spec.envs, true
 }
 
 // resolveReclaimTargets reads the per-target reclaim switches and refuses the retired

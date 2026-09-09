@@ -194,8 +194,15 @@ func TestContainerIDHasOneProducerAndItIgnoresTheProjectID(t *testing.T) {
 	}
 
 	// The two id prefixes are the only literals a container id is built from, and they
-	// live with the producer. A prefix appearing elsewhere means a second construction
-	// site the guard above cannot see.
+	// live in the target registry — one entry per subsystem, which is what makes a third
+	// subsystem a one-line change. A prefix appearing anywhere ELSE means a second
+	// construction site the guard above cannot see.
+	//
+	// The registry, not provisioning.go, is the allowed home: the invariant is "one
+	// producer, and the literals sit in exactly one table", not "the literals sit in a
+	// particular filename". Both are still checked — the single-producer half is the
+	// newContainerID extraction above plus the caller check below.
+	const prefixHome = registryHome
 	for _, prefix := range []string{`"octows-"`, `"octods-"`} {
 		var files []string
 		for _, f := range moduleSourceFiles(t) {
@@ -203,9 +210,18 @@ func TestContainerIDHasOneProducerAndItIgnoresTheProjectID(t *testing.T) {
 				files = append(files, f)
 			}
 		}
-		if len(files) != 1 || files[0] != "provisioning.go" {
-			t.Errorf("container id prefix %s appears in %v; it must exist only in provisioning.go, "+
-				"next to the single producer", prefix, files)
+		if len(files) != 1 || files[0] != prefixHome {
+			t.Errorf("container id prefix %s appears in %v; it must exist only in %s, "+
+				"in the single provisionTargetRegistry entry for that target", prefix, files, prefixHome)
+		}
+	}
+
+	// And every registry entry must declare a prefix. A target added with an empty
+	// containerPrefix would mint ids that are bare hex — indistinguishable on the
+	// subsystem side, and silently so, since nothing else reads this field.
+	for _, spec := range provisionTargetRegistry {
+		if spec.containerPrefix == "" {
+			t.Errorf("provisionTargetRegistry entry %q declares no containerPrefix", spec.name)
 		}
 	}
 
@@ -241,9 +257,18 @@ func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
 	// The slice's own files, by path suffix. internal/projectprovision never names the
 	// table (it takes the id as an argument), but it is listed so the guard does not
 	// depend on that staying true.
+	//
+	// config_provisioning.go is listed because it owns provisionTargetRegistry, which is
+	// where the two id prefixes live — one entry per subsystem, so that adding a third is
+	// a single-line change. It holds the PREFIXES, not ids and not the table: minting
+	// still happens only in newContainerID (provisioning.go), which
+	// TestContainerIDHasOneProducerAndItIgnoresTheProjectID pins, and this file never
+	// names octo_project_provisioning. The invariant this guard exists for — no package
+	// OUTSIDE the slice can read or mint a container id — is unchanged.
 	allowed := map[string]bool{
-		filepath.Join("modules", "project", "db_provisioning.go"): true,
-		filepath.Join("modules", "project", "provisioning.go"):    true,
+		filepath.Join("modules", "project", "db_provisioning.go"):     true,
+		filepath.Join("modules", "project", "provisioning.go"):        true,
+		filepath.Join("modules", "project", "config_provisioning.go"): true,
 	}
 	needles := []string{"octo_project_provisioning", `"octows-`, `"octods-`}
 	scanned := 0
@@ -426,6 +451,99 @@ func grepPackageForImport(t *testing.T, dir, importPath string) []string {
 	sort.Strings(hits)
 	return hits
 }
+
+// TestEveryTargetDecisionReadsTheRegistry is the one-place-to-add-a-subsystem rule.
+//
+// Before the registry, five sites decided things per target: allProvisionTargetNames,
+// targetEnvNames, containerIDPrefix, refreshProvisioningMetrics and
+// provisioningTargetLabel. Three of them rejected an unknown name loudly, but the last
+// two failed by OMISSION — a target missing from them provisions perfectly and is merely
+// invisible on the dashboards, which is the worst failure available here, because the
+// unnarrowed-container gauge is the measurement the whole slice's security argument
+// rests on (see the comments in refreshProvisioningMetrics).
+//
+// So the rule is not "don't switch on a target name" but "don't ENUMERATE targets
+// outside the registry": any site listing the members has to be re-edited for a
+// sixth subsystem, and whoever forgets gets no error.
+//
+// Scope is the whole package rather than the five known files, deliberately: a listed
+// set of files is exactly what would not notice a new one.
+func TestEveryTargetDecisionReadsTheRegistry(t *testing.T) {
+	// The names are DERIVED from the registry, not typed here, so this guard cannot be
+	// emptied out by a rename — and it automatically covers a target added later.
+	if len(provisionTargetRegistry) < 2 {
+		t.Fatalf("provisionTargetRegistry has %d entries; this guard needs the real table to be "+
+			"meaningful", len(provisionTargetRegistry))
+	}
+	constNames := map[string]string{TargetFleet: "TargetFleet", TargetDrive: "TargetDrive"}
+	var identifiers []string
+	for _, spec := range provisionTargetRegistry {
+		ident, ok := constNames[spec.name]
+		if !ok {
+			t.Fatalf("registry target %q has no known constant identifier; add it to constNames so "+
+				"this guard keeps covering every target", spec.name)
+		}
+		identifiers = append(identifiers, ident)
+	}
+
+	// A site "enumerates" when two or more target constants appear close enough together
+	// to be one expression — a slice literal, a multi-value case, a chain of ||. That is
+	// the shape that needs re-editing; a single mention (say, a fleet-only rule) does not.
+	const window = 60
+	examined := 0
+	for _, f := range moduleSourceFiles(t) {
+		if f == registryHome {
+			continue // the registry is where enumeration is supposed to live
+		}
+		src := readStripped(t, f)
+		examined++
+		for _, a := range identifiers {
+			for _, b := range identifiers {
+				if a == b {
+					continue
+				}
+				i := strings.Index(src, a)
+				if i < 0 {
+					continue
+				}
+				rest := src[i+len(a):]
+				if len(rest) > window {
+					rest = rest[:window]
+				}
+				if strings.Contains(rest, b) {
+					t.Errorf("%s enumerates target constants (%s ... %s within %d chars): every "+
+						"per-target decision must read provisionTargetRegistry, or adding a "+
+						"subsystem silently skips this site", f, a, b, window)
+				}
+			}
+		}
+	}
+	if examined == 0 {
+		t.Fatal("no source file was examined; this guard would pass vacuously")
+	}
+
+	// The registry must actually be the source the other sites read. If nothing outside
+	// the registry file consults it, the enumeration check above is satisfied by code that
+	// simply does not handle targets at all — a guard passing for the wrong reason.
+	readers := 0
+	for _, f := range moduleSourceFiles(t) {
+		if f == registryHome {
+			continue
+		}
+		src := readStripped(t, f)
+		if strings.Contains(src, "lookupProvisionTarget(") || strings.Contains(src, "allProvisionTargetNames()") {
+			readers++
+		}
+	}
+	if readers == 0 {
+		t.Error("no file outside " + registryHome + " reads the target registry; the per-target " +
+			"decisions have drifted somewhere this guard cannot see")
+	}
+}
+
+// registryHome is the file that owns the target table. Named once so the two guards
+// that reference it cannot disagree.
+const registryHome = "config_provisioning.go"
 
 // balancedArgs extracts a call's argument text up to its balanced closing paren.
 // Paren-counting rather than a regex because the argument list contains nested calls
