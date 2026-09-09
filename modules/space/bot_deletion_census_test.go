@@ -36,10 +36,30 @@ package space
 //     The name space is FLAT and repo-wide: `primitives`, `statusCapableWriters`
 //     and the `f.calls[name]` lookup are all keyed by bare function name, while
 //     d14ExemptDoors is keyed "file:func". That asymmetry is deliberate — an
-//     exemption must not be inherited by a same-named function elsewhere — but it
-//     means an unrelated `updateRobot` in another package WOULD inherit
-//     door-candidate status, and a same-named non-primitive is excluded from the
-//     door scan by `primitives[f.name] == nil`. Both fail loudly, not silently.
+//     exemption must not be inherited by a same-named function elsewhere.
+//     Two consequences, and they fail in OPPOSITE directions, which the earlier
+//     wording ("both fail loudly, not silently") got wrong about the second:
+//       - an unrelated `updateRobot` in another package WOULD inherit door-candidate
+//         status, and a same-named non-primitive is excluded from the door scan by
+//         `primitives[f.name] == nil`. Loud.
+//       - `primitives` is assigned last-write-wins, so two same-named bot-disabling
+//         functions in different packages collapse to one entry and the dropped one
+//         is never seen by the uncalled-primitive rule. SILENT. Not live today —
+//         deleteRobot, deleteRobotSoft and deleteCreatedBotArtifacts each have exactly
+//         one definition — and keying by file:func would close it. Recorded rather
+//         than fixed, because it changes the assembly, which this round did not.
+//         PR #868's sixth review.
+//   - Scope, since "the tree" is not the whole repository: the scan roots are
+//     `modules`, `pkg` and `internal`, so `main.go`, `tools/` and `scripts/` are never
+//     parsed (grepped: no robot write in any of them today). And the census watches the
+//     `robot` axis only — a bot whose `user` row is destroyed by the account-destruction
+//     path never becomes a door here.
+//   - The raw-SQL side is fail-CLOSED as of PR #868's sixth review, which found it
+//     failing OPEN on four spellings — a table alias, the AS form, a backticked column
+//     and an upsert — each classifying as nothing at all rather than as an over-match.
+//     Backticks are stripped, aliases tolerated, and the upsert's assignment list read
+//     as what it is. Every gap in this file is meant to fail loudly; those four did the
+//     opposite, in a file whose header said so.
 //   - writesStatusColumn / setsStatusZero are set from ANY `.Set` or key-value in
 //     the function body, not only from the statement that targets `robot`. A
 //     function that updates `robot` in one statement and writes `"status": 0` to
@@ -122,29 +142,44 @@ var d14Seam = map[string]bool{
 	"closeSeatsFn":       true,
 }
 
-// rawRobotDisable matches the raw-SQL spelling of "turn this bot's account off".
-var rawRobotDisable = regexp.MustCompile(`(?is)update\s+` + "`?robot`?" + `\s+set\s+status\s*=\s*0`)
-
-// rawRobotSetClause captures a raw-SQL UPDATE's SET clause on the robot table, so the
-// status column can be looked for THERE and not in the WHERE.
+// The raw-SQL matchers.
 //
-// The dbr side has had a non-literal status write since round 2 (`.Set("status", v)`,
-// `SetMap(param)`); the raw side only ever matched the literal zero, so
-// `UpdateBySql("UPDATE robot SET status=? ...")` was neither a primitive nor
-// status-capable. No live miss today — every raw write to this table was enumerated in
-// PR #868's review, P2-4 — but "no example today" is the exact condition this file
-// exists to stop relying on.
+// One shape decides everything: find the clause a statement ASSIGNS in, then look for
+// the status column THERE and not in the WHERE. Two live statements write
+// bound_agent_ref guarded by `status=1` in their WHERE, so a matcher that looked for
+// `status =` anywhere in the string would call both of them bot disables.
 //
-// The capture is what keeps it honest: two live statements write bound_agent_ref with
-// `status=1` in their WHERE, and a regex that just looked for `status\s*=` anywhere in
-// the string would call both of them bot disables.
-var rawRobotSetClause = regexp.MustCompile(`(?is)update\s+` + "`?robot`?" + `\s+set\s+(.*?)(?:\swhere\s|$)`)
+// PR #868's sixth review found the previous version failing OPEN on four spellings —
+// a table alias (`UPDATE robot r SET r.status=0`), the AS form, a backticked column
+// (UPDATE robot SET `status`=0) and an upsert (`... ON DUPLICATE KEY UPDATE status=0`).
+// Each classified as neither primitive nor status-capable, so the function was invisible
+// and its callers never became door candidates. That matters more than the count of
+// spellings: every other gap in this file is argued as fail-CLOSED — an over-match is a
+// false door and a loud red, never a missed deletion — and these four were the opposite,
+// in a file whose header says so and whose fixture table calls itself the authoritative
+// list. A stated guarantee the code did not hold.
+//
+// Backticks are stripped before matching rather than spelled into every pattern, so
+// quoting cannot hide a match anywhere and each regex stays readable.
+func normalizeRawSQL(sql string) string { return strings.ReplaceAll(sql, "`", "") }
 
-// rawStatusAssignment matches a status assignment inside such a SET clause.
+// rawRobotAssignClause captures the SET clause of an UPDATE on the robot table,
+// tolerating an optional alias in either spelling (`robot r`, `robot AS r`).
+var rawRobotAssignClause = regexp.MustCompile(`(?is)update\s+robot(?:\s+(?:as\s+)?\w+)?\s+set\s+(.*?)(?:\swhere\s|$)`)
+
+// rawRobotUpsertClause captures the assignment list of an INSERT ... ON DUPLICATE KEY
+// UPDATE on the robot table, which is an UPDATE of an existing row by another name.
+var rawRobotUpsertClause = regexp.MustCompile(`(?is)insert\s+into\s+robot\b.*?\son\s+duplicate\s+key\s+update\s+(.*?)$`)
+
+// rawStatusAssignment matches a status assignment inside such a clause, qualified
+// (`r.status=`) or not. Any value: status-capable.
 var rawStatusAssignment = regexp.MustCompile(`(?is)\bstatus\s*=`)
 
+// rawStatusZeroAssignment is the same, narrowed to the literal zero: a deletion primitive.
+var rawStatusZeroAssignment = regexp.MustCompile(`(?is)\bstatus\s*=\s*0\b`)
+
 // rawRobotDelete matches the raw-SQL spelling of "remove the bot's account row".
-var rawRobotDelete = regexp.MustCompile(`(?is)delete\s+from\s+` + "`?robot`?" + `\b`)
+var rawRobotDelete = regexp.MustCompile(`(?is)delete\s+from\s+robot\b`)
 
 type censusFunc struct {
 	name   string
@@ -325,19 +360,26 @@ func (c *censusFunc) matchRawSQL(sql string) {
 	if sql == "" {
 		return
 	}
-	if rawRobotDisable.MatchString(sql) {
-		c.rawDisablesRobot = true
-	}
-	// Raw UPDATE whose SET clause assigns status any value. Status-capable,
-	// not a primitive — same line the dbr side draws.
-	for _, m := range rawRobotSetClause.FindAllStringSubmatch(sql, -1) {
-		if rawStatusAssignment.MatchString(m[1]) {
-			c.updatesRobotTable = true
-			c.writesStatusColumn = true
-		}
-	}
+	sql = normalizeRawSQL(sql)
 	if rawRobotDelete.MatchString(sql) {
 		c.deletesRobotRow = true
+	}
+	// Both statement shapes that assign to an existing robot row, judged by the same
+	// two rules: any status assignment makes the function status-capable, and a literal
+	// zero makes it a deletion primitive. Deriving the primitive from the SAME capture
+	// as the status-capable case is the point — the previous version matched the table
+	// twice, in two patterns, and only one of them learned about aliases.
+	clauses := rawRobotAssignClause.FindAllStringSubmatch(sql, -1)
+	clauses = append(clauses, rawRobotUpsertClause.FindAllStringSubmatch(sql, -1)...)
+	for _, m := range clauses {
+		if !rawStatusAssignment.MatchString(m[1]) {
+			continue
+		}
+		c.updatesRobotTable = true
+		c.writesStatusColumn = true
+		if rawStatusZeroAssignment.MatchString(m[1]) {
+			c.rawDisablesRobot = true
+		}
 	}
 }
 
@@ -702,33 +744,42 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 // gets a fixture here, parsed from source rather than from the repository, which is
 // also the only way to cover a shape the tree does not currently contain.
 //
-// Measured, not asserted: each of the ELEVEN detection branches was deleted in turn
-// and the table below re-run. No branch is deletable while green — that is the
-// property this test exists for, and it is the one that was checked.
+// Measured, not asserted: each of the ELEVEN deletable detection branches was removed
+// in turn and the table below re-run, plus FOUR weakenings that are not deletions.
+// Nothing here is deletable or weakenable while green — that is the property this test
+// exists for, and it is the one that was checked.
 //
-// Six redden exactly one case, the one named after that spelling. Five redden more,
-// all for the same reason: they are not spellings but shapes that several fixtures are
-// built out of — `Update("robot")` (6) is the table precondition under every dbr case,
-// `rawRobotDisable` (3) and the concatenation fold (3) each underlie both a plain and a
-// concatenated fixture, and the key-value `"status": 0` (2) and the SET-clause capture
-// (2) each serve two.
+// Seven branches redden exactly one case, the one named after that spelling. Four redden
+// more, all for the same reason: they are not spellings but shapes several fixtures are
+// built out of — the literal-zero assignment (7) and `Update("robot")` (6) sit under
+// every disable and every dbr case respectively, the concatenation fold (3) underlies
+// three concatenated fixtures, and the key-value `"status": 0` (2) serves two.
 //
-// Two branches are mutated a SECOND way, because deleting them and weakening them are
-// different failures:
-//   - the SET-clause capture: matching `status =` anywhere in the string instead of
-//     inside the captured clause reddens the WHERE-only case, which is the live shape
-//     (two statements write bound_agent_ref guarded by status=1).
-//   - the fold: aborting on a non-literal fragment instead of skipping it reddens the
-//     variable-between-literals case, which is the choice argued at
-//     foldConcatenatedString.
+// The four weakenings, each a different failure from deleting the same branch:
+//   - drop the alias tolerance from the assign-clause capture -> the two alias fixtures.
+//   - stop stripping backticks -> the backticked-column fixture.
+//   - look for `status =` anywhere in the statement instead of inside the captured
+//     clause -> all three WHERE-guard fixtures, which are the live shape (two statements
+//     write bound_agent_ref guarded by status=1).
+//   - abort the fold on a non-literal fragment instead of skipping it -> the
+//     variable-between-literals fixture, the choice argued at foldConcatenatedString.
 //
-// A note on how this was measured, because the first attempt measured nothing. The
-// sweep reported 0 red for all eleven branches — not because they were undetectable but
-// because TestMain was panicking on stale migration state before a single test body
+// Two notes on how this was measured, because the harness was wrong twice, in opposite
+// directions, and both would have been believed if the numbers had looked plausible.
+//
+// First it measured nothing: 0 red for every branch, not because they were undetectable
+// but because TestMain was panicking on stale migration state before a single test body
 // ran, and a harness that counts FAIL lines reads "nothing ran" as "nothing failed".
-// The sweep now asserts the subtest COUNT on every mutation and calls a run invalid
-// rather than green when it does not match. Same defect as this file's subject, one
-// level further out: an outcome with no check that the check itself executed.
+// Then, after it was taught to check the subtest COUNT, its build-error detector matched
+// testify's own "expected: true" output and called every valid run INVALID. And a
+// mutation applied by string replacement silently did nothing when the pattern did not
+// match, reporting the branch as unpinned when it had never been removed.
+//
+// So the procedure, not just the numbers: recreate the database, take a baseline and its
+// subtest count, assert every mutation actually applied, and treat a run whose count
+// differs — or that panicked or failed to build — as INVALID rather than as a result.
+// Same defect as this file's subject, one level further out: an outcome with no check
+// that the check itself executed.
 func TestCensusMatcherSeesEverySpellingItClaimsTo(t *testing.T) {
 	cases := []struct {
 		name string
@@ -913,6 +964,65 @@ func probe(s S, id string, v int) error {
 			src: `package p
 func probe(s S, id string, col string) error {
 	_, err := s.UpdateBySql("UPDATE robot SET "+col+"=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			// The four spellings the sixth review found failing OPEN. Each classified as
+			// nothing at all before: not a primitive, not status-capable, so the callers
+			// never became doors and the census stayed green while a bot was disabled.
+			name: "raw SQL, table alias: UPDATE robot r SET r.status=0",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot r SET r.status=0 WHERE r.robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "raw SQL, AS alias: UPDATE robot AS r SET status=0",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot AS r SET status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// Backticks are stripped before matching, so quoting cannot hide the column.
+			// Written with a double-quoted Go string because the fixture source itself
+			// has to contain backticks.
+			name:         "raw SQL, backticked column: UPDATE robot SET `status`=0",
+			src:          "package p\nfunc probe(s S, id string) error {\n\t_, err := s.UpdateBySql(\"UPDATE `robot` SET `status`=0 WHERE robot_id=?\", id).Exec()\n\treturn err\n}",
+			wantDisables: true,
+		},
+		{
+			// An upsert is an UPDATE of an existing row under another name.
+			name: "raw SQL, upsert: ON DUPLICATE KEY UPDATE status=0",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("INSERT INTO robot (robot_id, status) VALUES (?, 1) ON DUPLICATE KEY UPDATE status=0", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// The live CAS shape again, now WITH an alias: tolerating aliases must not
+			// start reading a WHERE guard as a write.
+			name: "NOT a match, aliased: status=1 still only guards the WHERE",
+			src: `package p
+func probe(s S, id string, ref string) error {
+	_, err := s.UpdateBySql("UPDATE robot r SET r.bound_agent_ref=? WHERE r.robot_id=? AND r.status=1", ref, id).Exec()
+	return err
+}`,
+		},
+		{
+			// And the alias tolerance must not let a different table in: robot_menu has
+			// no whitespace after `robot`, so the alias branch cannot reach it.
+			name: "NOT a match, aliased: a table whose name merely starts with robot",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot_menu SET status=0 WHERE robot_id=?", id).Exec()
 	return err
 }`,
 		},

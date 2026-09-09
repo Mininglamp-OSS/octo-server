@@ -2551,6 +2551,86 @@ pr_868_round_6_fixed:
       parents that no line from either side was lost, rather than by reading the result -- the
       check that would have caught the log.md truncation this branch already made once.
 
+pr_868_round_7_fixed:
+  - id: the-raw-sql-matchers-failed-open-on-four-spellings
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2, review 5154235498"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      rawRobotDisable and rawRobotSetClause both required the literal shape `update robot set`,
+      so four spellings classified as NOTHING -- not a primitive, not status-capable, callers
+      never door candidates:
+        UPDATE robot r SET r.status=0            (table alias)
+        UPDATE robot AS r SET status=0           (AS form)
+        UPDATE robot SET `status`=0              (backticked column)
+        INSERT INTO robot ... ON DUPLICATE KEY UPDATE status=0
+      Reproduced by running the three regexes against each: all four produce nothing.
+      The severity is not the count of spellings. Every other gap in this file is argued as
+      fail-CLOSED -- an over-match is a false door and a loud red, never a missed deletion --
+      and the fixture table calls itself the authoritative list. These four were the opposite,
+      in a file whose header says so. A stated guarantee the code did not hold, which is this
+      PR's own subject.
+    fix: |
+      One shape for the whole raw side: strip backticks first (normalizeRawSQL), capture the
+      clause a statement ASSIGNS in (rawRobotAssignClause with an optional alias in either
+      spelling, plus rawRobotUpsertClause for the upsert), then apply two rules to that clause --
+      any status assignment is status-capable, a literal zero is a primitive.
+      Deriving the primitive from the SAME capture is the structural fix: the old version matched
+      the table twice, in two patterns, and only one of them ever learned anything.
+    mutation: |
+      Eleven deletable branches, all red. Four weakenings, all red: drop the alias tolerance
+      (2 cases), stop stripping backticks (1), match status anywhere in the statement instead of
+      inside the clause (3 -- all the WHERE-guard fixtures, the live shape), abort the fold on a
+      non-literal instead of skipping (1). Six new fixtures.
+    regression_check: |
+      Widening can only ADD matches, so the check was the live tree: classification byte-identical
+      -- 3 primitives, 2 status-capable writers, the same 6 doors. bindRobotCAS / unbindRobotCAS
+      still do not match, now verified with an alias fixture as well as without.
+  - id: the-ledger-and-the-journal-still-carried-the-GA-claim-this-PR-retracted
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2, same review"
+    where: brief.md:299 and :525; log.md
+    what: |
+      Round 5 corrected "the module has never been GA" in model.go, the journal and this file --
+      and stopped three files short. brief.md:299, brief.md:525 and log.md still recorded the
+      retracted argument as the resolution of a launch-gating checklist item, and brief.md is the
+      file project-p2-product-surfaces names as the source for the not-yet-written Swagger
+      contract. So the item that gates launch rested on a premise the same PR identifies as false,
+      in the document a future contract will be written from.
+      This is the same failure as round 5's own finding -- one sweep, one file short -- committed
+      by the same sweep that fixed it.
+    fix: |
+      All three restated in the tag-checkable form: v1.18.0 ships modules/project including
+      member_count as the total; `git tag --contains 566e625` is empty. Swept afterwards for any
+      remaining occurrence; the only hits left are the corrections quoting the old wording.
+  - id: the-mutation-harness-was-wrong-twice-more-in-the-other-direction
+    severity: low
+    reported_by: "self, running the round-7 sweep"
+    what: |
+      Round 5 taught the sweep to reject runs where nothing executed. This round it was wrong
+      twice the other way: its build-error detector matched testify's own "expected: true" output
+      and called every valid run INVALID; and a mutation applied by string replacement silently
+      did nothing when the pattern did not match, reporting a branch as UNPINNED when it had
+      never been removed. The second one is the dangerous shape -- it produced a plausible
+      "red=0" for the alias group, which is exactly the result that would have been believed.
+    fix: |
+      Detector anchored to real build/panic signals, and every mutation now asserts its pattern
+      matched before running. Both written into the test header, since the procedure is what the
+      next person re-measuring needs.
+  - id: still-carried-forward
+    severity: low
+    what: |
+      NOT fixed, and now recorded accurately in Known limits rather than claimed away:
+        - an UNCALLED status-capable writer escapes the census (uncalled primitives get their own
+          door; uncalled status-capable writers only become doors through callers). Zero live
+          instances, reviewer-probed.
+        - `primitives` is keyed by bare name and assigned last-write-wins, so two same-named
+          bot-disabling functions collapse silently. Keying by file:func would close it. Zero live
+          collisions.
+      Both change the ASSEMBLY. This round changed the classifier's raw-SQL half; doing both at
+      once is how each of the last five rounds produced the next. The header's "both fail loudly"
+      sentence, which was false about the second of these, is corrected.
+
 open_verification:
   - "modules/robot/api_manager.go updateRobotStatus writes an unvalidated path segment into
      robot.Status: ParseInt64OrDefault(param, 0) means a malformed segment silently DISABLES the
