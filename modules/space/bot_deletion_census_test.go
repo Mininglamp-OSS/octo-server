@@ -97,7 +97,15 @@ var d14ExemptDoors = map[string]string{
 		"残留说清楚：被停用的 bot 保留 space_member、octo_project_member（仍占 max_members 配额）与全部群成员行，" +
 		"而本 PR 之前引入的资格判定把 robot.status != 1 一律视为不可用分身，D13 也不会回收它的席位——" +
 		"于是系统自己认为它「不是可用分身」，却没有任何东西对账这件事。" +
-		"注意这扇门的 0 是**参数畸形时的默认值**（ParseInt64OrDefault(param, 0)），所以是可以被误触的。",
+		"注意这扇门的 0 是**参数畸形时的默认值**（ParseInt64OrDefault(param, 0)），所以是可以被误触的。" +
+		"——而这一句不是这条豁免的一部分，是一个**未修的缺陷**，必须分开读：api_manager.go 里 " +
+		"status 从路径段解析后直接写进 robot.Status，没有跟合法状态集校验过，所以 " +
+		"PUT /robot/status/{id}/abc 会静默停用一个 bot，/999 会把 999 写进状态列。" +
+		"PR #868 第四轮 review 指出：因为本 PR 把 d14ExemptDoors 变成了必须被消费的断言，" +
+		"把这扇门登记在这里，等于让普查从此不再报它——一条豁免会替一个输入校验缺陷提供永久掩护。" +
+		"所以写明：**产品决策部分是豁免，参数校验部分不是**，后者记在 " +
+		"project-p2-all-member-group/context.yaml 的 open_verification 下，" +
+		"该修就修，不因为这条豁免存在而算已定。",
 	"modules/robot/api_manager.go:robotUpdate": "超管编辑 bot（PUT /robots/{id}），status 是可选字段之一，" +
 		"经 updateRobotInfo 的调用方字段表落库。与上一条同一件事、同一个理由、同一份残留，" +
 		"只是换了一个更宽的端点：这里还能同时改 description。",

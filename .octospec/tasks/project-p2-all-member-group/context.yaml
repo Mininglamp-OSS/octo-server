@@ -2087,8 +2087,9 @@ pr_868_round_3_advisory_taken:
       So the new counter is not a nicety, it is the only signal this state exists.
     fix: |
       The residue is now named as a D6 violation, with the three points above and the reason it
-      is still P2 (reachability is 100k rows for one (space_id, uid), and the same projects were
-      never converged under the old code either -- the retry could not pass page one, so this is
+      is still P2 (reachability is 5000 rows -- 25 pages x 200 -- for one (space_id, uid), and the
+      same projects were never converged under the old code either: `after` resets per invocation,
+      so a retry re-walks all 25 pages and never advances past row 5000, so this is
       not a regression). The cursor-persistence follow-up now carries a D6 owner-correctness
       scan alongside it.
   - id: the-flat-name-space-was-visible-but-unstated
@@ -2290,7 +2291,90 @@ verify:
         arguments.
 
 # Cannot be verified from here; must be checked before merge.
+pr_868_round_4_fixed:
+  - id: the-number-carrying-the-severity-call-was-twenty-times-too-big
+    severity: medium
+    reported_by: "mochashanyao P2-1 (Octo-Q); yujiawei flagged the same arithmetic independently"
+    where: modules/project/space_member_removal.go; this file
+    what: |
+      The comment justifying "P2, not blocking" for the residual D6 violation put the page budget
+      at 十万行 (100,000). cascadePageSize = 200 and cascadeMaxPages = 25, so it is 5000 -- as the
+      constants' own comment says at :40, and as the SAME comment block says twenty lines earlier
+      ("走同样的前 5000 行"). The error is in the direction that flatters the decision: it claimed
+      twenty times more safety margin than exists, for accepting an invariant violation that D7
+      blocks manual repair of and no scan reports.
+      A second sentence was wrong the other way: "the retry could not pass page one". `after`
+      resets per invocation, so a retry re-walks all 25 pages and simply never advances past row
+      5000.
+      I had also repeated the reviewer's own earlier 100k figure without checking it. Both of us
+      carried it for two rounds.
+    fix: |
+      Both corrected in code and in this file, with the arithmetic spelled out (25 x 200) so the
+      next reader can check it in one line rather than trusting it, and the retry restated as
+      re-walking the budget rather than stalling at page one.
+  - id: the-degrade-comment-was-wrong-on-count-shape-and-table
+    severity: medium
+    reported_by: "mochashanyao P2-2"
+    where: modules/project/api.go
+    what: |
+      toResp's comment said the (total, 0) fallback "fires only after two consecutive COUNT
+      failures over the same table". splitSeatCounts returns (total, 0) when countActiveSeatsByKind
+      FAILS and the countActiveMembers fallback SUCCEEDS -- one failure, not two; two failures
+      return (0, 0). And countActiveSeatsByKind is not a COUNT over one table: it is two SELECTs,
+      over octo_project_member and then user. Wrong on the failure count, the statement shape and
+      the table, in one sentence.
+      This is the same class as the db_agent.go comment this PR already corrected twice for
+      describing a statement that does not exist -- in the same file, in the same round.
+    fix: "restated to how the code actually branches, with both failure paths named."
+  - id: an-exemption-was-absorbing-an-unfiled-validation-defect
+    severity: medium
+    reported_by: "mochashanyao P2-3"
+    where: modules/space/bot_deletion_census_test.go; modules/robot/api_manager.go
+    what: |
+      The updateRobotStatus exemption closed by noting that this door's 0 is the default for a
+      malformed parameter. That sentence is not a product question -- it is an unvalidated write.
+      Verified: status := ParseInt64OrDefault(c.Param("status"), 0) then robot.Status = int(status),
+      with no check against the legal status set. PUT /robot/status/{id}/abc silently disables a
+      bot; /999 writes 999 into a state column.
+      The trap is specific to what this PR did: making d14ExemptDoors load-bearing means the census
+      now asserts this door is FOUND, so it will never surface it as a finding again. A recorded
+      exemption would have become permanent cover for a validation bug.
+    fix: |
+      The exemption text now separates the two explicitly -- the product decision is exempt, the
+      parameter validation is not -- and points here. NOT fixed in code: this PR touches no
+      modules/robot logic, and adding validation to a super-admin write is a behaviour change that
+      wants its own test and review rather than a ride on a fast-follow.
+    open: |
+      modules/robot/api_manager.go updateRobotStatus must validate `status` against the legal set
+      and refuse malformed input, instead of defaulting a parse failure to 0 (= disable). Same
+      check belongs on robotUpdate's optional status field.
+  - id: the-unreadable-shard-2-failure-was-identified-by-a-reviewer
+    severity: low
+    reported_by: "mochashanyao, P2 CI note"
+    where: CI, E2E Test (2/4) at 94f85c17
+    what: |
+      I could not read which package failed -- get_job_logs caps returned content at ~8KB of tail
+      and that tail was the WuKongIM teardown dump, the log archive and blob hosts are blocked by
+      this environment's egress policy, and rerun-failed-jobs returns 403. The reviewer could read
+      it: ~10 bot-settings cases dying at modules/robot/bot_setting_integration_test.go:60 with
+      "sql: database is closed" -- a module this PR does not touch.
+      Independently confirmed afterwards by the rebase onto c16f8c1, whose fresh full run passed
+      shard 2. Two shards on this branch needed a runner-level retry within the hour, which points
+      at the runner/service-container layer rather than at any package.
+    fix: |
+      Nothing in this PR. Recorded because the diagnosis cost a round, and because the mitigation
+      ci/run-e2e-shard.sh already carries (reprint the FAIL lines last) is defeated by the
+      service-container dump that follows the step -- the summary should also go to
+      $GITHUB_STEP_SUMMARY, which is served by a separate API. Proposed on the PR, not pushed.
+
 open_verification:
+  - "modules/robot/api_manager.go updateRobotStatus writes an unvalidated path segment into
+     robot.Status: ParseInt64OrDefault(param, 0) means a malformed segment silently DISABLES the
+     bot, and any integer is written through to the state column. robotUpdate's optional status
+     field wants the same check. Found by PR #868's fourth review while reading the D14 exemption
+     that records this endpoint; deliberately NOT fixed there, because that PR touches no
+     modules/robot logic. The exemption text points here so the census's load-bearing exemption
+     cannot be mistaken for a decision that this is fine."
   - "The three items in the brief's 'must check before merge' section: the client
      blast radius of member_count counting humans only (D16), whether the agent
      picker already excludes self-hosted agents (D2), and whether any caller

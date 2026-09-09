@@ -714,9 +714,17 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 // gives the reads different predicates.
 //
 // One degraded case is worth knowing: when splitSeatCounts falls back it reports
-// (total, 0), so human_member_count claims everyone is human. That is the
-// pre-existing documented degrade -- it fires only after two consecutive COUNT
-// failures over the same table -- and member_count stays correct through it.
+// (total, 0), so human_member_count claims everyone is human, and member_count
+// stays correct through it.
+//
+// The trigger, stated the way the code actually branches: countActiveSeatsByKind
+// fails AND the countActiveMembers fallback succeeds. One failure, not two -- if
+// both fail the result is (0, 0), not (total, 0). And neither is a single COUNT:
+// countActiveSeatsByKind is two SELECTs across two tables (octo_project_member,
+// then user). The earlier wording here said "two consecutive COUNT failures over
+// the same table", which was wrong on the count, the shape and the table at once.
+// PR #868's fourth review. Worth the space, because this file already carries a
+// comment corrected twice for describing a statement that does not exist.
 //
 // pinned is a parameter rather than a field on Model because it is a fact about
 // the CALLER, not about the project: the same row is pinned for one user and not
