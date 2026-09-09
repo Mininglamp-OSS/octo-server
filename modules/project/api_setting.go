@@ -93,6 +93,12 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 			// see without holding a Project seat. The list path repairs a transient
 			// failure, so a sidebar write must not turn a committed pin into a 5xx.
 			p.provisionSidebarSection(row.ProjectID, row.SpaceID, uid)
+		} else {
+			// An explicit unpin is also an explicit removal from Follow. The
+			// pinned=0 setting prevents the membership repair path from bringing it
+			// back; this hook hides the retained ordering row without coupling this
+			// module to category's table.
+			p.removeSidebarSection(row.ProjectID, row.SpaceID, uid)
 		}
 	}
 

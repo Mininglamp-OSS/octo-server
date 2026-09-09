@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: sidebar-project-sections"
-description: Make the 关注 tab's top-level list one user-orderable sequence mixing manual categories and Projects as peers, with Project entries auto-provisioned on create, admit, or pin; every Sidebar-facing project_id ships its paired project_name; and Project groups remain mutually exclusive with manual categorization.
+description: Make the 关注 tab's top-level list one user-orderable sequence mixing manual categories and Projects as peers, with Project entries auto-provisioned on create, admit, or pin and removed on explicit unpin; every Sidebar-facing project_id ships its paired project_name; and Project groups remain mutually exclusive with manual categorization.
 tags: ["space", "isolation", "acl", "wire-contract", "error-response", "i18n", "rate-limit", "testing", "commit", "migration"]
 timestamp: 2026-09-09T00:00:00Z
 # --- octospec extension fields ---
@@ -21,10 +21,10 @@ source: self
 >
 > | | |
 > |---|---|
-> | **Confirmed** (requester, 2026-09-09) | The prototype mapping (Background §1); Project-group ↔ manual-category **mutual exclusion** (D3); category stays a per-user private view, never shared/admin-managed; Project creation, admission, and #861 pin each add the Project to the caller's 关注; every Sidebar-facing `project_id` in this task is paired with `project_name` |
-> | **Implemented in this task** | D1 (new ordering table), D2 (reuse the shipped project-groups query), D3 (mutual exclusion), D4 (auto-provision on create+admit+pin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
+> | **Confirmed** (requester, 2026-09-09) | The prototype mapping (Background §1); Project-group ↔ manual-category **mutual exclusion** (D3); category stays a per-user private view, never shared/admin-managed; Project creation, admission, and #861 pin each add the Project to the caller's 关注; explicit unpin removes it even while the caller remains a Project member; every Sidebar-facing `project_id` in this task is paired with `project_name` |
+> | **Implemented in this task** | D1 (new ordering table), D2 (reuse the shipped project-groups query), D3 (mutual exclusion), D4 (auto-provision on create+admit+pin and hide on unpin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
 > | **Deferred / unchanged** | D6 (`SidebarItem.ProjectID *string`) remains gated on Q2; D7 (全员群 pinning) remains a client concern |
-> | **Open** | Q1–Q4 |
+> | **Open** | Q2–Q4 |
 >
 > Line references measured at `98d2092` unless marked otherwise.
 
@@ -42,7 +42,9 @@ Creating or joining a Project auto-adds its entry to the caller's list, the
 way a default category is auto-provisioned today. A successful #861 pin does
 the same: a Space member may pin a Space-listed Project without receiving a
 Project seat, and sees an entry with an empty `groups` list. Pinning never
-grants Project or group membership.
+grants Project or group membership. Explicitly unpinning is a durable personal
+opt-out: it removes the Project from 关注 even if the caller still has an active
+Project seat, and a later pin restores the retained ordering entry.
 
 ## Background
 
@@ -194,7 +196,9 @@ what makes it a peer and not a filter.
   (`modules/project/db.go:837`), and #861's successful `updateSettingHandler`
   pin — **all three**, plus the read-path backstop. The backstop's visibility
   predicate is active Project membership **or** a `pinned=1` setting on a
-  Space-listed Project; it must not turn a pin into Project/group access.
+  Space-listed Project, except that an explicit `pinned=0` row is a durable
+  personal opt-out and wins over membership. It must not turn a pin into
+  Project/group access or undo an unpin during read repair.
 - **There is no third Project admission path today.** `join_mode = 0`
   self-join is unimplemented at HEAD — the column exists with no writer and no
   reader (`modules/project/db.go:48-50`). Recorded so nobody hooks a path that
@@ -283,8 +287,8 @@ filed under a manual category moves to its Project entry. It does not vanish.
 That is the argument for doing it silently (Q3).
 
 **D4 — Auto-provision the Project entry at create, admit, and successful #861
-pin, mirroring the `DefaultCategoryProvisioner` shape, with a read-path
-backstop. CONFIRMED for the three trigger points (requester, 2026-09-09).**
+pin; hide it on explicit unpin; and retain a read-path backstop. CONFIRMED
+(requester, 2026-09-09).**
 
 Without it, 「新建 Project 后要出现在分组列表」— the ask that started this task —
 does not hold. Hook points: `createProjectOnce`
@@ -303,6 +307,15 @@ GH #1228 proved a best-effort hook can miss a site and the read is the backstop
 that keeps the list correct anyway. It repairs only an active Project member or
 a `pinned=1` setting on a Space-listed Project; an unlisted Project's stale
 non-member pin is intentionally not rendered.
+
+An explicit `pinned=false` is also an explicit removal from 关注, including for
+an active Project member. The setting row is the durable opt-out used by both
+the render predicate and the repair predicate; the ordering row is retained as
+`status=2` so unpin is not confused with departure/disband and a later pin can
+reactivate the previous position. The post-commit hide hook remains best-effort:
+if it fails, `pinned=0` still suppresses the Project on the next read. A later
+`pinned=true` reactivates the row, and the read backstop repairs a missed
+reactivation hook.
 
 **D5 — The old `GET/PUT /v1/spaces/:space_id/categories(/sort)` stay, but
 source their ordering from `octo_sidebar_section`. RECOMMENDED — and this is
@@ -392,17 +405,10 @@ as a side effect.
 | `PUT /v1/groups/:group_no/category` | New rejection branch for Project groups (D3) | low — previously-legal request now errors; needs release-note mention |
 | `GET /v1/projects/:project_id/groups` | **Reused unchanged** (D2). Only D7(b), if chosen, would alter it | none as recommended |
 | `POST /v1/sidebar/sync` | `SidebarItem.ProjectID` → `*string` (D6); add paired `project_name` only for a non-empty, Space-scoped Project ID | **high** for D6, gated on Q2; `project_name` is additive and fails soft |
-| *(internal, no HTTP surface)* `createProjectOnce`, `admitMemberTx`, #861 `updateSettingHandler` | Provisioning hook call sites (D4) | low — pin remains personal preference, not membership |
+| *(internal, no HTTP surface)* `createProjectOnce`, `admitMemberTx`, #861 `updateSettingHandler` | Provision on create/admit/pin; retain-and-hide on unpin (D4) | low — pin remains personal preference, not membership |
 
 ## Open questions
 
-- **Q1 — Can a user remove a Project entry from their list without leaving the
-  Project (a "hide", not an "exit")?** Not asked yet. Affects schema now, not
-  later: **recommend a soft-delete `status` column on `octo_sidebar_section`
-  from the start**, because hard deletion makes "user hid it" and "membership
-  ended / Project disbanded" indistinguishable in the data — and the latter
-  needs a reconcile path regardless, since D4's hooks can miss events exactly
-  as `EnsureDefaultCategory`'s did before GH #1228.
 - **Q2 — Rollout sequencing for D6.** Which clients parse `SidebarItem` today,
   and can they be made pointer-tolerant first? Product/client-team question.
   Gates D6 only.
@@ -485,6 +491,9 @@ golangci-lint run ./...
   `project_id` / `project_name` and an empty `groups` array.
 - `TestSidebarSectionsListsJoinedProjectsAndOwnCategories` — the read-path
   backstop covers members whose hook did not run.
+- `TestUnpinningProjectRemovesItFromFollowAndRepinningRestoresIt` — an explicit
+  unpin hides the retained section even while the caller remains an active
+  Project member; repeated reads do not undo the opt-out, and re-pin restores it.
 - A hook failure warns and does **not** roll back the Project write.
 
 **D5 — old endpoints stay consistent**

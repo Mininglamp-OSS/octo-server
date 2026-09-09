@@ -31,4 +31,5 @@ func init() {
 	// category cycle, so category publishes the post-commit sidebar provisioner
 	// back into project by the same reverse-registration pattern as space hooks.
 	project.RegisterSidebarSectionProvisioner(EnsureProjectSidebarSection)
+	project.RegisterSidebarSectionRemover(HideProjectSidebarSection)
 }

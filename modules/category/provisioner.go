@@ -65,3 +65,13 @@ func EnsureProjectSidebarSection(ctx *config.Context, uid, spaceID, projectID st
 	}
 	return db.ensureSidebarSection(uid, spaceID, sidebarSectionTypeProject, projectID, nextSort+1)
 }
+
+// HideProjectSidebarSection records an explicit unpin without deleting the
+// ordering row. Re-pinning can therefore restore the Project at its previous
+// position, while status=2 keeps it out of the shared section order.
+func HideProjectSidebarSection(ctx *config.Context, uid, spaceID, projectID string) error {
+	if ctx == nil || uid == "" || spaceID == "" || projectID == "" {
+		return nil
+	}
+	return newCategoryDB(ctx).hideSidebarSection(uid, spaceID, sidebarSectionTypeProject, projectID)
+}

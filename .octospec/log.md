@@ -18,6 +18,11 @@ change-log convention (§7). Newest first.
 
 ## 2026-09-09 — sidebar-project-sections
 
+- **Follow-up** — explicit Project unpin now removes the retained section from
+  关注 even for an active Project member. The `pinned=0` setting suppresses both
+  rendering and membership repair, `status=2` preserves the old position, and a
+  later pin reactivates it. A RED→GREEN HTTP regression covers unpin, repeated
+  reads, and re-pin.
 - **Implemented** — one per-user Sidebar order now interleaves manual categories
   and Projects; Project create, member admission, and #861 pin provision the
   personal Project entry, with a read-path repair backstop.

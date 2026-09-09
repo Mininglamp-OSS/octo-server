@@ -16,19 +16,22 @@ func (d *categoryDB) maxSidebarSectionSort(uid, spaceID string) (int, error) {
 	return maxSort, err
 }
 
-// ensureSidebarSection is idempotent through the typed unique key. A concurrent
-// first insert may choose the same sort as another new entry; that is harmless
-// because the primary key remains the deterministic tie-breaker until the user
-// explicitly orders both entries.
+// ensureSidebarSection is idempotent through the typed unique key. A hidden row
+// is reactivated without changing its previous sort, which lets an explicit
+// re-pin restore the Project instead of being swallowed by INSERT IGNORE. A
+// concurrent first insert may choose the same sort as another new entry; that is
+// harmless because the primary key remains the deterministic tie-breaker until
+// the user explicitly orders both entries.
 func (d *categoryDB) ensureSidebarSection(uid, spaceID string, sectionType int, refID string, sort int) error {
 	if uid == "" || spaceID == "" || refID == "" {
 		return nil
 	}
 	now := time.Now().UTC()
 	_, err := d.session.InsertBySql(
-		"INSERT IGNORE INTO octo_sidebar_section "+
+		"INSERT INTO octo_sidebar_section "+
 			"(uid, space_id, section_type, ref_id, sort, status, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+			"VALUES (?, ?, ?, ?, ?, 1, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE status=VALUES(status), updated_at=VALUES(updated_at)",
 		uid, spaceID, sectionType, refID, sort, now, now,
 	).Exec()
 	if err != nil {
@@ -109,6 +112,8 @@ func (d *categoryDB) querySidebarProjectSections(uid, spaceID string) ([]*sideba
 		Join(dbr.I("octo_project").As("p"),
 			"p.project_id=ss.ref_id AND p.space_id=ss.space_id AND p.status=1").
 		Where("ss.uid=? AND ss.space_id=? AND ss.section_type=? AND ss.status=1 "+
+			"AND NOT EXISTS (SELECT 1 FROM octo_project_user_setting ps_hidden "+
+			"WHERE ps_hidden.project_id=p.project_id AND ps_hidden.uid=ss.uid AND ps_hidden.pinned=0) "+
 			"AND (EXISTS (SELECT 1 FROM octo_project_member pm WHERE pm.project_id=p.project_id AND pm.uid=? "+
 			"AND pm.space_id=p.space_id AND pm.status=1 AND pm.removing=0) OR "+
 			"(p.discoverability=? AND EXISTS (SELECT 1 FROM octo_project_user_setting ps "+
@@ -151,11 +156,13 @@ func (d *categoryDB) queryVisibleProjectSidebarRefs(uid, spaceID string) ([]stri
 	_, err := d.session.Select("p.project_id").
 		From(dbr.I("octo_project").As("p")).
 		Where("p.space_id=? AND p.status=1 AND "+
+			"NOT EXISTS (SELECT 1 FROM octo_project_user_setting ps_hidden "+
+			"WHERE ps_hidden.project_id=p.project_id AND ps_hidden.uid=? AND ps_hidden.pinned=0) AND "+
 			"(EXISTS (SELECT 1 FROM octo_project_member pm WHERE pm.project_id=p.project_id AND pm.uid=? "+
 			"AND pm.space_id=p.space_id AND pm.status=1 AND pm.removing=0) OR "+
 			"(p.discoverability=? AND EXISTS (SELECT 1 FROM octo_project_user_setting ps "+
 			"WHERE ps.project_id=p.project_id AND ps.uid=? AND ps.pinned=1)))",
-			spaceID, uid, projectmod.DiscoverabilitySpaceListed, uid).
+			spaceID, uid, uid, projectmod.DiscoverabilitySpaceListed, uid).
 		OrderAsc("p.id").
 		Load(&projectIDs)
 	return projectIDs, err
@@ -187,4 +194,16 @@ func (d *categoryDB) hideSidebarSectionTx(tx *dbr.Tx, uid, spaceID string, secti
 		Where("uid=? AND space_id=? AND section_type=? AND ref_id=? AND status=1", uid, spaceID, sectionType, refID).
 		Exec()
 	return err
+}
+
+func (d *categoryDB) hideSidebarSection(uid, spaceID string, sectionType int, refID string) error {
+	_, err := d.session.Update("octo_sidebar_section").
+		Set("status", 2).
+		Set("updated_at", time.Now().UTC()).
+		Where("uid=? AND space_id=? AND section_type=? AND ref_id=? AND status=1", uid, spaceID, sectionType, refID).
+		Exec()
+	if err != nil {
+		return fmt.Errorf("category: hide sidebar section: %w", err)
+	}
+	return nil
 }

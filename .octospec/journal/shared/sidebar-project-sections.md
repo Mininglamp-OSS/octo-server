@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: sidebar-project-sections"
-description: Unified the Follow sidebar order for personal categories and Projects, auto-provisioned Project entries on create, admit, and pin, and paired Sidebar-facing project IDs with names.
+description: Unified the Follow sidebar order for personal categories and Projects, synchronized Project entries with pin and unpin actions, and paired Sidebar-facing project IDs with names.
 tags: ["sidebar", "project", "category", "space", "isolation", "migration", "testing"]
 timestamp: 2026-09-09T20:17:10+08:00
 # --- octospec extension fields ---
@@ -24,6 +24,9 @@ source: self
   member admission, and successful #861 pin. The read path repairs missed hooks.
   A Space-listed Project pinned by a non-member appears with `groups: []`; pinning
   does not grant a Project seat or group access.
+- Made explicit unpin a durable personal opt-out, including for active Project
+  members. It retains the ordering row as hidden, prevents read repair from
+  immediately restoring it, and lets a later pin reactivate the previous position.
 - Added `project_name` wherever this task emits a Sidebar-facing non-empty
   `project_id`. `/v1/sidebar/sync` resolves distinct IDs with one Space-scoped
   query and fails soft by omitting names if that lookup fails.
@@ -36,6 +39,8 @@ source: self
   Project group contents; a Space-listed pin controls only personal visibility.
 - Hook failures never roll back a committed Project, member admission, or pin.
   Idempotent reads are the repair path.
+- A `pinned=0` row is meaningful sidebar state: it wins over active Project
+  membership so an explicit unpin cannot be undone by the membership backstop.
 - `SidebarItem.ProjectID` remains the existing string type. The pointer wire
   change in D6 is deferred pending client rollout confirmation.
 - The new migration and joins use `utf8mb4_general_ci`, matching the Project and
