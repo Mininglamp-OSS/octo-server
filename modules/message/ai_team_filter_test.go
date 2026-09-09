@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestFilterAITeamSidebarItemsDropsParentAndSessionsFromNormalTabs(t *testing.T) {
+func TestFilterAITeamSidebarItemsDropsAllAITeamParentsAndThreadsFromNormalTabs(t *testing.T) {
 	items := []*SidebarItem{
 		{TargetID: "normal", TargetType: int(common.ChannelTypeGroup)},
 		{TargetID: "pair", TargetType: int(common.ChannelTypeGroup)},
@@ -22,8 +22,8 @@ func TestFilterAITeamSidebarItemsDropsParentAndSessionsFromNormalTabs(t *testing
 		{TargetID: "normal____thread-1", TargetType: int(common.ChannelTypeCommunityTopic)},
 	}
 
-	got := filterAITeamSidebarItems(items, map[string]struct{}{"pair": {}, "team": {}})
-	assert.Equal(t, []string{"normal", "custom", "custom____thread-1", "normal____thread-1"}, sidebarTargetIDs(got))
+	got := filterAITeamSidebarItems(items, map[string]struct{}{"pair": {}, "team": {}, "custom": {}})
+	assert.Equal(t, []string{"normal", "normal____thread-1"}, sidebarTargetIDs(got))
 }
 
 func TestIsAITeamConversationMatchesParentAndThread(t *testing.T) {
@@ -39,8 +39,8 @@ func TestIsAITeamConversationMatchesParentAndThread(t *testing.T) {
 	assert.True(t, isAITeamConversation("pair____session-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
 	assert.True(t, isAITeamConversation("team", common.ChannelTypeGroup.Uint8(), groups))
 	assert.True(t, isAITeamConversation("team____session-2", common.ChannelTypeCommunityTopic.Uint8(), groups))
-	assert.False(t, isAITeamConversation("custom", common.ChannelTypeGroup.Uint8(), groups))
-	assert.False(t, isAITeamConversation("custom____thread-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
+	assert.True(t, isAITeamConversation("custom", common.ChannelTypeGroup.Uint8(), groups))
+	assert.True(t, isAITeamConversation("custom____thread-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
 	assert.False(t, isAITeamConversation("normal____thread-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
 }
 
@@ -63,11 +63,9 @@ func TestFilterAITeamLegacyConversationsDropsParentAndSessions(t *testing.T) {
 	}
 
 	got := filterAITeamLegacyConversations(items, groups)
-	require.Len(t, got, 4)
+	require.Len(t, got, 2)
 	assert.Equal(t, "normal", got[0].ChannelID)
-	assert.Equal(t, "custom", got[1].ChannelID)
-	assert.Equal(t, "custom____thread-1", got[2].ChannelID)
-	assert.Equal(t, "normal____thread-1", got[3].ChannelID)
+	assert.Equal(t, "normal____thread-1", got[1].ChannelID)
 }
 
 func sidebarTargetIDs(items []*SidebarItem) []string {

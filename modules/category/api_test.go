@@ -204,6 +204,7 @@ func TestCategory_ExcludesAndRejectsAITeamManagedGroups(t *testing.T) {
 	managed := map[string]string{
 		"group-category-ai-session": aiteampkg.GroupPurpose,
 		"group-category-ai-team":    aiteampkg.TeamGroupPurpose,
+		"group-category-ai-custom":  aiteampkg.CustomTeamPurpose,
 	}
 	for groupNo, purpose := range managed {
 		seedGroup(t, f, groupNo, spaceID)

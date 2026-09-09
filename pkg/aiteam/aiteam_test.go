@@ -34,7 +34,7 @@ func TestProtectedPurposes(t *testing.T) {
 	assert.False(t, IsProtectedPurpose("ordinary"))
 	assert.True(t, IsHiddenPurpose(GroupPurpose))
 	assert.True(t, IsHiddenPurpose(TeamGroupPurpose))
-	assert.False(t, IsHiddenPurpose(CustomTeamPurpose))
+	assert.True(t, IsHiddenPurpose(CustomTeamPurpose))
 	assert.True(t, IsImmutablePurpose(GroupPurpose))
 	assert.True(t, IsImmutablePurpose(TeamGroupPurpose))
 	assert.False(t, IsImmutablePurpose(CustomTeamPurpose))

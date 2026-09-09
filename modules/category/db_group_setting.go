@@ -1,7 +1,5 @@
 package category
 
-import aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
-
 func (d *categoryDB) queryGroupSettingForCategory(groupNo, uid string) (*groupSettingCategoryRow, error) {
 	var row *groupSettingCategoryRow
 	_, err := d.session.Select("id", "group_no", "uid", "category_id", "category_sort").
@@ -60,9 +58,9 @@ func (d *categoryDB) queryUserGroupsInSpace(uid, spaceID string) ([]*userGroupIn
 		INNER JOIN group_member gm ON g.group_no = gm.group_no
 		LEFT JOIN group_setting gs ON g.group_no = gs.group_no AND gs.uid = ?
 		WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ?
-		  AND (g.purpose = '' OR g.purpose = ?)
+		  AND g.purpose = ''
 		GROUP BY g.group_no
 		ORDER BY gs.category_sort ASC
-	`, uid, uid, spaceID, aiteampkg.CustomTeamPurpose).Load(&results)
+	`, uid, uid, spaceID).Load(&results)
 	return results, err
 }

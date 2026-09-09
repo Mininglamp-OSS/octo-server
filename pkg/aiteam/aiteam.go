@@ -76,11 +76,11 @@ func IsProtectedPurpose(purpose string) bool {
 	return purpose == GroupPurpose || purpose == TeamGroupPurpose || purpose == CustomTeamPurpose
 }
 
-// IsHiddenPurpose identifies server-managed AI containers which must stay out
-// of ordinary group and conversation surfaces. User-created custom AI teams are
-// intentionally visible like ordinary groups.
+// IsHiddenPurpose identifies AI-team groups which must stay out of ordinary
+// group and conversation surfaces. They are exclusively presented through the
+// AI Team API and page, including user-created custom teams.
 func IsHiddenPurpose(purpose string) bool {
-	return purpose == GroupPurpose || purpose == TeamGroupPurpose
+	return purpose == GroupPurpose || purpose == TeamGroupPurpose || purpose == CustomTeamPurpose
 }
 
 // IsImmutablePurpose identifies AI groups whose metadata and roster are fully
@@ -170,7 +170,8 @@ func RuntimeSessionKey(target *SessionTarget, channelID string) string {
 	return target.SpaceID + ":" + target.BotID + ":" + channelID
 }
 
-// ExcludeProtectedItems filters both a dedicated parent and its thread channel.
+// ExcludeProtectedItems filters every AI-team parent and its thread channel
+// from ordinary conversation surfaces.
 // channelType values follow WuKongIM: group=2, community-topic=5.
 func ExcludeProtectedItems(session *dbr.Session, items [][2]string) (map[string]struct{}, error) {
 	groupNos := make([]string, 0, len(items))
@@ -201,7 +202,7 @@ func ExcludeProtectedItems(session *dbr.Session, items [][2]string) (map[string]
 		GroupNo string `db:"group_no"`
 	}
 	_, err := session.Select("group_no").From("`group`").
-		Where("group_no IN ? AND purpose IN ?", groupNos, []string{GroupPurpose, TeamGroupPurpose}).Load(&rows)
+		Where("group_no IN ? AND purpose IN ?", groupNos, []string{GroupPurpose, TeamGroupPurpose, CustomTeamPurpose}).Load(&rows)
 	if err != nil {
 		return nil, err
 	}

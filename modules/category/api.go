@@ -552,7 +552,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
-	if aiteampkg.IsImmutablePurpose(purpose) {
+	if aiteampkg.IsProtectedPurpose(purpose) {
 		httperr.ResponseErrorL(ctx, errcode.ErrAITeamContainerProtected, nil, nil)
 		return
 	}

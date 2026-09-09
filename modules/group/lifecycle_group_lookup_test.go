@@ -32,29 +32,41 @@ func TestOnlyUserCreatedGroupsConsumeDailyGroupCreationQuota(t *testing.T) {
 	require.Zero(t, otherCount, "one user's groups must not consume another user's daily quota")
 }
 
-func TestGetGroupsWithMemberUIDForLifecycleCleanupIncludesAITeamContainers(t *testing.T) {
+func TestProductGroupListsHideAllAITeamsButLifecycleCleanupIncludesThem(t *testing.T) {
 	svc, _, ctx := setupServiceTestWithCtx(t)
-	const botUID = "bot_lifecycle_lookup"
+	const (
+		botUID  = "bot_lifecycle_lookup"
+		spaceID = "space_lifecycle_lookup"
+	)
 
 	for _, model := range []*Model{
-		{GroupNo: "ordinary_lifecycle_lookup", Name: "ordinary", Creator: "owner", Status: GroupStatusNormal},
-		{GroupNo: "ai_lifecycle_lookup", Name: "ai", Creator: "owner", Status: GroupStatusNormal, Purpose: aiteam.GroupPurpose},
-		{GroupNo: "ai_team_lifecycle_lookup", Name: "ai team", Creator: "owner", Status: GroupStatusNormal, Purpose: aiteam.TeamGroupPurpose},
-		{GroupNo: "custom_ai_team_lifecycle_lookup", Name: "custom ai team", Creator: "owner", Status: GroupStatusNormal, Purpose: aiteam.CustomTeamPurpose},
+		{GroupNo: "ordinary_lifecycle_lookup", Name: "ordinary", Creator: "owner", SpaceID: spaceID, Status: GroupStatusNormal},
+		{GroupNo: "ai_lifecycle_lookup", Name: "ai", Creator: "owner", SpaceID: spaceID, Status: GroupStatusNormal, Purpose: aiteam.GroupPurpose},
+		{GroupNo: "ai_team_lifecycle_lookup", Name: "ai team", Creator: "owner", SpaceID: spaceID, Status: GroupStatusNormal, Purpose: aiteam.TeamGroupPurpose},
+		{GroupNo: "custom_ai_team_lifecycle_lookup", Name: "custom ai team", Creator: "owner", SpaceID: spaceID, Status: GroupStatusNormal, Purpose: aiteam.CustomTeamPurpose},
 	} {
 		require.NoError(t, NewDB(ctx).Insert(model))
 		require.NoError(t, NewDB(ctx).InsertMember(&MemberModel{
 			GroupNo: model.GroupNo, UID: botUID, Status: int(common.GroupMemberStatusNormal), Robot: 1, Version: 1,
 		}))
+		_, err := ctx.DB().InsertInto("group_setting").Columns("group_no", "uid", "save").Values(model.GroupNo, botUID, 1).Exec()
+		require.NoError(t, err)
 	}
 
 	productGroups, err := svc.GetGroupsWithMemberUID(botUID)
 	require.NoError(t, err)
-	require.Len(t, productGroups, 2)
-	require.ElementsMatch(t,
-		[]string{"ordinary_lifecycle_lookup", "custom_ai_team_lifecycle_lookup"},
-		[]string{productGroups[0].GroupNo, productGroups[1].GroupNo},
-	)
+	require.Len(t, productGroups, 1)
+	require.Equal(t, "ordinary_lifecycle_lookup", productGroups[0].GroupNo)
+
+	spaceGroups, err := NewDB(ctx).queryGroupsWithMemberUIDAndSpaceID(botUID, spaceID)
+	require.NoError(t, err)
+	require.Len(t, spaceGroups, 1)
+	require.Equal(t, "ordinary_lifecycle_lookup", spaceGroups[0].GroupNo)
+
+	savedGroups, err := NewDB(ctx).querySavedGroups(botUID)
+	require.NoError(t, err)
+	require.Len(t, savedGroups, 1)
+	require.Equal(t, "ordinary_lifecycle_lookup", savedGroups[0].GroupNo)
 
 	lifecycleGroups, err := svc.GetGroupsWithMemberUIDForLifecycleCleanup(botUID)
 	require.NoError(t, err)
