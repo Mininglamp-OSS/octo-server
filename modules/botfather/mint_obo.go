@@ -46,7 +46,7 @@ func MintBotOBO(ctx *config.Context, ownerUID, spaceID, displayName, botToken st
 
 	h := newCommandHandler(ctx)
 
-	robotID, err := h.createBotCoreWithRetry(ownerUID, displayName, botToken)
+	robotID, err := h.createBotCoreWithRetry(ownerUID, displayName, botToken, "")
 	if err != nil {
 		return nil, fmt.Errorf("MintBotOBO: createBotCore: %w", err)
 	}

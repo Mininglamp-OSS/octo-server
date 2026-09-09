@@ -16,6 +16,20 @@ change-log convention (§7). Newest first.
   visible-bot predicate is staged in
   [learnings/pending](learnings/pending/space-directory-octo-hosted-only.md).
 
+## 2026-09-09 — cloud-clone-per-user-limit
+
+- Server-side `octo_hosted` creation intent now enforces one active cloud clone
+  per creator globally, including cross-Space and concurrent requests; normal
+  Bots remain unrestricted.
+- Owner-only hosted lookup supports idempotent EVA create-or-reuse flow and
+  intentionally omits Space identity from its response.
+- EVA removes the free-form cloud-Bot name, derives `<display name>的 AI 分身`,
+  and refreshes rather than duplicates its local cloud record.
+- Recorded the result in
+  [journal](journal/shared/cloud-clone-per-user-limit.md); a transaction-lock
+  pattern is staged in
+  [learnings/pending](learnings/pending/cloud-clone-per-user-limit.md).
+
 ## 2026-09-09 — project-collaboration-roles
 
 - Added project-scoped, multi-select collaboration roles for human members while

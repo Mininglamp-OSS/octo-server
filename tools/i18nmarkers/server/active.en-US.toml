@@ -285,6 +285,9 @@ other = "The bot does not belong to the current space."
 ["err.server.botfather.cannot_apply_own_bot"]
 other = "No need to apply for a bot you own."
 
+["err.server.botfather.hosted_bot_exists"]
+other = "A hosted AI clone already exists."
+
 ["err.server.botfather.not_owner"]
 other = "You are not the owner of this bot."
 

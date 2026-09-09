@@ -1261,6 +1261,9 @@ other = "你们已经是好友了。"
 ["err.server.botfather.username_taken"]
 other = "用户名已被占用。"
 
+["err.server.botfather.hosted_bot_exists"]
+other = "你已有一个 AI 云端分身。"
+
 ["err.server.botfather.auth_failed"]
 other = "机器人认证失败。"
 
