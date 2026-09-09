@@ -1570,6 +1570,46 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		assert.Equal(t, []string{TargetFleet}, cfg.ReclaimTargets)
 	})
 
+	// The env NAME is a configmap contract, so it is spelled as a literal here rather
+	// than through envProvisionRequeueProjectID. Keying the fixture with the same
+	// constant the code reads would be a tautology that passes through a rename — and a
+	// rename is silent in the worst way: the operator sets the documented name, the code
+	// reads a different one, the value resolves empty, and requeueAbandonedProvisioningAtBoot
+	// returns before emitting any log line. Same reasoning as the reclaim envs above.
+	t.Run("the requeue env resolves from its documented name", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:                         "fleet",
+			envProvisionFleetURL:                        "https://fleet.internal/api/internal/workspaces/ensure",
+			ProvisionFleetSecretEnv:                     okSecretA,
+			"OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID": "  p-123  ",
+		}))
+		require.Empty(t, problems)
+		assert.Equal(t, "p-123", cfg.RequeueProjectID, "the requeue env did not resolve, or was not trimmed")
+
+		unset, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:     "fleet",
+			envProvisionFleetURL:    "https://fleet.internal/api/internal/workspaces/ensure",
+			ProvisionFleetSecretEnv: okSecretA,
+		}))
+		require.Empty(t, problems)
+		assert.Empty(t, unset.RequeueProjectID, "an unset requeue env must resolve empty, not to a stale value")
+	})
+
+	// A rescue instruction that cannot run has to say so. The requeue executes from
+	// startProvisioningWorker, which returns early when nothing is enabled, so without a
+	// problem here the operator gets no output at any level — which is the outcome the
+	// env's own comment promises to prevent.
+	t.Run("the requeue env is refused when no target is enabled", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			"OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID": "p-123",
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID")
+		assert.False(t, cfg.Enabled())
+		// Still resolved: the value is reported, not silently dropped.
+		assert.Equal(t, "p-123", cfg.RequeueProjectID)
+	})
+
 	t.Run("the retired process-global reclaim env is refused, not ignored", func(t *testing.T) {
 		cfg, problems := loadProvisioningConfig(env(map[string]string{
 			"OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE": "true",

@@ -191,7 +191,7 @@ func (p *Project) requeueAbandonedProvisioningAtBoot() {
 	for _, t := range p.cfg.Provisioning.Targets {
 		targets = append(targets, t.Name)
 	}
-	moved, err := p.db.requeueAbandonedProvisioningJobs(projectID, targets, time.Now())
+	moved, err := p.db.requeueAbandonedProvisioningJobs(projectID, targets, time.Now().UTC())
 	if err != nil {
 		p.Error("project provisioning requeue failed; the abandoned rows are unchanged",
 			zap.String("project_id", projectID), zap.Strings("targets", targets), zap.Error(err))

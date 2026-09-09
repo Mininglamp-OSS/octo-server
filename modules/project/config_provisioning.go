@@ -327,6 +327,22 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 
 	requested := parseTargetList(getenv(envProvisionTargets))
 	if len(requested) == 0 {
+		// Saying so out loud is the whole point of resolving the value above. The requeue
+		// runs from startProvisioningWorker, which returns early when no target is
+		// enabled, so without this the rescue an operator reaches for during an incident
+		// produces no output at any level — the exact "no trace either way" outcome the
+		// comment above promises to prevent. A rollback deployment (targets cleared, a
+		// leftover rescue value still in the configmap) is where this lands.
+		//
+		// Same reasoning as the retired reclaim env below: an operator who followed the
+		// runbook has to learn that the instruction did nothing, and a startup problem is
+		// the channel that survives a restart loop.
+		if cfg.RequeueProjectID != "" {
+			problems = append(problems, fmt.Errorf(
+				"project provisioning: %s is set but %s enables no target, so no row will be requeued; "+
+					"enable the target that owns the stuck row, or clear the requeue env",
+				envProvisionRequeueProjectID, envProvisionTargets))
+		}
 		cfg.Problems = problems
 		return cfg, problems
 	}

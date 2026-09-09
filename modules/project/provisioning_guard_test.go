@@ -258,19 +258,23 @@ func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
 	// table (it takes the id as an argument), but it is listed so the guard does not
 	// depend on that staying true.
 	//
-	// config_provisioning.go is listed because it owns provisionTargetRegistry, which is
-	// where the two id prefixes live — one entry per subsystem, so that adding a third is
-	// a single-line change. It holds the PREFIXES, not ids and not the table: minting
-	// still happens only in newContainerID (provisioning.go), which
-	// TestContainerIDHasOneProducerAndItIgnoresTheProjectID pins, and this file never
-	// names octo_project_provisioning. The invariant this guard exists for — no package
-	// OUTSIDE the slice can read or mint a container id — is unchanged.
-	allowed := map[string]bool{
-		filepath.Join("modules", "project", "db_provisioning.go"):     true,
-		filepath.Join("modules", "project", "provisioning.go"):        true,
-		filepath.Join("modules", "project", "config_provisioning.go"): true,
+	// Keyed per (file, needle), not per file. config_provisioning.go has to be exempt for
+	// the two PREFIX literals — it owns provisionTargetRegistry, where they now live, one
+	// entry per subsystem so adding a third is a single-line change. It must NOT become
+	// exempt for the table name: the justification for listing it is precisely that it
+	// never reads octo_project_provisioning, and a file-keyed exemption would stop
+	// enforcing the property it was admitted on. Minting still happens only in
+	// newContainerID (provisioning.go), pinned by
+	// TestContainerIDHasOneProducerAndItIgnoresTheProjectID.
+	const tableNeedle = "octo_project_provisioning"
+	needles := []string{tableNeedle, `"octows-`, `"octods-`}
+	projectFile := func(name string) string { return filepath.Join("modules", "project", name) }
+	allowed := map[string]map[string]bool{
+		projectFile("db_provisioning.go"): {tableNeedle: true, `"octows-`: true, `"octods-`: true},
+		projectFile("provisioning.go"):    {tableNeedle: true, `"octows-`: true, `"octods-`: true},
+		// Prefixes only — deliberately still on the hook for the table name.
+		projectFile("config_provisioning.go"): {`"octows-`: true, `"octods-`: true},
 	}
-	needles := []string{"octo_project_provisioning", `"octows-`, `"octods-`}
 	scanned := 0
 	var offenders []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -292,8 +296,12 @@ func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
 		if relErr != nil {
 			return relErr
 		}
-		if allowed[rel] || strings.HasPrefix(rel, filepath.Join("internal", "projectprovision")) {
+		if strings.HasPrefix(rel, filepath.Join("internal", "projectprovision")) {
 			return nil
+		}
+		exempt := allowed[rel]
+		if len(exempt) == len(needles) {
+			return nil // fully exempt; nothing left to check in this file
 		}
 		scanned++
 		raw, readErr := os.ReadFile(path)
@@ -302,6 +310,9 @@ func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
 		}
 		src := stripComments(string(raw))
 		for _, needle := range needles {
+			if exempt[needle] {
+				continue
+			}
 			if strings.Contains(src, needle) {
 				offenders = append(offenders, rel+" ("+needle+")")
 			}
@@ -475,21 +486,40 @@ func TestEveryTargetDecisionReadsTheRegistry(t *testing.T) {
 		t.Fatalf("provisionTargetRegistry has %d entries; this guard needs the real table to be "+
 			"meaningful", len(provisionTargetRegistry))
 	}
-	constNames := map[string]string{TargetFleet: "TargetFleet", TargetDrive: "TargetDrive"}
-	var identifiers []string
+	// Every registry target must have a known identifier spelling, so a third subsystem
+	// cannot be half-covered: this fails loudly with instructions rather than quietly
+	// checking one fewer name.
 	for _, spec := range provisionTargetRegistry {
-		ident, ok := constNames[spec.name]
-		if !ok {
-			t.Fatalf("registry target %q has no known constant identifier; add it to constNames so "+
-				"this guard keeps covering every target", spec.name)
+		if identifierOf[spec.name] == "" {
+			t.Fatalf("registry target %q has no entry in identifierOf; add it so this guard keeps "+
+				"covering every target", spec.name)
 		}
-		identifiers = append(identifiers, ident)
 	}
 
-	// A site "enumerates" when two or more target constants appear close enough together
-	// to be one expression — a slice literal, a multi-value case, a chain of ||. That is
-	// the shape that needs re-editing; a single mention (say, a fleet-only rule) does not.
-	const window = 60
+	// A file "enumerates" when it mentions two or more DISTINCT targets outside the
+	// registry — in either spelling. That is the shape that has to be re-edited for a
+	// third subsystem, and the shape whose omission is silent.
+	//
+	// Counting distinct targets per file, rather than looking for two identifiers close
+	// together, is deliberate and is the second version of this guard. The first scanned a
+	// 60-char window forward from strings.Index — the FIRST occurrence only — which left
+	// three ways through, all of them ordinary edits rather than adversarial ones:
+	//
+	//  1. Any earlier lone mention (the shape the rule explicitly allows, e.g. a
+	//     fleet-only rule) moved that constant's first index away from the enumeration,
+	//     and every later occurrence was invisible. Adding one benign function above a
+	//     regressed site turned the whole rest of the file into a blind spot.
+	//  2. A switch whose first case body runs more than a few statements puts the two
+	//     identifiers further apart than any window worth choosing.
+	//  3. Enumeration by WIRE VALUE was never searched at all — a []string{"fleet",
+	//     "drive"}, a map keyed by them, or an IN ('fleet','drive') all passed. That is
+	//     not a hypothetical: refreshProvisioningMetrics lists its four statuses as bare
+	//     string literals one line above the target loop this guard protects.
+	//
+	// A per-file count has no window to tune and no first-occurrence to sidestep. It costs
+	// the ability to say "these two mentions are one expression", which is the right trade:
+	// a file outside the registry that knows two target names has a per-target decision in
+	// it either way.
 	examined := 0
 	for _, f := range moduleSourceFiles(t) {
 		if f == registryHome {
@@ -497,25 +527,18 @@ func TestEveryTargetDecisionReadsTheRegistry(t *testing.T) {
 		}
 		src := readStripped(t, f)
 		examined++
-		for _, a := range identifiers {
-			for _, b := range identifiers {
-				if a == b {
-					continue
-				}
-				i := strings.Index(src, a)
-				if i < 0 {
-					continue
-				}
-				rest := src[i+len(a):]
-				if len(rest) > window {
-					rest = rest[:window]
-				}
-				if strings.Contains(rest, b) {
-					t.Errorf("%s enumerates target constants (%s ... %s within %d chars): every "+
-						"per-target decision must read provisionTargetRegistry, or adding a "+
-						"subsystem silently skips this site", f, a, b, window)
-				}
+		var mentioned []string
+		for _, spec := range provisionTargetRegistry {
+			// Both spellings: the Go constant and the wire value it holds. The quoted
+			// form is what a raw SQL predicate or a literal slice would use.
+			if strings.Contains(src, identifierOf[spec.name]) || strings.Contains(src, `"`+spec.name+`"`) {
+				mentioned = append(mentioned, spec.name)
 			}
+		}
+		if len(mentioned) > 1 {
+			t.Errorf("%s mentions %d targets (%s) outside %s: every per-target decision must read "+
+				"provisionTargetRegistry, by constant or by wire value, or adding a subsystem "+
+				"silently skips this site", f, len(mentioned), strings.Join(mentioned, ", "), registryHome)
 		}
 	}
 	if examined == 0 {
@@ -539,6 +562,14 @@ func TestEveryTargetDecisionReadsTheRegistry(t *testing.T) {
 		t.Error("no file outside " + registryHome + " reads the target registry; the per-target " +
 			"decisions have drifted somewhere this guard cannot see")
 	}
+}
+
+// identifierOf maps a target's wire value to the Go constant that holds it, so the
+// enumeration guard can search for both spellings. Kept next to registryHome for the
+// same reason: the guards that depend on it must not disagree about it.
+var identifierOf = map[string]string{
+	TargetFleet: "TargetFleet",
+	TargetDrive: "TargetDrive",
 }
 
 // registryHome is the file that owns the target table. Named once so the two guards

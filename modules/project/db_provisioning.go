@@ -387,10 +387,19 @@ func (d *DB) abandonExhaustedProvisioningJobs(targets []string, maxAttempts uint
 // created (ensure is at-least-once, so a lost response leaves a real container
 // behind a row that never reached `ready`).
 //
-// last_error is APPENDED to, matching abandonExhaustedProvisioningJobs: the reason
-// provisioning gave up is the operator's only durable evidence, and the requeue
-// marker is what distinguishes "gave up once" from "gave up, was retried, gave up
+// last_error is APPENDED to, matching abandonExhaustedProvisioningJobs: while the row
+// is parked, the reason provisioning gave up is the operator's durable evidence, and
+// the requeue marker distinguishes "gave up once" from "gave up, was retried, gave up
 // again". LEFT(...) bounds it at the column width for the same reason as there.
+//
+// Scope of that claim, precisely: it holds while the row is pending or abandoned, NOT
+// after a successful re-drive. finishProvisioningJob and releaseProvisioningJob both
+// REPLACE last_error (pre-existing behaviour), and the success path passes "" — so a
+// rescued row that reaches `ready` carries no trace of the rescue. That is the right
+// default for a column whose job is "why is this row not done", and the audit question
+// ("was this project ever rescued") is not one a mutable status column can answer;
+// the boot log line is. Recorded here because the appended history looks durable and
+// is not.
 func (d *DB) requeueAbandonedProvisioningJobs(projectID string, targets []string, now time.Time) (int64, error) {
 	if strings.TrimSpace(projectID) == "" || len(targets) == 0 {
 		return 0, nil
@@ -413,6 +422,14 @@ func (d *DB) requeueAbandonedProvisioningJobs(projectID string, targets []string
 	// The UPDATE re-checks status, so two concurrent requeues (two pods reading the same
 	// env value) cannot both move the same row: the second matches nothing. That is what
 	// makes this safe to run more than once rather than merely unlikely to be.
+	//
+	// It re-checks ONLY status, where abandonExhaustedProvisioningJobs deliberately
+	// re-checks every predicate its SELECT used. The asymmetry is intentional, not an
+	// oversight: that function's extra predicates guard against replicas disagreeing about
+	// max_attempts mid-rollout, i.e. against a value that CHANGES under the row. Here the
+	// dropped predicates are project_id and target, which no statement in this package
+	// ever updates — uk_octo_project_provisioning_target makes them the row's identity, so
+	// re-checking them could not fail. status is the only column another actor can move.
 	result, err := d.session.UpdateBySql(
 		"UPDATE `octo_project_provisioning` "+
 			"SET status = ?, attempts = 0, next_attempt_at = ?, "+
