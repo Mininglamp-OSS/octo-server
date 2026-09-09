@@ -314,13 +314,13 @@ func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 // from becoming a second mutation/read surface for hidden AI containers. Run it
 // only after robot ownership succeeds so callers cannot probe arbitrary group IDs.
 func (rb *Robot) rejectAIContainerMentionPref(c *wkhttp.Context, groupNo string) bool {
-	protected, err := aiteampkg.IsProtectedGroup(rb.ctx.DB(), groupNo)
+	purpose, err := aiteampkg.Purpose(rb.ctx.DB(), groupNo)
 	if err != nil {
 		rb.Error("检查群聊用途失败", zap.String("group_no", groupNo), zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return true
 	}
-	if protected {
+	if aiteampkg.IsDedicatedSessionPurpose(purpose) {
 		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
 		return true
 	}

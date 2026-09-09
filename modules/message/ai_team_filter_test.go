@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -12,37 +13,45 @@ import (
 func TestFilterAITeamSidebarItemsDropsParentAndSessionsFromNormalTabs(t *testing.T) {
 	items := []*SidebarItem{
 		{TargetID: "normal", TargetType: int(common.ChannelTypeGroup)},
-		{TargetID: "protected", TargetType: int(common.ChannelTypeGroup)},
-		{TargetID: "protected____session-1", TargetType: int(common.ChannelTypeCommunityTopic)},
+		{TargetID: "pair", TargetType: int(common.ChannelTypeGroup)},
+		{TargetID: "pair____session-1", TargetType: int(common.ChannelTypeCommunityTopic)},
+		{TargetID: "team", TargetType: int(common.ChannelTypeGroup)},
+		{TargetID: "team____session-2", TargetType: int(common.ChannelTypeCommunityTopic)},
 		{TargetID: "normal____thread-1", TargetType: int(common.ChannelTypeCommunityTopic)},
 	}
 
-	got := filterAITeamSidebarItems(items, map[string]struct{}{"protected": {}})
+	got := filterAITeamSidebarItems(items, map[string]struct{}{"pair": {}, "team": {}})
 	assert.Equal(t, []string{"normal", "normal____thread-1"}, sidebarTargetIDs(got))
 }
 
 func TestIsAITeamConversationMatchesParentAndThread(t *testing.T) {
 	groups := map[string]*group.GroupResp{
-		"normal":    {GroupNo: "normal"},
-		"protected": {GroupNo: "protected", Purpose: "ai_session_container"},
+		"normal": {GroupNo: "normal"},
+		"pair":   {GroupNo: "pair", Purpose: aiteam.GroupPurpose},
+		"team":   {GroupNo: "team", Purpose: aiteam.TeamGroupPurpose},
 	}
 
 	assert.False(t, isAITeamConversation("normal", common.ChannelTypeGroup.Uint8(), groups))
-	assert.True(t, isAITeamConversation("protected", common.ChannelTypeGroup.Uint8(), groups))
-	assert.True(t, isAITeamConversation("protected____session-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
+	assert.True(t, isAITeamConversation("pair", common.ChannelTypeGroup.Uint8(), groups))
+	assert.True(t, isAITeamConversation("pair____session-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
+	assert.True(t, isAITeamConversation("team", common.ChannelTypeGroup.Uint8(), groups))
+	assert.True(t, isAITeamConversation("team____session-2", common.ChannelTypeCommunityTopic.Uint8(), groups))
 	assert.False(t, isAITeamConversation("normal____thread-1", common.ChannelTypeCommunityTopic.Uint8(), groups))
 }
 
 func TestFilterAITeamLegacyConversationsDropsParentAndSessions(t *testing.T) {
 	items := []conversationResp{
 		{ChannelID: "normal", ChannelType: common.ChannelTypeGroup.Uint8()},
-		{ChannelID: "protected", ChannelType: common.ChannelTypeGroup.Uint8()},
-		{ChannelID: "protected____session-1", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+		{ChannelID: "pair", ChannelType: common.ChannelTypeGroup.Uint8()},
+		{ChannelID: "pair____session-1", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+		{ChannelID: "team", ChannelType: common.ChannelTypeGroup.Uint8()},
+		{ChannelID: "team____session-2", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
 		{ChannelID: "normal____thread-1", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
 	}
 	groups := map[string]*group.GroupResp{
-		"normal":    {GroupNo: "normal"},
-		"protected": {GroupNo: "protected", Purpose: "ai_session_container"},
+		"normal": {GroupNo: "normal"},
+		"pair":   {GroupNo: "pair", Purpose: aiteam.GroupPurpose},
+		"team":   {GroupNo: "team", Purpose: aiteam.TeamGroupPurpose},
 	}
 
 	got := filterAITeamLegacyConversations(items, groups)

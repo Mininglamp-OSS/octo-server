@@ -9,7 +9,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -91,6 +90,23 @@ func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.T
 		Set("version", version).
 		Set("forbidden_expir_time", 0).
 		Where("group_no=? and uid=?", groupNo, uid).Exec()
+	return err
+}
+
+// normalizeManagedMemberTx repairs the role/status flags of a member whose
+// membership is owned by a server-managed group projection. Callers must first
+// pass the member through admitOrRestoreMembersTx; keeping this primitive in DB
+// preserves the single group_member write boundary enforced by source guards.
+func (d *DB) normalizeManagedMemberTx(groupNo, uid string, role, robot int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group_member").
+		Set("role", role).
+		Set("status", int(common.GroupMemberStatusNormal)).
+		Set("robot", robot).
+		Set("bot_admin", 0).
+		Set("is_deleted", 0).
+		Set("forbidden_expir_time", 0).
+		Set("version", version).
+		Where("group_no=? AND uid=?", groupNo, uid).Exec()
 	return err
 }
 
@@ -792,14 +808,14 @@ func (d *DB) QueryMemberCount(groupNo string) (int64, error) {
 // 查询群总数
 func (d *DB) queryGroupCount() (int64, error) {
 	var count int64
-	_, err := d.session.Select("count(*)").From("`group`").Where("purpose<>?", aiteampkg.GroupPurpose).Load(&count)
+	_, err := d.session.Select("count(*)").From("`group`").Where("purpose=''").Load(&count)
 	return count, err
 }
 
 // 查询某天的新建群数量
 func (d *DB) queryCreatedCountWithDate(date string) (int64, error) {
 	var count int64
-	_, err := d.session.Select("count(*)").From("`group`").Where("date_format(created_at,'%Y-%m-%d')=? and purpose<>?", date, aiteampkg.GroupPurpose).Load(&count)
+	_, err := d.session.Select("count(*)").From("`group`").Where("date_format(created_at,'%Y-%m-%d')=? and purpose=''", date).Load(&count)
 	return count, err
 }
 
@@ -869,7 +885,7 @@ func (d *DB) queryForbiddenExpirationTimeMembers(limit int64) ([]*MemberModel, e
 // 查询用户当天建群数量
 func (d *DB) querySameDayCreateCountWitUID(uid string, day string) (int, error) {
 	var count int
-	err := d.session.SelectBySql("SELECT COUNT(*) AS count FROM `group` WHERE creator=? AND DATE(created_at)=?", uid, day).LoadOne(&count)
+	err := d.session.SelectBySql("SELECT COUNT(*) AS count FROM `group` WHERE creator=? AND DATE(created_at)=? AND purpose=''", uid, day).LoadOne(&count)
 	return count, err
 }
 

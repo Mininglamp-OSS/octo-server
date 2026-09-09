@@ -671,9 +671,10 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		items = dropArchivedThreadItems(items)
 	}
 
-	// Dedicated AI parent groups and their thread conversations live only in
-	// /v1/ai-team. Hiding just the parent would still leak every session through
-	// target_type=5, so filter both shapes from one authoritative purpose query.
+	// Dedicated AI parent groups, the aggregate AI-team group, and their thread
+	// conversations live only in /v1/ai-team. Hiding just a parent would still
+	// leak every session through target_type=5, so filter both shapes from one
+	// authoritative purpose query.
 	items, err = sb.excludeAITeamItems(items)
 	if err != nil {
 		sb.Error("sidebar sync: AI container filter failed (fail-closed)", zap.Error(err))

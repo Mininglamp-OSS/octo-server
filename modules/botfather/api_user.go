@@ -214,6 +214,7 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 
 	// Add bot to Space (best-effort, non-critical)
 	// Verify caller belongs to the Space before adding bot (prevent cross-Space injection)
+	botBoundToSpace := false
 	if spaceID != "" {
 		var memberCount int
 		_, countErr := bf.db.session.SelectBySql(
@@ -229,9 +230,17 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 			).Exec()
 			if spErr != nil {
 				bf.Error("Bot加入Space失败", zap.String("spaceID", spaceID), zap.Error(spErr))
+			} else {
+				botBoundToSpace = true
 			}
 		} else {
 			bf.Warn("用户不属于指定Space，跳过", zap.String("uid", uid), zap.String("spaceID", spaceID))
+		}
+	}
+	if botBoundToSpace {
+		if provisionErr := provisionAITeam(bf.ctx, spaceID, uid, robotID); provisionErr != nil {
+			bf.Warn("Bot已创建但AI团队群同步失败，将由后续AI团队请求重试",
+				zap.String("robotID", robotID), zap.String("spaceID", spaceID), zap.Error(provisionErr))
 		}
 	}
 

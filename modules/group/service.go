@@ -275,7 +275,7 @@ func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
 			Members:              []string{uid},
 			OperatorUID:          uid,
 			SuppressRemoveNotice: true,
-			AllowProtected:       group.Purpose == aiteampkg.GroupPurpose,
+			AllowProtected:       aiteampkg.IsProtectedPurpose(group.Purpose),
 		})
 		if removeErr != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: %w", uid, group.GroupNo, removeErr))
@@ -1927,6 +1927,17 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		return nil, errors.New("failed to begin transaction")
 	}
 	defer tx.RollbackUnlessCommitted()
+	if req.AllowProtected && aiteampkg.IsProtectedPurpose(groupModel.Purpose) {
+		lifecycleUIDs := make([]string, 0, len(removableMembers))
+		for _, member := range removableMembers {
+			lifecycleUIDs = append(lifecycleUIDs, member.UID)
+		}
+		if err := markAITeamLifecycleRosterRemovalTx(tx, groupModel, lifecycleUIDs); err != nil {
+			s.Error("mark AI-team lifecycle roster removal failed", zap.Error(err),
+				zap.String("group_no", req.GroupNo), zap.Strings("removed_uids", lifecycleUIDs))
+			return nil, errors.New("failed to mark AI-team lifecycle roster removal")
+		}
+	}
 
 	var removedUIDs []string
 	var removedVos []*config.UserBaseVo

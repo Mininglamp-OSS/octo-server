@@ -76,7 +76,14 @@ type AgentGroup struct {
 	Items []*Agent       `json:"items"`
 }
 
+type TeamGroup struct {
+	GroupNo string `db:"group_no" json:"group_no"`
+	Name    string `db:"name" json:"name"`
+	State   int    `db:"state" json:"state"`
+}
+
 type AgentPage struct {
 	Groups     []*AgentGroup `json:"groups"`
+	TeamGroup  *TeamGroup    `json:"team_group,omitempty"`
 	NextCursor string        `json:"next_cursor,omitempty"`
 }

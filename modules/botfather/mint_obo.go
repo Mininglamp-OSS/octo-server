@@ -60,6 +60,10 @@ func MintBotOBO(ctx *config.Context, ownerUID, spaceID, displayName, botToken st
 			zap.Error(err), zap.String("bot_uid", robotID), zap.String("space_id", spaceID))
 		return nil, fmt.Errorf("MintBotOBO: add bot to space: %w", err)
 	}
+	if provisionErr := provisionAITeam(ctx, spaceID, ownerUID, robotID); provisionErr != nil {
+		h.Warn("MintBotOBO: Bot已创建但AI团队群同步失败，将由后续AI团队请求重试",
+			zap.Error(provisionErr), zap.String("bot_uid", robotID), zap.String("space_id", spaceID))
+	}
 
 	if err := h.userService.AddFriend(ownerUID, &user.FriendReq{UID: ownerUID, ToUID: robotID}); err != nil {
 		h.Warn("MintBotOBO: 好友 owner->bot 失败", zap.Error(err))
