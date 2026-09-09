@@ -120,7 +120,7 @@ func TestContainerEventIDIsAOneWayStableDerivation(t *testing.T) {
 // attempt, and abandoned has no automatic re-drive.
 //
 // The missing shape is what a peer serves while its ensure endpoint is still
-// rolling out — a stub answering {}, a proxy returning an empty 200 body. That
+// rolling out — a stub answering {}. That
 // is precisely the window in which the first target gets enabled, so filing it
 // as terminal would need a human to requeue every row created during it.
 func TestEnsureTreatsAnAbsentContainerIDAsRetryable(t *testing.T) {
@@ -128,7 +128,7 @@ func TestEnsureTreatsAnAbsentContainerIDAsRetryable(t *testing.T) {
 	// this branch — Decode returns io.EOF on it and the decode-failure branch
 	// catches it first. `null` is here because the corrected comment names it and
 	// the earlier test did not pin it.
-	for _, body := range []string{`{}`, `{"container_id":""}`, `null`} {
+	for _, body := range []string{`{}`, `{"container_id":""}`, `{"container_id":" "}`, `{"container_id":"\t\n"}`, `null`} {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(body))
@@ -143,6 +143,29 @@ func TestEnsureTreatsAnAbsentContainerIDAsRetryable(t *testing.T) {
 					"response, not proof the peer owns a different container (err=%v)", got, err)
 			}
 		})
+	}
+}
+
+// TestEnsureDecodeFailureHasSafeDetail keeps a malformed 200 response actionable
+// without persisting response bytes, which can contain the container capability.
+func TestEnsureDecodeFailureHasSafeDetail(t *testing.T) {
+	const containerID = "octows-deadbeef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("<html>" + containerID + "</html>"))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(nil, nil).Ensure(context.Background(), testTarget(server.URL+"/ensure"), EnsureRequest{
+		ContainerID: containerID, ProjectID: "p1", OctoSpaceID: "s1",
+	})
+	if got := Category(err); got != "invalid_response" {
+		t.Fatalf("category = %q, want invalid_response (err=%v)", got, err)
+	}
+	if got, want := Summary(err), "response body was not valid JSON"; got != want {
+		t.Fatalf("Summary = %q, want %q", got, want)
+	}
+	if strings.Contains(Summary(err), containerID) {
+		t.Fatalf("Summary leaks container id: %q", Summary(err))
 	}
 }
 
