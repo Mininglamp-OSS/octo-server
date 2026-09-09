@@ -415,6 +415,22 @@ func TestDigitalAvatarMembershipIsIndependentPerUser(t *testing.T) {
 	}
 	groupA, groupB := add(a), add(b)
 	require.NotEqual(t, groupA, groupB, "each user owns an independent private container")
+	createTeam := func(f fixture) string {
+		w := request(t, f, http.MethodPost, "/v1/ai-team/teams", "", map[string]interface{}{
+			"name": "Employee team", "bot_ids": []string{avatarID},
+		})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var team aiteammod.Team
+		decodeJSON(t, w, &team)
+		require.Len(t, team.Agents, 1)
+		require.Equal(t, avatarID, team.Agents[0].BotID)
+		return team.GroupNo
+	}
+	teamA, teamB := createTeam(a), createTeam(b)
+	w := request(t, a, http.MethodDelete, "/v1/ai-team/teams/"+teamA+"/members", "", map[string]interface{}{"bot_ids": []string{avatarID}})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	w = request(t, a, http.MethodPost, "/v1/ai-team/teams/"+teamA+"/members", "", map[string]interface{}{"bot_ids": []string{avatarID}})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	createSession := func(f fixture, key string) string {
 		w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+avatarID+"/sessions", key, map[string]string{"name": key})
@@ -430,8 +446,19 @@ func TestDigitalAvatarMembershipIsIndependentPerUser(t *testing.T) {
 	channelA := createSession(a, "avatar-a")
 	channelB := createSession(b, "avatar-b")
 
-	w := request(t, a, http.MethodDelete, "/v1/ai-team/agents/"+avatarID, "", nil)
+	w = request(t, a, http.MethodDelete, "/v1/ai-team/agents/"+avatarID, "", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	for _, tc := range []struct {
+		fixture fixture
+		groupNo string
+		count   int
+	}{{a, teamA, 0}, {b, teamB, 1}} {
+		w = request(t, tc.fixture, http.MethodGet, "/v1/ai-team/teams/"+tc.groupNo, "", nil)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var team aiteammod.Team
+		decodeJSON(t, w, &team)
+		require.Len(t, team.Agents, tc.count, "removal must only change this user's custom teams")
+	}
 	target, err := aiteampkg.LookupReadySessionTarget(testContext.DB(), channelA, userA)
 	require.NoError(t, err)
 	require.Nil(t, target, "removal must stop this user's active routing")

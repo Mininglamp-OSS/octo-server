@@ -2907,3 +2907,13 @@ Lessons from that task and its review:
   自动群隐藏、显式 @ 回复和 OpenClaw session 全流程。
 - Server 聚焦测试、build、vet、i18n 和 Web 76 条聚焦测试、i18n、CSS lint、生产构建通过；
   本地认证、LLM、端口及依赖产物均未纳入提交。
+
+## 2026-09-09 — digital-avatar-bot-kind（最新来源融合与 PR 收尾）
+
+- Rebase 到 `feat/multi-ai-teams` 的 `0bc8edac`；保留 hosted-only 个人分身通讯录规则和
+  独立数字员工目录，PR 依赖来源 #875。
+- 删除 Bot 授权和群列表中残留的 `ai_team_group` 旧表查询，统一校验有效群主/Agent 关系；
+  数字员工自定义团队复用既有资格策略，普通群仍拒绝，移除后立即撤权。
+- 无旧表的隔离实例真实接口验证 85 项通过、0 失败；build、全仓 vet、i18n、三个受影响
+  Go 测试包编译通过。按用户要求未做 BUA；固定共享库的破坏性测试初始化未执行。
+- 更新 brief、验收记录和复用经验；本地配置、认证材料和测试数据不纳入提交。

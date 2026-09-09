@@ -4,8 +4,11 @@ Date: 2026-09-09
 
 - Worktree: `/Users/kense/Projects/octo/octo-server-digital-avatar-bot-kind`
 - Branch: `feat/digital-avatar-bot-kind`
-- Base: `5053a00bcf95bfdd3e0919bb9fb2200ada781102`
-- Result: all acceptance criteria verified; no commit, push or PR was created.
+- Current base: `0bc8edaca4201a43beaf40342bc48d08da4dcb1a` (`feat/multi-ai-teams`, PR #875).
+- Latest result: **85 real-HTTP checks passed, 0 failed** after the final rebase;
+  build, vet, i18n and regression-test compilation passed. Ready for the
+  user-authorized commit, push and PR. Earlier sections retain historical
+  verification and superseded policy context; the last section is current.
 
 ## Test isolation
 
@@ -177,3 +180,81 @@ worktree had left migration `20191106000001_event_legacy01.sql` in its
 does not support a database override, and its cleanup only deletes table rows.
 The existing isolated test results above remain the recorded validation; the
 shared `test` database was not changed during this audit.
+
+## 2026-09-09: multi-team rebase and API-only verification
+
+- Rebased onto local `feat/multi-ai-teams` at `fe4f960a`; the Avatar commit is
+  now `410ab8f6`. `git range-diff` confirmed the rebased Avatar commit itself
+  is unchanged. The source commit hides custom AI teams from ordinary group,
+  conversation and category surfaces.
+- The subsequent integration audit found two obsolete table queries outside
+  the AI Team module: `pkg/botpolicy/authority.go` and
+  `modules/bot_api/groups.go` still queried `ai_team_group`. Both now use the
+  same live owner/Agent relation predicate over `group` and `ai_team_agent`.
+  Group membership, publication state, owner/Bot Space seats and tenant checks
+  remain required. Project-bound groups remain forbidden to Avatars.
+- Custom-team selection and internal membership admission now accept eligible
+  published Avatars, using the existing Bot policy. Public ordinary-group
+  admission remains forbidden. Extended existing regression tests cover
+  independent users' custom teams, Agent removal and revoked owner seats.
+- Reproduced before the fix using real HTTP requests: adding an Avatar to a
+  custom team returned 403, while Bot reads of the automatic and custom team
+  were rejected. After the fix the API run completed with **78 passed, 0
+  failed**; no BUA/browser tests were performed, as requested.
+- Live verification used `http://127.0.0.1:8097/api` (proxy to 8096), with
+  explicit database `octo_avatar_api_20260909`. The database has **no
+  `ai_team_group` table and no records for the two retired migrations**. The
+  copied legacy table was renamed to `archived_ai_team_group`; the source
+  database and a mode-0600 dump were preserved. No schema migration was added
+  to the repository.
+- HTTP coverage: OIDC session and User API Key exchange; three AI kinds;
+  Agent registration; session create/list/read/rename/mute/archive/unarchive/
+  delete; custom-team create/read/update/delete and member add/remove;
+  Avatar Bot group reads and group/thread sends; ordinary-group rejection;
+  categories, saved groups and recent conversations hiding AI groups after
+  actual messages; category mutation rejection; cross-Space denial;
+  immediate revocation after member/Agent removal and history reuse on re-add.
+- Build and regression-test compilation passed:
+  `go build -o /tmp/octo-avatar-bua.Jm62Fc/octo-server-api-current .`,
+  `go test -c ./modules/ai_team`, and `go test -c ./modules/bot_api`
+  (test binaries were written under the temporary verification directory).
+  The shared test harness was not executed in this verification: its
+  `NewTestServer` hardcodes `test` and deletes rows before migration setup.
+  An earlier invocation in this session had removed the previous temporary
+  `test`-database fixture; the current running server now explicitly uses the
+  isolated database instead.
+- Repository-wide SQL-reference search found no remaining reads/writes or
+  DDL targeting the retired table. `ai_team_group` remains a valid group
+  **purpose value**, not a table dependency.
+- Final focused `go vet` (`pkg/botpolicy`, `modules/ai_team`, `modules/bot_api`,
+  `modules/group`), `make i18n-extract-check`, `make i18n-lint`, and both
+  staged/unstaged `git diff --check` passed.
+
+## 2026-09-09: final rebase onto 0bc8edac and PR gates
+
+- The source branch advanced again; rebased the Avatar commit from `410ab8f6`
+  to `0f4c0a53` on `0bc8edac`. The only conflict was the Space directory
+  regression fixture. Resolution retains the source's `octo_hosted`-only
+  personal-bot display rule and the Avatar's separate `digital_employees`
+  collection; no vendor-hosted visibility was reintroduced.
+- Rebuilt and restarted the local backend against the same explicit isolated
+  database, without the retired `ai_team_group` table. Re-ran the HTTP script:
+  **85 passed, 0 failed**. All three AI kinds, AI-only group admission,
+  custom-team lifecycle, group/thread messaging, ordinary-surface hiding,
+  cross-Space denial, immediate removal revocation and historical reuse passed.
+- Added live directory assertions: hosted clone appears under its real owner;
+  local assistant does not appear there; Avatar appears independently, never
+  under a human owner; keyword and `only_with_agents` filtering preserve the
+  intended digital-employee behavior.
+- Final commands passed: `go build ./...`, the runnable-server build,
+  `go test ./pkg/botpolicy` (no database harness), `go test -c` for
+  `modules/space`, `modules/ai_team` and `modules/bot_api`,
+  `go vet ./...`, `make i18n-extract-check`, `make i18n-lint`, and
+  `git diff --check`. Database-backed Go test binaries were compiled, not
+  executed, because the existing harness destructively targets the shared
+  `test` database. No BUA/browser testing was performed in this pass.
+- SQL-reference audit again found no reads, writes or DDL targeting the
+  retired table. The `ai_team_group` purpose string remains intentional.
+- The PR targets upstream `main` and depends on source PR #875. Local
+  `assets/web/js/config.js`, authentication bridge, credentials, runtime
+  scripts, binaries and test data are excluded from the commit.

@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -111,7 +112,7 @@ func resolveEligibleTeamAgentsTx(tx *dbr.Tx, spaceID, userUID string, botIDs []s
 	var agents []*teamAgentRef
 	_, err := tx.SelectBySql(`SELECT a.id,a.bot_id FROM ai_team_agent a
 		JOIN robot r ON r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci
-			AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND r.status=1
+			AND r.status=1 AND `+botpolicy.TeamEligibilitySQL("r", "a.user_uid COLLATE utf8mb4_0900_ai_ci", "a.space_id COLLATE utf8mb4_0900_ai_ci")+`
 		JOIN user u ON u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND u.status=1 AND u.is_destroy<>2
 		JOIN space_member sm ON sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci
 			AND sm.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND sm.status=1

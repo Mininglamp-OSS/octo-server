@@ -58,14 +58,7 @@ func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 			JOIN space_member sm ON sm.space_id=s.space_id AND sm.uid=r.robot_id AND sm.status=1
 			WHERE gm.uid=? AND gm.status=1 AND gm.is_deleted=0 AND gm.is_external=0
 			AND ` + botpolicy.AvatarInSpaceSQL("r", "s.space_id") + `
-			AND ((g.purpose='ai_session_container' AND EXISTS (SELECT 1 FROM ai_team_agent a
-				WHERE a.group_no=g.group_no AND a.bot_id=r.robot_id AND a.is_added=1 AND a.container_state=2))
-				OR (g.purpose='ai_team_group' AND EXISTS (SELECT 1 FROM ai_team_group tg
-					JOIN ai_team_agent a ON a.space_id=tg.space_id AND a.user_uid=tg.user_uid
-					WHERE tg.group_no=g.group_no AND tg.state=2 AND a.bot_id=r.robot_id
-						AND a.is_added=1 AND a.container_state=2)))
-			AND (IFNULL(g.project_id,'')='' OR EXISTS (SELECT 1 FROM octo_project_member pm
-				WHERE pm.project_id=g.project_id AND pm.uid=r.robot_id AND pm.status=1 AND pm.removing=0))`
+			AND ` + botpolicy.AIGroupRelationSQL("g", "r.robot_id")
 		args := []interface{}{robotID}
 		if spaceID != "" {
 			query += " AND g.space_id=?"

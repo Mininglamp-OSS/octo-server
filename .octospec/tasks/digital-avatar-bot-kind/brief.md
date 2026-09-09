@@ -8,7 +8,7 @@ source: user
 status: verified
 decision: "B — robot.kind"
 approval: "方案B吧 重新整个worktree实现"
-base_commit: 5053a00bcf95bfdd3e0919bb9fb2200ada781102
+base_commit: 0bc8edaca4201a43beaf40342bc48d08da4dcb1a
 ---
 
 # 数字分身：方案 B 实施规格
@@ -21,7 +21,8 @@ base_commit: 5053a00bcf95bfdd3e0919bb9fb2200ada781102
 
 - 分支：`feat/digital-avatar-bot-kind`
 - Worktree：`/Users/kense/Projects/octo/octo-server-digital-avatar-bot-kind`
-- 基线：当前 `feat/ai-team-integration` 的 `5053a00b`
+- 基线：`feat/multi-ai-teams` 的 `0bc8edac`（含自定义 AI 团队、普通入口隐藏规则及仅展示 octo_hosted 个人分身的通讯录规则）。
+- 收尾授权：用户已要求重新 rebase、提交并提 PR；不包含合并或部署。
 - 其他 digital-employees worktree 仅作参考，不采用其 App Bot 会话特例作为最终模型。
 
 ## Goal
@@ -55,8 +56,13 @@ base_commit: 5053a00bcf95bfdd3e0919bb9fb2200ada781102
 
 - Avatar 不得通过普通群、邀请确认、预设群、组织事件或项目全员群路径加入群；
   即使遗留 `group_member` 行存在，运行时也必须拒绝访问。
-- 只有 AI Team 服务可将 Avatar 投影到私有容器群和“我的 AI 团队”受控群；
+- 只有 AI Team 服务可将 Avatar 投影到私有容器群、自动全员群和自定义 AI 团队；
   群/子区访问仍须验证 AI Team 关系、有效 Space 席位与父资源。
+- 三类 AI 的群与子区均从普通群、会话和分类入口隐藏；普通群接口不能绕过
+  AI Team 成员管理。数字员工加入自定义团队仍需当前用户已激活该 Agent，
+  以及有效发布状态和对应 Space 席位；其他用户的个人 Bot 仍不可加入。
+- `ai_team_group` 旧表和两份旧迁移已废弃，不恢复。自动与自定义团队以现有
+  `group` / `group_member` 为事实来源，并关联 `ai_team_agent` 校验使用者权限。
 - 项目管理员可添加和移除 avatar。当前基线 project D15 已实施个人 Agent
   owner 校验，必须新增明确的 avatar 准入分支，不能仅依赖 Space 席位。
 - 个人用户的离开不级联带走 avatar；管理员显式移除和下架清理仍生效。
@@ -110,7 +116,7 @@ Avatar 使用显式允许清单；新路由、未知能力默认拒绝。
 - **error-response / i18n:** 注册错误码、统一 envelope、不泄露 token/租户信息。
 - **rate-limit:** 管理入口共享 UID 限流、Bot 现有限流、共享队列运维配置。
 - **testing:** 正反能力、跨 Space、独立成员、生命周期失败/重试/并发和存量回归。
-- **commit:** 若后续要求提交，使用英文 Conventional Commits；本阶段不提交。
+- **commit:** 使用英文 Conventional Commits 提交；按用户授权推送 feature 分支并创建 PR。
 
 ## Implementation checklist
 
@@ -147,13 +153,16 @@ Avatar 使用显式允许清单；新路由、未知能力默认拒绝。
 11. 运行聚焦及跨模块集成/并发测试，i18n-extract-check、i18n-lint、
     go build ./...、go vet ./...、git diff --check。
     使用隔离测试状态，命令与结果记入 verification.md。
+12. 不存在 `ai_team_group` 表时，数字员工仍可加入、读取和退出自定义 AI 团队，
+    并读取自己的私有容器和自动全员群；移除成员或 Agent 后立即撤权。
+    本次融合按用户要求使用真实接口验证，不进行 BUA 页面测试。
 
 ## Out of scope
 
 - 迁移/升级现有 App Bot（包括 Octo Assistant）。
 - OBO/个人分身实现、把 runtime hosting 当权限。
 - octo-web、OpenClaw 插件、fleet/daemon 修改。
-- 部署、commit、push、PR、合并。
+- 部署、合并；commit、push、PR 已由后续用户指令纳入收尾范围。
 
 ## 名称
 

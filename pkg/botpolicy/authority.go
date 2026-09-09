@@ -79,6 +79,26 @@ func CanManageAvatar(q Queryer, identity *Identity, actor string, superadmin boo
 	return count == 1, err
 }
 
+// AIGroupRelationSQL authorizes the active owner/Agent relationship behind an
+// AI group. The group row is authoritative for automatic and custom teams;
+// private containers additionally require the exact Agent container binding.
+// Callers must also check live Bot/Space seats and actual group membership.
+// Aliases and expressions must come from source code, never request values.
+func AIGroupRelationSQL(group, bot string) string {
+	return `(IFNULL(` + group + `.project_id,'')=''
+		AND ` + group + `.purpose IN ('ai_session_container','ai_team_group','ai_custom_team_group')
+		AND EXISTS (SELECT 1 FROM ai_team_agent a
+			JOIN space_member owner_sm ON owner_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci
+				AND owner_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND owner_sm.status=1
+			JOIN user owner_u ON owner_u.uid=owner_sm.uid AND owner_u.status=1 AND owner_u.is_destroy<>2
+			WHERE a.space_id=` + group + `.space_id COLLATE utf8mb4_0900_ai_ci
+				AND a.user_uid=` + group + `.creator COLLATE utf8mb4_0900_ai_ci
+				AND a.bot_id=` + bot + ` COLLATE utf8mb4_0900_ai_ci
+				AND a.is_added=1 AND a.container_state=2
+				AND (` + group + `.purpose<>'ai_session_container'
+					OR a.group_no=` + group + `.group_no COLLATE utf8mb4_0900_ai_ci)))`
+}
+
 // CanAccessChannel combines capability-independent resource authority with
 // live lifecycle and tenant membership. No owner bypass applies to avatars.
 func CanAccessChannel(q Queryer, uid, channelID string, channelType uint8, spaceHint string) (bool, error) {
@@ -108,23 +128,9 @@ func CanAccessChannel(q Queryer, uid, channelID string, channelType uint8, space
 		JOIN space_member sm ON sm.space_id=s.space_id AND sm.uid=r.robot_id AND sm.status=1
 		WHERE r.robot_id=? AND `+AvatarInSpaceSQL("r", "s.space_id")+`
 		AND (?='' OR s.space_id=?)
-		AND g.purpose IN (?, ?)
 		AND (?='' OR EXISTS (SELECT 1 FROM thread t WHERE t.group_no=g.group_no AND t.short_id=? AND t.status<>3))
-		AND (IFNULL(g.project_id,'')='' OR EXISTS (SELECT 1 FROM octo_project_member pm
-			WHERE pm.project_id=g.project_id AND pm.uid=r.robot_id AND pm.status=1 AND pm.removing=0))
-		AND ((g.purpose='ai_session_container' AND EXISTS (SELECT 1 FROM ai_team_agent a
-			JOIN space_member owner_sm ON owner_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci
-				AND owner_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND owner_sm.status=1
-			JOIN user owner_u ON owner_u.uid=owner_sm.uid AND owner_u.status=1 AND owner_u.is_destroy<>2
-			WHERE a.group_no=g.group_no COLLATE utf8mb4_0900_ai_ci AND a.bot_id=r.robot_id COLLATE utf8mb4_0900_ai_ci
-			AND a.is_added=1 AND a.container_state=2)) OR
-			(g.purpose='ai_team_group' AND EXISTS (SELECT 1 FROM ai_team_group tg
-			JOIN ai_team_agent a ON a.space_id=tg.space_id COLLATE utf8mb4_0900_ai_ci
-				AND a.user_uid=tg.user_uid COLLATE utf8mb4_0900_ai_ci
-			WHERE tg.group_no=g.group_no COLLATE utf8mb4_0900_ai_ci AND tg.state=2
-				AND a.bot_id=r.robot_id COLLATE utf8mb4_0900_ai_ci AND a.is_added=1
-				AND a.container_state=2)))`,
-		groupNo, uid, spaceHint, spaceHint, "ai_session_container", "ai_team_group", shortID, shortID).LoadOne(&count)
+		AND `+AIGroupRelationSQL("g", "r.robot_id"),
+		groupNo, uid, spaceHint, spaceHint, shortID, shortID).LoadOne(&count)
 	return count == 1, err
 }
 

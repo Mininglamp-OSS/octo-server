@@ -684,7 +684,7 @@ func (d *DB) admitOrRestoreMembersTx(
 			if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
 				return fmt.Errorf("group: query AI-team admission target: %w", err)
 			}
-			if purpose != aiteampkg.GroupPurpose && purpose != aiteampkg.TeamGroupPurpose {
+			if !aiteampkg.IsProtectedPurpose(purpose) {
 				return ErrAvatarOrdinaryGroupDenied
 			}
 		}

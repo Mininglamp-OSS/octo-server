@@ -239,6 +239,32 @@ func TestAvatarResourceAuthorizationCoversDMGroupThreadAndProject(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, allowed, "the server-owned AI Team container grants access")
 
+	// Automatic and custom teams use only group/group_member + ai_team_agent;
+	// no legacy aggregate-state table is needed to authorize either purpose.
+	for _, purpose := range []string{aiteampkg.TeamGroupPurpose, aiteampkg.CustomTeamPurpose} {
+		_, err = ctx.DB().Update("group").Set("purpose", purpose).Where("group_no=?", groupNo).Exec()
+		require.NoError(t, err)
+		allowed, err = botpolicy.CanAccessChannel(ctx.DB(), robotID, groupNo, common.ChannelTypeGroup.Uint8(), spaceID)
+		require.NoError(t, err)
+		require.True(t, allowed, purpose)
+		_, err = ctx.DB().Update("ai_team_agent").Set("is_added", 0).Where("bot_id=?", robotID).Exec()
+		require.NoError(t, err)
+		allowed, err = botpolicy.CanAccessChannel(ctx.DB(), robotID, groupNo, common.ChannelTypeGroup.Uint8(), spaceID)
+		require.NoError(t, err)
+		require.False(t, allowed, "stale group membership must not override Agent removal")
+		_, err = ctx.DB().Update("ai_team_agent").Set("is_added", 1).Where("bot_id=?", robotID).Exec()
+		require.NoError(t, err)
+		_, err = ctx.DB().Update("space_member").Set("status", 0).Where("space_id=? AND uid=?", spaceID, humanID).Exec()
+		require.NoError(t, err)
+		allowed, err = botpolicy.CanAccessChannel(ctx.DB(), robotID, groupNo, common.ChannelTypeGroup.Uint8(), spaceID)
+		require.NoError(t, err)
+		require.False(t, allowed, "the team owner's Space seat must remain active")
+		_, err = ctx.DB().Update("space_member").Set("status", 1).Where("space_id=? AND uid=?", spaceID, humanID).Exec()
+		require.NoError(t, err)
+	}
+	_, err = ctx.DB().Update("group").Set("purpose", aiteampkg.GroupPurpose).Where("group_no=?", groupNo).Exec()
+	require.NoError(t, err)
+
 	shortID := "thread_" + util.GenerUUID()[:8]
 	_, err = ctx.DB().InsertBySql("INSERT INTO thread (short_id,group_no,name,creator_uid,status) VALUES (?,?,?,?,1)",
 		shortID, groupNo, "Avatar thread", humanID).Exec()
