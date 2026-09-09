@@ -8,6 +8,11 @@ import (
 
 const directoryAgentsPerOwner = 50
 
+// directoryAgentHostingOctoHosted is the only self-reported hosting value the
+// Space directory treats as a visible cloud agent. This is not an authz
+// signal: any holder of the bot's bf_ token can claim the value.
+const directoryAgentHostingOctoHosted = "octo_hosted"
+
 // The legacy user and space_member tables can carry a different collation from
 // migration-created user_verification. Pin the completed display expression so
 // keyword matching remains valid on both schema shapes without changing the
@@ -20,7 +25,7 @@ const directoryOwnerDisplayNameExpr = "(COALESCE(NULLIF(u.name, ''), NULLIF(uv.r
 func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) ([]*directoryOwnerModel, error) {
 	var owners []*directoryOwnerModel
 	systemBots := spacepkg.SystemBotList()
-	args := make([]interface{}, 0, 6)
+	args := make([]interface{}, 0, 8)
 	query := `
 		SELECT
 			sm.uid,
@@ -40,18 +45,28 @@ func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) 
 			INNER JOIN robot r
 				ON r.robot_id=bot_sm.uid
 				AND r.status=1
-				AND r.agent_hosting<>'self_hosted'
+				AND r.agent_hosting='` + directoryAgentHostingOctoHosted + `'
 			INNER JOIN ` + "`user`" + ` bot_u
 				ON bot_u.uid=r.robot_id
 				AND bot_u.robot=1
+			INNER JOIN space_member owner_sm
+				ON owner_sm.space_id=bot_sm.space_id
+				AND owner_sm.uid=r.creator_uid
+				AND owner_sm.status=1
+			INNER JOIN ` + "`user`" + ` owner_u
+				ON owner_u.uid=owner_sm.uid
+				AND owner_u.robot=0
+				AND owner_u.status=1
+				AND COALESCE(owner_u.is_destroy, 0)<>2
 			WHERE bot_sm.space_id=?
 				AND bot_sm.status=1
 				AND r.creator_uid<>''
 				AND bot_sm.uid NOT IN ?
+				AND owner_sm.uid NOT IN ?
 				AND IFNULL(bot_u.name, '') LIKE ?` + likeEscapeClause + `
 		) matched_bot ON matched_bot.creator_uid=sm.uid
 		`
-		args = append(args, spaceID, systemBots, buildLikePattern(keyword))
+		args = append(args, spaceID, systemBots, systemBots, buildLikePattern(keyword))
 	}
 	query += `
 		WHERE sm.space_id=?
@@ -78,9 +93,11 @@ func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) 
 }
 
 // queryDirectoryAgents returns at most directoryAgentsPerOwner details per
-// eligible owner while retaining the exact count for that owner. agent_hosting
-// is bot self-reported telemetry and therefore filters this presentation only;
-// it must never be reused for authorization or other security decisions.
+// eligible owner while retaining the exact count for that owner. Only
+// octo_hosted bots with an eligible human owner in this Space are visible.
+// agent_hosting is bot self-reported telemetry and therefore filters this
+// presentation only; it must never be reused for authorization or other
+// security decisions.
 func (d *DB) queryDirectoryAgents(ctx context.Context, spaceID, loginUID, keyword string) ([]*directoryAgentModel, error) {
 	var agents []*directoryAgentModel
 	systemBots := spacepkg.SystemBotList()
@@ -96,7 +113,7 @@ func (d *DB) queryDirectoryAgents(ctx context.Context, spaceID, loginUID, keywor
 			INNER JOIN robot r
 				ON r.robot_id=bot_sm.uid
 				AND r.status=1
-				AND r.agent_hosting<>'self_hosted'
+				AND r.agent_hosting='` + directoryAgentHostingOctoHosted + `'
 			INNER JOIN ` + "`user`" + ` bot_u
 				ON bot_u.uid=r.robot_id
 				AND bot_u.robot=1

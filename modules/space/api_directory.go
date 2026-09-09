@@ -41,9 +41,10 @@ type directoryAgentResp struct {
 }
 
 // listDirectory returns each active human in a verified Space with the
-// non-self-hosted user bots they own. The hosting value is self-reported by a
-// bot, so this endpoint uses it solely as a display filter, never as an authz
-// or tenancy signal.
+// octo_hosted user bots they own. A bot with no eligible human owner in this
+// Space is omitted. The hosting value is self-reported by a bot, so this
+// endpoint uses it solely as a display filter, never as an authz or tenancy
+// signal.
 func (s *Space) listDirectory(c *wkhttp.Context) {
 	spaceID := c.Query("space_id")
 	if spaceID == "" {
