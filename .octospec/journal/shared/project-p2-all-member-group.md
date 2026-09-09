@@ -493,6 +493,175 @@ every five minutes on every pod against a core IM table. The two scans now ride 
 same switch as the three that cannot survive the drift, for a different stated
 reason, so the next reader does not "fix" the inconsistency by moving them back.
 
+### A guard passing for the wrong reason cannot expose its own blind spot
+
+The bot-deletion census kept a list of primitives it must keep recognising, precisely so
+the matcher could not rot into a test that asserts nothing. `deleteCreatedBotArtifacts`
+was on that list and was found on every run — and the matcher was still blind to the
+spelling that function actually uses. It uses `DeleteFrom("robot")`, which the matcher
+did not know; it registered as a primitive only because of an unrelated raw `UPDATE` in
+its fail-closed fallback.
+
+So the anti-vacuity check was green, and green for a reason unrelated to the thing it was
+protecting. That is a failure mode worth naming separately from vacuity: an assertion can
+be non-vacuous, correct, and still incapable of detecting the defect it was written
+against, because the sample it holds up is passing through a different code path than the
+one under test. The check for it is the same one that keeps catching things here — mutate,
+and mutate with the shape you claim to cover, not the shape you already handle.
+
+### Classifying a thing wrongly can make a fix pass its own mutation
+
+The fix for the second census bypass — a disable spelled across two functions — was
+written first as "the caller is a primitive". It was, in a sense. It also meant the caller
+was skipped by the rule that a primitive is not a door onto itself, and since nothing
+called it, nothing was asserted about it. The mutation stayed green against the fix
+written for it.
+
+The correct classification is that the caller is a **door**: in that shape the deletion
+site is the function holding the literal, because the `UPDATE` it borrows lives in a
+generic helper that is not itself a deletion. Same code, same coverage, opposite outcome
+— the taxonomy was load-bearing and looked like naming.
+
+### "Same retryable error" is a claim about the input, not about the error
+
+The Space-removal finalizer returned the cascade's retryable error when its page budget
+ran out, and said so in a comment: same error, same meaning. The error was the same. The
+meaning was not, and the difference is the only property that makes a retry worth asking
+for.
+
+The cascade re-queries *active* seats, so every row it closes leaves its own result set:
+each retry starts from a smaller input and the walk terminates. The finalizer's query
+deliberately has no status filter — with one it returns the empty set and converges
+nothing — so a retry re-reads the same first page forever, and the job spends its whole
+attempt budget on a walk that cannot advance, dragging every already-successful step
+through the re-runs with it.
+
+Two call sites can share an error value, a retry mechanism and a page budget and still
+disagree about whether retrying does anything. The question to ask of any "retry later" is
+not what it returns; it is what will be different next time.
+
+### A non-locking read narrows a window; it does not close one — and the obvious fix was a deadlock
+
+An in-transaction re-read was added to make the owner sync judge attribution from an
+authoritative snapshot. It reads into the transaction's read view, which means a write
+committing afterwards is invisible to it — and *invisible* is not *blocked*. The
+subsequent `group_member` locks do not revalidate the `group` row, so the sync proceeds on
+an attribution that is no longer true.
+
+The distinction is easy to lose because both readings sound like isolation. "I will not
+see a later write" protects you from a torn view of the past. "A later write will wait for
+me" is what protects a decision you are about to act on. Only the second one was wanted
+here, and taking a shared lock on the `group` row looked free: it sits exactly where the
+declared lock order already puts it.
+
+It was not free, and the reason is the more useful half of this entry. P1's cascade takes
+`group_member` first and then, on its no-successor branch, an exclusive lock on the same
+`group` row — `group_member` then `group`. A locking re-read here is `group` then
+`group_member`. Both paths reach the same all-member group (the cascade's detach branch
+needs "nobody in the group is still in the project", which a one-person project satisfies
+the moment its owner leaves), so concurrently that is ABBA and MySQL kills one side.
+
+So the lock was reverted and the window written down instead — with what it costs (a
+Space-direct group with a possibly-wrong creator, repairable by an ordinary transfer,
+because Space-direct means D7 no longer applies) and what has to happen first (the
+cascade's inversion of the declared order is the actual defect; straightening it is a
+change to a load-bearing path and deserves its own analysis).
+
+Two things worth keeping from this. **"It is in the declared lock order" is a statement
+about one call site, not about the system** — the order only holds if every path obeys it,
+and the one that did not was the reason. And **a fix that survives the full suite can still
+be wrong**: nothing here failed. It took reading the other path's lock sequence to see it.
+
+### "Is this breaking?" and "is this right?" are different questions, and the first one can hide the second
+
+`member_count` was flagged as the one change in this feature that would visibly break
+clients: redefined from "everyone" to "humans only", so any project with agents renders a
+smaller number. The whole discussion was about blast radius — how many clients read it,
+what the fallback costs, whether to measure it first.
+
+The blast radius turned out to be zero -- though I got the reason wrong, and the fifth
+review caught it by checking something I had only asserted. I wrote that the module "has
+never been GA, so nothing had shipped against either meaning". v1.18.0 (2026-09-07) ships
+42 files under modules/project, including this field, filled from countActiveMembers --
+the total. What never shipped is the humans-only redefinition: `git tag --contains` puts
+566e625 on no release.
+
+So the conclusion held and the argument did not, and the true argument is stronger: this
+restores the meaning that is in a release tag and retires the one that is not. **A
+justification that rests on a status ("never GA") instead of on something countable ("no
+tag contains this commit") is a claim nobody can check without redoing the work** -- and
+this is the sentence a future wire change will cite. Under the question as asked, that is
+the end of it: not breaking, no action.
+
+Asking the second question found something the first could not. This server already ships
+`member_count` — meaning the total — beside `human_member_count` and `agent_member_count`,
+from a different module, to the same client teams. So the change was not breaking; it was
+*inconsistent*, and inconsistent in a way that fails silently: both fields are ints, both
+compile, and a client author who learned the convention from one module renders the wrong
+number in the other. No test on either side can catch it, because neither side is wrong on
+its own.
+
+The fix was the fallback that had been designed for the breakage that did not exist —
+restore `member_count`, add the two split fields — adopted for an entirely different
+reason. Worth noticing: had the first question come back "yes, breaking", the same fix
+would have landed and the naming collision would have gone unnoticed, because the answer
+would have arrived before anyone looked at what the field ought to mean.
+
+The original argument for the change was sound and remains in the code: a project with one
+person and two of their agents should not render "3 人". That is a claim about what a
+client should DISPLAY. It was answered by changing what the server MEANS. Those are
+adjacent enough to substitute for each other without anyone noticing, and the substitution
+costs a name.
+
+### A guard can draw its line on spelling and explain it in semantics
+
+The census matched a literal `"status": 0`. Two live endpoints turn a bot off without one
+— one assigns a parsed parameter to a struct field, the other puts the value in a
+caller-supplied map — and the write that reaches the database from the first is
+byte-identical to the write the guard classifies as a deletion primitive. The only
+difference between "primitive" and "invisible" was where the zero was typed.
+
+What made it durable rather than merely wrong was the comment. It said the non-match was
+*correct*, because those endpoints are "a reversible disable, not a deletion". That
+sentence is about meaning; the behaviour it explained was about syntax. And the primitive
+it contrasted against — `deleteRobotSoft` — is exactly as reversible, so the distinction
+did not even hold on its own terms. A reader checking the guard would have found a reason
+and stopped.
+
+A justification written for behaviour you did not verify is worse than no justification:
+absence invites the next reader to look, and a plausible reason tells them not to.
+
+### A matcher branch with no example is a branch that has already stopped working
+
+Round 11 found the census passing for the wrong reason: an exempt primitive matched
+through an unrelated fallback, so the branch meant to catch its real spelling was never
+exercised. The fix added three branches. A reviewer then deleted each of the three and
+found the suite still green — nothing in the tree spells those shapes today.
+
+So the fix had the property it was fixing, one level up. The outcome assertion ("every
+door routes or is exempt") cannot see this, because it is true of a matcher that detects
+nothing as long as the tree contains nothing to detect. The two things are only
+independent if something exercises the detection paths directly, and in this case that
+means fixtures parsed from source strings — the tree cannot supply an example of a shape
+whose whole point is that the tree does not contain it yet.
+
+Worth stating as a rule, because this chain has now produced the same shape at three
+levels: **guards should assert their own detection paths, not only their outcomes.**
+
+### Widening a matcher tells you what it was quietly filing away
+
+Making the rule effect-based immediately produced a false positive — a function that
+hands `SetMap` a map it builds itself, all `agent_*` columns, never `status`. The first
+rule said "not a literal", which is not the same as "the caller's": a locally built map
+has knowable columns, a parameter does not.
+
+The correction narrowed the rule to `SetMap(p)` where `p` is one of the function's own
+parameters, and that narrowing removed a class of accusation the old rule was already
+making — callers of `setDescription`, `updateBotCommands`, `updateRobotIMTokenCache`
+could be reported as bot-deletion doors and told to call `CloseAllSpaceSeats`, which for
+them is actively wrong advice. The false positive was not a cost of widening; it was
+already there, hidden behind a narrower trigger.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

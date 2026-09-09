@@ -33,10 +33,50 @@ package space
 //     same-named primitives in different packages would collapse into one. The
 //     "known primitives must still be found" assertion is what keeps that from
 //     going silent for the three that exist today.
+//     The name space is FLAT and repo-wide: `primitives`, `statusCapableWriters`
+//     and the `f.calls[name]` lookup are all keyed by bare function name, while
+//     d14ExemptDoors is keyed "file:func". That asymmetry is deliberate — an
+//     exemption must not be inherited by a same-named function elsewhere.
+//     Two consequences, and they fail in OPPOSITE directions, which the earlier
+//     wording ("both fail loudly, not silently") got wrong about the second:
+//       - an unrelated `updateRobot` in another package WOULD inherit door-candidate
+//         status, and a same-named non-primitive is excluded from the door scan by
+//         `primitives[f.name] == nil`. Loud.
+//       - `primitives` is assigned last-write-wins, so two same-named bot-disabling
+//         functions in different packages collapse to one entry and the dropped one
+//         is never seen by the uncalled-primitive rule. SILENT. Not live today —
+//         deleteRobot, deleteRobotSoft and deleteCreatedBotArtifacts each have exactly
+//         one definition — and keying by file:func would close it. Recorded rather
+//         than fixed, because it changes the assembly, which this round did not.
+//         PR #868's sixth review.
+//   - Scope, since "the tree" is not the whole repository: the scan roots are
+//     `modules`, `pkg` and `internal`, so `main.go`, `tools/` and `scripts/` are never
+//     parsed (grepped: no robot write in any of them today). And the census watches the
+//     `robot` axis only — a bot whose `user` row is destroyed by the account-destruction
+//     path never becomes a door here.
+//   - The raw-SQL side is fail-CLOSED as of PR #868's sixth review, which found it
+//     failing OPEN on four spellings — a table alias, the AS form, a backticked column
+//     and an upsert — each classifying as nothing at all rather than as an over-match.
+//     Backticks are stripped, aliases tolerated, and the upsert's assignment list read
+//     as what it is. Every gap in this file is meant to fail loudly; those four did the
+//     opposite, in a file whose header said so.
+//   - writesStatusColumn / setsStatusZero are set from ANY `.Set` or key-value in
+//     the function body, not only from the statement that targets `robot`. A
+//     function that updates `robot` in one statement and writes `"status": 0` to
+//     another table in a second is therefore classified as a deletion primitive.
+//     Over-match, fail-closed: a false primitive is a false door and a loud
+//     failure, never a missed one. Pinned by the last fixture below.
 //   - A door is the DIRECT caller of a primitive. If someone puts a wrapper between
 //     the handler and the primitive, this reports the wrapper — which fails loudly
 //     and is the safe direction, rather than passing because the seam is one frame
 //     further up.
+//   - Indirection is resolved ONE level: a caller of a STATUS-CAPABLE writer is a door
+//     candidate (step 0 below). A disable assembled across two hops would still be
+//     invisible.
+//   - The matched spellings are enumerated by
+//     TestCensusMatcherSeesEverySpellingItClaimsTo, which is the list to read and the
+//     list to extend. It exists because deleting any one of these branches used to
+//     leave the whole suite green.
 
 import (
 	"go/ast"
@@ -70,6 +110,25 @@ var d14ExemptPrimitives = map[string]string{
 // primitive behind the chat-command door AND the compensation used when bot creation
 // half-fails. The primitive cannot be exempt; that one call site can.
 var d14ExemptDoors = map[string]string{
+	"modules/robot/api_manager.go:updateRobotStatus": "超管**停用/启用** bot（PUT /robot/status/{id}/{status}）。" +
+		"停用不是删除：可逆、不释放 username、不轮换 token，账号仍然存在，所以不走 D14。" +
+		"第十一轮 review 的第 7 条把它单独拎出来过，并把「停用该不该释放项目席位」定性为**产品决策**——" +
+		"在那件事定下来之前，这里登记豁免而不是替产品做主。" +
+		"残留说清楚：被停用的 bot 保留 space_member、octo_project_member（仍占 max_members 配额）与全部群成员行，" +
+		"而本 PR 之前引入的资格判定把 robot.status != 1 一律视为不可用分身，D13 也不会回收它的席位——" +
+		"于是系统自己认为它「不是可用分身」，却没有任何东西对账这件事。" +
+		"注意这扇门的 0 是**参数畸形时的默认值**（ParseInt64OrDefault(param, 0)），所以是可以被误触的。" +
+		"——而这一句不是这条豁免的一部分，是一个**未修的缺陷**，必须分开读：api_manager.go 里 " +
+		"status 从路径段解析后直接写进 robot.Status，没有跟合法状态集校验过，所以 " +
+		"PUT /robot/status/{id}/abc 会静默停用一个 bot，/999 会把 999 写进状态列。" +
+		"PR #868 第四轮 review 指出：因为本 PR 把 d14ExemptDoors 变成了必须被消费的断言，" +
+		"把这扇门登记在这里，等于让普查从此不再报它——一条豁免会替一个输入校验缺陷提供永久掩护。" +
+		"所以写明：**产品决策部分是豁免，参数校验部分不是**，后者记在 " +
+		"project-p2-all-member-group/context.yaml 的 open_verification 下，" +
+		"该修就修，不因为这条豁免存在而算已定。",
+	"modules/robot/api_manager.go:robotUpdate": "超管编辑 bot（PUT /robots/{id}），status 是可选字段之一，" +
+		"经 updateRobotInfo 的调用方字段表落库。与上一条同一件事、同一个理由、同一份残留，" +
+		"只是换了一个更宽的端点：这里还能同时改 description。",
 	"modules/botfather/command.go:tryCreateBotCore": "创建失败的补偿：AddUser 失败后回滚刚插入的 " +
 		"robot 行。此刻 Bot 还没有走到任何 Space 绑定，没有席位可关。与 " +
 		"deleteCreatedBotArtifacts 同一类，只是复用了 deleteRobot 这个原语。" +
@@ -83,8 +142,44 @@ var d14Seam = map[string]bool{
 	"closeSeatsFn":       true,
 }
 
-// rawRobotDisable matches the raw-SQL spelling of "turn this bot's account off".
-var rawRobotDisable = regexp.MustCompile(`(?is)update\s+` + "`?robot`?" + `\s+set\s+status\s*=\s*0`)
+// The raw-SQL matchers.
+//
+// One shape decides everything: find the clause a statement ASSIGNS in, then look for
+// the status column THERE and not in the WHERE. Two live statements write
+// bound_agent_ref guarded by `status=1` in their WHERE, so a matcher that looked for
+// `status =` anywhere in the string would call both of them bot disables.
+//
+// PR #868's sixth review found the previous version failing OPEN on four spellings —
+// a table alias (`UPDATE robot r SET r.status=0`), the AS form, a backticked column
+// (UPDATE robot SET `status`=0) and an upsert (`... ON DUPLICATE KEY UPDATE status=0`).
+// Each classified as neither primitive nor status-capable, so the function was invisible
+// and its callers never became door candidates. That matters more than the count of
+// spellings: every other gap in this file is argued as fail-CLOSED — an over-match is a
+// false door and a loud red, never a missed deletion — and these four were the opposite,
+// in a file whose header says so and whose fixture table calls itself the authoritative
+// list. A stated guarantee the code did not hold.
+//
+// Backticks are stripped before matching rather than spelled into every pattern, so
+// quoting cannot hide a match anywhere and each regex stays readable.
+func normalizeRawSQL(sql string) string { return strings.ReplaceAll(sql, "`", "") }
+
+// rawRobotAssignClause captures the SET clause of an UPDATE on the robot table,
+// tolerating an optional alias in either spelling (`robot r`, `robot AS r`).
+var rawRobotAssignClause = regexp.MustCompile(`(?is)update\s+robot(?:\s+(?:as\s+)?\w+)?\s+set\s+(.*?)(?:\swhere\s|$)`)
+
+// rawRobotUpsertClause captures the assignment list of an INSERT ... ON DUPLICATE KEY
+// UPDATE on the robot table, which is an UPDATE of an existing row by another name.
+var rawRobotUpsertClause = regexp.MustCompile(`(?is)insert\s+into\s+robot\b.*?\son\s+duplicate\s+key\s+update\s+(.*?)$`)
+
+// rawStatusAssignment matches a status assignment inside such a clause, qualified
+// (`r.status=`) or not. Any value: status-capable.
+var rawStatusAssignment = regexp.MustCompile(`(?is)\bstatus\s*=`)
+
+// rawStatusZeroAssignment is the same, narrowed to the literal zero: a deletion primitive.
+var rawStatusZeroAssignment = regexp.MustCompile(`(?is)\bstatus\s*=\s*0\b`)
+
+// rawRobotDelete matches the raw-SQL spelling of "remove the bot's account row".
+var rawRobotDelete = regexp.MustCompile(`(?is)delete\s+from\s+robot\b`)
 
 type censusFunc struct {
 	name   string
@@ -94,10 +189,29 @@ type censusFunc struct {
 	// updatesRobotTable is `.Update("robot")` — the dbr spelling of a write to the
 	// bot account table, matched with its argument so `.Update("user")` cannot count.
 	updatesRobotTable bool
-	// setsStatusZero is a `"status": 0` entry in a composite literal.
+	// setsStatusZero is a literal zero written to the status column, in either dbr
+	// spelling: a `"status": 0` entry in a SetMap literal, or `.Set("status", 0)`.
 	setsStatusZero bool
+	// writesStatusColumn is a write to the status column with ANY value, literal or
+	// not — `"status": m.Status`, `.Set("status", v)`, or a caller-supplied field map
+	// handed to SetMap. Combined with updatesRobotTable this is what makes a function
+	// STATUS-CAPABLE: able to put a bot's account into status 0 at runtime.
+	writesStatusColumn bool
+	// takesFieldMapParam is `SetMap(p)` where p is one of this function's own
+	// PARAMETERS — the caller chooses the columns, so the callee can write status
+	// without ever naming it.
+	//
+	// "not a literal" is not enough, and the widened matcher proved it by accusing
+	// bot_api's applyAgentReport: that one hands SetMap a map it builds itself, whose
+	// keys are all agent_* columns and never status. A locally-built map is visible
+	// in the same function, so the columns are knowable; a parameter is not.
+	takesFieldMapParam bool
 	// rawDisablesRobot is the raw-SQL spelling of the same write.
 	rawDisablesRobot bool
+	// deletesRobotRow is `DeleteFrom("robot")` or raw `DELETE FROM robot` — a HARD
+	// delete of the account row. A bot whose robot row is gone is at least as deleted
+	// as one whose status is 0, so this counts too.
+	deletesRobotRow bool
 }
 
 // scanRepoFuncs parses every non-test Go file under the given roots.
@@ -119,47 +233,106 @@ func scanRepoFuncs(t *testing.T, repoRoot string, roots ...string) []*censusFunc
 			if perr != nil {
 				return perr
 			}
-			for _, decl := range f.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
-					continue
-				}
-				cf := &censusFunc{
-					name:   fn.Name.Name,
-					file:   strings.TrimPrefix(path, repoRoot+string(filepath.Separator)),
-					calls:  map[string]bool{},
-					idents: map[string]bool{},
-				}
-				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					switch v := n.(type) {
-					case *ast.CallExpr:
-						name := calleeName(v.Fun)
-						cf.calls[name] = true
-						if name == "Update" && len(v.Args) == 1 && stringLit(v.Args[0]) == "robot" {
-							cf.updatesRobotTable = true
-						}
-					case *ast.KeyValueExpr:
-						if stringLit(v.Key) == "status" && intLit(v.Value) == "0" {
-							cf.setsStatusZero = true
-						}
-					case *ast.SelectorExpr:
-						cf.idents[v.Sel.Name] = true
-					case *ast.Ident:
-						cf.idents[v.Name] = true
-					case *ast.BasicLit:
-						if v.Kind == token.STRING && rawRobotDisable.MatchString(v.Value) {
-							cf.rawDisablesRobot = true
-						}
-					}
-					return true
-				})
-				out = append(out, cf)
-			}
+			out = append(out, censusFuncsIn(f, strings.TrimPrefix(path, repoRoot+string(filepath.Separator)))...)
 			return nil
 		})
 		require.NoError(t, err, "walking %s", root)
 	}
 	require.NotEmpty(t, out, "the scanner found no functions at all — it is broken, not the tree")
+	return out
+}
+
+// censusFuncsIn classifies every function in one parsed file.
+//
+// Split out of the walk so the matcher can be driven from source STRINGS as well as
+// from the tree — see TestCensusMatcherSeesEverySpellingItClaimsTo. Without that the
+// detection branches are only ever exercised by whatever the repository happens to
+// contain today, which is the failure this whole file exists to prevent, one level up:
+// the branches that close a blind spot become blind spots themselves the moment the
+// tree stops containing an example. PR #868s review, P2-2.
+func censusFuncsIn(f *ast.File, file string) []*censusFunc {
+	var out []*censusFunc
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		params := map[string]bool{}
+		if fn.Type.Params != nil {
+			for _, field := range fn.Type.Params.List {
+				for _, id := range field.Names {
+					params[id.Name] = true
+				}
+			}
+		}
+		cf := &censusFunc{
+			name:   fn.Name.Name,
+			file:   file,
+			calls:  map[string]bool{},
+			idents: map[string]bool{},
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.CallExpr:
+				name := calleeName(v.Fun)
+				cf.calls[name] = true
+				if name == "Update" && len(v.Args) == 1 && stringLit(v.Args[0]) == "robot" {
+					cf.updatesRobotTable = true
+				}
+				if name == "DeleteFrom" && len(v.Args) == 1 && stringLit(v.Args[0]) == "robot" {
+					cf.deletesRobotRow = true
+				}
+				// `.Set("status", …)` — the chained spelling, used 182 times in
+				// this tree. Missing it did not merely hide a door: the function
+				// landed in the status-capable set's OLD counterpart, i.e. it was
+				// filed as a benign helper. PR #868's review, P2-1.
+				if name == "Set" && len(v.Args) == 2 && stringLit(v.Args[0]) == "status" {
+					cf.writesStatusColumn = true
+					if intLit(v.Args[1]) == "0" {
+						cf.setsStatusZero = true
+					}
+				}
+				// `SetMap(p)` where p is one of this function's parameters: the
+				// COLUMNS are the caller's, so this callee can write status
+				// without naming it.
+				if name == "SetMap" && len(v.Args) == 1 {
+					if id, ok := v.Args[0].(*ast.Ident); ok && params[id.Name] {
+						cf.takesFieldMapParam = true
+					}
+				}
+			case *ast.KeyValueExpr:
+				if stringLit(v.Key) == "status" {
+					cf.writesStatusColumn = true
+					if intLit(v.Value) == "0" {
+						cf.setsStatusZero = true
+					}
+				}
+			case *ast.SelectorExpr:
+				cf.idents[v.Sel.Name] = true
+			case *ast.Ident:
+				cf.idents[v.Name] = true
+			case *ast.BinaryExpr:
+				// A raw statement spelled across concatenated literals.
+				//
+				// This is the LIVE style on this very table: botfather/db.go's two
+				// CAS writes are `"UPDATE robot SET …" + "WHERE … status=1 …"`.
+				// Matching per-BasicLit sees only the halves, so
+				// `"UPDATE robot SET " + "status=0 WHERE robot_id=?"` matched nothing
+				// — the first half has an empty SET clause, the second does not begin
+				// with UPDATE. A bot disable written that way was invisible to the
+				// census, which then stayed green while the deletion skipped D14.
+				// PR #868's fifth review.
+				cf.matchRawSQL(foldConcatenatedString(v))
+			case *ast.BasicLit:
+				if v.Kind != token.STRING {
+					return true
+				}
+				cf.matchRawSQL(v.Value)
+			}
+			return true
+		})
+		out = append(out, cf)
+	}
 	return out
 }
 
@@ -178,6 +351,74 @@ func calleeName(fun ast.Expr) string {
 }
 
 // stringLit returns the value of a string literal expression, or "".
+// matchRawSQL runs the three raw-SQL matchers over one statement's text.
+//
+// Extracted so the concatenated spelling goes through exactly the same three
+// regexes as the single-literal one. Two code paths applying "the same" rules by
+// hand is how the split-spelling hole got in on the dbr side.
+func (c *censusFunc) matchRawSQL(sql string) {
+	if sql == "" {
+		return
+	}
+	sql = normalizeRawSQL(sql)
+	if rawRobotDelete.MatchString(sql) {
+		c.deletesRobotRow = true
+	}
+	// Both statement shapes that assign to an existing robot row, judged by the same
+	// two rules: any status assignment makes the function status-capable, and a literal
+	// zero makes it a deletion primitive. Deriving the primitive from the SAME capture
+	// as the status-capable case is the point — the previous version matched the table
+	// twice, in two patterns, and only one of them learned about aliases.
+	clauses := rawRobotAssignClause.FindAllStringSubmatch(sql, -1)
+	clauses = append(clauses, rawRobotUpsertClause.FindAllStringSubmatch(sql, -1)...)
+	for _, m := range clauses {
+		if !rawStatusAssignment.MatchString(m[1]) {
+			continue
+		}
+		c.updatesRobotTable = true
+		c.writesStatusColumn = true
+		if rawStatusZeroAssignment.MatchString(m[1]) {
+			c.rawDisablesRobot = true
+		}
+	}
+}
+
+// foldConcatenatedString flattens a `+` tree into one string, keeping the literal
+// fragments and SKIPPING the non-literal ones, so a statement split across source
+// lines is matched as the statement it is.
+//
+// Skipping rather than aborting is a deliberate choice, and the first draft had it
+// the other way: a non-literal fragment made the whole expression fold to "". That
+// looked conservative and was not. It MISSES real disables —
+// `"UPDATE robot SET status=" + v + " WHERE robot_id=?"` and
+// `"UPDATE robot SET status=0 " + v + " WHERE x"` are both genuine status writes
+// that the abort rule reports as nothing at all.
+//
+// What skipping costs is invented adjacency: `"… SET status" + x + "=0"` folds to
+// `… SET status=0` and is called a primitive though the SQL says no such thing.
+// That is the fail-CLOSED direction — a false primitive is a false door and a loud
+// red — and this file takes loud over silent everywhere else, because a missed
+// deletion is a bot leaving with its Space seats open and nothing reporting it.
+// A fold that cannot read the statement must not therefore claim the statement is
+// harmless.
+//
+// Pinned in both directions by fixtures: the variable-valued status write must
+// match, and `"… SET " + col + "=0"` must not (the fused text names no column).
+func foldConcatenatedString(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		return stringLit(v)
+	case *ast.BinaryExpr:
+		if v.Op != token.ADD {
+			return ""
+		}
+		return foldConcatenatedString(v.X) + foldConcatenatedString(v.Y)
+	case *ast.ParenExpr:
+		return foldConcatenatedString(v.X)
+	}
+	return ""
+}
+
 func stringLit(e ast.Expr) string {
 	lit, ok := e.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
@@ -202,14 +443,164 @@ func intLit(e ast.Expr) string {
 // disablesBotAccount reports whether this function turns a bot's `robot` row off,
 // in either spelling used in this repository.
 //
-// The dbr form needs BOTH halves — `.Update("robot")` and a literal `"status": 0` —
-// so updateRobotInfo (a caller-supplied field map) and `"status": 0` written to some
-// other table both stay out, and `updateRobot` ("status": m.Status) stays out too.
+// The spellings matched today — an enumeration of what IS handled, not a claim that
+// the set is complete; the fixtures in TestCensusMatcherSeesEverySpellingItClaimsTo are
+// the authoritative list and each one dies if its branch is removed:
+//
+//   - the dbr disable, needing BOTH halves — `.Update("robot")` and a literal zero on
+//     the status column, in either the `SetMap{"status": 0}` or the `.Set("status", 0)`
+//     spelling — so `"status": 0` written to some other table stays out. The chained
+//     form was missing until PR #868, and its absence did more than hide a door: the
+//     function landed in the benign-helper set instead;
+//   - the raw-SQL disable;
+//   - the HARD delete, in either spelling. This one was missing until the eleventh
+//     review, which proved it by adding a `DeleteFrom("robot")` door and watching the
+//     guard pass. The gap was invisible from inside because deleteCreatedBotArtifacts
+//     — which uses exactly that spelling at modules/botfather/db.go:239 — was already
+//     in the known-primitives list, registering only via the raw UPDATE in its
+//     fail-closed fallback. It passed for the wrong reason, so it could not expose the
+//     matcher's blind spot.
+//
+// A write that puts status to a value it does not spell — `updateRobot`
+// ("status": m.Status), or `updateRobotInfo` (SetMap of a caller-supplied map) — is not
+// a primitive but is STATUS-CAPABLE, and its callers are resolved one hop up in step 0
+// of the test rather than here, because neither half is in one function.
 func (c *censusFunc) disablesBotAccount() bool {
-	return c.rawDisablesRobot || (c.updatesRobotTable && c.setsStatusZero)
+	return c.rawDisablesRobot || c.deletesRobotRow || (c.updatesRobotTable && c.setsStatusZero)
+}
+
+// isStatusCapableWriter reports whether this function can put a bot's status column
+// to any value without being a deletion primitive itself — which is what makes its
+// CALLERS door candidates.
+//
+// One definition, called from both assembleCensus and the fixture table. It used to be
+// written out in each, and a hand-copied predicate drifts: a change to the assembly's
+// rule would have been caught only by the assembly test, leaving the fixture table
+// asserting a rule the census no longer uses while still presenting itself as the
+// authoritative list. PR #868's sixth review, filed as a nit and worth taking, because
+// two copies of a rule is the same shape as two copies of the raw-SQL matchers that
+// this file already had to merge.
+func (c *censusFunc) isStatusCapableWriter() bool {
+	if !c.updatesRobotTable || c.disablesBotAccount() {
+		return false
+	}
+	return c.writesStatusColumn || c.takesFieldMapParam
 }
 
 func (c *censusFunc) String() string { return c.file + ":" + c.name }
+
+// assembleCensus turns classified functions into the three sets the census asserts on.
+//
+// Extracted from the test body so it can be driven by fixtures as well as by the tree.
+// That split is the whole point: censusFuncsIn (the CLASSIFIER) was already fixtured,
+// and the reviews then showed the ASSEMBLY was not — deleting the status-capable door
+// loop, or the uncalled-primitive rule, left every test green, because both branches
+// only ever fire on what the repository happens to contain. A branch exercised solely
+// by the tree stops working the day the tree stops containing an example, which is the
+// failure this file exists to prevent. PR #868s second review round.
+func assembleCensus(funcs []*censusFunc) (map[string]*censusFunc, map[string]bool, []*censusFunc) {
+	// STATUS-CAPABLE writers — functions that write the robot table's status column,
+	// whatever value they write.
+	//
+	// The rule used to key on a literal `"status": 0` in the caller. It drew the line at
+	// the wrong place, and the review proved it with the two doors it missed:
+	//
+	//	updateRobotStatus  PUT /robot/status/{id}/{status}  robot.Status = int(status)
+	//	                                                    -> updateRobot
+	//	                                                    -> UPDATE robot SET version=?, status=?
+	//	robotUpdate        PUT /robots/{id}                 fields["status"] = *req.Status
+	//	                                                    -> updateRobotInfo
+	//
+	// updateRobot's write is BYTE-IDENTICAL to deleteRobotSoft's, which this file
+	// classifies as a deletion primitive. The only difference is that one spells the
+	// zero as a literal and the other holds it in a variable — and the first door's
+	// zero is a malformed-parameter DEFAULT, so it is reachable by accident. The old
+	// comment justified the non-match by calling those endpoints "a reversible disable,
+	// not a deletion"; deleteRobotSoft is exactly as reversible, so that was a semantic
+	// story told about a syntactic behaviour.
+	//
+	// So: a function that can put a bot's status to zero is status-capable, and every
+	// caller of one is a door candidate. What happens next is a DECISION recorded in
+	// d14ExemptDoors, not an omission in a matcher.
+	//
+	// This also narrows what used to be flagged: writers that touch other columns
+	// (setDescription, updateBotCommands, updateRobotIMTokenCache) are no longer in the
+	// set, so their callers are no longer accused of being bot-deletion doors.
+	statusCapableWriters := map[string]bool{}
+	for _, f := range funcs {
+		if f.isStatusCapableWriter() {
+			statusCapableWriters[f.name] = true
+		}
+	}
+
+	// The primitives — everything that turns a bot account off or removes it.
+	primitives := map[string]*censusFunc{}
+	for _, f := range funcs {
+		if f.disablesBotAccount() {
+			primitives[f.name] = f
+		}
+	}
+
+	called := map[string]bool{}
+	for _, f := range funcs {
+		for name := range f.calls {
+			called[name] = true
+		}
+	}
+
+	var doors []*censusFunc
+	seen := map[string]bool{}
+	addDoor := func(f *censusFunc) {
+		if seen[f.String()] {
+			return
+		}
+		seen[f.String()] = true
+		doors = append(doors, f)
+	}
+
+	// A primitive NOTHING calls is its own door.
+	//
+	// "A primitive is not a door onto itself" assumes primitives are db-layer helpers
+	// with a handler above them — true of all three today. It is false for a handler
+	// that does the deletion inline, and the failure is silent in the worst way: the
+	// function is classified, excluded from the door set by that rule, and then checked
+	// by nothing.
+	for name, f := range primitives {
+		if _, exempt := d14ExemptPrimitives[name]; exempt {
+			continue
+		}
+		if !called[name] {
+			addDoor(f)
+		}
+	}
+
+	for _, f := range funcs {
+		if primitives[f.name] == nil {
+			for name := range primitives {
+				if _, exempt := d14ExemptPrimitives[name]; exempt {
+					continue
+				}
+				if f.calls[name] {
+					addDoor(f)
+					break
+				}
+			}
+		}
+		if f.disablesBotAccount() {
+			continue
+		}
+		// The split-spelling door: the deletion site is the function holding the
+		// intent, because the UPDATE it borrows lives in a generic helper that is not
+		// itself a deletion.
+		for writer := range statusCapableWriters {
+			if f.calls[writer] {
+				addDoor(f)
+				break
+			}
+		}
+	}
+	return primitives, statusCapableWriters, doors
+}
 
 func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
@@ -217,24 +608,25 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 
 	funcs := scanRepoFuncs(t, repoRoot, "modules", "pkg", "internal")
 
-	// Step 1: the primitives — everything that turns a bot account off.
-	primitives := map[string]*censusFunc{}
-	for _, f := range funcs {
-		if f.disablesBotAccount() {
-			primitives[f.name] = f
-		}
-	}
+	primitives, statusCapableWriters, doors := assembleCensus(funcs)
+
 	names := make([]string, 0, len(primitives))
 	for n := range primitives {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 	t.Logf("bot-disabling primitives found: %v", names)
+	writerNames := make([]string, 0, len(statusCapableWriters))
+	for n := range statusCapableWriters {
+		writerNames = append(writerNames, n)
+	}
+	sort.Strings(writerNames)
+	t.Logf("status-capable robot writers found: %v", writerNames)
 
 	// The scanner must keep finding the primitives we know about. Without this the
 	// census degrades silently into a test that asserts nothing the day someone
 	// rewrites one of these with a spelling the matcher misses — the exact shape of
-	// vacuity this PR has already been caught on twice.
+	// vacuity this file has already been caught on twice.
 	for _, known := range []string{"deleteRobot", "deleteRobotSoft", "deleteCreatedBotArtifacts"} {
 		assert.Contains(t, primitives, known,
 			"the scanner no longer recognises %s as a bot-disabling primitive; either it was "+
@@ -242,23 +634,16 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 				"does not match (fix the matcher) — until then the census below is blind to it",
 			known)
 	}
-
-	// Step 2: the doors — every function that calls a non-exempt primitive.
-	var doors []*censusFunc
-	for _, f := range funcs {
-		if primitives[f.name] != nil {
-			continue // a primitive is not a door onto itself
-		}
-		for name := range primitives {
-			if _, exempt := d14ExemptPrimitives[name]; exempt {
-				continue
-			}
-			if f.calls[name] {
-				doors = append(doors, f)
-				break
-			}
-		}
+	// Same for the two status-capable writers. They are what make the two live disable
+	// endpoints visible at all, and neither endpoint is reachable through a primitive.
+	for _, known := range []string{"updateRobot", "updateRobotInfo"} {
+		assert.Contains(t, statusCapableWriters, known,
+			"the scanner no longer recognises %s as status-capable. Its callers stop being "+
+				"door candidates, and since neither of them calls a primitive, they leave the "+
+				"census entirely — silently, because their exemption entries are not assertions",
+			known)
 	}
+
 	require.NotEmpty(t, doors,
 		"no bot-deletion entry point found at all — the census cannot be vacuous and pass")
 	doorNames := make([]string, 0, len(doors))
@@ -281,6 +666,40 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			"%s is no longer recognised as a bot-deletion entry point — if it was renamed or "+
 				"restructured, this list has to follow it, or the census stops covering that door",
 			known)
+	}
+
+	// The same consumption rule for the PRIMITIVE exemptions, which had only half of it.
+	//
+	// d14ExemptDoors keys were asserted present; d14ExemptPrimitives keys were only ever
+	// read to SKIP a primitive, so a renamed or removed one becomes a silent dead key —
+	// the exact vacuity class this file exists to catch, asymmetrically missing from the
+	// mechanism built to catch it. It is masked today only because the single key also
+	// appears in the hardcoded known-primitives list above, i.e. by a coincidence of
+	// there being one entry, not by anything checking. PR #868's sixth review.
+	for name := range d14ExemptPrimitives {
+		assert.Contains(t, primitives, name,
+			"%s is recorded in d14ExemptPrimitives but the scanner did not classify it as a "+
+				"bot-disabling primitive. Either it was renamed or removed (drop the exemption), "+
+				"or the matcher stopped seeing its spelling — and in that case the exemption is "+
+				"now dead config that silently exempts nothing while reading like a decision",
+			name)
+	}
+
+	// Every recorded exemption must correspond to a door that was actually FOUND.
+	//
+	// This is the assertion that makes the exemptions load-bearing, and without it the
+	// whole status-capable mechanism is deletable while the suite stays green: remove
+	// the door loop and updateRobotStatus / robotUpdate simply vanish from the door
+	// set — nothing asserts their presence, because neither is reachable through a
+	// primitive, and the known-door list below is satisfied by the three that are.
+	// Both reviewers reproduced exactly that, independently, and both named this as the
+	// fix. An exemption nothing checks is indistinguishable from a deleted matcher.
+	for key := range d14ExemptDoors {
+		assert.Contains(t, doorNames, key,
+			"%s is recorded in d14ExemptDoors but the census did not find it as a door. Either "+
+				"it was renamed or removed (drop the exemption), or the matcher stopped seeing "+
+				"the shape that made it a door — and in that case the exemption is now dead "+
+				"config describing a decision nothing enforces", key)
 	}
 
 	// Step 3: every door routes through D14, unless it is a recorded exemption.
@@ -309,4 +728,433 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 				"in, and for an account that ceased to exist that sentence is false; "+
 				"force_removed would print it", d)
 	}
+}
+
+// TestCensusMatcherSeesEverySpellingItClaimsTo guards the guard.
+//
+// The census above asserts an OUTCOME over the tree: every door routes or is exempt.
+// That says nothing about whether the matcher can still SEE each shape — and the
+// review proved the difference matters twice over. Round 11 found the census green
+// because an exempt primitive matched through an unrelated fallback, so the branch
+// meant to catch its real spelling was never exercised. The fix for that then had the
+// same property one level up: PR #868's review deleted each newly added branch in turn
+// and the suite stayed green, because nothing in the tree spells those shapes today.
+//
+// A matcher branch with no example is a branch that quietly stops working. So each one
+// gets a fixture here, parsed from source rather than from the repository, which is
+// also the only way to cover a shape the tree does not currently contain.
+//
+// Measured, not asserted: each of the ELEVEN deletable detection branches was removed
+// in turn and the table below re-run, plus FOUR weakenings that are not deletions.
+// Nothing here is deletable or weakenable while green — that is the property this test
+// exists for, and it is the one that was checked.
+//
+// Seven branches redden exactly one case, the one named after that spelling. Four redden
+// more, all for the same reason: they are not spellings but shapes several fixtures are
+// built out of — the literal-zero assignment (7) and `Update("robot")` (6) sit under
+// every disable and every dbr case respectively, the concatenation fold (3) underlies
+// three concatenated fixtures, and the key-value `"status": 0` (2) serves two.
+//
+// The four weakenings, each a different failure from deleting the same branch:
+//   - drop the alias tolerance from the assign-clause capture -> the two alias fixtures.
+//   - stop stripping backticks -> the backticked-column fixture.
+//   - look for `status =` anywhere in the statement instead of inside the captured
+//     clause -> all three WHERE-guard fixtures, which are the live shape (two statements
+//     write bound_agent_ref guarded by status=1).
+//   - abort the fold on a non-literal fragment instead of skipping it -> the
+//     variable-between-literals fixture, the choice argued at foldConcatenatedString.
+//
+// Two notes on how this was measured, because the harness was wrong twice, in opposite
+// directions, and both would have been believed if the numbers had looked plausible.
+//
+// First it measured nothing: 0 red for every branch, not because they were undetectable
+// but because TestMain was panicking on stale migration state before a single test body
+// ran, and a harness that counts FAIL lines reads "nothing ran" as "nothing failed".
+// Then, after it was taught to check the subtest COUNT, its build-error detector matched
+// testify's own "expected: true" output and called every valid run INVALID. And a
+// mutation applied by string replacement silently did nothing when the pattern did not
+// match, reporting the branch as unpinned when it had never been removed.
+//
+// So the procedure, not just the numbers: recreate the database, take a baseline and its
+// subtest count, assert every mutation actually applied, and treat a run whose count
+// differs — or that panicked or failed to build — as INVALID rather than as a result.
+// Same defect as this file's subject, one level further out: an outcome with no check
+// that the check itself executed.
+func TestCensusMatcherSeesEverySpellingItClaimsTo(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		// want is asserted on the function named "probe".
+		wantDisables      bool
+		wantStatusCapable bool
+	}{
+		{
+			name: "dbr SetMap literal zero — the spelling deleteRobotSoft uses",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.Update("robot").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "dbr Set chain literal zero — 182 uses in this tree, invisible until PR #868",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.Update("robot").Set("status", 0).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "raw SQL disable",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "hard delete, dbr — the spelling deleteCreatedBotArtifacts actually uses",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.DeleteFrom("robot").Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "hard delete, raw SQL",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.DeleteBySql("DELETE FROM robot WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "status-capable: .Set chain with a variable — pins the chain's non-literal half",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.Update("robot").Set("status", v).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			name: "status-capable: writes status from a variable — the updateRobot shape",
+			src: `package p
+func probe(s S, m *robot) error {
+	_, err := s.Update("robot").SetMap(map[string]interface{}{"version": m.Version, "status": m.Status}).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			name: "status-capable: caller-supplied field map — the updateRobotInfo shape",
+			src: `package p
+func probe(s S, id string, fields map[string]interface{}) error {
+	_, err := s.Update("robot").SetMap(fields).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			name: "NOT status-capable: a locally built map that never names status",
+			src: `package p
+func probe(s S, id string, v string) error {
+	set := map[string]interface{}{}
+	set["agent_version"] = v
+	_, err := s.Update("robot").SetMap(set).Where("robot_id=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			name: "NOT a robot write at all: status zero on another table",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.Update("space_member").SetMap(map[string]interface{}{"status": 0}).Where("uid=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			name: "NOT a match: a table whose name merely starts with robot",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("DELETE FROM robot_menu WHERE robot_id=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			name: "status-capable, raw SQL: a bound status in the SET clause",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.UpdateBySql("UPDATE robot SET status=? WHERE robot_id=?", v, id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			// The live shape this branch must NOT match: two statements write
+			// bound_agent_ref with status=1 as a GUARD. A regex looking for
+			// `status =` anywhere in the string would call both bot disables.
+			name: "NOT a match, raw SQL: status appears only in the WHERE",
+			src: `package p
+func probe(s S, id string, ref string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET bound_agent_ref=? WHERE robot_id=? AND status=1", ref, id).Exec()
+	return err
+}`,
+		},
+		{
+			// The LIVE spelling on this table. botfather/db.go's two CAS writes are
+			// built exactly this way, so a disable written like it would be too.
+			name: "concatenated raw SQL: a bound status in the SET clause",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+
+		"status=? WHERE robot_id=?", v, id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			name: "concatenated raw SQL: literal zero split across the join is still a primitive",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+
+		"status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// The two live CAS statements, in shape. Folding must not make these
+			// match: status is a GUARD in their WHERE, not a write.
+			name: "NOT a match, concatenated: status=1 guards the WHERE of a bound_agent_ref write",
+			src: `package p
+func probe(s S, id string, ref string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET bound_agent_ref=?, bound_at=NOW() "+
+		"WHERE robot_id=? AND status=1 "+
+		"AND (bound_agent_ref='' OR bound_agent_ref=?)", ref, id, ref).Exec()
+	return err
+}`,
+		},
+		{
+			// Non-literal fragments are SKIPPED, not fatal. Aborting the fold on
+			// them reports this genuine status write as nothing at all — the first
+			// draft of the fold did exactly that.
+			// Neither literal matches alone: the first has an empty SET clause, the
+			// second does not begin with UPDATE. Only skipping the non-literal and
+			// joining what is left produces the statement — which is why this case,
+			// unlike a fixture whose first literal already says `SET status=`,
+			// actually exercises the choice.
+			name: "concatenated raw SQL: a variable BETWEEN literals still yields the disable",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+placeholder(v)+" status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// The other half of that choice: skipping fragments can fuse text, so
+			// pin the case where the fusion names no column and must not match.
+			name: "NOT a match, concatenated: the column itself is the variable",
+			src: `package p
+func probe(s S, id string, col string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+col+"=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			// The four spellings the sixth review found failing OPEN. Each classified as
+			// nothing at all before: not a primitive, not status-capable, so the callers
+			// never became doors and the census stayed green while a bot was disabled.
+			name: "raw SQL, table alias: UPDATE robot r SET r.status=0",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot r SET r.status=0 WHERE r.robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			name: "raw SQL, AS alias: UPDATE robot AS r SET status=0",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot AS r SET status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// Backticks are stripped before matching, so quoting cannot hide the column.
+			// Written with a double-quoted Go string because the fixture source itself
+			// has to contain backticks.
+			name:         "raw SQL, backticked column: UPDATE robot SET `status`=0",
+			src:          "package p\nfunc probe(s S, id string) error {\n\t_, err := s.UpdateBySql(\"UPDATE `robot` SET `status`=0 WHERE robot_id=?\", id).Exec()\n\treturn err\n}",
+			wantDisables: true,
+		},
+		{
+			// An upsert is an UPDATE of an existing row under another name.
+			name: "raw SQL, upsert: ON DUPLICATE KEY UPDATE status=0",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("INSERT INTO robot (robot_id, status) VALUES (?, 1) ON DUPLICATE KEY UPDATE status=0", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// The live CAS shape again, now WITH an alias: tolerating aliases must not
+			// start reading a WHERE guard as a write.
+			name: "NOT a match, aliased: status=1 still only guards the WHERE",
+			src: `package p
+func probe(s S, id string, ref string) error {
+	_, err := s.UpdateBySql("UPDATE robot r SET r.bound_agent_ref=? WHERE r.robot_id=? AND r.status=1", ref, id).Exec()
+	return err
+}`,
+		},
+		{
+			// And the alias tolerance must not let a different table in: robot_menu has
+			// no whitespace after `robot`, so the alias branch cannot reach it.
+			name: "NOT a match, aliased: a table whose name merely starts with robot",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot_menu SET status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+		},
+		{
+			// KNOWN OVER-MATCH, pinned rather than fixed. The two halves come from
+			// two different statements: `Update("robot")` from the first, the zero
+			// status from the second, which targets another table entirely. The
+			// classifier holds both flags per FUNCTION, so it says primitive.
+			// That is the fail-closed direction — a false primitive makes its
+			// callers false doors and fails loudly — and scoping the flags to a
+			// statement means tracking dbr builder chains through locals, which is
+			// a different tool. Asserted so the day someone narrows it, this case
+			// tells them the behaviour changed on purpose. PR #868's review, P2-5.
+			name: "known over-match: robot update and a status zero in DIFFERENT statements",
+			src: `package p
+func probe(s S, id string) error {
+	if _, err := s.Update("robot").Set("agent_version", "v2").Where("robot_id=?", id).Exec(); err != nil {
+		return err
+	}
+	_, err := s.Update("robot_menu").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "probe.go", tc.src, 0)
+			require.NoError(t, err)
+			var probe *censusFunc
+			for _, cf := range censusFuncsIn(f, "probe.go") {
+				if cf.name == "probe" {
+					probe = cf
+				}
+			}
+			require.NotNil(t, probe, "the fixture must define a function named probe")
+
+			assert.Equal(t, tc.wantDisables, probe.disablesBotAccount(),
+				"disablesBotAccount is what promotes a function to a deletion PRIMITIVE, "+
+					"and every door of a non-exempt primitive must route through D14. A "+
+					"spelling it cannot see is a deletion the census reports nothing about")
+			assert.Equal(t, tc.wantStatusCapable, probe.isStatusCapableWriter(),
+				"status-capable writers are what make their CALLERS door candidates. Miss "+
+					"one and an endpoint that puts a bot into status 0 is invisible; widen "+
+					"it too far and innocent callers get told to call CloseAllSpaceSeats")
+		})
+	}
+}
+
+// TestCensusDoorAssemblyIsPinned guards the half the fixtures above do not reach.
+//
+// TestCensusMatcherSeesEverySpellingItClaimsTo covers the CLASSIFIER — what each
+// function is. This covers the ASSEMBLY — which of them become doors. Both reviews
+// found that half unguarded, independently and by the same method: delete the
+// status-capable door loop and the two live disable endpoints vanish from the door set
+// with every test still green; delete the uncalled-primitive rule and nothing changes,
+// because all three primitives happen to have callers today.
+//
+// Both branches only ever fired on what the repository contains. That is the exact
+// failure this file exists to prevent, and it had now recurred at three levels: the
+// census (round 11), the classifier branches (round 1 of this PR), and the assembly
+// (round 2). Fixtures here so there is no fourth.
+func TestCensusDoorAssemblyIsPinned(t *testing.T) {
+	// One synthetic package per case, classified through the same censusFuncsIn the
+	// census uses, then assembled through the same assembleCensus.
+	assemble := func(t *testing.T, src string) (map[string]bool, []string) {
+		t.Helper()
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "probe.go", src, 0)
+		require.NoError(t, err)
+		_, writers, doors := assembleCensus(censusFuncsIn(f, "probe.go"))
+		names := make([]string, 0, len(doors))
+		for _, d := range doors {
+			names = append(names, d.name)
+		}
+		sort.Strings(names)
+		return writers, names
+	}
+
+	t.Run("a caller of a status-capable writer is a door", func(t *testing.T) {
+		writers, doors := assemble(t, `package p
+func writeRobotFields(s S, id string, fields map[string]interface{}) error {
+	_, err := s.Update("robot").SetMap(fields).Where("robot_id=?", id).Exec()
+	return err
+}
+func handler(s S, id string) error {
+	return writeRobotFields(s, id, map[string]interface{}{"status": 0})
+}`)
+		assert.True(t, writers["writeRobotFields"], "the writer must be recognised as status-capable")
+		assert.Equal(t, []string{"handler"}, doors,
+			"the caller of a status-capable writer must be a door. Delete that loop and the "+
+				"two live disable endpoints leave the census silently — they reach it through "+
+				"no primitive, so nothing else would notice")
+	})
+
+	t.Run("a primitive nothing calls is its own door", func(t *testing.T) {
+		_, doors := assemble(t, `package p
+func inlineHandler(s S, id string) error {
+	_, err := s.Update("robot").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}`)
+		assert.Equal(t, []string{"inlineHandler"}, doors,
+			"a handler that deletes INLINE is a primitive, and 'a primitive is not a door onto "+
+				"itself' would then exclude it from every check. All three real primitives have "+
+				"callers today, so this branch fires for nobody in the tree — which is why it "+
+				"needs a fixture rather than a comment")
+	})
+
+	t.Run("a primitive with a caller makes the CALLER the door, not itself", func(t *testing.T) {
+		_, doors := assemble(t, `package p
+func deleteRow(s S, id string) error {
+	_, err := s.Update("robot").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}
+func handler(s S, id string) error { return deleteRow(s, id) }`)
+		assert.Equal(t, []string{"handler"}, doors,
+			"the db-layer helper is not the entry point; its caller is. Getting this backwards "+
+				"is what made the split-spelling fix pass its own mutation the first time")
+	})
+
+	t.Run("a writer that never touches status leaves its callers alone", func(t *testing.T) {
+		writers, doors := assemble(t, `package p
+func setDescription(s S, id string, d string) error {
+	_, err := s.Update("robot").Set("description", d).Where("robot_id=?", id).Exec()
+	return err
+}
+func handler(s S, id string) error { return setDescription(s, id, "hello") }`)
+		assert.Empty(t, writers, "touching another column must not make a writer status-capable")
+		assert.Empty(t, doors,
+			"and its callers must not be accused of deleting a bot — the failure message would "+
+				"tell them to call CloseAllSpaceSeats, which for this function is wrong advice")
+	})
 }

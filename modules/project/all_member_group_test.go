@@ -223,8 +223,15 @@ func TestCreateProjectSeatsTheCreatorsAgents(t *testing.T) {
 
 	// D16 — the counts are split, and the total still matches the seats the quota
 	// counts.
-	require.Equal(t, 1, resp.MemberCount, "member_count counts humans only")
-	require.Equal(t, 2, resp.AgentCount)
+	require.Equal(t, 1, resp.HumanMemberCount, "human_member_count counts humans only")
+	require.Equal(t, 2, resp.AgentMemberCount)
+	require.Equal(t, 3, resp.MemberCount,
+		"member_count is the TOTAL — one owner plus two agents. It means what it meant "+
+			"before D16 and what modules/opanalytics means by the same name; the human/agent "+
+			"split lives in the two fields above")
+	require.Equal(t, resp.HumanMemberCount+resp.AgentMemberCount, resp.MemberCount,
+		"and the three must add up, which is why toResp derives the total from the two "+
+			"halves instead of reading a third count under a third read view")
 
 	// The provisioner was seeded with the agents and NOT with the creator (the
 	// group side adds its own creator).

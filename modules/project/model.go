@@ -243,17 +243,46 @@ type Resp struct {
 	Creator         string `json:"creator"`
 	Discoverability int    `json:"discoverability"`
 	MaxMembers      int    `json:"max_members"`
-	// MemberCount counts HUMAN members only (D16). AI agents seated in the
-	// project are counted separately in AgentCount.
+	// MemberCount is EVERY active seat, humans and agents together — the same
+	// meaning it had before D16, and the same meaning `member_count` carries in
+	// modules/opanalytics. The split lives in the two fields below.
 	//
-	// This is a semantic change to an existing field, taken deliberately: a
-	// project with one person and two of their agents used to render "3 人",
-	// which is a sentence no user reads as true. The quota (MaxMembers) still
-	// counts every seat, agents included — an agent reads the project's
-	// messages, so it costs a seat.
+	// D16 first shipped this as "humans only", on the argument that a project with
+	// one person and two of their agents rendering as "3 人" is a sentence no user
+	// reads as true. That argument is right about what a client should DISPLAY and
+	// wrong about which field should change: the display fix is for the client to
+	// render HumanMemberCount. Redefining member_count bought the same outcome at
+	// the price of one server meaning two things by one name —
+	// modules/opanalytics' channel list already ships member_count as the total,
+	// beside human_member_count and agent_member_count, to the same client teams.
+	//
+	// Restored while it is still free, and the reason is checkable from the tags
+	// rather than from a claim about GA. v1.18.0 (2026-09-07) already ships this
+	// field from countActiveMembers -- the TOTAL. The humans-only redefinition
+	// landed in 566e625, which `git tag --contains` places on no release. So this
+	// restores the meaning that IS released and retires the one that never was: a
+	// v1.18.0 client sees no change at all, and only a client built against two
+	// days of unreleased main renames a field.
+	//
+	// The earlier version of this comment said the module "has never been GA, so
+	// nothing had shipped against either meaning". That was wrong -- v1.18.0
+	// carries 42 files under modules/project -- and it was the weaker argument
+	// besides. PR #868's fifth review, which checked the tags instead of taking
+	// the sentence. This is the sentence a future wire change will cite, so it
+	// needs to rest on something measurable.
+	//
+	// The quota (MaxMembers) bounds this number, agents included — an agent reads
+	// the project's messages, so it costs a seat.
 	MemberCount int `json:"member_count"`
-	// AgentCount is the number of active AI agent seats.
-	AgentCount             int   `json:"agent_count"`
+	// HumanMemberCount counts human members only. This is what a roster header
+	// should render.
+	HumanMemberCount int `json:"human_member_count"`
+	// AgentMemberCount counts active AI agent seats.
+	//
+	// Named for opanalytics' field rather than the shorter `agent_count`, which is
+	// already taken on the wire by the Space directory, where it means "how many
+	// agents this OWNER has" — a different question with the same short name.
+	AgentMemberCount       int   `json:"agent_member_count"`
 	MemberEpoch            int64 `json:"member_epoch"`
 	CollaborationRoleEpoch int64 `json:"collaboration_role_epoch"`
 	Status                 int   `json:"status"`
@@ -377,10 +406,15 @@ type GroupResp struct {
 	AvatarColor    *int `json:"avatar_color"`
 	IsUploadAvatar int  `json:"is_upload_avatar"`
 	// MemberCount counts active members (is_deleted = 0 AND status = 1),
-	// everyone in the group — unlike the project's own member_count, which #855
-	// narrowed to humans. These are different populations, so the same name
-	// meaning different things is a hazard the client teams need to know about:
-	// a project group's count includes the agents seated in it.
+	// everyone in the group — the same meaning the project's own member_count
+	// carries, and the same one modules/opanalytics uses.
+	//
+	// This comment used to warn that the two were different populations, because
+	// #855 had narrowed the project's member_count to humans. That narrowing was
+	// reverted before GA precisely to remove the hazard this line described: one
+	// name, one meaning, with the human/agent split in its own two fields. The
+	// populations are still different — a group's roster is not a project's — but
+	// the QUESTION the name asks is now the same everywhere.
 	MemberCount int `json:"member_count"`
 }
 

@@ -222,8 +222,16 @@ func PickActiveOwner(session dbr.SessionRunner, projectID string) (string, error
 // Here rather than in either module because three call sites across two modules
 // share it, and a per-module copy would make the dashboard question ("is D7
 // deciding?") need to be asked twice.
+//
+// Namespace `project`, matching every other metric this feature publishes
+// (modules/project/metrics.go declares the same constant) and the repository's habit of
+// one namespace per module — `group`, `dmwork`. It read `octo_project` when it was
+// written, after the table prefix rather than after the module, which made the ONE
+// metric an operator most needs to alert on the one that would not appear beside its six
+// siblings on a dashboard. Renamed while the feature is still off by default and no
+// dashboard exists; after that it would be a breaking rename.
 var AllMemberGroupGuardFailures = promauto.NewCounterVec(prometheus.CounterOpts{
-	Namespace: "octo_project",
+	Namespace: "project",
 	Name:      "all_member_group_guard_failures_total",
 	Help: "D7 all-member-group guard evaluations that failed and were let through, " +
 		"by the action that was allowed.",

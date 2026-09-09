@@ -481,14 +481,14 @@ func (p *Project) listProjectsHandler(c *wkhttp.Context) {
 	for _, row := range rows {
 		model := row.Model
 		// Both halves of the split come from fillMemberCounts, out of one roster
-		// read, so a list card and the detail route agree about what member_count
-		// means. Reporting the full seat count here while the detail route
-		// reported humans only would have been D16's own bug, one endpoint away.
+		// read, so a list card and the detail route agree about what the counts
+		// mean, and their sum IS the seat count rather than a third number hoping
+		// to match.
 		//
 		// This used to say "two bounded correlated subqueries", which was one too
 		// many after #855 removed member_count's and zero too many after PR-5
 		// removed seat_count's.
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.MemberCount, row.AgentCount(), row.Pinned == 1))
+		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.HumanCount, row.AgentCount(), row.Pinned == 1))
 	}
 	c.Response(resps)
 }
@@ -700,18 +700,39 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 
 // ---------- response shaping ----------
 
-// toResp renders a project. memberCount counts HUMANS and agentCount counts AI
-// agents (D16); MaxMembers still bounds the two together, because a seat is a
-// seat regardless of who sits in it.
-// toResp shapes one project for the wire.
+// toResp shapes one project for the wire. humans and agents are the two halves of
+// the roster (D16); MaxMembers bounds their sum, because a seat is a seat
+// regardless of who sits in it.
+//
+// member_count is DERIVED here as humans + agents rather than read as a third
+// count. Both callers produce the two halves by classifying ONE roster read --
+// countActiveSeatsByKind on the detail path, fillMemberCounts on the list path --
+// so their sum already IS the seat count, exactly. Reading a total separately
+// would add a number that can disagree with the two beside it for no gain, and
+// deriving it puts the identity a client renders (member_count ==
+// human_member_count + agent_member_count) beyond reach of a future edit that
+// gives the reads different predicates.
+//
+// One degraded case is worth knowing: when splitSeatCounts falls back it reports
+// (total, 0), so human_member_count claims everyone is human, and member_count
+// stays correct through it.
+//
+// The trigger, stated the way the code actually branches: countActiveSeatsByKind
+// fails AND the countActiveMembers fallback succeeds. One failure, not two -- if
+// both fail the result is (0, 0), not (total, 0). And neither is a single COUNT:
+// countActiveSeatsByKind is two SELECTs across two tables (octo_project_member,
+// then user). The earlier wording here said "two consecutive COUNT failures over
+// the same table", which was wrong on the count, the shape and the table at once.
+// PR #868's fourth review. Worth the space, because this file already carries a
+// comment corrected twice for describing a statement that does not exist.
 //
 // pinned is a parameter rather than a field on Model because it is a fact about
 // the CALLER, not about the project: the same row is pinned for one user and not
-// for the next. Every call site must therefore supply it truthfully — a default of
+// for the next. Every call site must therefore supply it truthfully -- a default of
 // false would make the update route report a project as un-pinned right after the
 // caller renamed it, and the client would watch its own card jump out of the
 // pinned section until the next list fetch.
-func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int, pinned bool) *Resp {
+func (p *Project) toResp(m *Model, myRole, spaceRole, humans, agents int, pinned bool) *Resp {
 	return &Resp{
 		ProjectID:              m.ProjectID,
 		SpaceID:                m.SpaceID,
@@ -721,8 +742,9 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount in
 		Creator:                m.Creator,
 		Discoverability:        m.Discoverability,
 		MaxMembers:             p.cfg.effectiveMaxMembers(m.MaxMembers),
-		MemberCount:            memberCount,
-		AgentCount:             agentCount,
+		MemberCount:            humans + agents,
+		HumanMemberCount:       humans,
+		AgentMemberCount:       agents,
 		MemberEpoch:            m.MemberEpoch,
 		CollaborationRoleEpoch: m.CollaborationRoleEpoch,
 		Status:                 m.Status,
