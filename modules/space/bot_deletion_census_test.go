@@ -670,20 +670,33 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 // gets a fixture here, parsed from source rather than from the repository, which is
 // also the only way to cover a shape the tree does not currently contain.
 //
-// Measured, not asserted: each of the ten detection branches in censusFuncsIn was
-// deleted in turn and the table below re-run. No branch is deletable while green —
-// that is the property this test exists for, and it is the one that was checked.
+// Measured, not asserted: each of the ELEVEN detection branches was deleted in turn
+// and the table below re-run. No branch is deletable while green — that is the
+// property this test exists for, and it is the one that was checked.
 //
-// Eight of the ten redden exactly one case, the one named after that spelling. Two
-// redden more, both for the same reason — they are not spellings but shapes that
-// several fixtures are built out of: `Update("robot")` (six) is the table precondition
-// under every robot-table case, and the key-value `"status": 0` (two) is shared by the
-// SetMap composite literal and the over-match case at the end.
+// Six redden exactly one case, the one named after that spelling. Five redden more,
+// all for the same reason: they are not spellings but shapes that several fixtures are
+// built out of — `Update("robot")` (6) is the table precondition under every dbr case,
+// `rawRobotDisable` (3) and the concatenation fold (3) each underlie both a plain and a
+// concatenated fixture, and the key-value `"status": 0` (2) and the SET-clause capture
+// (2) each serve two.
 //
-// The raw-SQL SET-clause capture is mutated separately, since deleting the branch and
-// widening it are different failures: matching `status =` anywhere in the string rather
-// than inside the captured SET clause reddens the WHERE-clause case, which is the live
-// shape (two statements write bound_agent_ref guarded by status=1).
+// Two branches are mutated a SECOND way, because deleting them and weakening them are
+// different failures:
+//   - the SET-clause capture: matching `status =` anywhere in the string instead of
+//     inside the captured clause reddens the WHERE-only case, which is the live shape
+//     (two statements write bound_agent_ref guarded by status=1).
+//   - the fold: aborting on a non-literal fragment instead of skipping it reddens the
+//     variable-between-literals case, which is the choice argued at
+//     foldConcatenatedString.
+//
+// A note on how this was measured, because the first attempt measured nothing. The
+// sweep reported 0 red for all eleven branches — not because they were undetectable but
+// because TestMain was panicking on stale migration state before a single test body
+// ran, and a harness that counts FAIL lines reads "nothing ran" as "nothing failed".
+// The sweep now asserts the subtest COUNT on every mutation and calls a run invalid
+// rather than green when it does not match. Same defect as this file's subject, one
+// level further out: an outcome with no check that the check itself executed.
 func TestCensusMatcherSeesEverySpellingItClaimsTo(t *testing.T) {
 	cases := []struct {
 		name string

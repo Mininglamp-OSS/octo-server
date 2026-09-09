@@ -2464,6 +2464,26 @@ pr_868_round_5_fixed:
       would go verify semantics that no longer exist. The same sweep had correctly updated
       project-p2-product-surfaces/brief.md and stopped one file short.
     fix: "entry rewritten: D2 and D14 remain open, the member_count item is recorded as resolved here."
+  - id: the-mutation-harness-reported-nothing-ran-as-nothing-failed
+    severity: medium
+    reported_by: "self, re-running the branch sweep after the refactor"
+    where: the sweep procedure, not the tree
+    what: |
+      After extracting matchRawSQL the branch sweep was re-run to keep the header's claim true,
+      and it came back 0 red for ALL eleven branches. That reads as "every branch is deletable
+      while green" -- the worst possible result -- and it was wrong. TestMain was panicking on
+      stale migration state left by the previous package's run, so no test body executed, and a
+      harness that counts "--- FAIL" lines cannot tell "nothing failed" from "nothing ran".
+      Two ways this could have gone wrong and one did: had the numbers looked plausible instead
+      of uniformly zero, the false measurement would have been believed and written into the
+      header as fact.
+    fix: |
+      The sweep now drops and recreates the test database first, records a BASELINE run and its
+      subtest count, and marks any mutation whose subtest count differs -- or whose output
+      contains a panic or build error -- as INVALID rather than as a result. Re-run under that
+      procedure: eleven branches, none deletable while green.
+      Written into the test header too, because the next person to re-measure needs the
+      procedure, not just the numbers.
   - id: carried-forward-not-fixed
     severity: low
     reported_by: "Jerry-Xin (P2 advisory); mochashanyao P2-3"
