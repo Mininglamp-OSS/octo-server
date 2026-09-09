@@ -2045,6 +2045,89 @@ pr_868_round_3_fixed:
       The bullet now says what is true -- the counter is new, and the kind it briefly was
       never left this branch. Description and this file corrected together.
 
+pr_868_round_3_advisory_taken:
+  - id: the-justification-said-expensive-about-a-ten-line-reorder
+    severity: medium
+    reported_by: "yujiawei P2-1 (both of that review's advisory passes reached it independently)"
+    where: modules/group/all_member_group.go
+    what: |
+      The comment explaining why FOR SHARE was reverted said the window can only be closed
+      after the cascade's lock order is straightened, i.e. that closing it is a cross-module
+      change to a P1 path. The ABBA analysis behind the revert is right; the conclusion drawn
+      from it is not. Verified the reviewer's alternative against the code: the txGroup read is
+      used only for validation (nil / disbanded / reassigned), and nothing between it and the
+      creator lock depends on its result. Moving it AFTER the `group_member ... FOR UPDATE` and
+      making it locking gives this function the order group_member -> group -- the cascade's own
+      order, so no ABBA, and the two paths then serialize on group_member so the detach cannot
+      land in the window. Cost: one extra lock in the already-detached case, which early-returns.
+      A justification that says "expensive" about a ten-line local reorder tells the next reader
+      not to look. That is the same failure as the round-2 comment that called a matcher gap
+      correct on semantic grounds.
+    fix: |
+      The comment now says the window CAN be closed locally, describes the reorder, and gives
+      the real reason for not doing it here: it changes lock acquisition on a P1-adjacent path
+      and deserves its own concurrency test, which is scheduling, not difficulty. The cascade's
+      own inversion is named as a separate matter and explicitly NOT a precondition.
+    not_changed: "the reorder itself. The reviewer asked for the justification, not the fix."
+  - id: the-spent-budget-comment-described-the-disposition-not-the-residue
+    severity: medium
+    reported_by: "yujiawei P2-2 (one of its advisory passes rated this P1)"
+    where: modules/project/space_member_removal.go
+    what: |
+      The comment framed the give-up as deferral -- "those projects wait for their own next
+      membership change". What it left out is what the intermediate state IS. All three of the
+      reviewer's claims check out against the code:
+        - querySuccessorForProjectGroupTx (group/db.go) picks by seniority narrowed by I2, i.e.
+          any ACTIVE project member, not an active project OWNER. That mismatch is the reason
+          this finalizer exists at all.
+        - a human cannot repair it: owner transfer is one of the six D7-guarded handlers, and
+          the group is still project-bound, so IsAllMemberGroup is true and the guard applies.
+        - nothing reports it: the five ungated scans are ownerless / epoch / I2 / I3 /
+          removing_stall, none of which asserts D6 owner correctness.
+      So the new counter is not a nicety, it is the only signal this state exists.
+    fix: |
+      The residue is now named as a D6 violation, with the three points above and the reason it
+      is still P2 (reachability is 100k rows for one (space_id, uid), and the same projects were
+      never converged under the old code either -- the retry could not pass page one, so this is
+      not a regression). The cursor-persistence follow-up now carries a D6 owner-correctness
+      scan alongside it.
+  - id: the-flat-name-space-was-visible-but-unstated
+    severity: low
+    reported_by: "yujiawei P2-4"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      primitives, statusCapableWriters and the f.calls[name] lookup are keyed by bare function
+      name, repo-wide, while d14ExemptDoors is keyed "file:func" and says why. The asymmetry is
+      deliberate -- an exemption must not be inherited by a same-named function elsewhere -- but
+      only one half of it was written down.
+    fix: "stated in Known limits, with which direction each half fails in (loudly, both)."
+  - id: the-status-flags-are-per-function-not-per-statement
+    severity: low
+    reported_by: "yujiawei P2-5"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      writesStatusColumn / setsStatusZero are set from any `.Set` or key-value in the body,
+      independent of which table the surrounding statement targets. A function that updates
+      `robot` in one statement and writes `"status": 0` to another table in a second is
+      classified as a deletion primitive. Round 2 widened the numerator, so the surface grew.
+      Fail-closed: a false primitive is a false door and a loud failure.
+    fix: |
+      Pinned rather than narrowed -- a twelfth fixture asserting the current over-match, with
+      the reason in place, so the day someone scopes the flags to a statement this case tells
+      them the behaviour changed on purpose. Narrowing it means tracking dbr builder chains
+      through locals, which is a different tool.
+  - id: the-remeasured-header-changed-again
+    severity: low
+    reported_by: "self, after adding the twelfth fixture"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The header's measurement was re-run after the over-match fixture landed and the numbers
+      moved: seven of nine branches redden exactly one case, not eight. `Update("robot")`
+      reddens six (was five) and the key-value `"status": 0` branch now reddens two, both
+      because they are shapes several fixtures are built out of rather than spellings of their
+      own.
+    fix: "header re-measured and rewritten. The invariant claim -- none deletable while green -- is unchanged and still verified."
+
 verify:
   rules_rechecked:
     - id: space-isolation

@@ -33,6 +33,19 @@ package space
 //     same-named primitives in different packages would collapse into one. The
 //     "known primitives must still be found" assertion is what keeps that from
 //     going silent for the three that exist today.
+//     The name space is FLAT and repo-wide: `primitives`, `statusCapableWriters`
+//     and the `f.calls[name]` lookup are all keyed by bare function name, while
+//     d14ExemptDoors is keyed "file:func". That asymmetry is deliberate — an
+//     exemption must not be inherited by a same-named function elsewhere — but it
+//     means an unrelated `updateRobot` in another package WOULD inherit
+//     door-candidate status, and a same-named non-primitive is excluded from the
+//     door scan by `primitives[f.name] == nil`. Both fail loudly, not silently.
+//   - writesStatusColumn / setsStatusZero are set from ANY `.Set` or key-value in
+//     the function body, not only from the statement that targets `robot`. A
+//     function that updates `robot` in one statement and writes `"status": 0` to
+//     another table in a second is therefore classified as a deletion primitive.
+//     Over-match, fail-closed: a false primitive is a false door and a loud
+//     failure, never a missed one. Pinned by the last fixture below.
 //   - A door is the DIRECT caller of a primitive. If someone puts a wrapper between
 //     the handler and the primitive, this reports the wrapper — which fails loudly
 //     and is the safe direction, rather than passing because the seam is one frame
@@ -564,10 +577,14 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 // also the only way to cover a shape the tree does not currently contain.
 //
 // Measured, not asserted: each of the nine detection branches in censusFuncsIn was
-// deleted in turn and the table below re-run. No branch is deletable while green.
-// Eight of the nine redden exactly one case — the case named after that spelling. The
-// ninth, the `Update("robot")` table guard, reddens five, because it is not a spelling
-// of its own but the precondition every robot-table shape is built on.
+// deleted in turn and the table below re-run. No branch is deletable while green —
+// that is the property this test exists for, and it is the one that was checked.
+//
+// Seven of the nine redden exactly one case, the one named after that spelling. Two
+// redden more, both for the same reason — they are not spellings but shapes that
+// several fixtures are built out of: `Update("robot")` (six) is the table precondition
+// under every robot-table case, and the key-value `"status": 0` (two) is shared by the
+// SetMap composite literal and the over-match case at the end.
 func TestCensusMatcherSeesEverySpellingItClaimsTo(t *testing.T) {
 	cases := []struct {
 		name string
@@ -673,6 +690,27 @@ func probe(s S, id string) error {
 	_, err := s.UpdateBySql("DELETE FROM robot_menu WHERE robot_id=?", id).Exec()
 	return err
 }`,
+		},
+		{
+			// KNOWN OVER-MATCH, pinned rather than fixed. The two halves come from
+			// two different statements: `Update("robot")` from the first, the zero
+			// status from the second, which targets another table entirely. The
+			// classifier holds both flags per FUNCTION, so it says primitive.
+			// That is the fail-closed direction — a false primitive makes its
+			// callers false doors and fails loudly — and scoping the flags to a
+			// statement means tracking dbr builder chains through locals, which is
+			// a different tool. Asserted so the day someone narrows it, this case
+			// tells them the behaviour changed on purpose. PR #868's review, P2-5.
+			name: "known over-match: robot update and a status zero in DIFFERENT statements",
+			src: `package p
+func probe(s S, id string) error {
+	if _, err := s.Update("robot").Set("agent_version", "v2").Where("robot_id=?", id).Exec(); err != nil {
+		return err
+	}
+	_, err := s.Update("robot_menu").SetMap(map[string]interface{}{"status": 0}).Where("robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
 		},
 	}
 

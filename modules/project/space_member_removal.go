@@ -190,11 +190,28 @@ func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacem
 	// 20260904000001_project_core.sql），而每 Space 的项目配额只按**活跃**项目算，所以
 	// 同一个 (space_id, uid) 的历史行数没有上限。
 	//
-	// 放弃的是什么，说清楚：超出预算的那些项目，这一次不收敛。它们只有在自己下一次
-	// 踢人 / 退出 / 改角色时才会被同步——而那三条路径本来就每次都调这个同步。换来的是
-	// 一条不会把整条清理工单拖进 abandoned 的失败路径。要真正做到"这一次就走完"，需要把
-	// 游标持久化到工单行上，而那张表属于 modules/space，为一个 project 侧收敛动作加列
-	// 是把分层反过来——真需要时单独立项。
+	// 放弃的是什么，说清楚——上一版只说了"这一次不收敛，等它们自己的下一次成员变动"，
+	// 那是**处置**，不是**残留状态**。PR #868 第二轮 review 的 P2-2 要求把后者点名，
+	// 因为它比"延后"重：
+	//
+	//   - 留下的是一次 D6 违反。群侧级联挑继任者用的是 querySuccessorForProjectGroupTx
+	//     （group/db.go），按资历、以 I2 收窄——条件是"项目的活跃成员"，**不是**项目
+	//     owner。这个错配正是本 finalizer 存在的理由（见本文件开头）。所以没被访问到的
+	//     项目，可能挂着一个群主不是 owner 的全员群。
+	//   - 人工修不了。群主转让是 D7 拦住的六个入口之一，而这个群仍然项目直属，
+	//     IsAllMemberGroup 为真，守卫照常生效。
+	//   - 没有任何扫描报它。五条不受开关控制的扫描是 ownerless / epoch / I2 / I3 /
+	//     removing_stall，没有一条查 D6 的群主正确性。
+	//
+	// 也就是说，上面那个 counter 不是锦上添花，它是这个状态**唯一**的信号。
+	//
+	// 为什么仍然只算 P2 而不是拦路：可达性极低（cascadeMaxPages × cascadePageSize =
+	// 单个 (space_id, uid) 十万行），而且这些项目在旧代码下同样从来没被收敛过——重试
+	// 走不过第一页——所以这不是回退，只是把一个既有残留说清楚。
+	//
+	// 要真正做到"这一次就走完"，需要把游标持久化到工单行上，而那张表属于 modules/space，
+	// 为一个 project 侧收敛动作加列是把分层反过来——真需要时单独立项，和一条 D6 群主
+	// 正确性扫描一起。
 	observeAllMemberGroupConvergenceIncomplete()
 	p.Warn("全员群群主收敛用尽单次页数预算，剩余项目留给它们各自的下一次成员变动",
 		zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID),

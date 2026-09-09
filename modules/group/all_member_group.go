@@ -238,10 +238,19 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 	// 单人项目正好走到级联那条 detach 分支），于是并发时构成 ABBA，MySQL 判定 1213
 	// 杀掉其中一个。改之前实测过这个方向：加锁能挡住 detach，但代价是这条新死锁。
 	//
-	// 真正的顺序问题在级联那边：声明的锁序是
-	// space_member → space → project → group → group_member → octo_project_member，
-	// 而它先 group_member 后 group，是一处既有的倒置。把那条理顺之后，这里的 FOR SHARE
-	// 才是安全的——那是它自己的一次改动，要带自己的分析和用例，不该搭在这次 fast-follow 上。
+	// 但**不要**据此以为必须先把级联理顺才能关掉这个窗口——上一版注释就是这么写的，
+	// 那句话把一次十行的本地调整说成了一次跨模块改造。PR #868 第二轮 review 的 P2-1
+	// 指出了这一点，说得对：下面这次读只用来校验（群没了 / 已解散 / 已改归属），
+	// 从它到取 creator 锁之间没有任何东西依赖它的结果。把它**移到 group_member
+	// … FOR UPDATE 之后**并改成锁定读，本函数的顺序就变成 group_member → group，
+	// 与级联同向，ABBA 消失，而且两条路径先在 group_member 上串行化，detach 也就
+	// 挤不进这个窗口了。代价是已经 detach 的情况下多取一把马上就要 early return 的锁。
+	//
+	// 那为什么这次仍然不做：它改的是一条 P1 相邻路径上的加锁次序，值得带自己的
+	// 并发用例单独提，而不是搭在一次 fast-follow 的末尾。这是排期，不是难度——
+	// 真正的顺序问题（级联声明的锁序是 space_member → space → project → group →
+	// group_member → octo_project_member，而它先 group_member 后 group，是一处既有的
+	// 倒置）是另一件事，那件事才需要跨模块分析，且**不是**关掉本窗口的前置条件。
 	//
 	// 在那之前，剩下的窗口有多大、后果是什么，说清楚而不是含糊过去：需要一次 detach
 	// 恰好落在本事务开读视图之后，终态是一个 Space 直属的群带着一个可能不对的群主——
