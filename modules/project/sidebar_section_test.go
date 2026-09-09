@@ -1,11 +1,13 @@
 package project
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,6 +59,30 @@ func TestPinningSpaceListedProjectProvisionsSidebarSection(t *testing.T) {
 	assertProjectSidebarSection(t, created.ProjectID, "sidebar-pinner", 1)
 }
 
+func TestUnpinningProjectRemovesItFromFollowAndRepinningRestoresIt(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "sidebar-unpin-owner")
+	seedSpaceMember(t, spaceA, "sidebar-unpin-owner", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerToken, "sidebar unpin")
+
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, ownerToken, true).Code)
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, true)
+
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, ownerToken, false).Code)
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, false)
+	assertProjectSidebarSection(t, created.ProjectID, "sidebar-unpin-owner", 0)
+
+	// A second read exercises the membership repair path. The explicit unpin is
+	// a personal opt-out and must not be undone merely because the user still has
+	// an active Project seat.
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, false)
+
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, ownerToken, true).Code)
+	assertProjectInFollow(t, srv, ownerToken, created.ProjectID, true)
+	assertProjectSidebarSection(t, created.ProjectID, "sidebar-unpin-owner", 1)
+}
+
 func TestProjectSidebarProvisionFailureDoesNotRollbackProject(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -85,4 +111,22 @@ func assertProjectSidebarSection(t *testing.T, projectID, uid string, want int) 
 		uid, spaceA, projectID,
 	).LoadOne(&count))
 	assert.Equal(t, want, count)
+}
+
+func assertProjectInFollow(t *testing.T, srv *server.Server, token, projectID string, want bool) {
+	t.Helper()
+	w := doJSON(t, srv, http.MethodGet, "/v1/spaces/"+spaceA+"/sidebar-sections", token, nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var sections []struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &sections), "body: %s", w.Body.String())
+	for _, section := range sections {
+		if section.Type == "project" && section.ID == projectID {
+			assert.True(t, want, "Project %s unexpectedly remains in Follow", projectID)
+			return
+		}
+	}
+	assert.False(t, want, "Project %s is missing from Follow", projectID)
 }
