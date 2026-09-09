@@ -18,6 +18,15 @@ type botfatherDB struct {
 var errCreateBotSpaceDenied = errors.New("bot creation Space authorization denied")
 var errCreateBotSpaceBindingFailed = errors.New("bot creation Space binding failed")
 var errCreateBotPersistenceFailed = errors.New("bot creation persistence failed")
+var errHostedBotAlreadyExists = errors.New("hosted bot already exists for creator")
+
+// hostedBotCreationLock serializes the globally limited hosted-bot creation
+// path for one real creator UID. The user row is the stable lock anchor: unlike
+// robot rows it exists before the first Bot is inserted, so it also closes the
+// empty-result race.
+type hostedBotCreationLock struct {
+	tx *dbr.Tx
+}
 
 func newBotfatherDB(ctx *config.Context) *botfatherDB {
 	return &botfatherDB{
@@ -26,7 +35,52 @@ func newBotfatherDB(ctx *config.Context) *botfatherDB {
 	}
 }
 
+// lockHostedBotCreation locks the creator's authoritative user row and checks
+// the global (not Space-scoped) hosted Bot quota. Callers must keep the lock
+// until the newly created robot row has committed, then release it with commit.
+func (d *botfatherDB) lockHostedBotCreation(creatorUID string) (*hostedBotCreationLock, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin hosted Bot creation lock: %w", err)
+	}
+
+	var lockedUID string
+	err = tx.SelectBySql("SELECT uid FROM user WHERE uid=? FOR UPDATE", creatorUID).LoadOne(&lockedUID)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("lock hosted Bot creator: %w", err)
+	}
+
+	var count int
+	err = tx.SelectBySql(
+		"SELECT COUNT(*) FROM robot WHERE creator_uid=? AND status=1 AND agent_hosting=?",
+		creatorUID, agentHostingOctoHosted,
+	).LoadOne(&count)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("check hosted Bot quota: %w", err)
+	}
+	if count > 0 {
+		_ = tx.Rollback()
+		return nil, errHostedBotAlreadyExists
+	}
+	return &hostedBotCreationLock{tx: tx}, nil
+}
+
+func (l *hostedBotCreationLock) release(commit bool) error {
+	if l == nil || l.tx == nil {
+		return nil
+	}
+	tx := l.tx
+	l.tx = nil
+	if commit {
+		return tx.Commit()
+	}
+	return tx.Rollback()
+}
+
 type robotModel struct {
+	Kind          string
 	AppID         string
 	RobotID       string
 	Username      string
@@ -50,9 +104,9 @@ type robotModel struct {
 	// BoundAt 占用时间；timestamp NULL，未占用时无效。用 NullTime 承接 NULL，
 	// 否则 Select("*") 把 NULL bound_at 扫进 string 会报错，殃及所有 robot 查询。
 	BoundAt dbr.NullTime
-	// AgentHosting Agent 自报托管形态，小写 slug（self_hosted / octo_hosted /
-	// <vendor>_hosted）；空=未上报。写入在 modules/bot_api 的 register，这里只读。
-	// 自报值，不可用于鉴权。
+	// AgentHosting 托管形态，小写 slug（self_hosted / octo_hosted /
+	// <vendor>_hosted）；空=未上报。创建路径对 octo_hosted 施加全局配额；
+	// 运行时上报仍是展示与排障遥测。
 	AgentHosting string
 	// AgentReportedHostingAt 最近一次收到 **agent_hosting** 上报的时间；
 	// timestamp NULL，从未上报时无效。只在 hosting 被上报时前进（见
@@ -74,22 +128,35 @@ func (d *botfatherDB) queryRobotByBotToken(botToken string) (*robotModel, error)
 // queryRobotByRobotID 通过RobotID查询机器人
 func (d *botfatherDB) queryRobotByRobotID(robotID string) (*robotModel, error) {
 	var m *robotModel
-	_, err := d.session.Select("*").From("robot").Where("robot_id=?", robotID).Load(&m)
+	_, err := d.session.Select("*").From("robot").Where("robot_id=? AND kind='user'", robotID).Load(&m)
 	return m, err
 }
 
 // queryRobotsByCreatorUID 查询某个用户创建的所有机器人
 func (d *botfatherDB) queryRobotsByCreatorUID(creatorUID string) ([]*robotModel, error) {
 	var list []*robotModel
-	_, err := d.session.Select("*").From("robot").Where("creator_uid=? and status=1", creatorUID).Load(&list)
+	_, err := d.session.Select("*").From("robot").Where("creator_uid=? and status=1 AND kind='user'", creatorUID).Load(&list)
 	return list, err
+}
+
+// queryActiveHostedBotByCreatorUID returns one deterministic existing hosted
+// Bot for an owner. Historical duplicate rows are deliberately not repaired by
+// this read; the oldest active row is the credential returned to the owner.
+func (d *botfatherDB) queryActiveHostedBotByCreatorUID(creatorUID string) (*robotModel, error) {
+	var m *robotModel
+	_, err := d.session.Select("*").From("robot").
+		Where("creator_uid=? AND status=1 AND agent_hosting=?", creatorUID, agentHostingOctoHosted).
+		OrderAsc("created_at").
+		Limit(1).
+		Load(&m)
+	return m, err
 }
 
 // queryRobotsByCreatorUIDAndSpaceID 查询某用户在指定 Space 下创建的机器人
 func (d *botfatherDB) queryRobotsByCreatorUIDAndSpaceID(creatorUID, spaceID string) ([]*robotModel, error) {
 	var list []*robotModel
 	_, err := d.session.SelectBySql(
-		"SELECT r.* FROM robot r INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1 WHERE r.creator_uid=? AND r.status=1",
+		"SELECT r.* FROM robot r INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1 WHERE r.creator_uid=? AND r.status=1 AND r.kind='user'",
 		spaceID, creatorUID,
 	).Load(&list)
 	return list, err
@@ -306,11 +373,11 @@ func (d *botfatherDB) insertRobotTx(m *robotModel, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("robot").Columns(
 		"app_id", "robot_id", "username", "token", "version", "status",
 		"creator_uid", "description", "bot_token", "im_token_cache", "bot_commands",
-		"auto_approve",
+		"auto_approve", "agent_hosting", "kind",
 	).Values(
 		m.AppID, m.RobotID, m.Username, m.Token, m.Version, m.Status,
 		m.CreatorUID, m.Description, m.BotToken, m.IMTokenCache, m.BotCommands,
-		m.AutoApprove,
+		m.AutoApprove, m.AgentHosting, "user",
 	).Exec()
 	return err
 }
@@ -319,7 +386,7 @@ func (d *botfatherDB) insertRobotTx(m *robotModel, tx *dbr.Tx) error {
 func (d *botfatherDB) updateRobotIMTokenCache(robotID string, imToken string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"im_token_cache": imToken,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -327,7 +394,7 @@ func (d *botfatherDB) updateRobotIMTokenCache(robotID string, imToken string) er
 func (d *botfatherDB) updateRobotBotToken(robotID string, newToken string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"bot_token": newToken,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -335,7 +402,7 @@ func (d *botfatherDB) updateRobotBotToken(robotID string, newToken string) error
 func (d *botfatherDB) updateRobotDescription(robotID string, description string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"description": description,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -351,7 +418,7 @@ func (d *botfatherDB) updateRobotAgentInfo(robotID, agentPlatform, agentVersion,
 		"agent_platform": agentPlatform,
 		"agent_version":  agentVersion,
 		"plugin_version": pluginVersion,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -360,7 +427,7 @@ func (d *botfatherDB) deleteRobot(robotID string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"status":   0,
 		"username": "",
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -368,7 +435,7 @@ func (d *botfatherDB) deleteRobot(robotID string) error {
 func (d *botfatherDB) queryRobotList(pageIndex, pageSize int) ([]*robotModel, error) {
 	var list []*robotModel
 	_, err := d.session.Select("*").From("robot").
-		Where("status=1").
+		Where("status=1 AND kind='user'").
 		OrderDir("created_at", false).
 		Limit(uint64(pageSize)).
 		Offset(uint64(pageIndex * pageSize)).
@@ -379,14 +446,14 @@ func (d *botfatherDB) queryRobotList(pageIndex, pageSize int) ([]*robotModel, er
 // queryRobotCount 查询机器人总数
 func (d *botfatherDB) queryRobotCount() (int64, error) {
 	var count int64
-	err := d.session.Select("count(*)").From("robot").Where("status=1").LoadOne(&count)
+	err := d.session.Select("count(*)").From("robot").Where("status=1 AND kind='user'").LoadOne(&count)
 	return count, err
 }
 
 // queryRobotCountByCreator 查询某用户创建的机器人数量
 func (d *botfatherDB) queryRobotCountByCreator(creatorUID string) (int64, error) {
 	var count int64
-	err := d.session.Select("count(*)").From("robot").Where("creator_uid=? and status=1", creatorUID).LoadOne(&count)
+	err := d.session.Select("count(*)").From("robot").Where("creator_uid=? and status=1 AND kind='user'", creatorUID).LoadOne(&count)
 	return count, err
 }
 
@@ -394,7 +461,7 @@ func (d *botfatherDB) queryRobotCountByCreator(creatorUID string) (int64, error)
 func (d *botfatherDB) updateBotCommands(robotID string, botCommands string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"bot_commands": botCommands,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -589,7 +656,7 @@ func (d *botfatherDB) querySpaceNameByID(spaceID string) (string, error) {
 // queryRobotByRobotIDAndCreator 查询指定创建者的Bot
 func (d *botfatherDB) queryRobotByRobotIDAndCreator(robotID, creatorUID string) (*robotModel, error) {
 	var m *robotModel
-	_, err := d.session.Select("*").From("robot").Where("robot_id=? AND creator_uid=? AND status=1", robotID, creatorUID).Load(&m)
+	_, err := d.session.Select("*").From("robot").Where("robot_id=? AND creator_uid=? AND status=1 AND kind='user'", robotID, creatorUID).Load(&m)
 	return m, err
 }
 
@@ -644,7 +711,7 @@ func (d *botfatherDB) querySpaceIDByRobotID(robotID string) (string, error) {
 func (d *botfatherDB) bindRobotCAS(robotID, creatorUID, agentRef string) (int64, error) {
 	res, err := d.session.UpdateBySql(
 		"UPDATE robot SET bound_agent_ref=?, bound_at=NOW() "+
-			"WHERE robot_id=? AND creator_uid=? AND status=1 "+
+			"WHERE robot_id=? AND creator_uid=? AND status=1 AND kind='user' "+
 			"AND (bound_agent_ref='' OR bound_agent_ref=?)",
 		agentRef, robotID, creatorUID, agentRef,
 	).Exec()
@@ -665,7 +732,7 @@ func (d *botfatherDB) bindRobotCAS(robotID, creatorUID, agentRef string) (int64,
 func (d *botfatherDB) unbindRobotCAS(robotID, creatorUID, agentRef string) (int64, error) {
 	res, err := d.session.UpdateBySql(
 		"UPDATE robot SET bound_agent_ref='', bound_at=NULL "+
-			"WHERE robot_id=? AND creator_uid=? AND status=1 "+
+			"WHERE robot_id=? AND creator_uid=? AND status=1 AND kind='user' "+
 			"AND (bound_agent_ref='' OR bound_agent_ref=?)",
 		robotID, creatorUID, agentRef,
 	).Exec()

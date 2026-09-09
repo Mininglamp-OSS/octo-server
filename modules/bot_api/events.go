@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
@@ -116,13 +117,48 @@ func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 // filter that applied to only one of them would be a silent hole the moment a
 // caller sets `wait`.
 func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*eventResp) []*eventResp {
-	if botKind != BotKindApp || len(results) == 0 {
+	if (botKind != BotKindApp && botKind != BotKindAvatar) || len(results) == 0 {
 		return results
 	}
 	filtered := make([]*eventResp, 0, len(results))
 	var filteredIDs []string
 	for _, r := range results {
+		if botKind == BotKindAvatar && r.Message != nil {
+			channelID, channelType := r.Message.ChannelID, r.Message.ChannelType
+			// Person-channel messages carry WuKongIM's synthetic channel id.
+			// The sender is the actual peer whose live shared-Space relation is
+			// authoritative, so never feed the synthetic id to CanAccessChannel.
+			if (channelType == 0 || channelType == common.ChannelTypePerson.Uint8()) && r.Message.FromUID != "" {
+				channelID, channelType = r.Message.FromUID, common.ChannelTypePerson.Uint8()
+			}
+			allowed, authErr := botpolicy.CanAccessChannel(ba.ctx.DB(), robotID, channelID, channelType, "")
+			if authErr != nil {
+				ba.Warn("authorize avatar event failed", zap.Error(authErr), zap.Int64("eventID", r.EventID))
+			}
+			if authErr != nil || !allowed {
+				filteredIDs = append(filteredIDs, fmt.Sprintf("%d", r.EventID))
+				continue
+			}
+		}
+		if botKind == BotKindAvatar && r.Message == nil && r.EventData != nil {
+			channelID, _ := r.EventData["channel_id"].(string)
+			channelType := eventChannelType(r.EventData["channel_type"])
+			if channelID != "" && channelType != 0 {
+				allowed, authErr := botpolicy.CanAccessChannel(ba.ctx.DB(), robotID, channelID, channelType, "")
+				if authErr != nil {
+					ba.Warn("authorize avatar typed event failed", zap.Error(authErr), zap.Int64("eventID", r.EventID))
+				}
+				if authErr != nil || !allowed {
+					filteredIDs = append(filteredIDs, fmt.Sprintf("%d", r.EventID))
+					continue
+				}
+			}
+		}
 		if r.Message != nil && r.Message.ChannelType != 0 && r.Message.ChannelType != common.ChannelTypePerson.Uint8() {
+			if botKind == BotKindAvatar {
+				filtered = append(filtered, r)
+				continue
+			}
 			filteredIDs = append(filteredIDs, fmt.Sprintf("%d", r.EventID))
 			continue
 		}
@@ -137,6 +173,24 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 		}
 	}
 	return filtered
+}
+
+func eventChannelType(value interface{}) uint8 {
+	switch typed := value.(type) {
+	case float64:
+		return uint8(typed)
+	case int:
+		return uint8(typed)
+	case int64:
+		return uint8(typed)
+	case uint8:
+		return typed
+	case string:
+		parsed, _ := strconv.ParseUint(typed, 10, 8)
+		return uint8(parsed)
+	default:
+		return 0
+	}
 }
 
 // ackEvent removes one auto-ACK'd event from the queue.

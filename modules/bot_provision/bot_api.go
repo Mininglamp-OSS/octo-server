@@ -146,7 +146,7 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 	_, err = a.ctx.DB().SelectBySql(
 		`SELECT r.bot_token, r.creator_uid FROM robot r
 		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
-		 WHERE r.robot_id=? AND r.status=1`,
+		 WHERE r.robot_id=? AND r.status=1 AND r.kind='user'`,
 		callerSpace, botUID,
 	).Load(&r)
 	if err != nil {

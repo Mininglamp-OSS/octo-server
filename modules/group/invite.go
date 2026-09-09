@@ -56,6 +56,19 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	if botErr := checkAvatarOrdinaryGroupAdmission(g.ctx.DB(), req.UIDS); botErr != nil {
+		if errors.Is(botErr, ErrAvatarOrdinaryGroupDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupAvatarAITeamOnly, nil, nil)
+			return
+		}
+		if errors.Is(botErr, ErrBotOwnershipDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
+			return
+		}
+		g.Error("检查 Avatar 群 Space 失败", zap.Error(botErr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
 
 	creatorOrManagerUIDS, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
 	if err != nil {
@@ -330,6 +343,8 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 		g.Error("添加成员失败！", zap.Error(err))
 		// 透出 allow_external 等策略拒绝的具体错误，方便管理员定位；其他底层错误走兜底文案
 		switch {
+		case errors.Is(err, ErrAvatarOrdinaryGroupDenied):
+			httperr.ResponseErrorL(c, errcode.ErrGroupAvatarAITeamOnly, nil, nil)
 		// 准入被拒是 400，不是 500。见 api.go groupCreate 处的说明。
 		case errors.Is(err, ErrAdmissionRefused):
 			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)

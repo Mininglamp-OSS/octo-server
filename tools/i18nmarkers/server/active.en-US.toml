@@ -93,6 +93,9 @@ other = "Bot authentication check failed."
 ["err.server.bot_api.auth_failed"]
 other = "Bot authentication failed."
 
+["err.server.bot_api.avatar_unsupported"]
+other = "Digital avatars are not permitted to perform this operation."
+
 ["err.server.bot_api.bot_not_provisioned"]
 other = "The bot is not fully provisioned for this operation."
 
@@ -285,6 +288,9 @@ other = "The bot does not belong to the current space."
 ["err.server.botfather.cannot_apply_own_bot"]
 other = "No need to apply for a bot you own."
 
+["err.server.botfather.hosted_bot_exists"]
+other = "A hosted AI clone already exists."
+
 ["err.server.botfather.not_owner"]
 other = "You are not the owner of this bot."
 
@@ -422,6 +428,9 @@ other = "The authorization code is invalid or has expired."
 
 ["err.server.group.auth_code_user_mismatch"]
 other = "The authorization code does not match the current user."
+
+["err.server.group.avatar_ai_team_only"]
+other = "Digital avatars can only join AI Team groups."
 
 ["err.server.group.bot_cannot_be_owner"]
 other = "Group ownership cannot be transferred to a bot."

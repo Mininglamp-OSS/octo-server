@@ -189,36 +189,44 @@ func TestCategory_List(t *testing.T) {
 	assert.Equal(t, 1, len(uncatGroups))
 }
 
-func TestCategory_ExcludesAndRejectsAITeamContainer(t *testing.T) {
+func TestCategory_ExcludesAndRejectsAITeamManagedGroups(t *testing.T) {
 	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 
 	spaceID := "space-category-ai"
-	groupNo := "group-category-ai"
 	seedSpaceAndMember(t, f, spaceID, 0)
-	seedGroup(t, f, groupNo, spaceID)
-	_, err := f.db.session.UpdateBySql("UPDATE `group` SET purpose=? WHERE group_no=?", aiteampkg.GroupPurpose, groupNo).Exec()
-	require.NoError(t, err)
 
 	category := createCategory(t, s.GetRoute(), spaceID, "工作")
 	require.Equal(t, http.StatusOK, category.Code, category.Body.String())
 	categoryID := parseJSON(t, category)["category_id"].(string)
 
-	move := doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{
-		"category_id": categoryID,
-	})
-	require.Equal(t, http.StatusBadRequest, move.Code, move.Body.String())
-	var envelope errEnvelope
-	require.NoError(t, json.Unmarshal(move.Body.Bytes(), &envelope))
-	assert.Equal(t, "err.server.ai_team.container_protected", envelope.Error.Code)
+	managed := map[string]string{
+		"group-category-ai-session": aiteampkg.GroupPurpose,
+		"group-category-ai-team":    aiteampkg.TeamGroupPurpose,
+		"group-category-ai-custom":  aiteampkg.CustomTeamPurpose,
+	}
+	for groupNo, purpose := range managed {
+		seedGroup(t, f, groupNo, spaceID)
+		_, err := f.db.session.UpdateBySql("UPDATE `group` SET purpose=? WHERE group_no=?", purpose, groupNo).Exec()
+		require.NoError(t, err)
+
+		move := doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{
+			"category_id": categoryID,
+		})
+		require.Equal(t, http.StatusBadRequest, move.Code, move.Body.String())
+		var envelope errEnvelope
+		require.NoError(t, json.Unmarshal(move.Body.Bytes(), &envelope))
+		assert.Equal(t, "err.server.ai_team.container_protected", envelope.Error.Code)
+	}
 
 	list := doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/categories", nil)
 	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
 	for _, category := range parseJSONArray(t, list) {
 		for _, rawGroup := range category["groups"].([]interface{}) {
 			group := rawGroup.(map[string]interface{})
-			assert.NotEqual(t, groupNo, group["group_no"], "AI container must not appear in category trees")
+			_, isManaged := managed[group["group_no"].(string)]
+			assert.False(t, isManaged, "AI-managed groups must not appear in category trees")
 		}
 	}
 }

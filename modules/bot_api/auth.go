@@ -4,13 +4,15 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"go.uber.org/zap"
 )
 
 // BotKind identifies the type of authenticated bot.
 const (
-	BotKindUser = "user" // User Bot (bf_ token, robot table)
-	BotKindApp  = "app"  // App Bot (app_ token, app_bot table)
+	BotKindAvatar = "avatar"
+	BotKindUser   = "user" // User Bot (bf_ token, robot table)
+	BotKindApp    = "app"  // App Bot (app_ token, app_bot table)
 )
 
 // Context keys for bot identity.
@@ -20,6 +22,7 @@ const (
 	CtxKeyRobot         = "robot"         // *robotModel for User Bot
 	CtxKeyAppBotScope   = "app_bot_scope" // "platform" | "space"
 	CtxKeyAppBotSpaceID = "app_bot_space_id"
+	CtxKeyAvatarDMSpace = "avatar_dm_space_id"
 )
 
 // authBot returns the unified Bot API authentication middleware.
@@ -56,8 +59,30 @@ func (ba *BotAPI) authUserBot(c *wkhttp.Context, token string) {
 	}
 
 	c.Set(CtxKeyRobotID, robot.RobotID)
-	c.Set(CtxKeyBotKind, BotKindUser)
+	kind := BotKindUser
+	if robot.Kind == string(botpolicy.Avatar) {
+		identity := botpolicy.Identity{Kind: botpolicy.Avatar, Status: robot.Status, CreatorUID: robot.CreatorUID,
+			Scope: robot.ManagementScope, SpaceID: robot.ManagementSpaceID, PublicationState: robot.PublicationState,
+			LifecyclePending: robot.LifecyclePending}
+		if !identity.ActiveAvatar() {
+			respondBotAPIAuthFailed(c)
+			return
+		}
+		kind = BotKindAvatar
+	} else if robot.Kind != "" && robot.Kind != BotKindUser {
+		respondBotAPIAuthFailed(c)
+		return
+	} else if robot.Kind == BotKindUser && robot.CreatorUID == "" {
+		// A missing owner is not an implicit Avatar marker. Only the
+		// administrator-owned kind can carry an empty creator.
+		respondBotAPIAuthFailed(c)
+		return
+	}
+	c.Set(CtxKeyBotKind, kind)
 	c.Set(CtxKeyRobot, robot)
+	if kind == BotKindAvatar && !ba.authorizeAvatarRoute(c) {
+		return
+	}
 	c.Next()
 }
 

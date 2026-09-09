@@ -262,6 +262,30 @@ func TestBotToken_NonexistentBot_404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
 }
 
+// Administrator-owned Avatars have a separate manager credential surface.
+// Even a valid daemon key in the same Space must not expose that token through
+// the personal User Bot provisioning endpoint.
+func TestBotToken_AvatarUsesManagerCredentialPath_404(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedBPFixtures(t, ctx)
+	const apiKey = "uk_bp_avatar_aaaaaaaaaaaaaaaaaaaaaaaa"
+	const avatarID = "avatar_bp"
+	insertAPIKey(t, ctx, bpTestUIDA, apiKey, bpTestSpaceA)
+	_, err := ctx.DB().InsertInto("robot").Columns(
+		"robot_id", "creator_uid", "bot_token", "status", "auto_approve", "kind",
+		"management_scope", "management_space_id", "created_by", "publication_state", "lifecycle_pending",
+	).Values(avatarID, "", "bf_avatar_secret", 1, 1, "avatar", "space", bpTestSpaceA, bpTestUIDA, "published", 0).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").Columns("space_id", "uid", "role", "status").
+		Values(bpTestSpaceA, avatarID, 0, 1).Exec()
+	require.NoError(t, err)
+
+	w := doBotToken(t, s, avatarID, apiKey)
+	assert.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "bf_avatar_secret")
+}
+
 // 8) v3.3.3 §E (yujiawei v3.3.1 stale review #3 三审): daemon path 的
 // disabled-space 修 (assertSpaceMember 加 `INNER JOIN space ON s.status=1`)
 // 也漏 test. 跟 §D 同款攻击形态在 botToken endpoint 上: space soft-deleted

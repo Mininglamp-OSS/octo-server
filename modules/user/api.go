@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -49,6 +50,7 @@ import (
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
@@ -282,8 +284,8 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// auth.GET("/users/:uid/conversation", u.userConversationInfoGet)
 
 		auth.GET("/user/search", searchLimit, u.search)
-		auth.POST("/users/:uid/avatar", u.uploadAvatar)              //上传用户头像
-		auth.PUT("/users/:uid/setting", u.setting.userSettingUpdate) // 更新用户设置
+		auth.POST("/users/:uid/avatar", appwkhttp.SharedUIDRateLimiter(r, u.ctx), u.uploadAvatar) //上传用户头像
+		auth.PUT("/users/:uid/setting", u.setting.userSettingUpdate)                              // 更新用户设置
 	}
 
 	// 用户详情与用户搜索开放给 User API Key（`uk_*`）树。两个 handler 的 actor 都取自
@@ -771,9 +773,32 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 
 	// 若 targetUID 与 loginUID 不同，需确认 loginUID 有权限修改该头像
 	if targetUID != loginUID {
+		avatarManaged := false
+		identity, identityErr := botpolicy.Lookup(u.ctx.DB(), targetUID)
+		if identityErr != nil {
+			u.Error("查询 Avatar 身份失败", zap.Error(identityErr), zap.String("uid", targetUID))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if identity != nil && identity.Kind == botpolicy.Avatar {
+			if identity.PublicationState == botpolicy.Deleted {
+				httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
+				return
+			}
+			avatarManaged, identityErr = botpolicy.CanManageAvatar(u.ctx.DB(), identity, loginUID, c.CheckLoginRoleIsSuperAdmin() == nil)
+			if identityErr != nil {
+				u.Error("校验 Avatar 管理权限失败", zap.Error(identityErr), zap.String("uid", targetUID))
+				respondUserError(c, errcode.ErrUserQueryFailed)
+				return
+			}
+			if !avatarManaged {
+				httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
+				return
+			}
+		}
 		var creatorUID string
 		err := u.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? and status=1", targetUID).LoadOne(&creatorUID)
-		if err != nil || creatorUID != loginUID {
+		if !avatarManaged && (err != nil || creatorUID != loginUID) {
 			// User Bot 校验失败，尝试 App Bot 权限校验
 			var appBot struct {
 				Scope   string `db:"scope"`
@@ -783,13 +808,13 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 				"SELECT scope, IFNULL(space_id,'') as space_id FROM app_bot WHERE uid=? LIMIT 1", targetUID,
 			).Load(&appBot)
 			if appErr != nil || cnt == 0 {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+				httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 				return
 			}
 			switch appBot.Scope {
 			case "platform":
 				if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+					httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 					return
 				}
 			case "space":
@@ -803,12 +828,12 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 						"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 LIMIT 1", appBot.SpaceID, loginUID,
 					).Load(&member)
 					if mErr != nil || mCnt == 0 || member.Role < 1 {
-						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+						httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 						return
 					}
 				}
 			default:
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+				httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 				return
 			}
 		}

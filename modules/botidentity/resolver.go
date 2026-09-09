@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -17,6 +18,7 @@ type Kind string
 const (
 	KindUserBot Kind = "user_bot"
 	KindAppBot  Kind = "app_bot"
+	KindAvatar  Kind = "avatar"
 
 	// ScopePlatform and ScopeSpace are the authoritative app_bot.scope values.
 	ScopePlatform = "platform"
@@ -46,6 +48,7 @@ type activeKindStore interface {
 
 type identityRecord struct {
 	UserBot    bool   `db:"user_bot"`
+	Avatar     bool   `db:"avatar"`
 	CreatorUID string `db:"creator_uid"`
 	AppBot     bool   `db:"app_bot"`
 	AppScope   string `db:"app_scope"`
@@ -63,12 +66,16 @@ func (s *dbActiveKindStore) lookup(uid string) (identityRecord, error) {
 	var row identityRecord
 	err := s.session.SelectBySql(`
 		SELECT
-			EXISTS(SELECT 1 FROM robot WHERE robot_id=? AND status=1) AS user_bot,
-			COALESCE((SELECT creator_uid FROM robot WHERE robot_id=? AND status=1 LIMIT 1), '') AS creator_uid,
+			EXISTS(SELECT 1 FROM robot WHERE robot_id=? AND status=1 AND kind='user') AS user_bot,
+			EXISTS(SELECT 1 FROM robot WHERE robot_id=? AND status=1 AND kind='avatar' AND creator_uid=''
+				AND publication_state='published' AND lifecycle_pending=0
+				AND ((management_scope='platform' AND management_space_id='') OR
+					(management_scope='space' AND management_space_id<>''))) AS avatar,
+			COALESCE((SELECT creator_uid FROM robot WHERE robot_id=? AND status=1 AND kind='user' LIMIT 1), '') AS creator_uid,
 			EXISTS(SELECT 1 FROM app_bot WHERE uid=? AND status=1) AS app_bot,
 			COALESCE((SELECT scope FROM app_bot WHERE uid=? AND status=1 LIMIT 1), '') AS app_scope,
 			COALESCE((SELECT space_id FROM app_bot WHERE uid=? AND status=1 LIMIT 1), '') AS app_space_id`,
-		uid, uid, uid, uid, uid,
+		uid, uid, uid, uid, uid, uid,
 	).LoadOne(&row)
 	if err != nil {
 		return identityRecord{}, err
@@ -102,11 +109,24 @@ func (r *Resolver) Resolve(uid string) (*Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve bot identity %q: %w", uid, err)
 	}
-	if record.UserBot && record.AppBot {
+	// An ordinary ownerless robot is not an identity authority. The explicit
+	// system-bot registry is the only exception because first-party bots such as
+	// notification and botfather intentionally predate per-user ownership.
+	userBot := record.UserBot && (record.CreatorUID != "" || spacepkg.IsSystemBot(uid))
+	activeKinds := 0
+	for _, active := range []bool{userBot, record.Avatar, record.AppBot} {
+		if active {
+			activeKinds++
+		}
+	}
+	if activeKinds > 1 {
 		return nil, fmt.Errorf("%w: uid %q is active in robot and app_bot", ErrAmbiguousIdentity, uid)
 	}
-	if record.UserBot {
+	if userBot {
 		return &Identity{UID: uid, Kind: KindUserBot, CreatorUID: record.CreatorUID}, nil
+	}
+	if record.Avatar {
+		return &Identity{UID: uid, Kind: KindAvatar}, nil
 	}
 	if record.AppBot {
 		return &Identity{

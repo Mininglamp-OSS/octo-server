@@ -81,7 +81,7 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 		}
 		return nil, categorized(terminal, resolveErr)
 	}
-	if identity.Kind != botidentity.KindUserBot && identity.Kind != botidentity.KindAppBot {
+	if identity.Kind != botidentity.KindUserBot && identity.Kind != botidentity.KindAppBot && identity.Kind != botidentity.KindAvatar {
 		terminal = CategoryIdentityUntrusted
 		return nil, categorized(terminal, errors.New("unsupported bot identity kind"))
 	}

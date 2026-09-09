@@ -853,7 +853,7 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 // createBotCoreWithRetry 生成 Bot ID 并创建 App + robot + user，碰撞时自动重试。
 // 非碰撞错误会返回本次生成的 robotID，供调用方补偿 commit 结果不确定的
 // App/robot/user；碰撞重试耗尽时不返回 ID，避免误删已有 Bot。
-func (h *commandHandler) createBotCoreWithRetry(creatorUID, name, botToken string) (string, error) {
+func (h *commandHandler) createBotCoreWithRetry(creatorUID, name, botToken, agentHosting string) (string, error) {
 	const maxRetries = 3
 	var robotID string
 	var lastErr error
@@ -862,7 +862,7 @@ func (h *commandHandler) createBotCoreWithRetry(creatorUID, name, botToken strin
 		if attempt > 0 {
 			time.Sleep(time.Millisecond)
 		}
-		lastErr = h.tryCreateBotCore(creatorUID, name, robotID, botToken, robotID)
+		lastErr = h.tryCreateBotCore(creatorUID, name, robotID, botToken, robotID, agentHosting)
 		if lastErr == nil {
 			return robotID, nil
 		}
@@ -893,9 +893,9 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 
 	var robotID string
 	if username == "" {
-		robotID, err = h.createBotCoreWithRetry(creatorUID, name, botToken)
+		robotID, err = h.createBotCoreWithRetry(creatorUID, name, botToken, "")
 	} else {
-		err = h.tryCreateBotCore(creatorUID, name, username, botToken, username)
+		err = h.tryCreateBotCore(creatorUID, name, username, botToken, username, "")
 		robotID = username
 	}
 	if err != nil {
@@ -929,6 +929,10 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 				zap.String("reason", "space_binding_cleanup_failed"))
 		}
 		return errCreateBotSpaceBindingFailed
+	}
+	if provisionErr := provisionAITeam(h.ctx, targetSpaceID, creatorUID, robotID); provisionErr != nil {
+		h.Warn("Bot已创建但AI团队群同步失败，将由后续AI团队请求重试",
+			zap.String("robotID", robotID), zap.String("spaceID", targetSpaceID), zap.Error(provisionErr))
 	}
 
 	// 兼容：仍添加好友关系（过渡期）
@@ -1044,7 +1048,7 @@ func (h *commandHandler) formatBotDisplay(robotID string) string {
 	return fmt.Sprintf("%s (%s)", name, robotID)
 }
 
-func (h *commandHandler) tryCreateBotCore(creatorUID, name, username, botToken, robotID string) error {
+func (h *commandHandler) tryCreateBotCore(creatorUID, name, username, botToken, robotID, agentHosting string) error {
 	// robot_id 是自动生成的唯一值，app_id = robot_id 不会命中已有 app，
 	// 所以 CreateApp 一定是新建，失败时可安全删除。
 	appResp, err := h.appService.CreateApp(app.Req{AppID: robotID})
@@ -1069,14 +1073,15 @@ func (h *commandHandler) tryCreateBotCore(creatorUID, name, username, botToken, 
 		return fmt.Errorf("GenSeq failed: %w", err)
 	}
 	err = h.db.insertRobotTx(&robotModel{
-		AppID:      appResp.AppID,
-		RobotID:    robotID,
-		Username:   username,
-		Token:      appResp.AppKey,
-		Version:    version,
-		Status:     1,
-		CreatorUID: creatorUID,
-		BotToken:   botToken,
+		AppID:        appResp.AppID,
+		RobotID:      robotID,
+		Username:     username,
+		Token:        appResp.AppKey,
+		Version:      version,
+		Status:       1,
+		CreatorUID:   creatorUID,
+		BotToken:     botToken,
+		AgentHosting: agentHosting,
 	}, tx)
 	if err != nil {
 		tx.Rollback()

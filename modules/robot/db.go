@@ -106,7 +106,7 @@ func (d *robotDB) deleteMenuWithID(robotID string, id int64, tx *dbr.Tx) error {
 func (d *robotDB) queryRobotListPaged(pageIndex, pageSize int) ([]*robot, error) {
 	var list []*robot
 	_, err := d.session.Select("*").From("robot").
-		Where("status=1").
+		Where("status=1 AND kind='user'").
 		OrderDir("created_at", false).
 		Limit(uint64(pageSize)).
 		Offset(uint64(pageIndex * pageSize)).
@@ -117,7 +117,7 @@ func (d *robotDB) queryRobotListPaged(pageIndex, pageSize int) ([]*robot, error)
 // queryRobotTotalCount 查询机器人总数
 func (d *robotDB) queryRobotTotalCount() (int64, error) {
 	var count int64
-	err := d.session.Select("count(*)").From("robot").Where("status=1").LoadOne(&count)
+	err := d.session.Select("count(*)").From("robot").Where("status=1 AND kind='user'").LoadOne(&count)
 	return count, err
 }
 
@@ -135,13 +135,13 @@ func (d *robotDB) queryRobotByBotToken(botToken string) (*robot, error) {
 func (d *robotDB) updateRobotBotToken(robotID string, newToken string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"bot_token": newToken,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
 // updateRobotInfo 更新机器人信息（管理后台用）
 func (d *robotDB) updateRobotInfo(robotID string, fields map[string]interface{}) error {
-	_, err := d.session.Update("robot").SetMap(fields).Where("robot_id=?", robotID).Exec()
+	_, err := d.session.Update("robot").SetMap(fields).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -157,7 +157,7 @@ func (d *robotDB) updateRobotIMTokenCache(robotID string, imToken string) error 
 func (d *robotDB) deleteRobotSoft(robotID string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"status": 0,
-	}).Where("robot_id=?", robotID).Exec()
+	}).Where("robot_id=? AND kind='user'", robotID).Exec()
 	return err
 }
 
@@ -169,19 +169,25 @@ type menu struct {
 	db.BaseModel
 }
 type robot struct {
-	AppID        string
-	RobotID      string // 机器人唯一ID
-	Username     string // 机器人用户名
-	InlineOn     int    // 是否开启行内搜索
-	Placeholder  string // 输入框占位符，开启行内搜索有效
-	Token        string
-	Version      int64
-	Status       int
-	CreatorUID   string // 创建者UID
-	Description  string // 机器人描述
-	BotToken     string // Bot认证Token
-	IMTokenCache string // 缓存的IM Token
-	BotCommands  string // 机器人命令列表JSON
+	Kind              string
+	ManagementScope   string
+	ManagementSpaceID string
+	PublicationState  string
+	CreatedBy         string
+	LifecyclePending  int
+	AppID             string
+	RobotID           string // 机器人唯一ID
+	Username          string // 机器人用户名
+	InlineOn          int    // 是否开启行内搜索
+	Placeholder       string // 输入框占位符，开启行内搜索有效
+	Token             string
+	Version           int64
+	Status            int
+	CreatorUID        string // 创建者UID
+	Description       string // 机器人描述
+	BotToken          string // Bot认证Token
+	IMTokenCache      string // 缓存的IM Token
+	BotCommands       string // 机器人命令列表JSON
 	db.BaseModel
 }
 

@@ -20,7 +20,7 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 	conn.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = conn.Close() })
 	session := conn.NewSession(nil)
-	_, err = session.Exec("CREATE TABLE robot (robot_id TEXT PRIMARY KEY, status INTEGER NOT NULL, creator_uid TEXT NOT NULL DEFAULT '')")
+	_, err = session.Exec("CREATE TABLE robot (robot_id TEXT PRIMARY KEY, status INTEGER NOT NULL, creator_uid TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'user', publication_state TEXT NOT NULL DEFAULT 'draft', lifecycle_pending INTEGER NOT NULL DEFAULT 0, management_scope TEXT NOT NULL DEFAULT '', management_space_id TEXT NOT NULL DEFAULT '')")
 	require.NoError(t, err)
 	_, err = session.Exec("CREATE TABLE app_bot (uid TEXT PRIMARY KEY, status INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'platform', space_id TEXT)")
 	require.NoError(t, err)
@@ -32,6 +32,16 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 		_, err := session.InsertBySql("INSERT INTO robot(robot_id,status,creator_uid) VALUES(?,?,?)", uid, status, "owner-"+uid).Exec()
 		require.NoError(t, err)
 	}
+	insertOwnerlessRobot := func(uid string, status int) {
+		t.Helper()
+		_, err := session.InsertBySql("INSERT INTO robot(robot_id,status,creator_uid) VALUES(?,?,?)", uid, status, "").Exec()
+		require.NoError(t, err)
+	}
+	insertAvatar := func(uid string, state string) {
+		t.Helper()
+		_, err := session.InsertBySql("INSERT INTO robot(robot_id,status,creator_uid,kind,publication_state,lifecycle_pending,management_scope,management_space_id) VALUES(?,1,'','avatar',?,0,'space','space-a')", uid, state).Exec()
+		require.NoError(t, err)
+	}
 	insertAppBot := func(uid string, status int) {
 		t.Helper()
 		_, err := session.InsertBySql("INSERT INTO app_bot(uid,status,scope,space_id) VALUES(?,?,?,?)", uid, status, "space", "space-a").Exec()
@@ -40,6 +50,10 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 
 	insertRobot("identity_test_active_robot", 1)
 	insertRobot("identity_test_disabled_robot", 0)
+	insertOwnerlessRobot("identity_test_ownerless_robot", 1)
+	insertOwnerlessRobot("notification", 1)
+	insertAvatar("identity_test_avatar", "published")
+	insertAvatar("identity_test_draft_avatar", "draft")
 	insertAppBot("identity_test_published_bot", 1)
 	insertAppBot("identity_test_draft_bot", 0)
 	insertAppBot("identity_test_unpublished_bot", 2)
@@ -61,6 +75,10 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 	}{
 		{name: "active robot", uid: "identity_test_active_robot", wantKind: KindUserBot},
 		{name: "disabled robot", uid: "identity_test_disabled_robot", wantNil: true},
+		{name: "ownerless ordinary robot", uid: "identity_test_ownerless_robot", wantNil: true},
+		{name: "ownerless system bot", uid: "notification", wantKind: KindUserBot},
+		{name: "published avatar", uid: "identity_test_avatar", wantKind: KindAvatar},
+		{name: "draft avatar", uid: "identity_test_draft_avatar", wantNil: true},
 		{name: "missing robot", uid: "identity_test_missing_robot", wantNil: true},
 		{name: "published app bot", uid: "identity_test_published_bot", wantKind: KindAppBot},
 		{name: "draft app bot", uid: "identity_test_draft_bot", wantNil: true},
@@ -85,7 +103,7 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 			require.NotNil(t, got)
 			assert.Equal(t, tt.uid, got.UID)
 			assert.Equal(t, tt.wantKind, got.Kind)
-			if tt.wantKind == KindUserBot {
+			if tt.wantKind == KindUserBot && tt.uid != "notification" {
 				assert.Equal(t, "owner-"+tt.uid, got.CreatorUID)
 			}
 			if tt.wantKind == KindAppBot {

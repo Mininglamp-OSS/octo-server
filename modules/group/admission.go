@@ -3,12 +3,14 @@ package group
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
@@ -103,6 +105,10 @@ const (
 	// enforcing is visible per path, and folding two paths onto one label is
 	// exactly the visibility this metric was added to buy.
 	AdmissionEntryAllMemberGroup = "a12_all_member_group"
+	// AdmissionEntryAITeamGroup is the internal exact-roster projection for the
+	// visible "我的AI团队" group. It is used only by AI Team orchestration,
+	// never by an ordinary member-mutation endpoint.
+	AdmissionEntryAITeamGroup = "a13_ai_team_group"
 )
 
 // Rejection reasons. Low-cardinality enum; never a free-form message.
@@ -287,8 +293,11 @@ type MemberAdmission struct {
 }
 
 type aiTeamActiveMember struct {
-	UID    string `db:"uid"`
-	Status int    `db:"status"`
+	UID       string `db:"uid"`
+	Role      int    `db:"role"`
+	Status    int    `db:"status"`
+	Robot     int    `db:"robot"`
+	IsDeleted int    `db:"is_deleted"`
 }
 
 // AdmitAITeamContainerMembersTx is the narrow admission bridge used while an
@@ -326,6 +335,19 @@ func AdmitAITeamContainerMembersTx(
 		parent.Purpose != aiteampkg.GroupPurpose || parent.ProjectID != "" {
 		return false, errors.New("group: AI-team container admission target mismatch")
 	}
+	// Purpose is not an authority grant. The private container must be backed by
+	// the persisted AI Team relation in the same transaction, otherwise any
+	// internal caller able to insert a purpose-tagged group could place an Avatar
+	// into a non-AI conversation.
+	var agentCount int
+	if err = tx.SelectBySql(`SELECT COUNT(*) FROM ai_team_agent
+		WHERE space_id=? AND user_uid=? AND bot_id=? AND group_no=? AND is_added=1`,
+		spaceID, ownerUID, botUID, groupNo).LoadOne(&agentCount); err != nil {
+		return false, fmt.Errorf("group: validate AI-team container relation: %w", err)
+	}
+	if agentCount != 1 {
+		return false, errors.New("group: AI-team container relation mismatch")
+	}
 
 	var before []*aiTeamActiveMember
 	if _, err = tx.SelectBySql(
@@ -361,7 +383,7 @@ func AdmitAITeamContainerMembersTx(
 			InviteUID: ownerUID,
 			Robot:     1,
 		},
-	}, AdmissionEntryCreateGroup); err != nil {
+	}, AdmissionEntryAITeamGroup); err != nil {
 		return false, err
 	}
 
@@ -397,6 +419,180 @@ func hasExactAITeamMembers(members []*aiTeamActiveMember, ownerUID, botUID strin
 		}
 	}
 	return foundOwner && foundBot
+}
+
+// IsAITeamOwnerActiveTx is the shared authority check for every managed AI
+// group projection. Callers that project members or external subscribers must
+// use this predicate so a revoked owner cannot remain in one projection while
+// another has already removed them.
+func IsAITeamOwnerActiveTx(tx *dbr.Tx, spaceID, ownerUID string) (bool, error) {
+	var ownerCount int
+	if err := tx.SelectBySql(`SELECT COUNT(*) FROM user u
+		JOIN space sp ON sp.space_id=? AND sp.status=1
+		JOIN space_member sm ON sm.space_id=sp.space_id AND sm.uid=u.uid AND sm.status=1
+		WHERE u.uid=? AND u.status=1 AND u.is_destroy<>2`, spaceID, ownerUID).LoadOne(&ownerCount); err != nil {
+		return false, fmt.Errorf("group: validate AI-team group owner: %w", err)
+	}
+	return ownerCount == 1, nil
+}
+
+// SyncAITeamGroupMembersTx projects the authoritative AI-agent roster into the
+// visible "我的 OPT" group. Unlike ordinary admission, this bridge owns the
+// complete set: it restores missing desired members and soft-deletes every
+// extra member while the parent row and all member rows are locked.
+func SyncAITeamGroupMembersTx(
+	ctx *config.Context,
+	tx *dbr.Tx,
+	groupNo, spaceID, ownerUID string,
+	botUIDs []string,
+) (bool, error) {
+	if groupNo == "" || spaceID == "" || ownerUID == "" {
+		return false, errors.New("group: invalid AI-team group projection")
+	}
+
+	var parent struct {
+		SpaceID   string `db:"space_id"`
+		Creator   string `db:"creator"`
+		Purpose   string `db:"purpose"`
+		ProjectID string `db:"project_id"`
+		Status    int    `db:"status"`
+	}
+	count, err := tx.SelectBySql(
+		"SELECT space_id,creator,purpose,project_id,status FROM `group` WHERE group_no=? FOR UPDATE",
+		groupNo,
+	).Load(&parent)
+	if err != nil {
+		return false, fmt.Errorf("group: query AI-team group for projection: %w", err)
+	}
+	if count != 1 || parent.SpaceID != spaceID || parent.Creator != ownerUID ||
+		(parent.Purpose != aiteampkg.TeamGroupPurpose && parent.Purpose != aiteampkg.CustomTeamPurpose) || parent.ProjectID != "" ||
+		parent.Status != GroupStatusNormal {
+		return false, errors.New("group: AI-team group projection target mismatch")
+	}
+
+	ownerActive, err := IsAITeamOwnerActiveTx(tx, spaceID, ownerUID)
+	if err != nil {
+		return false, err
+	}
+	if !ownerActive {
+		return false, errors.New("group: AI-team group owner is not active in space")
+	}
+
+	uniqueBots := make([]string, 0, len(botUIDs))
+	seen := make(map[string]struct{}, len(botUIDs))
+	for _, uid := range botUIDs {
+		if uid == "" || uid == ownerUID {
+			return false, errors.New("group: invalid AI-team group bot roster")
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		uniqueBots = append(uniqueBots, uid)
+	}
+	sort.Strings(uniqueBots)
+	if len(uniqueBots) > 0 {
+		var authorized []string
+		_, err = tx.SelectBySql(`SELECT r.robot_id FROM robot r
+			JOIN user u ON u.uid=r.robot_id AND u.status=1 AND u.is_destroy<>2
+			JOIN space_member sm ON sm.space_id=? AND sm.uid=r.robot_id AND sm.status=1
+			WHERE r.status=1 AND `+botpolicy.TeamEligibilitySQL("r", "?", "?")+` AND r.robot_id IN ?
+			ORDER BY r.robot_id FOR UPDATE OF r`, spaceID, ownerUID, spaceID, uniqueBots).Load(&authorized)
+		if err != nil {
+			return false, fmt.Errorf("group: validate AI-team group bots: %w", err)
+		}
+		if len(authorized) != len(uniqueBots) {
+			return false, errors.New("group: AI-team group roster contains unauthorized bot")
+		}
+		authorizedSet := make(map[string]struct{}, len(authorized))
+		for _, uid := range authorized {
+			authorizedSet[uid] = struct{}{}
+		}
+		for _, uid := range uniqueBots {
+			if _, ok := authorizedSet[uid]; !ok {
+				return false, errors.New("group: AI-team group roster authorization mismatch")
+			}
+		}
+	}
+
+	var current []*aiTeamActiveMember
+	if _, err = tx.SelectBySql(
+		"SELECT uid,role,status,robot,is_deleted FROM group_member WHERE group_no=? FOR UPDATE",
+		groupNo,
+	).Load(&current); err != nil {
+		return false, fmt.Errorf("group: lock AI-team group members: %w", err)
+	}
+	desired := make(map[string]MemberAdmission, len(uniqueBots)+1)
+	desired[ownerUID] = MemberAdmission{UID: ownerUID, Role: MemberRoleCreator, InviteUID: ownerUID}
+	for _, uid := range uniqueBots {
+		desired[uid] = MemberAdmission{UID: uid, Role: MemberRoleCommon, InviteUID: ownerUID, Robot: 1}
+	}
+	desiredUIDs := append([]string{ownerUID}, uniqueBots...)
+	sort.Strings(desiredUIDs)
+	currentByUID := make(map[string]*aiTeamActiveMember, len(current))
+	changed := false
+	db := NewDB(ctx)
+	for _, member := range current {
+		currentByUID[member.UID] = member
+		if member.IsDeleted == 0 {
+			if _, ok := desired[member.UID]; !ok {
+				version, versionErr := ctx.GenSeq(common.GroupMemberSeqKey)
+				if versionErr != nil {
+					return false, versionErr
+				}
+				if err = db.DeleteMemberTx(groupNo, member.UID, version, tx); err != nil {
+					return false, fmt.Errorf("group: remove extra AI-team group member: %w", err)
+				}
+				changed = true
+			}
+		}
+	}
+
+	admissions := make([]MemberAdmission, 0, len(desired))
+	for _, uid := range desiredUIDs {
+		want := desired[uid]
+		row := currentByUID[uid]
+		if row != nil && row.IsDeleted == 0 && row.Status == int(common.GroupMemberStatusNormal) &&
+			row.Role == want.Role && row.Robot == want.Robot {
+			continue
+		}
+		version, versionErr := ctx.GenSeq(common.GroupMemberSeqKey)
+		if versionErr != nil {
+			return false, versionErr
+		}
+		want.Version = version
+		admissions = append(admissions, want)
+	}
+	if len(admissions) > 0 {
+		if err = db.admitOrRestoreMembersTx(tx, groupNo, spaceID, "", admissions, AdmissionEntryAITeamGroup); err != nil {
+			return false, err
+		}
+		for _, admission := range admissions {
+			if err = db.normalizeManagedMemberTx(groupNo, admission.UID, admission.Role, admission.Robot, admission.Version, tx); err != nil {
+				return false, fmt.Errorf("group: normalize AI-team group member: %w", err)
+			}
+		}
+		changed = true
+	}
+
+	var active []*aiTeamActiveMember
+	if _, err = tx.SelectBySql(
+		"SELECT uid,role,status,robot,is_deleted FROM group_member WHERE group_no=? AND is_deleted=0 FOR UPDATE",
+		groupNo,
+	).Load(&active); err != nil {
+		return false, fmt.Errorf("group: verify AI-team group projection: %w", err)
+	}
+	if len(active) != len(desired) {
+		return false, errors.New("group: AI-team group member projection is incomplete")
+	}
+	for _, member := range active {
+		want, ok := desired[member.UID]
+		if !ok || member.Status != int(common.GroupMemberStatusNormal) ||
+			member.Role != want.Role || member.Robot != want.Robot {
+			return false, errors.New("group: AI-team group member projection mismatch")
+		}
+	}
+	return changed, nil
 }
 
 // admitOrRestoreMembersTx is the single admission entry. Every path that adds a
@@ -464,6 +660,34 @@ func (d *DB) admitOrRestoreMembersTx(
 ) error {
 	if len(admissions) == 0 {
 		return nil
+	}
+	// This is the final admission choke point. Public and service paths reject
+	// Avatar membership earlier for a precise response, but event and repair
+	// paths also arrive here. An Avatar is valid only for a server-owned AI Team
+	// projection, never for a regular or project group.
+	avatarUIDs := make([]string, 0, len(admissions))
+	for _, admission := range admissions {
+		if admission.UID != "" {
+			avatarUIDs = append(avatarUIDs, admission.UID)
+		}
+	}
+	if len(avatarUIDs) > 0 {
+		var avatarCount int
+		if err := tx.SelectBySql("SELECT COUNT(*) FROM robot WHERE kind='avatar' AND robot_id IN ?", avatarUIDs).LoadOne(&avatarCount); err != nil {
+			return fmt.Errorf("group: query avatar admission target: %w", err)
+		}
+		if avatarCount > 0 {
+			if entry != AdmissionEntryAITeamGroup {
+				return ErrAvatarOrdinaryGroupDenied
+			}
+			var purpose string
+			if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
+				return fmt.Errorf("group: query AI-team admission target: %w", err)
+			}
+			if !aiteampkg.IsProtectedPurpose(purpose) {
+				return ErrAvatarOrdinaryGroupDenied
+			}
+		}
 	}
 
 	uids := make([]string, 0, len(admissions))

@@ -521,6 +521,9 @@ other = "无权限使用此群聊分组。"
 ["err.server.group.bot_ownership_denied"]
 other = "你没有权限邀请该机器人。"
 
+["err.server.group.avatar_ai_team_only"]
+other = "数字员工只能加入 AI 团队群。"
+
 ["err.server.group.bot_not_in_space"]
 other = "该机器人不属于你的空间。"
 
@@ -1261,6 +1264,9 @@ other = "你们已经是好友了。"
 ["err.server.botfather.username_taken"]
 other = "用户名已被占用。"
 
+["err.server.botfather.hosted_bot_exists"]
+other = "你已有一个 AI 云端分身。"
+
 ["err.server.botfather.auth_failed"]
 other = "机器人认证失败。"
 
@@ -1567,3 +1573,6 @@ other = "这是项目的全员群，请到项目中管理成员。"
 
 ["err.server.group.project_unavailable"]
 other = "该项目不可用。"
+
+["err.server.bot_api.avatar_unsupported"]
+other = "数字分身无权执行此操作。"

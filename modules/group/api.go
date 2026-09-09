@@ -112,7 +112,7 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, protectAIContainer, g.memberRemove) // 移除群成员
 		groups.GET("/:group_no/membersync", g.syncMembers)                                                    // 同步群成员
 		groups.GET("/:group_no", g.groupGet)                                                                  // 获取群信息
-		groups.PUT("/:group_no/setting", protectAIContainer, g.groupSettingUpdate)                            // 修改群设置
+		groups.PUT("/:group_no/setting", g.protectAISessionContainerMutation, g.groupSettingUpdate)           // 修改群设置
 		groups.PUT("/:group_no", protectAIContainer, g.groupUpdate)                                           // 修改群信息
 		groups.PUT("/:group_no/members/:uid", protectAIContainer, g.memberUpdate)                             // 修改群的群成员信息
 		groups.POST("/:group_no/exit", protectAIContainer, g.groupExit)                                       // 退出群聊
@@ -125,7 +125,7 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 		groups.GET("/:group_no/member/h5confirm", g.getToGroupMemberConfirmInviteDetailH5)                    // 获取确认邀请的h5页面
 		groups.POST("/:group_no/blacklist/:action", protectAIContainer, g.blacklist)                          // 添加或移除黑名单
 		groups.POST("/:group_no/forbidden_with_member", protectAIContainer, g.forbiddenWithGroupMember)       // 禁言或解禁某个群成员
-		groups.POST("/:group_no/avatar", protectAIContainer, g.avatarUpload)                                  // 上传群头像
+		groups.POST("/:group_no/avatar", g.protectImmutableAIGroupMutation, g.avatarUpload)                   // 上传群头像
 		groups.DELETE("/:group_no/disband", protectAIContainer, g.disband)                                    // 解散群
 		groups.GET("/:group_no/detail", g.groupDetailGet)                                                     // 获取群详情
 		groups.GET("/:group_no/md", g.groupMdGet)                                                             // 获取GROUP.md
@@ -208,6 +208,44 @@ func (g *Group) protectAIContainerMutation(c *wkhttp.Context) {
 		return
 	}
 	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
+// protectAISessionContainerMutation lets the visible AI-team group use normal
+// per-user preferences. groupSettingUpdate separately rejects group-level keys
+// for that group, while the hidden two-member container remains fully sealed.
+func (g *Group) protectAISessionContainerMutation(c *wkhttp.Context) {
+	purpose, err := aiteampkg.Purpose(g.ctx.DB(), c.Param("group_no"))
+	if err != nil {
+		g.Error("query AI group purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if purpose == aiteampkg.GroupPurpose {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
+// protectImmutableAIGroupMutation keeps the hidden pair container and the
+// automatic all-agent group immutable while allowing a user-created custom AI
+// team to reuse ordinary safe group features such as avatar upload.
+func (g *Group) protectImmutableAIGroupMutation(c *wkhttp.Context) {
+	purpose, err := aiteampkg.Purpose(g.ctx.DB(), c.Param("group_no"))
+	if err != nil {
+		g.Error("query AI group purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if purpose == aiteampkg.GroupPurpose || purpose == aiteampkg.TeamGroupPurpose {
 		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
 		c.Abort()
 		return
@@ -1208,6 +1246,14 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
+		if errors.Is(err, ErrAvatarOrdinaryGroupDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupAvatarAITeamOnly, nil, nil)
+			return
+		}
+		if errors.Is(err, ErrBotOwnershipDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
+			return
+		}
 		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
 		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
 		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
@@ -1606,6 +1652,19 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	if botErr := checkAvatarOrdinaryGroupAdmission(g.ctx.DB(), req.Members); botErr != nil {
+		if errors.Is(botErr, ErrAvatarOrdinaryGroupDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupAvatarAITeamOnly, nil, nil)
+			return
+		}
+		if errors.Is(botErr, ErrBotOwnershipDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
+			return
+		}
+		g.Error("检查 Avatar 群 Space 失败", zap.Error(botErr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
 
 	// 判断是否允许系统账号进入群聊
 	tStep = time.Now()
@@ -1765,7 +1824,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
 		return nil, err
 	}
-	if purpose == aiteampkg.GroupPurpose {
+	if aiteampkg.IsProtectedPurpose(purpose) {
 		return nil, aiteampkg.ErrContainerProtected
 	}
 
@@ -1813,6 +1872,9 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	if groupModel == nil {
 		g.Error("群不存在，拒绝加人", zap.String("group_no", groupNo))
 		return nil, errors.New("群不存在！")
+	}
+	if botErr := checkAvatarOrdinaryGroupAdmission(tx, members); botErr != nil {
+		return nil, botErr
 	}
 	// 跨 Space 外部成员标识：与 scanjoin / Service.AddGroupMembers 语义对齐。
 	// 群属于某 Space 时，不在 Space 的成员标记 is_external=1 并写 source_space_id，
@@ -3443,6 +3505,22 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 		if groupUpdateActionMap[key] != nil {
 			containsGroupUpdate = true
 			break
+		}
+	}
+	if containsGroupUpdate {
+		purpose, err := aiteampkg.Purpose(g.ctx.DB(), groupNo)
+		if err != nil {
+			g.Error("查询 AI 团队群用途失败", zap.Error(err), zap.String("group_no", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if purpose == aiteampkg.TeamGroupPurpose {
+			for key := range resultMap {
+				if groupUpdateActionMap[key] != nil && key != GroupAttrKeyAllowNoMention {
+					httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+					return
+				}
+			}
 		}
 	}
 	if containsGroupUpdate {

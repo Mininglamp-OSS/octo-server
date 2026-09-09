@@ -26,4 +26,17 @@ func init() {
 			Swagger: swaggerContent,
 		}
 	})
+
+	// Manager routes are a separate API surface, as in the group/message
+	// modules. Keep one instance so its durable Avatar cleanup worker has the
+	// same lifecycle as the registered handlers.
+	register.AddModule(func(ctx interface{}) register.Module {
+		manager := NewManager(ctx.(*config.Context))
+		return register.Module{
+			Name:     "robot_manager",
+			SetupAPI: func() register.APIRouter { return manager },
+			Start:    manager.StartAvatarCleanupWorker,
+			Stop:     manager.StopAvatarCleanupWorker,
+		}
+	})
 }

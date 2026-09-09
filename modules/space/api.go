@@ -22,6 +22,7 @@ import (
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
@@ -370,6 +371,13 @@ func (s *Space) createSpaceCore(p createSpaceParams) (*createSpaceResult, error)
 // 调用方负责提交事务并随后调用 createSpaceCorePostCommit 完成默认邀请码、BotFather、缓存与事件。
 // 用于 email-invite accept 路径在同一事务内完成 token 消费与空间创建（issue #1138）。
 func (s *Space) createSpaceCoreTx(tx *dbr.Tx, p createSpaceParams) (string, error) {
+	// Platform avatar publication takes the same singleton lock before changing
+	// its robot row and existing seats. Taking it before any Space write makes
+	// publication concurrent with Space creation serializable: the publisher
+	// either sees this Space, or this transaction sees the published avatar.
+	if err := botpolicy.LockEnrollmentTx(tx); err != nil {
+		return "", fmt.Errorf("lock avatar enrollment: %w", err)
+	}
 	spaceId := util.GenerUUID()
 	model := &SpaceModel{
 		SpaceId:        spaceId,
@@ -392,6 +400,9 @@ func (s *Space) createSpaceCoreTx(tx *dbr.Tx, p createSpaceParams) (string, erro
 		Status:  1,
 	}, tx); err != nil {
 		return "", fmt.Errorf("添加空间成员失败: %w", err)
+	}
+	if err := botpolicy.EnrollPlatformAvatarsTx(tx, spaceId); err != nil {
+		return "", fmt.Errorf("enroll platform avatars: %w", err)
 	}
 	return spaceId, nil
 }

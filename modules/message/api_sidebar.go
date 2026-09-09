@@ -164,7 +164,8 @@ type SidebarItem struct {
 	// 3=deleted，语义与 modules/thread/const.go 的 ThreadStatus* 枚举一致
 	// （GH octo-server#310）。客户端据此同步过滤已归档子区，无需等待 channelInfo。
 	// omitempty 让 DM / 群条目不带该字段，保持线上协议向后兼容。
-	Status int `json:"status,omitempty"`
+	Status  int    `json:"status,omitempty"`
+	BotType string `json:"bot_type,omitempty"` // DM Bot 类型（"user_bot" / "app_bot" / "avatar"）
 }
 
 // sidebarSyncResp is the JSON response for POST /v1/sidebar/sync.
@@ -671,14 +672,20 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		items = dropArchivedThreadItems(items)
 	}
 
-	// Dedicated AI parent groups and their thread conversations live only in
-	// /v1/ai-team. Hiding just the parent would still leak every session through
-	// target_type=5, so filter both shapes from one authoritative purpose query.
+	// Dedicated AI parent groups, the aggregate AI-team group, and their thread
+	// conversations live only in /v1/ai-team. Hiding just a parent would still
+	// leak every session through target_type=5, so filter both shapes from one
+	// authoritative purpose query.
 	items, err = sb.excludeAITeamItems(items)
 	if err != nil {
 		sb.Error("sidebar sync: AI container filter failed (fail-closed)", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
+	}
+	if err := sb.enrichSidebarBotTypes(items); err != nil {
+		// Display metadata must not turn a valid sidebar into a partial outage.
+		// Authorization remains enforced by the message/friend paths.
+		sb.Warn("sidebar sync: bot type enrichment failed (non-fatal)", zap.Error(err))
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -708,6 +715,33 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		Version:       respVersion,
 		FollowVersion: followVersion,
 	})
+}
+
+func (sb *Sidebar) enrichSidebarBotTypes(items []*SidebarItem) error {
+	uids := make([]string, 0)
+	byUID := make(map[string][]*SidebarItem)
+	for _, item := range items {
+		if item.TargetType != int(common.ChannelTypePerson) || item.TargetID == "" {
+			continue
+		}
+		if _, exists := byUID[item.TargetID]; !exists {
+			uids = append(uids, item.TargetID)
+		}
+		byUID[item.TargetID] = append(byUID[item.TargetID], item)
+	}
+	if len(uids) == 0 {
+		return nil
+	}
+	types, err := queryActiveBotTypes(sb.ctx, uids)
+	if err != nil {
+		return err
+	}
+	for uid, botType := range types {
+		for _, item := range byUID[uid] {
+			item.BotType = botType
+		}
+	}
+	return nil
 }
 
 func (sb *Sidebar) excludeAITeamItems(items []*SidebarItem) ([]*SidebarItem, error) {

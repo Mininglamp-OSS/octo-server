@@ -3,9 +3,11 @@ package robot
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
+	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -15,9 +17,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -32,16 +36,27 @@ type Manager struct {
 	// 全部的 Bot 删除入口（另有一条创建失败的补偿路径，已登记豁免）。
 	// 普查见 modules/space/bot_deletion_census_test.go。
 	closeSeatsFn func(ctx *config.Context, uid, operatorUID, reason string) ([]string, error)
+	// cleanupConnectionFn is the external IM/Redis revocation seam. Production
+	// points it at cleanupBotConnection; lifecycle tests replace it to exercise
+	// durable retry without depending on WuKongIM availability.
+	cleanupConnectionFn func(robotID string) error
+	cleanupStop         chan struct{}
+	cleanupDone         chan struct{}
+	cleanupOnce         sync.Once
 }
 
 func NewManager(ctx *config.Context) *Manager {
-	return &Manager{
+	m := &Manager{
 		ctx:          ctx,
 		Log:          log.NewTLog("robotManager"),
 		db:           newBotDB(ctx),
 		groupService: group.NewService(ctx),
 		closeSeatsFn: spacemod.CloseAllSpaceSeats,
+		cleanupStop:  make(chan struct{}),
+		cleanupDone:  make(chan struct{}),
 	}
+	m.cleanupConnectionFn = m.cleanupBotConnection
+	return m
 }
 
 // 路由配置
@@ -58,6 +73,23 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.DELETE("/robots/:robot_id", m.robotDelete)                 // 删除机器人
 		auth.POST("/robots/:robot_id/revoke_token", m.robotRevokeToken) // 重置Token
 	}
+
+	// Avatar administration is available to platform superadmins and to the
+	// owner/admin of the Avatar's management Space. Keep these newer mutation
+	// endpoints behind the shared authenticated UID bucket.
+	avatars := r.Group("/v1/manager/avatars", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
+	{
+		avatars.POST("", m.avatarCreate)
+		avatars.GET("", m.avatarList)
+		avatars.GET("/:robot_id", m.avatarDetail)
+		avatars.PUT("/:robot_id", m.avatarUpdate)
+		avatars.POST("/:robot_id/publish", m.avatarPublish)
+		avatars.POST("/:robot_id/unpublish", m.avatarUnpublish)
+		avatars.DELETE("/:robot_id", m.avatarDelete)
+		avatars.GET("/:robot_id/token", m.avatarRevealToken)
+		avatars.POST("/:robot_id/token/rotate", m.avatarRotateToken)
+		avatars.POST("/:robot_id/cleanup/retry", m.avatarRetryCleanup)
+	}
 }
 
 // 查询某个机器人菜单
@@ -70,6 +102,16 @@ func (m *Manager) list(c *wkhttp.Context) {
 	robotID := c.Query("robot_id")
 	if robotID == "" {
 		respondRobotRequestInvalid(c, "robot_id")
+		return
+	}
+	robot, err := m.db.queryRobotWithRobtID(robotID)
+	if err != nil {
+		m.Error("查询机器人失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if robot == nil || robot.Kind == string(botpolicy.Avatar) {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	list, err := m.db.queryMenusWithRobotID(robotID)
@@ -116,7 +158,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
-	if robot == nil {
+	if robot == nil || robot.Kind == string(botpolicy.Avatar) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
@@ -184,6 +226,13 @@ func (m *Manager) updateRobotStatus(c *wkhttp.Context) {
 		return
 	}
 	if robot == nil {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
+		return
+	}
+	if robot.Kind == "avatar" {
+		// Avatar lifecycle must go through publish/unpublish so seats, project
+		// membership, runtime credentials and the durable cleanup outbox stay in
+		// sync. The legacy status endpoint must never become a bypass.
 		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
@@ -278,6 +327,10 @@ func (m *Manager) robotDetail(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
+	if r.Kind == "avatar" {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
+		return
+	}
 	c.Response(&robotDetailResp{
 		RobotID:     r.RobotID,
 		Username:    r.Username,
@@ -301,6 +354,16 @@ func (m *Manager) robotUpdate(c *wkhttp.Context) {
 	robotID := c.Param("robot_id")
 	if robotID == "" {
 		respondRobotRequestInvalid(c, "robot_id")
+		return
+	}
+	robot, queryErr := m.db.queryRobotWithRobtID(robotID)
+	if queryErr != nil {
+		m.Error("查询机器人类型失败", zap.Error(queryErr), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if robot == nil || robot.Kind == string(botpolicy.Avatar) {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 
@@ -351,6 +414,10 @@ func (m *Manager) robotDelete(c *wkhttp.Context) {
 		return
 	}
 	if robot == nil {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
+		return
+	}
+	if robot.Kind == "avatar" {
 		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
@@ -416,7 +483,7 @@ func (m *Manager) robotDelete(c *wkhttp.Context) {
 func (m *Manager) cleanupBotConnection(robotID string) error {
 	// 1. 更新 IM Token，旧连接立即失效
 	newIMToken := util.GenerUUID()
-	_, err := m.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+	resp, err := m.ctx.UpdateIMToken(config.UpdateIMTokenReq{
 		UID:         robotID,
 		Token:       newIMToken,
 		DeviceFlag:  config.APP,
@@ -425,19 +492,23 @@ func (m *Manager) cleanupBotConnection(robotID string) error {
 	if err != nil {
 		return fmt.Errorf("更新IM Token失败: %w", err)
 	}
+	if resp == nil || resp.Status != config.UpdateTokenStatusSuccess {
+		return errors.New("更新IM Token失败: unexpected status")
+	}
 
+	var cleanupErr error
 	// 2. 清空缓存的 IM Token
-	m.db.updateRobotIMTokenCache(robotID, "")
+	cleanupErr = errors.Join(cleanupErr, m.db.updateRobotIMTokenCache(robotID, ""))
 
 	// 3. 清除心跳 Redis key
 	heartbeatKey := fmt.Sprintf("bot:heartbeat:%s", robotID)
-	m.ctx.GetRedisConn().Del(heartbeatKey)
+	cleanupErr = errors.Join(cleanupErr, m.ctx.GetRedisConn().Del(heartbeatKey))
 
 	// 4. 清除事件队列 Redis key
 	eventKey := botevent.QueueKey(robotID)
-	m.ctx.GetRedisConn().Del(eventKey)
+	cleanupErr = errors.Join(cleanupErr, m.ctx.GetRedisConn().Del(eventKey))
 
-	return nil
+	return cleanupErr
 }
 
 // 重置机器人Token
@@ -450,6 +521,16 @@ func (m *Manager) robotRevokeToken(c *wkhttp.Context) {
 	robotID := c.Param("robot_id")
 	if robotID == "" {
 		respondRobotRequestInvalid(c, "robot_id")
+		return
+	}
+	robot, queryErr := m.db.queryRobotWithRobtID(robotID)
+	if queryErr != nil {
+		m.Error("查询机器人类型失败", zap.Error(queryErr), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if robot == nil || robot.Kind == string(botpolicy.Avatar) {
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 

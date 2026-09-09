@@ -129,6 +129,14 @@ var (
 		DefaultMessage: "The username is already taken.",
 		SafeDetailKeys: []string{"username"},
 	})
+	// ErrBotfatherHostedBotExists covers a second active hosted Bot creation for
+	// the same owner. It intentionally has no detail fields so the
+	// response cannot reveal the existing Bot or its Space.
+	ErrBotfatherHostedBotExists = register(codes.Code{
+		ID:             "err.server.botfather.hosted_bot_exists",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "A hosted AI clone already exists.",
+	})
 
 	// ---- bot auth (401, anti-enumeration) ------------------------------------
 

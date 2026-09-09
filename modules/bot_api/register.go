@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -284,6 +285,7 @@ type BotRegisterResp struct {
 	APIURL         string `json:"api_url"`
 	OwnerUID       string `json:"owner_uid"`
 	OwnerChannelID string `json:"owner_channel_id"`
+	BotType        string `json:"bot_type"`
 }
 
 // reportsAnything reports whether the body carries at least one non-empty value.
@@ -327,6 +329,26 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
 		return
 	}
+	if robot.Kind == string(botpolicy.Avatar) {
+		identity := botpolicy.Identity{
+			Kind: botpolicy.Kind(robot.Kind), CreatorUID: robot.CreatorUID, Status: robot.Status,
+			Scope: robot.ManagementScope, SpaceID: robot.ManagementSpaceID,
+			PublicationState: robot.PublicationState, LifecyclePending: robot.LifecyclePending,
+		}
+		if !identity.ActiveAvatar() {
+			// register is intentionally outside authBot, so it must repeat the
+			// lifecycle gate before minting an IM credential. Collapse all inactive
+			// shapes into the normal anti-enumeration auth failure.
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
+			return
+		}
+	} else if robot.Kind != "" && robot.Kind != BotKindUser {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
+		return
+	} else if robot.Kind == BotKindUser && robot.CreatorUID == "" {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
+		return
+	}
 
 	// Use bot_token as im_token — single token design
 	imToken := robot.BotToken
@@ -367,6 +389,10 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 	if u, _ := ba.userService.GetUser(robot.RobotID); u != nil {
 		botName = u.Name
 	}
+	botType := "user_bot"
+	if robot.Kind == string(botpolicy.Avatar) {
+		botType = BotKindAvatar
+	}
 
 	c.Response(&BotRegisterResp{
 		RobotID:        robot.RobotID,
@@ -376,6 +402,7 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 		APIURL:         apiURL,
 		OwnerUID:       robot.CreatorUID,
 		OwnerChannelID: robot.CreatorUID,
+		BotType:        botType,
 	})
 }
 
@@ -505,5 +532,6 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 		APIURL:         apiURL,
 		OwnerUID:       appBot.CreatedBy,
 		OwnerChannelID: appBot.CreatedBy,
+		BotType:        "app_bot",
 	})
 }

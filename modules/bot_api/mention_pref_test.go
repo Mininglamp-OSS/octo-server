@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -76,9 +77,17 @@ func seedOwnerNoMention(t *testing.T, ctx *config.Context, noMention int) {
 // the handler exercise the no-row → default-1 fallback.
 func seedGroupRow(t *testing.T, ctx *config.Context, allowNoMention int) {
 	t.Helper()
+	seedGroupRowWithPurpose(t, ctx, allowNoMention, "")
+}
+
+// seedGroupRowWithPurpose is seedGroupRow plus an explicit `purpose`, so a test
+// can stand up an AI session container (purpose=aiteam.GroupPurpose) instead of
+// an ordinary group.
+func seedGroupRowWithPurpose(t *testing.T, ctx *config.Context, allowNoMention int, purpose string) {
+	t.Helper()
 	_, err := ctx.DB().InsertBySql(
-		"INSERT INTO `group` (group_no, name, status, version, allow_no_mention) VALUES (?, ?, 0, 1, ?)",
-		mpGroupNo, "mp group", allowNoMention,
+		"INSERT INTO `group` (group_no, name, status, version, allow_no_mention, purpose) VALUES (?, ?, 0, 1, ?, ?)",
+		mpGroupNo, "mp group", allowNoMention, purpose,
 	).Exec()
 	assert.NoError(t, err)
 }
@@ -170,4 +179,85 @@ func TestGetMentionPref_NoOwnerRecordDefaultsOff(t *testing.T) {
 	assert.Equal(t, 0, b.NoMention)
 	assert.Equal(t, 1, b.GroupAllowNoMention)
 	assert.False(t, b.Effective)
+}
+
+// TestResolveEffectiveNoMention pins the full decision, including the AI session
+// container override. The container cases are the load-bearing ones: a container
+// is effective even when BOTH owner axes say no, because in a container the @ is
+// not a routing signal — delivery is resolved from ai_team_agent, so requiring an
+// @ would only make the session look broken.
+func TestResolveEffectiveNoMention(t *testing.T) {
+	cases := []struct {
+		name       string
+		noMention  int
+		groupAllow int
+		purpose    string
+		want       bool
+	}{
+		// Ordinary groups: unchanged two-axis AND.
+		{"ordinary 0/0", 0, 0, "", false},
+		{"ordinary 0/1", 0, 1, "", false},
+		{"ordinary 1/0", 1, 0, "", false},
+		{"ordinary 1/1", 1, 1, "", true},
+		// AI session container: server-decided, both axes irrelevant.
+		{"container 0/0", 0, 0, aiteampkg.GroupPurpose, true},
+		{"container 0/1", 0, 1, aiteampkg.GroupPurpose, true},
+		{"container 1/0", 1, 0, aiteampkg.GroupPurpose, true},
+		{"container 1/1", 1, 1, aiteampkg.GroupPurpose, true},
+		// An unrelated purpose must NOT take the container branch.
+		{"other purpose 0/1", 0, 1, "something_else", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want,
+				resolveEffectiveNoMention(tc.noMention, tc.groupAllow, tc.purpose))
+		})
+	}
+}
+
+// TestGetMentionPref_AIContainerNeedsNoOwnerRecord is the regression this change
+// exists for. An AI session container has NO bot_mention_pref row and can never
+// get one (the owner endpoints reject writes for these groups), so before this
+// change the endpoint answered effective=false and the adapter's mention gate
+// dropped every non-@ message in the session into history — the AI never replied.
+func TestGetMentionPref_AIContainerNeedsNoOwnerRecord(t *testing.T) {
+	handler, ctx := setupBotMentionPref(t)
+	seedGroupRowWithPurpose(t, ctx, 1, aiteampkg.GroupPurpose)
+	// Intentionally do NOT seed a bot_mention_pref record — a container never has one.
+
+	b := decodeMentionPref(t, getBotMentionPref(t, handler))
+	assert.True(t, b.Effective, "AI session container must be 免@ without any owner record")
+	assert.Equal(t, 1, b.NoMention, "legacy adapters reading only no_mention must also see 免@")
+	assert.Equal(t, 1, b.GroupAllowNoMention)
+}
+
+// TestGetMentionPref_AIContainerIgnoresBlockedGroupSwitch pins that the container
+// override outranks a blocking allow_no_mention, and that the response still
+// reports the RAW column value. Containers are created with allow_no_mention=1
+// and the group-setting endpoints reject these groups, so a 0 can only come from
+// a hand-edited row — in which case a debugger needs to see the 0, while the
+// adapter (which gates on `effective` alone) keeps answering.
+func TestGetMentionPref_AIContainerIgnoresBlockedGroupSwitch(t *testing.T) {
+	handler, ctx := setupBotMentionPref(t)
+	seedGroupRowWithPurpose(t, ctx, 0, aiteampkg.GroupPurpose)
+	seedOwnerNoMention(t, ctx, 0)
+
+	b := decodeMentionPref(t, getBotMentionPref(t, handler))
+	assert.True(t, b.Effective, "container override must outrank the group switch")
+	assert.Equal(t, 1, b.NoMention)
+	assert.Equal(t, 0, b.GroupAllowNoMention, "group_allow_no_mention stays the raw column value")
+}
+
+// TestGetMentionPref_OrdinaryGroupUnaffectedByPurposeColumn guards the blast
+// radius: reading the new column must not change any ordinary group's answer,
+// including a group whose purpose is some other non-empty value.
+func TestGetMentionPref_OrdinaryGroupUnaffectedByPurposeColumn(t *testing.T) {
+	handler, ctx := setupBotMentionPref(t)
+	seedGroupRowWithPurpose(t, ctx, 1, "not_an_ai_container")
+	seedOwnerNoMention(t, ctx, 0)
+
+	b := decodeMentionPref(t, getBotMentionPref(t, handler))
+	assert.False(t, b.Effective, "a non-container purpose must not unlock 免@")
+	assert.Equal(t, 0, b.NoMention)
+	assert.Equal(t, 1, b.GroupAllowNoMention)
 }

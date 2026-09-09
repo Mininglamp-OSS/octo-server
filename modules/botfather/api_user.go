@@ -1,6 +1,7 @@
 package botfather
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -30,6 +31,11 @@ const maxAgentRefLen = 128
 // bindMaxAttempts 限定 bind 在「CAS 与复查之间被并发 unbind 释放」竞态下的重试次数，
 // 防止极端 bind/unbind 抖动时无限循环。正常路径一次成功。
 const bindMaxAttempts = 3
+
+// agentHostingOctoHosted is the only hosting form accepted as a privileged Bot
+// creation intent. It intentionally lives in botfather rather than a client
+// package: the server owns the quota contract.
+const agentHostingOctoHosted = "octo_hosted"
 
 // ========== User API Key 认证中间件 ==========
 
@@ -107,6 +113,7 @@ func (bf *BotFather) setupUserAPIRoutes(r *wkhttp.WKHttp) {
 	{
 		userAPI.POST("/bots", bf.createUserBot)
 		userAPI.GET("/bots", bf.listUserBots)
+		userAPI.GET("/bots/hosted", bf.getHostedUserBot)
 		userAPI.PUT("/bots/:bot_id", bf.updateUserBot)
 		userAPI.DELETE("/bots/:bot_id", bf.deleteUserBot)
 		userAPI.GET("/bots/:bot_id/token", bf.getUserBotToken)
@@ -119,6 +126,40 @@ func (bf *BotFather) setupUserAPIRoutes(r *wkhttp.WKHttp) {
 	// 上、不挂到上面的 /bots* 区块 —— 那些 handler 自己读 api_key_space_id 做校验，多一层
 	// 参数注入只会改动既有契约。
 	authtree.Mount(authtree.TreeUserKey, r, authtree.MountOn(userAPI, bf.enforceKeySpace()))
+}
+
+// getHostedUserBot GET /v1/user/bots/hosted
+//
+// This is deliberately owner-global rather than Space-scoped: the hosted Bot
+// quota is global, and a user who switches Spaces must be able to recover the
+// sole credential they already own. The response contains no Space identity or
+// memberships, so it cannot be used to enumerate cross-Space data.
+func (bf *BotFather) getHostedUserBot(c *wkhttp.Context) {
+	uid := getAPIKeyUID(c)
+	bot, err := bf.db.queryActiveHostedBotByCreatorUID(uid)
+	if err != nil {
+		bf.Error("查询托管Bot失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if bot == nil {
+		c.Response(&HostedBotResp{})
+		return
+	}
+	name := bot.Username
+	if u, userErr := bf.userService.GetUser(bot.RobotID); userErr != nil {
+		bf.Warn("查询托管Bot显示名失败，使用用户名兜底", zap.Error(userErr), zap.String("robotID", bot.RobotID))
+	} else if u != nil && u.Name != "" {
+		name = u.Name
+	}
+	c.Response(&HostedBotResp{
+		Exists:      true,
+		RobotID:     bot.RobotID,
+		Username:    bot.Username,
+		Name:        name,
+		Description: bot.Description,
+		BotToken:    bot.BotToken,
+	})
 }
 
 // ========== User Bot CRUD APIs ==========
@@ -136,6 +177,11 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" || len(name) > 64 {
 		respondBotfatherRequestInvalid(c, "name")
+		return
+	}
+	agentHosting := strings.TrimSpace(req.AgentHosting)
+	if agentHosting != "" && agentHosting != agentHostingOctoHosted {
+		respondBotfatherRequestInvalid(c, "agent_hosting")
 		return
 	}
 
@@ -186,16 +232,51 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 			respondBotfatherUsernameTaken(c, reqUsername)
 			return
 		}
+	}
 
-		createErr = bf.cmdHandler.tryCreateBotCore(uid, name, reqUsername, botToken, reqUsername)
+	// The lock is deliberately keyed by the authenticated UID, never by the
+	// requested or key-bound Space. It spans the core create commit so concurrent
+	// hosted creates observe the first row before either can succeed.
+	var hostedLock *hostedBotCreationLock
+	if agentHosting == agentHostingOctoHosted {
+		hostedLock, err = bf.db.lockHostedBotCreation(uid)
+		if errors.Is(err, errHostedBotAlreadyExists) {
+			respondBotfatherHostedBotExists(c)
+			return
+		}
+		if err != nil {
+			bf.Error("检查托管Bot创建配额失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
+			return
+		}
+		defer func() {
+			if hostedLock != nil {
+				_ = hostedLock.release(false)
+			}
+		}()
+	}
+
+	if reqUsername != "" {
+		createErr = bf.cmdHandler.tryCreateBotCore(uid, name, reqUsername, botToken, reqUsername, agentHosting)
 		robotID = reqUsername
 	} else {
-		robotID, createErr = bf.cmdHandler.createBotCoreWithRetry(uid, name, botToken)
+		robotID, createErr = bf.cmdHandler.createBotCoreWithRetry(uid, name, botToken, agentHosting)
 	}
 	if createErr != nil {
 		bf.Error("创建Bot失败", zap.Error(createErr))
 		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
+	}
+	if hostedLock != nil {
+		if lockErr := hostedLock.release(true); lockErr != nil {
+			bf.Error("提交托管Bot创建锁失败", zap.Error(lockErr))
+			if cleanupErr := bf.db.deleteCreatedBotArtifacts(uid, robotID); cleanupErr != nil {
+				bf.Error("托管Bot创建补偿失败", zap.Error(cleanupErr))
+			}
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
+			return
+		}
+		hostedLock = nil
 	}
 	username := robotID
 
@@ -214,6 +295,7 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 
 	// Add bot to Space (best-effort, non-critical)
 	// Verify caller belongs to the Space before adding bot (prevent cross-Space injection)
+	botBoundToSpace := false
 	if spaceID != "" {
 		var memberCount int
 		_, countErr := bf.db.session.SelectBySql(
@@ -229,9 +311,17 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 			).Exec()
 			if spErr != nil {
 				bf.Error("Bot加入Space失败", zap.String("spaceID", spaceID), zap.Error(spErr))
+			} else {
+				botBoundToSpace = true
 			}
 		} else {
 			bf.Warn("用户不属于指定Space，跳过", zap.String("uid", uid), zap.String("spaceID", spaceID))
+		}
+	}
+	if botBoundToSpace {
+		if provisionErr := provisionAITeam(bf.ctx, spaceID, uid, robotID); provisionErr != nil {
+			bf.Warn("Bot已创建但AI团队群同步失败，将由后续AI团队请求重试",
+				zap.String("robotID", robotID), zap.String("spaceID", spaceID), zap.Error(provisionErr))
 		}
 	}
 

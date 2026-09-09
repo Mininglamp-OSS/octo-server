@@ -125,7 +125,7 @@ func traceIDFromWKContext(c *wkhttp.Context) string {
 
 func safeBotKind(kind string) string {
 	switch kind {
-	case BotKindUser, BotKindApp:
+	case BotKindUser, BotKindApp, BotKindAvatar:
 		return kind
 	default:
 		return "unknown"

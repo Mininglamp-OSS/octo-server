@@ -7,11 +7,122 @@ host: "api.botgate.cn"
 tags:
   - name: "robot"
     description: "机器人"
+  - name: "digital-avatar"
+    description: "组织管理的数字分身（robot.kind=avatar）"
 schemes:
   - "https"
 basePath: "/v1"
 
 paths:
+  /manager/avatars:
+    get:
+      tags: ["digital-avatar"]
+      summary: "列出管理范围内的数字分身"
+      parameters:
+        - {in: query, name: scope, type: string, required: true, enum: [platform, space]}
+        - {in: query, name: space_id, type: string, required: false}
+      responses:
+        200:
+          description: "数字分身列表"
+          schema: {type: array, items: {$ref: "#/definitions/digitalAvatar"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+    post:
+      tags: ["digital-avatar"]
+      summary: "创建数字分身"
+      description: "platform 仅 superAdmin；space 允许该 Space 的 owner/admin。创建结果为 draft。"
+      parameters:
+        - in: body
+          name: data
+          required: true
+          schema: {$ref: "#/definitions/digitalAvatarCreate"}
+      responses:
+        200:
+          description: "创建结果；bot_token 仅在受管理者保护的响应中返回"
+          schema: {$ref: "#/definitions/digitalAvatarCredential"}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
+  /manager/avatars/{robot_id}:
+    parameters:
+      - {in: path, name: robot_id, type: string, required: true}
+    get:
+      tags: ["digital-avatar"]
+      summary: "读取数字分身详情"
+      responses:
+        200: {description: "数字分身详情", schema: {$ref: "#/definitions/digitalAvatar"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+    put:
+      tags: ["digital-avatar"]
+      summary: "更新数字分身名称或描述"
+      parameters:
+        - in: body
+          name: data
+          required: true
+          schema: {$ref: "#/definitions/digitalAvatarUpdate"}
+      responses:
+        200: {description: "成功", schema: {$ref: "#/definitions/response"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+    delete:
+      tags: ["digital-avatar"]
+      summary: "永久删除数字分身并启动可重试清理"
+      responses:
+        200: {description: "权限已撤销；外部清理由持久任务收敛", schema: {$ref: "#/definitions/response"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
+  /manager/avatars/{robot_id}/publish:
+    post:
+      tags: ["digital-avatar"]
+      summary: "发布数字分身"
+      parameters: [{in: path, name: robot_id, type: string, required: true}]
+      responses:
+        200: {description: "成功", schema: {$ref: "#/definitions/response"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
+  /manager/avatars/{robot_id}/unpublish:
+    post:
+      tags: ["digital-avatar"]
+      summary: "下架数字分身并启动可重试清理"
+      parameters: [{in: path, name: robot_id, type: string, required: true}]
+      responses:
+        200: {description: "本地权限与旧 token 已立即撤销", schema: {$ref: "#/definitions/response"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
+  /manager/avatars/{robot_id}/token:
+    get:
+      tags: ["digital-avatar"]
+      summary: "读取数字分身 Bot token"
+      parameters: [{in: path, name: robot_id, type: string, required: true}]
+      responses:
+        200: {description: "凭据", schema: {$ref: "#/definitions/digitalAvatarToken"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
+  /manager/avatars/{robot_id}/token/rotate:
+    post:
+      tags: ["digital-avatar"]
+      summary: "轮换数字分身 Bot token"
+      parameters: [{in: path, name: robot_id, type: string, required: true}]
+      responses:
+        200: {description: "新凭据；旧 token 已失效", schema: {$ref: "#/definitions/digitalAvatarToken"}}
+        400: {description: "统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
+  /manager/avatars/{robot_id}/cleanup/retry:
+    post:
+      tags: ["digital-avatar"]
+      summary: "重试数字分身生命周期清理"
+      parameters: [{in: path, name: robot_id, type: string, required: true}]
+      responses:
+        200: {description: "重试完成", schema: {$ref: "#/definitions/response"}}
+        400: {description: "仍未收敛或统一错误 envelope", schema: {$ref: "#/definitions/response"}}
+      security: [{token: []}]
+
   /robot/sync:
     get:
       tags:
@@ -590,6 +701,41 @@ securityDefinitions:
     description: "用户token"
 
 definitions:
+  digitalAvatarCreate:
+    type: object
+    required: [name, scope]
+    properties:
+      name: {type: string}
+      description: {type: string}
+      scope: {type: string, enum: [platform, space]}
+      space_id: {type: string, description: "scope=space 时必填；platform 时必须为空"}
+  digitalAvatarUpdate:
+    type: object
+    properties:
+      name: {type: string}
+      description: {type: string}
+  digitalAvatar:
+    type: object
+    properties:
+      robot_id: {type: string}
+      name: {type: string}
+      description: {type: string}
+      scope: {type: string, enum: [platform, space]}
+      space_id: {type: string}
+      publication_state: {type: string, enum: [draft, published, unpublished, deleted]}
+      lifecycle_pending: {type: integer, description: "1 表示外部清理仍在重试；此时运行时权限保持关闭"}
+      created_by: {type: string, description: "审计创建者，不是 owner_uid"}
+  digitalAvatarToken:
+    type: object
+    properties:
+      bot_token: {type: string}
+  digitalAvatarCredential:
+    allOf:
+      - $ref: "#/definitions/digitalAvatarToken"
+      - type: object
+        properties:
+          robot_id: {type: string}
+          publication_state: {type: string, enum: [draft]}
   event:
     type: object
     properties:

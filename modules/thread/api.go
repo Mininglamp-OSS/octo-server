@@ -78,7 +78,6 @@ func (t *Thread) onMessages(messages []*config.MessageResp) {
 		}); err != nil {
 			t.Error("更新消息统计/解档失败", zap.Error(err), zap.String("shortID", shortID))
 		}
-
 		// 发送者不是子区成员，自动加入
 		if msg.FromUID != "" {
 			if err := t.service.JoinThread(groupNo, shortID, msg.FromUID); err != nil {
@@ -207,14 +206,17 @@ func (t *Thread) Route(r *wkhttp.WKHttp) {
 }
 
 func (t *Thread) protectAIContainerMutation(c *wkhttp.Context) {
-	protected, err := aiteampkg.IsProtectedGroup(t.ctx.DB(), c.Param("group_no"))
+	purpose, err := aiteampkg.Purpose(t.ctx.DB(), c.Param("group_no"))
 	if err != nil {
 		t.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
 		httperr.ResponseErrorL(c, errcode.ErrThreadStoreFailed, nil, nil)
 		c.Abort()
 		return
 	}
-	if protected {
+	// The private owner+Bot parent is mutated only through /v1/ai-team.
+	// The aggregate "我的AI团队" group intentionally keeps ordinary thread
+	// creation and management so its dedicated page can expose normal subareas.
+	if aiteampkg.IsDedicatedSessionPurpose(purpose) {
 		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
 		c.Abort()
 		return
@@ -234,14 +236,14 @@ func (t *Thread) protectAIContainerSimpleMutation(c *wkhttp.Context) {
 		c.Next()
 		return
 	}
-	protected, err := aiteampkg.IsProtectedGroup(t.ctx.DB(), model.GroupNo)
+	purpose, err := aiteampkg.Purpose(t.ctx.DB(), model.GroupNo)
 	if err != nil {
 		t.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", model.GroupNo))
 		httperr.ResponseErrorL(c, errcode.ErrThreadStoreFailed, nil, nil)
 		c.Abort()
 		return
 	}
-	if protected {
+	if aiteampkg.IsDedicatedSessionPurpose(purpose) {
 		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
 		c.Abort()
 		return

@@ -42,6 +42,14 @@ func respondBotfatherUsernameTaken(c *wkhttp.Context, username string) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherUsernameTaken, nil, i18n.Details{"username": username})
 }
 
+// respondBotfatherHostedBotExists is intentionally detail-free: a caller only
+// learns that its own global hosted-Bot slot is occupied, never which Bot or
+// Space occupies it. This is an existing endpoint, so ResponseErrorL keeps its
+// legacy wire-400 envelope while the stable code records the semantic conflict.
+func respondBotfatherHostedBotExists(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrBotfatherHostedBotExists, nil, nil)
+}
+
 // ---- bot / User-API-Key auth middleware (status-preserving, anti-enum) -------
 
 // respondBotfatherAuthFailed renders the single anti-enumeration 401 for the

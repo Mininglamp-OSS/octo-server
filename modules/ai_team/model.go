@@ -3,7 +3,6 @@ package ai_team
 import "time"
 
 const (
-	containerUnassigned   = 0
 	containerProvisioning = 1
 	containerReady        = 2
 	containerFailed       = 3
@@ -25,7 +24,7 @@ const (
 	AgentGroupTypeDigitalEmployee   AgentGroupType = "digital_employee"
 
 	agentHostingOctoHosted = "octo_hosted"
-	agentGroupSQL          = "CASE WHEN r.agent_hosting='" + agentHostingOctoHosted + "' THEN '" + string(AgentGroupTypeCloudClone) + "' ELSE '" + string(AgentGroupTypePersonalAssistant) + "' END"
+	agentGroupSQL          = "CASE WHEN r.kind='avatar' THEN '" + string(AgentGroupTypeDigitalEmployee) + "' WHEN r.agent_hosting='" + agentHostingOctoHosted + "' THEN '" + string(AgentGroupTypeCloudClone) + "' ELSE '" + string(AgentGroupTypePersonalAssistant) + "' END"
 )
 
 type Agent struct {
@@ -76,7 +75,57 @@ type AgentGroup struct {
 	Items []*Agent       `json:"items"`
 }
 
+type TeamGroup struct {
+	GroupNo string `db:"group_no" json:"group_no"`
+	Name    string `db:"name" json:"name"`
+	State   int    `db:"state" json:"state"`
+}
+
+type TeamType string
+
+const (
+	TeamTypeAllAgents TeamType = "all_agents"
+	TeamTypeCustom    TeamType = "custom"
+)
+
 type AgentPage struct {
 	Groups     []*AgentGroup `json:"groups"`
 	NextCursor string        `json:"next_cursor,omitempty"`
+}
+
+type Team struct {
+	GroupNo         string    `db:"group_no" json:"group_no"`
+	SpaceID         string    `db:"space_id" json:"space_id"`
+	UserUID         string    `db:"user_uid" json:"user_uid"`
+	Name            string    `db:"name" json:"name"`
+	Type            TeamType  `db:"team_type" json:"type"`
+	Editable        bool      `db:"-" json:"editable"`
+	MembersEditable bool      `db:"-" json:"members_editable"`
+	State           int       `db:"state" json:"state"`
+	MemberCount     int64     `db:"member_count" json:"member_count"`
+	AvatarText      string    `db:"avatar_text" json:"avatar_text"`
+	AvatarColor     *int      `db:"avatar_color" json:"avatar_color"`
+	IsUploadAvatar  int       `db:"is_upload_avatar" json:"is_upload_avatar"`
+	CreatedAt       time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt       time.Time `db:"updated_at" json:"updated_at"`
+	Agents          []*Agent  `db:"-" json:"agents,omitempty"`
+	SortOrder       int       `db:"sort_order" json:"-"`
+}
+
+type TeamPage struct {
+	Items      []*Team `json:"items"`
+	NextCursor string  `json:"next_cursor,omitempty"`
+}
+
+type CreateTeamRequest struct {
+	Name        string   `json:"name"`
+	BotIDs      []string `json:"bot_ids"`
+	AvatarText  string   `json:"avatar_text"`
+	AvatarColor *int     `json:"avatar_color"`
+}
+
+type UpdateTeamRequest struct {
+	Name        *string `json:"name"`
+	AvatarText  *string `json:"avatar_text"`
+	AvatarColor *int    `json:"avatar_color"`
 }

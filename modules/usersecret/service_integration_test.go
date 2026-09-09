@@ -282,4 +282,23 @@ func TestStore_QueryBotByToken_Integration(t *testing.T) {
 	id, err = st.queryBotByToken("bf_unknown")
 	require.NoError(t, err)
 	assert.Nil(t, id)
+
+	// Organization Avatars and arbitrary ownerless robots must not inherit a
+	// person's secret namespace merely because they authenticate with a bf_ token.
+	_, err = ctx.DB().InsertBySql(`INSERT INTO robot
+		(robot_id,creator_uid,bot_token,status,auto_approve,kind,management_scope,
+		 management_space_id,publication_state,lifecycle_pending)
+		VALUES (?,'',?,1,1,'avatar','space','secret-space','published',0)`,
+		"avatar-secret", "bf_avatar_secret").Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id,creator_uid,bot_token,status,kind) VALUES (?,'',?,1,'user')",
+		"ownerless-secret", "bf_ownerless_secret",
+	).Exec()
+	require.NoError(t, err)
+	for _, token := range []string{"bf_avatar_secret", "bf_ownerless_secret"} {
+		id, err = st.queryBotByToken(token)
+		require.NoError(t, err)
+		assert.Nil(t, id, "token %s must not resolve a human-owned secret namespace", token)
+	}
 }

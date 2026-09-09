@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -60,6 +61,16 @@ func (a *DBAuthorizer) authorizeDM(identity *botidentity.Identity, target Target
 	}
 
 	switch identity.Kind {
+	case botidentity.KindAvatar:
+		allowed, err := botpolicy.CanAccessChannel(a.session, identity.UID, target.ChannelID,
+			common.ChannelTypePerson.Uint8(), target.SpaceID)
+		if err != nil {
+			return denyTarget(fmt.Errorf("query avatar DM authority: %w", err))
+		}
+		if !allowed {
+			return denyTarget(errors.New("avatar and recipient do not share an active space"))
+		}
+		return nil
 	case botidentity.KindAppBot:
 		switch identity.AppScope {
 		case botidentity.ScopePlatform:
@@ -113,6 +124,17 @@ func (a *DBAuthorizer) authorizeDM(identity *botidentity.Identity, target Target
 }
 
 func (a *DBAuthorizer) authorizeGroup(identity *botidentity.Identity, spaceID, groupNo string, policy AuthorizationPolicy) error {
+	if identity.Kind == botidentity.KindAvatar {
+		allowed, err := botpolicy.CanAccessChannel(a.session, identity.UID, groupNo,
+			common.ChannelTypeGroup.Uint8(), spaceID)
+		if err != nil {
+			return denyTarget(fmt.Errorf("query avatar group authority: %w", err))
+		}
+		if !allowed {
+			return denyTarget(errors.New("avatar is not authorized in target group"))
+		}
+		return nil
+	}
 	if identity.Kind != botidentity.KindUserBot {
 		return denyTarget(errors.New("app bots cannot target groups"))
 	}
@@ -176,6 +198,17 @@ func (a *DBAuthorizer) authorizeThread(identity *botidentity.Identity, target Ta
 	}
 	if status != thread.ThreadStatusActive {
 		return denyTarget(errors.New("thread is not active"))
+	}
+	if identity.Kind == botidentity.KindAvatar {
+		allowed, authErr := botpolicy.CanAccessChannel(a.session, identity.UID, target.ChannelID,
+			common.ChannelTypeCommunityTopic.Uint8(), target.SpaceID)
+		if authErr != nil {
+			return denyTarget(fmt.Errorf("query avatar thread authority: %w", authErr))
+		}
+		if !allowed {
+			return denyTarget(errors.New("avatar is not authorized in target thread"))
+		}
+		return nil
 	}
 	return a.authorizeGroup(identity, target.SpaceID, groupNo, policy)
 }

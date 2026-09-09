@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -48,15 +49,40 @@ func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	spaceID := c.Query("space_id")
 	var groups []GroupInfo
 	var err error
+	if getBotKindFromContext(c) == BotKindAvatar {
+		query := `SELECT gm.group_no,g.name,g.space_id FROM group_member gm
+			JOIN ` + "`group`" + ` g ON g.group_no=gm.group_no AND g.status=1
+			JOIN robot r ON r.robot_id=gm.uid
+			JOIN user bot_u ON bot_u.uid=r.robot_id AND bot_u.status=1 AND bot_u.is_destroy<>2
+			JOIN space s ON s.space_id=g.space_id AND s.status=1
+			JOIN space_member sm ON sm.space_id=s.space_id AND sm.uid=r.robot_id AND sm.status=1
+			WHERE gm.uid=? AND gm.status=1 AND gm.is_deleted=0 AND gm.is_external=0
+			AND ` + botpolicy.AvatarInSpaceSQL("r", "s.space_id") + `
+			AND ` + botpolicy.AIGroupRelationSQL("g", "r.robot_id")
+		args := []interface{}{robotID}
+		if spaceID != "" {
+			query += " AND g.space_id=?"
+			args = append(args, spaceID)
+		}
+		query += " ORDER BY gm.created_at DESC"
+		_, err = ba.ctx.DB().SelectBySql(query, args...).Load(&groups)
+		if err != nil {
+			ba.Error("查询 Avatar 群组失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		c.JSON(http.StatusOK, groups)
+		return
+	}
 	if spaceID != "" {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose = ''",
-			robotID, spaceID,
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose IN ('', ?, ?)",
+			robotID, spaceID, aiteampkg.TeamGroupPurpose, aiteampkg.CustomTeamPurpose,
 		).Load(&groups)
 	} else {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose = ''",
-			robotID,
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose IN ('', ?, ?)",
+			robotID, aiteampkg.TeamGroupPurpose, aiteampkg.CustomTeamPurpose,
 		).Load(&groups)
 	}
 	if err != nil {
