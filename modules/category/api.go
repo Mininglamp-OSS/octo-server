@@ -469,8 +469,12 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// The legacy request can express category order only, not Project entries.
+	// Reassign the requested categories within the category slots that already
+	// exist in the unified order so an old client cannot move an interleaved
+	// Project as a side effect of a category-only drag.
 	for i, catID := range req.CategoryIDs {
-		if err := c.db.updateSidebarSectionSortTx(tx, loginUID, spaceID, sidebarSectionTypeCategory, catID, i); err != nil {
+		if err := c.db.updateSidebarSectionSortTx(tx, loginUID, spaceID, sidebarSectionTypeCategory, catID, categories[i].Sort); err != nil {
 			c.Error("更新排序失败", zap.Error(err), zap.String("categoryID", catID))
 			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
@@ -560,7 +564,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
-	if groupRow.ProjectID != "" {
+	if groupRow.ProjectID != "" && req.CategoryID != "" {
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryProjectGroupCannotCategorize, nil, nil)
 		return
 	}

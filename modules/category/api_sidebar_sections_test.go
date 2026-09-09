@@ -236,9 +236,9 @@ func TestOldCategoriesSortWritesSidebarSectionTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 2)
 	require.Equal(t, categoryB, rows[0].RefID)
-	require.Equal(t, 0, rows[0].Sort)
+	require.Equal(t, 12, rows[0].Sort)
 	require.Equal(t, categoryA, rows[1].RefID)
-	require.Equal(t, 1, rows[1].Sort)
+	require.Equal(t, 37, rows[1].Sort)
 
 	// Old group_category.sort was only migration input and must not silently
 	// become a second writer after the authority handover.
