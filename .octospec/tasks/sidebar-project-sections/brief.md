@@ -18,6 +18,7 @@ source: self
 > **Status: IMPLEMENTED.** D1-D5 and the additive `project_name` contract are
 > implemented on `feat/sidebar-project-sections`. D6 remains deferred pending
 > Q2; D7 remains an unchanged client-side concern.
+> Client integration contract: [`docs/sidebar-project-sections-api.md`](../../../docs/sidebar-project-sections-api.md).
 >
 > | | |
 > |---|---|
