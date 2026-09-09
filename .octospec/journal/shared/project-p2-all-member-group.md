@@ -572,6 +572,37 @@ about one call site, not about the system** — the order only holds if every pa
 and the one that did not was the reason. And **a fix that survives the full suite can still
 be wrong**: nothing here failed. It took reading the other path's lock sequence to see it.
 
+### "Is this breaking?" and "is this right?" are different questions, and the first one can hide the second
+
+`member_count` was flagged as the one change in this feature that would visibly break
+clients: redefined from "everyone" to "humans only", so any project with agents renders a
+smaller number. The whole discussion was about blast radius — how many clients read it,
+what the fallback costs, whether to measure it first.
+
+The blast radius turned out to be zero. The module has never been GA, so nothing had
+shipped against either meaning. Under the question as asked, that is the end of it: not
+breaking, no action.
+
+Asking the second question found something the first could not. This server already ships
+`member_count` — meaning the total — beside `human_member_count` and `agent_member_count`,
+from a different module, to the same client teams. So the change was not breaking; it was
+*inconsistent*, and inconsistent in a way that fails silently: both fields are ints, both
+compile, and a client author who learned the convention from one module renders the wrong
+number in the other. No test on either side can catch it, because neither side is wrong on
+its own.
+
+The fix was the fallback that had been designed for the breakage that did not exist —
+restore `member_count`, add the two split fields — adopted for an entirely different
+reason. Worth noticing: had the first question come back "yes, breaking", the same fix
+would have landed and the naming collision would have gone unnoticed, because the answer
+would have arrived before anyone looked at what the field ought to mean.
+
+The original argument for the change was sound and remains in the code: a project with one
+person and two of their agents should not render "3 人". That is a claim about what a
+client should DISPLAY. It was answered by changing what the server MEANS. Those are
+adjacent enough to substitute for each other without anyone noticing, and the substitution
+costs a name.
+
 ## What we did not deliver
 
 - **No automatic repair for I4.** Both scans report only. Scan A's repair lives on

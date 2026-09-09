@@ -1810,6 +1810,52 @@ pr_855_round_11_fixed:
       Renamed to `project_all_member_group_guard_failures_total`. Done now because the
       feature is off by default and no dashboard exists yet; later it is a breaking rename.
 
+# D16 的计数口径在 GA 前改回来了。不是 review 提的，是核实"是否 breaking"时查出来的。
+pr_855_member_count_realigned:
+  - id: one-server-two-meanings-of-member_count
+    severity: medium
+    reported_by: "self, while answering whether the D16 semantic change was breaking"
+    where: modules/project/{model,api,db}.go
+    what: |
+      D16 redefined Resp.member_count as "humans only" and added agent_count. Checking the
+      client blast radius turned up two facts that together change the question:
+        1. Not breaking. modules/project has existed only since #841 and has never been
+           GA -- the write gate is on in the test environment, but nothing has shipped, so
+           no released client reads either meaning. group / thread / integration each have
+           their own member_count on their own endpoints; none was touched.
+        2. But modules/opanalytics already ships member_count (total),
+           human_member_count and agent_member_count on the wire, to the same client
+           teams. So the server now means two different things by one field name, and
+           `agent_count` is separately taken by the Space directory, where it means "how
+           many agents this OWNER has".
+      Nothing catches that: both spellings compile, both return an int, and a client author
+      who learned the opanalytics convention renders the wrong number in projects.
+    fix: |
+      member_count restored to EVERY active seat -- its pre-D16 meaning and opanalytics'
+      meaning -- with the split moved to human_member_count and agent_member_count, named
+      for the existing precedent rather than the shorter agent_count.
+      D16's original argument survives intact: a project with one person and two of their
+      agents should not render "3 人". That is a statement about what the client DISPLAYS,
+      and the display fix is for it to read human_member_count. Redefining member_count
+      bought the same outcome and charged one namespace collision for it.
+      toResp derives member_count as humans + agents rather than reading a third count:
+      both callers already produce the two halves from two statements, so a separately-read
+      total could disagree with them, and the identity a client renders
+      (member_count == human + agent) now holds by construction.
+      listRow.MemberCount renamed HumanCount for the same reason -- two structs one
+      function-argument apart holding a same-named field of opposite meaning is how the
+      wrong one gets passed.
+    test: |
+      TestListRouteSplitsTheRosterAndTheThreeCountsAddUp -- new, and it covers the path that
+      had none: the LIST route, where the two halves come from two statements. It asserts
+      the three fields on a mixed roster, that they add up, and that the detail route agrees
+      field-for-field. TestCreateProjectSeatsTheCreatorsAgents extended with the same three.
+    mutation: "making member_count humans-only again turns both cases red."
+    window: |
+      Done before the module's first GA, which is the only time it is free. After that,
+      restoring member_count and renaming agent_count are two breaking changes rather than
+      one field rename in an integration that has not shipped.
+
 verify:
   rules_rechecked:
     - id: space-isolation

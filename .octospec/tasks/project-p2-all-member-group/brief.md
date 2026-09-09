@@ -281,12 +281,22 @@ Background 里那条代码事实：群侧已经按 `robot.creator_uid` 把离开
 被否决：沿用今天"管理员想加谁加谁"——和创建弹窗的承诺矛盾，也让 D13 的"分身跟人走"没有对应的
 "分身跟人来"。
 
-**D16 — 名册透出 `robot` 与 `owner_uid`；`member_count` 只数人。** `MemberResp` 增加
+**D16 — 名册透出 `robot` 与 `owner_uid`；花名册计数拆成三个字段。** `MemberResp` 增加
 `robot int` 和 `owner_uid string`（bot 才有），客户端才能像通讯录那样把分身挂到人下面；
-项目 `Resp.member_count` 改为只数 `user.robot = 0` 的活跃成员，另加 `agent_count`。
-配额 `max_members` 仍按全部席位计（分身占席位是有意的：它是一个会读消息的成员）。
-**这是既有字段的语义变更**，PR 描述里要单独说明，并按「上线前须核对」第 1 条确认客户端影响面。
-被否决：`member_count` 混数——弹窗和列表页显示"3 人"里有两个是分身，用户会问。
+项目 `Resp` 保持 `member_count` 为**全部活跃席位**，另加 `human_member_count`（只数
+`user.robot = 0`）与 `agent_member_count`。配额 `max_members` 仍按全部席位计（分身占席位是
+有意的：它是一个会读消息的成员）。
+被否决：`member_count` 混数而不拆——弹窗和列表页显示"3 人"里有两个是分身，用户会问。
+
+**这一条改过一次口径，记下来。** #855 最初把 `member_count` **改成只数人**、另加
+`agent_count`，理由就是上面那句"3 人是假话"。那个理由对的是**客户端该显示什么**，错的是
+**该改哪个字段**：显示问题的正解是客户端去读 `human_member_count`。重定义 `member_count`
+换来了同样的显示效果，代价是同一个服务里一个名字两个意思——`modules/opanalytics` 的群组列表
+早就在线上协议里发 `member_count`（总数）/ `human_member_count` / `agent_member_count`
+这三件套，面向的是同一批客户端。`agent_count` 这个短名也已经被 Space 通讯录占用，在那里表示
+"这个所有者名下有几个分身"。
+所以在模块首次 GA 之前改回来，并对齐 opanalytics 的命名。这是唯一免费的窗口：两种含义都还
+没有任何一个已发布客户端在读（`modules/project` 自 #841 建立起从未正式上线）。
 
 **D17 — 产品文案不得承诺外部成员。** P0 / P1 两次记录的未决项：原型的「客户联合交付」叙事与
 v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本期把"项目就是一个群"的心智推到用户
@@ -362,8 +372,9 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
   IMRemoveSubscriber 的位置逼出来的。所以泄露面不是零而是**有界**：一个非成员能读出
   "这个群属于某个项目"，而"这个群存不存在"上游的 getGroupInfo 已经用 404 回答过了。
   实现侧的注释按这个口径写，本行原来的"所以不新增探测面"是错的）。touches: `isolation`
-- **响应契约。** 项目 `Resp` 新增 `all_member_group_no`（空串表示尚未建成）、`agent_count`，
-  `member_count` 语义改为只数人（D16，**既有字段语义变更**）；`MemberResp` 新增 `robot`、
+- **响应契约。** 项目 `Resp` 新增 `all_member_group_no`（空串表示尚未建成）、
+  `human_member_count`、`agent_member_count`，`member_count` 保持"全部席位"原义
+  （D16，与 `modules/opanalytics` 同名字段一致）；`MemberResp` 新增 `robot`、
   `owner_uid`；`Capabilities` 新增 `can_manage_own_agents`；`GroupResp`、群详情、以及
   `channelInfo.orgData`（`newChannelRespWithGroupResp`，与 `space_id` 并列）新增
   `project_id`（空串 = Space 直属，不发）。`POST /v1/auth/verify?include=context` 的
@@ -475,7 +486,8 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
 
 - [ ] 解散项目：`all_member_group_no` 在解散事务内清空；群按 P1 规则回退为 Space 直属、
       成员不动；从此对该群 `exit` / `disband` 恢复正常。
-- [ ] 项目 `Resp` 含 `all_member_group_no`、`agent_count`，`member_count` 只数人；
+- [ ] 项目 `Resp` 含 `all_member_group_no`、`human_member_count`、`agent_member_count`，
+      `member_count` 仍是全部席位，且三者恒满足 `member_count = human + agent`；
       `MemberResp` 含 `robot`、`owner_uid`；`Capabilities` 含 `can_manage_own_agents`；
       `GroupResp`、群详情与 `channelInfo.orgData` 含 `project_id`；
       `POST /v1/auth/verify?include=context` 的响应 golden 断言不变。
@@ -509,9 +521,12 @@ v1 的两条约束冲突（没有外部成员；Project 不是读边界）。本
 
 无法在本仓库内核实，不阻塞实现，合并前要有答案。
 
-1. **`member_count` 语义变更的客户端影响面（D16）。** 服务端可以改，但哪些端已经在用这个
-   字段、是否有把它当"含 bot 的席位数"使用的地方，只能问客户端。若影响面大，退路是保留
-   `member_count` 原语义并新增 `human_member_count`，那是一次纯加字段的变更。
+1. ~~**`member_count` 语义变更的客户端影响面（D16）。**~~ **已了结，走了退路方案。**
+   核实结果：开关已开但模块仍在测试阶段、从未正式上线，所以没有任何已发布客户端在读这个字段
+   ——"破坏性"不成立。真正该管的是另一件事：同一个服务里 `member_count` 会有两个意思
+   （`modules/opanalytics` 用它表示总数）。于是在 GA 前把口径改回"全部席位"，并按 opanalytics
+   的命名补上 `human_member_count` / `agent_member_count`。联调中的客户端改一个字段名即可；
+   GA 之后再改就是两次破坏性重命名。
 2. **前端分身选择器是否已排除 `self_hosted`（D2）。** 服务端按通讯录口径排除；如果选择器
    没排除，用户会看到一个选了就被拒的分身。两侧口径必须一致，以服务端为准。
 3. **botfather 删 bot 改走工单后，是否有调用方依赖旧裸 UPDATE 的同步性（D14）。**
