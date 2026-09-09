@@ -9,51 +9,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
-
-const aiTeamProjectionPending = 1
-
-// markAITeamLifecycleRosterRemovalTx makes an authoritative account/seat
-// teardown visible to the aggregate projection in the same transaction as the
-// managed-group membership removal. Deactivating the Agent here is important:
-// Bot/Space status changes may commit only after group cleanup returns, while a
-// concurrent stale projection must already observe that this identity is no
-// longer desired.
-func markAITeamLifecycleRosterRemovalTx(tx *dbr.Tx, model *Model, removedUIDs []string) error {
-	if tx == nil || model == nil || len(removedUIDs) == 0 {
-		return nil
-	}
-	type ownerKey struct {
-		SpaceID string `db:"space_id"`
-		UserUID string `db:"user_uid"`
-	}
-	var owners []*ownerKey
-	switch model.Purpose {
-	case aiteampkg.TeamGroupPurpose:
-		owners = append(owners, &ownerKey{SpaceID: model.SpaceID, UserUID: model.Creator})
-	case aiteampkg.GroupPurpose:
-		if _, err := tx.Select("DISTINCT space_id", "user_uid").From("ai_team_agent").
-			Where("group_no=? AND bot_id IN ?", model.GroupNo, uniqueSortedUIDs(removedUIDs)).Load(&owners); err != nil {
-			return fmt.Errorf("query affected AI-team owners: %w", err)
-		}
-	default:
-		return nil
-	}
-	for _, owner := range owners {
-		if _, err := tx.UpdateBySql(`UPDATE ai_team_group
-			SET state=?,last_error='',roster_version=roster_version+1,retry_after=CURRENT_TIMESTAMP
-			WHERE space_id=? AND user_uid=?`, aiTeamProjectionPending, owner.SpaceID, owner.UserUID).Exec(); err != nil {
-			return fmt.Errorf("advance AI-team roster version after lifecycle removal: %w", err)
-		}
-		if _, err := tx.Update("ai_team_agent").Set("is_added", 0).
-			Where("space_id=? AND user_uid=? AND bot_id IN ?", owner.SpaceID, owner.UserUID, removedUIDs).Exec(); err != nil {
-			return fmt.Errorf("deactivate lifecycle-removed AI-team agents: %w", err)
-		}
-	}
-	return nil
-}
 
 // SyncAITeamGroupSubscribers applies the authoritative AI-team roster to the
 // parent channel and every non-deleted subarea. WuKongIM's channel upsert is

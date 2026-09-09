@@ -20,6 +20,29 @@ const (
 
 var ErrContainerProtected = errors.New("ai session container is protected")
 
+type LifecycleRosterMarker func(
+	tx *dbr.Tx,
+	purpose, groupNo, spaceID, ownerUID string,
+	removedUIDs []string,
+) error
+
+var lifecycleRosterMarker LifecycleRosterMarker
+
+func RegisterLifecycleRosterMarker(marker LifecycleRosterMarker) {
+	lifecycleRosterMarker = marker
+}
+
+func MarkLifecycleRosterRemovalTx(
+	tx *dbr.Tx,
+	purpose, groupNo, spaceID, ownerUID string,
+	removedUIDs []string,
+) error {
+	if lifecycleRosterMarker == nil {
+		return nil
+	}
+	return lifecycleRosterMarker(tx, purpose, groupNo, spaceID, ownerUID, removedUIDs)
+}
+
 // Enabled gates AI routing as well as the public API. Container ACL protection
 // intentionally does not use this flag: disabling rollout must never reopen an
 // already-created private container to ordinary group mutation paths.

@@ -1932,7 +1932,9 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		for _, member := range removableMembers {
 			lifecycleUIDs = append(lifecycleUIDs, member.UID)
 		}
-		if err := markAITeamLifecycleRosterRemovalTx(tx, groupModel, lifecycleUIDs); err != nil {
+		if err := aiteampkg.MarkLifecycleRosterRemovalTx(
+			tx, groupModel.Purpose, groupModel.GroupNo, groupModel.SpaceID, groupModel.Creator, lifecycleUIDs,
+		); err != nil {
 			s.Error("mark AI-team lifecycle roster removal failed", zap.Error(err),
 				zap.String("group_no", req.GroupNo), zap.Strings("removed_uids", lifecycleUIDs))
 			return nil, errors.New("failed to mark AI-team lifecycle roster removal")

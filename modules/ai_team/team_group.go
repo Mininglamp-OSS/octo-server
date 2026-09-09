@@ -344,6 +344,48 @@ type teamProjectionSnapshot struct {
 	rosterVersion uint64
 }
 
+// markLifecycleRosterRemovalTx folds account/seat teardown into the Agent
+// authority before the protected membership removal commits. The aggregate
+// version is advanced first to preserve the projection lock order
+// (ai_team_group -> ai_team_agent -> group_member).
+func markLifecycleRosterRemovalTx(
+	tx *dbr.Tx,
+	purpose, groupNo, spaceID, ownerUID string,
+	removedUIDs []string,
+) error {
+	if tx == nil || len(removedUIDs) == 0 {
+		return nil
+	}
+	type ownerKey struct {
+		SpaceID string `db:"space_id"`
+		UserUID string `db:"user_uid"`
+	}
+	var owners []*ownerKey
+	switch purpose {
+	case aiteampkg.TeamGroupPurpose:
+		owners = append(owners, &ownerKey{SpaceID: spaceID, UserUID: ownerUID})
+	case aiteampkg.GroupPurpose:
+		if _, err := tx.Select("DISTINCT space_id", "user_uid").From("ai_team_agent").
+			Where("group_no=? AND bot_id IN ?", groupNo, removedUIDs).Load(&owners); err != nil {
+			return fmt.Errorf("query affected AI-team owners: %w", err)
+		}
+	default:
+		return nil
+	}
+	for _, owner := range owners {
+		if _, err := tx.UpdateBySql(`UPDATE ai_team_group
+			SET state=?,last_error='',roster_version=roster_version+1,retry_after=CURRENT_TIMESTAMP
+			WHERE space_id=? AND user_uid=?`, containerProvisioning, owner.SpaceID, owner.UserUID).Exec(); err != nil {
+			return fmt.Errorf("advance AI-team roster version after lifecycle removal: %w", err)
+		}
+		if _, err := tx.Update("ai_team_agent").Set("is_added", 0).
+			Where("space_id=? AND user_uid=? AND bot_id IN ?", owner.SpaceID, owner.UserUID, removedUIDs).Exec(); err != nil {
+			return fmt.Errorf("deactivate lifecycle-removed AI-team agents: %w", err)
+		}
+	}
+	return nil
+}
+
 // syncTeamGroupProjection never holds a transaction, pooled DB connection, or
 // MySQL named lock across WuKongIM HTTP. The snapshot carries a monotonic roster
 // version. If a newer roster commits while HTTP is in flight, the ready CAS
