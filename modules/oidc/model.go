@@ -54,6 +54,14 @@ const (
 	EventBindRefused     AuditEvent = "bind_refused"
 	EventBindCreated     AuditEvent = "bind_created"
 	EventBindCreateFail  AuditEvent = "bind_create_fail"
+
+	// token exchange 事件(原生客户端直连用)。
+	EventExchangeOK   AuditEvent = "exchange_ok"
+	EventExchangeFail AuditEvent = "exchange_fail"
+
+	// bearer JWT exchange 事件(原生客户端持自签 bearer JWT 直连)。
+	EventBearerExchangeOK   AuditEvent = "exchange_jwt_ok"
+	EventBearerExchangeFail AuditEvent = "exchange_jwt_fail"
 )
 
 // AuditModel 登录与状态同步审计

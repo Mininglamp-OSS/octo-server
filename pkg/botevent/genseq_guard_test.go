@@ -51,6 +51,27 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	// an operator flips the mode. Every OTHER caller is a second live id source.
 	const allowlisted = "pkg/botevent/seq.go"
 
+	// There are deliberately NO per-file exemptions.
+	//
+	// `app cutover botevent` needs the legacy `seq` prefix to sweep those rows
+	// for cutover floor evidence, and an earlier revision gave its file an
+	// exemption that waived the key-name check while still applying the
+	// allocation regex. That is weaker than it sounds: the allocation regex is
+	// line-anchored, so inside an exempted file
+	//
+	//	key := common.RobotEventSeqKey + robotID
+	//	seq, err := ctx.GenSeq(key)
+	//
+	// matches neither line and passes — the exact shape the header above
+	// documents as walking straight past a line-anchored pattern (review P2-5),
+	// and exactly the "bump the legacy boundary before flipping" edit an
+	// exemption is most likely to admit. Verified by injecting that form: the
+	// guard stayed green.
+	//
+	// So the command asks pkg/botevent for the prefix (LegacySeqSweepPrefix)
+	// instead of naming the key, and this ban stays unconditional — which is
+	// the only state in which it is worth anything.
+
 	var violations []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -60,8 +81,7 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 			switch d.Name() {
 			case ".git", "vendor", "node_modules", ".octospec", "tools":
 				// tools/ is exempt: tools/genseq-repro exists precisely to call the
-				// legacy allocator and demonstrate that it collides, and
-				// tools/botevent-seq reads the legacy rows to compute the cutover floor.
+				// legacy allocator and demonstrate that it collides.
 				return filepath.SkipDir
 			}
 			return nil
@@ -133,6 +153,28 @@ func TestGenSeqGuardWouldCatchAReintroduction(t *testing.T) {
 	for _, s := range shouldMatch {
 		if !legacyKey.MatchString(s) {
 			t.Fatalf("guard would not catch a reintroduction: %s", s)
+		}
+	}
+
+	// Why the ban has to be on the KEY NAME and cannot have per-file exemptions.
+	//
+	// An exemption necessarily lets a file name the key, so the only thing left
+	// to check it with is the allocation call shape — and that is line-anchored,
+	// so a two-line construction slips through. Pinning the hole here means a
+	// future "just exempt this one reader" proposal has to confront it rather
+	// than rediscover it: the previous revision shipped exactly that exemption,
+	// and injecting the form below into the exempted file left the guard green.
+	legacyAlloc := regexp.MustCompile(`GenSeq\([^)]*(RobotEventSeqKey|"robotEventSeq:)`)
+	for _, line := range []string{
+		`	key := common.RobotEventSeqKey + robotID`,
+		`	return c.GenSeq(key)`,
+	} {
+		if legacyAlloc.MatchString(line) {
+			t.Fatalf("the allocation pattern was expected to MISS %q — if it now matches, an "+
+				"exemption based on it may be safe again, but re-derive that before adding one", line)
+		}
+		if !legacyKey.MatchString(line) && strings.Contains(line, "RobotEventSeqKey") {
+			t.Fatalf("the key-name pattern must catch %q; it is the only thing that does", line)
 		}
 	}
 

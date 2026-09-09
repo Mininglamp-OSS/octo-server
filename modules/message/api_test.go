@@ -9,14 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	"github.com/stretchr/testify/assert"
 )
 

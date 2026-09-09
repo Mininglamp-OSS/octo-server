@@ -11,10 +11,13 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -33,6 +36,9 @@ const (
 	managerLoginRateLimitTag      = "manager_login"
 	managerLoginRateLimitRPS      = 10.0 / 60
 	managerLoginRateLimitBurst    = 5
+	managerMFARateLimitTag        = "manager_mfa"
+	managerMFARateLimitRPS        = 30.0 / 60
+	managerMFARateLimitBurst      = 12
 	managerLoginRateLimitPoolSize = 10
 )
 
@@ -50,6 +56,7 @@ type Manager struct {
 	roleService   *RoleService
 	sessionStore  userSessionStore
 	loginLog      *LoginLog
+	mfa           *managerMFAService
 }
 
 // NewManager NewManager
@@ -67,6 +74,7 @@ func NewManager(ctx *config.Context) *Manager {
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
 		sessionStore:  auth.SessionStoreForContext(ctx),
 		loginLog:      NewLoginLog(ctx),
+		mfa:           newManagerMFAService(ctx),
 	}
 	m.createManagerAccount()
 	return m
@@ -88,9 +96,19 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		managerLoginRateLimitRPS,
 		managerLoginRateLimitBurst,
 	)
+	managerMFALimit := r.StrictIPRateLimitMiddleware(
+		context.Background(),
+		managerLoginRedis,
+		managerMFARateLimitTag,
+		managerMFARateLimitRPS,
+		managerMFARateLimitBurst,
+	)
 	user := r.Group("/v1/manager")
 	{
 		user.POST("/login", managerLoginLimit, m.login) // 账号登录
+		user.POST("/login/send", managerMFALimit, m.sendManagerMFACode)
+		user.POST("/login/resend", managerMFALimit, m.resendManagerMFACode)
+		user.POST("/login/verify", managerMFALimit, m.verifyManagerMFACode)
 	}
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{
@@ -98,6 +116,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.POST("/user/admin", m.addAdminUser)              // 添加一个管理员
 		auth.GET("/user/admin", m.getAdminUsers)              // 查询管理员用户
 		auth.DELETE("/user/admin", m.deleteAdminUsers)        // 删除管理员用户
+		auth.PUT("/user/admin/email", m.updateAdminEmail)     // 超管维护管理端账号邮箱
 		auth.POST("/user/add", m.addUser)                     // 添加一个用户
 		auth.POST("/user/resetpassword", m.resetUserPassword) // 重置用户密码
 		auth.GET("/user/list", m.list)                        // 用户列表
@@ -118,15 +137,21 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.POST("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfill)
 		auth.GET("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfillStatus)
 	}
-	dashboardReader := r.Group(
+	// 固定管理角色的授予/撤销面（pre-RBAC，见 setFixedManagerRole 上方说明）。
+	// SharedUIDRateLimiter 必须挂在 AuthMiddleware 之后才读得到 uid。
+	fixedRole := r.Group(
 		"/v1/manager/user",
 		m.ctx.AuthMiddleware(r),
 		appwkhttp.SharedUIDRateLimiter(r, m.ctx),
 	)
 	{
-		dashboardReader.GET("/dashboard-read", m.listDashboardReaders)
-		dashboardReader.PUT("/:uid/dashboard-read", m.grantDashboardRead)
-		dashboardReader.DELETE("/:uid/dashboard-read", m.revokeDashboardRead)
+		fixedRole.GET("/dashboard-read", m.listDashboardReaders)
+		fixedRole.PUT("/:uid/dashboard-read", m.grantDashboardRead)
+		fixedRole.DELETE("/:uid/dashboard-read", m.revokeDashboardRead)
+
+		fixedRole.GET("/market-admin", m.listMarketAdmins)
+		fixedRole.PUT("/:uid/market-admin", m.grantMarketAdmin)
+		fixedRole.DELETE("/:uid/market-admin", m.revokeMarketAdmin)
 	}
 }
 
@@ -143,8 +168,9 @@ type managerMeResp struct {
 	Capabilities map[string]bool `json:"capabilities"`
 }
 
-// me 返回当前登录管理台账号的身份与能力图谱。dashboardReader 只在这里和 Dashboard
-// 读面被承认；普通管理接口仍走 octo-lib CheckLoginRole，只接受 admin∪superAdmin。
+// me 返回当前登录管理台账号的身份与能力图谱。两个固定角色都只在这里被承认——
+// dashboardReader 另加 Dashboard 读面，marketAdmin 另加 octo-marketplace 的目录面；
+// 普通管理接口仍走 octo-lib CheckLoginRole，只接受 admin∪superAdmin。
 func (m *Manager) me(c *wkhttp.Context) {
 	if !auth.IsManagerConsoleRole(c.GetLoginRole()) {
 		respondManagerForbidden(c)
@@ -176,10 +202,12 @@ func (m *Manager) me(c *wkhttp.Context) {
 //   - space.read        = 空间/成员/邀请/入群申请 列表查询（requireAdmin）
 //   - space.write       = 建空间/改资料/加成员/邀请增改禁用/通过拒绝入群申请（requireAdmin，故恒 true）
 //   - space.destructive = 强制解散/封禁/强制移除/改成员角色（requireSuperAdmin）
-//   - skill.read        = 系统 Skill 列表/详情查看（requireSuperAdmin）
-//   - skill.write       = 系统 Skill 创建/编辑/删除/分类管理（requireSuperAdmin）
-//   - mcp.read          = 系统 MCP 列表/详情查看（requireSuperAdmin）
-//   - mcp.write         = 系统 MCP 创建/编辑/删除（requireSuperAdmin）
+//   - skill.read        = 系统 Skill 列表/详情查看（superAdmin ∪ marketAdmin）
+//   - skill.write       = 系统 Skill 创建/编辑/删除/分类管理（superAdmin ∪ marketAdmin）
+//   - mcp.read          = 系统 MCP 列表/详情查看（superAdmin ∪ marketAdmin）
+//   - mcp.write         = 系统 MCP 创建/编辑/删除（superAdmin ∪ marketAdmin）
+//   - expert.read       = 专家市场 专家/专家团 列表/详情查看（superAdmin ∪ marketAdmin）
+//   - expert.write      = 专家市场 上传新建/编辑/删除 + 分类管理（superAdmin ∪ marketAdmin）
 //
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
@@ -196,10 +224,19 @@ func managerCapabilities(role string) map[string]bool {
 		"users.write":        isSuper, // 重置密码 / 新增用户 / 解封 / 改密
 		"users.manage_admin": isSuper, // 管理员账号 增/查/删
 		"groups.write":       isSuper, // 解散封禁群 / 强制移除成员
-		"skill.read":         isSuper, // 系统 Skill 列表/详情（marketplace admin surface）
-		"skill.write":        isSuper, // 系统 Skill 创建/编辑/删除/分类管理（marketplace admin surface）
-		"mcp.read":           isSuper, // 系统 MCP 列表/详情（marketplace admin surface 只认共享 X-Admin-Token 不分 role，此处收窄到超管以缩小页面暴露面）
-		"mcp.write":          isSuper, // 系统 MCP 创建/编辑/删除（同上）
+		// superAdmin ∪ marketAdmin —— 整个平台市场的运营面：MCP 目录、Skill 目录、
+		// 专家市场。marketAdmin 是与 dashboardReader 同形状的固定角色：octo-lib 不
+		// 认识它，所以它过不了任何 admin/superAdmin 端点，只有这六个键为真。
+		//
+		// 这六个键只驱动前端渲染；真正的放行在 octo-marketplace 的 /api/v1/admin/*，
+		// 见 auth.CanAdminMarketplace。两侧必须同时放开——marketplace 侧仍按资源分组
+		// 挂门，所以只改这里不改那边，页面会渲染出来但每个请求 403。
+		"skill.read":   auth.CanAdminMarketplace(role), // 系统 Skill 列表/详情
+		"skill.write":  auth.CanAdminMarketplace(role), // 系统 Skill 创建/编辑/删除/分类管理
+		"mcp.read":     auth.CanAdminMarketplace(role), // 系统 MCP 列表/详情
+		"mcp.write":    auth.CanAdminMarketplace(role), // 系统 MCP 创建/编辑/删除
+		"expert.read":  auth.CanAdminMarketplace(role), // 专家市场 专家/专家团 列表/详情
+		"expert.write": auth.CanAdminMarketplace(role), // 专家市场 上传新建/编辑/删除 + 分类管理
 		// admin ∪ superAdmin；dashboardReader 仅有 dashboard.read。
 		"appversion.read": isAdmin,                            // 版本列表
 		"dashboard.read":  auth.CanReadManagerDashboard(role), // 运营看板查看
@@ -319,6 +356,80 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	if userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
+	if !matched {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	// 自动将旧 MD5 密码迁移到 bcrypt
+	if needsMigration {
+		if newHash, hashErr := HashPassword(req.Password); hashErr == nil {
+			if updateErr := m.userDB.updatePassword(newHash, userInfo.UID); updateErr == nil {
+				userInfo.Password = newHash
+			}
+		}
+	}
+	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪两个固定角色
+	// dashboardReader/marketAdmin，见 575185b0），被拒同样计入登录失败日志。
+	if !auth.IsManagerConsoleRole(userInfo.Role) {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
+		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
+		return
+	}
+
+	settings := common2.EnsureSystemSettings(m.ctx)
+	switch settings.ManagerEmailMFAState() {
+	case common2.ManagerEmailMFAUnavailable:
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
+		return
+	case common2.ManagerEmailMFAOn:
+		if !settings.ManagerEmailMFAReady() {
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+			return
+		}
+		email := strings.ToLower(strings.TrimSpace(userInfo.Email))
+		if err := commonbase.ValidateEmailAddress(email); err != nil {
+			respondUserError(c, errcode.ErrUserManagerMFAEmailRequired)
+			return
+		}
+		challengeID := util.GenerUUID()
+		now := time.Now()
+		challenge := managerMFAChallenge{
+			ID:                  challengeID,
+			UID:                 userInfo.UID,
+			Username:            userInfo.Username,
+			Role:                userInfo.Role,
+			Email:               email,
+			PasswordFingerprint: passwordFingerprint(userInfo.Password),
+			CreatedAt:           now.UnixMilli(),
+			ExpiresAt:           now.Add(managerMFAChallengeTTL).UnixMilli(),
+		}
+		if err := m.mfa.createChallenge(c.Request.Context(), challenge); err != nil {
+			m.Error("创建管理端 MFA challenge 失败", zap.Error(err), zap.String("uid", userInfo.UID))
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+			return
+		}
+		c.Response(&managerLoginResp{
+			UID:         userInfo.UID,
+			Name:        userInfo.Name,
+			Role:        userInfo.Role,
+			Email:       maskManagerEmail(email),
+			ChallengeID: challengeID,
+			ExpiresIn:   int64(managerMFAChallengeTTL.Seconds()),
+			MFARequired: true,
+		})
+		return
+	}
+
+	// MFA is disabled: retain the existing direct-token path. The session
+	// issue fence is intentionally created only at the final token boundary;
+	// the MFA branch above creates no fence while a challenge is in progress.
 	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, userInfo.UID)
 	if err != nil {
 		m.Error("初始化管理端登录会话栅栏失败", zap.Error(err))
@@ -338,23 +449,10 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
-	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
-	if !matched {
+	matched, _ = CheckPassword(req.Password, userInfo.Password)
+	if !matched || !auth.IsManagerConsoleRole(userInfo.Role) {
 		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
-		return
-	}
-	// 自动将旧 MD5 密码迁移到 bcrypt
-	if needsMigration {
-		if newHash, hashErr := HashPassword(req.Password); hashErr == nil {
-			_ = m.userDB.updatePassword(newHash, userInfo.UID)
-		}
-	}
-	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪dashboardReader，
-	// 见 575185b0），被拒同样计入登录失败日志。
-	if !auth.IsManagerConsoleRole(userInfo.Role) {
-		m.loginLog.recordFailure(req.Username, publicIP, "manager")
-		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
 	token := util.GenerUUID()
@@ -377,8 +475,283 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Token: token,
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
+		Email: maskManagerEmail(userInfo.Email),
 	})
 	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
+}
+
+type managerMFAChallengeReq struct {
+	ChallengeID string `json:"challenge_id"`
+}
+
+type managerMFAVerifyReq struct {
+	ChallengeID string `json:"challenge_id"`
+	Code        string `json:"code"`
+}
+
+// loadAndVerifyManagerMFAChallenge checks both Redis ownership and the live
+// account snapshot. It is called before every send/resend/verify operation so
+// password, role, status, or email changes invalidate the challenge.
+func (m *Manager) loadAndVerifyManagerMFAChallenge(c *wkhttp.Context, challengeID string) (*managerMFAChallenge, *managerLoginModel, bool) {
+	challenge, err := m.mfa.loadChallenge(c.Request.Context(), challengeID)
+	if err != nil {
+		if errors.Is(err, errManagerMFAChallengeInvalid) {
+			managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		} else {
+			m.Error("读取管理端 MFA challenge 失败", zap.Error(err))
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		}
+		return nil, nil, false
+	}
+	userInfo, err := m.db.queryUserInfoWithNameAndPwd(challenge.Username)
+	if err != nil {
+		m.Error("复核管理端 MFA challenge 用户失败", zap.Error(err))
+		managerMFAServiceUnavailable(c, errcode.ErrUserQueryFailed)
+		return nil, nil, false
+	}
+	if !managerMFAChallengeMatchesUser(challenge, userInfo) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return nil, nil, false
+	}
+	return challenge, userInfo, true
+}
+
+func managerMFAChallengeMatchesUser(challenge *managerMFAChallenge, userInfo *managerLoginModel) bool {
+	if challenge == nil || userInfo == nil || userInfo.UID == "" {
+		return false
+	}
+	return userInfo.UID == challenge.UID &&
+		userInfo.Username == challenge.Username &&
+		userInfo.Role == challenge.Role &&
+		userInfo.Status != int(common.UserDisable) &&
+		userInfo.IsDestroy != IsDestroyDone &&
+		auth.IsManagerConsoleRole(userInfo.Role) &&
+		strings.EqualFold(strings.TrimSpace(userInfo.Email), challenge.Email) &&
+		passwordFingerprint(userInfo.Password) == challenge.PasswordFingerprint
+}
+
+func (m *Manager) sendManagerMFACode(c *wkhttp.Context) {
+	m.sendManagerMFACodeInternal(c)
+}
+
+func (m *Manager) resendManagerMFACode(c *wkhttp.Context) {
+	m.sendManagerMFACodeInternal(c)
+}
+
+func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
+	var req managerMFAChallengeReq
+	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.ChallengeID) == "" {
+		respondUserRequestInvalid(c, "challenge_id")
+		return
+	}
+	settings := common2.EnsureSystemSettings(m.ctx)
+	switch settings.ManagerEmailMFAState() {
+	case common2.ManagerEmailMFAUnavailable:
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
+		return
+	case common2.ManagerEmailMFAOff:
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return
+	case common2.ManagerEmailMFAOn:
+		if !settings.ManagerEmailMFAReady() {
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+			return
+		}
+	}
+	challenge, _, ok := m.loadAndVerifyManagerMFAChallenge(c, req.ChallengeID)
+	if !ok {
+		return
+	}
+	attemptID := util.GenerUUID()
+	retryAfter, err := m.mfa.claimSend(c.Request.Context(), challenge, attemptID)
+	if err != nil {
+		var limited *managerMFASendRateError
+		if errors.As(err, &limited) {
+			details := octoi18n.Details{}
+			if retryAfter > 0 {
+				details["retry_after"] = retryAfter
+			}
+			managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, details)
+			return
+		}
+		if errors.Is(err, errManagerMFAChallengeInvalid) {
+			managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+			return
+		}
+		m.Error("claim manager MFA send failed", zap.Error(err), zap.String("challenge_id", challenge.ID))
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+
+	lang := octoi18n.OutboundLanguage(c.Request.Context())
+	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	emailService := commonbase.NewEmailService(m.ctx, settings)
+	emailErr := emailService.SendVerifyCodeTrackedWithAttempt(
+		sendCtx, challenge.Email, commonbase.CodeTypeManagerLogin, lang, attemptID,
+		managerMFASendStateKey(challenge.ID),
+	)
+	cancel()
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	committed, commitErr := m.mfa.completeSend(commitCtx, challenge.ID, attemptID, emailErr == nil)
+	commitCancel()
+	if commitErr != nil || !committed {
+		if clearErr := emailService.ClearManagerCodeIfAttempt(context.Background(), challenge.Email, attemptID); clearErr != nil {
+			m.Warn("清理失去所有权的管理端 MFA 验证码失败", zap.Error(clearErr), zap.String("challenge_id", challenge.ID))
+		}
+		if commitErr != nil {
+			m.Error("提交管理端 MFA 发送状态失败", zap.Error(commitErr), zap.String("challenge_id", challenge.ID))
+		}
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+	if emailErr != nil {
+		if errors.Is(emailErr, commonbase.ErrEmailSendRateLimited) {
+			retryAfter, retryErr := emailService.EmailSendRateLimitRetryAfter(
+				challenge.Email, commonbase.CodeTypeManagerLogin,
+			)
+			if retryErr != nil || retryAfter < 1 {
+				m.Warn("读取管理端 MFA 邮箱冷却时间失败，使用默认重试时间", zap.Error(retryErr), zap.String("challenge_id", challenge.ID))
+				retryAfter = int(time.Minute / time.Second)
+			}
+			managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, octoi18n.Details{
+				"retry_after": retryAfter,
+			})
+			return
+		}
+		m.Warn("管理端 MFA 邮件发送失败", zap.Error(emailErr), zap.String("challenge_id", challenge.ID))
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+	c.Response(&managerMFAChallengeResponse{
+		ChallengeID: challenge.ID,
+		Email:       maskManagerEmail(challenge.Email),
+		ExpiresIn:   managerMFAExpiresIn(challenge, time.Now()),
+		CodeSent:    true,
+		ResendAfter: int64(managerMFASendCooldown.Seconds()),
+	})
+}
+
+func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
+	var req managerMFAVerifyReq
+	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.ChallengeID) == "" || strings.TrimSpace(req.Code) == "" {
+		respondUserRequestInvalid(c, "challenge_id")
+		return
+	}
+	settings := common2.EnsureSystemSettings(m.ctx)
+	if settings.ManagerEmailMFAState() == common2.ManagerEmailMFAUnavailable {
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
+		return
+	}
+	if settings.ManagerEmailMFAState() != common2.ManagerEmailMFAOn || !settings.ManagerEmailMFAReady() {
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+	challenge, userInfo, ok := m.loadAndVerifyManagerMFAChallenge(c, req.ChallengeID)
+	if !ok {
+		return
+	}
+	codeService := commonbase.NewEmailService(m.ctx, settings)
+	err := codeService.VerifyManagerCodeAtomically(
+		c.Request.Context(), challenge.Email, strings.TrimSpace(req.Code), challenge.ID,
+		managerMFAActiveKey(challenge.UID), managerMFASendStateKey(challenge.ID),
+		managerMFAChallengeKey(challenge.ID),
+	)
+	var lockedErr *commonbase.ManagerCodeLockedError
+	if errors.As(err, &lockedErr) {
+		retryAfter := lockedErr.RetryAfter
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerifyLocked, octoi18n.Details{
+			"retry_after": retryAfter,
+		})
+		return
+	}
+	if errors.Is(err, commonbase.ErrManagerCodeInvalid) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFACodeInvalid, nil)
+		return
+	}
+	if err != nil {
+		m.Error("管理端 MFA 验证码消费失败", zap.Error(err), zap.String("challenge_id", challenge.ID))
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+
+	// Re-read after atomic OTP consumption. If the account changes between the
+	// pre-check and the consume, the code is spent but no token is issued.
+	userInfo, err = m.db.queryUserInfoWithNameAndPwd(challenge.Username)
+	if err != nil {
+		m.Error("管理端 MFA 消费后复核用户失败", zap.Error(err))
+		managerMFAServiceUnavailable(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if !managerMFAChallengeMatchesUser(challenge, userInfo) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return
+	}
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, userInfo.UID)
+	if err != nil {
+		m.Error("初始化管理端 MFA 最终会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	userInfo, err = m.db.queryUserInfoWithNameAndPwd(challenge.Username)
+	if err != nil || !managerMFAChallengeMatchesUser(challenge, userInfo) {
+		if err != nil {
+			m.Error("管理端 MFA 最终会话栅栏后复核失败", zap.Error(err))
+		}
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return
+	}
+	token := util.GenerUUID()
+	if err := issueUserSession(c.Request.Context(), m.sessionStore, token, auth.TokenInfo{
+		UID: userInfo.UID, Name: userInfo.Name, Role: userInfo.Role,
+		Language: userInfo.Language, DeviceFlag: int(config.Web),
+	}, issueFence); err != nil {
+		m.Error("管理端 MFA 最终签发 token 失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	publicIP := wkhttp.ClientIP(c.Request)
+	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
+	c.Response(&managerLoginResp{
+		UID:   userInfo.UID,
+		Token: token,
+		Name:  userInfo.Name,
+		Role:  userInfo.Role,
+		Email: maskManagerEmail(userInfo.Email),
+	})
+}
+
+func managerMFAExpiresIn(challenge *managerMFAChallenge, now time.Time) int64 {
+	if challenge == nil {
+		return 0
+	}
+	remaining := time.UnixMilli(challenge.ExpiresAt).Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	seconds := int64(remaining / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+// maskManagerEmail keeps the local-part boundary visible while preserving the
+// complete domain. The full address remains in the Challenge and is used for
+// SMTP delivery; only API responses receive the masked representation.
+func maskManagerEmail(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	at := strings.LastIndexByte(email, '@')
+	if at <= 0 || at == len(email)-1 {
+		return email
+	}
+	local := []rune(email[:at])
+	if len(local) == 1 {
+		return string(local[0]) + "xxxx" + email[at:]
+	}
+	return string(local[0]) + "xxxx" + string(local[len(local)-1]) + email[at:]
 }
 
 // 重置用户密码
@@ -437,47 +810,108 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+// ── 固定管理角色（pre-RBAC） ─────────────────────────────────────────────────
+//
+// dashboardReader 与 marketAdmin 都是「既非 admin 也非 superAdmin」的固定角色：
+// octo-lib 的 CheckLoginRole* 不认识它们，所以持有者过不了任何 admin/superAdmin
+// 端点，能力完全由 managerCapabilities 那张图（以及下游服务对该角色的承认）决定。
+//
+// 两者的授予/撤销流程逐字相同——CAS 改 user.role、失效角色热缓存、幂等、目标资格
+// 校验——因此共用下面这套按角色参数化的代码，而不是复制一份。
+//
+// 两个运维陷阱，源于 user.role 是单值列（运维手册里应写明）：
+//
+//   - 授予是**单向降级**：给一个 admin 授予固定角色会覆盖掉 admin，而撤销只会回到
+//     ""，不会还原成 admin。要恢复得重新走加管理员流程。
+//   - 持有固定角色的账号**删不掉**：deleteAdminUsers 只接受 admin / superAdmin，
+//     对固定角色返回 not_admin_account，必须先撤销角色再删。
+//
+// 过渡性质：通用 admin RBAC 落地后（见 .octospec/tasks/admin-rbac-extraction/），
+// 这两个角色将变成角色表里的两行数据，本节连同 pkg/auth/manager_roles.go 一并删除。
+
 // grantDashboardRead assigns the temporary dashboardReader role to an existing
 // non-SuperAdmin account. The role is exclusive: assigning it to an admin is a
 // deliberate downgrade to Dashboard-only access.
 func (m *Manager) grantDashboardRead(c *wkhttp.Context) {
-	m.setDashboardReaderRole(c, true)
+	m.setFixedManagerRole(c, auth.ManagerRoleDashboardReader, errcode.ErrUserDashboardReaderTargetIneligible, true)
 }
 
 // revokeDashboardRead removes only the temporary dashboardReader role. It does
 // not remove dashboard access inherited from admin or SuperAdmin.
 func (m *Manager) revokeDashboardRead(c *wkhttp.Context) {
-	m.setDashboardReaderRole(c, false)
+	m.setFixedManagerRole(c, auth.ManagerRoleDashboardReader, errcode.ErrUserDashboardReaderTargetIneligible, false)
 }
 
-func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
+// grantMarketAdmin assigns the marketAdmin role, which grants the whole platform
+// market admin surface — MCP catalog, Skill catalog and Expert Market — and no
+// console power outside it. Assigning it to an admin is a deliberate downgrade,
+// same semantics as dashboardReader. See ManagerRoleMarketAdmin for what a
+// holder can publish, and why revoking the role alone does not cut that off.
+func (m *Manager) grantMarketAdmin(c *wkhttp.Context) {
+	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, true)
+}
+
+// revokeMarketAdmin removes only the marketAdmin role. It does not remove the
+// market access a SuperAdmin holds inherently, and — see ManagerRoleMarketAdmin
+// — it does not end the holder's existing sessions, which is what actually cuts
+// off marketplace access.
+func (m *Manager) revokeMarketAdmin(c *wkhttp.Context) {
+	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, false)
+}
+
+// isFixedManagerRole reports whether role is one this section is allowed to
+// write. The set is closed on purpose: setFixedManagerRole is the write side of
+// a privilege boundary, and fixedManagerRoleTransition will persist whatever
+// role string it is handed. Without this guard a future caller passing
+// wkhttp.SuperAdmin would have the CAS commit a promotion, and passing "" would
+// silently demote an admin to a plain user — neither reachable today (both
+// callers pass a constant), both cheap to make unreachable by construction.
+func isFixedManagerRole(role string) bool {
+	return role == auth.ManagerRoleDashboardReader ||
+		role == auth.ManagerRoleMarketAdmin
+}
+
+// setFixedManagerRole grants or revokes one fixed manager role on a target
+// account. ineligibleCode is the role-specific 4xx returned when the target is
+// not a grantable account (bot / banned / destroyed).
+func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligibleCode codes.Code, grant bool) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		respondManagerForbidden(c)
 		return
 	}
+	if !isFixedManagerRole(role) {
+		// Programmer error, not a client one: no request shape can reach this.
+		// Fail closed and log loudly rather than writing an arbitrary role.
+		m.Error("refusing to write a role that is not a fixed manager role",
+			zap.String("role", role),
+			zap.String("actor_uid", c.GetLoginUID()))
+		respondManagerForbidden(c)
+		return
+	}
 
-	target, ok := m.dashboardReaderTarget(c)
+	target, ok := m.fixedManagerRoleTarget(c, role)
 	if !ok {
 		return
 	}
-	nextRole, changed, allowed := dashboardReaderRoleTransition(target.Role, grant)
+	nextRole, changed, allowed := fixedManagerRoleTransition(target.Role, role, grant)
 	if !allowed {
 		respondManagerForbidden(c)
 		return
 	}
-	if grant && !dashboardReaderGrantEligible(target) {
-		respondUserError(c, errcode.ErrUserDashboardReaderTargetIneligible)
+	if grant && !fixedManagerRoleGrantEligible(target) {
+		respondUserError(c, ineligibleCode)
 		return
 	}
 	if !changed {
-		m.finishDashboardReaderRoleRequest(c, target.UID, grant, false)
+		m.finishFixedManagerRoleRequest(c, role, target.UID, grant, false)
 		return
 	}
 
 	updated, err := m.db.updateUserRole(target.UID, target.Role, nextRole)
 	if err != nil {
-		m.Error("update dashboard reader role failed",
+		m.Error("update fixed manager role failed",
 			zap.Error(err),
+			zap.String("role", role),
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", target.UID),
 			zap.Bool("grant", grant))
@@ -487,7 +921,8 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 	if !updated {
 		// The role changed after QueryByUID. Fail closed instead of overwriting a
 		// concurrent promotion (especially to SuperAdmin).
-		m.Info("dashboard reader role update lost compare-and-set",
+		m.Info("fixed manager role update lost compare-and-set",
+			zap.String("role", role),
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", target.UID),
 			zap.String("expected_role", target.Role),
@@ -495,10 +930,10 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 		respondUserError(c, errcode.ErrUserManagerRoleChanged)
 		return
 	}
-	m.finishDashboardReaderRoleRequest(c, target.UID, grant, true)
+	m.finishFixedManagerRoleRequest(c, role, target.UID, grant, true)
 }
 
-func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
+func (m *Manager) fixedManagerRoleTarget(c *wkhttp.Context, role string) (*Model, bool) {
 	targetUID := strings.TrimSpace(c.Param("uid"))
 	if targetUID == "" {
 		respondUserRequestInvalid(c, "uid")
@@ -506,7 +941,8 @@ func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
 	}
 	target, err := m.userDB.QueryByUID(targetUID)
 	if err != nil {
-		m.Error("query dashboard reader target failed", zap.Error(err), zap.String("target_uid", targetUID))
+		m.Error("query fixed manager role target failed",
+			zap.Error(err), zap.String("role", role), zap.String("target_uid", targetUID))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return nil, false
 	}
@@ -517,15 +953,16 @@ func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
 	return target, true
 }
 
-func dashboardReaderGrantEligible(target *Model) bool {
+func fixedManagerRoleGrantEligible(target *Model) bool {
 	return target != nil && target.Robot == 0 &&
 		target.Status == StatusEnable.Int() && target.IsDestroy == IsDestroyNo
 }
 
-func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID string, grant, changed bool) {
+func (m *Manager) finishFixedManagerRoleRequest(c *wkhttp.Context, role, targetUID string, grant, changed bool) {
 	if err := m.roleService.Invalidate(targetUID); err != nil {
-		m.Error("invalidate dashboard reader role cache failed",
+		m.Error("invalidate fixed manager role cache failed",
 			zap.Error(err),
+			zap.String("role", role),
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", targetUID),
 			zap.Bool("grant", grant),
@@ -533,11 +970,12 @@ func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID 
 		respondUserError(c, errcode.ErrUserRoleCacheFailed)
 		return
 	}
-	message := "dashboard reader role already in requested state"
+	message := "fixed manager role already in requested state"
 	if changed {
-		message = "dashboard reader role changed"
+		message = "fixed manager role changed"
 	}
 	m.Info(message,
+		zap.String("role", role),
 		zap.String("actor_uid", c.GetLoginUID()),
 		zap.String("target_uid", targetUID),
 		zap.Bool("granted", grant))
@@ -545,13 +983,21 @@ func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID 
 }
 
 func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
+	m.listUsersWithFixedManagerRole(c, auth.ManagerRoleDashboardReader)
+}
+
+func (m *Manager) listMarketAdmins(c *wkhttp.Context) {
+	m.listUsersWithFixedManagerRole(c, auth.ManagerRoleMarketAdmin)
+}
+
+func (m *Manager) listUsersWithFixedManagerRole(c *wkhttp.Context, role string) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		respondManagerForbidden(c)
 		return
 	}
-	users, err := m.db.queryUsersWithRole(auth.ManagerRoleDashboardReader)
+	users, err := m.db.queryUsersWithRole(role)
 	if err != nil {
-		m.Error("query dashboard reader list failed", zap.Error(err))
+		m.Error("query fixed manager role list failed", zap.Error(err), zap.String("role", role))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
@@ -559,23 +1005,27 @@ func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
 	for _, user := range users {
 		list = append(list, &dashboardReaderResp{
 			UID: user.UID, Name: user.Name, Username: user.Username,
-			RegisterTime: user.CreatedAt.String(),
+			Email: user.Email, RegisterTime: user.CreatedAt.String(),
 		})
 	}
 	c.Response(list)
 }
 
-// dashboardReaderRoleTransition is the complete temporary-role policy. The
-// boolean results are (changed, allowed). Admin may be deliberately downgraded
-// to dashboardReader; inherited admin/SuperAdmin dashboard access cannot be
-// revoked through this fixed-role endpoint.
-func dashboardReaderRoleTransition(currentRole string, grant bool) (nextRole string, changed, allowed bool) {
+// fixedManagerRoleTransition is the complete fixed-role policy, shared by every
+// role in this section. The boolean results are (changed, allowed).
+//
+// Admin may be deliberately downgraded to a fixed role. Everything else is
+// rejected rather than silently rewritten: user.role is single-valued, so the
+// fixed roles are mutually exclusive, and swapping one for another must be an
+// explicit revoke-then-grant instead of an implicit side effect of a grant.
+// Access a SuperAdmin (or an admin) holds inherently cannot be revoked here.
+func fixedManagerRoleTransition(currentRole, role string, grant bool) (nextRole string, changed, allowed bool) {
 	if grant {
 		switch currentRole {
 		case "", string(wkhttp.Admin):
-			return auth.ManagerRoleDashboardReader, true, true
-		case auth.ManagerRoleDashboardReader:
-			return auth.ManagerRoleDashboardReader, false, true
+			return role, true, true
+		case role:
+			return role, false, true
 		default:
 			return "", false, false
 		}
@@ -584,7 +1034,7 @@ func dashboardReaderRoleTransition(currentRole string, grant bool) (nextRole str
 	switch currentRole {
 	case "":
 		return "", false, true
-	case auth.ManagerRoleDashboardReader:
+	case role:
 		return "", true, true
 	default:
 		return "", false, false
@@ -727,11 +1177,79 @@ func (m *Manager) getAdminUsers(c *wkhttp.Context) {
 				UID:          user.UID,
 				Name:         user.Name,
 				Username:     user.Username,
+				Email:        user.Email,
 				RegisterTime: user.CreatedAt.String(),
 			})
 		}
 	}
 	c.Response(list)
+}
+
+// updateAdminEmail is the trusted repair path for management-console MFA.
+// Only a SuperAdmin may move another management account's second factor, and
+// the audit log records an email fingerprint rather than the address itself.
+func (m *Manager) updateAdminEmail(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	var req struct {
+		UID   string `json:"uid"`
+		Email string `json:"email"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	req.UID = strings.TrimSpace(req.UID)
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if req.UID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+	if err := commonbase.ValidateEmailAddress(req.Email); err != nil {
+		respondUserError(c, errcode.ErrUserEmailInvalid)
+		return
+	}
+	target, err := m.userDB.QueryByUID(req.UID)
+	if err != nil {
+		m.Error("查询待维护管理账号失败", zap.Error(err), zap.String("target_uid", req.UID))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if target == nil || !auth.IsManagerConsoleRole(target.Role) {
+		respondUserError(c, errcode.ErrUserNotAdminAccount)
+		return
+	}
+	oldEmail := target.Email
+	_, err = m.db.updateManagerEmail(target.UID, target.Role, req.Email)
+	m.Info("manager_email_update",
+		zap.String("actor_uid", c.GetLoginUID()),
+		zap.String("target_uid", target.UID),
+		zap.String("target_role", target.Role),
+		zap.String("email_fingerprint", passwordFingerprint(req.Email)),
+		zap.String("old_email_fingerprint", passwordFingerprint(strings.ToLower(strings.TrimSpace(oldEmail)))),
+		zap.String("source_ip", wkhttp.ClientIP(c.Request)),
+		zap.Bool("success", err == nil),
+	)
+	if err != nil {
+		m.Error("更新管理账号邮箱失败", zap.Error(err), zap.String("target_uid", target.UID))
+		if errors.Is(err, ErrManagerEmailAlreadyInUse) {
+			respondUserError(c, errcode.ErrUserAlreadyExists)
+			return
+		}
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := m.mfa.invalidateUID(context.Background(), target.UID, oldEmail, req.Email); err != nil {
+		// The database update is already durable. A cleanup failure is surfaced
+		// as an internal error and logged; future challenge requests still
+		// reject the old snapshot and the TTL bounds the residual Redis state.
+		m.Error("清理管理账号旧 MFA challenge 失败", zap.Error(err), zap.String("target_uid", target.UID))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	c.ResponseOK()
 }
 
 // 添加一个管理员
@@ -745,6 +1263,7 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		LoginName string `json:"login_name"`
 		Name      string `json:"name"`
 		Password  string `json:"password"`
+		Email     string `json:"email"`
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
@@ -765,6 +1284,11 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	}
 	if req.Password == "" {
 		respondUserRequestInvalid(c, "password")
+		return
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if err := commonbase.ValidateEmailAddress(req.Email); err != nil {
+		respondUserError(c, errcode.ErrUserEmailInvalid)
 		return
 	}
 	if err := ValidatePasswordStrength(req.Password); err != nil {
@@ -788,6 +1312,7 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.QRVercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode)
 	userModel.Phone = ""
 	userModel.Username = req.LoginName
+	userModel.Email = req.Email
 	userModel.Zone = ""
 	userModel.Role = string(wkhttp.Admin)
 	hashedPassword, err := HashPassword(req.Password)
@@ -807,9 +1332,31 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.ShockOn = 0
 	userModel.Sex = 1
 	userModel.Status = int(common.UserAvailable)
-	err = m.userDB.Insert(userModel)
+	tx, err := m.db.session.Begin()
 	if err != nil {
+		m.Error("开启管理员邮箱检查事务错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	owner, err := queryEmailOwner(tx, req.Email, "")
+	if err != nil {
+		m.Error("查询管理员邮箱是否已被使用错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if owner != nil {
+		respondUserError(c, errcode.ErrUserAlreadyExists)
+		return
+	}
+	if err = m.userDB.insertTx(userModel, tx); err != nil {
 		m.Error("添加管理员错误", zap.String("username", req.Name), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		m.Error("提交管理员事务错误", zap.String("username", req.Name), zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
@@ -1637,10 +2184,22 @@ type managerLoginReq struct {
 }
 
 type managerLoginResp struct {
-	UID   string `json:"uid"`
-	Token string `json:"token"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
+	UID         string `json:"uid"`
+	Token       string `json:"token,omitempty"`
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	Email       string `json:"email,omitempty"`
+	ChallengeID string `json:"challenge_id,omitempty"`
+	ExpiresIn   int64  `json:"expires_in,omitempty"`
+	MFARequired bool   `json:"mfa_required,omitempty"`
+}
+
+type managerMFAChallengeResponse struct {
+	ChallengeID string `json:"challenge_id"`
+	Email       string `json:"email"`
+	ExpiresIn   int64  `json:"expires_in"`
+	CodeSent    bool   `json:"code_sent"`
+	ResendAfter int64  `json:"resend_after"`
 }
 type managerAddUserReq struct {
 	Name     string `json:"name"`
@@ -1658,12 +2217,14 @@ type adminUserResp struct {
 	Name         string `json:"name"`
 	UID          string `json:"uid"`
 	Username     string `json:"username"`
+	Email        string `json:"email"`
 	RegisterTime string `json:"register_time"`
 }
 type dashboardReaderResp struct {
 	Name         string `json:"name"`
 	UID          string `json:"uid"`
 	Username     string `json:"username"`
+	Email        string `json:"email"`
 	RegisterTime string `json:"register_time"`
 }
 type managerUserResp struct {

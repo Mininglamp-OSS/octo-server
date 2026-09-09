@@ -7,6 +7,11 @@
 默认 `OCTO_AUTH_SESSION_AUTO_ADVANCE=0`。首次部署先验证接管、registry、扫描和 migration，
 再显式开启自动推进。
 
+> 本仓库共有三套单向 cutover 机制。这一套是五阶证据阶梯（`app session-rollout`），
+> 不在共享的两态 flip 框架上；另两套（`app cutover msgextra` / `app cutover botevent`）
+> 与公共约定（状态表模板、guard env 命名、"先翻转、验证后才武装 guard"顺序不变量）见
+> [cutover-framework.md](cutover-framework.md)。
+
 ## 1. 权威状态与启动顺序
 
 MySQL migration 创建：

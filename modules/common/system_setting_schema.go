@@ -119,12 +119,25 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.LocalLoginOff()) }},
 	{Category: "login", Key: "scan_enabled", Type: settingTypeBool, Description: "是否开启扫码登录（默认关闭，客户端适配后显式开启）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ScanLoginEnabled()) }},
+	{Category: "login", Key: "manager_email_mfa_on", Type: settingTypeBool, Description: "是否开启管理控制台邮箱二次验证（仅保护管理控制台登录端点，默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ManagerEmailMFAOn()) }},
 
 	// Space user-facing creation toggle — admin 关闭后客户端隐藏创建入口,
 	// 后端 POST /v1/space/create 直接 403。env DM_SPACE_DISABLE_USER_CREATE
 	// 仍作 fallback,DB 行为单一真源。
 	{Category: "space", Key: "disable_user_create", Type: settingTypeBool, Description: "是否关闭普通用户创建空间入口",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.SpaceDisableUserCreate()) }},
+
+	// OIDC 建号自动加入的初始 Space（task oidc-auto-join-initial-space）。
+	//
+	// 值是 space_id 而不是空间名称：space 表只有 space_id 上有唯一索引，名称可以
+	// 重名、也能随时改名，用名称配会指到别的空间。空字符串 = 关闭，所以这里刻意
+	// 不另外配一个 bool 开关——少一个键就少一种「开了但没配 id」的半残状态。
+	//
+	// 写入时校验目标 Space 存在且未解散/未封禁（见 updateSystemSettings）；配置
+	// 之后 Space 才被解散的情况在消费侧兜底（登录照常成功，只记日志和计数）。
+	{Category: "space", Key: "oidc_initial_space_id", Type: settingTypeString, Description: "OIDC 建号后自动加入的初始 Space 的 space_id（必须存在且未解散）；留空=关闭该功能",
+		Effective: func(s *SystemSettings) string { return s.OIDCInitialSpaceID() }},
 
 	// Sidebar recent-tab activity filter — per-channel-type window in days for
 	// POST /v1/sidebar/sync 的 recent tab。0 = 关闭该类型的时间过滤（全量返回）。
@@ -273,6 +286,26 @@ var systemSettingSchema = []settingDef{
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
 
+	// Project（项目协作）总开关。与上面几个「展示开关」不同，它**同时**是服务端的
+	// 写入闸门：modules/project 的 requireWriteEnabled 读的就是这个值，
+	// GET /v1/common/appconfig 的 project_on 下发的也是这个值。单一真源是关键——
+	// 客户端开关和服务端开关分成两个的话，最坏的形态是「入口显示出来了、点进去每个
+	// 写操作都 403」。
+	//
+	// 缺行时回落到 P0 就有的 OCTO_PROJECT_CREATE_ENABLED，所以现有部署不改行为；
+	// 写了行就以行为准，管理台改完 60s 内多实例收敛，不需要滚动重启。
+	//
+	// 关掉它只停止「产生新的项目和项目群」，已有项目群的成员约束（不变量 I2）照常
+	// 强制——设计文档明确要求回滚不能放松已有项目群的约束。
+	{Category: "project", Key: "enabled", Type: settingTypeBool, Description: "是否开启项目(Project)协作模块；同时控制客户端入口展示与服务端写入闸门（默认关闭，缺行时回落 OCTO_PROJECT_CREATE_ENABLED）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ProjectEnabled()) }},
+
+	// Agent Mail 模块展示开关。默认关闭；部署完成 octo-mail 与网关配置后由管理台切
+	// mail.enabled 放量。仅控制客户端入口展示，不替代 Agent Mail 既有鉴权。
+	// 经 GET /v1/common/appconfig 的 mail_on 下发给客户端。
+	{Category: "mail", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示 Agent Mail 模块入口（默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.MailEnabled()) }},
+
 	// docs 全文搜索展示开关，与 docs.enabled 解耦：搜索端点由 octo-docs-backend #131
 	// 独立提供，可晚于 docs 模块本体上线。默认关闭；上线且索引灰度完成后由管理台
 	// 切 docs.search_enabled 放量。仅表达展示策略，不承担任何服务端鉴权（搜索鉴权在
@@ -286,6 +319,15 @@ var systemSettingSchema = []settingDef{
 	{Category: "drive", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示网盘(drive)模块入口（octo-drive 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveEnabled()) }},
 
+	// drive 全局搜索"网盘"tab 展示开关，与 drive.enabled 解耦：drive-search 后端
+	// 由独立的 octo-drive-search 服务提供，可晚于 drive 模块本体上线。默认关闭；
+	// 上线且索引灰度完成后由管理台切 drive.search_enabled 放量。仅表达展示策略，
+	// 不承担任何服务端鉴权（搜索鉴权在 octo-drive-search 自身：VisibleSpaces +
+	// VisibleDocs + baseFilters）。经 GET /v1/common/appconfig 的 drive_search_on
+	// 下发给客户端。
+	{Category: "drive", Key: "search_enabled", Type: settingTypeBool, Description: "是否向客户端展示全局搜索的\"网盘\"tab（与 drive.enabled 解耦；搜索端点上线+索引就绪前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveSearchEnabled()) }},
+
 	// Loop(回路)模块展示开关。loop 依赖后端服务 + fleet 代理 + daemon runtime 一整套,未就绪前
 	// 默认关闭;feature 分支合入 main 也不暴露,上线后由管理台切 dmloop.enabled 灰度放量。仅表达
 	// 展示策略,不承担服务端鉴权(/fleet 鉴权在后端)。经 GET /v1/common/appconfig 的 dmloop_on 下发给客户端。
@@ -297,12 +339,19 @@ var systemSettingSchema = []settingDef{
 	{Category: "dmpersonal", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示「我的/运行时」模块入口（默认关闭；与 dmloop 分开以便独立放量）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DmpersonalEnabled()) }},
 
+	// 前端埋点(octo-dap)采集总开关。默认关闭，埋点层随发布上线但静默(fail-closed)：
+	// octo-web 只有在 appconfig 下发 tracking_enabled 为真时才开始采集。采集器 collector
+	// 与 TRACK_API_URL egress 在集群内验证通过前，运维保持此开关为关。仅表达采集策略，
+	// 不承担服务端鉴权(collector 自身鉴权)。经 GET /v1/common/appconfig 的 tracking_enabled 下发给客户端。
+	{Category: "tracking", Key: "enabled", Type: settingTypeBool, Description: "是否开启前端埋点(octo-dap)采集（collector 与 egress 在集群内验证通过前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.TrackingEnabled()) }},
+
 	// 自定义贴纸上传限制（sticker-upload-compression 任务）。原先硬编码在
 	// modules/file/const.go；挪进 system_setting 后可灰度/回滚，且每键都有
 	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会
 	// 越出资源上限。全部 Positive:true 走"必须正整数"admin 写侧校验，同时放开
 	// settingTypeInt 默认的 [0,3650] 上界（本组键上限单独校验，见读侧 clamp）。
-	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024", Positive: true,
+	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024。上传校验里全局大小门在贴纸门之前，因此实际生效值为 min(本值, file.max_size_kb 的生效值)——全局上限更低时 effective_value 会直接显示收敛后的值", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxSizeKB()) }},
 	{Category: "sticker", Key: "upload_max_dimension", Type: settingTypeInt, Description: "自定义贴纸解码后单边像素上限，服务端硬上限 1024；默认 512", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxDimension()) }},
@@ -330,6 +379,24 @@ var systemSettingSchema = []settingDef{
 	// gif/webp 及压缩关闭时仍受 upload_max_dimension 约束。硬上限 1024。
 	{Category: "sticker", Key: "compress_max_dimension", Type: settingTypeInt, Description: "贴纸压缩缩放目标边长(px，仅静态 jpg/png)；压缩开启后大于此值等比缩小再存；硬上限 1024，默认 512。建议 ≤ upload_max_dimension，否则压后仍超 upload_max_dimension 的图会被 fail-closed 拒绝", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxDimension()) }},
+
+	// 文件上传策略（task file-extension-policy-dynamic-config）。原先扩展名白/黑
+	// 名单只在进程 init() 读 env 改写包级 map、大小上限是散落三处的硬编码常量，
+	// 改一次要重启全部 pod；挪进 system_setting 后运维可即时紧急封堵扩展名。
+	//
+	// 两个扩展名键都是 env ∪ DB 的并集（见 system_settings_file_upload.go）：
+	// 「允许」栏只管加、「禁止」栏只管减，写入不会误伤对方已有的配置。放开方向
+	// 不设候选集 —— 需求本身就是「不重启放开一个格式」。安全边界是**内置黑名单
+	// 不可撤销**：读侧永远压制，写侧直接拒绝。语法非法的 token 在读侧静默丢弃。
+	{Category: "file", Key: "extra_blocked_extensions", Type: settingTypeString, Description: "额外禁止上传的扩展名(逗号分隔，如 svg,dwg)；与 env DM_FILE_EXTRA_BLOCKED 取并集，只增不减；内置黑名单不可撤销。跨实例最长 60s 收敛",
+		Effective: func(s *SystemSettings) string { return strings.Join(s.FileExtraBlockedExtensions(), ",") }},
+	{Category: "file", Key: "extra_allowed_extensions", Type: settingTypeString, Description: "额外允许上传的扩展名(逗号分隔，如 dwg,psd)；与 env DM_FILE_EXTRA_ALLOWED 取并集，只增不减，只填新增的即可；要收回某一项请写进 extra_blocked_extensions。服务端内置禁止清单(可执行文件/脚本类)不可撤销，写入其中的项会被拒绝。跨实例最长 60s 收敛",
+		Effective: func(s *SystemSettings) string { return strings.Join(s.FileExtraAllowedExtensions(), ",") }},
+	// max_size_kb 必须 Positive:true —— 值为 102400，会被 settingTypeInt 默认的
+	// [settingIntMin, settingIntMax]=[0,3650] 上界拒掉；上界由读侧
+	// FileMaxSizeKBHardCap clamp 承担，同 sticker.upload_max_size_kb 那组。
+	{Category: "file", Key: "max_size_kb", Type: settingTypeInt, Description: "单文件上传大小上限(KB)；默认 102400(100MB)。天花板由部署侧 env OCTO_FILE_MAX_SIZE_KB_HARD_CAP 决定(未配置时 524288/512MB)，本值超过天花板会被钳到天花板。注意：阿里云 OSS V1 签名不覆盖 Content-Length，该部署下预签名直传路径上此上限只是 advisory，挡不住超量 PUT", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.FileMaxSizeKB()) }},
 
 	// Space 新成员欢迎语（onboarding.space_welcome_*）— task
 	// space-new-user-welcome-message。这四个键必须构成一致的「启用组合」：

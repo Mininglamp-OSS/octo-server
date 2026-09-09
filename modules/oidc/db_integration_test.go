@@ -34,7 +34,7 @@ func TestDB_InsertAndQueryIdentity_Integration(t *testing.T) {
 		LinkedAt:      now,
 	}))
 
-	got, err := d.QueryIdentityByIssuerSubject("https://aegis", "sub-1")
+	got, err := d.queryIdentityByIssuerSubject("https://aegis", "sub-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "u-1", got.UID)
@@ -42,12 +42,12 @@ func TestDB_InsertAndQueryIdentity_Integration(t *testing.T) {
 	assert.Equal(t, 1, got.EmailVerified)
 }
 
-func TestDB_QueryIdentityByIssuerSubject_NotFound_Integration(t *testing.T) {
+func TestDB_QueryIdentityExact_NotFound_Integration(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	d := NewDB(ctx)
 
-	got, err := d.QueryIdentityByIssuerSubject("https://aegis", "nope")
+	got, err := d.queryIdentityByIssuerSubject("https://aegis", "nope")
 	require.NoError(t, err)
 	assert.Nil(t, got, "missing binding should return nil, not error")
 }
@@ -101,7 +101,7 @@ func TestDB_InsertRefresh_AndRotate_Integration(t *testing.T) {
 	require.NoError(t, d.InsertIdentity(&IdentityModel{
 		UID: "u-r", Issuer: "https://aegis", Subject: "sub-r", LinkedAt: time.Now(),
 	}))
-	idRow, err := d.QueryIdentityByIssuerSubject("https://aegis", "sub-r")
+	idRow, err := d.queryIdentityByIssuerSubject("https://aegis", "sub-r")
 	require.NoError(t, err)
 	require.NotNil(t, idRow)
 
@@ -160,7 +160,7 @@ func TestDB_QueryIdentitiesByUID_AndUpdateIdentityLogin_Integration(t *testing.T
 	require.NoError(t, d.UpdateIdentityLogin(target.Id,
 		"new@example.com", 1, "+8613900000000", 1))
 
-	updated, err := d.QueryIdentityByIssuerSubject(target.Issuer, target.Subject)
+	updated, err := d.queryIdentityByIssuerSubject(target.Issuer, target.Subject)
 	require.NoError(t, err)
 	assert.Equal(t, "new@example.com", updated.Email)
 	assert.Equal(t, 1, updated.EmailVerified)
@@ -210,7 +210,7 @@ func TestDB_MarkRefreshRevoked_Idempotent_Integration(t *testing.T) {
 	require.NoError(t, d.InsertIdentity(&IdentityModel{
 		UID: "u-rev", Issuer: "https://aegis", Subject: "sub-rev", LinkedAt: time.Now(),
 	}))
-	idRow, err := d.QueryIdentityByIssuerSubject("https://aegis", "sub-rev")
+	idRow, err := d.queryIdentityByIssuerSubject("https://aegis", "sub-rev")
 	require.NoError(t, err)
 	require.NoError(t, d.InsertRefresh(&RefreshModel{
 		IdentityID: idRow.Id, TokenHash: "h-rev",
@@ -242,7 +242,7 @@ func TestDB_DueRefreshes_JoinsUID_Integration(t *testing.T) {
 	require.NoError(t, d.InsertIdentity(&IdentityModel{
 		UID: "u-due", Issuer: "https://aegis", Subject: "sub-due", LinkedAt: time.Now(),
 	}))
-	idRow, err := d.QueryIdentityByIssuerSubject("https://aegis", "sub-due")
+	idRow, err := d.queryIdentityByIssuerSubject("https://aegis", "sub-due")
 	require.NoError(t, err)
 	require.NoError(t, d.InsertRefresh(&RefreshModel{
 		IdentityID: idRow.Id, TokenHash: "h-due",
@@ -296,7 +296,7 @@ func TestDB_RevokeRefreshByUID_Integration(t *testing.T) {
 	require.NoError(t, d.InsertIdentity(&IdentityModel{
 		UID: "u-bystander", Issuer: "https://aegis", Subject: "sub-bys", LinkedAt: time.Now(),
 	}))
-	bys, err := d.QueryIdentityByIssuerSubject("https://aegis", "sub-bys")
+	bys, err := d.queryIdentityByIssuerSubject("https://aegis", "sub-bys")
 	require.NoError(t, err)
 	require.NoError(t, d.InsertRefresh(&RefreshModel{
 		IdentityID: bys.Id, TokenHash: "h-bys",

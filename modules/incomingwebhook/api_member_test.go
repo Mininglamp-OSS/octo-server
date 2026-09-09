@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -110,6 +111,22 @@ func TestMemberCreate_AutoNameWhenOmitted(t *testing.T) {
 		map[string]interface{}{"name": "Webhook-"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "literal-prefix create body: %s", w.Body.String())
 	assert.Equal(t, "Webhook-", parseJSON(t, w)["name"])
+}
+
+func TestUserManagementMountsRejectAIContainer(t *testing.T) {
+	handler, ctx, groupNo := setupMemberEnv(t)
+	_, err := ctx.DB().Update("group").Set("purpose", aiteam.GroupPurpose).
+		Where("group_no=?", groupNo).Exec()
+	require.NoError(t, err)
+
+	for _, path := range []string{
+		fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		fmt.Sprintf("/v1/groups/%s/threads/100000000000098/incoming-webhooks", groupNo),
+	} {
+		w := do(handler, userReq(http.MethodPost, path, map[string]interface{}{}, memberAToken))
+		require.Equal(t, http.StatusForbidden, w.Code, "%s: %s", path, w.Body.String())
+		assert.Contains(t, w.Body.String(), "This AI session container cannot be changed through group APIs.")
+	}
 }
 
 // 成员自定义名称的字节上限（与管理员同口径，create/update 都要钉住）：

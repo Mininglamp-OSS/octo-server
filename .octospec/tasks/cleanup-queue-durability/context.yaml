@@ -1,0 +1,66 @@
+schema_version: 1
+task: cleanup-queue-durability
+brief: .octospec/tasks/cleanup-queue-durability/brief.md
+resolved_at: 2026-08-22T15:10:00+00:00
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      Both items decide how long a removed member keeps access. A job that can
+      never reach a terminal state leaves them in the Space's groups and IM
+      subscriptions indefinitely; a surviving positive membership-cache entry
+      keeps them past SpaceMiddleware for up to 60s. The rule's fail-open warning
+      shaped two decisions: the sweep respects the lease so it cannot steal a
+      terminal state from a job still executing, and the cache path now writes a
+      negative entry when DEL fails rather than leaving the stale positive to
+      live out its TTL.
+  - id: testing
+    source: repo
+    load_bearing: true
+    why: >
+      Both failure modes are silent — no crash, no failed request, a 200 already
+      returned. Every new test was mutation-verified rather than merely observed
+      green (see the journal's table). The DEL-failure branch is the only
+      dangerous one and cannot be produced with a real Redis, so the invalidation
+      path grew an injectable seam following the repo's existing
+      enforceKeySpaceWithChecker pattern.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Injected by path glob but substantively a no-op: nothing here responds to a
+      client. InvalidateMembershipCache's new error return is consumed by a log
+      statement, not an HTTP envelope; no pkg/errcode entry is added and no raw
+      c.ResponseError / c.JSON is introduced. i18n-extract-check and i18n-lint
+      both pass unchanged.
+  - id: rate-limit
+    source: repo
+    load_bearing: true
+    why: >
+      Injected by path glob only. No route, middleware, or request-frequency
+      counter is touched. The new sweep is a scheduled background job, not a
+      request path.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: Conventional Commits, English subject line.
+
+gates_run:
+  - "ci/run-e2e-shard.sh 1 1 — full CI E2E lane, 44 packages"
+  - "go test ./modules/space/ -race -shuffle=on — pass, no data races"
+  - "go test ./pkg/space/ — pass"
+  - "golangci-lint run ./pkg/space/... ./modules/space/... ./modules/robot/... — 0 issues"
+  - "make i18n-extract-check — pass"
+  - "make i18n-lint — pass"
+
+notes: >
+  Environment prerequisites are unchanged from cleanup-membership-predicate; see
+  that task's context.yaml. Short form: export OCTO_MASTER_KEY, create the `test`
+  database COLLATE utf8mb4_general_ci, and drive the suite through
+  ci/run-e2e-shard.sh so it resets the database between packages.
+
+  One pre-existing gofmt drift in pkg/space/middleware.go (comment alignment on
+  negativeCacheTTL, unformatted on main) was fixed in passing — it is the very
+  constant the new fallback depends on and the file was already being edited.

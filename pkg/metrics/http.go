@@ -175,6 +175,11 @@ type bodyCapture struct {
 	limit int
 }
 
+// Unwrap keeps optional net/http capabilities reachable through this shim.
+func (b *bodyCapture) Unwrap() http.ResponseWriter {
+	return b.ResponseWriter
+}
+
 func (b *bodyCapture) Write(p []byte) (int, error) {
 	if remain := b.limit - b.buf.Len(); remain > 0 {
 		take := len(p)

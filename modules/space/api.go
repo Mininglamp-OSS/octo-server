@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -91,6 +92,8 @@ func (s *Space) checkSpaceActive(c *wkhttp.Context, spaceId string) bool {
 func (s *Space) Route(r *wkhttp.WKHttp) {
 	// 启动时加载已知 spaceId 到 ParseChannelID 缓存
 	s.loadKnownSpaceIDs()
+	// 成员移除后的会话面清理 worker（当前：退出该 Space 下的全部群），按工单重试
+	s.startMemberRemovalCleanupWorker()
 
 	auth := r.Group("/v1/space", s.ctx.AuthMiddleware(r))
 	{
@@ -159,6 +162,17 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		search.PUT("/:space_id/welcome", s.putWelcome)
 		search.DELETE("/:space_id/welcome", s.deleteWelcome)
 	}
+
+	// directory is a Space-scoped, cross-member read. space_id deliberately stays
+	// in the query string: SpaceMiddleware only reads query/header values, not
+	// path parameters. listDirectory also rejects an empty query value because
+	// the middleware intentionally passes through requests with no Space selector.
+	directory := r.Group("/v1/space",
+		s.ctx.AuthMiddleware(r),
+		appwkhttp.SharedUIDRateLimiter(r, s.ctx),
+		spacepkg.SpaceMiddleware(s.ctx),
+	)
+	directory.GET("/directory", s.listDirectory)
 
 	// 邀请码预览端点（公开无认证）严格 per-IP 限流：防枚举 + 暴破（issue #1000）。
 	// 两个端点共享同一 limiter，使同一 IP 跨端点总配额受控。
@@ -532,6 +546,34 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 			respondSpaceRequestInvalid(c, "preset_group_ids")
 			return
 		}
+		// A project group may not be a preset group.
+		//
+		// Preset means "everyone who joins this Space is added automatically",
+		// and a project group requires each member to hold a project seat. Put
+		// together, every new Space member would violate invariant I2 on the way
+		// in — so the two settings are not merely a bad combination, they are
+		// contradictory.
+		//
+		// Checked at CONFIGURATION time here, and again at execution time in
+		// joinPresetGroups. Both, deliberately: this one gives the admin an error
+		// at the moment they choose the group, which is the only moment they can
+		// act on it; the runtime one covers a group configured before this check
+		// existed, and the (currently impossible) case of a group acquiring an
+		// attribution afterwards. A check only at execution time fails silently
+		// into a log line nobody reads.
+		//
+		// validatePresetGroupIds itself stays a pure string validator with no
+		// database access — the semantic half belongs at a call site that has a
+		// session, not bolted onto a parser.
+		if bad, err := s.firstProjectGroupAmongPresets(spaceId, *req.PresetGroupIds); err != nil {
+			s.Error("校验预设群组失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+			return
+		} else if bad != "" {
+			s.Warn("预设群组不能是项目群", zap.String("group_no", bad), zap.String("space_id", spaceId))
+			respondSpaceRequestInvalid(c, "preset_group_ids")
+			return
+		}
 	}
 
 	// allowBanned=false：用户端绝不能更新封禁空间。事务侧二次校验关闭了
@@ -653,11 +695,15 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 		return
 	}
 
-	err = s.db.disbandSpace(spaceId)
+	removed, err := s.db.disbandSpace(spaceId, loginUID)
 	if err != nil {
+		s.Error("解散空间失败", zap.Error(err), zap.String("spaceId", spaceId))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 刷新 ParseChannelID 缓存，与管理端强制解散一致
+	go s.loadKnownSpaceIDs()
+	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonSpaceDisbanded)
 	c.ResponseOK()
 }
 
@@ -909,24 +955,41 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		respondSpaceRequestInvalid(c, "")
 		return
 	}
+	// 与管理端同一个上限。此前用户侧完全没有上限：一次请求里每个 uid 都要跑一个
+	// 独立事务 + 一次 Redis DEL + 一条工单插入，几万个 uid 就能把一个连接和
+	// worker 队列压满。
+	if len(req.UIDs) > managerMaxBatchUIDs {
+		respondSpaceBatchTooLarge(c, managerMaxBatchUIDs)
+		return
+	}
 
+	// 只收集**真的被移除**的成员：removeMemberLocked 对「行本来就不存在」也返回
+	// nil error，拿它去清缓存 / 发事件会对着非成员空跑一整套收尾。
+	removed := make([]string, 0, len(req.UIDs))
 	for _, uid := range req.UIDs {
 		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
 		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
 		// 防止 pre-check 后目标被并发转让升为 owner 仍被移除（PR #339 review）。
-		if err = s.db.removeMemberLocked(spaceId, uid, member.Role); err != nil {
+		ok, err := s.db.removeMemberLocked(spaceId, uid, member.Role, loginUID, MemberRemoveReasonKicked)
+		if err != nil {
 			if errors.Is(err, ErrCannotRemoveOwner) || errors.Is(err, ErrRemoveHierarchy) {
 				continue
 			}
 			s.Error("移除空间成员失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("uid", uid))
+			// 前面几个已经各自提交了（removeMemberLocked 一人一事务），中途失败
+			// 直接 return 会把他们的收尾整个丢掉——鉴权缓存留着 "1" 最长 60s，
+			// 人已被移除却还能通过 SpaceMiddleware。而且客户端重试整批时，
+			// 这些人的 removeMemberLocked 返回 ok=false，缓存也补不回来。
+			s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
+		if ok {
+			removed = append(removed, uid)
+		}
 	}
-	// 失效通知成员缓存
-	if event.SpaceMemberCacheInvalidator != nil {
-		event.SpaceMemberCacheInvalidator(spaceId)
-	}
+	// 整批一次收尾：鉴权缓存逐个同步失效，事件与清理 worker 合并到一个后台 goroutine。
+	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)
 	c.ResponseOK()
 }
 
@@ -954,7 +1017,7 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 	}
 
 	// 锁内重读角色：pre-check 与移除之间可能被并发转让升为 owner（PR #339 review）
-	err = s.db.removeMemberLocked(spaceId, loginUID, 2)
+	removed, err := s.db.removeMemberLocked(spaceId, loginUID, 2, loginUID, MemberRemoveReasonLeft)
 	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
@@ -964,9 +1027,8 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	// 失效通知成员缓存
-	if event.SpaceMemberCacheInvalidator != nil {
-		event.SpaceMemberCacheInvalidator(spaceId)
+	if removed {
+		s.afterMemberRemoved(spaceId, loginUID, loginUID, MemberRemoveReasonLeft)
 	}
 	c.ResponseOK()
 }
@@ -1376,32 +1438,58 @@ func (s *Space) joinPresetGroups(uid string, spaceID string, presetGroupIdsJSON 
 		return
 	}
 
+	// 入群动作必须走 modules/group 的唯一准入口。本模块不能 import modules/group
+	// （group 已经 import space，反过来即成环），所以由 group 侧反向注册进来，
+	// 见 preset_group_admitter.go —— 那里也记着原来那条裸 INSERT 的四个缺陷。
+	admit := presetGroupAdmitter()
+	if admit == nil {
+		s.Error("预设群组准入口未注册，跳过自动入群",
+			zap.String("uid", uid), zap.String("space_id", spaceID))
+		return
+	}
+
 	session := s.ctx.DB()
 	for _, groupNo := range groupNos {
 		if groupNo == "" {
 			continue
 		}
-		// 检查群是否存在、未解散，且属于当前 Space
-		var groupStatus int
-		count, err := session.SelectBySql("SELECT status FROM `group` WHERE group_no=? AND space_id=?", groupNo, spaceID).Load(&groupStatus)
-		if err != nil || count == 0 || groupStatus != 1 {
+		// 检查群是否存在、未解散、属于当前 Space，且不是项目群。
+		//
+		// project_id 只是这条既有查询上多取一列，不是新依赖（modules/space 本来
+		// 就直接读 group 表）。项目群不能当预设群：预设群是「每个加入本 Space 的人
+		// 都自动进」，而项目群要求成员必须是该项目成员——把两者叠在一起，等于每来
+		// 一个新 Space 成员就批量破坏一次 I2。这里是执行期的兜底检查，配置期的检查
+		// 在 updateSpace 的入口。
+		var presetGroup struct {
+			Status    int    `db:"status"`
+			ProjectID string `db:"project_id"`
+		}
+		count, err := session.SelectBySql(
+			"SELECT status, project_id FROM `group` WHERE group_no=? AND space_id=?",
+			groupNo, spaceID).Load(&presetGroup)
+		if err != nil || count == 0 || presetGroup.Status != 1 {
 			s.Warn("预设群组不存在、已解散或不属于当前 Space，跳过", zap.String("group_no", groupNo), zap.String("space_id", spaceID))
 			continue
 		}
-		// 检查用户是否已在群中
-		var memberCount int
-		_, err = session.SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, uid).Load(&memberCount)
+		protected, err := aiteampkg.IsProtectedGroup(session, groupNo)
 		if err != nil {
-			s.Warn("检查群成员失败，跳过", zap.String("group_no", groupNo), zap.Error(err))
+			s.Warn("检查预设群组用途失败，跳过", zap.String("group_no", groupNo), zap.Error(err))
 			continue
 		}
-		if memberCount > 0 {
-			s.Warn("用户已在群中，跳过", zap.String("group_no", groupNo), zap.String("uid", uid))
+		if protected {
+			s.Warn("AI 会话容器不能作为预设群组，跳过", zap.String("group_no", groupNo))
 			continue
 		}
-		// 添加成员
-		_, err = session.InsertBySql("INSERT INTO group_member (group_no, uid) VALUES (?, ?)", groupNo, uid).Exec()
-		if err != nil {
+		if presetGroup.ProjectID != "" {
+			s.Warn("预设群组属于某个项目，跳过自动入群（项目群要求显式的项目成员资格）",
+				zap.String("group_no", groupNo), zap.String("project_id", presetGroup.ProjectID),
+				zap.String("uid", uid))
+			continue
+		}
+		// 不再自己判断「是否已在群中」。原来那个检查过滤 is_deleted=0，于是曾经退过群
+		// 的人能通过检查、撞上唯一索引、拿到 1062、被记成一条 Warn，然后**永远**加不
+		// 回来。准入口内部用 upsert 决定插入还是恢复，已在群里则整条语句是空操作。
+		if err := admit(s.ctx, spaceID, groupNo, uid); err != nil {
 			s.Warn("自动加入预设群组失败", zap.String("group_no", groupNo), zap.String("uid", uid), zap.Error(err))
 			continue
 		}
@@ -2262,8 +2350,23 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// fireSpaceMemberJoinEvent 触发 SpaceMemberJoin 事件
+// fireSpaceMemberJoinEvent 触发 SpaceMemberJoin 事件。
+//
+// 与 joinPresetGroups 一样自带 recover:本函数总是被 `go` 出去(afterJoinSpace),
+// 所以调用方的 defer 拦不住这里的 panic —— 一次 panic 直接带走整个进程。而
+// EventCommit 会同步跑各监听方(botfather 欢迎语、notify 空间欢迎语),panic 面
+// 不止本函数自己。
+//
+// 加这层兜底的直接原因:SSO 建号自动加入初始 Space 之后,这条路径可以由一次普通
+// 登录触发,而登录量远大于原来的"用户主动加邀请码入空间"。风险本身是既有的,
+// 变的是触发频率。
 func (s *Space) fireSpaceMemberJoinEvent(uid string, spaceId string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Error("fireSpaceMemberJoinEvent panic", zap.Any("recover", r),
+				zap.String("uid", uid), zap.String("spaceId", spaceId))
+		}
+	}()
 	if s.ctx.Event == nil {
 		return
 	}
@@ -2272,6 +2375,11 @@ func (s *Space) fireSpaceMemberJoinEvent(uid string, spaceId string) {
 		s.Error("开启SpaceMemberJoin事件事务失败", zap.Error(err))
 		return
 	}
+	// 上面的 recover 让 panic 不再带走进程,但被接住的 panic 会跳过下面的
+	// Commit/Rollback,把事务连同它持有的锁一起挂在连接上直到池回收 —— 兜住崩溃
+	// 却泄漏事务,是把一种故障换成了另一种。RollbackUnlessCommitted 对已提交的
+	// 事务是 no-op,所以正常路径不受影响。
+	defer tx.RollbackUnlessCommitted()
 	eventID, err := s.ctx.EventBegin(&wkevent.Data{
 		Event: event.SpaceMemberJoin,
 		Type:  wkevent.Message,
@@ -2302,4 +2410,45 @@ func (s *Space) loadKnownSpaceIDs() {
 	}
 	spacepkg.RegisterSpaceIDs(ids)
 	s.Info("已注册 spaceId 到 ParseChannelID 缓存", zap.Int("count", len(ids)), zap.Strings("ids", ids))
+}
+
+// firstProjectGroupAmongPresets returns the first group_no in the preset list
+// that belongs to a project of THIS Space, or "" when none does.
+//
+// One query for the whole list rather than one per id: the list is admin-supplied
+// and bounded only by a byte cap, so a per-id loop would let a large payload turn
+// one settings save into an unbounded number of round-trips.
+//
+// space_id is in the WHERE because without it this validation answers a question
+// about groups the caller cannot see: a Space admin who guesses a group_no in
+// another Space learns from the error whether it is a project group. Scoping it
+// costs nothing here — a preset group in another Space is unusable anyway, and
+// joinPresetGroups re-checks the attribution at execution time (see the call
+// site), so the pair of checks is unchanged for every group this Space can
+// actually preset.
+func (s *Space) firstProjectGroupAmongPresets(spaceID, raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	var groupNos []string
+	if err := json.Unmarshal([]byte(raw), &groupNos); err != nil {
+		// Shape was already validated by validatePresetGroupIds; a failure here
+		// means the two disagree, which is worth surfacing rather than ignoring.
+		return "", err
+	}
+	if len(groupNos) == 0 {
+		return "", nil
+	}
+	var bad []string
+	_, err := s.ctx.DB().SelectBySql(
+		"SELECT group_no FROM `group` WHERE space_id = ? AND group_no IN ? AND project_id <> '' LIMIT 1",
+		spaceID, groupNos,
+	).Load(&bad)
+	if err != nil {
+		return "", err
+	}
+	if len(bad) == 0 {
+		return "", nil
+	}
+	return bad[0], nil
 }

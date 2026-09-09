@@ -1,0 +1,405 @@
+package project
+
+import "time"
+
+// ---------- enums ----------
+
+// Project status (octo_project.status).
+const (
+	// StatusDisbanded — the project has been disbanded. Terminal: its name is
+	// released (the active_name generated column goes NULL) and every read path
+	// treats it as nonexistent.
+	StatusDisbanded = 0
+	// StatusNormal — active.
+	StatusNormal = 1
+)
+
+// Member status (octo_project_member.status). Rows are never deleted, so
+// re-adding a member is a status flip rather than an INSERT that a unique index
+// could reject.
+const (
+	// MemberStatusRemoved — the seat is gone but the row stays for audit.
+	MemberStatusRemoved = 0
+	// MemberStatusActive — an active seat. I1 constrains exactly these rows.
+	MemberStatusActive = 1
+)
+
+// Member roles (octo_project_member.role). Ordered, and the ordering is
+// load-bearing: the transitive-protection rules compare roles numerically.
+const (
+	// RoleCommon — ordinary project member.
+	RoleCommon = 0
+	// RoleAdmin — may edit the project and manage ordinary members.
+	RoleAdmin = 1
+	// RoleOwner — may additionally disband and change roles.
+	RoleOwner = 2
+)
+
+// roleNonMember is the sentinel the middleware writes for a caller who is not a
+// project member. It is deliberately negative: RoleCommon is 0, which is also
+// the zero value of an int, so a "not a member" state spelled as 0 would grant
+// ordinary-member rights on any code path that forgot to check membership.
+const roleNonMember = -1
+
+// IsValidRole reports whether r is an assignable role.
+func IsValidRole(r int) bool { return r == RoleCommon || r == RoleAdmin || r == RoleOwner }
+
+// Discoverability (octo_project.discoverability).
+//
+// Named for what it is. These values filter the Space project list and directory
+// search; they are NOT a security boundary — a Space admin can still enumerate
+// project metadata. Calling the field "visibility" or "secret" would invite
+// readers to treat it as isolation, which it is not.
+const (
+	// DiscoverabilitySpaceListed — appears in the Space project list.
+	DiscoverabilitySpaceListed = 0
+	// DiscoverabilityUnlisted — hidden from the list; reachable by its members
+	// and by Space admins.
+	DiscoverabilityUnlisted = 1
+)
+
+// IsValidDiscoverability reports whether d is a known discoverability value.
+func IsValidDiscoverability(d int) bool {
+	return d == DiscoverabilitySpaceListed || d == DiscoverabilityUnlisted
+}
+
+// Join modes (octo_project.join_mode).
+//
+// P0 has NO self-service join path — the invite surface is P2 — so the column exists with
+// its DDL default and NOTHING above the storage layer reads or writes it. Same treatment as
+// is_official: no model field, no request field, no response field. A client-visible
+// join_mode with no enforcement point would let deployments persist join_mode=0 today and
+// hand every such row open-join semantics the day the P2 path lands, with nobody
+// re-consenting (yujiawei S-2, PR #841).
+const (
+	// JoinModeOpen — any Space member may join without an invite (P2).
+	JoinModeOpen = 0
+	// JoinModeInviteOnly — admission is by invite or admin add. P0 default.
+	JoinModeInviteOnly = 1
+)
+
+// ---------- DB models ----------
+
+// Model is an octo_project row.
+//
+// Deliberately has NO ActiveName field. active_name is a STORED generated column,
+// and MySQL rejects any INSERT/UPDATE that names it with error 3105. The DAO uses
+// explicit column lists rather than util.AttrToUnderscore, so this is belt and
+// braces rather than the only guard — but a struct field would make the failure
+// reachable again the moment someone reaches for the reflective helper.
+//
+// It likewise has no IsOfficial field: no P0 code path writes that column, and
+// leaving it out of the model is what makes that checkable rather than aspirational.
+type Model struct {
+	ID                     int64  `db:"id"`
+	ProjectID              string `db:"project_id"`
+	SpaceID                string `db:"space_id"`
+	Name                   string `db:"name"`
+	Description            string `db:"description"`
+	Logo                   string `db:"logo"`
+	Creator                string `db:"creator"`
+	Discoverability        int    `db:"discoverability"`
+	MaxMembers             int    `db:"max_members"`
+	MemberEpoch            int64  `db:"member_epoch"`
+	CollaborationRoleEpoch int64  `db:"collaboration_role_epoch"`
+	Status                 int    `db:"status"`
+	// AllMemberGroupNo is this project's all-member group, or "" when it has
+	// none yet. "" is the sentinel and the column is NOT NULL, so every
+	// predicate in the feature is written `= ''` / `!= ''` (see D5).
+	//
+	// Empty is a REACHABLE state, not an error: the group is provisioned after
+	// the create transaction commits (the hook opens its own transaction in
+	// modules/group), so a provisioning failure leaves the project alive with no
+	// group. D4 makes that recoverable rather than terminal — the next write path
+	// on this project retries under a lease, and reconcile scan A reports it.
+	AllMemberGroupNo string    `db:"all_member_group_no"`
+	CreatedAt        time.Time `db:"created_at"`
+	UpdatedAt        time.Time `db:"updated_at"`
+}
+
+// MemberModel is an octo_project_member row.
+type MemberModel struct {
+	ProjectID string `db:"project_id"`
+	UID       string `db:"uid"`
+	SpaceID   string `db:"space_id"`
+	Role      int    `db:"role"`
+	Status    int    `db:"status"`
+	// Removing is D4's seat-closing flag: 1 means the seat is being torn down
+	// while Status is still MemberStatusActive.
+	//
+	// Every authorization read treats Removing == 1 as a NON-member — the member
+	// list, the group admission gate, the middleware's role resolution. Status
+	// stays active until the group detach finishes, and that is what keeps I2
+	// from being literally violated by the removal itself: the group_member rows
+	// that have not been cleaned up yet still belong to a member of record.
+	Removing  int       `db:"removing"`
+	InviteUID string    `db:"invite_uid"`
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
+}
+
+// officialFlagModel reads is_official back for the D6 guard test. It exists only
+// so the assertion "no P0 path ever writes is_official" can be made against the
+// real table without putting the column on the write-side model.
+type officialFlagModel struct {
+	ProjectID  string `db:"project_id"`
+	IsOfficial int    `db:"is_official"`
+}
+
+// ---------- API request payloads ----------
+
+type createReq struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Logo        string `json:"logo"`
+	// AgentUIDs are the caller's OWN AI agents to seat in the new project
+	// (D2/D15). Optional; the eligibility of every uid here is re-decided
+	// server-side inside the create transaction, never trusted from the client.
+	//
+	// One ineligible uid rejects the WHOLE request (D3): "the project was
+	// created but two of your agents are missing" is harder to explain than
+	// "fix it and retry", and a partial success would add a third meaning to
+	// D4's already-loaded failure story.
+	AgentUIDs       []string `json:"agent_uids"`
+	Discoverability *int     `json:"discoverability"`
+	MaxMembers      *int     `json:"max_members"`
+}
+
+type updateReq struct {
+	Name            *string `json:"name"`
+	Description     *string `json:"description"`
+	Logo            *string `json:"logo"`
+	Discoverability *int    `json:"discoverability"`
+	MaxMembers      *int    `json:"max_members"`
+}
+
+// settingReq is the caller's personal preferences for one project.
+//
+// Shaped as a settings bag with pointer fields rather than as /pin and /unpin
+// routes, following PUT /v1/groups/:group_no/setting, which carries top / mute /
+// save / remark through one endpoint. Two verb routes look simpler while there is
+// one preference and stop looking simpler at the second: a preference then costs a
+// key here, not two routes and two handlers.
+//
+// A pointer distinguishes "not mentioned" from "set to false", so a client that
+// learns about a future preference does not have to send every field to change
+// one. A body that names no preference (`{}`) is a no-op, not a reset — a
+// zero-byte body is a 400, see updateSettingHandler.
+type settingReq struct {
+	Pinned *bool `json:"pinned"`
+}
+
+type membersReq struct {
+	UIDs []string `json:"uids"`
+}
+
+type leaveReq struct {
+	// TransferTo names the successor when the caller is the last owner. Leaving
+	// without it is rejected rather than silently producing an ownerless project.
+	TransferTo string `json:"transfer_to"`
+}
+
+type roleReq struct {
+	// Role is a POINTER so a payload that names no role is distinguishable from one
+	// naming RoleCommon. As a plain int, `{}` and `{"role": null}` both decoded to 0,
+	// passed IsValidRole, and silently DEMOTED the target with a 200 — a destructive
+	// action as the failure mode of a broken payload, which is the same thing the leave
+	// handler was hardened against in round 1. Matches updateReq, where every optional
+	// field is a pointer for the same reason.
+	Role *int `json:"role"`
+	// TransferTo is required when demoting the last owner, for the same reason as
+	// in leaveReq.
+	TransferTo string `json:"transfer_to"`
+}
+
+type collaborationRoleNameReq struct {
+	Name string `json:"name"`
+}
+
+type collaborationRoleBindingReq struct {
+	RoleIDs []string `json:"role_ids"`
+}
+
+// ---------- API responses ----------
+
+// Resp is the Project payload returned by list and detail.
+//
+// MemberEpoch ships here and nowhere else in P0 (D3): first-party clients get it
+// next to my_role and the capability bits, but no machine-to-machine endpoint
+// exposes it. This repo has already built "an endpoint and waited for a consumer"
+// twice, and the eventual subsystem channel is verify?include=context, not a new
+// route.
+//
+// Capabilities are emitted as explicit booleans rather than left for the client to
+// derive from MyRole. A client that computes permissions from a role number
+// re-implements the server's permission matrix, and the two drift the first time
+// the matrix changes.
+type Resp struct {
+	ProjectID       string `json:"project_id"`
+	SpaceID         string `json:"space_id"`
+	Name            string `json:"name"`
+	Description     string `json:"description"`
+	Logo            string `json:"logo"`
+	Creator         string `json:"creator"`
+	Discoverability int    `json:"discoverability"`
+	MaxMembers      int    `json:"max_members"`
+	// MemberCount counts HUMAN members only (D16). AI agents seated in the
+	// project are counted separately in AgentCount.
+	//
+	// This is a semantic change to an existing field, taken deliberately: a
+	// project with one person and two of their agents used to render "3 人",
+	// which is a sentence no user reads as true. The quota (MaxMembers) still
+	// counts every seat, agents included — an agent reads the project's
+	// messages, so it costs a seat.
+	MemberCount int `json:"member_count"`
+	// AgentCount is the number of active AI agent seats.
+	AgentCount             int   `json:"agent_count"`
+	MemberEpoch            int64 `json:"member_epoch"`
+	CollaborationRoleEpoch int64 `json:"collaboration_role_epoch"`
+	Status                 int   `json:"status"`
+	// AllMemberGroupNo is this project's all-member group, or "" when it has
+	// none yet (provisioning failed and has not been retried; see D4). A client
+	// showing an entry point to the group must handle "" rather than assuming.
+	AllMemberGroupNo string `json:"all_member_group_no"`
+	// Pinned is the CALLER's own pin, not a property of the project: the same
+	// project reads true for one user and false for the next. It is on the list
+	// AND the detail route, because a field present on one and absent on the other
+	// makes the two disagree about the same project — the defect
+	// all_member_group_no already had to be fixed for once.
+	Pinned bool `json:"pinned"`
+	// MyRole is the caller's project role, or -1 when the caller is not a member
+	// (a Space admin reading a project they have not joined).
+	MyRole       int          `json:"my_role"`
+	Capabilities Capabilities `json:"capabilities"`
+	CreatedAt    string       `json:"created_at"`
+	UpdatedAt    string       `json:"updated_at"`
+}
+
+// Capabilities is the server's verdict on what the caller may do with this
+// project, so clients never derive permissions from a role number.
+type Capabilities struct {
+	CanUpdate       bool `json:"can_update"`
+	CanDisband      bool `json:"can_disband"`
+	CanManageMember bool `json:"can_manage_member"`
+	CanChangeRole   bool `json:"can_change_role"`
+	CanLeave        bool `json:"can_leave"`
+	CanViewMembers  bool `json:"can_view_members"`
+	// CanManageOwnAgents is the narrow capability D15 adds: any active project
+	// member may seat and unseat THEIR OWN agents, without holding
+	// CanManageMember. It is deliberately not derivable from the role number —
+	// an ordinary member has it and cannot manage anyone else.
+	CanManageOwnAgents bool `json:"can_manage_own_agents"`
+}
+
+// MemberResp is one row of the project member roster.
+type MemberResp struct {
+	UID       string `json:"uid"`
+	Name      string `json:"name"`
+	Role      int    `json:"role"`
+	InviteUID string `json:"invite_uid"`
+	// Robot is 1 for an AI agent seat, 0 for a person (D16). Without it the
+	// roster cannot be rendered the way the directory renders it — agents
+	// nested under the person who owns them — and a client would have to guess
+	// from the uid shape.
+	Robot int `json:"robot"`
+	// OwnerUID is the agent's owner (robot.creator_uid); empty for a person and
+	// for an agent whose owner row is gone. It is the join key the client uses
+	// to nest an agent under its owner.
+	OwnerUID           string                  `json:"owner_uid"`
+	CollaborationRoles []CollaborationRoleResp `json:"collaboration_roles"`
+	CreatedAt          string                  `json:"created_at"`
+}
+
+const (
+	CollaborationRoleSourceBuiltin = "builtin"
+	CollaborationRoleSourceCustom  = "custom"
+)
+
+type CollaborationRoleModel struct {
+	RoleID         string    `db:"role_id"`
+	ProjectID      string    `db:"project_id"`
+	BuiltinKey     string    `db:"builtin_key"`
+	Name           string    `db:"name"`
+	NormalizedName string    `db:"normalized_name"`
+	Source         string    `db:"source"`
+	CreatorUID     string    `db:"creator_uid"`
+	CreatedAt      time.Time `db:"created_at"`
+	UpdatedAt      time.Time `db:"updated_at"`
+}
+
+type CollaborationRoleResp struct {
+	RoleID     string `json:"role_id"`
+	BuiltinKey string `json:"builtin_key,omitempty"`
+	Name       string `json:"name"`
+	Source     string `json:"source"`
+}
+
+type collaborationRoleCatalogResp struct {
+	CollaborationRoleEpoch int64                   `json:"collaboration_role_epoch"`
+	Roles                  []CollaborationRoleResp `json:"roles"`
+}
+
+// GroupResp is one row of the project group list.
+//
+// Deliberately NARROW, and not a copy of modules/group's GroupResp. That struct
+// is forty-odd fields of per-user group state, and it is served by the routes a
+// client already calls for exactly that (GET /v1/group/my, GET /v1/groups/:group_no).
+// Restating it here would create a second wire contract for one piece of state,
+// and the two would drift the first time either changed — while this module,
+// which cannot import modules/group, would have no compiler to notice.
+//
+// So this answers one question — which groups in this project am I in — with the
+// fields the tree renders, and the client fetches everything else where it
+// already does. The avatar fields travel together because they are one decision
+// on the client: avatar_text/avatar_color override, is_upload_avatar wins over
+// both, and is_named decides the fallback when none is set. Shipping a subset
+// would make the list render group avatars differently from every other surface.
+type GroupResp struct {
+	GroupNo string `json:"group_no"`
+	Name    string `json:"name"`
+	// IsNamed is 1 for a group created BEFORE the 2026-06-29 avatar revamp and 0
+	// for one created after: legacy groups render the group name's first two
+	// characters into the default avatar, new ones fall back to the two-person
+	// icon. NOT "the user chose this name" — that was the column's original
+	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
+	//
+	// On THIS endpoint the value is therefore always 0: modules/group hardcodes
+	// IsNamed: 0 at BOTH create sites in modules/group/service.go, and 1 exists only where
+	// the #500 migration backfilled it, which no project group can be. It is
+	// shipped anyway so the avatar fallback chain is evaluated by the same code
+	// on every surface rather than special-cased here — a client that hardcodes
+	// the fallback for this list is the drift the field exists to prevent.
+	IsNamed int `json:"is_named"`
+	// AvatarText is the custom avatar text; "" falls back per IsNamed.
+	AvatarText string `json:"avatar_text"`
+	// AvatarColor is the custom palette index; null derives it from group_no.
+	// A pointer because the column is nullable and null is NOT index 0.
+	AvatarColor    *int `json:"avatar_color"`
+	IsUploadAvatar int  `json:"is_upload_avatar"`
+	// MemberCount counts active members (is_deleted = 0 AND status = 1),
+	// everyone in the group — unlike the project's own member_count, which #855
+	// narrowed to humans. These are different populations, so the same name
+	// meaning different things is a hazard the client teams need to know about:
+	// a project group's count includes the agents seated in it.
+	MemberCount int `json:"member_count"`
+}
+
+// memberRosterModel is the member roster joined to `user` for display names.
+type memberRosterModel struct {
+	MemberModel
+	Name string `db:"name"`
+	// Robot / OwnerUID come from `user` and `robot` respectively, both LEFT
+	// JOINed: a member whose user row is missing must still appear (see
+	// listMembers), and a robot row is absent for every person.
+	Robot    int    `db:"robot"`
+	OwnerUID string `db:"owner_uid"`
+}
+
+const respTimeFormat = "2006-01-02 15:04:05"
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(respTimeFormat)
+}

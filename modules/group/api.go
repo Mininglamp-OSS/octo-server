@@ -28,12 +28,14 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -97,34 +99,40 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	groups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
-		groups.POST("/:group_no/members", g.memberAdd)                                     // 添加群成员
-		groups.DELETE("/:group_no/members", g.memberRemove)                                // 移除群成员
-		groups.GET("/:group_no/members", g.membersGet)                                     // 获取群成员
-		groups.GET("/:group_no/members/:uid", g.memberGet)                                 // 查询单个 uid 是否为群成员（命中时返回成员详情）
-		groups.POST("/:group_no/members_delete", g.memberRemove)                           // 移除群成员
-		groups.GET("/:group_no/membersync", g.syncMembers)                                 // 同步群成员
-		groups.GET("/:group_no", g.groupGet)                                               // 获取群信息
-		groups.PUT("/:group_no/setting", g.groupSettingUpdate)                             // 修改群设置
-		groups.PUT("/:group_no", g.groupUpdate)                                            // 修改群信息
-		groups.PUT("/:group_no/members/:uid", g.memberUpdate)                              // 修改群的群成员信息
-		groups.POST("/:group_no/exit", g.groupExit)                                        // 退出群聊
-		groups.POST("/:group_no/managers", g.managerAdd)                                   // 添加群管理员
-		groups.DELETE("/:group_no/managers", g.managerRemove)                              // 移除群管理员
-		groups.POST("/:group_no/forbidden/:on", g.groupForbidden)                          // 群全员禁言
-		groups.GET("/:group_no/qrcode", g.groupQRCode)                                     // 获取群二维码信息
-		groups.POST("/:group_no/transfer/:to_uid", g.transferGrouper)                      // 群主转让
-		groups.POST("/:group_no/member/invite", g.groupMemberInviteAdd)                    // 群成员邀请
-		groups.GET("/:group_no/member/h5confirm", g.getToGroupMemberConfirmInviteDetailH5) // 获取确认邀请的h5页面
-		groups.POST("/:group_no/blacklist/:action", g.blacklist)                           // 添加或移除黑名单
-		groups.POST("/:group_no/forbidden_with_member", g.forbiddenWithGroupMember)        // 禁言或解禁某个群成员
-		groups.POST("/:group_no/avatar", g.avatarUpload)                                   // 上传群头像
-		groups.DELETE("/:group_no/disband", g.disband)                                     // 解散群
-		groups.GET("/:group_no/detail", g.groupDetailGet)                                  // 获取群详情
-		groups.GET("/:group_no/md", g.groupMdGet)                                          // 获取GROUP.md
-		groups.PUT("/:group_no/md", g.groupMdUpdate)                                       // 更新GROUP.md
-		groups.DELETE("/:group_no/md", g.groupMdDelete)                                    // 删除GROUP.md
-		groups.PUT("/:group_no/bot_admin/:uid", g.botAdminSet)                             // 设置Bot管理员
-		groups.DELETE("/:group_no/bot_admin/:uid", g.botAdminRemove)                       // 移除Bot管理员
+		protectAIContainer := g.protectAIContainerMutation
+		// 移除成员的两条路由（DELETE /members 与其别名 POST /members_delete）自
+		// bot-owner-self-removal 起对**普通成员**开放（自助移除自己名下的 bot，
+		// octo-web#1511），因此按认证路由惯例挂 per-UID 限流。
+		// 只挂这两条：/v1/groups 组还有 ~26 个端点，整组挂会改变它们的既有行为。
+		memberRemoveRateLimiter := appwkhttp.SharedUIDRateLimiter(r, g.ctx)
+		groups.POST("/:group_no/members", protectAIContainer, g.memberAdd)                                    // 添加群成员
+		groups.DELETE("/:group_no/members", memberRemoveRateLimiter, protectAIContainer, g.memberRemove)      // 移除群成员
+		groups.GET("/:group_no/members", g.membersGet)                                                        // 获取群成员
+		groups.GET("/:group_no/members/:uid", g.memberGet)                                                    // 查询单个 uid 是否为群成员（命中时返回成员详情）
+		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, protectAIContainer, g.memberRemove) // 移除群成员
+		groups.GET("/:group_no/membersync", g.syncMembers)                                                    // 同步群成员
+		groups.GET("/:group_no", g.groupGet)                                                                  // 获取群信息
+		groups.PUT("/:group_no/setting", protectAIContainer, g.groupSettingUpdate)                            // 修改群设置
+		groups.PUT("/:group_no", protectAIContainer, g.groupUpdate)                                           // 修改群信息
+		groups.PUT("/:group_no/members/:uid", protectAIContainer, g.memberUpdate)                             // 修改群的群成员信息
+		groups.POST("/:group_no/exit", protectAIContainer, g.groupExit)                                       // 退出群聊
+		groups.POST("/:group_no/managers", protectAIContainer, g.managerAdd)                                  // 添加群管理员
+		groups.DELETE("/:group_no/managers", protectAIContainer, g.managerRemove)                             // 移除群管理员
+		groups.POST("/:group_no/forbidden/:on", protectAIContainer, g.groupForbidden)                         // 群全员禁言
+		groups.GET("/:group_no/qrcode", protectAIContainer, g.groupQRCode)                                    // 获取群二维码信息
+		groups.POST("/:group_no/transfer/:to_uid", protectAIContainer, g.transferGrouper)                     // 群主转让
+		groups.POST("/:group_no/member/invite", protectAIContainer, g.groupMemberInviteAdd)                   // 群成员邀请
+		groups.GET("/:group_no/member/h5confirm", g.getToGroupMemberConfirmInviteDetailH5)                    // 获取确认邀请的h5页面
+		groups.POST("/:group_no/blacklist/:action", protectAIContainer, g.blacklist)                          // 添加或移除黑名单
+		groups.POST("/:group_no/forbidden_with_member", protectAIContainer, g.forbiddenWithGroupMember)       // 禁言或解禁某个群成员
+		groups.POST("/:group_no/avatar", protectAIContainer, g.avatarUpload)                                  // 上传群头像
+		groups.DELETE("/:group_no/disband", protectAIContainer, g.disband)                                    // 解散群
+		groups.GET("/:group_no/detail", g.groupDetailGet)                                                     // 获取群详情
+		groups.GET("/:group_no/md", g.groupMdGet)                                                             // 获取GROUP.md
+		groups.PUT("/:group_no/md", protectAIContainer, g.groupMdUpdate)                                      // 更新GROUP.md
+		groups.DELETE("/:group_no/md", protectAIContainer, g.groupMdDelete)                                   // 删除GROUP.md
+		groups.PUT("/:group_no/bot_admin/:uid", protectAIContainer, g.botAdminSet)                            // 设置Bot管理员
+		groups.DELETE("/:group_no/bot_admin/:uid", protectAIContainer, g.botAdminRemove)                      // 移除Bot管理员
 	}
 	openGroups := r.Group("/v1/groups")
 	{ // 获取群头像
@@ -132,15 +140,15 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	authGroups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
-		authGroups.GET("/:group_no/scanjoin", g.groupScanJoin) // 扫码加入群（需要认证）
+		authGroups.GET("/:group_no/scanjoin", g.protectAIContainerMutation, g.groupScanJoin) // 扫码加入群（需要认证）
 	}
 	// 群入群欢迎语 CRUD（群主/管理员自助，task group-welcome-message）。挂 auth +
 	// SharedUIDRateLimiter：认证路由默认按登录用户公平限流（与 /v1/message 等一致）。
 	welcomeGroups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, g.ctx))
 	{
 		welcomeGroups.GET("/:group_no/welcome", g.getWelcome)
-		welcomeGroups.PUT("/:group_no/welcome", g.putWelcome)
-		welcomeGroups.DELETE("/:group_no/welcome", g.deleteWelcome)
+		welcomeGroups.PUT("/:group_no/welcome", g.protectAIContainerMutation, g.putWelcome)
+		welcomeGroups.DELETE("/:group_no/welcome", g.protectAIContainerMutation, g.deleteWelcome)
 	}
 	// H5 公开落地页配套的认证接口：把公开 code（二维码 UUID）换成当前登录用户的 auth_code。
 	// 之后前端直接调用 /v1/groups/:group_no/scanjoin?auth_code=xxx 完成入群。
@@ -188,6 +196,25 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	go g.CheckForbiddenLoop()
 }
 
+// protectAIContainerMutation keeps the two-member AI container invariant on
+// every ordinary group-admin route. Read/history routes intentionally remain
+// available and still use the normal parent membership checks.
+func (g *Group) protectAIContainerMutation(c *wkhttp.Context) {
+	protected, err := aiteampkg.IsProtectedGroup(g.ctx.DB(), c.Param("group_no"))
+	if err != nil {
+		g.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
 // 解散群
 func (g *Group) disband(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
@@ -211,6 +238,14 @@ func (g *Group) disband(c *wkhttp.Context) {
 	if err != nil {
 		g.Error("查询用户群内身份错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
+	// D7 —— 全员群不能被解散。它随项目结束而结束，没有别的等价物。
+	//
+	// 放在群主判定**之后**：先回答"你有没有权限做这件事"，再回答"这件事对这个群
+	// 允不允许"。反过来会让一个普通成员通过一条错误消息知道这个群是某项目的全员群。
+	if loginMember != nil && loginMember.Role == MemberRoleCreator &&
+		g.refuseIfAllMemberGroup(c, group, allMemberGroupActionDisband) {
 		return
 	}
 	if loginMember == nil || loginMember.Role != MemberRoleCreator {
@@ -451,6 +486,8 @@ func (g *Group) membersGet(c *wkhttp.Context) {
 	g.fillSpaceRelatedFields(groupNo, "", resps)
 	// YUJ-413 Scope B：批量回填实名字段（零 N+1），Android 气泡 + 群成员列表依赖。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：回填 bot_owned_by_me，前端据此渲染自助移除按钮。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 
 	c.Response(resps)
 }
@@ -493,6 +530,8 @@ func (g *Group) memberGet(c *wkhttp.Context) {
 	// 调用成本与 N=1 一致），Android 客户端 /v1/groups/:group_no/members/:uid
 	// 是资料卡 / @提及 等路径的数据源。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：单成员查询同样回填 bot_owned_by_me，保持三处同名同型。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 
 	c.Response(memberCheckResp{Exists: true, Member: &resps[0]})
 }
@@ -707,6 +746,7 @@ func (g *Group) avatarPalette(c *wkhttp.Context) {
 
 func (g *Group) avatarUpload(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
+	loginName := c.GetLoginName()
 	groupNo := c.Param("group_no")
 	if groupNo == "" {
 		respondGroupRequestInvalid(c, "group_no")
@@ -763,21 +803,19 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	// 发送群头像更新命令
-	err = g.ctx.SendCMD(config.MsgCMDReq{
+	// 落库已成功：系统消息与 CMD 都是 best-effort，失败不能让客户端重传已成功的上传。
+	if err := sendGroupAvatarChangedMessage(g.ctx, groupNo, loginUID, loginName); err != nil {
+		g.Error("发送群头像变更系统消息失败！", zap.String("groupNo", groupNo), zap.Error(err))
+	}
+	if err := g.ctx.SendCMD(config.MsgCMDReq{
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		CMD:         common.CMDGroupAvatarUpdate,
 		Param: map[string]interface{}{
 			"group_no": groupNo,
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		g.Error("发送群头像更新命令失败！", zap.String("groupNo", groupNo), zap.Error(err))
-		// The avatar object and DB version are already committed; the IM
-		// notification is best-effort so clients do not retry a successful upload.
-		c.ResponseOK()
-		return
 	}
 	c.ResponseOK()
 }
@@ -845,6 +883,9 @@ func (g *Group) syncMembers(c *wkhttp.Context) {
 	// membersync 是 Android WKSDK ChannelMember 缓存的唯一增量来源，漏下发就
 	// 永远没 extraMap.realname_verified → 气泡 + 群成员列表永远不亮。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：增量同步路径同样回填。注意本字段上线前已缓存的成员行要等其
+	// version 变动才会带上它，故客户端必须按「缺失 = false」降级。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 	c.Response(resps)
 }
 
@@ -993,6 +1034,73 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	// 零宽/格式字符撑爆 avatar_text VARCHAR(16) 导致 MySQL 截断。
 	req.AvatarText = avatarrender.GroupText(req.AvatarText)
 
+	// 校验 project_id。
+	//
+	// 四道门，顺序有意如此：
+	//
+	//  1. 必须同时给 space_id —— 项目本身就活在某个 Space 里，没有 Space 的项目群
+	//     无从谈起。
+	//  2. 功能开关必须打开。这是 brief D1 说的唯一回滚手段：关掉它只是「不再产生
+	//     新的项目群」，已有项目群的成员约束照常强制——设计文档明确不允许放松
+	//     已有约束。开关与 appconfig 的 project_on 是同一个值。
+	//  3. 调用方本人必须在这个 Space 里。见下面那段：Space 成员校验在 Service 里，
+	//     也就是在这之后，所以不先问这一句，第 4 道门就成了一个人人可用的探测器。
+	//  4. 项目必须存在、活跃、且属于同一个 Space。三种失败回同一个错误码，不区分
+	//     ——区分开就等于把建群变成一个探测器：拿着一个自己看不见的 project_id，
+	//     用一个自己有权限的 Space 就能问出「它存不存在、在哪个 Space」。
+	//
+	// 「创建者本人是不是这个项目的成员」不在这里查。那是准入闸门的事，发生在建群
+	// 事务内、持锁状态下；放在这里查是一次会过期的读。
+	if req.ProjectID != "" {
+		if req.SpaceID == "" {
+			respondGroupRequestInvalid(c, "space_id")
+			return
+		}
+		if !common2.EnsureSystemSettings(g.ctx).ProjectEnabled() {
+			g.Warn("项目功能未开启，拒绝创建项目群",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+		// 先确认调用方自己在这个 Space 里，再去问项目存不存在。
+		//
+		// 顺序不是风格问题。Space 成员校验被放在 Service 里（见下方 CreateGroup），
+		// 也就是**在这段之后**；于是先查项目就把建群接口变成了一个探测器：任何
+		// 持有效 token 的人都能拿 space_id + project_id 组合去问「这个项目在不在
+		// 这个 Space」，而这正是上一条注释说要避免的事——只不过它防住了「三种失败
+		// 回同一个码」，没防住「根本不该被回答」。
+		//
+		// 失败回同一个 ErrGroupProjectUnavailable，而不是一个「你不在这个 Space」
+		// 的专属错误：区分开来同样是在回答问题。真正的原因进日志。
+		creatorInSpace, err := spacepkg.CheckMembership(g.ctx.DB(), req.SpaceID, creator)
+		if err != nil {
+			g.Error("查询 Space 成员失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !creatorInSpace {
+			g.Warn("建项目群：调用方不在该 Space，不回答项目是否存在",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID),
+				zap.String("creator", creator))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+		ok, err := projectpkg.ResolveForGroup(g.ctx.DB(), req.SpaceID, req.ProjectID)
+		if err != nil {
+			g.Error("查询项目失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !ok {
+			// The distinguishing reason (absent / disbanded / other Space) stays
+			// in the log, never on the wire.
+			g.Warn("项目不可用：不存在、已解散，或不属于该 Space",
+				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
+			return
+		}
+	}
+
 	// 校验 category_id
 	if req.CategoryID != "" {
 		if req.SpaceID == "" {
@@ -1093,12 +1201,22 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 		Members:     realUids,
 		Name:        req.Name,
 		SpaceID:     req.SpaceID,
+		ProjectID:   req.ProjectID,
 		CategoryID:  req.CategoryID,
 		AvatarText:  req.AvatarText,
 		AvatarColor: req.AvatarColor,
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
+		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
+		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
+		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
+		// 变成 5xx，把本功能最常见的一次拒绝变成一条 on-call 告警；而 P1 专为
+		// 这次拒绝注册的错误码从此不可达，本地化文案永远不会出现。
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1597,6 +1715,11 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			return
 		}
 		g.Error("添加群成员失败", zap.Error(err))
+		// 与建群同理：准入被拒是 400，不是 500。见 groupCreate 处的说明。
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1638,6 +1761,13 @@ func (g *Group) addMembersTx(members []string, groupNo string, operator, operato
 // 非空时优先作为跨 Space 邀请新成员的 source_space_id；空时沿用历史兜底逻辑
 // （operator 外部 → operator.SourceSpaceID；否则 → 被邀请者 home Space）。
 func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator, operatorName, inviterSpaceID string, tx *dbr.Tx) (func(), error) {
+	var purpose string
+	if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
+		return nil, err
+	}
+	if purpose == aiteampkg.GroupPurpose {
+		return nil, aiteampkg.ErrContainerProtected
+	}
 
 	/**
 	判断操作者是否在群内，如果不在群内是不允许邀请好友的
@@ -1672,6 +1802,18 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 		g.Error("查询群信息失败", zap.Error(err))
 		return nil, errors.New("查询群信息失败")
 	}
+	// 群行查不到就不再往下走（I2 / D3）。
+	//
+	// 原来下游是 `if groupModel != nil { admitSpaceID, admitProjectID = ... }`：
+	// 查不到时两者留空，准入口拿到的是「这不是项目群」这个断言，于是整批放行。
+	// 这与 preset_group_admission.go 为自己那条路径写下的理由是同一条——空
+	// project_id 是一个 fail-OPEN 的捷径，只要群行读不到就自动生效。两个调用方
+	// （memberAdd、邀请确认）都作用在已存在的群上，且此函数上方已校验操作者是
+	// 该群成员，所以这里读不到群行只可能是并发解散或数据损坏，都不该继续加人。
+	if groupModel == nil {
+		g.Error("群不存在，拒绝加人", zap.String("group_no", groupNo))
+		return nil, errors.New("群不存在！")
+	}
 	// 跨 Space 外部成员标识：与 scanjoin / Service.AddGroupMembers 语义对齐。
 	// 群属于某 Space 时，不在 Space 的成员标记 is_external=1 并写 source_space_id，
 	// 让消息头 from_is_external / from_source_space_name 下发路径可正确渲染
@@ -1681,7 +1823,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	externalMap := make(map[string]bool)
 	sourceSpaceMap := make(map[string]string)
 	var operatorMemberForSpace *MemberModel
-	if groupModel != nil && groupModel.SpaceID != "" && groupModel.AllowExternal == 0 {
+	if groupModel.SpaceID != "" && groupModel.AllowExternal == 0 {
 		operatorMember, opErr := g.db.QueryMemberWithUID(operator, groupNo)
 		if opErr != nil {
 			g.Error("查询操作者群成员失败", zap.Error(opErr))
@@ -1703,7 +1845,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			}
 		}
 	}
-	if groupModel != nil && groupModel.SpaceID != "" {
+	if groupModel.SpaceID != "" {
 		if operatorMemberForSpace == nil {
 			operatorMemberForSpace, _ = g.db.QueryMemberWithUID(operator, groupNo)
 		}
@@ -1831,6 +1973,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	 将成员信息存到数据库
 	**/
 	userBaseVos := make([]*config.UserBaseVo, 0, len(realMembers))
+	admissions := make([]MemberAdmission, 0, len(realMemberModels))
 	hasNewExternal := false
 	for _, realMember := range realMemberModels {
 		version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
@@ -1843,11 +1986,6 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			UID:  realMember.UID,
 			Name: realMember.Name,
 		})
-		existDelete, err := g.db.ExistMemberDelete(realMember.UID, groupNo)
-		if err != nil {
-			g.Error("查询是否存在删除成员失败！", zap.Error(err))
-			return nil, errors.New("查询是否存在删除成员失败！")
-		}
 		// 跨 Space 外部成员：写入 is_external=1 和 source_space_id（YUJ-53）。
 		isExt := 0
 		srcSpaceID := ""
@@ -1855,36 +1993,40 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			isExt = 1
 			srcSpaceID = sourceSpaceMap[realMember.UID]
 		}
-		newMember := &MemberModel{
-			GroupNo:       groupNo,
-			InviteUID:     operator,
+		admissions = append(admissions, MemberAdmission{
 			UID:           realMember.UID,
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			Version:       version,
-			Status:        int(common.GroupMemberStatusNormal),
+			Role:          MemberRoleCommon,
+			InviteUID:     operator,
 			Robot:         realMember.Robot,
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}
-		if existDelete {
-			err = g.db.recoverMemberTx(newMember, tx)
-		} else {
-			err = g.db.InsertMemberTx(newMember, tx)
-		}
-		if err != nil {
-			g.Error("添加群成员失败！", zap.Error(err))
-			return nil, errors.New("添加群成员失败！")
-		}
+		})
 		// is_external_group 只反映人类外部成员：bot 即便 is_external=1 也不应
 		// flip 群标记（与 DELETE 路径 robot=0 过滤对称）。
 		if isExt == 1 && realMember.Robot == 0 {
 			hasNewExternal = true
 		}
 	}
+	// 收口到唯一准入口（I2 / D3）。此前这里是「ExistMemberDelete 会话查询 →
+	// 分支 → InsertMemberTx / recoverMemberTx」，每个 uid 两次往返且带竞态；
+	// 现在整批一条 upsert，插入与恢复的列语义在 admission.go 里有实测记录。
+	//
+	// groupModel 在本函数前半段已按 groupNo 查出（外部成员判定要用它），
+	// 直接复用，不额外查一次；查不到已在上面直接返回，所以这里无需再判空——
+	// 判空会重新引入「空 project_id = 不是项目群」的放行分支。
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, groupModel.SpaceID, groupModel.ProjectID,
+		admissions, AdmissionEntryInviteConfirm); err != nil {
+		g.Error("添加群成员失败！", zap.Error(err))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("添加群成员失败！")
+	}
 
 	// 首次出现外部人类成员时，在事务内将群标记为外部群。
 	markedExternal := false
-	if hasNewExternal && groupModel != nil && groupModel.IsExternalGroup == 0 {
+	if hasNewExternal && groupModel.IsExternalGroup == 0 {
 		if updateErr := g.db.UpdateIsExternalGroupTx(groupNo, 1, tx); updateErr != nil {
 			g.Error("更新 is_external_group 失败", zap.Error(updateErr), zap.String("group_no", groupNo))
 			return nil, errors.New("更新 is_external_group 失败")
@@ -2615,14 +2757,11 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		}
 	}
 
-	memberModel := &MemberModel{
-		GroupNo:   groupNo,
+	scanAdmission := MemberAdmission{
 		UID:       scaner,
-		Role:      MemberRoleCommon,
 		Version:   version,
-		Status:    int(common.GroupMemberStatusNormal),
+		Role:      MemberRoleCommon,
 		InviteUID: generator,
-		Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 		// 保留 scaner 的 robot 标记，与其它入群路径保持一致，
 		// 让 DELETE 路径的 QueryExternalMemberCountTx(robot=0) 能正确排除 bot。
 		Robot:         scanerInfo.Robot,
@@ -2662,21 +2801,16 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	existDelete, err := g.db.ExistMemberDelete(scaner, groupNo)
-	if err != nil {
-		tx.Rollback()
-		g.Error("查询是否存在删除成员失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	if existDelete {
-		err = g.db.recoverMemberTx(memberModel, tx)
-	} else {
-		err = g.db.InsertMemberTx(memberModel, tx)
-	}
-	if err != nil {
+	// 收口到唯一准入口（A5）。扫码入群是自助路径：扫码者自己决定加入，没有
+	// 任何管理员参与，所以它必须和被邀请入群受同一道闸门约束。
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, group.SpaceID, group.ProjectID,
+		[]MemberAdmission{scanAdmission}, AdmissionEntryScanJoin); err != nil {
 		tx.Rollback()
 		g.Error("添加群成员失败！", zap.Error(err))
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -2771,6 +2905,10 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupTransferTargetNotFound, nil, nil)
 		return
 	}
+	if toUser.Robot == 1 {
+		httperr.ResponseErrorL(c, errcode.ErrGroupBotCannotBeOwner, nil, nil)
+		return
+	}
 
 	/**
 	判断转让的用户是否在群内,只有在群内才能转让
@@ -2823,6 +2961,21 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 	groupModel, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
+		return
+	}
+
+	// D7 —— 全员群的群主不能手动转让。它始终跟着项目 owner 走（D6），由项目侧
+	// 在 owner 变动时驱动同步。
+	//
+	// 放在群主判定之后：只有群主本人会看到这条拒绝，别人先拿到 creator_only。
+	// 这一路仍在任何写入之前——下面才开始改成员角色。
+	//
+	// 放在 getGroupInfo **之后**并复用它读到的群行，而不是用按群号的那个版本。
+	// 前一版用了 refuseIfAllMemberGroupByNo，它自己发一次 QueryWithGroupNo，而紧
+	// 接着的 getGroupInfo 就是同一条查询：Space 直属群多 1 次、普通项目群多 2 次，
+	// 而 C1 纪律给的额度是 0 和 1。守卫注释里把这条写成硬要求，这里却是四个调用点
+	// 里唯一违反它的。TestAllMemberGroupGuardAddsNoQueryOnANonProjectGroup 现在钉住它。
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionTransfer) {
 		return
 	}
 
@@ -3039,12 +3192,23 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 判断群是否存在
-	_, err := g.getGroupInfo(groupNo)
+	removeGroupInfo, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
 		return
 	}
+	// D7 —— 全员群里不能踢人。要把谁移出这个群，就是要把他移出这个项目。
+	//
+	// 放在这里而不是等操作者身份查完：这个 handler 后面会走 RemoveGroupMembers，
+	// 那条路径带 IM 退订、系统消息、bot 连带移除等一串副作用，守卫必须在任何副作用
+	// 之前。存在性已经由上面那次 getGroupInfo 回答过，所以这条拒绝不多说什么。
+	if g.refuseIfAllMemberGroup(c, removeGroupInfo, allMemberGroupActionRemove) {
+		return
+	}
 	var loginMember *MemberModel
+	// botOwnerSelfRemoval 标记「普通成员自助移除自己名下 bot」这条路径，
+	// 后续用于：拒绝 Creator 角色目标、以及让 service 改发更贴切的 Tip。
+	botOwnerSelfRemoval := false
 	// 查询操作者身份
 	// 这里要兼容后台管理系统的删除操作
 	if c.CheckLoginRole() != nil {
@@ -3059,8 +3223,70 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		if loginMember.Role != int(common.GroupMemberRoleCreater) && loginMember.Role != int(common.GroupMemberRoleManager) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
-			return
+			// 自助路径（octo-web#1511）：普通成员可以移除**自己名下**的 bot。
+			// 在此之前 bot 归属只在入群侧校验（checkBotOwnership），移除侧完全不看，
+			// 形成一道单向门——成员能把自己的 bot 拉进群，却再也取不出来。
+			//
+			// 判据必须是 QueryBotUIDsOwnedByUIDs 这种**默认拒绝的白名单**：它只返回
+			// 「本群内 + group_member.robot=1 + is_deleted=0 + robot.status=1 +
+			// robot.creator_uid = 操作者」的 bot UID。
+			//
+			// 切勿改用 checkBotOwnership —— 它的 SQL 是 `WHERE u.robot = 1`，人类 UID
+			// 根本查不出行、循环因此不拒绝（见 bot_ownership.go doc「human → always OK」）。
+			// 那是入群侧「非 bot 不归我管」的正确语义，搬到移除侧就是提权：
+			// 普通成员传一批人类 UID 即可踢人。
+			// 自助分支是新增的**授权谓词**，必须用活跃口径（is_deleted=0 AND
+			// status=Normal），不能只看上面 QueryMemberWithUID 的 is_deleted ——
+			// 见 db.go QueryActiveMemberGroupNosWithUID 的约定：「只看 is_deleted
+			// 会把被拉黑成员当作仍然在群」。
+			// 若不加这道门，被拉黑的成员（status=Blacklist、is_deleted=0）会凭空获得
+			// 一个能改群成员表、并往群里写一条持久化 Tip 的写操作；而在本改动之前
+			// 他会直接吃到 ErrGroupMemberCannotRemove。
+			// 注意 QueryBotUIDsOwnedByUIDs 故意不过滤 group_member.status（拉黑级联
+			// 需要它），所以这道门必须由调用方来把。
+			operatorActive, aerr := g.db.ExistMemberActive(operator, groupNo)
+			if aerr != nil {
+				g.Error("查询操作者活跃成员状态失败", zap.Error(aerr))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			if !operatorActive {
+				httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				return
+			}
+			ownedBotUIDs, qerr := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{operator})
+			if qerr != nil {
+				g.Error("查询操作者名下 bot 失败", zap.Error(qerr))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			ownedBots := make(map[string]struct{}, len(ownedBotUIDs))
+			for _, uid := range ownedBotUIDs {
+				ownedBots[uid] = struct{}{}
+			}
+			// 整批校验：任一目标不在白名单内即整批拒绝，不做部分执行。
+			for _, uid := range req.Members {
+				if _, ok := ownedBots[uid]; ok {
+					continue
+				}
+				// 目标不在白名单有两种原因，要给出不同的错误：白名单按
+				// is_deleted=0 过滤，所以「刚被移除过的自己的 bot」会落到这里。
+				// 一律回「无权移除」会让用户看到「你没有权限移除自己的 bot」，
+				// 而真相是它已经不在群里了（重复点击 / 离线重试 / 列表过期）。
+				stillMember, merr := g.db.ExistMember(uid, groupNo)
+				if merr != nil {
+					g.Error("查询目标成员是否在群失败", zap.Error(merr))
+					httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+					return
+				}
+				if !stillMember {
+					httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+					return
+				}
+				httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				return
+			}
+			botOwnerSelfRemoval = true
 		}
 	}
 	// 验证删除者是否包含自己
@@ -3083,6 +3309,26 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		for _, member := range deleteMembers {
+			// 自助路径只允许移除**普通角色**的 bot。
+			//
+			// 白名单按所有权圈定目标，但不过滤 role，所以理论上能命中一个被授予了
+			// 群角色的 bot。两种角色分别的问题：
+			//   - Creator：RemoveGroupMembers 对 Creator 是静默跳过，会变成
+			//     「200 但成员没动」，前端误报已移除；
+			//   - Manager：普通成员将得以移除一个群管理员，而真正的管理员反而
+			//     不能移除另一个管理员（下面几行），权限阶梯倒挂。
+			//     维护者当初拍板的「所有权优先」针对的是 bot_admin 这一列，
+			//     group_member.role 是比它更强的授予，不在那条决策覆盖范围内。
+			// 故一并拒绝，把角色 bot 的处置交回群主/管理员。
+			// （managerAdd 不排除 robot，所以 Manager 角色的 bot 是构造得出来的。）
+			if botOwnerSelfRemoval && member.Role != MemberRoleCommon {
+				if member.Role == int(common.GroupMemberRoleCreater) {
+					httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
+					return
+				}
+				httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveAdmin, nil, nil)
+				return
+			}
 			if loginMember.Role == int(common.GroupMemberRoleManager) {
 				if member.Role == int(common.GroupMemberRoleManager) {
 					httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveAdmin, nil, nil)
@@ -3097,11 +3343,14 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 调用 Service 移除群成员
-	_, err = g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+	removeResp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:      groupNo,
 		Members:      req.Members,
 		OperatorUID:  operator,
 		OperatorName: operatorName,
+		// 自助路径改发「X 将机器人 Y 移出了群聊」，而不是默认的「你被 X 移除群聊」
+		// ——后者是被移除者视角的措辞，套在 bot 上读起来是错的。
+		BotOwnerSelfRemoval: botOwnerSelfRemoval,
 	})
 	if err != nil {
 		// 后台管理路径会跳过普通成员的目标预校验；若删除的 UID 全不在群内，
@@ -3120,7 +3369,53 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		return
 	}
 
+	// 自助路径核对**实际移除集合**：上面的角色守卫读的是事务外快照，而 service 在
+	// 行锁内重读角色，期间状态变化的目标会被静默跳过（其 doc 写明「让调用方按
+	// Removed 计数发现并重试」，但此前没有调用方真的去看）。不核对的话，这条竞态
+	// 窗口仍会回到「200 但成员没动」——正是上面那道守卫要消灭的形态，只是更窄。
+	//
+	// 比对集合而不是比数量：removedUIDs 含级联带走的 bot，数量会被撑大，
+	// 足以把「某个请求目标被跳过」在数字上抹平（请求 2 个、跳过 1 个、级联补 1 个，
+	// 计数仍然相等）。
+	//
+	// 错误码也不写死成「不能移除群主」：跳过的真实原因可能是目标被提升为 Creator
+	// 或 Manager，也可能是 DeleteMemberTx 失败后 service 的 continue（此时事务已
+	// 提交、部分目标已删）。统一回「无权移除」并把缺失的目标记进日志 —— 断言不了
+	// 的原因就不要假装断言得了。
+	// 只在自助路径上核对：后台管理路径本来就允许「部分目标不在群内」的宽松语义。
+	if botOwnerSelfRemoval && removeResp != nil {
+		if missing := missingRemovalTargets(req.Members, removeResp.RemovedUIDs); len(missing) > 0 {
+			g.Warn("自助移除存在未被移除的目标，疑似其角色在事务内发生变化或删除失败",
+				zap.String("groupNo", groupNo), zap.String("operator", operator),
+				zap.Strings("requested", req.Members), zap.Strings("missing", missing))
+			httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+			return
+		}
+	}
+
 	c.ResponseOK()
+}
+
+// missingRemovalTargets 返回「请求移除、但实际没被移除」的目标。
+//
+// 为什么不比数量：removedUIDs 除请求目标外还含级联带走的 bot，数量会被撑大，
+// 于是「请求 2 个、跳过 1 个、级联补 1 个」在计数上完全相等，静默成功照旧发生。
+// 集合比对不受级联影响 —— 多出来的 UID 无所谓，少掉的才是问题。
+func missingRemovalTargets(requested, removedUIDs []string) []string {
+	if len(requested) == 0 {
+		return nil
+	}
+	removed := make(map[string]struct{}, len(removedUIDs))
+	for _, uid := range removedUIDs {
+		removed[uid] = struct{}{}
+	}
+	var missing []string
+	for _, uid := range requested {
+		if _, ok := removed[uid]; !ok {
+			missing = append(missing, uid)
+		}
+	}
+	return missing
 }
 
 // 修改群设置
@@ -3269,6 +3564,20 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
+	// D7 —— 全员群不能退。要离开这个群，就是要离开这个项目。
+	//
+	// 位置是被这个 handler 的既有顺序决定的，不是随便挑的：**下面那次
+	// IMRemoveSubscriber 发生在成员校验之前**。守卫若放在成员校验旁边，一次被拒的
+	// 退群会先把人从 IM 频道上摘掉——人还在群里，却再也收不到消息，而且没有任何
+	// 路径会把订阅加回来。那是一个比这里的取舍严重得多的缺陷。
+	//
+	// 代价是这条拒绝先于"你是不是群成员"给出，于是一个非成员能从中读出这个群是
+	// 某项目的全员群。这个泄露是有界的：上面那次 getGroupInfo 已经用 404 与否
+	// 回答了"这个群存不存在"，而下面的 not_in_group 也一样——群的存在性在这个
+	// handler 上本来就不是秘密，多出来的只是"它属于某个项目"。
+	if g.refuseIfAllMemberGroup(c, groupInfo, allMemberGroupActionExit) {
+		return
+	}
 	// 调用IM的移除订阅者
 	err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
 		ChannelID:   groupNo,
@@ -3290,22 +3599,9 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
 		return
 	}
-	// 查询群的管理员和群主
-	adminAndCreatorUIDS, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
-	if err != nil {
-		g.Error("查询群管理员失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	visiblesUids := make([]string, 0)
-	if len(adminAndCreatorUIDS) > 0 {
-		for _, uid := range adminAndCreatorUIDS {
-			if uid != loginUID {
-				visiblesUids = append(visiblesUids, uid)
-				break
-			}
-		}
-	}
+	// 退群提示已改为全员可见（见 sendGroupExitNotice），不再需要查管理员挑
+	// `visibles` 白名单 —— 连带去掉了那次 QueryGroupManagerOrCreatorUIDS：
+	// 它此前失败会直接 500 中断整个退群，而它唯一的用途就是挑一个可见性目标。
 
 	/**
 	如果退出的人是群主，则选择第二个入群的人作为群主。
@@ -3379,7 +3675,7 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	// #354 产品决策：bot 永远跟随其主人，无角色例外——群主退群（角色已由上方
 	// newGrouper 完成转让）同样级联带走自己名下的 bot，和普通成员一致。
 	var cascadedBotUsers []*user.Model
-	cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(g.db, g.ctx, groupNo, loginUID, tx)
+	cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(g.db, g.ctx, groupNo, loginUID, false, tx)
 	if cerr != nil {
 		tx.Rollback()
 		g.Error("级联移除 bot 成员失败", zap.Error(cerr))
@@ -3456,14 +3752,15 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
 		return
 	}
-	var showName = loginMember.Remark
-	if showName == "" {
-		showName = c.GetLoginName()
-	}
-	if groupInfo.Status != GroupStatusDisband && len(visiblesUids) > 0 {
-		// 发送群成员退出群聊消息
-		err = g.ctx.SendGroupExit(groupNo, loginUID, showName, visiblesUids)
-		if err != nil {
+	// 展示名口径与 sendGroupExitTip 共用 resolveExitShowName：群内备注优先 →
+	// 登录名 → 中性兜底，绝不落到裸 UID（提示现在全员可见且是持久历史）。
+	showName := resolveExitShowName(loginMember.Remark, c.GetLoginName)
+	// 发送群成员退出群聊消息（全员可见 + RedDot:0，见 sendGroupExitNotice）。
+	// 门槛只剩「群没解散」：此前还要求 len(visiblesUids) > 0，等于「群里还有另一位
+	// 管理员/群主」，否则整条提示被静默吞掉。可见性白名单去掉后该门槛失去意义，
+	// 群里已无其他管理员时同样要发。
+	if groupInfo.Status != GroupStatusDisband {
+		if err := sendGroupExitNotice(g.ctx, groupNo, loginUID, showName); err != nil {
 			g.Error("发送成员退出群聊错误", zap.Error(err))
 		}
 	}
@@ -3598,6 +3895,21 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
 		return
 	}
+	// D7 —— 全员群里不能拉黑。
+	//
+	// 拉黑是**第五条**改变活跃成员集合的群面路径，而且很容易被漏掉：它不叫"移除"，
+	// 也不走 RemoveGroupMembers，它把 group_member.status 翻成 Blacklist 并做 IM
+	// 退订。对 I4 来说结果与踢人完全一样——这个人还是项目成员，却不在全员群的活跃
+	// 成员集合里，于是 I4 扫描 B 报出一个缺口，而且没有任何东西会修复它：项目侧的
+	// 席位没变，准入器只在新加入时跑。
+	//
+	// 解除拉黑（A11）那半边不挡：它是把人**放回**活跃集合，方向与 I4 一致，而且
+	// 已经受 I2 准入闸门约束。挡住它反而会让一个已经被拉黑的成员永远出不来。
+	//
+	// 要把谁挡在项目之外，就把他移出项目——那条路径会连群带席位一起处理。
+	if action == "add" && g.refuseIfAllMemberGroup(c, &group.Model, allMemberGroupActionBlacklist) {
+		return
+	}
 	// #354 · Bot 跟人走：拉黑/解除拉黑级联到目标用户名下在群的 bot
 	// （robot.creator_uid 命中）。旧行为只动用户本人，其 bot 仍 status=Normal，
 	// 被拉黑用户可经自己的 bot 旁路读群/子区内容，绕过 ExistMemberActive
@@ -3621,9 +3933,37 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	err = g.db.updateMembersStatus(version, groupNo, status, targetUIDs)
-	if err != nil {
-		g.Error("添加或移除群成员黑名单错误", zap.Error(err))
+	// A11 —— 解除拉黑是一条准入路径，必须过闸门。
+	//
+	// 它不碰 InsertMemberTx / recoverMemberTx，只把 status 翻回 Normal，然后
+	// 重新订阅 IM 频道（见下方 IMAddSubscriber）和群内子区。如果闸门只装在那两个
+	// 原语里，一个被移出项目的人只要曾经被拉黑过，就能被解除拉黑重新拿到项目群的
+	// 全部访问权——不经过任何准入检查。
+	//
+	// 拉黑方向（收回权限）不需要闸门，但两个方向共用同一个事务，免得后来的人
+	// 以为只有一条分支需要事务。
+	if txErr := func() error {
+		tx, beginErr := g.ctx.DB().Begin()
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.RollbackUnlessCommitted()
+		if status == int(common.GroupMemberStatusNormal) {
+			if gateErr := g.db.assertAdmissibleTx(tx, group.SpaceID, group.ProjectID,
+				targetUIDs, AdmissionEntryUnblacklist); gateErr != nil {
+				return gateErr
+			}
+		}
+		if updErr := g.db.updateMembersStatusTx(tx, version, groupNo, status, targetUIDs); updErr != nil {
+			return updErr
+		}
+		return tx.Commit()
+	}(); txErr != nil {
+		g.Error("添加或移除群成员黑名单错误", zap.Error(txErr))
+		if errors.Is(txErr, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -4363,8 +4703,17 @@ type memberDetailResp struct {
 	RealnameVerified   bool   `json:"realname_verified"`
 	RealName           string `json:"real_name,omitempty"`
 	RealnameVerifiedAt int64  `json:"realname_verified_at,omitempty"`
-	CreatedAt          string `json:"created_at"`
-	UpdatedAt          string `json:"updated_at"`
+	// BotOwnedByMe 表示「该 bot 成员归当前请求方所有」（octo-web#1511）。
+	// 响应本身就是 per-viewer 的，故用布尔而不是下发 creator_uid：客户端直接可用，
+	// 也不把 bot 的归属关系暴露给全群。
+	//
+	// 前端据此逐行决定是否渲染移除按钮。**缺失必须按 false 处理**：
+	// /membersync 是按 version 的增量同步，本字段上线前已缓存的成员行在其 version
+	// 变动前不会带上它，降级方向只能是「退回现状」，绝不能误开权限。
+	// 非 bot 成员、他人的 bot 均为 false。
+	BotOwnedByMe bool   `json:"bot_owned_by_me"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
@@ -4467,6 +4816,76 @@ func (g *Group) fillRealnameFields(resps []memberDetailResp) {
 
 // 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
 // 函数不会改写 is_external / source_space_id 字段。
+// fillBotOwnedByMe 批量回填 memberDetailResp.BotOwnedByMe（octo-web#1511）。
+//
+// 复用 memberRemove 自助路径的同一判据 QueryBotUIDsOwnedByUIDs —— 一次
+// `group_member INNER JOIN robot` 批量查出「本群内属于 loginUID 的 bot」，零 N+1，
+// 且保证「前端看得到移除按钮」与「后端放行移除」用的是同一口径，不会出现
+// 按钮显示了但请求被拒的错位。
+//
+// 为什么不做成群级能力位（如 can_remove_own_bots）：那需要在 GetGroupDetail 这类
+// 每次群信息拉取都走的热路径上多打一次 robot 表 JOIN；而本字段只在成员列表这类
+// 本来就要分页取数的场景计算一次。
+//
+// 失败处理：仅 log，全部留 false —— fail closed，宁可不显示移除按钮，
+// 不能因查询抖动误开权限。
+func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailResp) {
+	if len(resps) == 0 || groupNo == "" || loginUID == "" {
+		return
+	}
+	hasBot := false
+	for i := range resps {
+		if resps[i].Robot == 1 {
+			hasBot = true
+			break
+		}
+	}
+	if !hasBot {
+		return
+	}
+	// 移除的授权是**两个**谓词：活跃成员（ExistMemberActive）+ 所有权白名单。
+	// 只按所有权回填的话，被拉黑的所有者（status=Blacklist、is_deleted=0）仍能拉到
+	// 成员列表、拿到 bot_owned_by_me=true、看到移除按钮，点下去却被 memberRemove
+	// 的活跃门拒绝。这里补上同一道门，让「按钮可见」与「请求会被放行」用的是同一组
+	// 判据，而不是其中一半。方向仍是 fail-closed：查询出错一律留 false。
+	operatorActive, aerr := g.db.ExistMemberActive(loginUID, groupNo)
+	if aerr != nil {
+		g.Warn("查询请求方活跃成员状态失败（octo-web#1511）",
+			zap.Error(aerr), zap.String("group_no", groupNo))
+		return
+	}
+	if !operatorActive {
+		return
+	}
+	ownedBotUIDs, err := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{loginUID})
+	if err != nil {
+		g.Warn("批量查询本人名下 bot 失败（octo-web#1511）",
+			zap.Error(err), zap.String("group_no", groupNo))
+		return
+	}
+	if len(ownedBotUIDs) == 0 {
+		return
+	}
+	owned := make(map[string]struct{}, len(ownedBotUIDs))
+	for _, uid := range ownedBotUIDs {
+		owned[uid] = struct{}{}
+	}
+	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
+	for i := range resps {
+		if resps[i].Robot != 1 {
+			continue
+		}
+		// 被授予了群角色（Creator / Manager）的 bot 由 memberRemove 的自助分支拒绝，
+		// 处置权留给群主/管理员；这里同步排除，避免下发一个点了必报错的按钮。
+		if resps[i].Role != MemberRoleCommon {
+			continue
+		}
+		if _, ok := owned[resps[i].UID]; ok {
+			resps[i].BotOwnedByMe = true
+		}
+	}
+}
+
 func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []memberDetailResp) {
 	if len(resps) == 0 {
 		return
@@ -4540,12 +4959,19 @@ func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []mem
 }
 
 type groupReq struct {
-	Name        string   `json:"name"`         // 群名
-	Members     []string `json:"members"`      // 成员uid
-	SpaceID     string   `json:"space_id"`     // Space ID（可选）
-	CategoryID  string   `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
-	AvatarText  string   `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int     `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
+	Name    string   `json:"name"`     // 群名
+	Members []string `json:"members"`  // 成员uid
+	SpaceID string   `json:"space_id"` // Space ID（可选）
+	// ProjectID 把新群挂到某个项目下（可选，必须与 space_id 同时传）。
+	//
+	// 一旦设置就不可更改（不变量 I3）：没有任何接口能改群的项目归属，源码守卫
+	// 也禁止在创建路径和 detach 步骤之外写这一列。要换项目只能新建群。
+	//
+	// 非空时，群的成员集合从此受不变量 I2 约束——加人时必须是该项目的活跃成员。
+	ProjectID   string `json:"project_id"`   // 所属项目 ID（可选，需配合 space_id）
+	CategoryID  string `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
+	AvatarText  string `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
 }
 
 func (g groupReq) Check() error {

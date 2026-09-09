@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	libserver "github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
+	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/stretchr/testify/require"
 )
@@ -354,6 +355,12 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 	migrationServer.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(migrationServer.GetRoute())
 	require.NoError(t, module.Setup(ctx), "set up modules in isolated token TTL database")
+	// The process-wide SystemSettings singleton may have been constructed before
+	// its backing database finished migrating. With -shuffle=on this test can be
+	// the first handler test and would otherwise observe the fail-closed nil
+	// snapshot, making an MFA-off manager login return 503. Publish a successful
+	// post-migration snapshot before registering the handlers exercised here.
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
 
 	// Register only the handlers exercised here from objects constructed with
 	// this test's context. This keeps handler reads and fixture writes on the

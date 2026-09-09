@@ -1,0 +1,22 @@
+brief: .octospec/tasks/agent-mail-auto-provisioning/brief.md
+injected:
+  - id: space-isolation
+    source: repo
+    reason: "Provisioning binds an authenticated UID to an exact validated Space."
+  - id: error-handling
+    source: repo
+    reason: "Provisioning failures use the existing localized gateway error envelope."
+  - id: rate-limit
+    source: repo
+    reason: "The change stays behind the existing authenticated shared UID limiter."
+  - id: testing
+    source: repo
+    reason: "The gateway trust boundary and concurrency path require regressions."
+  - id: commit-style
+    source: repo
+    reason: "Repository commit and PR convention."
+files_expected:
+  - modules/agentmailgateway/gateway.go
+  - modules/agentmailgateway/provisioning.go
+  - modules/agentmailgateway/gateway_test.go
+updated_at: 2026-08-14T00:00:00Z

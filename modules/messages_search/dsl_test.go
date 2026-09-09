@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -899,14 +900,63 @@ func TestBuildSearchMessagesDSL_ExcludesContentField(t *testing.T) {
 	}
 }
 
-// TestBuildSearchAllHighlight_ExcludesFileContent is the Q4 D negative pin:
-// pickSnippet does not promote payload.file.content into the snippet slot, so
-// requesting a highlight on that field would allocate a fragment that no
-// consumer reads.
-func TestBuildSearchAllHighlight_ExcludesFileContent(t *testing.T) {
+// TestBuildSearchAllHighlight_IncludesFileContent supersedes the earlier Q4 D
+// negative pin: _search_all now DOES highlight payload.file.content so a
+// chat-tab file message whose body matched (but whose name did not) carries a
+// <mark>-wrapped content_snippet into the mixed feed (welded file card).
+// singleFileHit -> pickFileContentSnippet reads this fragment. Q6 A is
+// unaffected: only the 120-char fragment rides the wire, never the full body
+// (fileContentSourceExcludes still drops payload.file.content from _source).
+func TestBuildSearchAllHighlight_IncludesFileContent(t *testing.T) {
 	body := asJSONString(t, buildSearchAllHighlight())
-	if strings.Contains(body, `"payload.file.content"`) {
-		t.Errorf("_search_all highlight must NOT include payload.file.content (Q4 D):\n%s", body)
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_all highlight must include payload.file.content (V6 chat-tab file body snippet):\n%s", body)
+	}
+}
+
+// TestBuildSearchFilesHighlight_NoRequestEncoder pins the design decision to
+// leave the file-tab highlighter's request-level `encoder` unset (default =
+// pass-through). Escaping is applied in Go via escapeHighlightFragment inside
+// pickFileNameHighlight / pickFileContentSnippet — scoped strictly to the two
+// new file fields — so the shared _search_all/_search_global_messages
+// highlighter can stay off `encoder=html` and MessageHit.Snippet keeps its
+// long-shipped raw-text wire contract. Flipping this on would silently escape
+// text/richText/mergeForward snippets too via the shared builder.
+func TestBuildSearchFilesHighlight_NoRequestEncoder(t *testing.T) {
+	body := asJSONString(t, buildSearchFilesHighlight())
+	if strings.Contains(body, `"encoder"`) {
+		t.Errorf("buildSearchFilesHighlight() must NOT set a request-level encoder; escaping is applied per-field in Go via escapeHighlightFragment:\n%s", body)
+	}
+}
+
+// TestBuildSearchAllHighlight_NoRequestEncoder pins the same "no request-level
+// encoder" invariant on the mixed highlighter. Critical because this builder
+// feeds four call sites (_search_all, _search_global_messages ×2,
+// _search_global_groups top_hits) whose snippet fragments become the pre-
+// existing MessageHit.Snippet wire value — an encoder here would change that
+// field's encoding on four endpoints while leaving /_search
+// (buildSearchMessagesHighlight) raw.
+func TestBuildSearchAllHighlight_NoRequestEncoder(t *testing.T) {
+	body := asJSONString(t, buildSearchAllHighlight())
+	if strings.Contains(body, `"encoder"`) {
+		t.Errorf("buildSearchAllHighlight() must NOT set a request-level encoder; MessageHit.Snippet must stay raw. Escaping for the two new file fields is done in Go via escapeHighlightFragment:\n%s", body)
+	}
+}
+
+// TestBuildSearchAllHighlight_FileNameWholeField pins the P1 alignment with the
+// file-tab highlighter: payload.file.name is rendered whole (in-place <mark>)
+// on both tabs, so a long or multi-sentence file name never gets truncated to
+// a single "best passage" only on the chat tab.
+func TestBuildSearchAllHighlight_FileNameWholeField(t *testing.T) {
+	body := asJSONString(t, buildSearchAllHighlight())
+	// The Fields() builder serialises as `"fields":{"payload.file.name":{...}}`,
+	// so the tolerant assertion is "the payload.file.name entry carries
+	// number_of_fragments:0 within its own object". A regex that matches the
+	// field key followed (allowing nested chars) by the pair — before the next
+	// field key or closing brace — keeps the assertion tolerant to key order.
+	pat := regexp.MustCompile(`"payload\.file\.name":\{[^{}]*"number_of_fragments":0[^{}]*\}`)
+	if !pat.MatchString(body) {
+		t.Errorf("_search_all highlight for payload.file.name must set number_of_fragments=0 to match file-tab whole-field behaviour:\n%s", body)
 	}
 }
 
@@ -1278,4 +1328,36 @@ func TestPaginate_VirtualSiblingsCrossPageBoundary(t *testing.T) {
 		t.Fatalf("search_after[2] must be subSeq=2 (last hit of page 1); got %v", sa[2])
 	}
 	_ = lastSA
+}
+
+// TestBuildSearchGroupsPreviewHighlight_ExcludesFileContent pins that the
+// groups-preview highlighter never allocates a payload.file.content fragment.
+// pickSnippet does not read that field, and the aggregation runs against up
+// to 8000 docs per request — scanning 30-100 KB Tika bodies would be pure
+// waste that pushes the request past OCTO_SEARCH_TIMEOUT.
+func TestBuildSearchGroupsPreviewHighlight_ExcludesFileContent(t *testing.T) {
+	body := asJSONString(t, buildSearchGroupsPreviewHighlight())
+	if strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must NOT highlight payload.file.content (pickSnippet does not read it; 30-100 KB body scan × 8000 docs would blow OCTO_SEARCH_TIMEOUT):\n%s", body)
+	}
+}
+
+// TestBuildSearchGroupsPreviewHighlight_FileNameFragmentSize pins that
+// payload.file.name is fragment-sized (120-char window, not whole-field). The
+// groups path feeds pickSnippet → MessageHit.Snippet, which by long-shipped
+// contract carries raw uploader-controlled text; whole-field mode would widen
+// a pre-existing raw-name-length concern from 120 chars to unbounded. Fixing
+// the pre-existing raw-Snippet contract is out of scope for this PR.
+func TestBuildSearchGroupsPreviewHighlight_FileNameFragmentSize(t *testing.T) {
+	body := asJSONString(t, buildSearchGroupsPreviewHighlight())
+	if !strings.Contains(body, `"fragment_size":120`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must keep fragment_size=120 (pre-existing shipped behaviour):\n%s", body)
+	}
+	if !strings.Contains(body, `"number_of_fragments":1`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must keep number_of_fragments=1 for payload.file.name (no whole-field widening on the raw-Snippet path):\n%s", body)
+	}
+	// Explicitly assert we did NOT include the file-tab's NumOfFragments(0) override.
+	if strings.Contains(body, `"payload.file.name":{"number_of_fragments":0}`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must not set payload.file.name to NumOfFragments(0) — that would widen a pre-existing raw-Snippet vector:\n%s", body)
+	}
 }

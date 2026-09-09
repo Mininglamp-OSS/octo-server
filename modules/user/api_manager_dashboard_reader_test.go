@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
+	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
@@ -44,13 +45,22 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	ctx.SetHttpRoute(route)
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
 	resetManagerUIDRateLimit(t, ctx)
 	m := NewManager(ctx)
 	stopRollout, err := testsession.StartRollout(ctx, "manager-route-test")
 	require.NoError(t, err)
 	t.Cleanup(stopRollout)
 	m.Route(route)
-	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
+	t.Cleanup(func() {
+		if err := testutil.CleanAllTables(ctx); err != nil {
+			t.Logf("cleanup: clean tables failed: %v", err)
+			return
+		}
+		if err := commonsettings.EnsureSystemSettings(ctx).Reload(); err != nil {
+			t.Logf("cleanup: reload SystemSettings failed: %v", err)
+		}
+	})
 	return route, ctx, m
 }
 
@@ -82,9 +92,10 @@ func TestManagerLoginAllowsDashboardReader(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"role":"`+appauth.ManagerRoleDashboardReader+`"`)
 }
 
-func TestDashboardReaderRoleTransition(t *testing.T) {
+func TestFixedManagerRoleTransition(t *testing.T) {
 	tests := []struct {
 		name        string
+		role        string
 		currentRole string
 		grant       bool
 		wantRole    string
@@ -101,11 +112,31 @@ func TestDashboardReaderRoleTransition(t *testing.T) {
 		{name: "do not revoke admin inheritance", currentRole: string(wkhttp.Admin)},
 		{name: "protect superAdmin revoke", currentRole: string(wkhttp.SuperAdmin)},
 		{name: "reject unknown revoke", currentRole: "future-role"},
+
+		// marketAdmin reuses the same policy.
+		{name: "market grant normal", role: appauth.ManagerRoleMarketAdmin, grant: true, wantRole: appauth.ManagerRoleMarketAdmin, wantChanged: true, wantAllowed: true},
+		{name: "market downgrade admin", role: appauth.ManagerRoleMarketAdmin, currentRole: string(wkhttp.Admin), grant: true, wantRole: appauth.ManagerRoleMarketAdmin, wantChanged: true, wantAllowed: true},
+		{name: "market grant idempotent", role: appauth.ManagerRoleMarketAdmin, currentRole: appauth.ManagerRoleMarketAdmin, grant: true, wantRole: appauth.ManagerRoleMarketAdmin, wantAllowed: true},
+		{name: "market protect superAdmin grant", role: appauth.ManagerRoleMarketAdmin, currentRole: string(wkhttp.SuperAdmin), grant: true},
+		{name: "market revoke", role: appauth.ManagerRoleMarketAdmin, currentRole: appauth.ManagerRoleMarketAdmin, wantChanged: true, wantAllowed: true},
+
+		// user.role is single-valued, so the fixed roles are mutually exclusive:
+		// swapping one for the other must be an explicit revoke-then-grant, never
+		// an implicit side effect of a grant (and revoking role A must not touch
+		// an account currently holding role B).
+		{name: "reject swapping reader to market", role: appauth.ManagerRoleMarketAdmin, currentRole: appauth.ManagerRoleDashboardReader, grant: true},
+		{name: "reject swapping market to reader", role: appauth.ManagerRoleDashboardReader, currentRole: appauth.ManagerRoleMarketAdmin, grant: true},
+		{name: "market revoke leaves reader alone", role: appauth.ManagerRoleMarketAdmin, currentRole: appauth.ManagerRoleDashboardReader},
+		{name: "reader revoke leaves market alone", role: appauth.ManagerRoleDashboardReader, currentRole: appauth.ManagerRoleMarketAdmin},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotRole, gotChanged, gotAllowed := dashboardReaderRoleTransition(tt.currentRole, tt.grant)
+			role := tt.role
+			if role == "" {
+				role = appauth.ManagerRoleDashboardReader
+			}
+			gotRole, gotChanged, gotAllowed := fixedManagerRoleTransition(tt.currentRole, role, tt.grant)
 			assert.Equal(t, tt.wantRole, gotRole)
 			assert.Equal(t, tt.wantChanged, gotChanged)
 			assert.Equal(t, tt.wantAllowed, gotAllowed)

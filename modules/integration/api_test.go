@@ -309,18 +309,18 @@ func TestNewConfigBranches(t *testing.T) {
 
 	t.Setenv("DM_OIDC_ENABLED", "false")
 	disabled := New(ctx)
-	assert.Nil(t, disabled.oidcClient)
+	assert.Nil(t, disabled.provider)
 
 	t.Setenv("DM_OIDC_ENABLED", "true")
 	t.Setenv("DM_OIDC_RT_ENC_KEY", "not-base64")
 	badConfig := New(ctx)
-	assert.Nil(t, badConfig.oidcClient)
+	assert.Nil(t, badConfig.provider)
 
 	rtKey := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	t.Setenv("DM_OIDC_RT_ENC_KEY", rtKey)
 	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "://bad")
 	badDiscovery := New(ctx)
-	assert.Nil(t, badDiscovery.oidcClient)
+	assert.Nil(t, badDiscovery.provider)
 }
 
 func TestIntegrationDBMissingClientAndBlankSpace(t *testing.T) {

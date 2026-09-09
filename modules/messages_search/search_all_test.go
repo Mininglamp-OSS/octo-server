@@ -32,6 +32,36 @@ func TestSingleSearchAllHit_File(t *testing.T) {
 	}
 }
 
+// TestSingleSearchAllHit_FileContentSnippet pins the V6 chat-tab path: when the
+// _search_all highlight map carries a payload.file.content fragment (body hit,
+// name did not match), the file result surfaces it as ContentSnippet so the
+// welded file card can render the body-match context. Mirrors the file-tab
+// contract but through the mixed _search_all dispatcher.
+func TestSingleSearchAllHit_FileContentSnippet(t *testing.T) {
+	tp := payloadTypeFile
+	doc := Doc{
+		MessageID:  101,
+		MessageSeq: 9,
+		From:       "u1",
+		Timestamp:  1717000000,
+		Payload: &Payload{
+			Type: &tp,
+			File: &FilePayload{Name: "gateway.xlsx", Ext: "xlsx", URL: "http://x"},
+		},
+	}
+	hl := map[string][]string{
+		"payload.file.content": {"预充值<mark>渠道</mark>,如用量很大请提前联系"},
+	}
+	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, hl)
+	if got.ResultType != "file" || got.File == nil {
+		t.Fatalf("expected file result, got %+v", got)
+	}
+	if got.File.ContentSnippet != "预充值<mark>渠道</mark>,如用量很大请提前联系" {
+		t.Errorf("content_snippet must flow from highlight map: got %q", got.File.ContentSnippet)
+	}
+}
+
 func TestSingleSearchAllHit_TextMessage(t *testing.T) {
 	tp := payloadTypeText
 	doc := Doc{

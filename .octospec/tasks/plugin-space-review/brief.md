@@ -361,3 +361,21 @@ code itself was making.
    pointed the tag-uniqueness invariant at `main_test.go` (it is in
    `ratelimit_tags_test.go`), and `modules/notify/config.go` described the
    collision set as "four pairs / five" when C(5,2) is ten.
+
+## PR #827 main-branch conflict resolution
+
+- Goal: merge current `main` while retaining the Space-review contract and the
+  upstream project-verification contract.
+- Load-bearing: preserve both marketplace and project-provisioning credential
+  exclusions; return Space roles alongside project answers, `context_error`, and
+  `spaces_truncated`; derive roles and memberships from the same capped rows.
+- Out of scope: new routes, credential policy changes, and unrelated refactors.
+- Acceptance: build and vet pass; focused role, notification, verify, and startup
+  checks pass; truncation and database-error tests assert both contracts together.
+
+Validation for this merge: `go build ./...`, `go vet ./...`, the CI unit-test
+script, i18n checks, and card-dispatch lint passed. Isolated MySQL/Redis/WuKongIM
+checks passed for 716 top-level tests across user verification, space, notify,
+internal resolution, bot mentions, startup, and the project credential guard
+(5 existing Space tests skipped). `make openapi-check` / `make openapi-diff`
+could not run because this checkout defines neither target.

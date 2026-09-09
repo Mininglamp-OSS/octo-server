@@ -18,6 +18,13 @@ import (
 // *config.Context.QuitUserDevice(uid, -1)，它不撤销 octo-server HTTP bearer。
 type sessionKiller interface {
 	Kick(ctx context.Context, uid string) error
+
+	// KickDevice 只断开指定 device_flag 的连接,其余端保持在线。
+	//
+	// logout 走这条(brief Decision 3:登出仅当前端),封号/改密走 Kick。
+	// 两者都放在这个接口上而不是让 handler 直接调 o.ctx —— 否则"踢哪些端"
+	// 这个决定就没有测试注入点,而它正是登出的爆炸半径。
+	KickDevice(ctx context.Context, uid string, deviceFlag uint8) error
 }
 
 // refresher 调 IdP /oauth/token grant_type=refresh_token。

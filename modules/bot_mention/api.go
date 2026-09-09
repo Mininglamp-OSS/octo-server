@@ -295,6 +295,11 @@ func mentionEventData(mention normalizedMention, enqueuedAt int64) map[string]in
 	if mention.ParentID != "" {
 		data["parent_id"] = mention.ParentID
 	}
+	// 只在非默认类型时出现:普通文档的事件载荷保持和加这个字段之前逐字节一致,
+	// 免得既有消费者的字段集断言(插件那份签进仓库的快照)无端变红。
+	if mention.DocKind != "" {
+		data["doc_kind"] = mention.DocKind
+	}
 	if mention.URL != "" {
 		data["url"] = mention.URL
 	}

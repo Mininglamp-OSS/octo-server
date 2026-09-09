@@ -1,0 +1,8 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: testing
+    source: repo
+brief: .octospec/tasks/notification-pause-manual-mode/brief.md

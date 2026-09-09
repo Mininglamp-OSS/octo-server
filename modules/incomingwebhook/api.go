@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -611,6 +612,16 @@ func (w *IncomingWebhook) resolveActor(c *wkhttp.Context, groupNo string) (mgmtA
 	}
 	if !isMember {
 		mgmtForbidden(c)
+		return mgmtActor{}, false
+	}
+	protected, err := aiteampkg.IsProtectedGroup(w.ctx.DB(), groupNo)
+	if err != nil {
+		w.Error("query group purpose failed", zap.String("group_no", groupNo), zap.Error(err))
+		mgmtQueryFailed(c)
+		return mgmtActor{}, false
+	}
+	if protected {
+		mgmtContainerProtected(c)
 		return mgmtActor{}, false
 	}
 	return mgmtActor{uid: uid, isAdmin: isAdmin}, true

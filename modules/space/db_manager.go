@@ -198,23 +198,48 @@ func (d *managerDB) isUserExists(uid string) (bool, error) {
 }
 
 // forceDisbandSpace 管理员强制解散：标记 space 状态为 0，同时将所有成员置为已移除
-func (d *managerDB) forceDisbandSpace(spaceId string) error {
+// 返回本次真正被移除的成员 UID，供调用方逐个做缓存失效与事件广播。
+func (d *managerDB) forceDisbandSpace(spaceId string, operatorUID string) ([]string, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.RollbackUnlessCommitted()
 
 	now := time.Now()
+	// 先用 FOR UPDATE 锁定并读出活跃成员，再动任何 UPDATE。
+	//
+	// 顺序和锁都是必要的：普通 SELECT 在 REPEATABLE READ 下建立的是快照读，而后面
+	// 的 UPDATE 是当前读。两者之间若有成员并发加入，UPDATE 会把他一并置 0，但他不在
+	// 快照名单里 —— 于是没有清理工单、没有缓存失效，人被移出了一个已解散的空间，
+	// 却还留在该空间的所有群里、IM 群订阅也原封不动。加锁读挡住的是这一种。
+	//
+	// 它**没有**关掉整个「解散期间并发加入」窗口：gap lock 只是让那次插入等到本事务
+	// 提交，之后它照样往一个 status=0 的空间里写一行 status=1，而且没有清理工单
+	// （joinPresetGroups 也不复核成员身份，人还可能落进已解散空间的预设群）。
+	// 那个孤儿过不了 SpaceMiddleware（谓词带 space.status），所以影响限于群内。
+	// 彻底关闭要让加入侧的事务在锁内复核 space.status，记在 follow-up。
+	uids, err := lockActiveMemberUIDsTx(tx, spaceId)
+	if err != nil {
+		return nil, err
+	}
 	if _, err = tx.Update("space").Set("status", 0).Set("updated_at", now).
 		Where("space_id=?", spaceId).Exec(); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err = tx.Update("space_member").Set("status", 0).Set("updated_at", now).
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.Commit()
+	// 批量入队：本事务正握着 space_member 的 FOR UPDATE 范围锁，逐条 INSERT 会把
+	// 上万次往返都压在锁内，期间所有并发加入路径全部阻塞。
+	if err := enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return uids, nil
 }
 
 // queryMembersAdmin 管理后台查询空间成员（含已移除，支持 keyword）
@@ -409,13 +434,14 @@ var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer owner
 //
 // 反向窗口（先本事务删除 → 再被并发 transfer 提升为 owner）由 transferOwnerAdmin 内部的
 // `AND status=1` 守卫关掉：本事务 commit 后该 uid 的 status=0，后续 transfer 的 UPDATE 影响 0 行。
-func (d *managerDB) removeMembersForce(spaceId string, uids []string) error {
+// 返回本次真正被移除的 uid，供调用方精确地做失效缓存与事件广播。
+func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUID string) ([]string, error) {
 	if len(uids) == 0 {
-		return nil
+		return nil, nil
 	}
 	tx, err := d.session.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.RollbackUnlessCommitted()
 
@@ -424,22 +450,41 @@ func (d *managerDB) removeMembersForce(spaceId string, uids []string) error {
 		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid IN ? AND role=2 AND status=1 FOR UPDATE",
 		spaceId, uids,
 	).Load(&ownerCount); err != nil {
-		return err
+		return nil, err
 	}
 	if ownerCount > 0 {
-		return ErrCannotRemoveOwner
+		return nil, ErrCannotRemoveOwner
 	}
 
 	now := time.Now()
+	removed := make([]string, 0, len(uids))
 	for _, uid := range uids {
-		if _, err := tx.Update("space_member").
+		result, err := tx.Update("space_member").
 			Set("status", 0).
 			Set("updated_at", now).
-			Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
-			return err
+			Where("space_id=? AND uid=? AND status=1", spaceId, uid).Exec()
+		if err != nil {
+			return nil, err
 		}
+		// 只给真正被改动的成员行入队。此前这里没有 status=1 谓词，对已移除 / 不存在
+		// 的 uid 也会"更新"一次；无谓词地入队会产出永远无事可做的工单，还会让
+		// 一次误传的 uid 触发一遍别人的会话面清理。
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected == 0 {
+			continue
+		}
+		if err := enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved); err != nil {
+			return nil, err
+		}
+		removed = append(removed, uid)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return removed, nil
 }
 
 // ErrTransferTargetMissing 目标成员不存在或已被移除，不能成为新 owner
@@ -503,10 +548,19 @@ var ErrRemoveHierarchy = errors.New("operator does not outrank removal target")
 //   - 目标 role == 2 → ErrCannotRemoveOwner；
 //   - 目标 role >= rejectRoleAtOrAbove → ErrRemoveHierarchy
 //     （removeMembers 传操作者角色，实现「仅可移除更低角色」；自助退出传 2，仅拦 owner）。
-func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAbove int) error {
+//
+// 返回值 removed 表示这次是否真的改动了成员行。调用方据此决定要不要做失效缓存 /
+// 广播事件 / 触发清理 —— 「行本来就不存在」与「真的移除了」都返回 nil error，
+// 只看 error 分不出来，会对着非成员空跑一整套收尾。
+//
+// 真正改动了成员行时，会在**同一事务内**写出会话面清理工单
+// （transactional outbox，见 enqueueMemberRemovalCleanupTx）：这样成员行提交与
+// 清理任务落库同生共死，进程在两者之间崩溃也不会留下"已移除但没清理"的成员。
+// 提前返回的三条分支（行不存在 / owner / 角色不够）都没有改动成员行，因此不入队。
+func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) (bool, error) {
 	tx, err := sess.Begin()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.RollbackUnlessCommitted()
 
@@ -515,23 +569,29 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 		"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 FOR UPDATE",
 		spaceId, uid,
 	).Load(&roles); err != nil {
-		return err
+		return false, err
 	}
 	if len(roles) == 0 {
-		return nil
+		return false, nil
 	}
 	if roles[0] == 2 {
-		return ErrCannotRemoveOwner
+		return false, ErrCannotRemoveOwner
 	}
 	if roles[0] >= rejectRoleAtOrAbove {
-		return ErrRemoveHierarchy
+		return false, ErrRemoveHierarchy
 	}
 	if _, err = tx.Update("space_member").
 		Set("status", 0).Set("updated_at", time.Now()).
 		Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	if err = enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, reason); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // queryInvitesAdmin 分页查询空间所有邀请码（含已禁用）

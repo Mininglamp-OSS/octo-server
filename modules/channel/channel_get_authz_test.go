@@ -346,8 +346,27 @@ func TestChannelGet_Person_SameSpace_Full(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "short_no", "同 Space 可直接聊天，资料应完整下发")
 }
 
-// PERSON 系统账号：无需任何关系即可查看（category=system / customerService）。
-func TestChannelGet_Person_SystemAccount_Viewable(t *testing.T) {
+// PERSON 系统 Bot：pkg/space.SystemBots 白名单里的账号无需任何关系即可查看完整资料。
+// 用 robot=0 的 fileHelper（而非 robot=1 的 u_10000），确保命中 SystemBot 分支而非 Robot
+// 分支——CleanAllTables 已清掉迁移预置的 fileHelper，这里重新建号无冲突。
+func TestChannelGet_Person_SystemBot_Viewable(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "fileHelper", Name: "SystemBot", ShortNo: "SNSYSBOT",
+	}))
+
+	w := getChannel(s, "fileHelper", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "SystemBot")
+	assert.Contains(t, w.Body.String(), `"short_no":`, "白名单系统 Bot 资料应完整可查，不被降级为最小集")
+}
+
+// 回归（本次收紧的核心）：category=system 但**不在** SystemBots 白名单的账号（如 admin
+// 超管号）不再享受系统放行，无可见关系时必须降级为最小集，不得整份下发身份字段。
+func TestChannelGet_Person_SystemCategoryNotWhitelisted_Minimal(t *testing.T) {
 	s, ctx := newChannelAuthzServer(t)
 	defer testutil.CleanAllTables(ctx)
 
@@ -359,8 +378,26 @@ func TestChannelGet_Person_SystemAccount_Viewable(t *testing.T) {
 	w := getChannel(s, "t_sysacct", common.ChannelTypePerson.Uint8())
 
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), "SystemAccount")
-	assert.Contains(t, w.Body.String(), "short_no", "系统账号资料应完整可查，不被降级为最小集")
+	assert.NotContains(t, w.Body.String(), `"short_no":`,
+		"非白名单的 category=system 账号无关系时必须降级为最小集，不得泄露身份字段")
+}
+
+// 同上，锁住被移除判定的另一半：`customerService` 也不再享受身份放行（两端对称，
+// 一边漏掉就会静默重开同一越权面）。
+func TestChannelGet_Person_CustomerServiceCategoryNotWhitelisted_Minimal(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_csacct", Name: "CustomerServiceAcct", ShortNo: "SNCSACCT",
+	}))
+	setUserCategory(t, ctx, "t_csacct", user.CategoryCustomerService)
+
+	w := getChannel(s, "t_csacct", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"short_no":`,
+		"customerService 账号无关系时同样必须降级为最小集")
 }
 
 // 最小集的 JSON 线上形状（判定与构造已收口到 modules/channel/service，纯逻辑分支在

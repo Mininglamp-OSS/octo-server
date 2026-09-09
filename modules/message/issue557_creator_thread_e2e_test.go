@@ -276,7 +276,7 @@ func issue557FollowTabThreadItems(t *testing.T, sb *Sidebar, loginUID string, un
 		nil, rows, lastMsgAt,
 		map[string]*GroupCategorySetting{}, // 父群未分类
 		unfollowedGroups,
-		map[string]string{}, map[string]string{}, "",
+		map[string]string{}, nil, map[string]string{}, "",
 		selfCreated,
 		statusMap,
 	)

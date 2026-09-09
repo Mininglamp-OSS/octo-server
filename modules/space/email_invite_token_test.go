@@ -43,7 +43,7 @@ func TestMaskInviteEmail(t *testing.T) {
 		{"foo@a.b.example.com", "fo***@a***.com"},
 		{"", "***"},
 		{"@", "***"},
-		{"a@b", "***"},     // 域无 . 视为非法
+		{"a@b", "***"}, // 域无 . 视为非法
 		{"a@", "***"},
 		{"@b.com", "***"},
 	}

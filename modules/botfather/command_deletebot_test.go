@@ -1,14 +1,72 @@
 package botfather
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-lib/common"
-	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type deleteBotGroupServiceSpy struct {
+	group.IService
+	cleaned []string
+}
+
+func (s *deleteBotGroupServiceSpy) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
+	s.cleaned = append(s.cleaned, uid)
+	return nil
+}
+
+func TestDeleteBotCommandUsesLifecycleCleanup(t *testing.T) {
+	spy := &deleteBotGroupServiceSpy{}
+	h := &commandHandler{groupService: spy}
+	h.removeBotFromGroups("bot")
+	assert.Equal(t, []string{"bot"}, spy.cleaned)
+}
+
+func TestDeleteUserBotRemovesAITeamContainerMembership(t *testing.T) {
+	route, ctx := newUserAPITestServer(t)
+	ownerUID := "owner_" + util.GenerUUID()[:8]
+	botUID := "bot_" + util.GenerUUID()[:8]
+	groupNo := "ai_" + util.GenerUUID()[:8]
+	spaceID := "space_" + util.GenerUUID()[:8]
+	insertTestUser(t, ctx, ownerUID, "owner")
+	insertTestUser(t, ctx, botUID, "bot")
+	insertTestBotUser(t, ctx, botUID)
+	insertTestBot(t, ctx, botUID, ownerUID)
+	token := mintUserAPIKey(t, ctx, ownerUID)
+
+	groupDB := group.NewDB(ctx)
+	require.NoError(t, groupDB.Insert(&group.Model{
+		GroupNo: groupNo, Name: "AI container", Creator: ownerUID,
+		SpaceID: spaceID, Status: group.GroupStatusNormal,
+		Purpose: "ai_session_container",
+	}))
+	for _, member := range []*group.MemberModel{
+		{GroupNo: groupNo, UID: ownerUID, Role: group.MemberRoleCreator, Status: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID())},
+		{GroupNo: groupNo, UID: botUID, Role: group.MemberRoleCommon, Status: 1, Robot: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID())},
+	} {
+		require.NoError(t, groupDB.InsertMember(member))
+	}
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, userAPIRequest(t, http.MethodDelete, "/v1/user/bots/"+botUID, token, nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var active int
+	_, err := ctx.DB().Select("COUNT(*)").From("group_member").
+		Where("group_no=? AND uid=? AND is_deleted=0", groupNo, botUID).Load(&active)
+	require.NoError(t, err)
+	assert.Zero(t, active, "REST deletion must remove the Bot from its protected AI container")
+}
 
 // TestDeleteBotCleansUpGroupMembers verifies that deleting a bot
 // removes it from all group_member records.

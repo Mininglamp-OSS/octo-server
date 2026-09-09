@@ -1,11 +1,14 @@
 package common
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -179,12 +183,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// Validate everything first so a malformed item never produces a
 	// half-applied write. The actual writes happen later in one
 	// transaction.
-	type prepared struct {
-		def   *settingDef
-		value string
-		skip  bool
-	}
-	plans := make([]prepared, 0, len(req.Items))
+	plans := make([]preparedSetting, 0, len(req.Items))
 	for _, item := range req.Items {
 		def := findSchemaDef(item.Category, item.Key)
 		if def == nil {
@@ -194,7 +193,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			return
 		}
 
-		p := prepared{def: def, value: item.Value}
+		p := preparedSetting{def: def, value: item.Value, effectiveValue: item.Value}
 		switch def.Type {
 		case settingTypeBool:
 			normalised, ok := normaliseBool(item.Value)
@@ -268,6 +267,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				// ciphertext — do not queue an upsert that would blank it out
 				// or accidentally store "****" as the real password.
 				p.skip = true
+				if item.Category == "support" && item.Key == "email_pwd" {
+					p.effectiveValue = m.systemSettings.SupportEmailPwd()
+				}
 				break
 			}
 			enc, err := encryptKey(item.Value)
@@ -283,10 +285,76 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				return
 			}
 			p.value = enc
+			p.effectiveValue = item.Value
 		case settingTypeString:
 			// Anything goes.
 		}
+		if def.Type != settingTypeEncrypted {
+			p.effectiveValue = p.value
+		}
 		plans = append(plans, p)
+	}
+
+	// Manager MFA uses the merged final configuration. This check is purposely
+	// before the database transaction: a failed SMTP preflight cannot leave a
+	// partially committed MFA switch or SMTP value behind.
+	managerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
+	managerMFATouched := false
+	smtpTouched := false
+	prospectiveSMTP := smtpSettingsSnapshot{
+		from:     m.systemSettings.SupportEmail(),
+		address:  m.systemSettings.SupportEmailSmtp(),
+		password: m.systemSettings.SupportEmailPwd(),
+	}
+	for _, p := range plans {
+		if p.def.Category == "login" && p.def.Key == "manager_email_mfa_on" {
+			managerMFATouched = true
+			managerMFAOn = p.value == "1"
+		}
+		if p.def.Category == "support" && !p.skip {
+			switch p.def.Key {
+			case "email":
+				prospectiveSMTP.from = p.effectiveValue
+				smtpTouched = true
+			case "email_smtp":
+				prospectiveSMTP.address = p.effectiveValue
+				smtpTouched = true
+			case "email_pwd":
+				prospectiveSMTP.password = p.effectiveValue
+				smtpTouched = true
+			}
+		}
+	}
+	managerMFAProbeSucceeded := false
+	if managerMFAOn && (managerMFATouched || smtpTouched) {
+		if err := commonbase.ValidateSMTPConfiguration(
+			prospectiveSMTP.address, prospectiveSMTP.from, prospectiveSMTP.password,
+		); err != nil {
+			m.Warn("管理端 MFA SMTP 配置校验失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+		probeErr := commonbase.NewEmailService(m.ctx, prospectiveSMTP).PreflightSMTP(probeCtx)
+		cancel()
+		if probeErr != nil {
+			m.Warn("管理端 MFA SMTP 预检失败", zap.Error(probeErr))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrUserManagerMFAMisconfigured, nil, nil)
+			return
+		}
+		managerMFAProbeSucceeded = true
+	}
+	if managerMFAOn && managerMFATouched {
+		var operator struct{ Email string }
+		if _, err := m.ctx.DB().Select("email").From("user").Where("uid=?", c.GetLoginUID()).Load(&operator); err != nil {
+			m.Error("查询开启管理端 MFA 的超管邮箱失败", zap.Error(err))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrUserQueryFailed, nil, nil)
+			return
+		}
+		if err := commonbase.ValidateEmailAddress(strings.TrimSpace(operator.Email)); err != nil {
+			httperr.ResponseErrorL(c, errcode.ErrUserManagerMFAEmailRequired, nil, nil)
+			return
+		}
 	}
 
 	// Prospective composite validation for the onboarding space-welcome
@@ -340,6 +408,58 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 
+	// OIDC initial-Space target validation (task oidc-auto-join-initial-space).
+	//
+	// Single-key check, so there is no merge-with-snapshot step like the
+	// onboarding block above needs: the value being written is the whole
+	// configuration. Empty is always legal and means "feature off".
+	//
+	// The value is trimmed into the plan rather than only for the check, so the
+	// stored value, the GET response's `value` and its `effective_value` (the
+	// getter trims on read) all agree. A pasted space_id carrying trailing
+	// whitespace would otherwise be stored verbatim, read back as configured,
+	// and miss on every lookup.
+	//
+	// Validating here — before the transaction — is the only moment an operator
+	// can be told the id is wrong: the consumer runs on a later OIDC account
+	// creation and is required to fail silently there (login must not break).
+	// Every matching plan is trimmed, and the LAST one is what gets validated:
+	// the write loop below upserts each plan in order, so two items naming this
+	// key leave the second one in the database. Stopping at the first match
+	// would approve one value and store another — a 200 for a configuration
+	// pointing at a Space that does not exist. The onboarding and archive
+	// guards above judge their merged last-wins value for the same reason.
+	oidcInitialSpace := ""
+	oidcInitialSpaceSet := false
+	for i := range plans {
+		if plans[i].def.Category != "space" || plans[i].def.Key != "oidc_initial_space_id" {
+			continue
+		}
+		trimmed := strings.TrimSpace(plans[i].value)
+		plans[i].value = trimmed
+		plans[i].effectiveValue = trimmed
+		oidcInitialSpace = trimmed
+		oidcInitialSpaceSet = true
+	}
+	if oidcInitialSpaceSet && oidcInitialSpace != "" {
+		active, err := spacepkg.IsSpaceActive(m.ctx.DB(), oidcInitialSpace)
+		if err != nil {
+			// Infrastructure error (Space lookup failed). Do not leak the DB
+			// detail — log it, respond with the generic internal code.
+			m.Error("校验 OIDC 初始 Space 失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		if !active {
+			m.Warn("拒绝写入 OIDC 初始 Space：目标空间不存在或已解散/封禁",
+				zap.String("space_id", oidcInitialSpace),
+				zap.String("operator", c.GetLoginUID()))
+			httperr.ResponseErrorL(c, errcode.ErrOIDCInitialSpaceInvalid, nil,
+				i18n.Details{"field": "oidc_initial_space_id"})
+			return
+		}
+	}
+
 	// Two-stage-decay ordering guard (task inactive-hiding-user-control / P1).
 	// Same merge-then-validate shape as the onboarding block above: a partial
 	// update must be checked against merge(current snapshot, incoming items),
@@ -369,6 +489,16 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			return
 		}
 	}
+
+	// file.* 键的写侧校验（长度/条数、内置黑名单、与贴纸上限的组合）。
+	// 实现在 api_manager_system_setting_file.go —— 这个 handler 已经过长，
+	// 新增校验不再往里堆。
+	if m.rejectInvalidFileSettingWrites(c, plans) {
+		return
+	}
+
+	// 变更审计：旧值必须在写入**前**从当前快照捕获，提交后再落日志。
+	audits := m.collectSettingAudits(plans)
 
 	// Atomic batch: open one transaction, queue every upsert, commit only
 	// if all rows succeed. A mid-batch DB failure rolls back everything
@@ -404,10 +534,31 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	}
 	committed = true
 
-	if err := m.systemSettings.Reload(); err != nil {
-		// Reload is best-effort — the row is already persisted, so other
-		// instances and the next auto-reload tick will pick it up.
-		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(err))
+	// The merged prospective configuration was already SMTP-probed before the
+	// transaction. Use the no-probe load here so this instance publishes that
+	// result without sending a duplicate probe email; generic Reload callers
+	// still trigger a one-shot probe when they observe a settings change.
+	generation, reloadErr := m.systemSettings.loadWithGeneration(false)
+	if reloadErr != nil {
+		// 配置已提交但本实例 reload 失败：属于系统配置基础设施故障，本实例仍在
+		// 服务旧快照，最长等到下一次 60s 自动 reload 才收敛。
+		//
+		// 这条路径**不回滚**已提交的事务 —— 落库本身是对的，其他实例照常在一个
+		// 收敛窗口内拿到新值。但它也不能继续返回一个无差别的 200：紧急封堵某个
+		// 扩展名（file.extra_blocked_extensions）时，运维会据此以为封堵已生效。
+		// 生效状态经响应体的 `applied` 字段回带（见下），日志升级为 Error。
+		m.Error("Reload SystemSettings 失败，本实例仍在旧快照，等待自动刷新",
+			zap.Error(reloadErr),
+			zap.String("trace_id", c.GetString(reqid.GinKey)),
+			zap.String("operator", c.GetLoginUID()))
+	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
+		// The probe above used the merged prospective values. Publish its
+		// result only when the live snapshot still contains those exact values;
+		// a concurrent partial SMTP update must not make an unprobed
+		// combination look ready.
+		if !m.systemSettings.RecordManagerEmailMFAPreflightIfMatches(generation, prospectiveSMTP) {
+			m.Warn("丢弃与当前配置不匹配的管理端 MFA SMTP 预检结果")
+		}
 	}
 
 	// 写入若涉及 login.local_off,直接用刚刚校验过的 plan.value 触发 safety
@@ -425,7 +576,24 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 
-	c.ResponseOK()
+	m.finishSettingUpdate(c, audits, reloadErr)
+}
+
+// finishSettingUpdate 落变更审计并回应写入结果。
+//
+// 响应保留 status 字段让老管理台前端原样工作；applied 是新增的生效状态：
+// false = 已入库但本实例 reload 失败、仍在服务旧快照，其他实例最长 60s 内跟上。
+// 紧急封堵时运维需要看到这个区别，而不是一个无差别的 200。
+func (m *Manager) finishSettingUpdate(c *wkhttp.Context, audits []settingAuditEntry, reloadErr error) {
+	operator := c.GetLoginUID()
+	traceID := c.GetString(reqid.GinKey)
+	for _, a := range audits {
+		m.Info("system_setting 变更", settingAuditFields(a, operator, traceID, reloadErr == nil)...)
+	}
+	c.Response(jsonH{
+		"status":  http.StatusOK,
+		"applied": reloadErr == nil,
+	})
 }
 
 // testSystemSettingEmail handles POST /v1/manager/common/system_setting/test_email.
@@ -586,6 +754,16 @@ const smtpTestEmailHTML = `<!doctype html>
 // jsonH is a tiny alias for inline JSON payloads. We define a local alias
 // instead of importing gin.H to keep the surface visible at the call site.
 type jsonH = map[string]interface{}
+
+type smtpSettingsSnapshot struct {
+	from     string
+	address  string
+	password string
+}
+
+func (s smtpSettingsSnapshot) SupportEmail() string     { return s.from }
+func (s smtpSettingsSnapshot) SupportEmailSmtp() string { return s.address }
+func (s smtpSettingsSnapshot) SupportEmailPwd() string  { return s.password }
 
 // normaliseBool canonicalises any accepted bool spelling to "0" / "1" so
 // the raw DB rows are consistent regardless of admin UI capitalisation.

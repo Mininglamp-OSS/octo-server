@@ -34,6 +34,78 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "The File Helper cannot be added to a group.",
 	})
+	// ErrGroupProjectUnavailable refuses a group creation naming a project that
+	// cannot own it: absent, disbanded, or belonging to a different Space.
+	//
+	// ONE code for all three, and the reason never reaches the wire. Splitting
+	// them would turn group creation into an oracle: a caller holding a project
+	// id they cannot otherwise see could learn whether it exists and which Space
+	// it lives in, using only a Space they DO have access to. The distinguishing
+	// reason goes to the log.
+	ErrGroupProjectUnavailable = register(codes.Code{
+		ID:             "err.server.group.project_unavailable",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This project is unavailable.",
+	})
+	// ErrGroupProjectMemberRequired refuses an admission into a group that
+	// belongs to a Project when the target is not an active member of that
+	// Project (invariant I2).
+	//
+	// ONE code for every refusal reason, deliberately. The gate can refuse
+	// because the uid is not in the project, because their project seat is
+	// being closed (removing = 1), or because they lost their Space seat while
+	// the asynchronous cascade had not caught up. Emitting a distinct code per
+	// reason would turn "add this uid to a group" into an oracle for project
+	// membership — a caller could enumerate who belongs to a project they
+	// cannot see. The specific reason goes to the log and to the
+	// group_admission_rejected_total metric, never to the wire.
+	//
+	// The refused uids are NOT in Details for the same reason: the caller
+	// already knows which uids they sent, and echoing a subset back tells them
+	// which of those are project members.
+	ErrGroupProjectMemberRequired = register(codes.Code{
+		ID:             "err.server.group.project_member_required",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Only members of this project can be added to the group.",
+	})
+	// ErrGroupAllMemberGroupProtected refuses the FIVE group operations that
+	// would break a project's all-member group (P2 D7): disband, exit, remove a
+	// member, hand over the owner, and blacklist a member.
+	//
+	// The all-member group's roster IS the project's roster (invariant I4), so
+	// each of those has a project-side equivalent that must be used instead:
+	// leave the project, remove the member from the project, transfer project
+	// ownership. Disbanding has no equivalent — the group ends when the project
+	// does. Blacklisting has none either: it removes the member from the roster
+	// as a side effect, which is the same I4 break by another name.
+	//
+	// This list said "four" and omitted blacklist while the paragraph below
+	// already counted five call sites — and this is the one place a client author
+	// reads to find out what the code means. PR #855's tenth review.
+	//
+	// details.action names which of the five was refused, so a client can render
+	// the right redirection ("leave the project instead") rather than a generic
+	// refusal.
+	//
+	// What it exposes is BOUNDED, not nothing. Two of the five call sites — member
+	// removal and exit — run the guard before reading the caller's own membership,
+	// the exit one because the handler unsubscribes from the IM channel first and
+	// the guard has to precede that. So a non-member can learn from this refusal
+	// that the group belongs to a project. The bound is that the same handler's
+	// getGroupInfo has already answered "does this group exist" with its 404, so
+	// the increment is "and it is a project's". Stated accurately here because the
+	// next person to move the guard will cite this line.
+	//
+	// The refusal is on the HTTP handlers ONLY. The service-layer primitives stay
+	// open, because P1's project cascade, the Space-removal cascade, botfather's
+	// bot deletion and P2's own owner-sync hook all go through them — blocking
+	// there would block the very cascades that keep I2 and I4 true.
+	ErrGroupAllMemberGroupProtected = register(codes.Code{
+		ID:             "err.server.group.all_member_group_protected",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
+		SafeDetailKeys: []string{"action"},
+	})
 	ErrGroupCategorySpaceMismatch = register(codes.Code{
 		ID:             "err.server.group.category_space_mismatch",
 		HTTPStatus:     http.StatusBadRequest,
@@ -112,6 +184,11 @@ var (
 		ID:             "err.server.group.external_cannot_be_owner",
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "Group ownership cannot be transferred to an external member.",
+	})
+	ErrGroupBotCannotBeOwner = register(codes.Code{
+		ID:             "err.server.group.bot_cannot_be_owner",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Group ownership cannot be transferred to a bot.",
 	})
 	ErrGroupExternalJoinForbidden = register(codes.Code{
 		ID:             "err.server.group.external_join_forbidden",

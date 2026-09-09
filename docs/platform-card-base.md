@@ -549,6 +549,14 @@ func (r *Registry) RegisteredForTest() []Template
 }
 ```
 
+`card.channel_id` 与 legacy 扁平请求的 `channel_id` 同一来源（都取
+`cardactiondispatch.Event.ChannelID`），语义是**卡片 sender 视角**的频道标识，与
+`/v1/bot/sendMessage` 的 `channel_id` 一致：DM 取对端用户 UID（不是 sender 自己的
+UID，也不是点击客户端提交的那个值 —— 客户端报的是它自己的对端，即 bot）；群 / 子区
+的标识指频道自身，两端本就同名。上例里 `card.channel_id` 与 `actor.uid` 同为
+`uid_xxx`，正是普通 DM 下「对端就是点击者」的样子；但二者回答的是不同问题，不要拿它们
+相等当校验条件。
+
 `response_url` 当前为保留能力，不会出现在 payload 中。其请求体、鉴权、TTL、重放与
 运维归属尚未形成独立契约，在此之前不得发布不可调用的伪 URL。
 

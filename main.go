@@ -32,6 +32,7 @@ import (
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
+	"github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
@@ -51,6 +52,7 @@ import (
 	ratelimitpkg "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	rd "github.com/go-redis/redis"
 	"github.com/judwhite/go-svc"
@@ -117,6 +119,20 @@ func main() {
 		if err := runSessionRolloutCommand(os.Args[2:], os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
+		}
+		return
+	}
+
+	// `app cutover <domain> ...` — the shared one-way cutover operator surface
+	// (#627 msgextra, #697 botevent) — is dispatched the same way and for the
+	// same reason.
+	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) == cutoverCommand {
+		if err := runCutoverCommand(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			// 128+signum for an interrupt, 1 for everything else, so anything
+			// scripting a runbook can tell an operator's Ctrl-C (130) from the
+			// platform terminating the pod (143) from a refused activation.
+			os.Exit(cutoverExitCode(err))
 		}
 		return
 	}
@@ -262,6 +278,16 @@ func runAPI(ctx *config.Context) {
 		}
 		accessLogger(c)
 	})
+	// Authorization: Bearer → token 头回填。必须在任何 route group 的
+	// AuthMiddleware 之前执行（全局中间件天然满足），否则回填不生效。
+	//
+	// 为什么需要：octo-lib 的 AuthMiddleware 只认自定义的 `token` 头。接入外部
+	// IdP 之后，按标准 OAuth2 习惯开发的客户端会发 Authorization: Bearer，
+	// 于是「登录成功、后续每个调用 401」——只在集成联调阶段才暴露的断点。
+	//
+	// 纯增量：`token` 头优先，Authorization 头原样保留（bot / integration 类路由
+	// 直接读它），只认 Bearer，不接受 query 参数兜底。详见该函数注释。
+	route.UseGin(appwkhttp.BearerTokenCompat())
 	// 全局 per-IP 作为 DDoS 底线：办公室共享出网 IP 下 IM 基础量就能到 100+ rps
 	// （每人 1-2 rps × 数十人），200 余量过小；真实 DDoS 常数千 rps+，底线设 500
 	// 更合理。精细限流交给 UID 层和端点级严格桶（#1090）。
@@ -459,6 +485,22 @@ func runAPI(ctx *config.Context) {
 	if err != nil {
 		cardActionRuntime.Stop()
 		panic(err)
+	}
+	// The system-setting singleton may have been constructed before module
+	// migrations completed. Reload it now, then probe the effective SMTP only
+	// when management-console MFA is enabled. A failed probe is an operational
+	// warning, not a reason to panic the API process: the singleton records the
+	// failed readiness and the manager login gate remains fail-closed until a
+	// later successful probe or policy change.
+	managerMFASettings := commonmodule.EnsureSystemSettings(ctx)
+	if err := managerMFASettings.Load(); err != nil {
+		log.Warn("reload SystemSettings after module setup failed; manager MFA remains fail-closed until reload succeeds", zap.Error(err))
+	} else if managerMFASettings.ManagerEmailMFAState() == commonmodule.ManagerEmailMFAOn {
+		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := managerMFASettings.PreflightManagerEmailMFA(preflightCtx); err != nil {
+			log.Warn("manager-console MFA SMTP startup preflight failed; management login remains fail-closed", zap.Error(err))
+		}
+		preflightCancel()
 	}
 	stopSessionRollout, err = startSessionRolloutControl(ctx, tokenStore, sessionRedis)
 	if err != nil {
@@ -663,6 +705,21 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// Space role lookup AND route notify. Registered by qualified constant,
 		// not a literal, so main_wiring_test.go can assert it stays present.
 		os.Getenv(space.MarketplaceInternalTokenEnv),
+		// The two project provisioning secrets, for the same reason and with the same
+		// limitation: modules/project can check them against each other and against the
+		// four FIXED internal-token envs, but it cannot see the dynamic route-scoped
+		// notify tokens / callback secrets. Without these two arguments an operator who
+		// set a provisioning secret equal to a route's notify_token_env would pass every
+		// local check, and one leaked value would then authorize BOTH provisioning a
+		// container into fleet/drive AND minting that route's card action.
+		//
+		// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions in
+		// modules/project/provisioning_guard_test.go asserts both arguments stay present
+		// so a refactor cannot drop them silently. (This pointer exists so a future
+		// refactorer can find the guard — an earlier version named a file that does not
+		// exist, which defeats the only purpose the comment has.)
+		os.Getenv(project.ProvisionFleetSecretEnv),
+		os.Getenv(project.ProvisionDriveSecretEnv),
 	); err != nil {
 		return nil, err
 	}

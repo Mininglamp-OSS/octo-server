@@ -54,7 +54,21 @@ var webhookPushPrefixes = []string{
 // the line stays useful for correlation. Case-insensitive for the same reason as
 // ScrubPath — scrubbing is the security control, so it must survive casing
 // variants that a router would 404 but the logger would still print.
-var secretQueryInPath = regexp.MustCompile(`(?i)\b((?:poll_secret|auth_code|encrypt)=)[^&\s?"']*`)
+// OAuth2/OIDC additions: the callback carries `code` and `state` as query
+// parameters, and the token/userinfo calls of a plain-OAuth2 IdP carry
+// `client_secret` / `access_token` in the query string (that IdP's own reference
+// implementation puts them there and documents no alternative). All of these are
+// redeemable credential material, so they must never reach a log sink:
+//   - code           exchangeable for a token; on an IdP without PKCE its only
+//     protection is the client_secret
+//   - state          the single-use CSRF binding
+//   - client_secret  long-lived credential; re-issuing it is a vendor process
+//   - access_token / id_token / refresh_token  bearer material
+//
+// Alternation order matters: longer names must precede shorter ones that are
+// their suffix, otherwise `auth_code=` would be matched by the `code` branch and
+// only its tail would be masked.
+var secretQueryInPath = regexp.MustCompile(`(?i)\b((?:poll_secret|auth_code|client_secret|refresh_token|access_token|id_token|encrypt|code|state)=)[^&\s?"']*`)
 
 // authCodeInPath masks the redeemable scan-login auth code, which travels as a
 // path segment.

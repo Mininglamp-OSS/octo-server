@@ -144,12 +144,32 @@ for i = 1, 5 do redis.call('PEXPIRE', KEYS[i], ARGV[6]) end
 return 1
 `)
 
+// reclaimScript requeues leases whose expiry passed without an Ack/Nack/Defer (a crashed,
+// hung, or errored worker), so a dropped lease can never wedge an event in the leased set.
+// KEYS[9] is the route_missing_since marker. When the reclaimed lease belonged to an event
+// still in the route-missing defer loop, refund the claim's speculative attempt +1: claimScript
+// increments on every claim and only a completed Defer restores it (a claim->Defer re-check cycle
+// is net-zero), so a crash / Redis error / lease expiry in the window BETWEEN claim and Defer
+// would otherwise leak that +1. Across many self-heal cycles the counter creeps up until the
+// event reads attempt > MaxAttempts and dead-letters as attempts_exhausted on a route it never
+// got to try. The refund (floored at 0) makes a reclaimed defer cycle net-zero too. It is gated
+// on the marker so DELIVERY leases — which carry no marker and whose attempt legitimately counts a
+// real delivery try that bounds retries — are untouched (see TestRedisQueueLeaseTokenRetryDLQAndReplay,
+// where a markerless reclaim still advances to attempt 2). A crash before the first marker is written
+// (claim -> first RouteMissingSeenAt) leaks that cycle's +1, since reclaim then finds no marker;
+// normally the marker persists across the rest of the episode so only the first cycle is exposed (one
+// increment), and even a pathological loop that dies before every marker write yields at worst a
+// recoverable DLQ entry (attempts_exhausted, replayable) rather than silent loss.
 var reclaimScript = rd.NewScript(`
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 for _, id in ipairs(ids) do
   if redis.call('ZREM', KEYS[2], id) == 1 then
     redis.call('HDEL', KEYS[5], id)
     if redis.call('HEXISTS', KEYS[3], id) == 1 then
+      if redis.call('HEXISTS', KEYS[9], id) == 1 then
+        local attempt = tonumber(redis.call('HGET', KEYS[4], id) or '0')
+        if attempt > 0 then redis.call('HINCRBY', KEYS[4], id, -1) end
+      end
       redis.call('ZADD', KEYS[1], ARGV[1], id)
     end
   end
@@ -199,11 +219,16 @@ return #expired
 // first miss stamps now, later misses read the stored stamp, so the bounded route-missing
 // window is measured from the FIRST miss (not from Event.ActedAt). The marker is explicitly
 // removed on every exit transition — ackScript, nackScript (both requeue and dead-letter),
-// and replayDLQScript all HDEL the field — so the hash only ever holds markers for events
-// currently waiting in the route-missing defer loop and CANNOT grow unbounded under sustained
-// route-missing traffic (a whole-hash PEXPIRE cannot expire individual fields, so relying on
-// TTL alone would leak). The hash-level TTL refreshed here to liveTTL is only a backstop that
-// reaps the whole key once misses stop.
+// and replayDLQScript all HDEL the field — so in the normal case the hash only holds markers
+// for events currently waiting in the route-missing defer loop. That is not a guarantee: this
+// write is NOT fenced by the lease token, so a stalled call that lands after its event already
+// terminated re-plants a field no exit transition will ever run to reap again, while the
+// PEXPIRE below keeps pushing the whole key's expiry out under sustained traffic. Orphan
+// accumulation is slow and needs an in-flight write reordered past a lease loss, but it is
+// possible — tracked together with the related refund corner in #680. Absent that corner the
+// hash-level TTL refreshed here to liveTTL is only a backstop that reaps the whole key once
+// misses stop (a whole-hash PEXPIRE cannot expire individual fields, so relying on TTL alone
+// would leak).
 var routeMissingSinceScript = rd.NewScript(`
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if not v then
@@ -214,6 +239,37 @@ redis.call('PEXPIRE', KEYS[1], ARGV[3])
 return v
 `)
 
+// clearRouteMissingScript removes an event's route-missing first-seen marker once its route has
+// resolved at dispatch, so a lease that proceeds to delivery no longer looks like a deferred lease
+// to reclaimScript. It is token-protected (KEYS[5] = tokens): only the current lease owner may clear
+// the marker, so a stale worker whose lease was already reclaimed and re-leased cannot strip a marker
+// the newer owner still needs. KEYS[9] = route_missing_since. ARGV[1] = event_id, ARGV[2] = token.
+var clearRouteMissingScript = rd.NewScript(`
+if redis.call('HGET', KEYS[5], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[9], ARGV[1])
+return 1
+`)
+
+// minLiveTTL is the smallest LiveTTL NewRedisQueue accepts. It bounds exactly ONE window: a
+// route-missing re-check is re-scheduled routeMissingDeferInterval ahead while every queue
+// operation PEXPIREs the event's ready/payload keys to LiveTTL, so a LiveTTL at or below that
+// interval could let the deferred key expire BEFORE the event became claimable — silently
+// dropping it instead of delivering it. The margin (4×) leaves room to actually claim and
+// process the event after it becomes due, not merely to survive to the due instant.
+//
+// It deliberately does NOT establish that invariant for every schedule-ahead window in this
+// subsystem, and must not be read as doing so. Three others can exceed it: nackScript requeues
+// at now+retryBackoff (bounded by route.MaxBackoff — 1m by default, accepted up to 10m by
+// registry.go), the capacity-defer path re-schedules at now+DispatcherConfig.PollInterval (only
+// validated > 0, no upper bound), and DispatcherConfig.LeaseDuration defaults to 30s. Covering
+// those belongs in a cross-config check at dispatcher construction, where the values are known —
+// widening this constant to their ceiling would instead reject otherwise-valid
+// seconds-to-minutes configs. LiveTTL is Robot.MessageExpire, which defaults to 7 days and can
+// never sensibly sit in the seconds range (no user acts on a card that fast), so in practice
+// every real config clears all four; this floor only fails a pathological one fast at
+// construction (server boot) rather than dropping events at runtime.
+const minLiveTTL = 4 * routeMissingDeferInterval
+
 func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 	if client == nil {
 		return nil, errors.New("cardactiondispatch: Redis client is required")
@@ -223,6 +279,10 @@ func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 	}
 	if cfg.LiveTTL <= 0 || cfg.DLQRetention <= 0 {
 		return nil, errors.New("cardactiondispatch: queue retention must be positive")
+	}
+	if cfg.LiveTTL < minLiveTTL {
+		return nil, fmt.Errorf("cardactiondispatch: LiveTTL %s is below the %s floor required to outlast the route-missing defer interval (%s); a route-missing deferred event could expire before it becomes claimable",
+			cfg.LiveTTL, minLiveTTL, routeMissingDeferInterval)
 	}
 	base := cfg.Prefix + ":{queue}:"
 	return &RedisQueue{
@@ -433,6 +493,23 @@ func (q *RedisQueue) RouteMissingSeenAt(eventID int64, now time.Time) (time.Time
 		return time.Time{}, fmt.Errorf("cardactiondispatch: record route-missing first-seen: %w", err)
 	}
 	return time.UnixMilli(ms), nil
+}
+
+// ClearRouteMissing removes the durable route-missing first-seen marker for an event whose route has
+// resolved at dispatch. Once the route is present the event is no longer route-missing, so its lease
+// must be treated as a delivery lease by ReclaimExpired: without this, a once-route-missing event that
+// reaches delivery still carries the marker, and a hard crash during delivery (no Ack/Nack runs) would
+// have reclaimScript refund its attempt as though it were still a defer cycle — asymmetrically exempting
+// it from the MaxAttempts bound. Clearing the marker here makes a delivery-phase crash advance the
+// attempt like any delivery lease. Token-protected so only the current lease owner clears it; returns
+// true when this worker owned the lease.
+func (q *RedisQueue) ClearRouteMissing(eventID int64, token string) (bool, error) {
+	value, err := clearRouteMissingScript.Run(q.client, q.scriptKeys(),
+		strconv.FormatInt(eventID, 10), token).Int()
+	if err != nil {
+		return false, fmt.Errorf("cardactiondispatch: clear route-missing marker: %w", err)
+	}
+	return value == 1, nil
 }
 
 func newLeaseToken() (string, error) {

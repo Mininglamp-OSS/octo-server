@@ -1,5 +1,7 @@
 package category
 
+import aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+
 func (d *categoryDB) queryGroupSettingForCategory(groupNo, uid string) (*groupSettingCategoryRow, error) {
 	var row *groupSettingCategoryRow
 	_, err := d.session.Select("id", "group_no", "uid", "category_id", "category_sort").
@@ -42,10 +44,12 @@ func (d *categoryDB) updateGroupSettingCategory(id int64, categoryID *string, ca
 // QueryCategorySettingsByGroupNos: INNER/LEFT JOIN group_category gc ON
 // (gs.category_id, gs.uid) AND gc.status != 2, then SELECT gc.category_id so
 // dangling refs surface as NULL.  Out of scope here because:
-//   (a) issue #151 is scoped to the follow tab / sidebar materialization;
-//   (b) the API consumer of this function may rely on stale ids to render the
-//       "uncategorize-after-delete" affordance — needs PM input before
-//       changing user-visible behaviour.
+//
+//	(a) issue #151 is scoped to the follow tab / sidebar materialization;
+//	(b) the API consumer of this function may rely on stale ids to render the
+//	    "uncategorize-after-delete" affordance — needs PM input before
+//	    changing user-visible behaviour.
+//
 // Track this as a follow-up; see PR description for rationale.
 func (d *categoryDB) queryUserGroupsInSpace(uid, spaceID string) ([]*userGroupInfo, error) {
 	var results []*userGroupInfo
@@ -55,9 +59,9 @@ func (d *categoryDB) queryUserGroupsInSpace(uid, spaceID string) ([]*userGroupIn
 		FROM `+"`group`"+` g
 		INNER JOIN group_member gm ON g.group_no = gm.group_no
 		LEFT JOIN group_setting gs ON g.group_no = gs.group_no AND gs.uid = ?
-		WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ?
+		WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose <> ?
 		GROUP BY g.group_no
 		ORDER BY gs.category_sort ASC
-	`, uid, uid, spaceID).Load(&results)
+	`, uid, uid, spaceID, aiteampkg.GroupPurpose).Load(&results)
 	return results, err
 }

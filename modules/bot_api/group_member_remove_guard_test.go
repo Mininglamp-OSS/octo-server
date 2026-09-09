@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
@@ -31,7 +32,7 @@ const (
 	rmGuardCommon   = "u_rm_common"
 )
 
-func setupRemoveGuardEnv(t *testing.T) http.Handler {
+func setupRemoveGuardEnv(t *testing.T) (http.Handler, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
@@ -62,7 +63,7 @@ func setupRemoveGuardEnv(t *testing.T) http.Handler {
 		require.NoError(t, err)
 	}
 
-	return s.GetRoute()
+	return s.GetRoute(), ctx
 }
 
 func rmGuardIsActiveMember(t *testing.T, handler http.Handler, uid string) bool {
@@ -84,7 +85,7 @@ func rmGuardIsActiveMember(t *testing.T, handler http.Handler, uid string) bool 
 }
 
 func TestBotGroupMemberRemove_ManagerTargetForbidden(t *testing.T) {
-	handler := setupRemoveGuardEnv(t)
+	handler, _ := setupRemoveGuardEnv(t)
 
 	w := doBot(handler, botReq(t, "POST", "/v1/bot/groups/"+rmGuardGroupNo+"/members/remove", rmGuardBotToken,
 		map[string]interface{}{"members": []string{rmGuardManager}}))
@@ -94,7 +95,7 @@ func TestBotGroupMemberRemove_ManagerTargetForbidden(t *testing.T) {
 }
 
 func TestBotGroupMemberRemove_CreatorTargetForbidden(t *testing.T) {
-	handler := setupRemoveGuardEnv(t)
+	handler, _ := setupRemoveGuardEnv(t)
 
 	w := doBot(handler, botReq(t, "POST", "/v1/bot/groups/"+rmGuardGroupNo+"/members/remove", rmGuardBotToken,
 		map[string]interface{}{"members": []string{rmGuardCreator}}))
@@ -104,7 +105,7 @@ func TestBotGroupMemberRemove_CreatorTargetForbidden(t *testing.T) {
 }
 
 func TestBotGroupMemberRemove_MixedListRejectedAtomically(t *testing.T) {
-	handler := setupRemoveGuardEnv(t)
+	handler, _ := setupRemoveGuardEnv(t)
 
 	// 混合列表（普通成员 + 管理员）→ 整个请求 403，普通成员也不能被顺带移除。
 	w := doBot(handler, botReq(t, "POST", "/v1/bot/groups/"+rmGuardGroupNo+"/members/remove", rmGuardBotToken,
@@ -116,7 +117,7 @@ func TestBotGroupMemberRemove_MixedListRejectedAtomically(t *testing.T) {
 }
 
 func TestBotGroupMemberRemove_ManagerTargetCaseVariantForbidden(t *testing.T) {
-	handler := setupRemoveGuardEnv(t)
+	handler, _ := setupRemoveGuardEnv(t)
 
 	// MySQL utf8mb4_*_ci collation 下 uid 匹配大小写不敏感：大小写变体在
 	// service 层仍会命中真实 manager 行，所以守卫必须按 DB 解析行的角色
@@ -129,7 +130,7 @@ func TestBotGroupMemberRemove_ManagerTargetCaseVariantForbidden(t *testing.T) {
 }
 
 func TestBotGroupMemberRemove_CommonTargetStillWorks(t *testing.T) {
-	handler := setupRemoveGuardEnv(t)
+	handler, _ := setupRemoveGuardEnv(t)
 
 	w := doBot(handler, botReq(t, "POST", "/v1/bot/groups/"+rmGuardGroupNo+"/members/remove", rmGuardBotToken,
 		map[string]interface{}{"members": []string{rmGuardCommon}}))
@@ -138,4 +139,17 @@ func TestBotGroupMemberRemove_CommonTargetStillWorks(t *testing.T) {
 	assert.Equal(t, true, resp["ok"])
 	assert.Equal(t, float64(1), resp["removed"])
 	assert.False(t, rmGuardIsActiveMember(t, handler, rmGuardCommon), "common member should be removed")
+}
+
+func TestBotGroupMemberRemove_AIContainerForbidden(t *testing.T) {
+	handler, ctx := setupRemoveGuardEnv(t)
+	_, err := ctx.DB().Update("group").Set("purpose", "ai_session_container").
+		Where("group_no=?", rmGuardGroupNo).Exec()
+	require.NoError(t, err)
+
+	w := doBot(handler, botReq(t, "POST", "/v1/bot/groups/"+rmGuardGroupNo+"/members/remove", rmGuardBotToken,
+		map[string]interface{}{"members": []string{rmGuardCommon}}))
+	assert.Equalf(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "AI session container")
+	assert.True(t, rmGuardIsActiveMember(t, handler, rmGuardCommon))
 }

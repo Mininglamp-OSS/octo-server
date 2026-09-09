@@ -184,7 +184,7 @@ func TestGlobalHitShape_ChannelTypeAndIDPresent(t *testing.T) {
 	// File hit for a group.
 	fp := payloadTypeFile
 	docFile := Doc{MessageID: 2, Payload: &Payload{Type: &fp, File: &FilePayload{Name: "a.pdf"}}}
-	fh := h.singleFileHit(docFile, "gA", channelTypeGroup)
+	fh := h.singleFileHit(docFile, "gA", channelTypeGroup, nil)
 	if b, _ := json.Marshal(fh); !strings.Contains(string(b), `"channel_id":"gA"`) || !strings.Contains(string(b), `"channel_type":2`) {
 		t.Errorf("FileHit must carry channel_id+channel_type: %s", b)
 	}

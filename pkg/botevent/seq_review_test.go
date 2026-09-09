@@ -33,7 +33,7 @@ func TestNeverDowngradesToLegacyAfterIssuingCounterIDs(t *testing.T) {
 		{
 			name: "authority row deleted (migration rollback)",
 			breakAuthority: func(t *testing.T, ctx *config.Context) {
-				if _, err := ctx.DB().DeleteFrom(stateTable).
+				if _, err := ctx.DB().DeleteFrom(StateTable).
 					Where("`singleton_id`=?", stateSingletonID).Exec(); err != nil {
 					t.Fatalf("delete state row: %v", err)
 				}
@@ -224,7 +224,7 @@ func TestUnauthorizedMirrorIsLeftAloneAndDoesNotSwallowActivation(t *testing.T) 
 	// effect — the cache may delay it by repairCooldown, never swallow it. Ageing the belief
 	// stands in for that second passing.
 	setStateMode(t, ctx, StateModeIncr, 0)
-	if _, err := ctx.DB().UpdateBySql("update `"+stateTable+"` set `epoch`=1 where `singleton_id`=?",
+	if _, err := ctx.DB().UpdateBySql("update `"+StateTable+"` set `epoch`=1 where `singleton_id`=?",
 		stateSingletonID).Exec(); err != nil {
 		t.Fatalf("advance epoch: %v", err)
 	}

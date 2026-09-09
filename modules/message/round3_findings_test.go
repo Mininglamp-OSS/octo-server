@@ -178,7 +178,7 @@ func TestSpaceID_Round3_Finding2_Sidebar_EmptySourceFallback(t *testing.T) {
 
 	t.Run("buildFollowItems", func(t *testing.T) {
 		items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil,
-			groupSpaceMap, externalGroupMap, defaultSpaceID)
+			groupSpaceMap, nil, externalGroupMap, defaultSpaceID)
 		byID := map[string]*SidebarItem{}
 		for _, it := range items {
 			byID[it.TargetID] = it
@@ -192,7 +192,7 @@ func TestSpaceID_Round3_Finding2_Sidebar_EmptySourceFallback(t *testing.T) {
 	})
 
 	t.Run("buildRecentItems", func(t *testing.T) {
-		items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, nil, externalGroupMap, defaultSpaceID)
 		byID := map[string]*SidebarItem{}
 		for _, it := range items {
 			byID[it.TargetID] = it
@@ -211,7 +211,7 @@ func TestSpaceID_Round3_Finding2_Sidebar_EmptySourceFallback(t *testing.T) {
 		}
 		result := mergeThreadEntries(nil, extRows,
 			aliveThread("g_legacy_ext____alive", nil),
-			categorySetting, nil, groupSpaceMap, externalGroupMap, defaultSpaceID, nil, nil)
+			categorySetting, nil, groupSpaceMap, nil, externalGroupMap, defaultSpaceID, nil, nil)
 		require.Len(t, result, 1)
 		assert.Equal(t, "spaceDefault", result[0].MySourceSpaceID,
 			"DB-only thread: 父群 source='' 兜底到 defaultSpaceID")

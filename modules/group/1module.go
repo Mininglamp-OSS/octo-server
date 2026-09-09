@@ -37,6 +37,21 @@ func init() {
 		// 与 RegisterGroupMemberChecker（ExistMember，服务置顶等既有路径）分开，避免
 		// 收紧一处波及另一处。
 		user.RegisterActiveGroupMemberChecker(api.groupService.ExistMemberActive)
+		// 成员被移出 Space 时，把他从该 Space 下的所有群里清出去
+		// （task space-member-removal-cleanup）。反向注册避免 space -> group 成环。
+		api.registerSpaceMemberRemovalCleanup()
+		// 新成员加入 Space 时自动进预设群，同样反向注册：入群动作必须走本模块的
+		// 唯一准入口，而 modules/space 不能 import 本模块。原先它自己裸写
+		// group_member，四个缺陷记在 modules/space/preset_group_admitter.go。
+		api.registerPresetGroupAdmitter()
+		// 项目侧级联：成员被移出项目 → 退出该项目所有群（必要时先做群主交接）；
+		// 项目解散 → 群回落 Space 直属。同样是反向注册，modules/project 不能
+		// import 本模块。
+		api.registerProjectCascadeSteps()
+
+		// P2：全员群的四个钩子（建群 / 入群 / 群主同步 / 改名），同样反向注册进
+		// modules/project。见 all_member_group.go。
+		api.registerAllMemberGroupHooks()
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {
@@ -207,6 +222,9 @@ func newChannelRespWithGroupResp(groupResp *GroupResp) *model.ChannelResp {
 	extraMap["chat_pwd_on"] = groupResp.ChatPwdOn
 	extraMap["allow_view_history_msg"] = groupResp.AllowViewHistoryMsg
 	extraMap["group_type"] = groupResp.GroupType
+	if groupResp.Purpose != "" {
+		extraMap["purpose"] = groupResp.Purpose
+	}
 	extraMap["allow_member_pinned_message"] = groupResp.AllowMemberPinnedMessage
 	extraMap["is_named"] = groupResp.IsNamed
 	extraMap["avatar_text"] = groupResp.AvatarText
@@ -234,6 +252,13 @@ func newChannelRespWithGroupResp(groupResp *GroupResp) *model.ChannelResp {
 	// Space 隔离：前端 channelInfo 需要 space_id 用于实时会话过滤
 	if groupResp.SpaceID != "" {
 		extraMap["space_id"] = groupResp.SpaceID
+	}
+	// 项目归属：与 space_id 同一个理由，也与 GroupResp / 群详情保持一致。P2 给
+	// GroupResp 加了 project_id，却漏了这条通道，于是读 channelInfo.orgData 的客户端
+	// 看不到一个群属于哪个项目——而同一份数据在群详情里是有的。空串（Space 直属群）
+	// 不发，与 space_id 的写法一致。PR #855 第五轮 review 的 nit。
+	if groupResp.ProjectID != "" {
+		extraMap["project_id"] = groupResp.ProjectID
 	}
 
 	// 外部群标记：前端 UI 需要根据此字段渲染「外部群」标签

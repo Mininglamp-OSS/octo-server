@@ -1,0 +1,94 @@
+schema_version: 1
+task: cleanup-membership-predicate
+brief: .octospec/tasks/cleanup-membership-predicate/brief.md
+resolved_at: 2026-08-22T13:35:00+00:00
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      This change edits the predicate that decides whether a removed member gets
+      torn out of a Space's groups, so it sits directly on the multi-tenant
+      boundary — and it is load-bearing in BOTH directions. A false "still a
+      member" leaves a removed person inside the Space's groups and IM
+      subscriptions; a false "not a member" tears an active member out of every
+      group. The rule's fail-open warning is why CheckMembership itself is left
+      byte-for-byte unchanged: it has 36 non-test call sites including
+      pkg/space/middleware.go's SpaceMiddleware, the primary auth gate, and
+      #797's original proposal to relax it to `status <> 0` would have admitted
+      banned Spaces across the entire authenticated API. The new predicate is
+      documented as cleanup-only and non-authorizing, and a behavioural truth
+      table (TestCheckMembershipForCleanupMatrix) pins the two apart by asking
+      both predicates about the same rows. Corrected 2026-08-23: this line
+      previously named a source guard, TestCheckMembershipStaysStrict, which
+      was written on this branch and then deleted — it passed the security
+      regression it was named for and failed on whitespace. See the journal.
+  - id: testing
+    source: repo
+    load_bearing: true
+    why: >
+      TDD was requested and both behaviour changes are silent ones — a job
+      finishing as done/skipped_rejoined looks identical to a job that ran. Each
+      new test was mutation-verified: relaxing the predicate to `= 1` kills only
+      the banned-Space test, dropping the space join entirely kills only the
+      disbanded-orphan test, and relaxing CheckMembership kills only the source
+      guard. The two pre-existing gate tests
+      (TestCleanupWorkerSkipsRejoinedMember,
+      TestGroupCascadeStillRunsAfterSpaceDisbanded) are the no-regression proof.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Injected by path glob (modules/**/*.go) but substantively a no-op here:
+      neither gate responds to a client. Both return errors inward — the worker
+      releases the job for retry, the step returns an error that the worker
+      retries — so no user-facing envelope, no new pkg/errcode entry, and no raw
+      c.ResponseError / c.JSON is introduced. i18n-extract-check and i18n-lint
+      both pass unchanged.
+  - id: rate-limit
+    source: repo
+    load_bearing: true
+    why: >
+      Injected by path glob only. No route, middleware, or request-frequency
+      counter is touched; the change is entirely inside the background cleanup
+      worker and its registered step.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Conventional Commits, English subject line.
+
+gates_run:
+  - "ci/run-e2e-shard.sh 1 1 — the full CI E2E lane, all 44 packages, against real
+     MySQL 8 / Redis / WuKongIM v2.2.4-20260313: 44/44 pass"
+  - "go test ./modules/space/ -race -shuffle=on — pass, no data races"
+  - "go test ./modules/group/ -race -shuffle=on — pass, no data races (95s)"
+  - "golangci-lint run ./pkg/space/... ./modules/space/... ./modules/group/... — 0 issues"
+  - "make i18n-extract-check — pass"
+  - "make i18n-lint — pass"
+
+notes: >
+  Local test services were brought up by hand. Four environment gotchas, none of
+  them visible from the code and all of them costly to rediscover:
+
+  (1) OCTO_MASTER_KEY must be exported (CI pins
+  0123456789abcdef0123456789abcdef at ci.yml:191). Without it common.Setup
+  refuses to boot and modules/botfather, modules/robot and modules/channel each
+  panic during module.Setup — three package-level failures from one unset
+  variable, and the panic text names a private key rather than the missing env.
+
+  (2) The `test` database must be created COLLATE utf8mb4_general_ci. MySQL 8
+  defaults a fresh schema to utf8mb4_0900_ai_ci and migration
+  20260308000002_space_legacy01.sql then dies with Error 1267.
+
+  (3) Packages share one `test` database but register different migration sets,
+  so it must be dropped and recreated between package runs or the next package
+  panics with `unknown migration in database`. ci/run-e2e-shard.sh already does
+  this and falls back to local mysql/redis binaries outside CI — use it rather
+  than `go test ./...`.
+
+  (4) modules/group tests that create real IM channels panic with a nil-pointer
+  dereference when the WuKongIM broker is down instead of failing cleanly; the
+  real cause (dial tcp 127.0.0.1:5001: connection refused) is buried above the
+  stack trace.

@@ -1,0 +1,43 @@
+# Optional package weights in milliseconds, used only to balance E2E shards.
+# Missing packages default to 1000ms. Values come from a local CI-equivalent
+# baseline and are intentionally advisory, not pass/fail data.
+github.com/Mininglamp-OSS/octo-server/modules/user	246618
+github.com/Mininglamp-OSS/octo-server/modules/bot_api	80280
+github.com/Mininglamp-OSS/octo-server/modules/group	49625
+github.com/Mininglamp-OSS/octo-server/modules/botfather	46196
+github.com/Mininglamp-OSS/octo-server/modules/category	42659
+github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook	41286
+github.com/Mininglamp-OSS/octo-server/modules/integration	23664
+github.com/Mininglamp-OSS/octo-server/modules/thread	21902
+github.com/Mininglamp-OSS/octo-server/modules/bot_provision	18365
+github.com/Mininglamp-OSS/octo-server/modules/common	18071
+github.com/Mininglamp-OSS/octo-server/modules/oidc	17518
+github.com/Mininglamp-OSS/octo-server/modules/space	16110
+github.com/Mininglamp-OSS/octo-server/modules/robot	16069
+github.com/Mininglamp-OSS/octo-server/modules/notify	15822
+github.com/Mininglamp-OSS/octo-server/modules/sticker	13624
+github.com/Mininglamp-OSS/octo-server/modules/usersecret	11632
+github.com/Mininglamp-OSS/octo-server/modules/channel	10902
+github.com/Mininglamp-OSS/octo-server/modules/opanalytics	10792
+github.com/Mininglamp-OSS/octo-server/modules/file	10734
+github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog	7215
+github.com/Mininglamp-OSS/octo-server/modules/app_bot	7142
+github.com/Mininglamp-OSS/octo-server/modules/webhook	6887
+github.com/Mininglamp-OSS/octo-server/modules/voice_adapter	6135
+github.com/Mininglamp-OSS/octo-server/modules/qrcode	5784
+github.com/Mininglamp-OSS/octo-server/pkg/botevent	5755
+github.com/Mininglamp-OSS/octo-server/internal/msgextraseq	5707
+github.com/Mininglamp-OSS/octo-server/modules/message	4931
+github.com/Mininglamp-OSS/octo-server/pkg/auth	3454
+github.com/Mininglamp-OSS/octo-server/modules/bot_mention	1401
+github.com/Mininglamp-OSS/octo-server/modules/workplace	1343
+github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch	1248
+github.com/Mininglamp-OSS/octo-server/modules/messages_search	1131
+github.com/Mininglamp-OSS/octo-server/modules/conversation_ext	1129
+github.com/Mininglamp-OSS/octo-server/modules/internal_resolve	1081
+github.com/Mininglamp-OSS/octo-server/modules/report	1072
+github.com/Mininglamp-OSS/octo-server/modules/statistics	1061
+github.com/Mininglamp-OSS/octo-server/pkg/db	1055
+github.com/Mininglamp-OSS/octo-server/modules/botidentity	1039
+github.com/Mininglamp-OSS/octo-server/modules/base/event	1038
+github.com/Mininglamp-OSS/octo-server/pkg/ratelimit	1038

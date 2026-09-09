@@ -1,6 +1,10 @@
 package i18n
 
-import "github.com/gin-gonic/gin"
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
 
 // contentLanguageWriter is a gin.ResponseWriter shim that refreshes the
 // Content-Language header right before the response is committed.
@@ -33,6 +37,11 @@ type contentLanguageWriter struct {
 
 func newContentLanguageWriter(c *gin.Context, earlyLang string) *contentLanguageWriter {
 	return &contentLanguageWriter{ResponseWriter: c.Writer, c: c, earlyLang: earlyLang}
+}
+
+// Unwrap keeps optional net/http capabilities reachable through this shim.
+func (w *contentLanguageWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // applyLanguage stamps the late-merged Content-Language onto the response.

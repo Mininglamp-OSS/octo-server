@@ -26,11 +26,58 @@ func NewDB(ctx *config.Context) *DB {
 
 // ---------- user_oidc_identity ----------
 
-// QueryIdentityByIssuerSubject 通过 (issuer, sub) 查询绑定关系
+// QueryIdentityExact 通过 (issuer, subject) 查询绑定关系,并对返回行做**逐字节复核**。
+//
+// 这是包外唯一可用的入口,原始查询刻意不导出 —— 因为原始查询单独用是不安全的:
+// 本表 COLLATE 是 utf8mb4_general_ci,`WHERE subject='ABC'` 会命中一行
+// subject='abc' 的记录,于是两个只差大小写的上游主体落到同一个 uid。在登录路径
+// 上那是账号接管;在 modules/integration 的认证中间件上更重 —— 它据此签发
+// API key。
+//
+// 曾经复核只装在 modules/oidc 的 adapter 里,而 modules/integration 直连了原始
+// 查询,把这个口子开了一半。改成"包外只能拿到复核版"之后,这类绕过是**编译期**
+// 挡住的,不依赖谁记得加守卫。
+//
+// 三种结果必须区分:
+//   - 逐字节命中 → 返回该行;
+//   - 确实没有行 → (nil, nil),即"首次登录";
+//   - ci 命中但不是逐字节相等 → ErrIdentityCaseCollision。
+//
+// 第三种曾经也报 (nil, nil)。那样 ResolveOrLink 会回 IsNew=true,调用方随即
+// IssueSession(CreateUser=true) 把用户行建出来,之后 Insert 才撞 1062,竞态恢复
+// 走同一个逐字节查询、同样看不见 —— 每次登录尝试留一个孤立 user 行然后永久失败。
+// 现在拒绝落在 ResolveOrLink 里,在任何副作用之前。
+// 也就是把静默合并换成响亮拒绝。
+func (d *DB) QueryIdentityExact(issuer, subject string) (*IdentityModel, error) {
+	row, err := d.queryIdentityByIssuerSubject(issuer, subject)
+	if err != nil {
+		return nil, err
+	}
+	if row != nil && !identityRowMatches(row, issuer, subject) {
+		// ci 查询命中了,但不是逐字节相等 —— 折叠碰撞。
+		//
+		// **不能报成"没查到"**:那会让 ResolveOrLink 回 IsNew=true,调用方随即
+		// IssueSession(CreateUser=true) 把用户行建出来,之后 identity Insert 才撞上
+		// ci 唯一键报 1062,竞态恢复又走同一个逐字节查询、同样看不见,于是拒绝 ——
+		// 每次尝试留一个孤立 user 行,永久失败,可无限重复。见 ErrIdentityCaseCollision。
+		return nil, fmt.Errorf("%w: issuer/subject collide with an existing row",
+			ErrIdentityCaseCollision)
+	}
+	if row == nil {
+		// 真的没有行 —— 首次登录,与碰撞必须区分,否则每个新用户都登不进来。
+		return nil, nil
+	}
+	return row, nil
+}
+
+// queryIdentityByIssuerSubject 通过 (issuer, sub) 查询绑定关系。
+//
+// **不导出**:ci collation 下它会命中大小写不同的行,单独使用不安全。
+// 包外走 QueryIdentityExact。
 //
 // 未命中返回 (nil, nil),与项目其他模块的单条查询语义一致。
 // 调用方通过 m == nil && err == nil 判定"记录不存在"。
-func (d *DB) QueryIdentityByIssuerSubject(issuer, subject string) (*IdentityModel, error) {
+func (d *DB) queryIdentityByIssuerSubject(issuer, subject string) (*IdentityModel, error) {
 	var m *IdentityModel
 	if _, err := d.session.Select("*").From("user_oidc_identity").
 		Where("issuer=? AND subject=?", issuer, subject).

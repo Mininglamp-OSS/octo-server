@@ -1,0 +1,176 @@
+// NOTE: stored as .txt on purpose — this is `package main` with dependencies that
+// are not in the repo go.mod, so a real .go file here would break `go vet ./...`.
+// To run it: copy into an empty dir, `go mod init probe && go mod tidy`, point at a
+// broker started with the CI env (WK_MODE=debug WK_TOKENAUTHON=false ...).
+
+// 实测「IM 订阅泄漏」到底给了被移除的人什么。
+//
+// 场景：octo-server 删掉了 group_member 行，随后 IMRemoveSubscriber 调用失败
+// （modules/group/service.go:1912 只打日志）。业务库里人已经不是成员，
+// WuKongIM 里他还是订阅者。broker 不知道业务库发生了什么，所以这里直接
+// 对比两种 broker 状态：
+//
+//   泄漏态 = subscriber_remove 没生效（订阅还在）
+//   正确态 = subscriber_remove 生效了
+//
+// 两者之差就是这个 bug 的影响面。
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/client"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+)
+
+const apiURL = "http://127.0.0.1:5001"
+const tcpAddr = "127.0.0.1:5100"
+const groupID = "leakprobe_group"
+
+func post(path string, body any) (int, string) {
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(apiURL+path, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(out)
+}
+
+func mkUser(uid, token string) {
+	post("/user/token", map[string]any{"uid": uid, "token": token, "device_flag": 0, "device_level": 1})
+}
+
+func subscribers(op string, uids ...string) {
+	code, body := post("/channel/subscriber_"+op, map[string]any{
+		"channel_id": groupID, "channel_type": 2, "subscribers": uids,
+	})
+	if code != 200 {
+		fmt.Printf("   !! subscriber_%s -> %d %s\n", op, code, body)
+	}
+}
+
+// listener 保持长连接，记录收到的群消息。
+type listener struct {
+	cli  *client.Client
+	mu   sync.Mutex
+	got  []string
+}
+
+func newListener(uid, token string) (*listener, error) {
+	l := &listener{}
+	l.cli = client.New(tcpAddr, client.WithUID(uid), client.WithToken(token))
+	l.cli.SetOnRecv(func(r *wkproto.RecvPacket) error {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if r.ChannelID == groupID {
+			l.got = append(l.got, string(r.Payload))
+		}
+		return nil
+	})
+	return l, l.cli.Connect()
+}
+
+func (l *listener) drain() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := append([]string{}, l.got...)
+	l.got = nil
+	return out
+}
+
+// sendToGroup 发一条群消息，返回 broker 的 ACK 判定。
+func sendToGroup(uid, token, payload string) string {
+	cli := client.New(tcpAddr, client.WithUID(uid), client.WithToken(token))
+	acks := make(chan *wkproto.SendackPacket, 4)
+	cli.SetOnSendack(func(p *wkproto.SendackPacket) { acks <- p })
+	if err := cli.Connect(); err != nil {
+		return "CONNECT_ERR: " + err.Error()
+	}
+	defer cli.Close()
+	if err := cli.SendMessage(client.NewChannel(groupID, wkproto.ChannelTypeGroup), []byte(payload)); err != nil {
+		return "SEND_ERR: " + err.Error()
+	}
+	select {
+	case ack := <-acks:
+		switch ack.ReasonCode {
+		case wkproto.ReasonSuccess:
+			return "ALLOWED"
+		case wkproto.ReasonSubscriberNotExist:
+			return "BLOCKED (SubscriberNotExist)"
+		case wkproto.ReasonInBlacklist:
+			return "BLOCKED (InBlacklist)"
+		}
+		return fmt.Sprintf("other(ReasonCode=%d)", uint8(ack.ReasonCode))
+	case <-time.After(8 * time.Second):
+		return "TIMEOUT"
+	}
+}
+
+func main() {
+	const owner, victim = "leak_owner", "leak_victim"
+	const tOwner, tVictim = "leak_tok_o", "leak_tok_v"
+	mkUser(owner, tOwner)
+	mkUser(victim, tVictim)
+
+	// 干净起步
+	post("/channel/subscriber_remove_all", map[string]any{"channel_id": groupID, "channel_type": 2})
+	subscribers("add", owner, victim)
+	time.Sleep(500 * time.Millisecond)
+
+	vic, err := newListener(victim, tVictim)
+	if err != nil {
+		fmt.Println("victim listener connect failed:", err)
+		os.Exit(1)
+	}
+	defer vic.cli.Close()
+	time.Sleep(500 * time.Millisecond)
+
+	type row struct{ phase, canSend, canRecv string }
+	var rows []row
+
+	probe := func(name string) {
+		vic.drain()
+		ownerAck := sendToGroup(owner, tOwner, "msg-"+name)
+		time.Sleep(1500 * time.Millisecond)
+		recv := "NO"
+		if len(vic.drain()) > 0 {
+			recv = "YES"
+		}
+		victimAck := sendToGroup(victim, tVictim, "victim-"+name)
+		_ = ownerAck
+		rows = append(rows, row{name, victimAck, recv})
+	}
+
+	// 阶段 1：正常成员（基线）
+	probe("1. 正常群成员（基线）")
+
+	// 阶段 2：泄漏态 —— octo-server 删了 group_member，但 IMRemoveSubscriber 失败了，
+	// 所以 broker 这边一个字节都没变。这正是 service.go:1912 吞掉错误后的真实状态。
+	probe("2. 泄漏态（退订失败）")
+
+	// 阶段 3：正确态 —— 退订成功
+	subscribers("remove", victim)
+	time.Sleep(1000 * time.Millisecond)
+	probe("3. 正确态（退订成功）")
+
+	fmt.Println()
+	fmt.Printf("%-30s %-32s %s\n", "阶段", "被移除者能否发言", "能否收到群消息")
+	fmt.Println("--------------------------------------------------------------------------------------")
+	for _, r := range rows {
+		fmt.Printf("%-30s %-32s %s\n", r.phase, r.canSend, r.canRecv)
+	}
+	fmt.Println()
+	if rows[1].canSend == rows[0].canSend && rows[1].canRecv == rows[0].canRecv &&
+		rows[2].canSend != rows[1].canSend {
+		fmt.Println("结论：泄漏态与正常成员**完全无差别** —— 退订失败 = 群成员身份原封不动保留。")
+	}
+}

@@ -42,22 +42,119 @@ paths:
         200:
           description: "返回"
           schema:
-            type: object
-            properties:
-              uid:
-                type: string
-                description: "账号唯一ID"
-              token:
-                type: string
-                description: "接口授权码"
-              name:
-                type: string
-                description: "用户名"
-              role:
-                type: string
-                description: "账号角色 'superAdmin' 超级管理员"
+            $ref: "#/definitions/managerLoginResp"
         400:
           description: "错误"
+          schema:
+            $ref: "#/definitions/response"
+        429:
+          description: "管理端登录 IP 或 MFA 验证码限流"
+          schema:
+            $ref: "#/definitions/response"
+        503:
+          description: "管理端 MFA 配置或系统设置暂不可用"
+          schema:
+            $ref: "#/definitions/response"
+  /manager/login/send:
+    post:
+      tags:
+        - "userManager"
+      summary: "发送管理端 MFA 验证码"
+      description: "显式发送当前管理端登录 Challenge 的邮箱验证码；不会签发 token。"
+      operationId: "manager login mfa send"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "req"
+          required: true
+          schema:
+            $ref: "#/definitions/managerMFAChallengeReq"
+      responses:
+        200:
+          description: "验证码已发送并进入可验证状态"
+          schema:
+            $ref: "#/definitions/managerMFAChallengeResp"
+        400:
+          description: "Challenge 无效或请求错误"
+          schema:
+            $ref: "#/definitions/response"
+        429:
+          description: "验证码冷却、在途锁或发送次数超限；线上状态为 429"
+          schema:
+            $ref: "#/definitions/response"
+        503:
+          description: "管理端 MFA 配置、SMTP 或状态存储暂不可用"
+          schema:
+            $ref: "#/definitions/response"
+  /manager/login/resend:
+    post:
+      tags:
+        - "userManager"
+      summary: "重发管理端 MFA 验证码"
+      description: "重发会立即作废旧验证码；仅新邮件明确发送成功且状态提交成功后才可验证。"
+      operationId: "manager login mfa resend"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "req"
+          required: true
+          schema:
+            $ref: "#/definitions/managerMFAChallengeReq"
+      responses:
+        200:
+          description: "验证码已重发并进入可验证状态"
+          schema:
+            $ref: "#/definitions/managerMFAChallengeResp"
+        400:
+          description: "Challenge 无效或请求错误"
+          schema:
+            $ref: "#/definitions/response"
+        429:
+          description: "验证码冷却、在途锁或发送次数超限；线上状态为 429"
+          schema:
+            $ref: "#/definitions/response"
+        503:
+          description: "管理端 MFA 配置、SMTP 或状态存储暂不可用"
+          schema:
+            $ref: "#/definitions/response"
+  /manager/login/verify:
+    post:
+      tags:
+        - "userManager"
+      summary: "验证管理端 MFA 验证码并登录"
+      description: "原子消费最新且已确认发送成功的验证码，成功后才签发管理控制台 token。"
+      operationId: "manager login mfa verify"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "req"
+          required: true
+          schema:
+            $ref: "#/definitions/managerMFAVerifyReq"
+      responses:
+        200:
+          description: "验证成功并返回管理控制台 token"
+          schema:
+            $ref: "#/definitions/managerLoginResp"
+        400:
+          description: "Challenge 或验证码无效"
+          schema:
+            $ref: "#/definitions/response"
+        429:
+          description: "验证码错误次数达到锁定阈值或管理端入口限流；线上状态为 429"
+          schema:
+            $ref: "#/definitions/response"
+        503:
+          description: "管理端 MFA 配置、SMTP、Redis 或系统设置暂不可用"
           schema:
             $ref: "#/definitions/response"
   /manager/user/add:
@@ -412,6 +509,9 @@ paths:
           required: true
           schema:
             type: object
+            required:
+              - password
+              - new_password
             properties:
               password:
                 type: string
@@ -448,6 +548,11 @@ paths:
           required: true
           schema:
             type: object
+            required:
+              - login_name
+              - name
+              - password
+              - email
             properties:
               password:
                 type: string
@@ -458,6 +563,9 @@ paths:
               name:
                 type: string
                 description: "用户名"
+              email:
+                type: string
+                description: "管理端账号邮箱（必填）"
       responses:
         200:
           description: "返回"
@@ -498,6 +606,9 @@ paths:
                 register_time:
                   type: string
                   description: "添加时间"
+                email:
+                  type: string
+                  description: "管理端 MFA 邮箱"
         400:
           description: "错误"
           schema:
@@ -527,6 +638,44 @@ paths:
             $ref: "#/definitions/response"
         400:
           description: "错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+  /manager/user/admin/email:
+    put:
+      tags:
+        - "userManager"
+      summary: "维护管理端账号邮箱【超级管理员才能操作】"
+      description: "为任意管理端角色账号设置邮箱并使其旧 MFA Challenge 失效；操作会记录审计。"
+      operationId: "user update admin email"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "req"
+          required: true
+          schema:
+            type: object
+            required:
+              - uid
+              - email
+            properties:
+              uid:
+                type: string
+                description: "目标管理端账号 UID"
+              email:
+                type: string
+                description: "新的邮箱地址"
+      responses:
+        200:
+          description: "更新成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "请求失败；线上 HTTP 状态为 400，具体错误语义见响应体"
           schema:
             $ref: "#/definitions/response"
       security:
@@ -2445,6 +2594,73 @@ securityDefinitions:
     name: "token"
     description: "用户token"
 definitions:
+  managerLoginResp:
+    type: object
+    properties:
+      uid:
+        type: string
+      token:
+        type: string
+        description: "MFA 验证成功后返回的管理控制台 token"
+      name:
+        type: string
+      role:
+        type: string
+      email:
+        type: string
+        description: "脱敏后的管理端账号邮箱；保留完整邮箱域名"
+      challenge_id:
+        type: string
+        description: "MFA 开启时密码校验成功后返回的 Challenge ID"
+      expires_in:
+        type: integer
+        format: int64
+        description: "Challenge 剩余有效秒数"
+      mfa_required:
+        type: boolean
+  managerMFAChallengeReq:
+    type: object
+    required:
+      - challenge_id
+    properties:
+      challenge_id:
+        type: string
+  managerMFAVerifyReq:
+    type: object
+    required:
+      - challenge_id
+      - code
+    properties:
+      challenge_id:
+        type: string
+      code:
+        type: string
+        description: "6 位邮箱验证码"
+  managerMFAChallengeResp:
+    type: object
+    required:
+      - challenge_id
+      - email
+      - expires_in
+      - code_sent
+      - resend_after
+    properties:
+      challenge_id:
+        type: string
+      email:
+        type: string
+        description: "脱敏后的管理端账号邮箱；保留完整邮箱域名"
+      expires_in:
+        type: integer
+        format: int64
+        description: "Challenge 剩余有效秒数"
+      code_sent:
+        type: boolean
+        description: "验证码是否已明确发送成功并进入可验证状态"
+      resend_after:
+        type: integer
+        format: int64
+        description: "再次发送验证码前需要等待的秒数"
   managerUserResp:
     type: object
     properties:

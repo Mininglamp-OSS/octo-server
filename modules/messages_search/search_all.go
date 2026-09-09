@@ -180,15 +180,52 @@ func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStri
 	return b, analyzeErr
 }
 
+// buildSearchAllHighlight configures the OpenSearch highlight sub-phase for
+// the mixed _search_all / _search_global_messages endpoints. This highlighter
+// is deliberately WITHOUT an Encoder("html") request-level option:
+//   - `encoder` is a highlight-request global (not per-field), so setting it
+//     would also HTML-entity-escape the pre-existing text/richText/mergeForward
+//     snippet fragments, silently changing the wire-value encoding of the
+//     long-shipped MessageHit.Snippet field across three callsites (this file,
+//     search_global_messages.go ×2) while leaving /_search
+//     (buildSearchMessagesHighlight) raw — a cross-endpoint encoding split for
+//     the same JSON field.
+//   - Escaping is scoped to the two new file fields (name_highlight /
+//     content_snippet) in Go via escapeHighlightFragment; MessageHit.Snippet
+//     keeps its raw-text contract on every endpoint.
+//
+// The groups top_hits preview uses buildSearchGroupsPreviewHighlight() instead
+// — see comment there for why (performance on the 8000-doc aggregation path,
+// and a no-widen posture on payload.file.name whose fragment feeds the raw
+// MessageHit.Snippet contract via pickSnippet).
 func buildSearchAllHighlight() *elastic.Highlight {
 	return elastic.NewHighlight().
 		PreTags("<mark>").PostTags("</mark>").
 		FragmentSize(120).
 		NumOfFragments(1).
-		Field("payload.text.content").
-		Field("payload.richText.searchText").
-		Field("payload.mergeForward.msgs.searchText").
-		Field("payload.file.name")
+		Fields(
+			elastic.NewHighlighterField("payload.text.content"),
+			elastic.NewHighlighterField("payload.richText.searchText"),
+			elastic.NewHighlighterField("payload.mergeForward.msgs.searchText"),
+			// NumOfFragments(0) returns the whole field with matches marked
+			// in-place — matches file-tab (buildSearchFilesHighlight) behaviour
+			// so a long or multi-sentence file name is never truncated to a
+			// single "best passage" here while the file-tab returns whole.
+			elastic.NewHighlighterField("payload.file.name").NumOfFragments(0),
+			// payload.file.content: mirror the file-tab highlighter so a file
+			// message whose body (Tika-extracted content) matched the keyword —
+			// but whose name did not — surfaces a <mark>-wrapped body fragment in
+			// the mixed feed. Consumed by singleFileHit -> pickFileContentSnippet
+			// -> FileHit.ContentSnippet (search_files.go), which _search_all file
+			// hits already call. Uses the top-level FragmentSize(120)/NumOfFragments(1),
+			// so only a single 120-char window is drawn from _source (server-side
+			// read; request-level source excludes are response-level only) — Q6 A
+			// is unaffected: the whole field never rides the wire, only the
+			// fragment does. Supersedes the earlier Q4 D "name-only" decision;
+			// the chat-tab UI now renders a content snippet block below the file
+			// card.
+			elastic.NewHighlighterField("payload.file.content"),
+		)
 }
 
 func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.SearchHit, req SearchAllReq, loginUID string) []SearchAllHit {
@@ -259,7 +296,7 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) SearchAllHit {
 	entry := SearchAllHit{SortedAt: msToRFC3339(doc.Timestamp)}
 	if payloadType(doc.Payload) == payloadTypeFile {
-		fh := h.singleFileHit(doc, channelID, channelType)
+		fh := h.singleFileHit(doc, channelID, channelType, hl)
 		entry.ResultType = "file"
 		entry.File = &fh
 		entry.SortedAt = fh.SentAt

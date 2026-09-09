@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -668,6 +669,9 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		for _, conversation := range conversations {
 
 			if conversation.ChannelType == common.ChannelTypeGroup.Uint8() {
+				if isAITeamConversation(conversation.ChannelID, conversation.ChannelType, groupMap) {
+					continue
+				}
 				if _, vaild := groupVaildSet[conversation.ChannelID]; !vaild { // 无效群则跳过
 					continue
 				}
@@ -682,6 +686,9 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 				// 用户仍能透出子区。
 				parentNo, _, perr := thread.ParseChannelID(conversation.ChannelID)
 				if perr != nil {
+					continue
+				}
+				if isAITeamConversation(conversation.ChannelID, conversation.ChannelType, groupMap) {
 					continue
 				}
 				if _, member := groupActiveSet[parentNo]; !member {
@@ -925,6 +932,13 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		// X-Space-ID 维度下都可见。
 		syncUserConversationResps = EnsureSystemBotsPresent(syncUserConversationResps)
 	}
+	visibleGroups := groups[:0]
+	for _, info := range groups {
+		if info.Purpose != aiteampkg.GroupPurpose {
+			visibleGroups = append(visibleGroups, info)
+		}
+	}
+	groups = visibleGroups
 
 	c.Response(SyncUserConversationRespWrap{
 		Conversations:    syncUserConversationResps,
@@ -934,6 +948,19 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		ChannelStates:    channelStates,
 		SpaceMemberships: spaceMemberships,
 	})
+}
+
+func isAITeamConversation(channelID string, channelType uint8, groups map[string]*group.GroupResp) bool {
+	groupNo := channelID
+	if channelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parent, _, err := thread.ParseChannelID(channelID)
+		if err != nil {
+			return false
+		}
+		groupNo = parent
+	}
+	info := groups[groupNo]
+	return info != nil && info.Purpose == aiteampkg.GroupPurpose
 }
 
 // filterRecentConversations drops conversations whose per-channel-type activity
@@ -1196,7 +1223,13 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 					visitorNo, _ := co.ctx.GetConfig().GetCustomerServiceVisitorUID(resp.ChannelID)
 					visitorNos = append(visitorNos, visitorNo)
 				} else {
-					groupNos = append(groupNos, resp.ChannelID)
+					groupNo := resp.ChannelID
+					if resp.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+						if parentNo, _, parseErr := thread.ParseChannelID(resp.ChannelID); parseErr == nil {
+							groupNo = parentNo
+						}
+					}
+					groupNos = append(groupNos, groupNo)
 				}
 
 			}
@@ -1225,17 +1258,33 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 
 			}
 		}
+		groupMap := make(map[string]*group.GroupResp, len(groupDetails))
 		if len(groupDetails) > 0 {
-			for _, group := range groupDetails {
-				groupResps = append(groupResps, groupResp{}.from(group))
+			for _, detail := range groupDetails {
+				info := &group.GroupResp{GroupNo: detail.GroupNo, Purpose: detail.Purpose}
+				groupMap[detail.GroupNo] = info
+				if info.Purpose != aiteampkg.GroupPurpose {
+					groupResps = append(groupResps, groupResp{}.from(detail))
+				}
 			}
 		}
+		conversationResps = filterAITeamLegacyConversations(conversationResps, groupMap)
 	}
 	c.JSON(http.StatusOK, conversationWrapResp{
 		Conversations: conversationResps,
 		Groups:        groupResps,
 		Users:         userResps,
 	})
+}
+
+func filterAITeamLegacyConversations(items []conversationResp, groups map[string]*group.GroupResp) []conversationResp {
+	visible := make([]conversationResp, 0, len(items))
+	for _, item := range items {
+		if !isAITeamConversation(item.ChannelID, item.ChannelType, groups) {
+			visible = append(visible, item)
+		}
+	}
+	return visible
 }
 
 // 清除最近会话未读数

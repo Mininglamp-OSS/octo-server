@@ -65,7 +65,7 @@ func (t *Template) Build(
 	attribution := attributionFor(strings.TrimSpace(f.ActorName), labels)
 	source := sourceFor(env.Lang)
 	body, deepLink, err := cardtmpl.BuildDocsResourceCardBodyWithLang(
-		env.Lang, env.WebLoginURL, f.DocID, env.SpaceID, cardtmpl.ResourceCard{
+		env.Lang, env.WebLoginURL, f.DocID, cardtmpl.ResourceCard{
 			Title:       f.Title,
 			Attribution: attribution,
 			Excerpt:     strings.TrimSpace(f.Excerpt),

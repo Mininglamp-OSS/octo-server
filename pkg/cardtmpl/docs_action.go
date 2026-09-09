@@ -45,13 +45,15 @@ type ApprovalActions struct {
 // localized copy (producer picks them by language). ActorAvatar is optional and
 // must be an absolute https URL when present (empty => no avatar column).
 type DocsApprovalContent struct {
-	Title       string
-	Actor       string
-	ActorAvatar string
-	Timestamp   string
-	Reason      string
-	Variant     string
-	Source      Source
+	Title              string
+	Actor              string
+	ActorAvatar        string
+	Timestamp          string
+	Reason             string
+	RequesterSpaceName string
+	RequestedBotNames  []string
+	Variant            string
+	Source             Source
 
 	HeaderLabel  string // e.g. "文档申请" / "Document access"
 	StatusLabel  string // e.g. "待你处理" / "Pending"
@@ -69,24 +71,26 @@ type DocsOutcomeContent struct {
 	Source  Source
 	Denied  bool // true => denied (attention), false => approved (good)
 
-	HeaderLabel     string // "文档申请"
-	SourceName      string // optional document/source display name
-	StatusLabel     string // "已允许" / "已拒绝"
-	PermissionLabel string // optional permission vocabulary beside status
-	ResultText      string // "申请人已获得所申请的文档权限。" / "申请已被拒绝。"
-	ReasonLabel     string // "拒绝原因"
-	Reason          string // reviewer deny reason (denied only); "" => omit
+	HeaderLabel         string // "文档申请"
+	SourceName          string // optional document/source display name
+	StatusLabel         string // "已允许" / "已拒绝"
+	PermissionLabel     string // optional permission vocabulary beside status
+	PermissionRoleLabel string // requested role display label
+	ReasonLabel         string // "拒绝原因"
+	Reason              string // reviewer deny reason (denied only); "" => omit
 
-	Actor              string
-	ActorAvatar        string
-	RequestedAtDisplay string
-	RequestReason      string
-	BannerSuffix       string
-	RoleLabel          string
-	RequestReasonLabel string
-	DecisionSummary    string
-	MessageTimeLabel   string
-	MessageTimeDisplay string
+	Actor                     string
+	ActorAvatar               string
+	RequesterSpaceName        string
+	RequestedBotNames         []string
+	RequestedAtDisplay        string
+	RequestReason             string
+	BannerSuffix              string
+	RoleLabel                 string
+	RequestReasonLabel        string
+	DecisionOperatorName      string
+	DecisionOperatorSpaceName string
+	MessageTimeDisplay        string
 }
 
 // BuildDocsAccessRequestCard renders the enriched docs access-request approval
@@ -100,13 +104,12 @@ func BuildDocsAccessRequestCard(
 	webLoginURL string,
 	docID string,
 	requestID string,
-	spaceID string,
 	content DocsApprovalContent,
 	actions ApprovalActions,
 ) (json.RawMessage, error) {
 	lang := i18n.OutboundLanguage(ctx)
 	body, cardActions, deepLink, err := BuildDocsAccessRequestBodyWithLang(
-		lang, webLoginURL, docID, requestID, spaceID, content, actions,
+		lang, webLoginURL, docID, requestID, content, actions,
 	)
 	if err != nil {
 		return nil, err
@@ -136,7 +139,6 @@ func BuildDocsAccessRequestBodyWithLang(
 	webLoginURL string,
 	docID string,
 	requestID string,
-	spaceID string,
 	content DocsApprovalContent,
 	actions ApprovalActions,
 ) (body []interface{}, cardActions []interface{}, deepLink string, err error) {
@@ -160,7 +162,7 @@ func BuildDocsAccessRequestBodyWithLang(
 			return nil, nil, "", fmt.Errorf("cardtmpl: source icon URL: %w", err)
 		}
 	}
-	deepLink, err = docsDeepLink(webLoginURL, docID, spaceID)
+	deepLink, err = docsDeepLink(webLoginURL, docID)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -225,11 +227,10 @@ func BuildDocsApprovalOutcomeCard(
 	ctx context.Context,
 	webLoginURL string,
 	docID string,
-	spaceID string,
 	content DocsOutcomeContent,
 ) (json.RawMessage, error) {
 	body, deepLink, err := BuildDocsApprovalOutcomeBodyWithLang(
-		i18n.OutboundLanguage(ctx), webLoginURL, docID, spaceID, content,
+		i18n.OutboundLanguage(ctx), webLoginURL, docID, content,
 	)
 	if err != nil {
 		return nil, err
@@ -253,7 +254,6 @@ func BuildDocsApprovalOutcomeBodyWithLang(
 	lang string,
 	webLoginURL string,
 	docID string,
-	spaceID string,
 	content DocsOutcomeContent,
 ) ([]interface{}, string, error) {
 	if strings.TrimSpace(content.Title) == "" || utf8.RuneCountInString(content.Title) > maxTitleRunes {
@@ -269,16 +269,15 @@ func BuildDocsApprovalOutcomeBodyWithLang(
 			return nil, "", fmt.Errorf("cardtmpl: actor avatar URL: %w", err)
 		}
 	}
-	deepLink, err := docsDeepLink(webLoginURL, docID, spaceID)
+	deepLink, err := docsDeepLink(webLoginURL, docID)
 	if err != nil {
 		return nil, "", err
 	}
 	labels := labelsForLanguage(lang)
 
 	statusColor := "Good"
-	boxStyle := "good"
 	if content.Denied {
-		statusColor, boxStyle = "Attention", "attention"
+		statusColor = "Attention"
 	}
 	body := []interface{}{
 		docsOutcomeHeader(content.HeaderLabel, content.SourceName, content.StatusLabel, content.PermissionLabel, statusColor),
@@ -293,10 +292,13 @@ func BuildDocsApprovalOutcomeBodyWithLang(
 	if box := docsReasonBox(content.RequestReasonLabel, content.RequestReason); box != nil {
 		body = append(body, box)
 	}
-	body = append(body,
-		docsResultBox(boxStyle, statusColor, content.ResultText, content.DecisionSummary, content.ReasonLabel, content.Reason),
-		docsOutcomeFooter(content.MessageTimeLabel, content.MessageTimeDisplay, labels.viewDetails, deepLink),
-	)
+	if content.Denied {
+		if box := docsReasonBox(content.ReasonLabel, content.Reason); box != nil {
+			body = append(body, box)
+		}
+	}
+	body = append(body, docsOutcomeFooter(lang, content.RequestedAtDisplay, content.MessageTimeDisplay,
+		content.DecisionOperatorName, content.DecisionOperatorSpaceName, labels.viewDetails, deepLink))
 	return body, deepLink, nil
 }
 
@@ -348,30 +350,46 @@ func docsOutcomeHeader(headerLabel, sourceName, statusLabel, permissionLabel, st
 
 // docsOutcomeFooter keeps the terminal card free of submit actions while
 // preserving the handoff's processed-time context and view-details link.
-func docsOutcomeFooter(timeLabel, timeDisplay, viewDetails, deepLink string) map[string]interface{} {
-	actionSet := map[string]interface{}{
-		"type": "ActionSet", "spacing": "None",
-		"actions": []interface{}{
+func docsOutcomeFooter(lang, requestedAt, decidedAt, operatorName, operatorSpaceName, viewDetails, deepLink string) map[string]interface{} {
+	requestedAt = truncateRunes(strings.TrimSpace(requestedAt), maxTimestampRunes)
+	decidedAt = truncateRunes(strings.TrimSpace(decidedAt), maxTimestampRunes)
+	operatorName = truncateRunes(strings.TrimSpace(operatorName), maxActorRunes)
+	operatorSpaceName = truncateRunes(strings.TrimSpace(operatorSpaceName), maxTitleRunes)
+	requestedLabel, decidedLabel := "Requested at", "Processed at"
+	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh") {
+		requestedLabel, decidedLabel = "申请于", "处理于"
+	}
+	leftItems := []interface{}{}
+	if requestedAt != "" {
+		leftItems = append(leftItems, map[string]interface{}{
+			"type": "TextBlock", "text": escapeMarkdown(requestedLabel + " " + requestedAt),
+			"size": "Small", "isSubtle": true, "spacing": "None", "wrap": false,
+		})
+	}
+	if decidedAt != "" {
+		leftItems = append(leftItems, map[string]interface{}{
+			"type": "TextBlock", "text": escapeMarkdown(decidedLabel + " " + decidedAt),
+			"size": "Small", "isSubtle": true, "spacing": "Small", "wrap": false,
+		})
+	}
+	operatorText := strings.Trim(strings.TrimSpace(operatorName)+" · "+strings.TrimSpace(operatorSpaceName), " ·")
+	if operatorText != "" {
+		leftItems = append(leftItems, map[string]interface{}{
+			"type": "TextBlock", "text": escapeMarkdown(operatorText),
+			"size": "Small", "weight": "Bolder", "spacing": "Small", "wrap": false,
+		})
+	}
+	rightItems := []interface{}{}
+	rightItems = append(rightItems, map[string]interface{}{
+		"type": "ActionSet", "spacing": "Small", "actions": []interface{}{
 			map[string]interface{}{"type": "Action.OpenUrl", "id": "view_document", "title": viewDetails, "url": deepLink},
 		},
-	}
-	timeDisplay = truncateRunes(strings.TrimSpace(timeDisplay), maxTimestampRunes)
-	if timeDisplay == "" {
-		return actionSet
-	}
-	processedAt := strings.TrimSpace(timeLabel + " " + timeDisplay)
+	})
 	return map[string]interface{}{
-		"type": "ColumnSet", "spacing": "Medium", "columns": []interface{}{
-			map[string]interface{}{
-				"type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
-				"items": []interface{}{map[string]interface{}{
-					"type": "TextBlock", "text": escapeMarkdown(processedAt), "size": "Small",
-					"isSubtle": true, "spacing": "None", "wrap": false,
-				}},
-			},
-			map[string]interface{}{
-				"type": "Column", "width": "auto", "items": []interface{}{actionSet},
-			},
+		"type": "ColumnSet", "spacing": "Medium", "verticalContentAlignment": "Center",
+		"columns": []interface{}{
+			map[string]interface{}{"type": "Column", "width": "stretch", "verticalContentAlignment": "Center", "items": leftItems},
+			map[string]interface{}{"type": "Column", "width": "auto", "verticalContentAlignment": "Center", "items": rightItems},
 		},
 	}
 }
@@ -508,36 +526,6 @@ func docsReasonBox(label, reason string) map[string]interface{} {
 		"type": "TextBlock", "text": escapeMarkdown(reason), "size": "Medium", "wrap": true, "spacing": "Small",
 	})
 	return map[string]interface{}{"type": "Container", "style": "emphasis", "spacing": "Medium", "items": items}
-}
-
-// docsResultBox is the terminal good/attention result section. For denials it
-// appends the reviewer reason as a labeled sub-line.
-func docsResultBox(boxStyle, textColor, resultText, decisionSummary, reasonLabel, reason string) map[string]interface{} {
-	items := []interface{}{
-		map[string]interface{}{
-			"type": "TextBlock", "text": escapeMarkdown(strings.TrimSpace(resultText)),
-			"size": "Medium", "weight": "Bolder", "color": textColor, "wrap": true, "spacing": "None",
-		},
-	}
-	if summary := truncateRunes(strings.TrimSpace(decisionSummary), maxTitleRunes); summary != "" {
-		items = append(items, map[string]interface{}{
-			"type": "TextBlock", "text": escapeMarkdown(summary),
-			"size": "Small", "isSubtle": true, "spacing": "Small",
-		})
-	}
-	if r := truncateRunes(strings.TrimSpace(reason), maxReasonRunes); r != "" {
-		label := strings.TrimSpace(reasonLabel)
-		if label != "" {
-			items = append(items, map[string]interface{}{
-				"type": "TextBlock", "text": escapeMarkdown(label),
-				"size": "Small", "weight": "Bolder", "isSubtle": true, "spacing": "Small",
-			})
-		}
-		items = append(items, map[string]interface{}{
-			"type": "TextBlock", "text": escapeMarkdown(r), "size": "Medium", "wrap": true, "spacing": "None",
-		})
-	}
-	return map[string]interface{}{"type": "Container", "style": boxStyle, "spacing": "Medium", "items": items}
 }
 
 func copyActionData(source map[string]interface{}) map[string]interface{} {

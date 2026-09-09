@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestManagerAdd_RejectsExternalMember 验证 creator 试图将外部成员 (is_external=1)
@@ -171,4 +172,42 @@ func TestTransferGrouper_RejectsExternalMember(t *testing.T) {
 	if assert.NotNil(t, externalAfter) {
 		assert.Equal(t, MemberRoleCommon, externalAfter.Role)
 	}
+}
+
+func TestTransferGrouper_RejectsBot(t *testing.T) {
+	s, ctx := newTestServer(t)
+	wireI18nRendererForGroupTest(s)
+	f := New(ctx)
+
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	const groupNo = "g-transfer-bot-owner"
+	const botUID = "bot-transfer-target"
+
+	require.NoError(t, f.userDB.Insert(&user.Model{
+		UID: botUID, Name: "bot transfer target", ShortNo: "bot_xfer", Robot: 1,
+	}))
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: groupNo, Name: "reject bot owner", Creator: testutil.UID, Status: GroupStatusNormal,
+	}))
+	for _, member := range []*MemberModel{
+		{GroupNo: groupNo, UID: testutil.UID, Role: MemberRoleCreator, Version: 1},
+		{GroupNo: groupNo, UID: botUID, Role: MemberRoleCommon, Robot: 1, Version: 2},
+	} {
+		require.NoError(t, f.db.InsertMember(member))
+	}
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/groups/"+groupNo+"/transfer/"+botUID, nil)
+	require.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.group.bot_cannot_be_owner")
+	creator, err := f.db.QueryMemberWithUID(testutil.UID, groupNo)
+	require.NoError(t, err)
+	require.Equal(t, MemberRoleCreator, creator.Role)
+	target, err := f.db.QueryMemberWithUID(botUID, groupNo)
+	require.NoError(t, err)
+	require.Equal(t, MemberRoleCommon, target.Role)
 }

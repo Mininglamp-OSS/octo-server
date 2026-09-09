@@ -11,7 +11,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -142,6 +144,23 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 		}
 		var robotID string
 		var robotIDs []string
+		var aiTarget *aiteampkg.SessionTarget
+		// A dedicated AI session is an authoritative one-Bot route. The target is
+		// resolved from the persisted association and full thread channel, never
+		// from client-controlled robot_id/purpose/mention fields. The lookup also
+		// checks active Space seats, Bot ownership/status and thread readiness.
+		if aiteampkg.Enabled() &&
+			message.ChannelType == common.ChannelTypeCommunityTopic.Uint8() &&
+			isAITeamUserContentType(payloadValue.Get("type").Int()) {
+			resolved, resolveErr := aiteampkg.LookupReadySessionTarget(rb.ctx.DB(), message.ChannelID, message.FromUID)
+			if resolveErr != nil {
+				rb.Error("resolve AI session target failed", zap.Error(resolveErr), zap.String("channelID", message.ChannelID), zap.Int64("messageID", message.MessageID))
+			} else if resolved != nil {
+				aiTarget = resolved
+				robotID = resolved.BotID
+				rb.maybeSetAISessionTitle(resolved, aiSessionTitleFromPayload(message.Payload, payloadValue.Get("type").Int()))
+			}
+		}
 		// aisBroadcastSet captures the robotIDs that were added to
 		// `robotIDs` purely because of the `mention.ais=1` broadcast
 		// branch below (i.e. group bots that were NOT already in
@@ -427,7 +446,15 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 						rb.Error("panic in robot message goroutine", zap.Any("recover", r), zap.String("robotID", robotID))
 					}
 				}()
-				rb.saveRobotMessage(message, robotID)
+				if aiTarget != nil {
+					rb.saveRobotMessage(message, robotID, &aiSessionDelivery{
+						SpaceID:    aiTarget.SpaceID,
+						SessionKey: aiteampkg.RuntimeSessionKey(aiTarget, message.ChannelID),
+						InputID:    message.MessageID,
+					})
+				} else {
+					rb.saveRobotMessage(message, robotID)
+				}
 				rb.autoReadForBot(message, robotID)
 			}()
 		}
@@ -453,7 +480,52 @@ func (rb *Robot) autoReadForBot(message *config.MessageResp, robotID string) {
 	}
 }
 
-func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
+type aiSessionDelivery struct {
+	SpaceID    string
+	SessionKey string
+	InputID    int64
+}
+
+func isAITeamUserContentType(contentType int64) bool {
+	switch common.ContentType(contentType) {
+	case common.Text, common.Image, common.GIF, common.Voice,
+		common.Video, common.Location, common.Card, common.File,
+		common.MultipleForward, common.VectorSticker, common.EmojiSticker,
+		common.RichText:
+		return true
+	}
+	return contentType == int64(cardmsg.InteractiveCard)
+}
+
+func aiSessionTitleFromPayload(payload []byte, contentType int64) string {
+	if contentType == int64(common.Text) {
+		return gjson.GetBytes(payload, "content").String()
+	}
+	if contentType == int64(cardmsg.InteractiveCard) {
+		return cardmsg.DisplayText()
+	}
+	return common.GetDisplayText(int(contentType))
+}
+
+func (rb *Robot) maybeSetAISessionTitle(target *aiteampkg.SessionTarget, content string) {
+	if target == nil || target.ManualTitle != 0 {
+		return
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	runes := []rune(content)
+	if len(runes) > 100 {
+		content = string(runes[:100])
+	}
+	if _, err := rb.ctx.DB().Update("thread").Set("name", content).
+		Where("group_no=? AND short_id=? AND name=?", target.GroupNo, target.ShortID, aiteampkg.DefaultSessionName).Exec(); err != nil {
+		rb.Warn("update initial AI session title failed", zap.Error(err), zap.String("short_id", target.ShortID))
+	}
+}
+
+func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string, aiMeta ...*aiSessionDelivery) {
 
 	// YUJ-2531 / Mininglamp-OSS/octo-server#208: bot-delivery chokepoint.
 	// Strip any bare legacy `mention.all=1` and inject `mention.humans=1`
@@ -475,11 +547,17 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 		rb.Warn("allocate bot event id failed", zap.Error(err), zap.String("robotID", robotID))
 		return
 	}
-	messageUpdateJson := util.ToJson(&robotEvent{
+	event := &robotEvent{
 		EventID: seq,
 		Message: message,
 		Expire:  time.Now().Add(rb.ctx.GetConfig().Robot.MessageExpire).Unix(),
-	})
+	}
+	if len(aiMeta) > 0 && aiMeta[0] != nil {
+		event.SpaceID = aiMeta[0].SpaceID
+		event.SessionKey = aiMeta[0].SessionKey
+		event.InputID = aiMeta[0].InputID
+	}
+	messageUpdateJson := util.ToJson(event)
 	key := botevent.QueueKey(robotID)
 	err = rb.ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson)
 	if err != nil {

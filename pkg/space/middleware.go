@@ -1,6 +1,7 @@
 package space
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -15,7 +16,7 @@ import (
 type MembershipChecker func(spaceID string, uid string) (bool, error)
 
 const cacheTTL = 60 * time.Second         // 正向缓存 60s
-const negativeCacheTTL = 30 * time.Second  // 否定结果缓存 30s，新成员加入后快速生效
+const negativeCacheTTL = 30 * time.Second // 否定结果缓存 30s，新成员加入后快速生效
 
 // MembershipCache 缓存成员身份校验结果的接口。
 type MembershipCache interface {
@@ -55,9 +56,58 @@ func (c *RedisMembershipCache) Set(spaceID, uid string, isMember bool, ttl time.
 	_ = c.redisConn.SetAndExpire(redisCacheKey(spaceID, uid), val, ttl)
 }
 
+// membershipCacheStore 是缓存失效路径依赖的最小 Redis 面。抽成接口是为了让
+// 「DEL 失败」这条分支可测——它恰恰是唯一危险的那条分支，用真 Redis 造不出来。
+// 抽 seam 的成例见 botfather 的 enforceKeySpaceWithChecker。
+type membershipCacheStore interface {
+	Del(key string) error
+	SetAndExpire(key string, value interface{}, expire time.Duration) error
+}
+
+// ErrMembershipCacheNegativeFallback 标记「DEL 失败，但否定缓存已写入」这一种失败。
+//
+// InvalidateMembershipCache 的两种非空返回，运维含义正好相反：
+//
+//   - 命中这个哨兵：正向条目没删掉，但已被一条 TTL 更短的 "0" 盖住，SpaceMiddleware
+//     当场就拒绝这个人——**边界守住了**，只是留下一条到期才消失的脏数据。
+//   - 不命中（DEL 与兜底写入都失败）：正向条目原样活满它的 60s TTL，被移除的人在这
+//     段时间里仍然进得来——**这才是真的隔离失效**。
+//
+// 分不开的后果不是少记一点信息，而是记反：兜底成功是两者中更常见的一种，把它按
+// 「可能仍可访问」报出去，等于在边界明明守住的时候报一次越权，值班的人照着排查会
+// 一无所获，几次之后这条日志就不再被当真。
+var ErrMembershipCacheNegativeFallback = errors.New("membership cache: negative fallback written")
+
 // InvalidateMembershipCache 删除指定用户在指定 Space 的成员缓存。
-func InvalidateMembershipCache(redisConn *redis.Conn, spaceID, uid string) {
-	_ = redisConn.Del(redisCacheKey(spaceID, uid))
+//
+// 返回 error 而不是吞掉：这条缓存是隔离边界的一部分，删除失败必须让调用方有机会
+// 记日志。原先的 `_ = redisConn.Del(...)` 让失败完全无声。
+func InvalidateMembershipCache(redisConn *redis.Conn, spaceID, uid string) error {
+	return invalidateMembershipCacheIn(redisConn, spaceID, uid)
+}
+
+// invalidateMembershipCacheIn 是 InvalidateMembershipCache 的可注入实现。
+//
+// 为什么 DEL 失败要主动写否定缓存，而不是记个日志就算：
+//
+// 整个 Redis 挂掉反而是**安全**的——中间件的 Get 未命中，会回落到查库，被移除的人
+// 当场就进不来了。危险的是**单独** DEL 失败：正向条目 "1" 会活满它的 60s TTL，
+// SpaceMiddleware 继续放行这个已经被移除的人，而 handler 早已提交并返回 200。
+// 重新发起一次移除也救不回来——removeMemberLocked 返回 ok=false，afterMembersRemoved
+// 根本不会为这个 uid 再跑一次（见 modules/space/api.go 的同名注释）。
+//
+// 所以删不掉时就把它**盖掉**：写一条 TTL 更短的否定条目，中间件读到 "0" 即拒绝。
+// 这比干等 60s 强，也比让失败无声强。
+func invalidateMembershipCacheIn(store membershipCacheStore, spaceID, uid string) error {
+	key := redisCacheKey(spaceID, uid)
+	delErr := store.Del(key)
+	if delErr == nil {
+		return nil
+	}
+	if setErr := store.SetAndExpire(key, "0", negativeCacheTTL); setErr != nil {
+		return fmt.Errorf("invalidate membership cache: del failed (%w) and negative-cache fallback also failed (%v)", delErr, setErr)
+	}
+	return fmt.Errorf("invalidate membership cache: del failed (%w); %w", delErr, ErrMembershipCacheNegativeFallback)
 }
 
 // InMemoryMembershipCache 基于内存的 MembershipCache 实现，用于测试。

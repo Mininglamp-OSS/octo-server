@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/pkg/db"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -403,7 +403,7 @@ func TestManager_AddMembers(t *testing.T) {
 	assert.Equal(t, 3, count) // owner + 2 new
 
 	t.Run("reactivate removed member", func(t *testing.T) {
-		err := testSpaceDB.removeMemberLocked("mgr-addmem", "new-u-1", 2)
+		_, err := testSpaceDB.removeMemberLocked("mgr-addmem", "new-u-1", 2, testutil.UID, MemberRemoveReasonKicked)
 		assert.NoError(t, err)
 
 		body2 := util.ToJson(map[string]interface{}{"uids": []string{"new-u-1"}})
@@ -1089,7 +1089,7 @@ func TestManager_RemoveOwnerBlockedInTx(t *testing.T) {
 	seedSpace(t, "mgr-rm-tx", "tx guard", "u-owner-tx", SpaceStatusNormal)
 
 	mgrDB := newManagerDB(testCtx.DB())
-	err = mgrDB.removeMembersForce("mgr-rm-tx", []string{"u-owner-tx"})
+	_, err = mgrDB.removeMembersForce("mgr-rm-tx", []string{"u-owner-tx"}, testutil.UID)
 	assert.ErrorIs(t, err, ErrCannotRemoveOwner)
 
 	owner, err := testSpaceDB.queryMember("mgr-rm-tx", "u-owner-tx")
@@ -1362,12 +1362,12 @@ func TestManager_CreateSpace_ValidationErrors(t *testing.T) {
 
 func TestEscapeLike(t *testing.T) {
 	cases := map[string]string{
-		"":              "",
-		"foo":           "foo",
-		"foo_bar":       `foo\_bar`,
-		"100%":          `100\%`,
-		`a\b`:           `a\\b`,
-		`mix_%\tricky`:  `mix\_\%\\tricky`,
+		"":             "",
+		"foo":          "foo",
+		"foo_bar":      `foo\_bar`,
+		"100%":         `100\%`,
+		`a\b`:          `a\\b`,
+		`mix_%\tricky`: `mix\_\%\\tricky`,
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, escapeLike(in), "in=%q", in)

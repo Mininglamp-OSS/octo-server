@@ -145,12 +145,23 @@ const (
 	envRegisterIPBurst  = "OCTO_BOT_RATELIMIT_REGISTER_IP_BURST"
 	envHeartbeatIPRPS   = "OCTO_BOT_RATELIMIT_HEARTBEAT_IP_RPS"
 	envHeartbeatIPBurst = "OCTO_BOT_RATELIMIT_HEARTBEAT_IP_BURST"
+	// batch users：本组的 per-bot business 桶默认关闭（enabled=false / dry-run=true，
+	// 见 modules/common defaultBotRateLimit*），故给 /v1/bot/users/batch 一道自带的
+	// always-on per-IP 底线，与 register / heartbeat 同构。它是该端点默认配置下真正的
+	// 速率上界：一次调用最多解析 MaxBatchUserUIDs 个身份，这道桶把单 IP 能买到的身份
+	// 解析放大压住，不依赖那个默认关闭的开关。20 rps 对"一个大群转发折叠成一次调用"
+	// 的正常用法绰绰有余（本就是用 1 次调用替掉 ~76 次单查）。
+	envBatchUsersIPRPS   = "OCTO_BOT_RATELIMIT_USERS_BATCH_IP_RPS"
+	envBatchUsersIPBurst = "OCTO_BOT_RATELIMIT_USERS_BATCH_IP_BURST"
 
 	defaultRegisterIPRPS   = 100.0
 	defaultRegisterIPBurst = 500
 
 	defaultHeartbeatIPRPS   = 500.0
 	defaultHeartbeatIPBurst = 1500
+
+	defaultBatchUsersIPRPS   = 20.0
+	defaultBatchUsersIPBurst = 40
 )
 
 // ipLimitParams 读 env 并消毒。**刻意没有 enabled 开关**:per-bot 层默认关闭

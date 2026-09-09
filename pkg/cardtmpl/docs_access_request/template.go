@@ -87,10 +87,12 @@ type pendingFields struct {
 		SourceName string `json:"sourceName"`
 	} `json:"document"`
 	Requester struct {
-		Name      string `json:"name"`
-		AvatarURL string `json:"avatarUrl"`
+		Name            string `json:"name"`
+		AvatarURL       string `json:"avatarUrl"`
+		SourceSpaceName string `json:"sourceSpaceName"`
 	} `json:"requester"`
-	Permission struct {
+	RequestedBotNames []string `json:"requestedBotNames"`
+	Permission        struct {
 		Label     string `json:"label"`
 		RoleLabel string `json:"roleLabel"`
 	} `json:"permission"`
@@ -133,7 +135,7 @@ func (t *Template) Build(
 	actions := cardtmplApprovalActions(labels.approveTitle, labels.denyTitle)
 
 	body, cardActions, deepLink, err := cardtmpl.BuildDocsAccessRequestBodyWithLang(
-		env.Lang, env.WebLoginURL, docID, pf.RequestID, env.SpaceID, content, actions,
+		env.Lang, env.WebLoginURL, docID, pf.RequestID, content, actions,
 	)
 	if err != nil {
 		return cardtmpl.BuildResult{}, err

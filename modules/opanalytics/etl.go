@@ -19,12 +19,18 @@ const (
 	convTypeHHPrivate uint8 = 3
 	convTypeHAPrivate uint8 = 4
 
-	channelTypePerson uint8 = 1 // = octo-lib common.ChannelTypePerson
-	channelTypeGroup  uint8 = 2 // = octo-lib common.ChannelTypeGroup
+	channelTypePerson         uint8 = 1 // = octo-lib common.ChannelTypePerson
+	channelTypeGroup          uint8 = 2 // = octo-lib common.ChannelTypeGroup
+	channelTypeCommunityTopic uint8 = 5 // = octo-lib common.ChannelTypeCommunityTopic (群下子区/话题)
 
 	dimStatusNormal   uint8 = 1
 	dimStatusDisband  uint8 = 2
 	privateMemberSize       = 2
+
+	// threadChannelIDSeparator 子区 channel_id = "<父群no>____<短ID>"(与 bot_api
+	// threadChannelIDSeparator 同值)。父群段即父群 channel_id(= group_no)，据此
+	// 归属父群的 space_id/conv_type，无需额外数据源。
+	threadChannelIDSeparator = "____"
 )
 
 // ETL 看板预聚合任务(增量水位，幂等)。
@@ -170,10 +176,11 @@ type senderDayAgg struct {
 
 // channelMeta 会话的归属/分类(ETL 当日打标)。
 type channelMeta struct {
-	spaceID     string
-	convType    uint8
-	channelType uint8
-	skip        bool // 不可解析的私聊(uid 含 @)或任一方为系统/测试账号 → 丢弃其事实行
+	spaceID         string
+	convType        uint8
+	channelType     uint8
+	parentChannelID string // 子区(channelType=5)所属父群 channel_id；非子区为 ""
+	skip            bool   // 不可解析的私聊(uid 含 @)或任一方为系统/测试账号 → 丢弃其事实行
 }
 
 // aggregateChunk 把一个 chunk 的消息按(日,会话,成员)聚合成待写数据(纯函数)。
@@ -235,7 +242,11 @@ func aggregateChunk(rows []*srcMessageRow, memberType map[string]uint8, excluded
 			continue
 		}
 		dirtySet[ca.day] = struct{}{}
-		res.activityRows = append(res.activityRows, []interface{}{ca.channelID, ca.channelType, ca.dayMaxTs})
+		// 子区不登记 dim_channel 活跃行：该维表仅服务群/私聊看板，子区无展示；写入只会
+		// 积累永不被 refreshDimChannelGroups enrich 的裸 channel_type=5 行(YUJ-375 review)。
+		if cm.channelType != channelTypeCommunityTopic {
+			res.activityRows = append(res.activityRows, []interface{}{ca.channelID, ca.channelType, ca.dayMaxTs})
+		}
 		if cm.channelType == channelTypePerson {
 			a, b, _ := normalizePrivatePair(ca.channelID) // skip=false 保证可解析
 			human, agent := 0, 0
@@ -265,16 +276,17 @@ func aggregateChunk(rows []*srcMessageRow, memberType map[string]uint8, excluded
 			st = memberTypeHuman
 		}
 		res.fact3 = append(res.fact3, &factMemberChannelDailyModel{
-			StatDate:    sa.day,
-			ChannelID:   sa.channelID,
-			ChannelType: cm.channelType,
-			SpaceID:     cm.spaceID,
-			ConvType:    cm.convType,
-			ContentType: 0,
-			SenderUID:   sa.senderUID,
-			SenderType:  st,
-			MsgCount:    sa.msgCount,
-			LastMsgAt:   sa.lastMsgAt,
+			StatDate:        sa.day,
+			ChannelID:       sa.channelID,
+			ChannelType:     cm.channelType,
+			SpaceID:         cm.spaceID,
+			ConvType:        cm.convType,
+			ParentChannelID: cm.parentChannelID,
+			ContentType:     0,
+			SenderUID:       sa.senderUID,
+			SenderType:      st,
+			MsgCount:        sa.msgCount,
+			LastMsgAt:       sa.lastMsgAt,
 		})
 	}
 
@@ -293,7 +305,7 @@ func channelTypeFromChannels(channels map[string]*chanDayAgg, day, channelID str
 	return 0
 }
 
-// resolveChannelMeta 解析会话归属/分类(群查 group 维表；私聊反解 fakeChannelID)。
+// resolveChannelMeta 解析会话归属/分类(群查 group 维表；子区劈父群段继承；私聊反解 fakeChannelID)。
 func resolveChannelMeta(channelID string, channelType uint8, memberType map[string]uint8, excludedUID func(string) bool, groupMeta map[string]groupMetaInfo) *channelMeta {
 	if channelType == channelTypeGroup {
 		if gm, ok := groupMeta[channelID]; ok {
@@ -301,6 +313,23 @@ func resolveChannelMeta(channelID string, channelType uint8, memberType map[stri
 		}
 		// 已从 group 表消失的孤儿群：仍计消息，但不归 space、类型未知。
 		return &channelMeta{spaceID: "", convType: 0, channelType: channelTypeGroup}
+	}
+	// 子区(话题)：channel_id = "<父群no>____<短ID>"。劈出父群段，归属父群的 space/conv。
+	// 子区自有 channel_id → 事实表按子区独立成行；parentChannelID 记父群便于上卷。
+	if channelType == channelTypeCommunityTopic {
+		parts := strings.Split(channelID, threadChannelIDSeparator)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			// 畸形子区 channel_id → fail-closed 丢弃：要求恰两段且父群段/topic段均非空
+			// (与 canonical thread.ParseChannelID 一致；堵住 "g1____" 空 topic 段与
+			// "a____b____c" 多段)。与 bot_api obo_fanout / message disband guard 同口径。
+			return &channelMeta{channelType: channelTypeCommunityTopic, skip: true}
+		}
+		parentNo := parts[0]
+		if gm, ok := groupMeta[parentNo]; ok {
+			return &channelMeta{spaceID: gm.spaceID, convType: gm.convType, channelType: channelTypeCommunityTopic, parentChannelID: parentNo}
+		}
+		// 父群已消失的孤儿子区：仍计消息，不归 space、conv 未知，但保留父群归属。
+		return &channelMeta{spaceID: "", convType: 0, channelType: channelTypeCommunityTopic, parentChannelID: parentNo}
 	}
 	// 私聊(person)
 	a, b, ok := normalizePrivatePair(channelID)

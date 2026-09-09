@@ -99,21 +99,45 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build -v ./...
 
-  test:
+  unit-test:
     needs: [changes]
     if: |
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
       needs.changes.outputs.code == 'true'
-    name: Test
+    name: Unit Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-key/unit-test
+
+      - name: Run unit tests
+        run: ci/run-unit-tests.sh
+
+  e2e-test:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: E2E Test (${{ matrix.shard }}/${{ matrix.total }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # MySQL, Redis, and WuKongIM are required by integration tests
-    # (modules/{user,oidc,thread,group,space,botfather,...}). The tests
-    # hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+        total: [4]
+    # MySQL, Redis, and WuKongIM are required by E2E/integration-style tests.
+    # Tests hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
     # octo-lib's default WuKongIM API URL http://127.0.0.1:5001 — see
-    # github.com/Mininglamp-OSS/octo-lib/testutil.NewTestServer and
-    # config.New. Ports are mapped to the host so jobs running in the
-    # runner VM can reach them via 127.0.0.1.
+    # github.com/Mininglamp-OSS/octo-lib/testutil.NewTestServer and config.New.
+    # Each matrix shard gets an independent runner and service set.
     services:
       mysql:
         image: mysql:8.0
@@ -171,14 +195,9 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
-
-      - name: Install MySQL/Redis client tooling
-        run: |
-          # mysql + redis-cli are needed below to reset the shared `test`
-          # database between Go packages; ubuntu-latest's preinstall set
-          # is not stable across runner image rolls so install fresh.
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq mysql-client redis-tools
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-key/e2e-test
 
       - name: Wait for MySQL
         # mysql:8.0 defaults the server collation to utf8mb4_0900_ai_ci, but
@@ -189,10 +208,34 @@ jobs:
         # the 8.0 default). Tables created without explicit COLLATE inherit
         # the database default; using general_ci keeps them aligned with
         # the rest of the schema and avoids "Illegal mix of collations".
+        #
+        # The client runs inside the service container rather than on the
+        # runner. mysql:8.0 ships mysqladmin, so there is nothing to install
+        # and no network dependency between the runner and a package mirror.
+        #
+        # Two probes, because the in-container ping alone would be a weaker gate
+        # than the runner-side client it replaced: it proves mysqld is up, but
+        # the Go tests connect from the runner to the published 127.0.0.1:3306,
+        # and a ping on the container's own loopback can pass while that mapping
+        # is not serving yet. The bash /dev/tcp probe covers the published port
+        # without reintroducing a client on the runner.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
         run: |
+          # This is the first consumer of the id, so it has to be the one that
+          # names an unresolved one. A service rename empties the context
+          # property silently, and `docker exec "" ...` fails instantly, so
+          # without this the loop would burn its full 60s and then report
+          # "mysql did not become ready" — the wrong cause, which is the exact
+          # diagnose-the-symptom failure this lane was cleaned up to stop.
+          [ -n "$MYSQL_CID" ] || {
+            echo "::error title=Missing service container id::MYSQL_CID is empty; job.services.mysql.id did not resolve" >&2
+            exit 1
+          }
           for _ in $(seq 1 30); do
-            if mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent; then
-              echo "mysql ready"
+            if docker exec "$MYSQL_CID" mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent \
+              && timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3306' 2>/dev/null; then
+              echo "mysql ready (server up, published port reachable)"
               exit 0
             fi
             sleep 2
@@ -215,10 +258,17 @@ jobs:
         # plateaus near the observed peak (~300) and stays green.
         #
         # max_connections is a dynamic GLOBAL, so set it at runtime (root is
-        # available and mysql-client is installed above). This unblocks every
-        # package at once; the proper O(1) fix — idle-reap in octo-lib testutil
-        # — is tracked upstream.
-        run: mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
+        # available inside the service container). This unblocks every package
+        # at once; the proper O(1) fix — idle-reap in octo-lib testutil — is
+        # tracked upstream.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+        run: |
+          [ -n "$MYSQL_CID" ] || {
+            echo "::error title=Missing service container id::MYSQL_CID is empty; job.services.mysql.id did not resolve" >&2
+            exit 1
+          }
+          docker exec "$MYSQL_CID" mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
 
       - name: Wait for WuKongIM
         run: |
@@ -232,7 +282,7 @@ jobs:
           echo "wukongim did not become ready" >&2
           exit 1
 
-      - name: Run tests
+      - name: Run E2E shard
         # NOTE (issue #557 / integration build tag): this lane runs the DEFAULT
         # build (NO `-tags integration`). It intentionally does NOT enable the
         # `//go:build integration` suite, and here is the load-bearing reason —
@@ -269,19 +319,43 @@ jobs:
         # `t.Skip("OCTO migration TODO: ...issues/17")` marker in-source
         # — see issue #17 for the cleanup tracker. Grep for `OCTO migration
         # TODO` to find the suppressed tests.
+        #
+        # The per-package reset reaches mysql/redis through these container
+        # ids instead of runner-local clients; see ci/run-e2e-shard.sh.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+          REDIS_CID: ${{ job.services.redis.id }}
+        run: ci/run-e2e-shard.sh "${{ matrix.shard }}" "${{ matrix.total }}"
+
+  test:
+    needs: [changes, unit-test, e2e-test]
+    if: always()
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      CODE_CHANGED: ${{ needs.changes.outputs.code }}
+      IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft || false }}
+      UNIT_RESULT: ${{ needs.unit-test.result }}
+      E2E_RESULT: ${{ needs.e2e-test.result }}
+    steps:
+      - name: Aggregate split test results
         run: |
           set -euo pipefail
-          fail=0
-          while read -r pkg; do
-            mysql -h 127.0.0.1 -uroot -pdemo -e "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-            redis-cli -h 127.0.0.1 -p 6379 FLUSHALL >/dev/null
-            echo "::group::go test $pkg"
-            if ! go test -race -shuffle=on -count=1 -timeout 5m "$pkg"; then
-              fail=1
-            fi
-            echo "::endgroup::"
-          done < <(go list ./...)
-          exit $fail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error title=Test preflight failed::changes job result was $CHANGES_RESULT"
+            exit 1
+          fi
+          if [ "$IS_DRAFT" = "true" ] || [ "$CODE_CHANGED" != "true" ]; then
+            echo "Split tests intentionally skipped: draft=$IS_DRAFT code_changed=$CODE_CHANGED"
+            exit 0
+          fi
+          if [ "$UNIT_RESULT" != "success" ] || [ "$E2E_RESULT" != "success" ]; then
+            echo "::error title=Split tests failed::Unit Test=$UNIT_RESULT E2E Test=$E2E_RESULT"
+            exit 1
+          fi
+          echo "Unit Test and E2E Test passed"
 
   vet:
     needs: [changes]

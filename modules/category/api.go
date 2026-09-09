@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -539,6 +540,20 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		}
 		c.Error("查询群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
+		return
+	}
+
+	// Check the server-owned purpose only after membership succeeds so a caller
+	// cannot use this route to distinguish an inaccessible group from a private
+	// AI container whose identifier they guessed.
+	protected, err := aiteampkg.IsProtectedGroup(c.ctx.DB(), groupNo)
+	if err != nil {
+		c.Error("查询AI容器用途失败", zap.Error(err), zap.String("group_no", groupNo))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(ctx, errcode.ErrAITeamContainerProtected, nil, nil)
 		return
 	}
 

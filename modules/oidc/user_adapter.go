@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 )
 
 // userAdapter 适配 user.IService + oidc.DB → service.userLookup。
@@ -81,7 +81,9 @@ func (a *userAdapter) IssueSession(ctx context.Context, req IssueSessionReq) (*I
 type identityStoreAdapter struct{ db *DB }
 
 func (a identityStoreAdapter) Get(issuer, subject string) (*IdentityModel, error) {
-	return a.db.QueryIdentityByIssuerSubject(issuer, subject)
+	// 复核在 DB.QueryIdentityExact 里(见那里的说明)。这里不再自己做一遍 ——
+	// 两份实现就是两处会漂移的判断,而判断错的后果是账号接管。
+	return a.db.QueryIdentityExact(issuer, subject)
 }
 func (a identityStoreAdapter) Insert(m *IdentityModel) error {
 	return a.db.InsertIdentity(m)

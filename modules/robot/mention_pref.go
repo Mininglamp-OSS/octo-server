@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
@@ -143,6 +144,9 @@ func (rb *Robot) setMentionPref(c *wkhttp.Context) {
 	if rb.assertRobotOwner(c, robotID, loginUID) {
 		return
 	}
+	if rb.rejectAIContainerMentionPref(c, groupNo) {
+		return
+	}
 
 	// dbr 的 InsertStmt 不暴露 Suffix，用 InsertBySql + ON DUPLICATE KEY UPDATE 完成 upsert。
 	// updated_at 走列默认 ON UPDATE CURRENT_TIMESTAMP 自动更新。
@@ -179,6 +183,9 @@ func (rb *Robot) deleteMentionPref(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 
 	if rb.assertRobotOwner(c, robotID, loginUID) {
+		return
+	}
+	if rb.rejectAIContainerMentionPref(c, groupNo) {
 		return
 	}
 
@@ -268,6 +275,9 @@ func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 	if rb.assertRobotOwner(c, robotID, loginUID) {
 		return
 	}
+	if rb.rejectAIContainerMentionPref(c, groupNo) {
+		return
+	}
 
 	var noMention int
 	err := rb.ctx.DB().Select("no_mention").From("bot_mention_pref").
@@ -298,6 +308,23 @@ func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 		"no_mention":             noMention,
 		"group_allow_no_mention": groupAllow,
 	})
+}
+
+// rejectAIContainerMentionPref keeps the owner-facing mention preference API
+// from becoming a second mutation/read surface for hidden AI containers. Run it
+// only after robot ownership succeeds so callers cannot probe arbitrary group IDs.
+func (rb *Robot) rejectAIContainerMentionPref(c *wkhttp.Context, groupNo string) bool {
+	protected, err := aiteampkg.IsProtectedGroup(rb.ctx.DB(), groupNo)
+	if err != nil {
+		rb.Error("检查群聊用途失败", zap.String("group_no", groupNo), zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return true
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		return true
+	}
+	return false
 }
 
 // groupScanRow is the raw DB row for listGroups. no_mention scans as int
@@ -344,8 +371,8 @@ func (rb *Robot) listGroups(c *wkhttp.Context) {
 		"FROM group_member gm " +
 		"INNER JOIN `group` g ON gm.group_no = g.group_no " +
 		"LEFT JOIN bot_mention_pref p ON p.robot_id = gm.uid AND p.group_no = gm.group_no " +
-		"WHERE gm.uid = ? AND gm.is_deleted = 0 AND gm.id > ?"
-	args := []interface{}{robotID, lastID}
+		"WHERE gm.uid = ? AND gm.is_deleted = 0 AND gm.id > ? AND g.purpose <> ?"
+	args := []interface{}{robotID, lastID, aiteampkg.GroupPurpose}
 	if q != "" {
 		sql += " AND g.name LIKE ?"
 		args = append(args, "%"+q+"%")

@@ -29,6 +29,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
@@ -63,6 +66,11 @@ type File struct {
 // New New
 func New(ctx *config.Context) *File {
 	settings := common.EnsureSystemSettings(ctx)
+	// 把配置源挂到包级上传策略上。漏掉这一行，policy.go 的 currentPolicy() 会
+	// 一直走「未挂载」分支（env + baseline + 默认 100MB），管理台写入 file.*
+	// 能落库却对任何上传入口都不生效 —— 功能整体是死的，且没有任何报错。
+	// 见 TestNewMountsPolicySettings / policy_integration_test.go。
+	SetPolicySettings(settings)
 	return &File{
 		ctx:        ctx,
 		Log:        log.NewTLog("File"),
@@ -289,8 +297,15 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		}
 	}
 
-	// 限制请求体大小，防止大文件 DoS
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxFileSize+1024*1024)
+	// 限制请求体大小，防止大文件 DoS。
+	//
+	// maxUpload 在整个 handler 里只取一次：MaxBytesReader 的上限与下面的
+	// fileHeader.Size 校验必须同源。若各自调用 MaxUploadSize()，两次调用之间
+	// 发生一次 system_setting reload 就会错位 —— reader 先截断请求体，客户端
+	// 拿到的是 "http: request body too large"/EOF 而不是「文件大小不能超过 X MB」。
+	// +1MB 是 multipart 信封（boundary/头部）的余量，语义同改动前。
+	maxUpload := MaxUploadSize()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpload+1024*1024)
 
 	file, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
@@ -304,12 +319,12 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	defer file.Close()
 
 	// 文件大小检查
-	if fileHeader.Size > MaxFileSize {
+	if fileHeader.Size > maxUpload {
 		if isStickerUpload {
 			observeStickerUpload("size_rejected")
 		}
-		f.Warn("文件大小超出限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+		f.Warn("文件大小超出限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", maxUpload))
+		respondFileTooLarge(c, maxUpload)
 		return
 	}
 	// 自定义贴纸单独收紧上限（可运营配置的 sticker.upload_max_size_kb，默认 1024
@@ -856,10 +871,10 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
 		return
 	}
-	if fileSize > MaxFileSize {
+	if maxUpload := MaxUploadSize(); fileSize > maxUpload {
 		f.Warn("预签名上传 fileSize 超出限制",
-			zap.Int64("size", fileSize), zap.Int64("max", MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+			zap.Int64("size", fileSize), zap.Int64("max", maxUpload))
+		respondFileTooLarge(c, maxUpload)
 		return
 	}
 
@@ -894,9 +909,19 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 			contentType = inferred
 		}
 	}
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
+	// GH#760: this value is BOTH signed into the presigned PUT and echoed to
+	// the client, which is contractually required to send it back verbatim —
+	// so it has to survive SigV4 Trimall unchanged, and be a legal header
+	// value, for the same reasons Content-Disposition does. The caller's raw
+	// query value reaches here whenever mime.TypeByExtension cannot resolve
+	// the extension, which is the norm in production: the prod image is
+	// alpine with no /etc/mime.types, so Go falls back to its small builtin
+	// table and .docx / .xlsx / .pptx / .zip all return "". A parameter such
+	// as `; name="a  b"` would then be signed collapsed and sent uncollapsed
+	// → 403 SignatureDoesNotMatch. normalizeUploadContentType also owns the
+	// empty/whitespace-only default, which is why no `== ""` check precedes
+	// it — see that function for the ordering rationale.
+	contentType = normalizeUploadContentType(contentType)
 
 	// When both path and filename are provided, path determines the objectKey
 	// while filename is used for Content-Disposition (friendly download name).
@@ -1096,7 +1121,7 @@ func BuildContentDisposition(filename string) string {
 		// ASCII 文件名：转义反斜杠和双引号以确保安全
 		safe := strings.ReplaceAll(filename, `\`, `\\`)
 		safe = strings.ReplaceAll(safe, `"`, `\"`)
-		return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+		return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", quotedFilenameFallback(safe), encoded)
 	}
 	// 非 ASCII 文件名：filename 使用下划线替换非 ASCII 字符作为回退
 	var asciiFallback strings.Builder
@@ -1109,7 +1134,50 @@ func BuildContentDisposition(filename string) string {
 	}
 	safe := strings.ReplaceAll(asciiFallback.String(), `\`, `\\`)
 	safe = strings.ReplaceAll(safe, `"`, `\"`)
-	return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+	return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", quotedFilenameFallback(safe), encoded)
+}
+
+// quotedFilenameFallback prepares the ASCII fallback that goes inside
+// `filename="…"`.
+//
+// Runs of whitespace are collapsed to a single space (GH#760): this header is
+// signed into presigned PUT URLs, and a whitespace run inside the quoted
+// string makes minio-go and the storage gateway derive different canonical
+// requests — see collapseSignableWhitespace for the full mechanism. The
+// user's exact filename, spaces and all, is still carried losslessly by the
+// adjacent RFC 5987 `filename*` parameter, which percent-encodes spaces as
+// %20 and is what every modern browser prefers; only the legacy fallback is
+// normalized.
+//
+// Remaining C0 controls and DEL are replaced with '_'. Collapsing only
+// removes the whitespace ones (`\t\n\v\f\r`); bytes like 0x01 or 0x7F would
+// otherwise reach the emitted header and make it an invalid HTTP header
+// value, which Go's transport rejects outright with "invalid header field
+// value" — so the credentials response would hand the client a
+// Content-Disposition it cannot send. Most callers never hit this because
+// they pre-sanitize, but modules/bot_api and modules/robot pass the raw
+// multipart filename / query parameter straight in, so the guarantee has to
+// live here. `filename*` is unaffected: percent-encoding already renders
+// those bytes as %XX.
+//
+// A name that collapses to nothing (all-whitespace) degrades to "file" rather
+// than emitting an empty `filename=""`.
+func quotedFilenameFallback(safe string) string {
+	collapsed := collapseSignableWhitespace(safe)
+	var b strings.Builder
+	b.Grow(len(collapsed))
+	for i := 0; i < len(collapsed); i++ {
+		if isInvalidHeaderByte(collapsed[i]) {
+			b.WriteByte('_')
+			continue
+		}
+		b.WriteByte(collapsed[i])
+	}
+	collapsed = b.String()
+	if collapsed == "" {
+		return "file"
+	}
+	return collapsed
 }
 
 // isASCII 检查字符串是否全部为 ASCII 字符
@@ -1185,4 +1253,18 @@ func (f *File) checkReq(fileType Type, path string) error {
 		return errors.New("文件类型错误")
 	}
 	return nil
+}
+
+// respondFileTooLarge 回应「超过单文件上限」，上限值取自当前策略快照。
+//
+// 走 httperr 信封而不是裸 c.ResponseError：file.max_size_kb 接受任意 KB 值，
+// 而原先的 `fmt.Errorf("...%dMB", bytes/1024/1024)` 按整除截断 —— 配成 1536KB
+// 时服务端实际放行 1.5MB，却告诉客户端「不能超过 1MB」。既然要改这条面向用户的
+// 文案，就按仓库规则一并搬进本地化信封，顺带给出精确的 max_size_kb 详情。
+func respondFileTooLarge(c *wkhttp.Context, maxBytes int64) {
+	maxSizeKB, maxMB := SizeLimitDetails(maxBytes)
+	httperr.ResponseErrorL(c, errcode.ErrFileUploadTooLarge,
+		i18n.Params{"max_size": FormatSizeLimit(maxBytes)},
+		i18n.Details{"max_size_kb": maxSizeKB, "max_mb": maxMB},
+	)
 }

@@ -265,8 +265,9 @@ func TestQueryUserSpaceContext_SpacesTruncatedAtPolicyLimit(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var resp struct {
-		Spaces     []string       `json:"spaces"`
-		SpaceRoles map[string]int `json:"space_roles"`
+		Spaces          []string       `json:"spaces"`
+		SpaceRoles      map[string]int `json:"space_roles"`
+		SpacesTruncated bool           `json:"spaces_truncated"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Len(t, resp.Spaces, 100,
@@ -276,6 +277,7 @@ func TestQueryUserSpaceContext_SpacesTruncatedAtPolicyLimit(t *testing.T) {
 	// two must agree exactly. The over-fetch is LIMIT 101: a map built before
 	// truncation would carry 101 entries and hand the marketplace reviewer gate
 	// a space that `spaces` denies.
+	assert.True(t, resp.SpacesTruncated, "role-aware context must retain the truncation signal")
 	assert.Len(t, resp.SpaceRoles, 100,
 		"space_roles must be truncated in lockstep with spaces, got %d", len(resp.SpaceRoles))
 	inSpaces := make(map[string]struct{}, len(resp.Spaces))
@@ -499,6 +501,7 @@ func TestAuthVerifyToken_IncludeContext_DBError_FailSecure(t *testing.T) {
 	var resp struct {
 		UID              string              `json:"uid"`
 		ContextIncluded  bool                `json:"context_included"`
+		ContextError     bool                `json:"context_error"`
 		Spaces           []string            `json:"spaces"`
 		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
 		SpaceRoles       map[string]int      `json:"space_roles"`
@@ -512,6 +515,7 @@ func TestAuthVerifyToken_IncludeContext_DBError_FailSecure(t *testing.T) {
 	// nil and empty are semantically "no spaces / no bots / no roles", authz
 	// stays fail-closed (range over nil = 0 iterations, lookup on nil map = 0).
 	// assert.Empty accepts both nil and zero-length.
+	assert.True(t, resp.ContextError, "role-aware context must retain the lookup failure signal")
 	assert.Empty(t, resp.Spaces, "spaces MUST be empty (nil or len 0) on DB err")
 	assert.Empty(t, resp.OwnedBotsBySpace, "owned_bots_by_space MUST be empty on DB err")
 	assert.Empty(t, resp.SpaceRoles,

@@ -4,6 +4,371 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-09 — project-collaboration-roles
+
+- Added project-scoped, multi-select collaboration roles for human members while
+  preserving `owner/admin/member` as the sole authorization model.
+- Added four immutable built-ins, owner-managed custom definitions, owner/admin
+  member bindings, roster exposure, an independent epoch, lifecycle cleanup, audit,
+  metrics, quotas, and a default-off write gate.
+- Closed review findings around bounded integrity scans, case-only display renames,
+  and accent-sensitive normalized-name uniqueness.
+- Recorded the implementation and operational boundaries in
+  [journal](journal/shared/project-collaboration-roles.md); reusable pagination guidance
+  is staged in [learnings/pending](learnings/pending/project-collaboration-roles.md).
+
+## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
+
+- **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的
+  anyApplied 契约）；join_mode 与 is_official 完全对称撤出全部客户端面（S-2：P2 上线自助
+  加入前必须先消灭"现在写入的 join_mode=0 将追溯性变成开放加入"的存量数据）。
+- **Fixed (non-blocking)** — anyApplied 改按 committed 判定（no-op 不冒充已提交）；
+  successor/target 的 space_member 共享锁前置到 project 锁之前，消除三方死锁环（Q2）；
+  projectMiddleware 的成员与角色合成一次 MemberRole 读取（Q3/Q8，banned 在下一请求即生效）；
+  五条特权写路径事务内复核 actor 的 Space 席位（Q6，新增 requireActorSpaceSeatTx）；
+  reconcile 分页改为 base 行 LIMIT + 每行 violating 标记（Q4：LIMIT 从此约束"检查行"而非
+  "返回行"）；ForTest 全局函数指针改为实例字段（Q7）；orphan 扫描覆盖解散 Space；
+  bumpMemberEpochTx 不再搅动 updated_at 且加 status 谓词；指标改名 write_rejected_total（S-3）；
+  brief 成员配额验收措辞按批量契约修订（S-1）。
+- **Learned** — 行为级测试必须做变异检查：reentrancy 测试重写为读 histogram SampleSum 后
+  才杀得掉"删 guard"变异；两个源码 guard join 续行后立即抓到跨行绝对赋值变异。TDD 循环里
+  新写的守卫（bumpMemberEpochTx 的 status 谓词）当场抓到既有代码的顺序缺陷（disband 先翻转
+  后 bump 吞掉 epoch）——测试先行不是仪式，是捕获手段。
+- **Learned** — 测试断言不能从 wire 读被刻意排除的字段（committed 是 json:"-"），必须断言
+  其行为后果（403 vs 200 per-target report）。
+- **Test hardening** — setup Redis helper Skipf→require；级联注册可断言（space 导出
+  MemberRemovalCleanupStepNames）；级联 step 导出供外部测试恢复真实注册；缓存 seam 三分支
+  与 corrupt-cache 回落补测；并发测试加 start barrier + loser 断言；RoutesReject 断言
+  registered code；COUNT(1) 纳入黑名单；schema 测试要求两表齐备。
+
+## 2026-09-06 — project-p0-foundation (P0 implemented, 4 review rounds)
+
+- **Added** — `modules/project`：Space 内项目协作层 P0。`octo_project` / `octo_project_member`
+  两表（`active_name` 生成列让解散释放重名），CRUD + 成员管理在请求事务内同步校验不变量 I1，
+  `member_epoch` 与每次成员写在同一事务内 `+1`（写纪律由源码级 guard 钉死），Space 移除级联经
+  反向注册清理步骤接入既有 outbox 工单，reconcile 只读对账（LIMIT+cursor，跨 tick 轮转），
+  四类配额 + 审计 + 按 entry point 拆分的拒绝指标。`project_create_enabled` fail-closed。
+  未触碰 group/thread/message；回滚 = 删两张表 + 去掉一个 blank import。
+  See [journal](journal/shared/project-p0-foundation.md).
+- **Learned** — 不变量只存在于它被强制执行的路径上，而每条新写路径都是一个新的执行点。
+  I1 的校验在 addOneMember 有了、createProject 的 owner 席位没有过；转让路径复核了 Space 席位、
+  直接 role change 却没有。brief 早已预言（「十一条群写路径证明 retrofit 会漏」），仍然发生。
+  对策是把「枚举写路径并断言各自含不变量调用」做成源码级 guard。
+- **Learned** — 「后续会有人补」必须写成代码。三处缺陷都是注释在断言代码不具备的性质：
+  cascade 注释说 reconcile 是第一页之后席位的「backstop」（reconcile 按设计只读）；
+  页数上限注释说「下一 tick 继续」（cursor 是局部变量，每 tick 从头开始，~25k 行之后
+  永远不被扫描）；批次标签 `not_attempted` 在 remove 路径是真话、在 add 路径是谎话
+  （service 先跑完整批，handler 事后标注）。
+- **Fixed (4 rounds of review)** — 事务内 I1 校验（`FOR SHARE OF` 锁 space_member 行）、
+  三个配额改为锁 space 行后计数（daily 维度跨 Space 的窄窗口为已接受例外）、特权写路径
+  一律锁内重读 actor 角色、提升/继任均复核目标 Space 席位、级联每短事务复核 + 页预算
+  耗尽返回可重试错误、abandoned 对账改为分页统计泄漏席位并排除在途工单、leave 只容忍
+  io.EOF、所有权交接补继任者审计、部分提交批次返回 per-target 结果。
+- **Deferred (产品待决，已记录进 brief Open questions)** — 唯一 owner 被移出 Space 后留下
+  无 owner 项目：自动提拔与自动解散都是产品决策，P0 只打 Warn；与 group 模块
+  `handOverGroupCreator` 无继任者时的既有终局一致。
+- **范围收敛** — 按需求方指示回退三处超出 brief 的扩展：级联的自动转让/自动解散、
+  Space admin 在用户侧列表对 unlisted 的放宽（brief 只授权 detail；枚举属 P2 admin surface）、
+  `member_epoch_bumped_total` 指标。
+- **Known gap** — 每日创建配额的跨 Space 并发窄窗口（per-space / per-creator 两个硬配额已在
+  space 行锁内计数，跨 Space 的 daily 维度未加锁）；生产 collation 待人工确认
+  （legacy 表未写 COLLATE，若生产默认非 `utf8mb4_general_ci`，对账 JOIN 会撞 1267）。
+## 2026-09-06 (space-cloud-agents-by-owner)
+
+- **Implemented** — Added the authenticated, UID-rate-limited, Space-isolated
+  `GET /v1/space/directory` endpoint. It returns every active non-system human
+  in the selected Space with visible non-self-hosted user bots grouped by
+  owner, real per-owner counts, and a SQL-enforced 50-detail cap. See
+  [journal](journal/shared/space-cloud-agents-by-owner.md).
+- **Guarded** — The handler requires the query selector to preserve the public
+  contract, then uses the Space middleware's verified value; both database
+  reads share one cancellation/timeout budget and never produce partial data.
+  The test suite now covers zero / exactly 50 / 51 agents, hosting's two empty
+  states, inactive/orphan/system exclusions, friendship, request cancellation,
+  auth/isolation behavior, and literal owner/Bot-name `keyword` filtering. An
+  adversarial `>= 50` mutation fails the exact-50 assertion.
+- **Learned** — `CREATE TABLE IF NOT EXISTS` is an existence check, not a test
+  fixture schema check. The manually provisioned robot fixture now recreates
+  its required shape; the reusable guidance is staged in
+  [learnings/pending/space-cloud-agents-by-owner.md](learnings/pending/space-cloud-agents-by-owner.md).
+
+## 2026-09-04 (bot-agent-hosting · review round 4)
+
+- **Learned** — **注释声称有区分力、实际没有的测试，比没有测试更糟：它会被相信。**
+  reviewer 用变异法证明我两条关键测试杀不掉对应变异：时区测试把**旁观连接**调偏
+  （register 走池里另一条，两个 TIMESTAMP 落同一 UTC 瞬间、偏差恒 0）；三条稀疏写入
+  测试的带外 UPDATE 落在下一次 register **之前**（合并实现读到新值再写回，结果相同）。
+  而我上一轮把"验了两处"表述成了"三处全部验证通过"。
+- **Adopted** — 定为规则：**每个行为断言都要过变异检查，且测试注释写明它杀掉哪个变异。**
+  本轮 6 个断言逐一实跑变异版验证（SQL 时钟 / 合并守卫 / legacy 空值跳过 /
+  日志字段 / App Bot Warn / 全有或全无解码）。
+- **Changed** — 稀疏写入的不变量改由**源码守卫**承担：真正的交错窗口在
+  queryRobotByBotToken 与 UPDATE 之间，行为测试无法确定性插入。守卫区分**赋值目标** ——
+  robot 行的值作为独立 stored 快照传参用于 skip 比较合法（不匹配时写调用方的值），
+  赋回 req.Agent* 则禁止。
+- **Learned** — **一条需要污染进程级状态才能运行的测试，在整包里就是不可靠的。**
+  时区端到端测试要区分两种时钟，必须把连接池压到单连接（SetMaxOpenConns 是进程级），
+  于是其它测试排队/超时、失败集每次不同。**删掉而非修好**：它守的不变量有确定性替代
+  （断言语句里是字面 NOW()），杀同一变异且不碰共享状态。删除理由留在原代码位置。
+- **Fixed** — brief 四处与实现矛盾，其中两处描述的是**前两轮被改掉**的行为
+  （含两位 reviewer 都阻塞过的"形状非法落空串"）。上一轮只修了被点名那处、没修类别。
+  Load-bearing 段里的过时规则比没有规则更糟：后来人当权威读，会把代码"修"回 bug。
+- **Decided** — `agent_hosting` 的撤回改用保留 slug `none`，`""` 回归 no-op（四字段统一）。
+  让 `""` 清空会给新列复制出老列被判为数据丢失的同一形状：从不填该字段但总是发 key 的
+  客户端每次重连落进 `('', 非NULL)` —— 那个状态被三处文档定义为「曾上报后刻意撤回」。
+  `none` 在存储层归一成空串，读取方无需知道这个 sentinel。
+- **Fixed** — 去掉 skip-if-unchanged 的**理由已消失**（时间戳现在只在 hosting 上报时前进，
+  于是版本-only 重连的那条 UPDATE 无任何可观察效果）。legacy 三列恢复跳过，比较用的
+  stored 快照**永不被写进语句**；hosting 保持无条件写（撤回/再确认都是真实上报）。
+- **Fixed** — recordingLog 原先只记 msg **丢掉 fields**，而泄露风险全在 fields 里；
+  迁移测试原先断言"不得出现 INFORMATION_SCHEMA"，把无守卫写法变成了强制（且大小写敏感
+  只是碰巧正确）—— 单条原子 ALTER 解决的是列级半应用，**不解决**可重入性，这一点上一轮
+  说错了。迁移补 pin `ALGORITHM=INSTANT`（不 pin 会静默退化为 COPY 锁表）。
+- **Learned（环境）** — **botfather 整包"失败集每次不同、耗时恰好 5s/30s"时，先重启
+  WuKongIM 再怀疑代码。** 连续 8 天运行的容器状态劣化，UpdateIMToken 5s 超时
+  → `err.server.bot_api.im_token_failed`，看起来极像测试污染。判据：串行跑
+  （`-p 1 -parallel 1`）—— 真正的顺序依赖会变**稳定**，容量问题仍然随机。
+  重启后整包 15.7s 全绿。排查中确实找出两个真污染并保留修复：register 的 per-IP 桶
+  必须在 helper 里每次清（不是 setup 清一次，一条测试就能自己打满）、`SET time_zone`
+  打在连接池上无作用域。
+
+## 2026-09-03 (bot-agent-hosting · review round 2)
+
+- **Fixed** — round 1 的修复引入的数据丢失回归（两位 reviewer 再次独立端到端复现）：
+  三个 legacy 版本字段改 `*string` 后，指向空串的非 nil 指针被无条件写入，于是
+  「报空」从 merge base 的「保留」变成「清空」。register 是重连路径，任何序列化器对
+  未填字段输出 `""` 的客户端会每次重连擦一次，HTTP 200、无日志、事后与「从未上报」
+  不可区分。现在 legacy 三列**空值也跳过**，`agent_hosting` 保持「报空即清空」。
+- **Learned** — **「不在语句里」与「以空串在语句里」只在没有东西区分它们时才是同一件事。**
+  为修并发引入指针，同时也引入了这个区分，而旧契约默默依赖它不存在。稀疏写入与
+  「空值即不变」从来不冲突：丢更新的根源是「替换成刚读到的值」，不是「跳过该列」。
+- **Learned** — 同一个 learning 在 brief 里重演：brief 同时留着新规则（四字段一律稀疏）
+  和被它取代的旧规则（三个 legacy 保持 merge-then-write），**而过时那条描述的行为
+  恰好能防住这次回归**。reviewer 直接引用了本 PR 新增的
+  `a-rule-in-a-comment-is-not-applied.md`。取代一条规则 = 删掉旧的，不是并排放新的。
+- **Adopted** — **变异测试作为常规手段**（跟 reviewer 学的）。他验证 round 1 的时区修复
+  不是装饰：把 `dbr.Expr("NOW()")` 改回 `time.Now()`，确认两条测试红、其中一条报出实测
+  `7h59m59s` 偏差。本轮推送前照做：去掉 legacy 空值跳过 → 端到端与 SQL 层两条都红；
+  改回 `_ = c.ShouldBindJSON` → 部分采纳那条红。「测试过了」与「没这行就会红」是两个
+  不同的断言，只有后者有价值。
+- **Fixed** — `json.Decoder` 会先填好已解析字段再返回类型错误，所以忽略 bind 错误等于
+  采纳一个**前缀**（`{"agent_platform":"OpenClaw","agent_version":123}` 存下 platform
+  丢掉后面，无任何诊断）。改为全有或全无：解码到临时变量 + 要求干净 EOF 才采纳。
+- **Guarded** — 空 `agent_hosting` 的两种含义（时间戳 NULL=从未上报 / 非 NULL=显式清空）
+  此前被列 COMMENT 否认、被 `omitempty` 在 wire 上抹平；现在 COMMENT、字段注释、
+  wire 说明三处对齐。补了 4 KiB body 上限的测试（本功能唯一没测的新行为）。
+- **Fixed** — 测试里 `SET time_zone` 打在连接池上，deferred 复位可能落到另一条连接、
+  把 `+08:00` 的连接留在池里污染后续测试。改为独占一条 `*sql.Conn` 并**关闭**而非复位。
+- **Noted** — `normalizeAgentHosting` 的排序理由（「10MB 值不该付 10MB 折叠开销」）在
+  4 KiB body 上限之后**已过时**。顺序仍对（零成本，且不让这个界依赖两层调用之外的限制），
+  但理由随之改写 —— 论证过时和论证错误一样需要修。
+
+## 2026-09-03 (bot-agent-hosting · review round 1)
+
+- **Fixed** — PR #837 两位 reviewer 独立实测复现的两个阻塞项：
+  ① `agent_reported_hosting_at` 原用 Go `time.Now()` 写，经驱动 `Config.Loc`（默认 UTC，
+  DSN 未设 `loc`）转换，而它并列展示的 `bound_at` 由 MySQL `NOW()` 写、应用镜像固定
+  `TZ=Asia/Shanghai` —— session 时区非 UTC 时两者相差 8 小时。改 `dbr.Expr("NOW()")`。
+  生产 MySQL 是 UTC，故为潜伏未发生。
+  ② 四个 `agent_*` 字段全改稀疏写入（`*string`，nil 即不进 `SetMap`）：初版只对新列稀疏，
+  三个既有版本列仍回写读到的值，且把条件 UPDATE 改成无条件，等于新开一条丢更新路径。
+- **Learned** — **注释里写下的规则不会因为被写下就生效。** 那段「不要把缺席字段解析成
+  刚读到的值，会丢更新」的注释，正上方三行就是它否决的写法 —— 周边代码早于这句话存在，
+  而没有任何东西在事后重新审视它。同时两种实现对**单写者**的所有 DB 可观察断言完全等价，
+  所以推理产物（注释）与验证产物（测试）盲在同一处。可断言的是**发出的 SQL 里有哪些列**。
+- **Learned** — `strings.ToLower` **不限于 ASCII**：`U+212A KELVIN SIGN`→`k`、
+  `U+0130`→`i`，所以折叠排在 ASCII-only 正则之前时混淆字符能通过，让函数自己注释里
+  「confusables all fail it」变成假的（测试恰好只挑了会失败的 `U+200B`）。ASCII 前置后
+  才成立；且 ASCII 性质同时是**列宽不变量**的前提（`len()` 数字节 vs `VARCHAR` 数字符）。
+- **Guarded** — 「被拒」与「清空」原本被文档成同一件事（PR 描述说 degrades to not
+  reported，字段注释说 present overwrites）。定为**保持不变**：触发场景不需要恶意，
+  `self-hosted`（连字符，正是所引用 GitHub Actions 的写法）就会被拒，一次客户端拼错
+  会把全量 bot 的该列刷空。清空仍可做，但要显式报 `""`。
+- **Learned** — 测试注释声称「能区分两种实现」时，那本身是个需要验证的断言。初版那条
+  「值保留 + 时间戳前进」在被否决的写回实现下三条断言全过。改用**带外写入**（第三方在
+  两次 register 之间改列，写回实现会覆盖它）+ sqlmock 直接断言 SQL 文本。
+- **Changed** — `agent_reported_at` 更名 `agent_reported_hosting_at` 并收窄为只在 hosting
+  被上报时前进：原实现任何 `agent_*` 上报都刷新它，等于替一份该次上报从未提及的数据背书
+  新鲜度，而分歧场景正是用来论证指针语义的那个「新 runtime 漏报 hosting」。
+- **Guarded** — register 的 body 加 4 KiB 上限（`binding.JSON` 无上限，本路由此前无任何
+  body 界，而四个 sibling bot_api 路由都有）。App Bot 分支上那次解码只换来一行日志。
+  超限按「未上报」处理，绝不让 register 失败（#696）。
+
+
+## 2026-09-03 (bot-agent-hosting)
+
+- **Added** — `robot.agent_hosting` + `robot.agent_reported_hosting_at`（单条原子 `ALTER`）。
+  `POST /v1/bot/register` 的 User Bot 分支接收自报托管形态，`GET /v1/user/bots` 带出。
+  App Bot 显式不支持（只解析 body 打 Warn，由源码守卫钉住 `app_bot` 无 `agent_*` 列）。
+  无新 errcode / 端点 / i18n 条目 / 路由变更。
+  See [journal](journal/shared/bot-agent-hosting.md).
+- **Learned** — 「本地 vs 云上」在服务端**没有可信来源**，三个候选字段全部不成立：
+  `user_api_key.client_id` 把桌面客户端与云端服务混装在同一个 `octopush` 下
+  （`modules/integration/api.go` 明写桌面端只持业务后端自签 JWT，`/exchange` 硬编码单一
+  client_id），从它推导会把本地标成云上；`bound_agent_ref` 是 bind 时客户端自填且
+  「Octo 不解析其语义」；`agent_platform` 只有平台名。所以这个列是**观测**字段，
+  永不可喂授权判定。
+- **Learned** — **枚举白名单给的保证是虚假的。** 它校验「值在集合内」，不校验
+  「你有资格声称这个值」——任何持 `bf_` token 的进程照样能报 `octo_hosted`。真正要挡的
+  是引号/尖括号/空格/控制字符/Unicode 混淆字符，`^[a-z][a-z0-9_]*$` 全挡且不需要预知
+  vendor。改为开放取值后，新托管方无需服务端发版，且 vendor 名不进这个开源仓。
+  代价已明示：`cloud`/`local` 从此合法（约定降级为客户端约定，**刻意不做黑名单**）。
+- **Guarded** — **校验上界高于列宽不是余量，是延迟的失败。** 初版 `maxAgentHostingLen=64`
+  配 `VARCHAR(20)`：25 字节的值会过校验、写库撞 `1406`，而 `agent_*` 共用一条 UPDATE，
+  会连带挡掉同一请求里的 `agent_platform/version/plugin_version`，且 register 仍返回 200。
+  现在上界与列宽**严格相等**（测试从迁移文件正则提取列宽后断言 `Equal` 而非 `<=`）。
+  另：长度上界必须排在 `ToLower` **之前**（后者按输入等大分配，body 无上限）。
+- **Learned** — **规格核到「响应结构没这个字段」不等于核到「端点存在」。**
+  原计划改的运维面 `GET /v1/manager/robots{,/:robot_id}` 整个是死代码：
+  `modules/robot/api_manager.go` 的 `NewManager` 全仓无调用方、`Route()` 从未执行
+  （`1module.go` 只注册 `New(ctx)`）。字段和测试都写完了，靠测试报 `404 page not found`
+  才发现，随后整体 `git checkout` 撤回 —— 给死代码加字段没有调用方看得到，却会让
+  下一个人以为运维面已有这个能力。
+- **Learned** — 测试要放在**拥有 schema 的模块**里，不是拥有代码的模块。写入路径在
+  `modules/bot_api`，但 `robot` 表的 `agent_*` 列归 `modules/botfather` 的迁移，而
+  bot_api 的测试二进制不 link botfather 的 `init()`，那里 `NewTestServer` 建出的 robot 表
+  没有这些列（`1054 Unknown column`）。App Bot 那条用例则要 blank import
+  `modules/app_bot` 而**不能**裸 `CREATE TABLE IF NOT EXISTS` —— 绕过 sql-migrate 建表
+  不写 `gorp_migrations`，会让下一个包的同名迁移撞「already exists」（`modules/message`
+  大量 DB 测试被 skip 的已知根因）。
+## 2026-08-24 (group-exit-notice-visibility)
+
+- **Fixed** — 「某成员退出群聊」系统提示（`type=1021`）改为**全员可见 + RedDot:0**，
+  与 bot 级联移除 Tip 同一套语义。此前它带 `visibles` 白名单只给一位管理员可见，
+  非管理员看不到气泡却被计一格未读、且永远消不掉。实现走 octo-server 侧新增的
+  `modules/group/group_exit_notice.go`，**不动 octo-lib 的 `SendGroupExit`**。
+  See [journal](journal/shared/group-exit-notice-visibility.md).
+- **Learned** — `visibles` 挡的是**内容**，挡不住 **seq**。IM 的未读是纯游标减法
+  （`unread = latest_msg_seq − read_seq`），与 `red_dot`、`visibles` **都无关**
+  （octo-im `build.go` / `sync.go`，octo-server 只原样透传）。所以「改红点字段」
+  这个直觉修复**完全无效** —— 真正修好未读的是让消息可读。推论：单条共享 channel log
+  里，「只给部分人看的持久气泡」与「不给其他人产生未读」不可兼得。
+- **Guarded** — 可见性白名单里藏着一条**静默早退**：白名单为空（群里没有其他
+  管理员）时整条提示不发。那不是产品规则，只是可见性实现的副作用。现已由
+  `TestGroupExitTipSentWhenNoOtherAdmin` 钉死。`groupExit` 侧还连带去掉了一个
+  查询失败即 500 中断整个退群的错误分支。
+- **Learned** — 差分验证若只回退**改动面的一部分**，同样失真。第一轮只回退了 helper
+  的 payload，两条测试确实红了，但那条早退门槛的断言从未被验证过；补做整段还原才
+  跑出 `"[]" should have 1 item(s), but has 0`。移除了 N 个行为门槛，就得逐个还原。
+  See [learning](learnings/pending/group-exit-notice-visibility.md).
+- **Known gap** — `groupExit` handler 那处发送门槛的改动**无运行中的测试**：
+  `api_test.go` 整片 HTTP handler 测试（19 处 skip）卡在 issue #17 的路由重复注册
+  （解除 skip 会 `panic: handlers are already registered`）。补齐前置是先修 #17。
+- **Out of scope** — 排查中确认的第二个问题（跨端已读不同步：`unreadClear` CMD
+  `NoPersist:true` 离线丢失、`readed_to_msg_seq` 被 octo-lib 丢弃、iOS
+  `reconcileServerSnapshot` 走 `MAX` 本地优先）未动，独立任务。
+
+## 2026-08-23 (bot-owner-self-removal)
+
+- **Implemented** — 普通群成员现在可以把自己名下（`robot.creator_uid`）的 bot 移出
+  群聊。`memberRemove` 在调用方非 Creator/Manager 时落到一条窄口径自助分支：目标必须
+  **全部**是本群内属于调用方的活跃 bot，否则整批拒绝。成员列表新增 per-viewer 的
+  `bot_owned_by_me` 供前端逐行判权；「你被 X 移除群聊」换成 owner 视角的 Tip；两条
+  移除路由挂上 `SharedUIDRateLimiter`（它们现在对普通成员开放）。
+  上游 Mininglamp-OSS/octo-web#1511。
+  See [journal](journal/shared/bot-owner-self-removal.md).
+- **Guarded** — 移除侧的判据必须是默认拒绝的白名单（`QueryBotUIDsOwnedByUIDs`）。
+  复用入群侧的 `checkBotOwnership` 会是提权漏洞：它对非 bot UID 返回 nil，搬到移除侧
+  等于放开踢人权限。由 `TestBotOwnerSelfRemoval_RejectsHumanTarget` 钉死。
+- **Fixed in review** — 三处只有 code review 才抓到的问题：授权谓词漏用活跃口径，
+  让被拉黑成员拿到一个能改群成员表并写持久化 Tip 的写操作；`queryMemberWithGroupNoAndUID`
+  漏选 `group_member.robot`，使 `bot_owned_by_me` 在 memberGet 上静默恒 false；
+  前端只把 `removeAction` 透传给「查看全部」，而该入口在 19 人以下的群根本不渲染，
+  功能等于没上。
+- **Learned** — `register.GetModules` 用进程级 `sync.Once` 构造模块实例，一个测试
+  二进制里 handler 永远持有第一个 `NewTestServer` 的 ctx。因此对系统消息的断言必须
+  走 service 层，走 HTTP 路由时 IM 桩只对进程内第一个测试生效（表现为「单独跑绿、
+  一起跑红」）。候选规则见 `learnings/pending/bot-owner-self-removal.md`。
+
+## 2026-08-21 (space-member-removal-cleanup)
+
+- **Implemented** — Space member removal now takes the member out of the Space's
+  groups and sub-threads instead of only soft-deleting `space_member`. A
+  transactional outbox (`space_member_removal_cleanup`) drives a leased, retried
+  cascade that exits every group in the Space (full group-exit semantics, with
+  creator handover first); the `SpaceMiddleware` and notify membership caches are
+  invalidated inside the request. Covers all five removal paths — the
+  owner-initiated `DELETE /v1/space/:space_id` was not in the original survey
+  because it only flipped `space.status`.
+  See [journal](journal/shared/space-member-removal-cleanup.md).
+- **Split** — Person-channel (DM) isolation was originally part of this task and
+  was moved to `space-member-dm-isolation` after eleven review rounds. Two
+  measured reasons: WuKongIM's `whitelistOffOfPerson` defaults to `true`, so the
+  DM half changes no delivery behaviour in any current deployment; and it did not
+  converge by point fixes (a new escape in six consecutive rounds, with
+  structural root causes). Keeping it would have blocked a group cascade that is
+  live behaviour today behind a half that is inert.
+- **Learning (pending)** — Deferred cleanup must be scoped with was-ever
+  predicates: an is-currently predicate observes the state the trigger already
+  destroyed and turns the job into a silent no-op. See
+  [learning](learnings/pending/cleanup-predicate-tense.md).
+
+## 2026-08-13 (cutover-framework)
+
+- **Refactor** — Task `cutover-framework`: extracted the control plane the three
+  one-way cutover mechanisms (#627 msgextra, #697 botevent, #733 token session)
+  had hand-written separately into the new leaf package `pkg/cutover` —
+  singleton state read, FOR UPDATE CAS flip with under-lock evidence and floor
+  bounds, and the malformed-fails-closed expected-mode guard — and folded the
+  two standalone operator tools into the server binary as
+  `app cutover <domain> {preflight,activate,status}` so they finally ship in
+  the image (the #733 precedent, generalized). Refusal conditions, floor
+  semantics (#627 inclusive vs #697 strict), sentinel errors, and runtime hot
+  paths are unchanged; the characterization tests moved with the code. The
+  session rollout stays on its own five-phase surface and shares only the
+  documented conventions (`docs/cutover-framework.md`: state-table template,
+  `OCTO_<DOMAIN>_EXPECTED_MODE` naming, the flip-then-arm ordering invariant,
+  evidence discipline, Down 3819 pattern). Runbooks now live in `docs/`
+  (msgextra moved, botevent written for the first time). A review round fixed
+  twelve findings on top, four of them operationally material: the endpoint
+  print echoed the full MySQL DSN (password included) and is now redacted; a
+  committed flip could be reported as a failure when releasing the pinned
+  connection failed; msgextra never named the Redis instance whose scan sets its
+  cutover floor; and `msgextra status` hard-failed on a missing state row,
+  hiding the guard readout in exactly the state that fails every write closed.
+  A second review round fixed twelve more, led by a regression from the first
+  round's own fix: the signal handler added to make a wedged activation
+  abortable had disabled default termination while no evidence phase could
+  observe the context, so the command ignored every Ctrl-C. Interrupts are now
+  two-stage (cancel, then restore default handling so a second signal
+  terminates), the botevent score ceiling moved into the domain, and the
+  msgextra mode constants alias the shared ones rather than restating them.
+  A third round added a schema conformance test for every registered domain's
+  state table (asserting the DDL from the live migrated schema and the inert
+  seed from the migration source), and a fourth closed thirteen more: an
+  operator interrupt was being reported as unreadable evidence, the interrupt
+  notice raced process exit, two botevent MySQL reads still ignored the
+  deadline, SIGTERM now exits 143 rather than sharing SIGINT's 130, and the
+  operator commands say which config file they resolved again (on stderr, so
+  `session-rollout status` stays parseable).
+  See [journal](journal/shared/cutover-framework.md).
+
+## 2026-08-12 (profile-visibility-system-bot-whitelist)
+
+- **Task** — `profile-visibility-system-bot-whitelist`: took the public-bot
+  exemption in the shared person-profile visibility decision off the writable
+  `user.category` column and put it on the `pkg/space.SystemBots` whitelist, so a
+  `category=system` row that is not a system bot — the superuser account, which
+  has a fixed guessable UID — no longer skips the Space, friend, and common-group
+  legs. The input field was renamed `SystemAccount` to `SystemBot` to close the
+  wiring that caused the defect, and both endpoints moved together. Recorded as a
+  narrowing of the authorization input, not an incident fix: no material
+  disclosure was reproduced. The two endpoints differ, and the record states them
+  separately — `/v1/users/:uid` withheld the short number via the `Follow` gate at
+  `modules/user/api.go:1431-1436`, while `/v1/channels/:id/:type` has no such gate
+  and did hand a stranger the superuser's `extra.short_no` plus online state. That
+  value is a public seed constant in this repository and carries no PII and no
+  capability; `username` and `vercode` were checked and never reached a stranger.
+  Two inherited tests had asserted the defective behavior and were rewritten, with
+  reverse regressions added on both endpoints for `system` and `customerService`.
+  **Operators upgrading**: any human support account sitting on
+  `category=customerService` with `robot=0` degrades to the minimal profile set on
+  deploy; `SystemBots` is a compile-time literal, so the supported remedies are
+  adding the UID to that whitelist, marking the account `robot=1`, or relying on a
+  normal relationship path. Focused MySQL-backed runs and the prior authorization
+  matrix pass, before and after rebase. See
+  [journal](journal/shared/profile-visibility-system-bot-whitelist.md).
+
 ## 2026-08-12 (botfather-space-binding-hardening)
 
 - **Task** — `botfather-space-binding-hardening`: made the server authoritative
@@ -1398,3 +1763,961 @@ change-log convention (§7). Newest first.
 
 - **Update** — Synced OKF-aware slash commands, workflow skill, and task brief
   template from octo-spec 1.1.0 so generated briefs/journals stay conformant.
+
+## 2026-08-14 (notification-pause-manual-mode)
+
+- **Implemented** — Added explicit manual/timed pause state, server-side fixed
+  durations, unified REST/CMD responses, migration, validation, and tests.
+
+## 2026-08-22 (cleanup-membership-predicate)
+
+- **Fixed** — The two removal-cleanup rejoin guards were asking one question
+  with two different predicates: a disbanded Space silently voided cleanup
+  (orphan `space_member` row), a banned Space wrongly triggered it. Both now use
+  `CheckMembershipForCleanup` (`sm.status=1 AND s.status <> 0`).
+  `CheckMembership` is deliberately **unchanged** — #797's original proposal to
+  relax it would have admitted banned Spaces across all **36** of its non-test
+  call sites, `SpaceMiddleware` — the primary auth gate — included. A behavioural truth table now pins both predicates' answers
+  across `{disbanded, normal, banned} x {active, removed}`, including the one
+  cell where they must disagree. (Corrected 2026-08-23: this entry originally
+  claimed a *source guard*; that guard was deleted on the same branch for
+  passing the regression it was named for.) Closes two #797 items.
+  See [journal](journal/shared/cleanup-membership-predicate.md).
+
+## 2026-08-22 (cleanup-queue-durability)
+
+- **Fixed** — Two silent-failure items from #797. The cleanup queue's retry budget
+  was only enforced in `releaseCleanupJob`, which a `SIGKILL` never reaches, so a
+  process-killing job was re-claimed forever and head-of-lined the whole queue;
+  the budget now gates the claim itself and a 1-minute sweep pushes exhausted rows
+  to `abandoned`, with three gauges so the new terminal state is not just as silent
+  as the old loop. Separately, a failed membership-cache `DEL` now returns, is
+  logged, and is overwritten with a negative entry — a total Redis outage was
+  already safe, but a DEL-only failure let a removed member keep passing
+  `SpaceMiddleware` for 60s with nothing logged.
+  See [journal](journal/shared/cleanup-queue-durability.md).
+
+## 2026-08-23 (space-member-removal follow-ups · wrap-up)
+
+- **Reverted** — The durable IM-unsubscribe outbox (`eb74529`) was implemented and
+  then withdrawn (`78e46d3`) after five-lens adversarial review. Three reviewers
+  independently found it reintroduced the exact leak it targets (an `abandoned` row
+  became a permanent tombstone that silently swallowed every later enqueue while the
+  log claimed "queued for retry"), and it added a new one (firing without
+  re-validating membership turns blacklist→un-blacklist into a permanent cutoff of an
+  active, visible member). The problem statement and the measured broker evidence
+  stand; the design does not. Corrected requirements are written into
+  `.octospec/tasks/im-pending-outbox/brief.md`.
+- **Fixed** — Two guard tests that could not fail for what they existed to check
+  (mutation-proven, then re-verified with the reviewers' own mutations), and a sweep
+  that took next-key locks across the whole pending range — reproduced as
+  `ERROR 1205` on a brand-new non-conflicting insert, which is the removal-cleanup
+  enqueue inside the removal transaction. See
+  [journal](journal/shared/cleanup-queue-durability.md).
+- **Learning** — `learnings/pending/mutation-testing-must-be-adversarial.md`: an
+  author-chosen mutation only proves the test catches what the author already thought
+  of. The same guard was green on the real security regression and red on whitespace.
+
+## 2026-08-26 — file-extension-policy-dynamic-config
+
+- **Shipped** — Upload extension allow/block lists and the single-file size cap
+  are runtime-configurable through `system_setting`; blocking a format no longer
+  needs a configmap edit and a pod restart. Both extension keys are `env ∪ DB`
+  unions ("allow" only adds, "block" only removes) over a non-revocable built-in
+  blocklist, and the effective limits are served from `/v1/common/appconfig`.
+  See [journal](journal/shared/file-extension-policy-dynamic-config.md).
+- **Fixed during review** — Four blocking findings on my own first revisions: the
+  provider was never mounted (feature inert while reporting success), the
+  `bot_api` / `robot` multipart paths had no extension gate at all, the snapshot
+  cache key could collide (emergency block silently serving the stale policy),
+  and the extension CSVs were unbounded on a response served from an
+  unauthenticated endpoint.
+- **Learning** — `learnings/pending/assembly-path-must-be-tested.md`: tests that
+  inject a dependency through a helper cannot show that production wiring exists.
+  A missing registration call passed the entire suite.
+
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction
+
+- **Shipped** — `modules/oidc` is no longer hard-wired to OpenID Connect. The
+  provider is an `AuthProvider` interface with two implementations selected by
+  `OCTO_OIDC_PROVIDER_KIND` (default `oidc`, so deployed configurations are
+  untouched), so an enterprise IdP that speaks plain OAuth2 — no Discovery, no
+  `id_token`, no JWKS, a vendor envelope around `/userinfo`, an app id in a path
+  segment for single logout — can drive login, logout and profile claims.
+  Business branches read `Capabilities()`, never the kind. Two exchange endpoints
+  serve clients that complete SSO themselves and arrive holding a credential:
+  `/exchange` (upstream `access_token` → `/userinfo`) and `/exchange-jwt`
+  (locally verified HS256 JWT, no outbound call). See
+  [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Guarded the one irreversible decision** — `(issuer, subject)` is the identity
+  key and cannot be changed after go-live, and the vendor docs contradict
+  themselves about whether `subject` is an internal long id or the employee
+  number. Since employee numbers are reused between leavers and joiners, guessing
+  wrong would log a new hire into a former employee's account. A shape guard
+  refuses short numeric subjects at the trust boundary before any row is written,
+  turning an unrecoverable data problem into a recoverable failure — and removing
+  "capture a real userinfo response first" from the critical path.
+- **Fixed during self-review** — Two CRITICALs of my own making: logout read
+  `device_flag` by decoding the raw token (a UUID with no fields), so it always
+  fell through to disconnecting *every* device instead of the calling one; and
+  `/exchange-jwt` lacked the nil-provider guard, so a boot-time provider failure
+  turned into a panic. Plus credential-leak closures at three points (`*url.Error`
+  embeds a URL that carries `client_secret`, redirects were being followed with
+  those credentials attached, and accesslog scrubbing missed the panic-dump sink).
+- **Trimmed the config surface** — New environment variables went from 8 to 5.
+  Endpoint rate limits became constants (matching `modules/user`), and the
+  bearer-JWT issuer namespace is now derived from the upstream issuer rather than
+  taking a second environment marker, which inherits per-environment isolation
+  instead of asking operators to keep two markers consistent.
+- **Learning** — `learnings/pending/build-does-not-compile-tests.md`: `go build
+  ./...` skips `_test.go`, so a rename done by string substitution left the entire
+  `modules/oidc` test binary uncompilable while the build gate stayed green; ~70
+  cases silently stopped running across a session boundary.
+- **Learning** — `learnings/pending/refusing-is-cheaper-than-an-immutable-wrong-key.md`:
+  when an identifier becomes an immutable primary key, fence the ambiguity instead
+  of resolving it first — refusal is a constant you can edit, a polluted identity
+  table is not.
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction (review round 2)
+
+- **Fixed six blocking defects found by review**, all re-derived from source before
+  acting. Per-device logout had never worked in production: the device flag was read
+  after `InvalidateCurrentToken` had deleted the record it comes from, and `0` was
+  used as the "unresolved" sentinel while `config.APP` *is* 0. Both exchange
+  endpoints discarded the race-recovery winner and handed the client a session for a
+  ghost account with no identity row. The bearer-JWT anchor accepted any non-empty
+  secret and had `exp` as its only freshness control. `RequireEmailVerified=false`
+  was an account-takeover primitive under a kind whose provider cannot assert
+  verification. And a provider-kind typo could take **every** login path down at
+  once. See [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Removed the mirror rather than updating it** — the login-lockout path existed
+  because `modules/common` hand-copied the module's boot validation and the copy
+  never gained the five new fatal conditions. The refusal rules now live in
+  `pkg/oidcboot`, a stdlib-only leaf package both sides import, and
+  `oidcboot.RefusedScenarios` pins both sides' tests to one table. Deleting the
+  delegation makes all nine scenarios fail, so we know the drift was live.
+- **Landed the de-duplication that the brief had already claimed** — both exchange
+  endpoints now share one post-validation tail. While it was duplicated, the
+  race-recovery defect existed in both copies and the phone-masking fix reached only
+  one; that is the class the shared tail exists to prevent.
+- **Reverted my own phone-number inference.** Bare 11-digit inference was added on
+  the strength of a documented example that is not a valid mainland number, and
+  roughly seven eighths of North American numbers are byte-identical to a valid
+  mainland mobile — `13861234567` is both. It was storing strangers' numbers.
+- **Corrected four places where the brief or PR body asserted properties the code
+  did not have**, each with the reason the original wording was wrong.
+- **Learning** — `learnings/pending/a-double-must-model-the-failure-you-fear.md`:
+  a double written to satisfy the assertion certified a fix production could not
+  perform; model what the collaborator destroys, and confirm the test fails without
+  the fix.
+- **Learning** — `learnings/pending/delete-the-mirror-instead-of-syncing-it.md`:
+  a comment saying "keep in sync with" is not a mechanism; extract the rule into a
+  leaf package and pin both sides' tests to one shared table.
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction (review round 5)
+
+- **Fixed a regression I introduced two commits earlier.** Extracting provider
+  construction into a shared factory silently deleted the neighbouring block that
+  wired the RP-Initiated Logout id_token cache, so the constructor had zero
+  production callers and the field stayed nil: logout never emitted an
+  `id_token_hint` and the upstream IdP session was never ended. A user who logged
+  out of DMWork remained signed in at the IdP. The suite stayed green because all
+  ten affected tests assign the store by hand — a double can be perfectly faithful
+  and still prove nothing about assembly. Restored, plus tests that build the
+  module through `New()` and assert the wiring exists.
+  See [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Closed the same guard gap on the second consumer.** The byte-exact
+  `(issuer, subject)` recheck existed only on the login path; `modules/integration`
+  called the raw query, so under the table's `ci` collation a subject differing
+  only in case authenticated as another user and minted an API key against their
+  account — reproduced in a test. Fixed structurally rather than by adding a second
+  call: the raw query is now unexported and `QueryIdentityExact` is the only way in
+  from outside the package, so a future third consumer is stopped at compile time.
+- **Stopped forwarding our own rejected tokens to the third-party IdP.** The
+  credential fall-through was unconditional, so a business JWT with a valid HMAC
+  that failed only on freshness was sent upstream in a URL query string, landing in
+  the vendor's access logs together with its signature. Now only "not ours"
+  (malformed / bad alg / bad signature) falls through; "ours but rejected" is a
+  local 401.
+- **Split the freshness policy by purpose.** The ten-minute ceiling was justified
+  by one-shot redemption but was also applied to a standing per-request
+  authenticator, where the desktop client reuses one long-lived token — so the
+  integration endpoints would have worked for ten minutes after login and then
+  returned an indistinguishable 401 forever. `VerifyForRedemption` keeps the
+  ceiling; `VerifyForAuthentication` honours the token's own `exp`. My own test had
+  pinned the broken behaviour.
+- **Added the subject upper bound the brief already claimed existed**, and folded
+  the duplicated app-id pattern into `pkg/oidcboot` so boot and runtime cannot
+  disagree (they did: `_tenant` passed boot and was refused at runtime, where the
+  error is swallowed and logout degrades to local-only).
+- **Learning** — `learnings/pending/extracting-a-helper-can-silently-drop-a-sibling.md`:
+  after lifting anything out of a constructor, diff the *removed* region and check
+  every `newXxxStore` still has a non-test caller.
+
+## 2026-09-02 — round 6: the classification boundary, and writing the matrix down
+
+Two independent `CHANGES_REQUESTED` converged on the same two blockers, both of
+them the round-5 defect reached through routes that fix had not enumerated.
+
+- **A sentinel cannot carry a stage judgement.** "Is this credential ours?" was
+  keyed on error identity, but `ErrJWTMalformed` is returned on both sides of
+  `hmac.Equal` — payload JSON, non-integer `exp`, claims decoding all fail *after*
+  the signature matched. A token bearing our own valid HMAC with a mistyped payload
+  was therefore forwarded to an IdP that takes credentials in the URL query. Fixed
+  by marking only the pre-/at-signature sites and inverting the predicate to an
+  allowlist, so a check added later defaults to "ours" and is refused locally.
+  The trigger is mundane (`iat: Date.now()/1000` unfloored) and the client reuses
+  the token for its whole life, so the leak was continuous.
+- **The guard's own construction failure was the unguarded cell.**
+  `modules/integration` logged and continued with a nil verifier — under a comment
+  saying it must not — and because the classification sits behind that nil check,
+  every desktop JWT went upstream unconditionally. Now every credential is refused
+  while the construction error is set; an absent secret stays a legal shape, pinned
+  by a paired negative test.
+- **Hoisting a guard hoists its code, not its justification.** Moving the subject
+  bound to a protocol-neutral funnel was right; taking the employee-number
+  heuristic with it was not — that path's subject is our own DB primary key, never
+  reused, and three existing tests went red. Split by what each half is a property
+  of (column vs producer); the producer half is now pinned by the conformance table
+  for both providers, which is how the standard-OIDC provider got it at all.
+- Also: `Capabilities().IDToken` + `EndSessionEndpoint()` on the interface instead
+  of a `*oidcProvider` assertion (any decorator silently lost RP-logout — including
+  the decorator design considered for the bounds guard this same round);
+  `AppIDPattern` from a mutable exported `var` to a function.
+- **Wrote the matrix I had dismissed** — `tasks/oidc-oauth2-provider-abstraction/guard-matrix.md`.
+  I retracted a reviewer's request for it on the grounds that it "produces no code
+  change", having measured it against the findings already in hand. Both of this
+  round's blockers sat in columns that request had named. Filling it in corrected
+  one imprecise cell and disproved one suspected gap, and it lists the cells still
+  open rather than closed.
+- **Learnings** — `a-sentinel-cannot-carry-a-stage-judgement.md`,
+  `a-guard-carries-its-justification-not-just-its-code.md`,
+  `when-a-defect-recurs-the-matrix-is-underspecified.md`.
+
+## 2026-09-02 — round 7: the taxonomy stopped at credentials we don't issue
+
+Two blocking findings, both reproduced before fixing.
+
+- **"Ours" is bigger than "the JWTs we sign".** Round 6's provenance guard answers
+  "is this an HS256 JWT under our secret" — true, and a strict subset of the
+  question that matters. A session token or a `uk_` API key is not a JWT, so it
+  failed at the segment split, was classified foreign, and went to the vendor's
+  `/userinfo` **in a URL query**. Reproduced: both appear verbatim in the upstream
+  request URL. Not exotic either — this PR's own global `BearerTokenCompat` is what
+  makes `Authorization: Bearer <session token>` the house convention, and
+  `userAPIKeyAuth` reads the same header on sibling routes in the same group.
+  New in this branch and specific to `kind=oauth2`: `main` verified locally and
+  never called out, and `kind=oidc` still doesn't (verified by closing the mock
+  server and getting a parse error, not a connection failure).
+- **A write-side guard doesn't cover values written by the previous binary.** Bind
+  snapshots cross the deployment boundary by design (there is a test pinning that
+  legacy snapshots still decode), so a snapshot issued before the bounds existed
+  still reproduced the orphan-user / truncation-collision shapes through
+  `Confirm`/`Create`. Both now re-validate after decode, before any mutation.
+- **The matrix I wrote last round had the blind spot that caused the first one.**
+  C1–C3 were all credentials the *upstream* issues; there was no row for the ones
+  *we* issue. Added C4, plus a lifetime column for artefacts that outlive the binary
+  that wrote them, plus a correction where it overstated rate-limit coverage.
+- Also: `HTTP_TIMEOUT` was silently ignored under `kind=oauth2`; and the two boolean
+  env readers disagreed on an unparseable primary — one falling through to the
+  legacy alias, the other returning the default — with the second carrying a comment
+  claiming it matched the first. Deleted the copy into `pkg/oidcboot.EnvBool` and
+  added the drift as a shared refusal scenario. **I had deferred this weighing
+  trigger difficulty; the reviewer was right that blast radius is the measure** —
+  the conjunction leaves an SSO-only deployment with no login path at all.
+- **Learning** — `own-is-larger-than-the-subset-you-can-verify.md`.
+
+## 2026-09-02 — round 8: a denylist of remembered types, and a vendor fact applied as a protocol fact
+
+- **The guard was mounted on one of two consumers. Again.** `/exchange` got the
+  own-credential detector but not the HMAC stage, so a business JWT went out whole —
+  signature included — into the vendor's URL query. The comment saying *this endpoint
+  is the likelier misdirection* was written in the commit that left the gap. Writing
+  down the reason is not the same as acting on it.
+- **`app_` was missed, and would have been missed again.** The fix that mattered was
+  not the entry, it was `own_credential_coverage_test.go`: scan the credential-minting
+  packages for prefix constants and fail naming any the detector does not know. It
+  found `app_` on its first run. A prefix list is a denylist of types someone
+  remembered; the omission has to become a CI failure, because "read it more carefully"
+  has now failed three rounds running.
+- **I applied a vendor fact as a protocol fact.** Round 6 said "the subject cap only
+  covers one provider" and I made the whole check protocol-neutral — correct for the
+  storage bound, wrong for the short-numeric heuristic. That one comes from *one IdP's*
+  documented employee-number reuse. `kind=oidc` is the generic client existing
+  deployments point at any IdP; a self-hosted IdP with `sub=1001` would have lost login
+  for every user, no override, redeploy-only recovery — the exact cost I argued was
+  unacceptable in the `local_off` section. **The module already made this argument one
+  axis over** (bearer JWT excluded because our own keys are not reused). The axis I
+  chose — derived vs upstream-asserted — was not the axis the argument needs, which is
+  per-deployment: does *this* IdP's subject come from a reused personnel identifier.
+  Now a capability bit, default false.
+- **Enumerated one cell rather than closing it**: a non-HS256 JWT shape is
+  unattributable and gets forwarded; closing it would break JWT-shaped upstream access
+  tokens, which is what these endpoints exist for. Nothing we issued leaves, so the
+  invariant holds; what is accepted is written down, and a test skips-with-explanation
+  if anyone "fixes" it.
+- **Learning** — `a-generalisation-can-widen-a-vendor-specific-rule.md`.
+
+## 2026-09-02 — round 9: four findings, three of them mine from the round before
+
+Two reviewers converged on the same headline; all four verified against code before any fix.
+
+- **P1.1 — `/exchange` failed open exactly where `modules/integration` fails closed.** The
+  round-8 verifier stage was written `if o.bearerJWT != nil`, and `New()` logged the
+  construction error and threw it away. So a 31-byte secret gave a nil verifier meaning both
+  "not configured" (legal) and "misconfigured" (must refuse), and the stage was skipped
+  silently. **I had fixed this exact fail-open in `modules/integration` in round 6** and kept
+  the error on the struct there — this round I copied the guard and not the failure direction.
+  The premise I wrote in the comment was also wrong: "no secret ⇒ no C3 credential can exist"
+  holds for an *absent* secret, not an *invalid* one, because the client backend signs with
+  the same configured value and HMAC does not care about key length.
+- **P1.2 — a regression I introduced: a doomed `/userinfo` call on every request.** Moving
+  `oidcAuth` onto `IdentityFromClientCredential` means the `TokenSet` carries only the
+  id_token, so `needUserInfo` fires with an empty `AccessToken`. go-oidc's `StaticTokenSource`
+  validates nothing, so a GET with `Authorization: Bearer ` goes out, 401s, and is swallowed.
+  A path that was purely local before this branch now blocks on an IdP round trip per request.
+  The suite was green because the mock matches `HasPrefix(auth, "Bearer ")` and 401s into the
+  swallow branch.
+- **P1.3 — the mirror was deleted, the *normalisation* was not.** Rules were unified into
+  `pkg/oidcboot`; one reader trimmed its env values, the other did not, and the rules compare
+  against `""`. Whitespace-only `BASE_URL` therefore reached the two sides as different
+  inputs → module 404s + helper reports configured + `local_off` honoured = no login path.
+  Fixed by normalising inside `ValidateKind`. **My first attempt encoded this as a
+  `RefusedScenario`, which was wrong** — after the fix the correct verdict is *accept* on both
+  sides. What needed pinning was agreement, and `RefusedScenarios` only pins one direction, so
+  the accepting direction became a second shared table (`AcceptedScenarios`), replacing the
+  local copy each side kept.
+- **P1.4 — two unauthenticated session-minting endpoints were on by default.** `main` exposes
+  three routes; every deployment with `DM_OIDC_ENABLED=true` silently gained `/exchange` and
+  `/exchange-jwt`, with no way to decline. Under `kind=oidc` that turns an id_token — a
+  front-channel artefact that legitimately appears in browser history and Referer headers —
+  into an unlimited session mint until `exp`. Now behind `OCTO_OIDC_EXCHANGE_ENABLED`,
+  default false, and the opt-out also skips constructing the limiter's Redis pool.
+- **Declined, with reasons recorded**: folding `validateLogoutURL` into `oidcboot` (reviewer
+  agrees it is pre-existing; making `ValidateKind` stricter risks creating a *new* lockout);
+  single-use redemption (adds Redis to the auth path and a new failure mode — and with the
+  opt-in flag defaulting off, existing installs are no longer exposed).
+
+## 2026-09-03 — oidc-auto-join-initial-space
+
+- **Shipped** — One admin setting (`space.oidc_initial_space_id`, empty = off)
+  makes every account created through OIDC — browser callback and
+  `/bind/create` — an ordinary member of that Space right after its identity row
+  lands. This unblocks `POST /v1/integrations/oidc/exchange`, which requires an
+  active Space and membership: SSO users previously belonged to no Space at all,
+  logged in fine, and failed exchange forever with no reachable remedy. The join
+  never affects the login — it runs after the session is issued, returns no
+  error, contains panics, and reports through
+  `oidc_initial_space_join_total{result=...}`.
+  See [journal](journal/shared/oidc-auto-join-initial-space.md).
+- **Fixed during review** — The new settings validator stopped at the first plan
+  naming its key while the write loop applies every plan in order, so a batch
+  carrying the key twice was judged on the first value and stored the second:
+  `200` for a configuration pointing at a Space that does not exist, with no
+  downstream component able to report it.
+- **Fixed proactively** — `atomicAddMemberIfNotFull` ran its
+  `COUNT ... FOR UPDATE` over all active member rows *before* testing
+  `maxUsers > 0`, so an unlimited Space paid an O(N) scan and a space-wide lock
+  for a decision the count could not inform. Sparse joins hid it; an initial
+  Space holding the whole company would not, since an SSO rollout puts every
+  employee's first login on the same space_id, on the login response path.
+- **Coverage gap closed late** — `/bind/create` is the second account-creating
+  entry point and carried the hook with nothing asserting it; every test drove
+  the callback, so the line could have been deleted silently.
+- **Known limitation, deliberately not fixed** — Nothing removes Space
+  membership when an IdP account is disabled. The hole predates this work but was
+  empty while SSO users belonged to no Space; auto-join fills it.
+- **Learning** — `learnings/pending/batch-write-validate-what-lands.md`: reduce a
+  batch to the state it will actually produce before validating it; a validator
+  that stops at the first match for a key approves one value and persists another.
+
+## 2026-09-06 — project P0：PR #841 第二轮 review 修复
+
+两位 reviewer 对新 head 重审，独立收敛到同一组三个 blocker。三条均为"本 PR 自己引入的
+保证，在除一处以外的全部调用点生效，而遗漏未被记录"：`addOneMember` 漏了 actor 的 Space
+席位复核、list 路由丢弃 `MemberRole` 的 `ok`、`createProject` 的锁序与 `modules/space` 记录
+的死锁事故顺序相反。
+
+- **B-3 的实测比预测更糟**：复现出 Error 1213，InnoDB 选中的受害者是**解散事务**而非
+  create —— 正是 `modules/space/db.go:71-88` 那条注释担心的一侧，而解散是成员移除安全
+  级联的一步。
+- **修 B-3 时引入的第二个缺陷，被既有验收测试当场抓住**：锁序交换让六个并发 create 全部
+  通过 `MaxPerSpace=1`。根因不在锁，在 read view —— `FOR SHARE OF sm` 里**不在 OF 列表中
+  的 JOIN 表按一致性读处理，而一致性读会打开事务的 read view**，于是快照冻结在 `space`
+  行锁之前，三个创建配额全按旧快照计数。在 MySQL 8.0.33 上做了有/无 JOIN 的对照实验坐实。
+  修法是给 create 单独一个无 JOIN 的席位锁；丢掉的 JOIN 不损失保证，Space 活性由紧随其后
+  的排他锁更强地复核。为此加了源码 guard，因为把两个 helper "统一"回去会静默重现它。
+- **一个 code 的文案也是分类的一部分**：actor 级失败复用 target 级 code，文案会说"目标用户
+  不是该空间的有效成员"——对调用者自己而言仍指错方向。新注册 actor 级 code；create 端点
+  本来就无 target，那处是既有误标。
+- **非回归证据从推理升级为实测**：建基线 worktree 对照 brief 点名的四个包。`modules/group`
+  初次 5 个 FAIL 定位为 WuKongIM 容器老化（同一份基线代码两次跑失败集 3 → 39，全是 IM
+  context deadline），重启容器后 HEAD 整包全绿；`modules/thread` 两侧同构 flaky（迁移竞态）。
+- **方法论修正**：`timeout` 在 macOS 不存在，批量跑包时命令静默失败、测试根本没执行，而
+  grep 无输出被读成"无失败"。凡是"没有输出即通过"的判断都要先确认命令真的跑了。
+
+## 2026-09-06 — project P0：PR #841 第三轮 review 修复（改为结构化而非点状补丁）
+
+两位 reviewer 都在真 MySQL 上执行并发断言，独立收敛到一个 P0 + 两个 P1，并都指出同一个
+模式：连续三轮，每轮的修复都在**上一轮修复没走到的路径**上留下同类问题。
+
+- **本轮的教训是范围而不是原因**。第二轮我把 read view 陷阱的原因写对了（甚至写进 guard 的
+  失败消息），却把 guard 指向了一个调用点。另外五条写路径的首条语句仍是 JOIN 版 helper，
+  后果比配额失效严重得多：**两个 owner 并发退出让项目变成 0 owner**，P0 无修复路径、四个
+  对账扫描无一检测。实测复现（service 方法在 project 行锁上真实排队 ~700ms，拿到锁后
+  `queryMemberTx` 是 FOR UPDATE 读新值、授权聚合读旧快照——所以 code review 看不出来）。
+- **两个纪律都做成结构性的**：读可见性 guard 改为解析每条在 `*dbr.Tx` 上执行的 SELECT
+  （新代码自动覆盖）；所有席位锁改为一条 `uid IN (...)` 语句让 InnoDB 定序（排序无效，
+  disband 扫描按 id 排不按 uid 排）；七个写入口统一经有界 1213/1205 重试。
+- **险情，与第二轮同一失败模式**：把写方法重命名为 `...Once` 后，三个源码 guard 开始检查空的
+  重试包装器——一个响亮失败，**两个变绿却什么都没检查**。能被一次重命名打败的 guard 不是
+  guard；现在统一经 `implBody()` 解析实现体，并在包装器背后改实现重做了变异验证。
+- **guard 的判据要精确到执行上下文**：读可见性 guard 初版用"文件里是否出现裸 COUNT"，误报了
+  列表端点的 `member_count` 列和指标采集——那两处在 session 上、不在写事务里、不授权任何
+  东西。改判据为"是否在 `*dbr.Tx` 上执行"。
+- **顺带发现统一 helper 能免费修好另一条 review 项**：所有路径都走同一个席位锁 helper 之后，
+  actor/target 分类自动补齐 6/6，update/disband 不再把授权拒绝渲染成 Internal 500。
+- **P2 拆后续 PR**（reviewer 建议）：缓存 cache-aside stale positive、对账随历史行增长。
+  collation 按指示本轮不查，PR 明确标注未在具名部署验证。
+
+## 2026-09-06 — project P0：PR #841 第四轮 review 修复
+
+第三轮那个"结构化"的修复 commit 自己引入了两个 blocker：给四个 handler 加 actor arm 时
+**全都忘了 `return`**。Go 的 case 不贯穿到下一个 case，但会掉出 switch，于是控制流走上成功
+路径——update **真的 panic**（nil model 进 toResp），disband 给一次**被拒绝的解散**写了审计并
+在错误信封上叠了第二个 JSON body。reviewer 只报了这两个；leave/role 也缺 return，无害纯粹
+因为它们的 switch 恰好是函数最后一句。
+
+- **单点变异不够，要变异"写错"而不只是"删掉"**。第三轮我给这个 arm 写了 guard，但只是
+  `assert.Contains(sentinel)`，且只变异验证了「删掉 arm」。substring 检查看不出 arm 是否终止。
+- **判据要精确到语境**。强化 guard 的第一版要求每个 arm 都 return，立刻标红三个——核对后是
+  要求错了：leave/role 以 switch 结尾（掉出去即函数结束），addMembers 的 switch 在逐目标循环
+  里、不终止正是"继续下一个 uid"。改为「switch 之后有代码时才要求终止」。
+- **guard 家族被系统性审了一遍，四条成立**：复现测试驱动重试包装器（P0 级复现变成抛硬币，
+  同类问题我自己还漏了 createProject 那个）；`LessOrEqual(n,1)` 允许 0；
+  `strings.Count("reconcileMaxPages")<4` 因函数名含同名子串而不可能失败；一个测试用自己手写的
+  SQL 当 oracle、从不调用产品代码，而那条 SQL 正是代码注释说明"错了三重"的废弃形态——测试把
+  删掉的 bug 编码成了断言。
+- **写新 guard 时当场又犯同一类错**：禁止 `p.Error(` 的检查被 `zap.Error(err)` 误报（za**p.Error(**）。
+  子串匹配的 guard 要用词边界。
+- **`cursors` 是包级全局，reset 从未在 setup 调用，而且漏了我自己第三轮加的两个字段**。CI 跑
+  `-shuffle=on`，所以"期望 0"的对账断言可能因为前一个用例留下的截断轮转而通过。已在 setup
+  调用 + 加字段覆盖 guard。
+- **collation 有实测答案了**：生产四列全是 `0900_ai_ci`。根因是 dump 导入（mysqldump 对
+  collation 等于源库默认的表省略 COLLATE），所以 `general_ci` 是意图、`0900` 是导入事故。
+  **不能逐表转**——那三张表还和 robot/group_member/group/app_bot/opanalytics 维表 JOIN，只转
+  它们会打破现在兼容的那些。方案是把 dump 那批一次转完。顺带发现：默认 collation 的库上
+  **迁移无法从零重放**（category 的 `group_setting ⋈ group_category` 1267），会咬到下个新环境。
+
+## 2026-09-08 — project-p2-all-member-group（项目自带全员群 / 不变量 I4）
+
+建项目时可带入自己的 AI 分身（同事务落座），并自动生成一个**全员群**，其活跃成员集合
+恒等于项目的活跃成员集合（I4）。配套：加人自动进群、离开项目连带分身一起出（一次 epoch
+bump）、群面五个改变成员集合的操作被拒、群主跟项目 owner、群名跟项目名、解散项目释放群、
+两个只报不修的对账扫描。`modules/project` 仍然不 import `modules/group`——四个钩子反向注册。
+
+**锁序把工作推出事务之后，事务就不再是你的串行化手段。** 声明的锁序要求群侧钩子在项目
+事务**提交后**才跑，否则会在项目行锁下去拿 `group` / `group_member` 的锁、把顺序整个倒过来。
+这一条约束决定了整个功能的形状：项目行锁那时已经没了，两个并发补建无法靠它串行，只能换成
+列上的 CAS 租约。凡是"事务会保护这件事"的直觉，在那次 commit 之外全部作废，而且要一条条
+显式替换掉。真正管用的不是这段论证而是那个断言：stub provisioner 用**连接池上的连接**读
+`octo_project`，行可见即证明事务已提交，每个用 stub 的用例都带着它——这个断言是 Verify 阶段
+去找才发现 brief 早就要求、但没人写。
+
+**为维护不变量而加的保护，可能先干掉维护它的级联。** D7 若放进服务层原语（最省事的地方，
+一处覆盖所有调用方），会一并挡掉 P1 的成员移除 detach、Space 移除级联、botfather 删 bot，
+以及 P2 自己的群主同步钩子——也就是说，为 I4 加的守卫会先把维护 I2 和 I4 的代码关掉。保护
+属于"人点了这个按钮"那一层。推论是：每个直调原语的 handler 都得自己挡一次，`modules/bot_api`
+的踢人接口就是这么在 Web 侧关掉之后被发现还开着的。
+
+**第五条路径不叫"移除"。** 拉黑不走 `RemoveGroupMembers`、名字里没有 remove，只把
+`group_member.status` 翻掉再退订，对 I4 的效果和踢人一模一样。凡是按**名字**而不是按**效果**
+归类路径的地方，都要问一遍还有没有第五条。
+
+**按文件名读取的守卫，看不见旁边新加的文件——第三次了，这次真放进来了缺陷。**
+`TestReconcileQueriesAreBounded` 和成本守卫都按名字读 `reconcile.go`；P1 加 `reconcile_p1.go`
+时发现两个都覆盖不到，只好自己写一份；P2 加 `reconcile_p2.go`，于是把 `g.id IS NULL` 写进了
+WHERE——正是成本守卫禁止的那个形状，理由也一模一样：健康库里这条谓词一行都不匹配，LIMIT
+界的是**返回行**而不是**检查行**，扫描每个 tick 走完整张 `octo_project`，没问题的时候最费。
+对照组是 `TestGroupNoLegacyResponseError`：它从目录**发现**文件，横跨 P0/P1/P2 一次都不用维护。
+能推导出来的集合就别手写枚举；推导不出来的，枚举本身要有守卫
+（`TestEveryAdmissionEntryConstantIsInTheGuardLists` 从源码读常量再比对）。
+
+**枚举型守卫的覆盖面由它自己的输入决定。** `TestEveryWritePathEmitsAnAuditEntry` 在
+"建项目写的分身席位一条审计都不发"期间一路绿灯——因为它从来不发 `agent_uids`。
+`TestWritePathsRevalidateTheActorSpaceSeatInTx` 同理：它自称覆盖 `requireSpaceSeatsTx` 的
+调用方，而建项目是直接取 `space_member` 锁的，天生在它之外。一个只在自己已知路径上通过的
+守卫不是地板。改动新增了某类路径，把它登记进守卫就是改动的一部分，不是后续工作。
+
+**收紧一个谓词，就得同时收紧回答同一个问题的另一个。** 第一轮把 `queryAllMemberGroupNo`
+改成要求群侧同意（群在、没解散、project_id 还是本项目）——对的。但认领 CAS 仍然以"指针是
+空串"为条件，而 P1 的 detach 释放群时**不清指针**。于是查询说"没有群"、认领说"已经有群了"，
+补建从此不再发生，后续每次入群都空转，扫描 A 报出一个谁也修不好的项目——全程无 error、
+无指标。两个谓词对同一个事实给出不同答案，正是第一轮要修的那个形状。
+
+**先提升后降级，只有在降级以提升成功为条件时才安全。** `ensureAllMemberGroupOwner` 无锁读
+继任者行、用一个对软删行静默影响 0 行的 helper 提升、然后无条件把原群主降级。两步之间被并发
+软删掉继任者行，两个都丢，而 D7 让这个"没有群主"的群从群面再也修不回来。答案两百行外就有：
+`project_cascade.go` 对继任者 `FOR UPDATE`、用 live-row 变体提升、没落地就硬失败。教训不是
+"要加锁"，而是**写成两条独立语句的交接在中间是有状态的，第二条必须知道第一条的结果**。
+
+**"这个测不了端到端"是错的，而且是需求方指出来的。** import 禁令约束的是**包**不是**测试
+二进制**：external test package 早就 blank-import 了 `octo-server/internal`，`module.Setup`
+会在同一个二进制里注册 modules/group 的真实 provisioner / admitter / owner 同步 / 改名。
+那句话还把两个障碍混成一个——一条不适用的架构规则，和一个开发环境缺 WuKongIM broker 的环境
+问题。现在有八个端到端用例跑真实实现、断言真实的 `group` / `group_member` 行。
+
+**进程级 latest-wins 注册表在测试里必须 snapshot/restore。** stub 装上不还原，理由是"反正
+latest-wins、在意的用例自己会装"。端到端用例**不**自己装——它们依赖 module.Setup 注册的真家伙。
+症状很诚实：八个单独跑全过，全量跑全挂，这正是 `-shuffle=on` 该抓的东西。
+
+**普查的覆盖面等于它问的那个问题，不等于它花的力气。** "哪些入口能删 Bot"这条普查跑了两次、
+漏了同一扇门两次，两次的原因都是问题问错了：它被写成"谁**写** `space_member`"，而这扇门的
+全部缺陷恰恰是删 Bot 却**不写** `space_member`。规则的主语是"删除 Bot"，枚举就得从删除起步，
+不能从修复过的那几处反推。改成对**集合**的测试之后（找出所有会把 robot 行关掉的原语 → 找出
+它们的调用方 → 每个调用方要么走 D14、要么是登记在案的豁免），它当场又找出第四个调用点：
+一条创建失败的补偿路径，正确豁免。按端点写的测试永远找不到它——你没法为一扇你不知道存在的门
+写测试。
+
+**顺序没被声明，就别去算一个依赖顺序的答案。** 清理步骤的执行顺序就是注册顺序，而注册顺序
+由 import 方向决定。"全员群的群主必须是项目活跃 owner"这个答案，要等群侧交接和项目侧关席位
+两件都发生之后才成立；写进项目步骤里，两种顺序各错一种。修法是**阶段**而不是**位置**：
+所有步骤都成功之后才跑的收敛动作。注意它不是"取个好名字的第五个步骤"——注册表给不了位置承诺，
+而"请按某个顺序注册"的注释不是机制。
+
+**夹具里有并列项的测试，断言的是掷硬币。** 上面那条的端到端用例在把修复删掉之后照样通过：
+`group_member.created_at` 只到秒，两次加人落在同一秒，而选继任者的 SQL 按 `created_at` 排序
+且没有次级排序键——谁被选中取决于存储引擎先返回哪一行，而它恰好返回了正确答案。前面每一轮
+抓到的都是"断言比它自称的弱"，这一轮同一个毛病长在夹具上。抓到它的仍然只有 mutation：
+测试是绿的、名字是对的、注释描述的性质夹具根本没造出来。
+
+**"跑得通"和"跑得起"是两个问题。** 两个 I4 扫描留在对账开关之外，理由是每条跨 schema 比较都
+带显式 `COLLATE`、能扛住排序规则漂移。这话是真的，也是不相干的：同一个文件里已经记着它们在
+生产形态下的实测计划——`group` 全表扫加临时表，而临时表会把它们赖以分页的 `ORDER BY`/`LIMIT`
+一起废掉。扛得住 1267 只说明语句能执行，不说明可以每五分钟在每个副本上对一张核心 IM 表执行
+一次。
+
+**反探测藏的是"原因"，不是"对象"。** 六种分身不合格的原因合成一个码、具体原因只进日志，
+对的。但第一版据此把**提交的全部 uid** 都回显了，论据是"回显调用方自己的输入不泄露任何东西"
+——话没错，但答非所问：十个里坏一个，客户端会告诉用户十个全被拒，只能从头重选。
+"不说为什么"和"说清是哪几个"是两个独立决定，混在一起白白牺牲了精度。
+
+**权限判定与类型判定的先后顺序，决定你建不建一个探测器。** `addOneMemberOnce` 最初先问
+"这是不是分身、你能不能带它"，再过权限门。于是普通成员能把"别人名下的活 bot"（逐 uid 的
+`agent_not_eligible`）与"人类或不存在的 uid"（actor 级 `permission_denied`）区分开——正是那个
+单一错误码要藏的区别，还偏偏交到了权限最低的调用方手里。顺序应当是：先判**归属**（普通成员
+唯一能动的就是"自己的分身"），再过权限门，类型相关的拒绝只对已经过门的调用方可见。
+
+**未交付**：I4 两个扫描只报不修；扫描 B 不豁免被封禁 Space（brief 列了，但它要压制的状态在
+⊇ 方向压根不会出现，加了就是每行一次永不触发的 `space` 点查）；全员群 IM 频道订阅者集合等于
+成员集合这一条无法断言——仓库里没有任何一处能把订阅者读回来，与 P1 记的同一个缺口。
+
+## 2026-09-07 — project-p1-group-binding（第一轮 review 修复 + rebase 到 P0 新门控）
+
+**两阶段状态机会把每一处既有的 `status == active` 变成一道必须重答的题**——这次六个高优
+里有四个是同一形状，而且都朝「看起来安全」的方向静默失败：Space 级联和项目解散把
+`status` 翻成 0 却不清 `removing`，落进 schema 自己写着「不允许存在」的那格，而
+`finishMemberRemovalTx` 的 `status=1 AND removing=1` 谓词从此永远匹配不上，滞留告警每
+tick 报一次、没人能修；`actorRoleTx` 把正在关闭的席位当活跃成员，于是即将离开的 owner
+在整个级联窗口里握着解散权；`promoteSuccessorTx` 允许把最后一个 owner 交给一个正在关闭
+的席位——而 `countActiveOwnersTx` 已经排除了它，于是「最后一个 owner 必须先转让」这道闸
+门自己把项目变成了零 owner。
+
+**「自我修正」是个需要证明的说法。** I2 扫描的游标停在整页最后一个**群 id** 上，
+`WHERE g.id > ?` 于是跳过那个群边界之后的所有成员；注释写着「下一轮就看到了」，但分页每
+轮都落在同一个边界，所以被跳过的是**永远**被跳过。改成 `(g.id, gm.uid)` 复合游标（P0 的
+I1 早就是这个形状），顺带删掉旧游标要的第二条查询——那条的过滤条件还和主查询不一致。
+
+**一个被解散的群足以让整个项目的成员都移除不掉。** 级联的群列表没有 status 过滤，而
+`RemoveGroupMembers` 对解散群直接报错，于是八次尝试全部同样失败、工单终态 abandoned、席位
+永远停在 removing=1。
+
+**COLLATE 的规则是「列在哪一侧」，不是「查询是谁写的」。** 我按「legacy ⋈ legacy 不需要」
+清理了一轮，然后写了一个**故意制造漂移**的库去跑真查询——当场抓到两处判断错误：
+`space_member_removal_cleanup` 是迁移建的、显式 general_ci，属于 pinned 侧不是 legacy 侧；
+而 SELECT 列表里的比较和 ON 子句里的一样会 1267。这也是 P1 三个扫描**不进** P0 新增的
+`OCTO_PROJECT_RECONCILE_ENABLED` 门控的依据：门是为「撑不住漂移的语句」设的，这三条撑得住
+（有测试为证），而 I2 背后没有任何读路径过滤，把最有牙齿的那个不变量监控默认关掉，正是
+P0 第五轮修的那个失败从另一侧再来一次。
+
+**撇号会配对。** 迁移测试的朴素分割把引号当字符串定界符，所以文件里撇号数为偶数时可能
+碰巧通过、奇数时才炸。这次是一处四十行外的无关编辑删掉了一个撇号、翻转了奇偶，测试便指向
+了完全无辜的语句。修法不是数撇号，是全文件不用撇号。
+
+## 2026-09-06 — project-p1-group-binding（群绑定项目 / 不变量 I2）
+
+把群的成员集合收进项目边界。11 条准入路径收口到**唯一入口**，4 条源码守卫钉住它，
+按入口点打标签的指标暴露"某条路径悄悄不再拦截"，3 个对账扫描兜底。配套：两阶段
+关席位（`removing`）+ 独立外发表与 worker、反向注册的群 detach（含群主交接）、
+建群参数、appconfig 下发开关、`/v1/auth/verify` 的点查读契约。
+
+**迁移落点是依赖问题，不是归属问题。** `group.project_id` 放错两次，每次都由整个
+测试包 `Error 1054: Unknown column` 炸出来，而不是想出来的：放 `modules/project/sql`
+时 group 的测试二进制没有项目迁移（82 个测试红）；放 `modules/group/sql` 时 space 的
+二进制没有 group 迁移（Space 设置接口一读就炸）。规则是**列必须来自每个读它的二进制
+都有的迁移目录**——`go list -deps` 说只有 `modules/space/sql` 满足。这也是 `group.space_id`
+当年落在那里的真实原因；brief 援引的先例是对的，它给的解释不对。
+
+**守卫比它守的不变量更值钱。** 这轮四个缺陷是守卫抓的，不是功能测试抓的：P0 的
+"授权聚合必须是锁定读"守卫抓到新工单认领里的事务内非锁定读；P0 的迁移测试抓到我
+SQL 注释里一个撇号破坏了它的朴素语句分割；P0 的游标覆盖守卫抓到两个新游标漏了重置；
+新写的 I2 测试抓到 `addOneMemberOnce` 在 `status==1` 上短路，导致"重新加入取消级联"
+整条路径从未执行——**而且是静默的**：接口返回 OK、没有指标动、对账扫描恰好豁免这个状态。
+两阶段状态机会把每一处既有的 `status == active` 判断变成一道必须重答的题，答错的那些
+都朝着"看起来安全"的方向静默失败。
+
+**brief 对已发布代码的三处描述与实测不符**：P0 并没有"无主项目自动解散"分支；说是
+三个死 DAO 方法实际只有两个；而"`context_included` 失败时仍为 true 是缺陷"是**错判**——
+照它改会开安全口子，因为那个标志的语义是"本服务端讲 v2 契约"，消费方读到 false 会回落
+到信任客户端传的 `X-Space-Id`。真正缺的是"分不清失败和空结果"，用一个独立字段补上。
+
+**验收项之间也会打架**：D3 要求把准入原语改成不导出，同一份 brief 的非回归验收要求
+"不许改动既有测试文件"，而 41 个受保护测试文件正在用这些原语。用源码守卫达成 D3 的
+意图——"只能从漏斗调用"这件事，守卫断言得比编译器的导出规则更准。
+
+**豁免必须豁免整道门**：系统 bot 原本只豁免项目那半、仍受 Space 那半约束，而平台 bot
+根本没有 `space_member` 行——于是这个"豁免"把它们挡在了每一个项目群外面。合取式里只
+豁免一半，不是豁免。
+
+**未交付**：陈旧订阅扫描。octo-lib 共享客户端没有列订阅者的能力，锁定版 broker 只在
+**管理面**提供（要管理员凭证、跟管理台版本走）。后果照实说：P1 有意继承的 IM 退订泄漏
+在项目粒度上仍然不可观测。应与 #797 / im-pending-outbox 中先补上该能力的那个一起落地。
+
+## 2026-09-06 — project P0：PR #841 第五轮 review 修复
+
+三位 reviewer 收敛到同一组：两个 blocker + 一处记录不一致。两人各自在真 MySQL 上验证。
+
+- **我上一轮亲手写的安全声明不成立**。迁移注释写着「create flag 默认 false 使这成为 pre-enable
+  检查项而非故障」——对 HTTP 面成立，对后台任务不成立：`startReconcileWorker()` 是 `Route()` 第
+  一句，不看任何 flag。两人独立确认**空表也失败**（collation 在语句**解析**时聚合）。而且三个
+  gauge 只在完整轮转时 publish → **永远不 publish** → 监控读起来是「健康、零违约」，实际从未跑过。
+- **没照搬 reviewer 的门控建议，两处故意不同**：① 不复用 create flag——写开关关掉时（止血）恰恰
+  最需要不变量监控，耦合会在那一刻让它变瞎；② 不门控整个 worker——ownerless/epoch/分布指标只碰
+  本模块自己的表，一刀切白丢能工作的观测，而 ownerless 检测的是 P0 无法修复的状态。测试**双向**
+  钉住范围（过度门控同样变红）。
+- **让门控诚实而非遮盖**：flag 关时启动 Warn 点名 env 变量（没人宣布的「监控缺失」比「监控坏了」
+  更糟）；新增 `reconcile_scan_failures_total`（此前「从未跑」与「跑了没发现」在看板上同形，
+  这正是漂移会呈现的样子）。
+- **又一次：我的测试固定了错误行为**。I1 扫描对 banned Space 豁免过宽，而那个测试的 fixture 用
+  `removeSpaceMember`(status=0) 再 ban——cleanup 语义下那人**不是成员**，cascade 不会跳过他，
+  所以测试恰好在两者**不一致**的场景上断言了「一致」。一个 cleanup 语义谓词替掉原来的两个。
+- **删函数会让 guard 变 vacuous**：删掉 `checkSpaceMembershipForWriteTx` 后，`assert.NotContains`
+  那句永远成立。改为点名**仍存在**的 JOIN 版 helper。它的测试不是删而是**改指在用的函数**。
+- **实施中自己抓到三个**：指标标签不一致（`abandoned_leak` vs histogram 的 `abandoned`，看板
+  join 不上，已加一致性 guard）；既有 helper `histogramSum` 只 return 第一个 series 而非求和
+  （加第五个标签后整包跑失败、单独跑通过）；leave/role 缺 return 今天无害只因 switch 恰在函数末尾。
+- **collation 的正确 guard 形态**：CI 建库就是 general_ci，所以断言 legacy 列是 general_ci 的
+  guard 靠继承通过、永不失败。改成**故意制造漂移**：独立库（共享表不能在 shuffle 下改）+
+  `CREATE TABLE ... LIKE` 从真实 schema 复制（零手写 DDL）+ 调产品查询方法。它同时是转换的验收证据。
+- **Jerry-Xin 撤回了他自己第四轮的建议**：只转 space/space_member/user 会让 `modules/space` 与
+  `modules/user` 的现网 join 报 1267（robot/group_member 仍 0900）。坐实「不能逐表转」。
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger
+
+- **The anchor, not the number** — `/exchange-jwt` judged a bearer JWT's freshness
+  by `now - iat <= 10min`. `iat` is when the upstream signed the token, which says
+  nothing about when the user came to redeem it, so the ceiling refused a client
+  that exchanged 36 minutes after login (a 401 indistinguishable from "invalid
+  credential") while still admitting anyone who captured the token inside the
+  window. Freshness now comes from the redemption itself: a Redis ledger keyed by
+  `sha256(token)`, bounding how late a **first** redemption may arrive (F, default
+  24h) and how long a token may sit unused **between** redemptions (T, default 7d).
+- **A sliding window is not a TTL** — the first design set `TTL = T` and read
+  expiry as "abandoned". Backwards: an expired key is indistinguishable from a
+  never-seen token, so the record's death would readmit the token as a first
+  redemption. The record must outlive the window (TTL = the token's own remaining
+  life) and idleness is computed from the stored `last_at`.
+- **A count cap was dropped before it shipped** — capping redemptions per token
+  stops nothing (an attacker needs one), and would refuse a client that restarts
+  often, with exactly the 401 this task removes. Kept as the `admit_repeat`
+  metric, which answers whether the client reuses one token instead of enforcing
+  an unfounded limit.
+- **Verification stayed side-effect-free** — `api_exchange.go` reuses the same
+  verify method to classify a credential posted to the wrong endpoint. A ledger
+  inside the verifier would have given that misdelivered token an idle window it
+  never earned; the side effect lives in the one caller that redeems.
+- **Degraded path keeps F** — with Redis down we cannot tell first from repeat, so
+  the fallback applies F alone: bounded, never "anything within exp", and not a
+  self-inflicted login outage. `degraded_*` labels are pre-warmed so the alert can
+  exist before the first outage.
+- **Deliberately not done** — true one-shot redemption. Whether the client redeems
+  once or on every launch is not recorded anywhere in the repo; making it one-shot
+  now would break the second case with the same indistinguishable 401. `T` is
+  configurable, so tightening later is a decision, not a redesign.
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (review round)
+
+- **The same outage, through another door** — `normalized()` guarded against
+  `F <= 0` because `F=0` refuses every login, then let `F=500ms` through: the Lua
+  script compares whole seconds, so it arrived as `0`. A guard written against one
+  spelling of a value missed the other. Bounds are now truncated to whole seconds
+  with a 1s floor, which incidentally fixed a real divergence between the Go
+  degraded path (Durations) and the Lua path (seconds).
+- **A defensive branch that could never run** — `admitRedemption` refuses a nil
+  credential, but the caller dereferenced it one line earlier in a log field. The
+  guard read as safety and was decoration; on an unauthenticated endpoint it would
+  have been a panic.
+- **A cap that silently rewrote a configured value** — `T` longer than the
+  record's max TTL could not fire, and the resulting refusal was attributed to `F`,
+  which is the knob an operator would then tune. Capped where it is read so the
+  startup log prints what actually applies.
+- **Close() wrote a field the request path reads** — mirrored an existing pattern
+  without noticing the new field is read on the hot path. The closable client now
+  lives in its own field.
+- **Verified against real infrastructure** — MySQL 8.0.46 + Redis 7.0.15 brought
+  up locally (this environment has no docker): the whole `modules/oidc` package
+  passes under `-race`, including the ledger's decision table and a new
+  concurrency case proving the Lua decision-and-write is one atomic round trip
+  (8 concurrent redemptions of one token yield exactly one `admit_first`).
+- **Learnings** — `learnings/pending/a-sliding-window-is-not-a-record-ttl.md`
+  (absence cannot mean both "never seen" and "expired"; the record must outlive
+  the window) and
+  `learnings/pending/validate-in-the-representation-the-consumer-uses.md`
+  (a guard protects the value as its consumer sees it, not as its author wrote it).
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (PR #843 review)
+
+- **An argument written for one bound and not turned around on its twin** — the
+  file argued at length why `T` cannot exceed the record's lifetime, then left `F`
+  uncapped, where the same overflow silently defeats `T` entirely. Both are capped
+  now. Worth looking for whenever a rule is written next to its sibling.
+- **A degraded path is only justified while it is never looser** — applying `F`
+  alone made a Redis outage more permissive than normal operation for any
+  deployment configuring `T < F`. The fallback bound is `min(F, T)`; on the
+  defaults it is unchanged, which is why nothing caught it.
+- **Two failure states sharing one metric label hide the worse one** — "ledger
+  never configured" and "Redis is down" both reported `degraded_*`. The first does
+  not self-heal and disables `T` outright; on a dashboard it read as flapping
+  Redis. Separate labels, plus a `New()` wiring test, since every handler test
+  injects a double and would stay green if the constructor were dropped.
+- **A regression test that stubs the mechanism does not pin the fix** — the
+  36-minute case proved the handler no longer applies a ceiling, not that the
+  shipped default admits it. The default could have been reverted to ten minutes
+  with the suite green.
+
+## 2026-09-06 — oidc-bearer-jwt-redemption-ledger (PR #843, round 3 — blocking)
+
+- **The same lesson, second door** — round two fixed the *degraded* path to
+  `min(F, T)` and left the *authoritative* one on `F` alone. The Lua no-record
+  branch has two triggers: never-written (where `F` is right) and **lost**
+  (evicted / un-persisted restart, where the bound should be `T`). Under `T < F`
+  a lost record admits as a "first redemption" what an intact one refuses as
+  idle — fail-open, with the documented loss signal (`reject_stale_first`)
+  replaced by `admit_first`, and Redis-down left stricter than Redis-evicted.
+- **The decision, not the clamp, is the content** — `T < F` was defended one
+  round earlier as a coherent configuration. It is now unsupported: `F` is capped
+  at `T` and the startup log reports the reduction. Nobody had asked for the
+  config, and its price was a fail-open on an unauthenticated session-minting
+  endpoint under an ordinary eviction policy.
+- **"Equivalent to deletion" was nearly true** — a numeric `last_at` in the
+  future made the elapsed time negative and admitted unconditionally, where
+  deleting the key would have refused. Clamped, so the comment is literally true.
+- **A spec artifact that misstates its own implementation** — the brief still
+  described two rounds ago; `guard-matrix.md` still listed the deleted ceiling as
+  live. Both corrected in the same commit as the code they describe.
+- **Assertions one level weaker than their own comments** — four of them, all
+  cheap to strengthen, all on the path where the next regression would land.
+
+## 2026-09-07 — my-ai-team-sessions
+
+- Added a feature-gated personal AI API backed by one owner/Bot parent group and
+  idempotently provisioned thread sessions, with server-authoritative Bot routing.
+- Protected the two-member container invariant across ordinary group, manager,
+  thread and Bot mutation paths; Space lifecycle cleanup remains authoritative.
+- Filtered both parent group and type-5 topic channel shapes from normal recent,
+  follow, group and Bot group lists. The durable discriminator is the new
+  server-owned `group.purpose`, not the transport-facing `group_type`.
+- Disabled global thread auto-archive through an authoritative DB setting; a fresh
+  migration query returned `thread / auto_archive_enabled / 0`.
+- Build, unit, four E2E/API shards, focused regression, i18n, vet and direct
+  WuKongIM persistence passed. Full pilote2e retains an unrelated baseline
+  card-template catalog fixture failure.
+
+## 2026-09-07 — my-ai-team-sessions (upstream-main integration)
+
+- Merged open-source `main` at `96b3b926` and resolved the Space preset-group and
+  zh-CN catalog conflicts without dropping either side's behavior.
+- Integrated AI container initialization with #846's single group-member admission
+  funnel; its source guard now passes without allowlisting a direct table write.
+- Re-ran build, vet, 52 unit packages, all four MySQL/Redis/WuKongIM E2E/API shards,
+  i18n checks and the direct WuKongIM persistence test successfully.
+
+## 2026-09-07 — my-ai-team-sessions (final review hardening)
+
+- Preserved legacy-index use across mixed collations and added a production-shape
+  query-plan regression.
+- Closed org-sync membership mutation and Space-cleanup rejoin gaps for AI
+  containers, including parent/thread WuKongIM subscriber reconciliation.
+- Added a lifecycle-only group lookup so User Bot deletion cannot strand a hidden
+  AI-container membership or its WuKongIM subscription.
+- Hardened provisioning state transitions and session rename lock ordering.
+- Re-ran build, vet, unit, all four API/E2E shards, i18n and focused WuKongIM gates.
+
+## 2026-09-08 — my-ai-team-sessions (review convergence)
+
+- Centralized Bot group-membership teardown and applied it to command, User API,
+  and super-admin deletion paths so hidden AI containers cannot be stranded.
+- Guarded org-exit and category paths, filtered category reads, and excluded AI
+  session threads from automatic archival without overwriting global operator
+  settings during migration.
+- Added DB-backed regressions and passed all affected module suites, build, vet,
+  i18n extraction/lint, and diff checks on the isolated task test stack.
+## 2026-09-07 — project-p2-subsystem-integration（PR #850 第七轮 review：两个阻塞项）
+
+- **权限的作用域比它能代表的状态更宽** —— 两个阻塞项是同一个形状。一个进程级布尔门住
+  一条不带 `target` 谓词的 DELETE：本片其它所有「关于某个子系统」的事实都是 per-target
+  的（启用、URL、secret、收窄声明），理由就是 fleet 与 drive 排期不同 —— 而回收消费方
+  也是分开落地的。于是先交付消费方的那个子系统，顺带授权了删掉另一个的回收账。删行是
+  本片唯一不可逆的操作。改成 per-target 集合直接作为 `target IN ?` 穿进 DELETE，并且
+  **按已知 target 而非已启用 target 解析**：启用管「造什么」，这个管「可以忘掉什么」。
+- **回滚手册的步骤 2 会打坏一条与被回滚功能无关的路径** —— 解散事务里对本表的写入是
+  **无条件**的，而那个位置是对的（加 `Enabled()` 门会让「启用过又关掉」的 target 不再
+  标记可回收，那是真泄漏）。代价是清空开关并不会停掉这次写，手工 `DROP TABLE` 之后
+  每次解散都是 1146 → 500；而且 sql-migrate 的账本行还在，重启不会重建表。手册现在写明
+  顺序（先退二进制再退表）并指定走 `sql-migrate down`。
+- **七轮 review 没找到的那个缺陷是一个 flaky 测试找到的** —— 认领/清扫/清理三条语句都带
+  `target IN (...)`，但索引首列是 `status`，于是每个目标的扫描会先锁住并检出另一个目标的
+  行，`FOR UPDATE SKIP LOCKED` 又让兄弟扫描把这些被锁的行整个跳过。实测（MySQL 8.0.46）：
+  两目标同 tick 时，落后的那个**一行都认领不到**，静默等下一个 tick。这正是「每目标一个
+  goroutine」要消除的互相拖累，所以修的是索引不是并发模型。附带收益：`(target, status)`
+  的行数普查从全表扫变成覆盖索引读。
+- **一个概率性的 guard 不是 guard** —— 单 tick 对重新注入的索引缺陷只有 7/8 检出，也就是
+  缺陷在场时有八分之一的机会报绿。改成五轮独立 tick 后 8/8。要的是「多轮」而不是「一个
+  tick 里更多行」：同 tick 的行是相关的。
+- **用代码读的那个常量去构造 fixture 是自证的** —— reclaim env 的测试两边都用同一个常量，
+  把常量打错会同时改掉两边，测试照样绿，而失败方向是静默的（purge 永久关闭，恰好是操作者
+  最可能误以为已经打开的状态）。env 名是部署契约不是 Go 标识符，断言必须用字面量。
+- **基数不等于身份** —— purge 的测试断言「删了 1 行、剩 2 行」，而一个删掉 `ready` 行的
+  purge 给出完全相同的两个数字。改成回读**哪些** status 存活。
+- **发布出去的示例凭据能通过长度下限** —— 一致性向量在公开仓的非测试文件里带了两个可用
+  secret，都是 33 字节、都过了 32 字节的门槛；抄进生产 env 会启动干净地握着一把公开的
+  HMAC 密钥，而向量里那条 tampered_body 就是这把钥匙授权的伪造。`ValidateTarget` 现在按值
+  拒绝它们，检查函数放在字面量旁边，这样加第五条向量时不会把它落下。
+
+## 2026-09-07 — project-p2-subsystem-integration（PR #850 两个 approval 后的收尾：last_error + 文档失真闸门）
+
+- **一个被小心保护、却是空的字段** —— 两位 approve 的 reviewer 各自独立点名同一条为「启用任何
+  target 之前必须修」：目标宕机时 `last_error` 写的是 `transport_failed: projectprovision:
+  transport_failed`，也就是 outcome 标签写两遍；真实原因（refused / DNS / TLS / deadline）在
+  `cause` 里、`Unwrap()` 也在，但**全仓没有任何地方调用它**。而这个模块为了保住这个字段是下过
+  功夫的（sweep 专门从覆写改成追加，理由正是"唯一的按行失败证据"）—— 结果这个字段对操作者最先
+  撞上的那类失败恰好是空的。「小心地保住一个空容器」本身就是一种失败模式，而且只断言字段
+  **存在**的测试永远看不见它。
+- **它当初为空是因为一条正确的约束** —— `Error()` 只由 category+status 构成，恰恰因为这个字符串
+  会落进 `last_error` 而容器 id 是 capability。把 `cause` 整个折进去能让 review 满意、同时悄悄
+  破掉这条：`encode_failed` 站点的 `cause` 是对 `EnsureRequest`（带容器 id）做 `json.Marshal`
+  的错误。全字符串结构体的 Marshal 现实中不会失败 —— 但「现实中不会」不是 capability 该用的标准。
+  所以 detail **只**取传输错误的**内层**错误：它描述网络，结构上不可能含有我们发出去的东西。
+  这条保证仍然是「构造出来的性质」，而不是「关于标准库怎么格式化的论证」。
+- **修在写入侧还不够，得追到终态写** —— `finishProvisioning` 是 SET 而不是追加，于是 abandon
+  路径会用 `"retries exhausted"` 覆盖掉累积的 detail —— 而那恰好是唯一没有自动重驱动的那一行。
+  和 sweep 当初的问题一模一样，只差一层。只修写入侧会得到一套全绿的测试和一个空字段。
+- **把「文档失真」这一类交给机器** —— 同一形状的 finding 连续五轮出现（注释/文档声称代码没有的
+  行为），两次由机械改名造出、一次由本片自己的索引改动把没动过的散文打成过时的，每一次都是靠
+  人细读发现的 —— 而这是把细心的人用错了地方：涉及的引用都是 grep 能定案的。现在两道 guard 接手：
+  凡是本片文本里引用的仓库路径必须在树里解析得到；凡是整条由本表列名组成的括号元组都被读作「在
+  声称一个索引」，必须是迁移里某个 key 的**前缀**。**元组** guard 第一次跑就抓到一处真的 ——
+  `brief.md` 在索引改动之后仍写着 `(status, finished_at)`，三位 reviewer 和我都漏了。
+- **我把「首跑输出了一屏」当成了「抓到了真实例」** —— 这条当时写成「两道各抓到一处」，是假的：
+  路径 guard 首跑那一屏全是我随后修掉的**误报**，它一处真的都没抓到。reviewer 把两道 guard 回放
+  到修复前的树上，我自己复现确认后才接受。一个不实的功效声称比没有声称更糟，因为它恰好会让下一个
+  读者跳过对那道 guard 做变异 —— 而这道确实需要：它的第一版**看不见两段式的包名拼错**，而那正是
+  它自己点名的两个缺陷之一（父目录回落把任何两段式引用都解析到永远存在的顶层目录上，而我的变异
+  用的是带扩展名的路径，走的是另一支）。现在回落只在三段及以上生效。
+- **路径 guard 的第一版全是误报** —— 它把 HTTP 路由和 URL 也匹配了，因为
+  `/v1/internal/projects/status` 里就含有一个形状与包路径完全相同的子串。RE2 没有 lookbehind，
+  所以修法是对**前一个字符**开捕获组：真正的引用从非路径字符开始。这一个条件消掉了整个类别。
+- **会读自己文件的 guard 不能引用它要抓的那个缺陷** —— 两道 guard 都被自己的解释性注释绊倒。
+  改成用文字描述而不是引用那个坏形状，不是绕过，而是 guard 在证明它有效。
+
+## 2026-09-07 — project-p2-subsystem-integration（PR #850 第十轮：guard 自己被抓了三处）
+
+- **我建来防「文档失真」的 guard，自己漏掉了它点名的缺陷** —— 路径 guard 的父目录回落把任何
+  两段式引用都解析到永远存在的顶层目录上，于是「包名拼错」这一半永远绿；而我做的变异用的是
+  带扩展名的路径，走的是另一支。回落现在只在三段及以上生效。**变异要覆盖 guard 自己声称的每
+  一个形状，而不是任意一个能让它变红的形状。**
+- **覆盖下限必须高于「失去主体后仍能通过」的那个数** —— 文件下限写 12、实际匹配 15，其中 3 个
+  正是两次缺陷都发生在其中的交接文档；删掉那个目录，下限照过，guard 静默地不再覆盖自己的主体。
+- **只匹配未折行文本的 guard 并没有钉住它描述的那个实例** —— 元组 guard 看不见跨两行注释折行的
+  枚举，而历史实例恰恰就是折行的。它钉住的是当下的排版，不是缺陷。
+- **「DDL 才是真相」对头部注释是反过来的** —— 元组 guard 按这个理由跳过 `.sql`，结果一处过时枚举
+  就活在迁移头部，而且是在**加这道 guard 的同一个 commit 里**。语句上方的散文是关于语句的断言。
+- **rebase 之后「不依赖 P1」这条记录变成了假的，而且被代码自己反驳** —— `context.yaml` / `plan.md`
+  连续三个 head 断言 base 是 c7abadeb、P1 仍 OPEN 且不被依赖，而 `pkg/octosign` 抽取的包注释写的
+  正是「P1 让 modules/group 依赖 modules/project，闭合了导入环」。**独立性是有时效的：它当时为真，
+  rebase 之后就成了关于另一棵树的陈述。**
+- **一个跑不通的补救步骤会把人推回它自己禁止的操作** —— §3.5 写的 `sql-migrate down -limit=1`
+  在本仓根本没有入口（无 dbconfig、无 Makefile 目标，迁移由启动时的 `migrate.Exec` 施加）。改成
+  实测走通的等价物：`DROP TABLE` 与删 `gorp_migrations` 账本行**放在同一事务**。
+- **不实的功效声称会让下一个人跳过验证** —— 详见当日前一条与 journal。
+
+## 2026-09-08 — project-p2-product-surfaces（PR-1：项目视角群聊列表）
+
+`GET /v1/projects/:project_id/groups`。此前树上没有任何接口能回答「这个项目有哪些群」：
+`modules/project` 注册九条路由无一返回群，`GET /v1/group/my` 只按 space_id 过滤，而能答这
+个问题的查询早就存在、未导出，只有成员移除级联 worker 调它。
+
+- **访问控制就是 WHERE 子句，因此这个接口刻意没有角色门。** 旁边的 `listMembersHandler` 需要
+  `canViewMembers`，因为名册是「关于别人的事实」；这个接口只返回调用者已经在的行，没有可扣的
+  东西。没加入项目的 Space 管理员拿到 `[]`。**在这里加 403 比冗余更糟**——它会对一个正确答案
+  是空列表的调用者答拒绝，从而让「你不是本项目成员」在一条本来什么都不透露的路由上变得可观测，
+  等于在新路由上重新打开 `projectMiddleware` 三合一拒绝所要关掉的那个枚举通道。
+- **仓库里两个成员谓词，只在一个可达状态上分歧，而两边注释都没写。** `is_deleted = 0` 与
+  `is_deleted = 0 AND status = Normal`：移除置 `is_deleted = 1`，两者一致；**唯一**分歧是群
+  黑名单——只置 status、保留 `is_deleted = 0`。于是选谓词这件事实际上只有一个问题：*把你拉黑
+  的群还要不要出现在你的列表里*。这么问答案是自明的（`ExistMemberActive` 就是挡这个 uid 读群/
+  子区的加固线），但在 review 之前没人提出过这个问题。现已写进源码，并用**同时断言两半**的测试
+  钉住：既断言这里看不到，也断言 `/v1/group/my` 还看得到。
+- **一个什么都不 gate 的配置开关，被我信了三个 commit。** 为了结掉「group 桩表」那个悬问，我读到
+  `testutil` 里 `cfg.DB.Migration = false` 就断言「测试不跑迁移」。错：`module.Setup` 是无条件
+  调 `executeSQL` 的（octo-lib `module/module.go:29`）。它能活下来是因为**当时还不承重**——这个
+  断言只需要在有人依据它行动的那天为真。跑一遍套件一分钟就推翻了，而且推翻方式最直接：
+  `./modules/group/` 打在 `./modules/project/` 刚迁移过的库上，启动即死于
+  `unknown migration in database`（project 的测试二进制注册全部 40 个模块，group 的更少）。
+  **每个包要各自的干净 `test` 库。**
+- **两处只有客户端团队才会踩到的文档缺陷。** `is_named` 我写的是这一列**曾经**的含义
+  （`20260629000002` 已把「用户显式起名」改成「改版前老群」，且新群恒为 0，所以这个接口上它恒为
+  0）；排序注释写了「全员群**永远**最老」，而 `ensureAllMemberGroup` 会在补建时给它一个更大的
+  id。**文档描述一个已废弃的含义，比没有文档更糟：它是自信地错。**
+- **分页边界测试不是分页测试。** 第一版只有 `?page=<int64max>` 和一个越界空页。`LIMIT ? OFFSET ?`
+  两个参数写反——相邻 int、编译器不管——**第 1 页照样正确**，只有第 2 页起才崩，所有既有断言都会
+  通过。溢出回归和正确性是两个测试。
+- **模块自己的守卫压过了 brief 的验收清单。** brief 要求 `TestListProjectGroupsIsUIDRateLimited`；
+  同模块的 `TestAuthChainOrder` 恰恰论证了这种测试没用（`SharedUIDRateLimiter` 无 uid 时 fail
+  open，挂错顺序的路由两种情况都通过）。**在读模块自身守卫之前写下的验收项是假设，不是要求。**
+
+## 2026-09-08 — my-ai-team-sessions（PR #848 CI 异步测试收敛）
+
+- **认领不是完成** —— `space_member_removal_cleanup.attempts` 在 worker 认领工单时就自增，早于任何
+  cleanup callback。测试等待 `attempts >= 1` 后立即断言 callback 次数，会在新增的生命周期清理拉长窗口后
+  稳定暴露竞态；而 callback 对普通 `int` 的跨 goroutine 读写本身也没有同步保证。
+- 测试改用原子计数确认失败步骤确实执行，并等待 worker 跑完所有步骤后才写入的 `last_error`，再检查群成员
+  删除结果。目标用例及完整 `modules/project` 包均在 `-race` 与 shuffle 下通过。
+
+## 2026-09-08 — my-ai-team-sessions（PR #848 最终 blocker 收敛）
+
+- 超管删除 Bot 先验证 robot 实体，再进入破坏性的群成员清理，错误的人类 UID 不再触发级联删除。
+- 生命周期清理把群主不可删除视为带告警的预期 no-op，并禁止以后把普通群群主转让给 Bot。
+- mention preference、Bot target resolve 与管理端群列表均隐藏/拒绝 AI 容器；resolve 同时过滤其 thread。
+- 新增 DB/HTTP 回归，完整 `group`、`robot`、`bot_api` 包以及 build、vet、i18n、diff 门禁通过。
+- 继续关闭第六轮发现的路由族缺口：四组 incoming-webhook 管理挂载统一在成员鉴权后拒绝
+  AI 容器；旧版最近会话和运营看板也不再展示容器、thread 或成员明细。
+- 完整 `incomingwebhook`、`message`、`opanalytics` 套件通过。
+
+## 2026-09-08 — my-ai-team-sessions（PR #848 独立 review-fix）
+
+- 管理列表与统计面板的群总数统一排除 AI 容器，修复可见列表与聚合口径不一致。
+- 空 agent/session 页固定输出 `items: []`；软删除 session 的幂等 key 重放明确返回 409。
+- 非文本消息不再把原始结构化 payload 写入 session 标题，改用已有内容类型展示文案。
+- build、全仓 vet、AI Team 全包和 Robot 聚焦测试通过；Group DB 回归保留给干净数据库 CI，
+  本机共享库的 migration 账本包含当前分支不存在的旧迁移，未为跑绿而破坏共享状态。
+
+## 2026-09-08 — ai-team-agent-groups
+
+- AI Team Agent 列表改为云端分身、个人助理、数字员工三个固定分组；数字员工为未来 App Bot
+  能力预留，本次恒为空，不从 User Bot 自报的 `agent_hosting` 推断。
+- 分页查询与总数查询复用同一套 Space、owner、User Bot 和有效席位约束；未知托管值保守归入
+  个人助理，`agent_hosting` 不参与权限判断且不出现在响应中。
+- CI 单元 lane、E2E shard 4/4、AI Team race 测试、build、vet 与 diff 门禁均通过。
+- Review 后将分页 items 与总数统计统一到同一个 SQL 分类表达式，避免后续新增 hosting slug 时
+  两套条件漂移；独立 Swagger 文档不进入 PR。

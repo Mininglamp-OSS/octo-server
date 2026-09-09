@@ -1,6 +1,7 @@
 package file
 
 import (
+	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"strings"
 	"testing"
 
@@ -281,8 +282,11 @@ func TestFileTypeConstants(t *testing.T) {
 	assert.Equal(t, Type("workplaceappicon"), TypeWorkplaceAppIcon)
 }
 
+// MaxFileSize 从「运行期生效值」降级成「代码默认值」后，这两个用例仍然是等价性
+// 基线：未配置 file.max_size_kb 时 MaxUploadSize() 必须回落到 100MB，与改动前
+// 逐字节相同（生效值本身的用例见 policy_test.go）。
 func TestMaxFileSize(t *testing.T) {
-	assert.Equal(t, int64(100*1024*1024), MaxFileSize, "MaxFileSize should be 100MB")
+	assert.Equal(t, int64(100*1024*1024), MaxFileSize, "MaxFileSize default should be 100MB")
 }
 
 func TestAllowedExtensionsCompleteness(t *testing.T) {
@@ -395,6 +399,8 @@ func TestSanitizeFilename_BackslashHandling(t *testing.T) {
 
 func TestMaxFileSize_Value(t *testing.T) {
 	assert.Equal(t, int64(104857600), MaxFileSize)
+	assert.Equal(t, int64(common.DefaultFileMaxSizeKB)*1024, MaxFileSize,
+		"默认值必须与 common.DefaultFileMaxSizeKB 同源")
 	assert.Greater(t, MaxFileSize, int64(10*1024*1024))
 	assert.LessOrEqual(t, MaxFileSize, int64(1024*1024*1024))
 }
@@ -565,143 +571,13 @@ func TestValidateMagicNumber_MP4Variations(t *testing.T) {
 	}
 }
 
-func snapshotExtMap(m map[string]bool) map[string]bool {
-	cp := make(map[string]bool, len(m))
-	for k, v := range m {
-		cp[k] = v
-	}
-	return cp
-}
-
-// TestLoadExtensionsFromEnv 直接修改 package-level map，子测试不可并行执行。
-func TestLoadExtensionsFromEnv(t *testing.T) {
-	withCleanMaps := func(t *testing.T, fn func(t *testing.T)) {
-		t.Helper()
-		origAllowed := snapshotExtMap(allowedExtensions)
-		origBlocked := snapshotExtMap(blockedExtensions)
-		t.Cleanup(func() {
-			allowedExtensions = origAllowed
-			blockedExtensions = origBlocked
-		})
-		fn(t)
-	}
-
-	t.Run("DM_FILE_EXTRA_ALLOWED 追加白名单", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", ".svg,.heic")
-			loadExtensionsFromEnv()
-
-			assert.True(t, IsAllowedExtension(".svg"), ".svg 应被允许")
-			assert.True(t, IsAllowedExtension(".heic"), ".heic 应被允许")
-			assert.True(t, IsAllowedExtension(".jpg"), "原有 .jpg 应保持允许")
-		})
-	})
-
-	t.Run("DM_FILE_EXTRA_BLOCKED 追加黑名单", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_BLOCKED", ".xyz,.abc")
-			loadExtensionsFromEnv()
-
-			assert.True(t, IsBlockedExtension(".xyz"), ".xyz 应被禁止")
-			assert.True(t, IsBlockedExtension(".abc"), ".abc 应被禁止")
-			assert.False(t, IsAllowedExtension(".xyz"), "黑名单优先，.xyz 不应被允许")
-			assert.True(t, IsBlockedExtension(".exe"), "原有 .exe 应保持禁止")
-		})
-	})
-
-	t.Run("大小写与空格容错", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", " .SVG , .HEIC ")
-			loadExtensionsFromEnv()
-
-			assert.True(t, IsAllowedExtension(".SVG"), "大写 .SVG 应被允许")
-			assert.True(t, IsAllowedExtension(".svg"), "小写 .svg 应被允许")
-		})
-	})
-
-	t.Run("不带点号自动补全", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", "tiff,avif")
-			t.Setenv("DM_FILE_EXTRA_BLOCKED", "bin")
-			loadExtensionsFromEnv()
-
-			assert.True(t, IsAllowedExtension(".tiff"), "不带点号的 tiff 应被自动补全并允许")
-			assert.True(t, IsAllowedExtension(".avif"), "不带点号的 avif 应被自动补全并允许")
-			assert.True(t, IsBlockedExtension(".bin"), "不带点号的 bin 应被自动补全并禁止")
-		})
-	})
-
-	t.Run("空环境变量不影响现有配置", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", "")
-			t.Setenv("DM_FILE_EXTRA_BLOCKED", "")
-			loadExtensionsFromEnv()
-
-			assert.True(t, IsAllowedExtension(".jpg"), ".jpg 应保持允许")
-			assert.True(t, IsBlockedExtension(".exe"), ".exe 应保持禁止")
-		})
-	})
-
-	t.Run("黑名单中的扩展名加入白名单时被忽略", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", ".exe,.php")
-			loadExtensionsFromEnv()
-
-			assert.False(t, IsAllowedExtension(".exe"), ".exe 在黑名单中，白名单设置应被忽略")
-			assert.False(t, IsAllowedExtension(".php"), ".php 在黑名单中，白名单设置应被忽略")
-		})
-	})
-
-	t.Run("纯点号输入被忽略", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", ".,..,  ")
-			loadExtensionsFromEnv()
-
-			assert.False(t, allowedExtensions["."], `"." 不应被加入白名单`)
-			assert.False(t, allowedExtensions[".."], `".." 不应被加入白名单`)
-		})
-	})
-
-	t.Run("含路径分隔符的输入被忽略", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", "foo/bar,.svg")
-			loadExtensionsFromEnv()
-
-			assert.False(t, allowedExtensions[".foo/bar"], "含路径分隔符的扩展名不应被加入白名单")
-			assert.True(t, IsAllowedExtension(".svg"), "合法扩展名 .svg 应被允许")
-		})
-	})
-
-	t.Run("同一扩展名同时出现在两个 env var 中以黑名单为准", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", ".danger")
-			t.Setenv("DM_FILE_EXTRA_BLOCKED", ".danger")
-			loadExtensionsFromEnv()
-
-			assert.False(t, IsAllowedExtension(".danger"), "黑名单优先，.danger 不应被允许")
-			assert.True(t, IsBlockedExtension(".danger"), ".danger 应被禁止")
-			assert.False(t, allowedExtensions[".danger"], ".danger 不应残留在 allowedExtensions map 中")
-		})
-	})
-
-	t.Run("将已有白名单扩展名加入黑名单", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_BLOCKED", ".jpg")
-			loadExtensionsFromEnv()
-
-			assert.True(t, IsBlockedExtension(".jpg"), ".jpg 应被禁止")
-			assert.False(t, IsAllowedExtension(".jpg"), ".jpg 不应再被允许")
-			assert.False(t, allowedExtensions[".jpg"], ".jpg 应从 allowedExtensions 中移除")
-		})
-	})
-
-	t.Run("多连续点号的畸形输入被忽略", func(t *testing.T) {
-		withCleanMaps(t, func(t *testing.T) {
-			t.Setenv("DM_FILE_EXTRA_ALLOWED", "..exe,..svg")
-			loadExtensionsFromEnv()
-
-			assert.False(t, allowedExtensions["..exe"], `"..exe" 不应被加入白名单`)
-			assert.False(t, allowedExtensions["..svg"], `"..svg" 不应被加入白名单`)
-		})
-	})
-}
+// snapshotExtMap 与 TestLoadExtensionsFromEnv 已移除。
+//
+// 改动前 loadExtensionsFromEnv() 会原地改写包级 allowedExtensions /
+// blockedExtensions，那个用例因此需要 snapshotExtMap 备份 / 还原两张 map。
+// 现在 baseline 是只读的，运行期值由 policy.go 的不可变快照承载。
+//
+// 那 11 条 env 语义子用例**逐条搬到了** policy_test.go:
+// TestExtensionPolicy_EnvCompatibility —— 子用例名保持不变，断言改走
+// IsAllowedExtension / IsBlockedExtension / EffectiveAllowedExtensions 这些
+// 公开 API，方便与改动前逐条对照。

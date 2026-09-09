@@ -381,6 +381,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 	// 后者是收敛后的真源 key（与 octo-web ChannelSearch、octo-admin messages_search
 	// 命名一致）。两个分支共用同一计算结果，避免 Resolve 被调用多次。
 	searchEnabled := searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled()
+	octoAssistantUIDs := parseOctoAssistantUIDs()
 	messageReaction := buildMessageReactionCapability(
 		cn.systemSettings.MessageReactionReadEnabled(),
 		cn.systemSettings.MessageReactionWriteEnabled(),
@@ -397,14 +398,20 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			ProjectOn:              cn.systemSettings.ProjectEnabled(),
 			DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 			DriveOn:                cn.systemSettings.DriveEnabled(),
+			DriveSearchOn:          cn.systemSettings.DriveSearchEnabled(),
+			MailOn:                 cn.systemSettings.MailEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+			TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+			OctoAssistantUIDs:      octoAssistantUIDs,
 			MessageReaction:        messageReaction,
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
-			// 也能立刻拿到最新值。
+			// 也能立刻拿到最新值。文件上传限制同理。
 			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
+			FileUploadLimits:    buildFileUploadLimitsResp(),
 		})
 		return
 	}
@@ -449,13 +456,19 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		ProjectOn:              cn.systemSettings.ProjectEnabled(),
 		DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 		DriveOn:                cn.systemSettings.DriveEnabled(),
+		DriveSearchOn:          cn.systemSettings.DriveSearchEnabled(),
+		MailOn:                 cn.systemSettings.MailEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+		TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+		OctoAssistantUIDs:      octoAssistantUIDs,
 		MessageReaction:        messageReaction,
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
+		FileUploadLimits:    buildFileUploadLimitsResp(),
 	})
 }
 
@@ -465,14 +478,42 @@ func buildMessageReactionCapability(read, write bool) messageReactionCapabilityR
 
 // buildStickerUploadLimitsResp 从 SystemSettings 派生一份 stickerUploadLimitsResp
 // 快照。两个 handler 分支(version-shortcut / full-refresh)都用它,避免字段
-// 组装漂移。SystemSettings.StickerUpload* getter 各自内部已做 hard-cap clamp,
-// 拿到的都是安全值。
+// 组装漂移。
+//
+// 「安全值」的定义包含**全局单文件上限**:上传校验里全局大小门在贴纸门之前,
+// 所以 StickerUploadMaxSizeKB() 内部除了贴纸自身的硬上限,还会收敛到
+// FileMaxSizeKB()。少了那一道,部署把 OCTO_FILE_MAX_SIZE_KB_HARD_CAP 配到贴纸
+// 上限之下时,这里会向客户端广播一个服务端并不接受的值 —— 客户端按它做完本地
+// 预校验,上传后被前置的全局门以「文件过大」拒掉。
 func buildStickerUploadLimitsResp(s *SystemSettings) stickerUploadLimitsResp {
 	return stickerUploadLimitsResp{
 		MaxSizeKB:      s.StickerUploadMaxSizeKB(),
 		MaxDimension:   s.StickerUploadMaxDimension(),
 		AllowedFormats: s.StickerUploadAllowedFormats(),
 	}
+}
+
+// parseOctoAssistantUIDs 从 env DM_OCTO_ASSISTANT_UIDS 解析 Octo Assistant UID
+// 列表。逗号分隔,过滤空串。env 未设或为空时返回空切片(不是 nil,保证 JSON
+// 序列化为 [] 而非 null,前端 Array.isArray 判断一致)。
+//
+// 与 DM_OIDC_* 系列 env 同形态:运维在部署清单里配 UID 列表,后端作为单一真源
+// 通过 appconfig 下发,前端据此判别 octo_assistant_opened vs app_opened 事件。
+func parseOctoAssistantUIDs() []string {
+	raw := os.Getenv("DM_OCTO_ASSISTANT_UIDS")
+	if raw == "" {
+		return []string{}
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // oidcProviders 返回 OIDC provider 元数据数组,让前端不再硬编码 provider id/name/authorize_path。
@@ -850,12 +891,55 @@ type appConfigResp struct {
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DriveOn bool `json:"drive_on"`
 
+	// DriveSearchOn 告知客户端是否展示全局搜索的"网盘"tab。值来源于 system_setting
+	// drive.search_enabled；默认 false —— 与 drive_on 解耦，搜索端点由 octo-drive-search
+	// 独立提供，可晚于 drive 模块本体上线，上线+索引就绪后才放量。仅表达展示策略，鉴权
+	// 在 octo-drive-search 自身，本字段不承担鉴权。与 app_config.version 解耦的原因同 DriveOn。
+	DriveSearchOn bool `json:"drive_search_on"`
+
+	// ProjectOn 告知客户端项目(Project)协作模块是否开启。
+	//
+	// 与 DocsOn / MailOn 那批「纯展示开关」不同，它同时是服务端闸门：
+	// modules/project 的 requireWriteEnabled 读的是同一个
+	// SystemSettings.ProjectEnabled()。做成两个开关的话，最坏形态是客户端把入口
+	// 显示出来、点进去每个写操作都 403——单一真源就是为了排除这种状态。
+	//
+	// 与 app_config.version 解耦，两个分支都下发：运维在管理台切完之后，命中
+	// version 短路分支的老客户端也必须立刻拿到最新值，否则它会一直以为模块是关的。
+	//
+	// 关掉只停止「产生新项目 / 新项目群」；已有项目群的成员约束（不变量 I2）不受
+	// 影响，照常强制。
+	ProjectOn bool `json:"project_on"`
+
+	// MailOn 告知客户端是否展示 Agent Mail 模块入口。值来源于 system_setting
+	// mail.enabled，默认 false。该字段只表达展示策略，不替代 octo-server 网关及
+	// octo-mail 的身份、Space 和邮箱权限校验。两个 appconfig 分支均下发该字段，
+	// 避免 app_config.version 缓存阻止开关及时生效。
+	MailOn bool `json:"mail_on"`
+
 	// dmloop.enabled / dmpersonal.enabled；默认 false —— loop(回路)与「我的/运行时」入口在
 	// 后端服务就绪前先隐藏,上线后由管理台切对应 system_setting 灰度放开。两者分开:
 	// 「我的」将重设计脱离 loop、可独立放量。只表达展示策略,不承担服务端鉴权。与 app_config.version
 	// 解耦(同 DocsOn):运维切策略后老客户端命中 version 短路分支也须拿到最新值,故两分支都下发。
 	DmloopOn     bool `json:"dmloop_on"`
 	DmpersonalOn bool `json:"dmpersonal_on"`
+
+	// TrackingEnabled 告知客户端是否开启前端埋点(octo-dap)采集。值来源于 system_setting
+	// tracking.enabled；默认 false —— 埋点层随发布上线但静默(fail-closed)，octo-web 只有拿到
+	// 此字段为真才开始采集。collector 与 TRACK_API_URL egress 在集群内验证通过前运维保持关闭。
+	// 只表达采集策略，不承担服务端鉴权(collector 自身鉴权)。与 app_config.version 解耦的原因
+	// 同 DocsOn：运维切策略后老客户端命中 version 短路分支也须拿到最新值，故两分支都下发。
+	TrackingEnabled bool `json:"tracking_enabled"`
+
+	// OctoAssistantUIDs 下发 Octo Assistant 的 UID 列表，供前端判别当前打开的
+	// 应用 bot 是否为 Octo Assistant（YUJ-277 / octo-dap S3 埋点）。前端根据此
+	// 列表决定发 octo_assistant_opened 还是 app_opened 事件。
+	//
+	// 来源：env DM_OCTO_ASSISTANT_UIDS（逗号分隔），解析时过滤空串。默认 []
+	// （env 未设或为空）。与 app_config.version 解耦的原因同 TrackingEnabled：
+	// 运维调整 UID 列表后老客户端命中 version 短路分支也必须拿到最新值，故两个
+	// 分支都下发。
+	OctoAssistantUIDs []string `json:"octo_assistant_uids"`
 
 	// MessageReaction is the deployment-wide default capability for ordinary
 	// Web/iOS/Android clients. It is intentionally identity-agnostic because
@@ -890,6 +974,46 @@ type appConfigResp struct {
 	// compress_max_concurrency / compress_timeout_ms）—— 这些是服务端"影子"参数，
 	// 响应字段结构不变、无对应客户端行为，曝光只会泄露实现细节。
 	StickerUploadLimits stickerUploadLimitsResp `json:"sticker_upload_limits"`
+
+	// FileUploadLimits 是**通用文件上传**的有效限制，与 file.* system_setting
+	// 同源（modules/file 的策略快照：baseline ∪ extra_allowed − blocked）。
+	// 用途同 StickerUploadLimits：客户端选文件后本地预校验，避免超大文件 /
+	// 非法扩展名跑完整个 HTTP 上传才被服务端拒 —— 对移动端流量尤其友好。
+	//
+	// 只含 allowed，不含 blocked：客户端只需要知道能传什么。本端点无鉴权
+	// （commonNoAuth），下发黑名单等于让任何未认证调用方对比 baseline 就看出
+	// 本部署额外封了哪些扩展名。
+	//
+	// **客户端预校验只是 UX 优化**，服务端对每个上传请求仍用同一份快照兜底
+	// （size + 扩展名黑/白名单三层）。运营紧急封堵某扩展名后，客户端缓存的清单
+	// 最长滞后一个跨实例收敛窗口（60s），期间「选了文件、上传被拒」是**预期
+	// 行为**，客户端应正常提示错误，而不是断言这不可能发生。
+	//
+	// 指针 + omitempty：provider 未注册（modules/file 未链接进本次构建）时整个
+	// 字段不下发，而不是下发空数组 —— 空 allowed_extensions 会被客户端读成
+	// 「什么都不能传」，比缺字段更危险。
+	//
+	// 与 app_config.version 解耦的原因同 StickerUploadLimits：运维在管理台调整
+	// 后，老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	FileUploadLimits *fileUploadLimitsResp `json:"file_upload_limits,omitempty"`
+}
+
+// fileUploadLimitsResp 是 appConfigResp.file_upload_limits 的形状。
+// 单位与 stickerUploadLimitsResp 对齐（KB），避免同一响应体里两种单位。
+// allowed_extensions 每项含前导点、小写、字典序，稳定可比较。
+type fileUploadLimitsResp struct {
+	MaxSizeKB         int      `json:"max_size_kb"`
+	AllowedExtensions []string `json:"allowed_extensions"`
+}
+
+// buildFileUploadLimitsResp 从 modules/file 注册的 provider 取有效值。
+// provider 未注册时返回 nil，字段整体不下发（见 FileUploadLimits 的说明）。
+func buildFileUploadLimitsResp() *fileUploadLimitsResp {
+	maxSizeKB, allowed, ok := FileUploadLimits()
+	if !ok {
+		return nil
+	}
+	return &fileUploadLimitsResp{MaxSizeKB: maxSizeKB, AllowedExtensions: allowed}
 }
 
 type messageReactionCapabilityResp struct {

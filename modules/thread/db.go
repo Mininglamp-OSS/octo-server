@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -445,6 +446,7 @@ func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64
 		"UPDATE thread t SET t.status=?, t.version=?, t.updated_at=? "+
 			"WHERE t.status=? AND t.last_message_at IS NOT NULL AND t.last_message_at < ? "+
 			"AND t.version < ? "+
+			"AND NOT EXISTS (SELECT 1 FROM `group` g WHERE g.group_no=t.group_no COLLATE utf8mb4_0900_ai_ci AND g.purpose=?) "+
 			"AND NOT EXISTS ("+
 			"SELECT 1 FROM reminders r "+
 			"LEFT JOIN reminder_done rd ON rd.reminder_id=r.id AND rd.uid=r.uid "+
@@ -456,6 +458,7 @@ func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64
 		ThreadStatusArchived, version, time.Now(),
 		ThreadStatusActive, threshold,
 		version,
+		aiteampkg.GroupPurpose,
 		ChannelIDSeparator, channelType, ReminderTypeMentionMe,
 		batchSize,
 	).Exec()
