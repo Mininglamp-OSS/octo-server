@@ -1,6 +1,8 @@
 package group
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -127,6 +129,112 @@ func validateWorkspaceKeyword(keyword string) (string, error) {
 	}
 	return keyword, nil
 }
+func wrapGroupWorkspaceDependency(operation string, err error) error {
+	return fmt.Errorf("%w: %s: %v", workspace.ErrDependencyUnavailable, operation, err)
+}
+
+// ReadGroupWorkspace owns the complete single-relation read protocol. The
+// handler supplies only normalized route input and request scope; this method
+// keeps the relation row, authorization checks, and public projection on one
+// repeatable-read snapshot.
+func (s *Service) ReadGroupWorkspace(ctx context.Context, groupNo string, scope workspace.Scope) (GroupWorkspace, error) {
+	tx, err := s.ctx.DB().BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return GroupWorkspace{}, wrapGroupWorkspaceDependency("begin group Workspace read transaction", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	row, err := s.db.queryGroupWorkspaceTx(tx, groupNo)
+	if err != nil {
+		return GroupWorkspace{}, wrapGroupWorkspaceDependency("query group Workspace relation", err)
+	}
+	if row == nil || row.Status == GroupStatusDisband {
+		return GroupWorkspace{}, workspace.ErrNotFound
+	}
+	if strings.TrimSpace(row.SpaceID) == "" {
+		return GroupWorkspace{}, workspace.ErrSpaceRequired
+	}
+	if err := validateGroupWorkspacePair(row); err != nil {
+		return GroupWorkspace{}, err
+	}
+
+	workspaceID := workspaceIDFromPointer(row.WorkspaceID)
+	if workspaceID == "" {
+		active, err := s.db.ExistMemberActiveTx(tx, scope.UID, groupNo)
+		if err != nil {
+			return GroupWorkspace{}, wrapGroupWorkspaceDependency("check native group membership", err)
+		}
+		if !active {
+			return GroupWorkspace{}, workspace.ErrForbidden
+		}
+		spaceAccess, err := s.db.queryGroupSpaceAccessTx(tx, row.SpaceID, scope.UID)
+		if err != nil {
+			return GroupWorkspace{}, wrapGroupWorkspaceDependency("check group Space access", err)
+		}
+		if !spaceAccess {
+			return GroupWorkspace{}, workspace.ErrForbidden
+		}
+	} else {
+		// A native group member is not enough to read a bound relation.
+		// ReadWorkspaceTx revalidates active Workspace membership and
+		// organization status on this same snapshot/connection, so a
+		// Workspace-only member can read restricted relation metadata while a
+		// group-only member cannot.
+		ws, err := workspace.NewService(s.ctx).ReadWorkspaceTx(tx, scope, workspaceID)
+		if err != nil {
+			return GroupWorkspace{}, err
+		}
+		if ws == nil || ws.SpaceID != row.SpaceID {
+			return GroupWorkspace{}, errGroupWorkspaceConflict
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return GroupWorkspace{}, wrapGroupWorkspaceDependency("commit group Workspace read", err)
+	}
+	return groupWorkspaceFromRow(row), nil
+}
+
+// ListWorkspaceGroups owns the authorized Workspace relation list read. Both
+// count and rows are queried before committing the same repeatable-read
+// snapshot, so pagination metadata cannot drift from the returned page.
+func (s *Service) ListWorkspaceGroups(ctx context.Context, workspaceID, keyword string, page workspace.Page, scope workspace.Scope) (workspace.Pagination[GroupWorkspace], error) {
+	tx, err := s.ctx.DB().BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return workspace.Pagination[GroupWorkspace]{}, wrapGroupWorkspaceDependency("begin Workspace group list transaction", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	ws, err := workspace.NewService(s.ctx).ReadWorkspaceTx(tx, scope, workspaceID)
+	if err != nil {
+		return workspace.Pagination[GroupWorkspace]{}, err
+	}
+	if ws == nil || strings.TrimSpace(ws.SpaceID) == "" {
+		return workspace.Pagination[GroupWorkspace]{}, workspace.ErrSpaceRequired
+	}
+
+	count, err := s.db.queryWorkspaceGroupCountTx(tx, ws.SpaceID, workspaceID, keyword)
+	if err != nil {
+		return workspace.Pagination[GroupWorkspace]{}, wrapGroupWorkspaceDependency("count Workspace groups", err)
+	}
+	list, err := s.db.queryWorkspaceGroupsTx(tx, ws.SpaceID, workspaceID, keyword, page)
+	if err != nil {
+		return workspace.Pagination[GroupWorkspace]{}, wrapGroupWorkspaceDependency("query Workspace groups", err)
+	}
+	if list == nil {
+		list = make([]GroupWorkspace, 0)
+	}
+	if err := tx.Commit(); err != nil {
+		return workspace.Pagination[GroupWorkspace]{}, wrapGroupWorkspaceDependency("commit Workspace group list", err)
+	}
+	return workspace.Pagination[GroupWorkspace]{Count: count, List: list}, nil
+}
 
 // resolveGroupWorkspaceSpace is the derived-space callback used by the four
 // relation routes. The group row is authoritative; no client-provided Space
@@ -153,8 +261,8 @@ func (g *Group) resolveGroupWorkspaceSpace(c *wkhttp.Context) (string, error) {
 }
 
 // resolveWorkspaceGroupsSpace derives the Space for GET /v1/groups from the
-// target Workspace ID. Authorization is still performed by the middleware's
-// live Space-member check and by Service.Get in the handler.
+// target Workspace ID. Authorization is performed by the handler's
+// transaction-owned ReadWorkspaceTx validation.
 func (g *Group) resolveWorkspaceGroupsSpace(c *wkhttp.Context) (string, error) {
 	workspaceID := strings.TrimSpace(c.Query("workspace_id"))
 	if workspaceID == "" {

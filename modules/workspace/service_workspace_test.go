@@ -273,6 +273,359 @@ func TestWorkspaceServicePaginationOverflowReturnsEmptyPage(t *testing.T) {
 	require.NotNil(t, members.List)
 	require.Empty(t, members.List)
 }
+func TestWorkspaceServiceReadsCompleteWithOneDatabaseConnection(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceSpace(t, ctx, "ws-one-connection-space", "10000")
+	svc := workspaceService(t, ctx)
+	ws := createWorkspaceService(t, ctx, "10000", "ws-one-connection-space", "One connection")
+
+	t.Cleanup(func() {
+		bindWorkspaceTestDBPool(ctx)
+	})
+	ctx.DB().SetMaxOpenConns(1)
+	ctx.DB().SetMaxIdleConns(1)
+
+	list, err := svc.List(workspacemod.Scope{UID: "10000"}, "ws-one-connection-space", "", workspacemod.Page{Index: 1, Size: 15})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, list.Count)
+	require.Len(t, list.List, 1)
+
+	detail, err := svc.Get(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID)
+	require.NoError(t, err)
+	require.Equal(t, ws.WorkspaceID, detail.WorkspaceID)
+
+	members, err := svc.Members(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID,
+		workspacemod.MemberFilter{Status: workspacemod.MemberStatusActive}, workspacemod.Page{Index: 1, Size: 15})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, members.Count)
+	require.Len(t, members.List, 1)
+}
+func TestWorkspaceServiceMemberWritesCompleteWithOneDatabaseConnection(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceUser(t, ctx, "ws-one-connection-member", "One connection member")
+	seedWorkspaceSpace(t, ctx, "ws-one-connection-write-space", "10000", "ws-one-connection-member")
+	svc := workspaceService(t, ctx)
+	ws := createWorkspaceService(t, ctx, "10000", "ws-one-connection-write-space", "One connection writes")
+
+	t.Cleanup(func() {
+		bindWorkspaceTestDBPool(ctx)
+	})
+	ctx.DB().SetMaxOpenConns(1)
+	ctx.DB().SetMaxIdleConns(1)
+
+	added, err := svc.AddMembers(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID, []workspacemod.MemberInput{{
+		UID: "ws-one-connection-member", WorkspaceRole: workspacemod.WorkspaceRoleMember,
+	}})
+	require.NoError(t, err)
+	require.Len(t, added, 1)
+
+	updated, err := svc.UpdateMember(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID,
+		"ws-one-connection-member", workspacemod.WorkspaceRoleAdmin)
+	require.NoError(t, err)
+	require.Equal(t, workspacemod.WorkspaceRoleAdmin, updated.WorkspaceRole)
+}
+
+func TestWorkspaceWritesDifferentWorkspacesShareSpaceLock(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceSpace(t, ctx, "ws-shared-write-space", "10000")
+	svc := workspaceService(t, ctx)
+	first := createWorkspaceService(t, ctx, "10000", "ws-shared-write-space", "First")
+	second := createWorkspaceService(t, ctx, "10000", "ws-shared-write-space", "Second")
+
+	tx, err := ctx.DB().Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	var heldSpace struct {
+		SpaceID string `db:"space_id"`
+	}
+	require.NoError(t, tx.SelectBySql(
+		"SELECT space_id FROM `space` WHERE space_id=? FOR SHARE", "ws-shared-write-space",
+	).LoadOne(&heldSpace))
+	require.Equal(t, "ws-shared-write-space", heldSpace.SpaceID)
+	var heldWorkspace struct {
+		WorkspaceID string `db:"workspace_id"`
+	}
+	require.NoError(t, tx.SelectBySql(
+		"SELECT workspace_id FROM `octo_workspace` WHERE workspace_id=? FOR UPDATE", first.WorkspaceID,
+	).LoadOne(&heldWorkspace))
+	require.Equal(t, first.WorkspaceID, heldWorkspace.WorkspaceID)
+
+	done := make(chan error, 1)
+	go func() {
+		name := "Second updated"
+		_, updateErr := svc.Update(workspacemod.Scope{UID: "10000"}, second.WorkspaceID,
+			workspacemod.UpdateRequest{Name: &name})
+		done <- updateErr
+	}()
+	select {
+	case updateErr := <-done:
+		require.NoError(t, updateErr)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "a write to another Workspace waited on the held shared Space lock")
+	}
+	require.NoError(t, tx.Commit())
+}
+
+func TestWorkspaceGetsDoNotWaitOnLockedWorkspaceRows(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceSpace(t, ctx, "ws-locked-get-space", "10000")
+	svc := workspaceService(t, ctx)
+	first := createWorkspaceService(t, ctx, "10000", "ws-locked-get-space", "First")
+	second := createWorkspaceService(t, ctx, "10000", "ws-locked-get-space", "Second")
+
+	tx, err := ctx.DB().Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	_, err = tx.Update("octo_workspace").Set("name", "uncommitted").
+		Where("workspace_id=?", first.WorkspaceID).Exec()
+	require.NoError(t, err)
+
+	type getResult struct {
+		workspace *workspacemod.Workspace
+		err       error
+	}
+	done := make(chan getResult, 2)
+	go func() {
+		workspace, getErr := svc.Get(workspacemod.Scope{UID: "10000"}, first.WorkspaceID)
+		done <- getResult{workspace: workspace, err: getErr}
+	}()
+	go func() {
+		workspace, getErr := svc.Get(workspacemod.Scope{UID: "10000"}, second.WorkspaceID)
+		done <- getResult{workspace: workspace, err: getErr}
+	}()
+
+	for range 2 {
+		select {
+		case result := <-done:
+			require.NoError(t, result.err)
+			require.NotNil(t, result.workspace)
+			if result.workspace.WorkspaceID == first.WorkspaceID {
+				require.Equal(t, "First", result.workspace.Name,
+					"GET must use the last committed Workspace state")
+			} else {
+				require.Equal(t, second.WorkspaceID, result.workspace.WorkspaceID)
+			}
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "a GET waited on an unrelated Workspace row lock")
+		}
+	}
+	require.NoError(t, tx.Rollback())
+}
+
+func TestWorkspaceGroupAccessCurrentReadSeesMemberAfterPinnedSnapshot(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceUser(t, ctx, "ws-pinned-initial", "Initial member")
+	seedWorkspaceUser(t, ctx, "ws-pinned-late", "Late member")
+	seedWorkspaceSpace(t, ctx, "ws-pinned-snapshot-space", "10000", "ws-pinned-initial", "ws-pinned-late")
+	svc := workspaceService(t, ctx)
+	ws := createWorkspaceService(t, ctx, "10000", "ws-pinned-snapshot-space", "Pinned snapshot")
+	_, err := svc.AddMembers(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID, []workspacemod.MemberInput{{
+		UID: "ws-pinned-initial", WorkspaceRole: workspacemod.WorkspaceRoleMember,
+	}})
+	require.NoError(t, err)
+
+	tx, err := ctx.DB().Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	var pinned struct {
+		WorkspaceID string `db:"workspace_id"`
+	}
+	require.NoError(t, tx.SelectBySql(
+		"SELECT workspace_id FROM `octo_workspace_member` WHERE workspace_id=? AND status=1",
+		ws.WorkspaceID,
+	).LoadOne(&pinned))
+	require.Equal(t, ws.WorkspaceID, pinned.WorkspaceID)
+
+	_, err = svc.AddMembers(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID, []workspacemod.MemberInput{{
+		UID: "ws-pinned-late", WorkspaceRole: workspacemod.WorkspaceRoleMember,
+	}})
+	require.NoError(t, err)
+
+	access, err := svc.LockAccessesForGroupTx(tx, "10000", ws.WorkspaceID, []workspacemod.SpaceSeatKey{
+		{SpaceID: "ws-pinned-snapshot-space", UID: "10000"},
+		{SpaceID: "ws-pinned-snapshot-space", UID: "ws-pinned-initial"},
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"10000", "ws-pinned-initial", "ws-pinned-late"}, access.MemberUIDs,
+		"current member read must not reuse the pinned repeatable-read snapshot")
+	require.ElementsMatch(t, []string{"10000", "ws-pinned-initial"}, access.EligibleMemberUIDs,
+		"only prepared seats may enter the eligible snapshot subset")
+	require.NoError(t, tx.Commit())
+}
+func TestWorkspaceWriteAuthorizationUsesOwnerFromLockedWorkspaceRow(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Original owner")
+	seedWorkspaceUser(t, ctx, "ws-owner-race-target", "New owner")
+	seedWorkspaceSpace(t, ctx, "ws-owner-race-space", "10000", "ws-owner-race-target")
+	svc := workspaceService(t, ctx)
+	ws := createWorkspaceService(t, ctx, "10000", "ws-owner-race-space", "Owner race")
+	_, err := svc.AddMembers(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID, []workspacemod.MemberInput{{
+		UID: "ws-owner-race-target", WorkspaceRole: workspacemod.WorkspaceRoleMember,
+	}})
+	require.NoError(t, err)
+
+	tx, err := ctx.DB().Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	var pinned struct {
+		OwnerUID string `db:"owner_uid"`
+	}
+	require.NoError(t, tx.SelectBySql(
+		"SELECT owner_uid FROM `octo_workspace` WHERE workspace_id=?", ws.WorkspaceID,
+	).LoadOne(&pinned))
+	require.Equal(t, "10000", pinned.OwnerUID)
+
+	_, err = svc.TransferOwner(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID, "ws-owner-race-target")
+	require.NoError(t, err)
+
+	accesses, err := svc.LockAccessesTx(tx, "10000", []string{ws.WorkspaceID}, "ws-owner-race-space")
+	require.NoError(t, err,
+		"authorization must use the owner from the locked Workspace row, not the pinned location read")
+	access, ok := accesses[ws.WorkspaceID]
+	require.True(t, ok)
+	require.Equal(t, "ws-owner-race-target", access.OwnerUID)
+	require.Equal(t, workspacemod.WorkspaceRoleAdmin, access.Role)
+	require.NoError(t, tx.Commit())
+}
+
+func TestWorkspaceServiceWorkspaceNameSearchTreatsLikeMetacharactersLiterally(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceSpace(t, ctx, "ws-like-space", "10000")
+	svc := workspaceService(t, ctx)
+	for _, name := range []string{"literal %_! name", `literal \ name`, "literal ' name", "字面 %_ 名称", "literal ordinary name"} {
+		_, err := svc.Create(workspacemod.Scope{UID: "10000"}, workspacemod.CreateRequest{
+			SpaceID: "ws-like-space",
+			Name:    name,
+		})
+		require.NoError(t, err)
+	}
+
+	ctx.DB().SetMaxOpenConns(1)
+	ctx.DB().SetMaxIdleConns(1)
+	var originalMode string
+	require.NoError(t, ctx.DB().SelectBySql("SELECT @@SESSION.sql_mode").LoadOne(&originalMode))
+	t.Cleanup(func() {
+		_, restoreErr := ctx.DB().Exec("SET SESSION sql_mode = ?", originalMode)
+		require.NoError(t, restoreErr)
+		bindWorkspaceTestDBPool(ctx)
+	})
+	modeParts := make([]string, 0)
+	for _, part := range strings.Split(originalMode, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && !strings.EqualFold(part, "NO_BACKSLASH_ESCAPES") {
+			modeParts = append(modeParts, part)
+		}
+	}
+	defaultMode := strings.Join(modeParts, ",")
+	noBackslashMode := defaultMode
+	if noBackslashMode != "" {
+		noBackslashMode += ","
+	}
+	noBackslashMode += "NO_BACKSLASH_ESCAPES"
+	setMode := func(mode string) {
+		_, err := ctx.DB().Exec("SET SESSION sql_mode = ?", mode)
+		require.NoError(t, err)
+	}
+
+	for _, mode := range []string{defaultMode, noBackslashMode} {
+		setMode(mode)
+		for _, search := range []struct {
+			keyword string
+			name    string
+		}{
+			{keyword: "literal %_! name", name: "literal %_! name"},
+			{keyword: `literal \ name`, name: `literal \ name`},
+			{keyword: "literal ' name", name: "literal ' name"},
+			{keyword: "字面 %_ 名称", name: "字面 %_ 名称"},
+		} {
+			page, err := svc.List(workspacemod.Scope{UID: "10000"}, "ws-like-space", search.keyword,
+				workspacemod.Page{Index: 1, Size: 15})
+			require.NoError(t, err)
+			require.EqualValues(t, 1, page.Count, "mode %q keyword %q", mode, search.keyword)
+			require.Len(t, page.List, 1, "mode %q keyword %q", mode, search.keyword)
+			require.Equal(t, search.name, page.List[0].Name)
+		}
+	}
+}
+
+func TestWorkspaceLockAccessesForGroupLocksOnlyPreparedSeats(t *testing.T) {
+	_, ctx := setupWorkspaceTest(t)
+	for _, user := range []struct {
+		uid  string
+		name string
+	}{
+		{"10000", "Workspace owner"},
+		{"ws-snapshot-member", "Snapshot member"},
+		{"ws-unrelated-member", "Unrelated member"},
+	} {
+		seedWorkspaceUser(t, ctx, user.uid, user.name)
+	}
+	seedWorkspaceSpace(t, ctx, "ws-snapshot-space", "10000", "ws-snapshot-member", "ws-unrelated-member")
+	svc := workspaceService(t, ctx)
+	ws := createWorkspaceService(t, ctx, "10000", "ws-snapshot-space", "Snapshot")
+	_, err := svc.AddMembers(workspacemod.Scope{UID: "10000"}, ws.WorkspaceID, []workspacemod.MemberInput{{
+		UID: "ws-snapshot-member", WorkspaceRole: workspacemod.WorkspaceRoleMember,
+	}})
+	require.NoError(t, err)
+
+	tx, err := ctx.DB().Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	var plan struct {
+		Key *string `db:"key"`
+	}
+	require.NoError(t, tx.SelectBySql(
+		"EXPLAIN SELECT space_id, uid FROM `space_member` WHERE status=1 AND (space_id, uid) IN ((?, ?), (?, ?)) ORDER BY space_id, uid FOR SHARE",
+		"ws-snapshot-space", "10000", "ws-snapshot-space", "ws-snapshot-member",
+	).LoadOne(&plan))
+	require.NotNil(t, plan.Key)
+	require.Equal(t, "spacemember_spaceid_uid", *plan.Key,
+		"prepared seat locking must use the exact (space_id, uid) index")
+	access, err := svc.LockAccessesForGroupTx(tx, "10000", ws.WorkspaceID, []workspacemod.SpaceSeatKey{
+		{SpaceID: "ws-snapshot-space", UID: "10000"},
+		{SpaceID: "ws-snapshot-space", UID: "ws-snapshot-member"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, ws.WorkspaceID, access.WorkspaceID)
+	require.Equal(t, "ws-snapshot-space", access.SpaceID)
+	require.ElementsMatch(t, []string{"10000", "ws-snapshot-member"}, access.MemberUIDs)
+
+	type updateResult struct {
+		affected int64
+		err      error
+	}
+	updateDone := make(chan updateResult, 1)
+	go func() {
+		result, updateErr := ctx.DB().Update("space_member").Set("role", 1).
+			Where("space_id=? AND uid=?", "ws-snapshot-space", "ws-unrelated-member").Exec()
+		if updateErr != nil {
+			updateDone <- updateResult{err: updateErr}
+			return
+		}
+		affected, affectedErr := result.RowsAffected()
+		updateDone <- updateResult{affected: affected, err: affectedErr}
+	}()
+	select {
+	case result := <-updateDone:
+		require.NoError(t, result.err)
+		require.EqualValues(t, 1, result.affected,
+			"prepared seat update must affect the unrelated member row")
+		var updatedRole int
+		require.NoError(t, ctx.DB().Select("role").From("space_member").
+			Where("space_id=? AND uid=?", "ws-snapshot-space", "ws-unrelated-member").
+			LoadOne(&updatedRole))
+		require.Equal(t, 1, updatedRole)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "group snapshot locked an unrelated Space member")
+	}
+	require.NoError(t, tx.Commit())
+}
 
 func TestWorkspaceServiceTransferRemoveRacePreservesSingleOwner(t *testing.T) {
 	_, ctx := setupWorkspaceTest(t)

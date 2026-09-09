@@ -97,14 +97,33 @@ type MemberFilter struct {
 }
 
 // Access is the transactionally-authorized view used by other modules. Role is
-// the actor's projected Workspace role. MemberUIDs is populated only when a
-// complete active-member snapshot was requested.
+// the actor's projected Workspace role.
 type Access struct {
 	WorkspaceID string
 	SpaceID     string
 	OwnerUID    string
 	Role        string
 	MemberUIDs  []string
+}
+
+// SpaceSeatKey identifies one exact Space membership row. Group snapshot
+// callers must prepare and de-duplicate these keys before opening a database
+// transaction.
+type SpaceSeatKey struct {
+	SpaceID string
+	UID     string
+}
+
+// GroupAccess is the authorization and active-member snapshot returned to a
+// group-creation caller. It deliberately exposes only the facts required by
+// that workflow.
+type GroupAccess struct {
+	WorkspaceID        string
+	SpaceID            string
+	OwnerUID           string
+	Role               string
+	MemberUIDs         []string
+	EligibleMemberUIDs []string
 }
 
 type workspaceModel struct {
@@ -142,4 +161,38 @@ func formatWorkspaceTime(t time.Time) string {
 		return ""
 	}
 	return t.In(time.Local).Format(workspaceTimeFormat)
+}
+
+// InternalWorkspace is the service-facing Workspace representation. It does
+// not contain workspace_role because internal callers are not Workspace
+// members and therefore have no caller-relative role projection.
+type InternalWorkspace struct {
+	WorkspaceID string `json:"workspace_id"`
+	SpaceID     string `json:"space_id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Logo        string `json:"logo"`
+	OwnerUID    string `json:"owner_uid"`
+	MemberCount int64  `json:"member_count"`
+	Status      int    `json:"status"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+func internalWorkspacePublic(row *workspaceModel, memberCount int64) *InternalWorkspace {
+	if row == nil {
+		return nil
+	}
+	return &InternalWorkspace{
+		WorkspaceID: row.WorkspaceID,
+		SpaceID:     row.SpaceID,
+		Name:        row.Name,
+		Description: row.Description,
+		Logo:        row.Logo,
+		OwnerUID:    row.OwnerUID,
+		MemberCount: memberCount,
+		Status:      row.Status,
+		CreatedAt:   formatWorkspaceTime(row.CreatedAt),
+		UpdatedAt:   formatWorkspaceTime(row.UpdatedAt),
+	}
 }

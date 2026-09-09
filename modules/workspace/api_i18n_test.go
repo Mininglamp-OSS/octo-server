@@ -3,12 +3,15 @@ package workspace
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/require"
-	"net/http"
-	"net/http/httptest"
-	"testing"
 )
 
 func workspaceProbe(probe func(*wkhttp.Context)) *wkhttp.WKHttp {
@@ -63,6 +66,39 @@ func TestRespondErrorMapsSentinelsToRegisteredCodes(t *testing.T) {
 			if tc.name == "unknown_internal" {
 				require.NotContains(t, rec.Body.String(), "database detail must stay private")
 			}
+		})
+	}
+}
+
+// TestWorkspaceNoLegacyResponseError keeps every Workspace HTTP handler on
+// the localized error envelope. Keep new handler files in this list so a raw
+// c.JSON or legacy ResponseError call cannot bypass the shared error contract.
+func TestWorkspaceNoLegacyResponseError(t *testing.T) {
+	files := []string{"api.go", "api_i18n.go", "internal_api.go", "internal_tokens.go", "middleware.go"}
+	banned := []string{
+		".ResponseError(",
+		".ResponseErrorf(",
+		".ResponseErrorWithStatus(",
+	}
+	for _, file := range files {
+		t.Run(file, func(t *testing.T) {
+			data, err := os.ReadFile(file)
+			require.NoError(t, err)
+			var clean strings.Builder
+			for _, line := range strings.Split(string(data), "\n") {
+				if idx := strings.Index(line, "//"); idx >= 0 {
+					line = line[:idx]
+				}
+				clean.WriteString(line)
+				clean.WriteByte('\n')
+			}
+			cleaned := clean.String()
+			for _, token := range banned {
+				require.NotContains(t, cleaned, token)
+			}
+			require.NotContains(t, cleaned, "c.JSON(")
+			require.NotContains(t, cleaned, "c.AbortWithStatus(")
+			require.NotContains(t, cleaned, "c.AbortWithStatusJSON(")
 		})
 	}
 }

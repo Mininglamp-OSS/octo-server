@@ -1089,8 +1089,7 @@ func (g *Group) respondGroupMyModels(c *wkhttp.Context, loginUID string, models 
 		memberCounts, countErr = g.db.queryGroupMemberCounts(groupNos)
 		if countErr != nil {
 			g.Error("查询群成员数量失败", zap.Error(countErr), zap.String("uid", loginUID))
-			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-			return
+			memberCounts = make(map[string]int64)
 		}
 	}
 	resps := make([]*GroupResp, 0, len(models))
@@ -1320,16 +1319,18 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 
 	// 调用 Service 创建群
 	createResp, err := g.groupService.CreateGroup(&CreateGroupServiceReq{
-		Creator:         creator,
-		Members:         realUids,
-		Name:            req.Name,
-		SpaceID:         req.SpaceID,
-		ProjectID:       req.ProjectID,
-		WorkspaceID:     strings.TrimSpace(req.WorkspaceID),
-		expectedSpaceID: strings.TrimSpace(c.GetHeader("X-Space-ID")),
-		CategoryID:      req.CategoryID,
-		AvatarText:      req.AvatarText,
-		AvatarColor:     req.AvatarColor,
+		Creator:                 creator,
+		Members:                 realUids,
+		Name:                    req.Name,
+		SpaceID:                 req.SpaceID,
+		ProjectID:               req.ProjectID,
+		WorkspaceID:             strings.TrimSpace(req.WorkspaceID),
+		expectedSpaceID:         strings.TrimSpace(c.GetHeader("X-Space-ID")),
+		preparedAppConfig:       appConfig,
+		preparedAppConfigLoaded: true,
+		CategoryID:              req.CategoryID,
+		AvatarText:              req.AvatarText,
+		AvatarColor:             req.AvatarColor,
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))

@@ -146,20 +146,26 @@ func (d *DB) queryUserEligible(uid string) (bool, error) {
 	return rows[0].Status == 1 && rows[0].IsDestroy != 2, nil
 }
 
-func (d *DB) queryWorkspaceMember(workspaceID, uid string) (*workspaceMemberModel, error) {
-	if err := d.ensureSession(); err != nil {
+func (d *DB) ensureTx(tx *dbr.Tx) error {
+	if tx == nil {
+		return fmt.Errorf("workspace: database transaction unavailable: %w", ErrDependencyUnavailable)
+	}
+	return nil
+}
+
+func (d *DB) queryWorkspaceTx(tx *dbr.Tx, workspaceID string) (*workspaceModel, error) {
+	if err := d.ensureTx(tx); err != nil {
 		return nil, err
 	}
-	if workspaceID == "" || uid == "" {
+	if workspaceID == "" {
 		return nil, nil
 	}
-	var rows []*workspaceMemberModel
-	_, err := d.session.SelectBySql(
-		"SELECT "+workspaceMemberColumns+" FROM `octo_workspace_member` WHERE workspace_id = ? AND uid = ? LIMIT 1",
-		workspaceID, uid,
-	).Load(&rows)
-	if err != nil {
-		return nil, fmt.Errorf("workspace: query workspace member: %w", err)
+	var rows []*workspaceModel
+	if _, err := tx.SelectBySql(
+		"SELECT "+workspaceColumns+" FROM `octo_workspace` WHERE workspace_id = ? LIMIT 1",
+		workspaceID,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("workspace: query workspace in tx: %w", err)
 	}
 	if len(rows) == 0 {
 		return nil, nil
@@ -167,16 +173,91 @@ func (d *DB) queryWorkspaceMember(workspaceID, uid string) (*workspaceMemberMode
 	return rows[0], nil
 }
 
-func (d *DB) countActiveWorkspaceMembers(workspaceID string) (int64, error) {
-	if err := d.ensureSession(); err != nil {
+func (d *DB) querySpaceActiveTx(tx *dbr.Tx, spaceID string) (bool, error) {
+	if err := d.ensureTx(tx); err != nil {
+		return false, err
+	}
+	if spaceID == "" {
+		return false, nil
+	}
+	var status int
+	rows, err := tx.SelectBySql(
+		"SELECT status FROM `space` WHERE space_id = ? LIMIT 1", spaceID,
+	).Load(&status)
+	if err != nil {
+		return false, fmt.Errorf("workspace: query space status in tx: %w", err)
+	}
+	return rows > 0 && status == 1, nil
+}
+
+func (d *DB) querySpaceMemberActiveTx(tx *dbr.Tx, uid, spaceID string) (bool, error) {
+	if err := d.ensureTx(tx); err != nil {
+		return false, err
+	}
+	if uid == "" || spaceID == "" {
+		return false, nil
+	}
+	var found []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM `space_member` WHERE uid = ? AND space_id = ? AND status = 1 LIMIT 1",
+		uid, spaceID,
+	).Load(&found); err != nil {
+		return false, fmt.Errorf("workspace: query space member in tx: %w", err)
+	}
+	return len(found) > 0, nil
+}
+
+func (d *DB) queryUserEligibleTx(tx *dbr.Tx, uid string) (bool, error) {
+	if err := d.ensureTx(tx); err != nil {
+		return false, err
+	}
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return false, nil
+	}
+	var rows []*userEligibilityModel
+	if _, err := tx.SelectBySql(
+		"SELECT uid, status, IFNULL(is_destroy, 0) AS is_destroy FROM `user` WHERE uid = ? LIMIT 1",
+		uid,
+	).Load(&rows); err != nil {
+		return false, fmt.Errorf("workspace: query user eligibility in tx: %w", err)
+	}
+	if len(rows) == 0 || rows[0] == nil {
+		return false, nil
+	}
+	return rows[0].Status == 1 && rows[0].IsDestroy != 2, nil
+}
+
+func (d *DB) queryWorkspaceMemberReadTx(tx *dbr.Tx, workspaceID, uid string) (*workspaceMemberModel, error) {
+	if err := d.ensureTx(tx); err != nil {
+		return nil, err
+	}
+	if workspaceID == "" || uid == "" {
+		return nil, nil
+	}
+	var rows []*workspaceMemberModel
+	if _, err := tx.SelectBySql(
+		"SELECT "+workspaceMemberColumns+" FROM `octo_workspace_member` WHERE workspace_id = ? AND uid = ? LIMIT 1",
+		workspaceID, uid,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("workspace: query workspace member in tx: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return rows[0], nil
+}
+
+func (d *DB) countActiveWorkspaceMembersReadTx(tx *dbr.Tx, workspaceID string) (int64, error) {
+	if err := d.ensureTx(tx); err != nil {
 		return 0, err
 	}
 	var count int64
-	if err := d.session.SelectBySql(
+	if err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM `octo_workspace_member` WHERE workspace_id = ? AND status = 1",
 		workspaceID,
 	).LoadOne(&count); err != nil {
-		return 0, fmt.Errorf("workspace: count members: %w", err)
+		return 0, fmt.Errorf("workspace: count members in read tx: %w", err)
 	}
 	return count, nil
 }
@@ -232,17 +313,6 @@ func (d *DB) updateWorkspaceTx(tx *dbr.Tx, workspaceID string, req UpdateRequest
 	}
 	if _, err := stmt.Set("updated_at", now).Exec(); err != nil {
 		return fmt.Errorf("workspace: update workspace: %w", err)
-	}
-	return nil
-}
-
-func (d *DB) archiveWorkspaceTx(tx *dbr.Tx, workspaceID string, now time.Time) error {
-	if _, err := tx.Update("octo_workspace").
-		Set("status", WorkspaceStatusArchived).
-		Set("updated_at", now).
-		Where("workspace_id = ? AND status = 1", workspaceID).
-		Exec(); err != nil {
-		return fmt.Errorf("workspace: archive workspace: %w", err)
 	}
 	return nil
 }
@@ -312,29 +382,48 @@ func (d *DB) transferOwnerTx(tx *dbr.Tx, workspaceID, oldOwner, newOwner string,
 	return nil
 }
 
-func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceIDs, uids []string, allActive bool) (map[string]bool, error) {
+func uniqueSpaceSeatKeys(keys []SpaceSeatKey) []SpaceSeatKey {
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]SpaceSeatKey, 0, len(keys))
+	for _, key := range keys {
+		key.SpaceID = strings.TrimSpace(key.SpaceID)
+		key.UID = strings.TrimSpace(key.UID)
+		if key.SpaceID == "" || key.UID == "" {
+			continue
+		}
+		mapKey := key.SpaceID + "\x00" + key.UID
+		if _, ok := seen[mapKey]; ok {
+			continue
+		}
+		seen[mapKey] = struct{}{}
+		out = append(out, key)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SpaceID == out[j].SpaceID {
+			return out[i].UID < out[j].UID
+		}
+		return out[i].SpaceID < out[j].SpaceID
+	})
+	return out
+}
+
+func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, keys []SpaceSeatKey) (map[string]bool, error) {
 	held := make(map[string]bool)
-	spaceIDs = uniqueSorted(spaceIDs)
-	uids = uniqueSorted(uids)
-	if len(spaceIDs) == 0 {
+	if err := d.ensureTx(tx); err != nil {
+		return nil, err
+	}
+	keys = uniqueSpaceSeatKeys(keys)
+	if len(keys) == 0 {
 		return held, nil
 	}
-	args := make([]interface{}, 0, len(spaceIDs)+len(uids))
-	spacePH := placeholders(len(spaceIDs))
-	for _, spaceID := range spaceIDs {
-		args = append(args, spaceID)
+	tuples := make([]string, 0, len(keys))
+	args := make([]interface{}, 0, len(keys)*2)
+	for _, key := range keys {
+		tuples = append(tuples, "(?, ?)")
+		args = append(args, key.SpaceID, key.UID)
 	}
-	query := "SELECT space_id, uid FROM `space_member` WHERE space_id IN (" + spacePH + ") AND status = 1"
-	if !allActive {
-		if len(uids) == 0 {
-			return held, nil
-		}
-		query += " AND uid IN (" + placeholders(len(uids)) + ")"
-		for _, uid := range uids {
-			args = append(args, uid)
-		}
-	}
-	query += " FOR SHARE"
+	query := "SELECT space_id, uid FROM `space_member` WHERE status = 1 AND (space_id, uid) IN (" +
+		strings.Join(tuples, ", ") + ") ORDER BY space_id, uid FOR SHARE"
 	var rows []struct {
 		SpaceID string `db:"space_id"`
 		UID     string `db:"uid"`
@@ -357,7 +446,9 @@ func (d *DB) lockSpacesTx(tx *dbr.Tx, spaceIDs []string) (map[string]bool, error
 	var rows []struct {
 		SpaceID string `db:"space_id"`
 	}
-	query := "SELECT space_id FROM `space` WHERE space_id IN (" + placeholders(len(spaceIDs)) + ") AND status = 1 ORDER BY space_id FOR UPDATE"
+	// Space lifecycle checks only need a shared current-read lock; an exclusive
+	// Space lock would serialize writes for unrelated Workspaces in that Space.
+	query := "SELECT space_id FROM `space` WHERE space_id IN (" + placeholders(len(spaceIDs)) + ") AND status = 1 ORDER BY space_id FOR SHARE"
 	args := make([]interface{}, len(spaceIDs))
 	for i, spaceID := range spaceIDs {
 		args[i] = spaceID
@@ -392,30 +483,53 @@ func (d *DB) lockWorkspaceRowsTx(tx *dbr.Tx, workspaceIDs []string) (map[string]
 	return rowsByID, nil
 }
 
-func (d *DB) lockMemberRowsTx(tx *dbr.Tx, workspaceIDs, uids []string, allActive bool) (map[string]*workspaceMemberModel, error) {
-	workspaceIDs = uniqueSorted(workspaceIDs)
-	uids = uniqueSorted(uids)
+type workspaceMemberKey struct {
+	WorkspaceID string
+	UID         string
+}
+
+func uniqueWorkspaceMemberKeys(keys []workspaceMemberKey) []workspaceMemberKey {
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]workspaceMemberKey, 0, len(keys))
+	for _, key := range keys {
+		key.WorkspaceID = strings.TrimSpace(key.WorkspaceID)
+		key.UID = strings.TrimSpace(key.UID)
+		if key.WorkspaceID == "" || key.UID == "" {
+			continue
+		}
+		mapKey := key.WorkspaceID + "\x00" + key.UID
+		if _, ok := seen[mapKey]; ok {
+			continue
+		}
+		seen[mapKey] = struct{}{}
+		out = append(out, key)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].WorkspaceID == out[j].WorkspaceID {
+			return out[i].UID < out[j].UID
+		}
+		return out[i].WorkspaceID < out[j].WorkspaceID
+	})
+	return out
+}
+
+func (d *DB) lockMemberRowsTx(tx *dbr.Tx, keys []workspaceMemberKey) (map[string]*workspaceMemberModel, error) {
 	rowsByKey := make(map[string]*workspaceMemberModel)
-	if len(workspaceIDs) == 0 {
+	if err := d.ensureTx(tx); err != nil {
+		return nil, err
+	}
+	keys = uniqueWorkspaceMemberKeys(keys)
+	if len(keys) == 0 {
 		return rowsByKey, nil
 	}
-	args := make([]interface{}, 0, len(workspaceIDs)+len(uids))
-	for _, workspaceID := range workspaceIDs {
-		args = append(args, workspaceID)
+	tuples := make([]string, 0, len(keys))
+	args := make([]interface{}, 0, len(keys)*2)
+	for _, key := range keys {
+		tuples = append(tuples, "(?, ?)")
+		args = append(args, key.WorkspaceID, key.UID)
 	}
-	query := "SELECT " + workspaceMemberColumns + " FROM `octo_workspace_member` WHERE workspace_id IN (" + placeholders(len(workspaceIDs)) + ")"
-	if !allActive {
-		if len(uids) == 0 {
-			return rowsByKey, nil
-		}
-		query += " AND uid IN (" + placeholders(len(uids)) + ")"
-		for _, uid := range uids {
-			args = append(args, uid)
-		}
-	} else {
-		query += " AND status = 1"
-	}
-	query += " ORDER BY workspace_id, uid FOR UPDATE"
+	query := "SELECT " + workspaceMemberColumns + " FROM `octo_workspace_member` WHERE (workspace_id, uid) IN (" +
+		strings.Join(tuples, ", ") + ") ORDER BY workspace_id, uid FOR UPDATE"
 	var rows []*workspaceMemberModel
 	if _, err := tx.SelectBySql(query, args...).Load(&rows); err != nil {
 		return nil, fmt.Errorf("workspace: lock member rows: %w", err)
@@ -442,18 +556,23 @@ type workspaceListModel struct {
 	MyStorageRole int       `db:"my_storage_role"`
 }
 
-func (d *DB) listWorkspaces(spaceID, actorUID, keyword string, page Page) (*Pagination[Workspace], error) {
+func workspaceLikePattern(keyword string) string {
+	escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(keyword)
+	return "%" + escaped + "%"
+}
+
+func (d *DB) listWorkspacesTx(tx *dbr.Tx, spaceID, actorUID, keyword string, page Page) (*Pagination[Workspace], error) {
 	result := &Pagination[Workspace]{List: make([]Workspace, 0)}
-	if err := d.ensureSession(); err != nil {
+	if err := d.ensureTx(tx); err != nil {
 		return nil, err
 	}
 	where := "w.space_id = ? AND w.status = 1 AND wm.uid = ? AND wm.status = 1"
 	args := []interface{}{spaceID, actorUID}
 	if keyword != "" {
-		where += " AND w.name LIKE ?"
-		args = append(args, "%"+keyword+"%")
+		where += " AND w.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'"
+		args = append(args, []byte(workspaceLikePattern(keyword)))
 	}
-	if err := d.session.SelectBySql(
+	if err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM `octo_workspace` w INNER JOIN `octo_workspace_member` wm ON wm.workspace_id = w.workspace_id WHERE "+where,
 		args...,
 	).LoadOne(&result.Count); err != nil {
@@ -470,13 +589,15 @@ func (d *DB) listWorkspaces(spaceID, actorUID, keyword string, page Page) (*Pagi
 		" ORDER BY w.created_at ASC, w.workspace_id ASC LIMIT ? OFFSET ?"
 	pageArgs := append(append([]interface{}{}, args...), limit, offset)
 	var rows []*workspaceListModel
-	if _, err := d.session.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
+	if _, err := tx.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
 		return nil, fmt.Errorf("workspace: list visible workspaces: %w", err)
 	}
 	for _, row := range rows {
 		if row.MyStorageRole != MemberRoleMember && row.MyStorageRole != MemberRoleAdmin {
 			return nil, fmt.Errorf("workspace: invalid member role in list: %w", ErrForbidden)
 		}
+	}
+	for _, row := range rows {
 		result.List = append(result.List, Workspace{
 			WorkspaceID:   row.WorkspaceID,
 			Name:          row.Name,
@@ -518,9 +639,9 @@ func pageWindow(page Page) (offset int64, limit int64, ok bool) {
 	return int64(off), limit, true
 }
 
-func (d *DB) listMembers(workspaceID string, filter MemberFilter, page Page) (*Pagination[Member], error) {
+func (d *DB) listMembersTx(tx *dbr.Tx, workspaceID string, filter MemberFilter, page Page) (*Pagination[Member], error) {
 	result := &Pagination[Member]{List: make([]Member, 0)}
-	if err := d.ensureSession(); err != nil {
+	if err := d.ensureTx(tx); err != nil {
 		return nil, err
 	}
 	if filter.Status != MemberStatusInactive && filter.Status != MemberStatusActive {
@@ -535,7 +656,7 @@ func (d *DB) listMembers(workspaceID string, filter MemberFilter, page Page) (*P
 	}
 	countQuery := "SELECT COUNT(*) FROM `octo_workspace_member` wm INNER JOIN `octo_workspace` w ON w.workspace_id = wm.workspace_id WHERE w.workspace_id = ? AND w.status = 1 AND " + strings.TrimPrefix(where, "wm.workspace_id = ? AND ")
 	countArgs := append([]interface{}{workspaceID}, args[1:]...)
-	if err := d.session.SelectBySql(countQuery, countArgs...).LoadOne(&result.Count); err != nil {
+	if err := tx.SelectBySql(countQuery, countArgs...).LoadOne(&result.Count); err != nil {
 		return nil, fmt.Errorf("workspace: count members: %w", err)
 	}
 	offset, limit, ok := pageWindow(page)
@@ -545,10 +666,10 @@ func (d *DB) listMembers(workspaceID string, filter MemberFilter, page Page) (*P
 	query := "SELECT wm.uid, wm.role, wm.status, wm.granted_by, wm.created_at, wm.updated_at, w.owner_uid FROM `octo_workspace_member` wm INNER JOIN `octo_workspace` w ON w.workspace_id = wm.workspace_id WHERE " + where + " AND w.status = 1 ORDER BY wm.created_at ASC, wm.uid ASC LIMIT ? OFFSET ?"
 	pageArgs := append(append([]interface{}{}, args...), limit, offset)
 	var rows []*memberListModel
-	if _, err := d.session.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
+	if _, err := tx.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
 		return nil, fmt.Errorf("workspace: list members: %w", err)
 	}
-	names, err := d.queryMemberNames(rows)
+	names, err := d.queryMemberNamesTx(tx, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -613,53 +734,39 @@ func memberRolePredicate(roles []string) (string, []interface{}) {
 	return strings.Join(parts, " OR "), args
 }
 
-func (d *DB) queryMemberNames(rows []*memberListModel) (map[string]string, error) {
+func (d *DB) queryMemberNamesTx(tx *dbr.Tx, rows []*memberListModel) (map[string]string, error) {
 	names := make(map[string]string, len(rows))
+	if err := d.ensureTx(tx); err != nil {
+		return nil, err
+	}
 	if len(rows) == 0 {
 		return names, nil
 	}
 	uids := make([]string, 0, len(rows))
 	for _, row := range rows {
-		uids = append(uids, row.UID)
+		if row != nil {
+			uids = append(uids, row.UID)
+		}
 	}
-	var users []*memberNameModel
+	uids = uniqueSorted(uids)
+	if len(uids) == 0 {
+		return names, nil
+	}
 	args := make([]interface{}, len(uids))
 	for i, uid := range uids {
 		args[i] = uid
 	}
-	if _, err := d.session.SelectBySql(
+	var users []*memberNameModel
+	if _, err := tx.SelectBySql(
 		"SELECT uid, IFNULL(name, '') AS name FROM `user` WHERE uid IN ("+placeholders(len(uids))+")",
 		args...,
 	).Load(&users); err != nil {
-		return nil, fmt.Errorf("workspace: query member names: %w", err)
+		return nil, fmt.Errorf("workspace: query member names in tx: %w", err)
 	}
 	for _, user := range users {
 		names[user.UID] = user.Name
 	}
 	return names, nil
-}
-
-func (d *DB) queryMemberPublic(workspaceID, uid, ownerUID string) (*Member, error) {
-	row, err := d.queryWorkspaceMember(workspaceID, uid)
-	if err != nil || row == nil {
-		return nil, err
-	}
-	names, err := d.queryMemberNames([]*memberListModel{{UID: uid}})
-	if err != nil {
-		return nil, err
-	}
-	role := projectedRole(ownerUID, row.UID, row.Role)
-	if role == "" {
-		return nil, fmt.Errorf("workspace: invalid member role: %w", ErrForbidden)
-	}
-	return &Member{
-		UID:           row.UID,
-		Name:          names[uid],
-		WorkspaceRole: role,
-		Status:        row.Status,
-		CreatedAt:     formatWorkspaceTime(row.CreatedAt),
-		GrantedBy:     row.GrantedBy,
-	}, nil
 }
 
 func projectedRole(ownerUID, uid string, storageRole int) string {
@@ -688,6 +795,21 @@ func (d *DB) queryActiveWorkspaceMembers(workspaceID string) ([]*workspaceMember
 	}
 	return rows, nil
 }
+func (d *DB) queryActiveWorkspaceMembersTx(tx *dbr.Tx, workspaceID string) ([]*workspaceMemberModel, error) {
+	if err := d.ensureTx(tx); err != nil {
+		return nil, err
+	}
+	var rows []*workspaceMemberModel
+	// FOR SHARE is a locking current read, so this remains fresh even when the
+	// caller's repeatable-read snapshot was pinned before the Workspace lock.
+	if _, err := tx.SelectBySql(
+		"SELECT "+workspaceMemberColumns+" FROM `octo_workspace_member` WHERE workspace_id = ? AND status = 1 ORDER BY uid FOR SHARE",
+		workspaceID,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("workspace: query active members in tx: %w", err)
+	}
+	return rows, nil
+}
 
 func (d *DB) queryWorkspaceLocationsTx(tx *dbr.Tx, workspaceIDs []string) (map[string]*workspaceModel, error) {
 	locations := make(map[string]*workspaceModel, len(workspaceIDs))
@@ -711,30 +833,8 @@ func (d *DB) queryWorkspaceLocationsTx(tx *dbr.Tx, workspaceIDs []string) (map[s
 	}
 	return locations, nil
 }
-
-func (d *DB) queryWorkspaceMemberTx(tx *dbr.Tx, workspaceID, uid string) (*workspaceMemberModel, error) {
-	var rows []*workspaceMemberModel
-	if _, err := tx.SelectBySql(
-		"SELECT "+workspaceMemberColumns+" FROM `octo_workspace_member` WHERE workspace_id = ? AND uid = ? FOR UPDATE",
-		workspaceID, uid,
-	).Load(&rows); err != nil {
-		return nil, fmt.Errorf("workspace: lock member: %w", err)
-	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	return rows[0], nil
-}
-
-func (d *DB) queryLockedActiveMembersForWorkspace(locked map[string]*workspaceMemberModel, workspaceID string) ([]*workspaceMemberModel, error) {
-	rows := make([]*workspaceMemberModel, 0)
-	for key, row := range locked {
-		if strings.HasPrefix(key, workspaceID+"\x00") && row != nil && row.Status == MemberStatusActive {
-			rows = append(rows, row)
-		}
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].UID < rows[j].UID })
-	return rows, nil
+func (d *DB) queryMemberTx(tx *dbr.Tx, workspaceID, uid string) (*workspaceMemberModel, error) {
+	return d.queryWorkspaceMemberReadTx(tx, workspaceID, uid)
 }
 
 func (d *DB) queryWorkspaceLockedTx(tx *dbr.Tx, workspaceID string) (*workspaceModel, error) {
@@ -793,8 +893,11 @@ func (d *DB) lockEligibleUsersTx(tx *dbr.Tx, uids []string) (map[string]bool, er
 	return eligible, nil
 }
 
-func (d *DB) membersPublicFromModels(rows []*workspaceMemberModel, ownerUID string) ([]Member, error) {
+func (d *DB) membersPublicFromModelsTx(tx *dbr.Tx, rows []*workspaceMemberModel, ownerUID string) ([]Member, error) {
 	result := make([]Member, 0, len(rows))
+	if err := d.ensureTx(tx); err != nil {
+		return nil, err
+	}
 	if len(rows) == 0 {
 		return result, nil
 	}
@@ -805,7 +908,7 @@ func (d *DB) membersPublicFromModels(rows []*workspaceMemberModel, ownerUID stri
 		}
 		nameRows = append(nameRows, &memberListModel{UID: row.UID})
 	}
-	names, err := d.queryMemberNames(nameRows)
+	names, err := d.queryMemberNamesTx(tx, nameRows)
 	if err != nil {
 		return nil, err
 	}
@@ -825,6 +928,109 @@ func (d *DB) membersPublicFromModels(rows []*workspaceMemberModel, ownerUID stri
 			CreatedAt:     formatWorkspaceTime(row.CreatedAt),
 			GrantedBy:     row.GrantedBy,
 		})
+	}
+	return result, nil
+}
+
+func (d *DB) countActiveWorkspaceMembers(workspaceID string) (int64, error) {
+	if err := d.ensureSession(); err != nil {
+		return 0, err
+	}
+	var count int64
+	if err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM `octo_workspace_member` WHERE workspace_id = ? AND status = 1",
+		workspaceID,
+	).LoadOne(&count); err != nil {
+		return 0, fmt.Errorf("workspace: count active internal members: %w", err)
+	}
+	return count, nil
+}
+
+type internalWorkspaceListModel struct {
+	WorkspaceID string    `db:"workspace_id"`
+	SpaceID     string    `db:"space_id"`
+	Name        string    `db:"name"`
+	Description string    `db:"description"`
+	Logo        string    `db:"logo"`
+	OwnerUID    string    `db:"owner_uid"`
+	Status      int       `db:"status"`
+	CreatedAt   time.Time `db:"created_at"`
+	UpdatedAt   time.Time `db:"updated_at"`
+	MemberCount int64     `db:"member_count"`
+}
+
+func (d *DB) listInternalWorkspaces(spaceID string, page Page) (*Pagination[InternalWorkspace], error) {
+	result := &Pagination[InternalWorkspace]{List: make([]InternalWorkspace, 0)}
+	if err := d.ensureSession(); err != nil {
+		return nil, err
+	}
+	where := "status = 1"
+	args := make([]interface{}, 0, 1)
+	if spaceID != "" {
+		where += " AND space_id = ?"
+		args = append(args, spaceID)
+	}
+	if err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM `octo_workspace` WHERE "+where,
+		args...,
+	).LoadOne(&result.Count); err != nil {
+		return nil, fmt.Errorf("workspace: count internal workspaces: %w", err)
+	}
+	offset, limit, ok := pageWindow(page)
+	if !ok {
+		return result, nil
+	}
+	query := "SELECT workspace_id, space_id, name, description, logo, owner_uid, status, created_at, updated_at, " +
+		"(SELECT COUNT(*) FROM `octo_workspace_member` wm WHERE wm.workspace_id = w.workspace_id AND wm.status = 1) AS member_count " +
+		"FROM `octo_workspace` w WHERE " + where +
+		" ORDER BY created_at ASC, workspace_id ASC LIMIT ? OFFSET ?"
+	pageArgs := append(append([]interface{}{}, args...), limit, offset)
+	var rows []*internalWorkspaceListModel
+	if _, err := d.session.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
+		return nil, fmt.Errorf("workspace: list internal workspaces: %w", err)
+	}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		result.List = append(result.List, InternalWorkspace{
+			WorkspaceID: row.WorkspaceID,
+			SpaceID:     row.SpaceID,
+			Name:        row.Name,
+			Description: row.Description,
+			Logo:        row.Logo,
+			OwnerUID:    row.OwnerUID,
+			MemberCount: row.MemberCount,
+			Status:      row.Status,
+			CreatedAt:   formatWorkspaceTime(row.CreatedAt),
+			UpdatedAt:   formatWorkspaceTime(row.UpdatedAt),
+		})
+	}
+	return result, nil
+}
+
+func (d *DB) listInternalMembers(workspaceID string, filter MemberFilter, page Page) (*Pagination[Member], error) {
+	if err := d.ensureSession(); err != nil {
+		return nil, err
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("workspace: begin internal members read: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+	workspace, err := d.queryWorkspaceTx(tx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if workspace == nil || workspace.Status != WorkspaceStatusActive {
+		return nil, ErrNotFound
+	}
+	result, err := d.listMembersTx(tx, workspaceID, filter, page)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("workspace: commit internal members read: %w", err)
 	}
 	return result, nil
 }

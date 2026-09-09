@@ -27,18 +27,22 @@ const (
 
 // API is the Workspace HTTP adapter.
 type API struct {
-	ctx     *config.Context
-	service *Service
+	ctx        *config.Context
+	service    *Service
+	loopToken  string
+	driveToken string
 	log.Log
 }
 
 // New constructs the Workspace API and its service.
 func New(ctx *config.Context) *API {
-	return &API{
+	api := &API{
 		ctx:     ctx,
 		service: NewService(ctx),
 		Log:     log.NewTLog("Workspace"),
 	}
+	api.initInternalTokens()
+	return api
 }
 
 // Route mounts all Workspace user-facing endpoints. Every route is ordered as
@@ -60,7 +64,6 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 	)
 	resource.GET("/:workspace_id", a.getWorkspace)
 	resource.PUT("/:workspace_id", a.updateWorkspace)
-	resource.DELETE("/:workspace_id", a.archiveWorkspace)
 	resource.GET("/:workspace_id/members", a.listMembers)
 	// Gin's parameter route would otherwise capture the literal "me". The
 	// self-leave route must be registered first for the DELETE method.
@@ -70,6 +73,11 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 	resource.PUT("/:workspace_id/members/:uid", a.updateMember)
 	resource.DELETE("/:workspace_id/members/:uid", a.removeMember)
 	resource.PUT("/:workspace_id/owner", a.transferOwner)
+	internal := r.Group("/v1/internal")
+	ipLimit := a.workspaceInternalIPRateLimit(r)
+	internal.GET("/workspaces", ipLimit, a.internalAuthMiddleware(), a.internalListWorkspaces)
+	internal.GET("/workspaces/:workspace_id", ipLimit, a.internalAuthMiddleware(), a.internalGetWorkspace)
+	internal.GET("/workspaces/:workspace_id/members", ipLimit, a.internalAuthMiddleware(), a.internalListMembers)
 }
 
 func querySpaceResolver(c *wkhttp.Context) (string, error) {
@@ -223,18 +231,6 @@ func (a *API) updateWorkspace(c *wkhttp.Context) {
 		return
 	}
 	c.Response(result)
-}
-
-func (a *API) archiveWorkspace(c *wkhttp.Context) {
-	workspaceID, ok := requiredPath(c, "workspace_id")
-	if !ok {
-		return
-	}
-	if err := a.service.Archive(RequestScope(c), workspaceID); err != nil {
-		RespondError(c, err)
-		return
-	}
-	c.ResponseOK()
 }
 
 func (a *API) listMembers(c *wkhttp.Context) {

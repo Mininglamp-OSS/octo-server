@@ -3,18 +3,26 @@ package group
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
-	workspace "github.com/Mininglamp-OSS/octo-server/modules/workspace"
+	"github.com/Mininglamp-OSS/octo-server/modules/workspace"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/go-redis/redis"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
 	"github.com/stretchr/testify/require"
 )
 
@@ -229,6 +237,95 @@ func TestGroupWorkspaceRelationMetadataAuthRebindAndUnbind(t *testing.T) {
 	}
 }
 
+func TestGroupWorkspaceUnboundGetRechecksSpaceAccessAfterMiddleware(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*config.Context, string, string) error
+	}{
+		{
+			name: "account disabled",
+			mutate: func(ctx *config.Context, owner, _ string) error {
+				_, err := ctx.DB().Update("user").Set("status", 0).Where("uid=?", owner).Exec()
+				return err
+			},
+		},
+		{
+			name: "Space disabled",
+			mutate: func(ctx *config.Context, _, spaceID string) error {
+				_, err := ctx.DB().Update("space").Set("status", 2).Where("space_id=?", spaceID).Exec()
+				return err
+			},
+		},
+		{
+			name: "seat revoked",
+			mutate: func(ctx *config.Context, owner, spaceID string) error {
+				_, err := ctx.DB().Update("space_member").Set("status", 0).
+					Where("space_id=? AND uid=?", spaceID, owner).Exec()
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ctx, g := setupGroupWorkspaceContract(t)
+			owner := "gw-ub-owner"
+			member := "gw-ub-member"
+			spaceID := "gw-ub-space"
+			seedGroupWorkspaceUsers(t, g, owner, member)
+			seedSpaceWithMembers(t, ctx, spaceID, owner, member)
+			groupNo := createGroupWorkspace(t, g, owner, spaceID, member)
+			token := groupWorkspaceContractToken(t, ctx, owner)
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			released := false
+			defer func() {
+				if !released {
+					close(release)
+				}
+			}()
+
+			route := wkhttp.New()
+			route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+			route.GET("/v1/groups/:group_no/workspace",
+				g.ctx.AuthMiddleware(route),
+				workspace.VerifiedSpaceMiddleware(g.ctx, g.resolveGroupWorkspaceSpace),
+				func(c *wkhttp.Context) {
+					close(entered)
+					<-release
+					c.Next()
+				},
+				g.groupWorkspaceGet,
+			)
+
+			response := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				response <- groupWorkspaceContractJSON(t, route, http.MethodGet,
+					"/v1/groups/"+groupNo+"/workspace", token, nil)
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not reach the post-middleware barrier")
+			}
+
+			require.NoError(t, tc.mutate(ctx, owner, spaceID))
+			close(release)
+			released = true
+
+			var rec *httptest.ResponseRecorder
+			select {
+			case rec = <-response:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not finish")
+			}
+			require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+			errResp := decodeEnvelope(t, rec.Body.Bytes())
+			require.Equal(t, "err.server.workspace.forbidden", errResp.Error.Code)
+		})
+	}
+}
+
 func TestGroupWorkspaceMyModesUseNumericNativeRoles(t *testing.T) {
 	s, ctx, g := setupGroupWorkspaceContract(t)
 	const (
@@ -391,4 +488,147 @@ func TestGroupWorkspaceCreateSnapshotsUnionOnceAndSystemPolicy(t *testing.T) {
 	var after int64
 	require.NoError(t, ctx.DB().Select("COUNT(*)").From("`group`").LoadOne(&after))
 	require.Equal(t, before, after)
+}
+func createNamedBoundGroup(t *testing.T, g *Group, creator, spaceID, workspaceID, name string, members ...string) string {
+	t.Helper()
+	resp, err := g.groupService.CreateGroup(&CreateGroupServiceReq{
+		Creator: creator,
+		Members: members,
+		Name:    name,
+		SpaceID: spaceID,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp)
+	require.NotEmpty(t, resp.GroupNo)
+	_, err = g.ctx.DB().Update("group").
+		Set("workspace_id", workspaceID).
+		Set("workspace_linked_by", creator).
+		Where("group_no=?", resp.GroupNo).
+		Exec()
+	require.NoError(t, err)
+	return resp.GroupNo
+}
+
+func TestWorkspaceGroupLikeEscapesLiteralWildcards(t *testing.T) {
+	require.Equal(t, `%literal!!!%!_\\value%`, workspaceGroupLike(`literal!%_\\value`))
+}
+
+func TestGroupWorkspaceListMatchesLiteralKeywordCountAndList(t *testing.T) {
+	s, ctx, g := setupGroupWorkspaceContract(t)
+	const (
+		owner   = "gw-like-owner"
+		member  = "gw-like-member"
+		spaceID = "gw-like-space"
+	)
+	seedGroupWorkspaceUsers(t, g, owner, member)
+	seedSpaceWithMembers(t, ctx, spaceID, owner, member)
+	ws := createContractWorkspace(t, ctx, owner, spaceID, "Like workspace")
+	for _, name := range []string{"literal % group", "literal _ group", "literal ! group", `literal \ group`} {
+		createNamedBoundGroup(t, g, owner, spaceID, ws.WorkspaceID, name, member)
+	}
+	token := groupWorkspaceContractToken(t, ctx, owner)
+	ctx.DB().SetMaxOpenConns(1)
+	ctx.DB().SetMaxIdleConns(1)
+	var originalMode string
+	require.NoError(t, ctx.DB().SelectBySql("SELECT @@SESSION.sql_mode").LoadOne(&originalMode))
+	t.Cleanup(func() {
+		_, restoreErr := ctx.DB().Exec("SET SESSION sql_mode = ?", originalMode)
+		require.NoError(t, restoreErr)
+		bindTestDBPool(ctx)
+	})
+	modeParts := make([]string, 0)
+	for _, part := range strings.Split(originalMode, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && !strings.EqualFold(part, "NO_BACKSLASH_ESCAPES") {
+			modeParts = append(modeParts, part)
+		}
+	}
+	defaultMode := strings.Join(modeParts, ",")
+	noBackslashMode := defaultMode
+	if noBackslashMode != "" {
+		noBackslashMode += ","
+	}
+	noBackslashMode += "NO_BACKSLASH_ESCAPES"
+	setMode := func(mode string) {
+		_, err := ctx.DB().Exec("SET SESSION sql_mode = ?", mode)
+		require.NoError(t, err)
+	}
+	for _, mode := range []string{defaultMode, noBackslashMode} {
+		setMode(mode)
+		for _, keyword := range []string{"%", "_", "!", `\`} {
+			path := "/v1/groups?workspace_id=" + url.QueryEscape(ws.WorkspaceID) +
+				"&keyword=" + url.QueryEscape(keyword) + "&page_index=1&page_size=15"
+			resp := groupWorkspaceContractJSON(t, s.GetRoute(), http.MethodGet, path, token, nil)
+			require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
+			var listed struct {
+				Count int64            `json:"count"`
+				List  []GroupWorkspace `json:"list"`
+			}
+			require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &listed))
+			require.EqualValues(t, 1, listed.Count, "mode %q keyword %q", mode, keyword)
+			require.Len(t, listed.List, 1, "mode %q keyword %q count/list mismatch", mode, keyword)
+			require.Contains(t, listed.List[0].Name, keyword)
+		}
+	}
+}
+
+func TestGroupWorkspaceGetAndListUseOneReadConnection(t *testing.T) {
+	s, ctx, g := setupGroupWorkspaceContract(t)
+	const (
+		owner   = "gw-one-connection-owner"
+		member  = "gw-one-connection-member"
+		spaceID = "gw-one-connection-space"
+	)
+	seedGroupWorkspaceUsers(t, g, owner, member)
+	seedSpaceWithMembers(t, ctx, spaceID, owner, member)
+	ws := createContractWorkspace(t, ctx, owner, spaceID, "One connection workspace")
+	groupNo := createNamedBoundGroup(t, g, owner, spaceID, ws.WorkspaceID, "One connection group", member)
+	token := groupWorkspaceContractToken(t, ctx, owner)
+	ctx.DB().SetMaxOpenConns(1)
+
+	get := groupWorkspaceContractJSON(t, s.GetRoute(), http.MethodGet,
+		"/v1/groups/"+groupNo+"/workspace", token, nil)
+	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
+	list := groupWorkspaceContractJSON(t, s.GetRoute(), http.MethodGet,
+		"/v1/groups?workspace_id="+url.QueryEscape(ws.WorkspaceID)+"&page_index=1&page_size=15",
+		token, nil)
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+}
+
+func TestGroupMyMemberCountFailureStillReturnsRows(t *testing.T) {
+	rawDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rawDB.Close() })
+	conn := &dbr.Connection{
+		DB:            rawDB,
+		EventReceiver: &dbr.NullEventReceiver{},
+		Dialect:       dialect.MySQL,
+	}
+	g := &Group{
+		db:  &DB{session: conn.NewSession(nil)},
+		Log: log.NewTLog("Group"),
+	}
+	mock.ExpectQuery("SELECT group_no, role").
+		WillReturnRows(sqlmock.NewRows([]string{"group_no", "role"}).AddRow("group-1", MemberRoleCommon))
+	mock.ExpectQuery("SELECT group_no, COUNT").
+		WillReturnError(errors.New("count query failed"))
+
+	wk := wkhttp.New()
+	wk.GET("/group-my", func(c *wkhttp.Context) {
+		g.respondGroupMyModels(c, "uid", []*Model{{GroupNo: "group-1", Name: "group"}}, true, false)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/group-my", nil)
+	rec := httptest.NewRecorder()
+	wk.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var rows []struct {
+		GroupNo     string `json:"group_no"`
+		MemberCount int    `json:"member_count"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &rows))
+	require.Len(t, rows, 1)
+	require.Equal(t, "group-1", rows[0].GroupNo)
+	require.Zero(t, rows[0].MemberCount)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

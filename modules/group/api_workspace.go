@@ -3,12 +3,13 @@ package group
 import (
 	"errors"
 	"fmt"
+	"strings"
+
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/workspace"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
-	"strings"
 )
 
 // routeWorkspace mounts only the group-owned relation surface. It deliberately
@@ -41,53 +42,14 @@ func (g *Group) groupWorkspaceGet(c *wkhttp.Context) {
 		return
 	}
 
-	row, err := g.db.queryGroupWorkspace(groupNo)
-	if err != nil {
-		g.respondGroupWorkspaceDependency(c, "query group Workspace relation", err)
-		return
-	}
-	if row == nil || row.Status == GroupStatusDisband {
-		respondGroupWorkspaceError(c, workspace.ErrNotFound)
-		return
-	}
-	if strings.TrimSpace(row.SpaceID) == "" {
-		respondGroupWorkspaceError(c, workspace.ErrSpaceRequired)
-		return
-	}
-	if err := validateGroupWorkspacePair(row); err != nil {
-		respondGroupWorkspaceError(c, err)
-		return
-	}
-
-	workspaceID := workspaceIDFromPointer(row.WorkspaceID)
-	if workspaceID == "" {
-		active, err := g.db.ExistMemberActive(c.GetLoginUID(), groupNo)
-		if err != nil {
-			g.respondGroupWorkspaceDependency(c, "check native group membership", err)
-			return
-		}
-		if !active {
-			respondGroupWorkspaceError(c, workspace.ErrForbidden)
-			return
-		}
-		c.Response(groupWorkspaceFromRow(row))
-		return
-	}
-
-	// A native group member is not enough to read a bound relation. Service.Get
-	// revalidates active Workspace membership and organization status, so a
-	// Workspace-only member can read this restricted metadata while a
-	// group-only member cannot.
-	ws, err := workspace.NewService(g.ctx).Get(workspace.RequestScope(c), workspaceID)
+	result, err := g.groupService.ReadGroupWorkspace(
+		c.Request.Context(), groupNo, workspace.RequestScope(c),
+	)
 	if err != nil {
 		respondGroupWorkspaceError(c, err)
 		return
 	}
-	if ws == nil || ws.SpaceID != row.SpaceID {
-		respondGroupWorkspaceError(c, errGroupWorkspaceConflict)
-		return
-	}
-	c.Response(groupWorkspaceFromRow(row))
+	c.Response(result)
 }
 
 type groupWorkspacePutRequest struct {
@@ -150,7 +112,6 @@ func (g *Group) groupWorkspacePut(c *wkhttp.Context) {
 		scope.UID,
 		groupWorkspaceAccessIDs(initialSource, targetID),
 		"",
-		false,
 	)
 	if err != nil {
 		respondGroupWorkspaceError(c, err)
@@ -282,7 +243,6 @@ func (g *Group) groupWorkspaceDelete(c *wkhttp.Context) {
 			scope.UID,
 			[]string{initialSource},
 			scope.ExpectedSpaceID,
-			false,
 		)
 		if err != nil {
 			respondGroupWorkspaceError(c, err)
@@ -373,30 +333,14 @@ func (g *Group) groupWorkspaceList(c *wkhttp.Context) {
 	}
 	page := workspace.ParsePage(c)
 
-	ws, err := workspace.NewService(g.ctx).Get(workspace.RequestScope(c), workspaceID)
+	result, err := g.groupService.ListWorkspaceGroups(
+		c.Request.Context(), workspaceID, keyword, page, workspace.RequestScope(c),
+	)
 	if err != nil {
 		respondGroupWorkspaceError(c, err)
 		return
 	}
-	if ws == nil || strings.TrimSpace(ws.SpaceID) == "" {
-		respondGroupWorkspaceError(c, workspace.ErrSpaceRequired)
-		return
-	}
-
-	count, err := g.db.queryWorkspaceGroupCount(ws.SpaceID, workspaceID, keyword)
-	if err != nil {
-		g.respondGroupWorkspaceDependency(c, "count Workspace groups", err)
-		return
-	}
-	list, err := g.db.queryWorkspaceGroups(ws.SpaceID, workspaceID, keyword, page)
-	if err != nil {
-		g.respondGroupWorkspaceDependency(c, "query Workspace groups", err)
-		return
-	}
-	if list == nil {
-		list = make([]GroupWorkspace, 0)
-	}
-	c.Response(workspace.Pagination[GroupWorkspace]{Count: count, List: list})
+	c.Response(result)
 }
 
 func respondGroupWorkspaceError(c *wkhttp.Context, err error) {

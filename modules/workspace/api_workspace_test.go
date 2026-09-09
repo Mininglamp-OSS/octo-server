@@ -262,7 +262,7 @@ func TestWorkspaceHTTPMembersPaginationAndExitedMemberProjection(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, statusJunkSemantic)
 }
 
-func TestWorkspaceHTTPOwnerTransferLeaveArchiveAndOrganizationRevocation(t *testing.T) {
+func TestWorkspaceHTTPOwnerTransferLeaveAndOrganizationRevocation(t *testing.T) {
 	srv, ctx := setupWorkspaceTest(t)
 	for _, user := range []struct {
 		uid  string
@@ -300,19 +300,24 @@ func TestWorkspaceHTTPOwnerTransferLeaveArchiveAndOrganizationRevocation(t *test
 	var ownerView workspacemod.Workspace
 	require.NoError(t, json.Unmarshal(newOwnerView.Body.Bytes(), &ownerView))
 	require.Equal(t, workspacemod.WorkspaceRoleOwner, ownerView.WorkspaceRole)
+}
 
-	archive := doWorkspaceJSON(t, srv.GetRoute(), http.MethodDelete,
-		"/v1/workspaces/"+ws.WorkspaceID, newOwnerToken, nil)
-	require.Equal(t, http.StatusOK, archive.Code, archive.Body.String())
-	var okBody map[string]any
-	require.NoError(t, json.Unmarshal(archive.Body.Bytes(), &okBody))
-	require.EqualValues(t, http.StatusOK, okBody["status"])
-	archived := doWorkspaceJSON(t, srv.GetRoute(), http.MethodGet,
-		"/v1/workspaces/"+ws.WorkspaceID, newOwnerToken, nil)
-	require.Equal(t, http.StatusBadRequest, archived.Code, archived.Body.String())
-	archivedCode, archivedStatus := decodeWorkspaceError(t, archived)
-	require.Equal(t, "err.server.workspace.not_found", archivedCode)
-	require.Equal(t, http.StatusNotFound, archivedStatus)
+func TestWorkspaceHTTPDeleteWorkspaceIsUnregisteredAndPreservesStatus(t *testing.T) {
+	srv, ctx := setupWorkspaceTest(t)
+	seedWorkspaceUser(t, ctx, "10000", "Workspace owner")
+	seedWorkspaceSpace(t, ctx, "http-delete-space", "10000")
+	ownerToken := workspaceToken(t, ctx, "10000")
+	ws := createWorkspace(t, ctx, ownerToken, "http-delete-space", "Delete is unsupported")
+
+	deleted := doWorkspaceJSON(t, srv.GetRoute(), http.MethodDelete,
+		"/v1/workspaces/"+ws.WorkspaceID, ownerToken, nil)
+	require.Equal(t, http.StatusNotFound, deleted.Code, deleted.Body.String())
+
+	var status int
+	_, err := ctx.DB().Select("status").From("octo_workspace").
+		Where("workspace_id=?", ws.WorkspaceID).Load(&status)
+	require.NoError(t, err)
+	require.Equal(t, workspacemod.WorkspaceStatusActive, status)
 }
 
 func TestWorkspaceHTTPRevokedMemberAndBannedSpaceFailClosed(t *testing.T) {
