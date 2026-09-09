@@ -62,44 +62,43 @@ func (p *Project) registerSpaceMemberRemovalCleanup() {
 	// invalidation signal does not, because the signal is what a peer uses to
 	// decide a cached authorization is stale, and an async signal with a terminal
 	// abandoned state is not a bound at all. See bumpMemberEpochForSpaceMemberTx.
-	spacemod.RegisterMemberRemovalTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSpaceMemberRemoval)
-	// And the same signal for the OPPOSITE transition. Reopening a Space seat flips
-	// the membership answer exactly as closing one does — the surviving project seat
-	// becomes reachable again through the Space conjunction with no project-side
-	// write, so nothing else would move the epoch. Without this, a consumer's cached
-	// DENIAL keeps agreeing with the epoch and a valid returning member stays denied
-	// until some unrelated write in that project happens to bump. See
-	// spacemod.MemberReactivationTxStep.
-	spacemod.RegisterMemberReactivationTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSpaceMemberRejoin)
+	//
+	// ONE registration for BOTH directions. It used to be two — a removal step and a
+	// reactivation step registered separately, with byte-identical implementations —
+	// and that symmetry was the shape of two P1s on this branch: round 8 had the
+	// removal side wired and the rejoin side not, round 9 had two of the four rejoin
+	// doors wired. Neither was a missed scenario; both were a hand-maintained pair
+	// with one half missing. With one registry there is no other half to miss.
+	spacemod.RegisterSeatTransitionTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSeatTransition)
 }
 
-// bumpEpochsOnSpaceMemberRejoin moves member_epoch for every project the returning
-// member still holds a seat in, inside the Space-REACTIVATION transaction.
+// bumpEpochsOnSeatTransition moves member_epoch for every project the member still
+// holds a seat in, inside the Space transaction that flipped their seat.
 //
-// The same statement as the removal direction, and deliberately so: both transitions
-// change which projects answer differently for this uid, and the set of affected
-// projects is identical — the seats that survived the removal window. Sharing
-// bumpMemberEpochForSpaceMemberTx keeps the lock order, the chunking and the
-// non-locking-enumeration argument in one place rather than in two that can drift.
-// Takes a spacemod.SeatRef rather than two strings: the uid inside it is the spelling
-// `space_member` STORES, which is the only thing that can be matched against
-// `octo_project_member` — that table is pinned utf8mb4_general_ci while space_member is
-// utf8mb4_0900_ai_ci in production, and the latter's equivalence classes are strictly
-// coarser for compatibility characters. See modules/space/seatref.go.
-func (p *Project) bumpEpochsOnSpaceMemberRejoin(tx *dbr.Tx, seat spacemod.SeatRef) error {
-	return p.db.bumpMemberEpochForSpaceMemberTx(tx, seat.SpaceID(), seat.UID())
-}
-
-// bumpEpochsOnSpaceMemberRemoval moves member_epoch for every project the removed
-// member still holds a seat in, inside the Space-removal transaction.
+// # Both directions, one statement, and deliberately so
 //
-// One statement, and its failure rolls the removal back — see
-// MemberRemovalTxStep for why that is the right direction: committing a removal
-// whose invalidation signal did not fire hands a peer an authorization it cannot
-// detect as stale, and the async compensation has no upper bound once its job is
-// abandoned.
-func (p *Project) bumpEpochsOnSpaceMemberRemoval(tx *dbr.Tx, seat spacemod.SeatRef) error {
-	return p.db.bumpMemberEpochForSpaceMemberTx(tx, seat.SpaceID(), seat.UID())
+// Closing a seat and reopening one change the SAME fact — whether this uid is a
+// member of those projects — and a consumer caches the DECISION, not only positive
+// grants. A stuck cached denial locks a valid returning member out exactly as long as
+// a stuck cached grant leaks access, and in a quiet project neither window has an
+// upper bound. So the set of affected projects is the same set, the statement is the
+// same statement, and `t.Opened` is not read: there is nothing this step should do
+// differently in one direction.
+//
+// It takes spacemod.SeatTransition rather than two strings because the uid inside it
+// is the spelling `space_member` STORES. That is the only thing that can be matched
+// against `octo_project_member` — that table is pinned utf8mb4_general_ci while
+// space_member is utf8mb4_0900_ai_ci in production, and the latter's equivalence
+// classes are strictly coarser for compatibility characters. See
+// modules/space/seatref.go.
+//
+// One statement, and its failure rolls the whole transition back — see
+// spacemod.SeatTransitionTxStep for why that is the right direction: committing a
+// seat change whose invalidation signal did not fire hands a peer an authorization
+// state it cannot detect as stale, and the async compensation has no upper bound
+// once its job is abandoned.
+func (p *Project) bumpEpochsOnSeatTransition(tx *dbr.Tx, t spacemod.SeatTransition) error {
+	return p.db.bumpMemberEpochForSpaceMemberTx(tx, t.Seat.SpaceID(), t.Seat.UID())
 }
 
 // allMemberGroupOwnerFinalizerName is the finalizer's name, which also prefixes the

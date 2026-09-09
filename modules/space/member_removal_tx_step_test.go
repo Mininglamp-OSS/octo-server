@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Wiring tests for MemberRemovalTxStep.
+// Wiring tests for SeatTransitionTxStep.
 //
 // The step exists because the ASYNC cleanup registry cannot carry a fact that has
 // to be true at commit. A downstream module (modules/project) uses it to move the
@@ -49,11 +49,11 @@ func memberStatus(t *testing.T, spaceID, uid string) (int, bool) {
 func restoreTxSteps(t *testing.T, name string) {
 	t.Helper()
 	t.Cleanup(func() {
-		RegisterMemberRemovalTxStep(name, func(*dbr.Tx, SeatRef) error { return nil })
+		RegisterSeatTransitionTxStep(name, func(*dbr.Tx, SeatTransition) error { return nil })
 	})
 }
 
-func TestMemberRemovalTxStepRunsInsideTheTransaction(t *testing.T) {
+func TestSeatTransitionTxStepRunsInsideTheTransaction(t *testing.T) {
 	_, _, err := setup(t)
 	require.NoError(t, err)
 
@@ -66,8 +66,8 @@ func TestMemberRemovalTxStepRunsInsideTheTransaction(t *testing.T) {
 		gotUID    string
 		sawMember bool
 	)
-	RegisterMemberRemovalTxStep(name, func(tx *dbr.Tx, seat SeatRef) error {
-		spaceID, uid := seat.SpaceID(), seat.UID()
+	RegisterSeatTransitionTxStep(name, func(tx *dbr.Tx, t SeatTransition) error {
+		spaceID, uid := t.Seat.SpaceID(), t.Seat.UID()
 		calls++
 		gotSpace, gotUID = spaceID, uid
 		// Read through the SAME transaction: this is what proves the step is
@@ -97,7 +97,7 @@ func TestMemberRemovalTxStepRunsInsideTheTransaction(t *testing.T) {
 			"not running inside the transaction and nothing it writes is atomic with the removal")
 }
 
-// TestMemberRemovalTxStepFailureRollsBackTheRemoval is the property that makes
+// TestSeatTransitionTxStepFailureRollsBackTheRemoval is the property that makes
 // the step meaningful.
 //
 // If a step's failure were swallowed, the removal would commit without the fact
@@ -105,7 +105,7 @@ func TestMemberRemovalTxStepRunsInsideTheTransaction(t *testing.T) {
 // peer keeps an authorization it cannot detect as stale, with no bound, because
 // the async compensation has a terminal give-up state. Failing the removal is the
 // deliberate direction: the caller retries.
-func TestMemberRemovalTxStepFailureRollsBackTheRemoval(t *testing.T) {
+func TestSeatTransitionTxStepFailureRollsBackTheRemoval(t *testing.T) {
 	_, _, err := setup(t)
 	require.NoError(t, err)
 
@@ -113,7 +113,7 @@ func TestMemberRemovalTxStepFailureRollsBackTheRemoval(t *testing.T) {
 	restoreTxSteps(t, name)
 
 	boom := errors.New("tx step refused")
-	RegisterMemberRemovalTxStep(name, func(*dbr.Tx, SeatRef) error { return boom })
+	RegisterSeatTransitionTxStep(name, func(*dbr.Tx, SeatTransition) error { return boom })
 
 	seedRemovalFixture(t, "tx-step-space-2", "u-owner-tx2", "u-target-tx2")
 	removed, err := removeMemberLocked(testCtx.DB(), "tx-step-space-2", "u-target-tx2", 2, "u-owner-tx2", MemberRemoveReasonForceRemoved)

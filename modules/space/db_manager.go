@@ -405,7 +405,7 @@ func (d *managerDB) updateSpaceProfile(
 // upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）。
 //
 // 「重新激活」这一半会让**移除窗口里存活的项目席位重新可达**，而中间没有任何项目侧
-// 写入，所以必须在同一事务内发失效信号（见 MemberReactivationTxStep）。此前这里被
+// 写入，所以必须在同一事务内发失效信号（见 SeatTransitionTxStep）。此前这里被
 // 当成「只会插入不存在的席位」，而函数名与注释本身就写着 upsert / 重新激活 —— 唯一索引
 // spacemember_spaceid_uid 让 ON DUPLICATE 分支对任何已移除行都会命中。
 //
@@ -503,40 +503,22 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 		// 有把一个已关闭的席位打开」。数据库用它自己的 collation 匹配，Go 侧不再有可漂移的
 		// 比较——同 removeMembersForceOnce 的做法（它也是靠 status 谓词 + RowsAffected 判断
 		// 「这行真的改了吗」，而不是拿调用方拼写查 map）。
-		res, err := tx.UpdateBySql(
-			"UPDATE space_member SET status=1, updated_at=NOW() "+
-				"WHERE space_id=? AND uid=? AND status=0",
-			spaceId, uid,
-		).Exec()
+		// 角色不变（role=nil）：管理端重复添加一个曾是管理员的人，不该把他悄悄降级。
+		reactivated, err := openSeatTx(tx, spaceId, uid, nil)
 		if err != nil {
 			return err
 		}
-		reactivated, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-
-		// 剩下的两种情形交给 upsert：行不存在（插入）、已经是活跃成员（空写）。
-		// 重新激活的那一行上面已经改过，这条对它是空写，两者都不该动 epoch。
-		if reactivated == 0 {
-			if _, err := tx.InsertBySql(
-				"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
-					"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
-				spaceId, uid,
-			).Exec(); err != nil {
-				return err
-			}
+		if reactivated {
 			continue
 		}
 
-		// 判据来自写入（上面那条带谓词的 UPDATE），**标识符也必须来自数据库**。
-		// 上一轮到此为止：布尔值搬进了库，标识符还是调用方那串字节，而它接着要去匹配
-		// collation 更严的 octo_project_member。见 seatref.go。
-		seat, err := ResolveSeatTx(tx, spaceId, uid)
-		if err != nil {
-			return err
-		}
-		if err := runMemberReactivationTxSteps(tx, seat); err != nil {
+		// 剩下的两种情形交给 upsert：行不存在（插入）、已经是活跃成员（空写）。
+		// 两者都不该动 epoch，所以都不经过 openSeatTx。
+		if _, err := tx.InsertBySql(
+			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
+				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
+			spaceId, uid,
+		).Exec(); err != nil {
 			return err
 		}
 	}
@@ -556,7 +538,7 @@ var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer owner
 // `AND status=1` 守卫关掉：本事务 commit 后该 uid 的 status=0，后续 transfer 的 UPDATE 影响 0 行。
 // 返回本次真正被移除的 uid，供调用方精确地做失效缓存与事件广播。
 // removeMembersForce 是 removeMembersForceOnce 加上有界的 1213/1205 重试，
-// 见 pkg/db.RetryOnLockConflict。事务型步骤（runMemberRemovalTxSteps）的失败会
+// 见 pkg/db.RetryOnLockConflict。事务型步骤（runSeatTransitionTxSteps）的失败会
 // 回滚整次移除，而死锁是**瞬时**失败：不重试就等于把「这次踢人失败」的 500 甩给
 // 管理端，而它无法区分「重试就好」和「永久失败」。
 //
@@ -613,40 +595,17 @@ func (d *managerDB) removeMembersForceOnce(spaceId string, uids []string, operat
 		}
 	}
 
-	now := time.Now()
 	removed := make([]string, 0, len(uids))
 	for _, uid := range uids {
-		result, err := tx.Update("space_member").
-			Set("status", 0).
-			Set("updated_at", now).
-			Where("space_id=? AND uid=? AND status=1", spaceId, uid).Exec()
+		// 只给真正被改动的成员行入队——closeSeatTx 的 status=1 谓词保证了这一点。
+		// 无谓词地入队会产出永远无事可做的工单，还会让一次误传的 uid 触发一遍别人的
+		// 会话面清理。
+		closed, err := closeSeatTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved)
 		if err != nil {
 			return nil, err
 		}
-		// 只给真正被改动的成员行入队。此前这里没有 status=1 谓词，对已移除 / 不存在
-		// 的 uid 也会"更新"一次；无谓词地入队会产出永远无事可做的工单，还会让
-		// 一次误传的 uid 触发一遍别人的会话面清理。
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if affected == 0 {
+		if !closed {
 			continue
-		}
-		// 循环变量 uid 是**调用方**的拼写，而这一行是在 space_member 自己的 collation
-		// 下被匹配到的。工单与事务步骤都要拿它去查更严的表，所以先换成库里存的那串。
-		seat, err := ResolveSeatTx(tx, spaceId, uid)
-		if err != nil {
-			return nil, err
-		}
-		if err := enqueueMemberRemovalCleanupTx(tx, seat, operatorUID, MemberRemoveReasonForceRemoved); err != nil {
-			return nil, err
-		}
-		// Synchronous steps, beside the outbox enqueue and for the opposite reason:
-		// the enqueue makes the cleanup EVENTUAL, these make a fact TRUE AT COMMIT.
-		// A failure here rolls the removal back on purpose — see MemberRemovalTxStep.
-		if err := runMemberRemovalTxSteps(tx, seat); err != nil {
-			return nil, err
 		}
 		removed = append(removed, uid)
 	}
@@ -764,23 +723,16 @@ func removeMemberLockedOnce(sess *dbr.Session, spaceId, uid string, rejectRoleAt
 	if roles[0] >= rejectRoleAtOrAbove {
 		return false, ErrRemoveHierarchy
 	}
-	if _, err = tx.Update("space_member").
-		Set("status", 0).Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
-		return false, err
-	}
-	// 标识符取自库里那一行，理由同上：本事务已在上面对它取过 FOR UPDATE。
-	seat, err := ResolveSeatTx(tx, spaceId, uid)
+	// closeSeatTx 的 UPDATE 带 `AND status=1` 谓词，而此前这里没有。语义不变：上面那条
+	// `SELECT role ... AND status=1 FOR UPDATE` 已经确认这行是活跃的并对它持 X 锁，所以
+	// 谓词必然命中。改动的只是「如果那个不变量被破坏会怎样」——现在报错回滚，而不是静默
+	// 地当作移除成功了。
+	closed, err := closeSeatTx(tx, spaceId, uid, operatorUID, reason)
 	if err != nil {
 		return false, err
 	}
-	if err = enqueueMemberRemovalCleanupTx(tx, seat, operatorUID, reason); err != nil {
-		return false, err
-	}
-	// See the sibling call site: synchronous steps run beside the outbox enqueue,
-	// and their failure rolls the removal back.
-	if err = runMemberRemovalTxSteps(tx, seat); err != nil {
-		return false, err
+	if !closed {
+		return false, errSeatVanishedUnderLock
 	}
 	if err = tx.Commit(); err != nil {
 		return false, err

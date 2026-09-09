@@ -180,17 +180,19 @@ func assertProbeReproducesTheDrift(t *testing.T, sess *dbr.Session, spaceID, sto
 func recordSeatIdentities(t *testing.T, removals, rejoins *[]string) {
 	t.Helper()
 	const name = "seat_identity_probe"
-	RegisterMemberRemovalTxStep(name, func(_ *dbr.Tx, seat SeatRef) error {
-		*removals = append(*removals, seat.UID())
-		return nil
-	})
-	RegisterMemberReactivationTxStep(name, func(_ *dbr.Tx, seat SeatRef) error {
-		*rejoins = append(*rejoins, seat.UID())
+	// ONE registry, and the direction arrives as data. That is also what this
+	// recording step pins: a door that flips a seat must reach the single step with
+	// the right Opened value — there is no second registry it could be missing from.
+	RegisterSeatTransitionTxStep(name, func(_ *dbr.Tx, tr SeatTransition) error {
+		if tr.Opened {
+			*rejoins = append(*rejoins, tr.Seat.UID())
+		} else {
+			*removals = append(*removals, tr.Seat.UID())
+		}
 		return nil
 	})
 	t.Cleanup(func() {
-		RegisterMemberRemovalTxStep(name, func(*dbr.Tx, SeatRef) error { return nil })
-		RegisterMemberReactivationTxStep(name, func(*dbr.Tx, SeatRef) error { return nil })
+		RegisterSeatTransitionTxStep(name, func(*dbr.Tx, SeatTransition) error { return nil })
 	})
 }
 

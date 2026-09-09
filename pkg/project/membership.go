@@ -490,16 +490,8 @@ func FoldID(id string) string {
 // Folding the SET rather than the needle, because the set is the side with the
 // database's spelling and there may be many of them.
 func FoldedHas(set map[string]bool, want string) bool {
-	if set[want] {
-		return true
-	}
-	folded := FoldID(want)
-	for key, ok := range set {
-		if ok && FoldID(key) == folded {
-			return true
-		}
-	}
-	return false
+	_, ok := FoldedLookup(set, want)
+	return ok
 }
 
 // FoldedLookup is FoldedHas that also returns the DATABASE's spelling.

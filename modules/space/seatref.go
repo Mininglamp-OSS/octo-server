@@ -102,18 +102,3 @@ func ResolveSeatTx(tx *dbr.Tx, spaceID, callerUID string) (SeatRef, error) {
 	// index enforces its own. Taking the first is therefore not a choice.
 	return SeatRef{spaceID: spaceID, uid: stored[0]}, nil
 }
-
-// NewSeatRefFromStored builds a ref from bytes that are ALREADY known to be a
-// `space_member` spelling, without a round trip.
-//
-// The only sanctioned source is a value read out of `space_member` itself — a
-// `SELECT uid FROM space_member ...` in the same transaction, or a column the disband
-// scan already loaded. It exists because those paths would otherwise re-read a row
-// they just read, in a loop, inside a range lock.
-//
-// It is NOT a general escape hatch: passing a caller-supplied string here reintroduces
-// the whole defect class silently, which is why the one guard test over this file
-// pins its call sites.
-func NewSeatRefFromStored(spaceID, storedUID string) SeatRef {
-	return SeatRef{spaceID: spaceID, uid: storedUID}
-}

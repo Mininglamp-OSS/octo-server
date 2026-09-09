@@ -128,3 +128,25 @@ func UpsertMembersForTest(ctx *config.Context, spaceID string, uids []string) er
 	}
 	return newManagerDB(ctx.DB()).upsertMembers(spaceID, uids)
 }
+
+// SeatRefForTest builds a SeatRef from bytes a test already knows, without a database
+// round trip.
+//
+// It lives HERE, behind the same testing.Testing() fence as the other seams, because
+// it is the one way to obtain a SeatRef without going through ResolveSeatTx — and
+// ResolveSeatTx reading the canonical spelling back out of `space_member` is the whole
+// point of the type. An unfenced constructor taking two strings is a conversion from
+// `string` in all but name, and this branch spent four rounds establishing that no such
+// conversion should exist.
+//
+// It was previously exported as NewSeatRefFromStored with a doc comment asking callers
+// to only pass database-sourced bytes. Nothing in production called it — only tests —
+// so the honest form is a test seam rather than a request. That is the same reasoning
+// this file already applies to the removal entry points: "nothing calls it" is a
+// property of the current tree, not a boundary.
+func SeatRefForTest(spaceID, storedUID string) (SeatRef, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return SeatRef{}, err
+	}
+	return SeatRef{spaceID: spaceID, uid: storedUID}, nil
+}

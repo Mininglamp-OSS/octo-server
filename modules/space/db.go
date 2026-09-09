@@ -432,7 +432,7 @@ func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, op
 // reactivateMember 重新打开一个已被移除的成员席位。
 //
 // 现在跑在事务里，且事务内执行已注册的 reactivation 步骤——理由见
-// MemberReactivationTxStep：重新打开席位和关闭席位一样会翻转下游发布出去的成员判定，
+// SeatTransitionTxStep：重新打开席位和关闭席位一样会翻转下游发布出去的成员判定，
 // 所以失效信号必须在同一次提交里发出，否则消费方缓存的那条**拒绝**会一直和自己的
 // epoch 对得上，一个合法回归的成员被无上界地拒绝。
 //
@@ -450,27 +450,9 @@ func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
 		}
 		defer tx.RollbackUnlessCommitted()
 
-		result, err := tx.Update("space_member").
-			Set("status", 1).Set("role", role).
-			Set("updated_at", time.Now()).
-			Where("space_id=? and uid=? and status=0", spaceId, uid).Exec()
-		if err != nil {
-			return err
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if affected == 0 {
-			return tx.Commit()
-		}
-		// 标识符也来自数据库：见 seatref.go。上面那条 UPDATE 是在 space_member 自己的
-		// collation 下匹配的，而步骤要拿这个标识符去查 collation 更严的 octo_project_member。
-		seat, err := ResolveSeatTx(tx, spaceId, uid)
-		if err != nil {
-			return err
-		}
-		if err = runMemberReactivationTxSteps(tx, seat); err != nil {
+		// 翻转、解析规范拼写、发失效信号，都在 openSeatTx 里（seat_transition.go）。
+		// 席位本就活跃或不存在时它返回 false，那两种情况都不该动 epoch。
+		if _, err := openSeatTx(tx, spaceId, uid, &role); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -899,27 +881,10 @@ func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, max
 	}
 
 	// Reactivate member
-	result, err := tx.Update("space_member").
-		Set("status", 1).Set("role", 0).
-		Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=? AND status=0", spaceId, uid).Exec()
-	if err != nil {
+	// 同 reactivateMember，走同一个入口；这条路径把角色重置为普通成员。
+	roleCommon := 0
+	if _, err = openSeatTx(tx, spaceId, uid, &roleCommon); err != nil {
 		return err
-	}
-	// 同 reactivateMember：只在真的改动了行时发失效信号，空写不动 epoch。
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected > 0 {
-		// 同 reactivateMember：标识符取自库里那一行，不用调用方拼写。
-		seat, rerr := ResolveSeatTx(tx, spaceId, uid)
-		if rerr != nil {
-			return rerr
-		}
-		if err = runMemberReactivationTxSteps(tx, seat); err != nil {
-			return err
-		}
 	}
 
 	return tx.Commit()
@@ -1154,7 +1119,7 @@ func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId stri
 	// 席位，而 UPDATE 把一个已关闭的席位重新打开——后者会让**移除窗口里存活的项目席位
 	// 重新可达**，而这中间没有任何项目侧写入，所以除了下面那步没有任何东西会移动
 	// member_epoch。漏掉它，消费方缓存的那条**拒绝**会一直和 epoch 对得上（见
-	// MemberReactivationTxStep）。
+	// SeatTransitionTxStep）。
 	//
 	// 本函数是**设计好的重新加入漏斗**，不是边缘路径：resetApprovedApplyForRejoin 存在
 	// 的目的就是把陈旧的已通过申请打回待审批，让被移除的人重新申请并从这里回来。
@@ -1166,42 +1131,27 @@ func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId stri
 	// 拿调用方拼写去查以数据库拼写为键的 map，在 0900_ai_ci 下漏判、席位重开而信号不发。
 	// 这里改成带 `status=0` 谓词的 UPDATE + RowsAffected，让数据库用自己的 collation 回答
 	// 「这次到底有没有把一个已关闭的席位打开」——判据不再有可漂移的中间量。
-	res, err := tx.UpdateBySql(
-		"UPDATE space_member SET status=1, role=0, updated_at=? "+
-			"WHERE space_id=? AND uid=? AND status=0",
-		time.Now(), spaceId, row.UID,
-	).Exec()
+	//
+	// row.UID 是 space_join_apply 的拼写——**第三张表**，又一次可能与 space_member 存的
+	// 字节不同。openSeatTx 内部会把标识符换成 space_member 自己的那串再交给步骤。
+	//
+	// 锁上下文与另外三条路径一致：本事务已在第 3 步对这一行取过 FOR UPDATE，所以步骤里
+	// 那条枚举读的视图晚于该 X 锁。
+	roleCommon := 0
+	reopened, err := openSeatTx(tx, spaceId, row.UID, &roleCommon)
 	if err != nil {
 		return approveFailed, "", err
 	}
-	reopened, err := res.RowsAffected()
-	if err != nil {
-		return approveFailed, "", err
-	}
-	if reopened == 0 {
+	if !reopened {
 		// 不是重新激活：要么这行根本不存在（插入），要么它已经是活跃成员——而后者在第 3 步
 		// 就以 approveAlreadyMember 提前返回了，所以走到这里只剩「不存在」。
+		//
+		// 新插入的席位不发失效信号：它此前不存在，所以不可能有存活的项目席位被它重新变得
+		// 可达（新成员进项目要走项目侧写入，那边自己会 bump）。
 		if _, err = tx.InsertBySql(
 			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
 			spaceId, row.UID,
 		).Exec(); err != nil {
-			return approveFailed, "", err
-		}
-	}
-	// 只有真的重新打开了席位才发失效信号——判据是上面那条 UPDATE 的 RowsAffected，
-	// 不是任何 Go 侧推断。新插入的席位不发：它此前不存在，所以不可能有存活的项目席位被
-	// 它重新变得可达（新成员进项目要走项目侧写入，那边自己会 bump）。
-	//
-	// 锁上下文与另外三条路径一致：本事务已在第 3 步对这一行取过 FOR UPDATE，所以步骤里
-	// 那条枚举读的视图晚于该 X 锁。
-	if reopened > 0 {
-		// row.UID 是 space_join_apply 的拼写——**第三张表**，又一次可能与 space_member
-		// 存的字节不同。所以这里同样把标识符换成 space_member 自己的那串。
-		seat, rerr := ResolveSeatTx(tx, spaceId, row.UID)
-		if rerr != nil {
-			return approveFailed, "", rerr
-		}
-		if err = runMemberReactivationTxSteps(tx, seat); err != nil {
 			return approveFailed, "", err
 		}
 	}

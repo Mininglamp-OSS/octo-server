@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -160,48 +159,23 @@ func closeOneSeatAndEnqueueTx(session *dbr.Session, spaceID, uid, operatorUID, r
 		return false, nil
 	}
 
-	result, err := tx.Update("space_member").
-		Set("status", 0).
-		Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=? AND status=1", spaceID, uid).Exec()
-	if err != nil {
-		return false, fmt.Errorf("space: close seat: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("space: read close seat result: %w", err)
-	}
-	if affected == 0 {
-		return false, nil
-	}
-
-	// 标识符取自库里那一行：本事务已在上面对它取过 FOR UPDATE，而 uid 是调用方
-	// （BotFather 删 Bot）传来的拼写。见 seatref.go。
-	seat, err := ResolveSeatTx(tx, spaceID, uid)
-	if err != nil {
-		return false, err
-	}
-	if err := enqueueMemberRemovalCleanupTx(tx, seat, operatorUID, reason); err != nil {
-		return false, err
-	}
-	// 事务内步骤，和 outbox 入队并列、但理由相反：入队让清理**最终**发生，这一步让一个
-	// 事实**在提交那一刻**为真。
+	// 关席位 + 写工单 + 发失效信号，全在 closeSeatTx 里（seat_transition.go）。
 	//
-	// 少了它，这条路径就只修好了一半。异步清理会关掉项目席位，但 `epochs` 在那之前一直
-	// 答删除前的旧值，而 `_verify` 已经翻成 member:false（Space 合取看得见这次关闭）——
-	// 于是对端重读 epoch 拿到同一个数，**过期检查通过，被撤销的授权继续有效**。正常路径上
-	// 是一次退避的时长，工单 abandoned 之后是永久。
-	//
-	// 这与 removeMemberLockedOnce / removeMembersForceOnce 是同一个注册表、同一条语句
-	// （modules/project 的 bumpMemberEpochForSpaceMemberTx），所以三条关席位的路径对
-	// 失效信号的处理是一致的——而「一致」在这里不是整洁，是正确性：任何一条漏掉，那一类
-	// uid 的 epoch 一致性就不再是充分条件。
+	// 三条关席位路径走同一个入口，而「一致」在这里不是整洁是正确性：任何一条跳过失效
+	// 信号，那一类 uid 的 epoch 一致性就不再是充分条件。本函数当初落地时就恰好漏了它
+	// ——工单入了队，epoch 没动，于是对端缓存的授权比 Bot 删除活得更久，工单被
+	// abandoned 之后就是永久。收进一个入口是为了让那次遗漏不再是能写出来的状态。
 	//
 	// 失败会让这个 Space 的关席位回滚。调用方按 Space 逐个提交，所以已经成功的那些保留，
 	// 失败的这个由 err 报告——与本函数原有的部分成功语义一致。
-	if err := runMemberRemovalTxSteps(tx, seat); err != nil {
+	closed, err := closeSeatTx(tx, spaceID, uid, operatorUID, reason)
+	if err != nil {
 		return false, err
 	}
+	if !closed {
+		return false, nil
+	}
+
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("space: commit close seat: %w", err)
 	}

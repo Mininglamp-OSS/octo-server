@@ -383,15 +383,16 @@ func TestSpaceRemovalMovesTheEpochAtCommit(t *testing.T) {
 	// modules/space's handler, because the two halves are tested where they live:
 	// that modules/space actually RUNS a registered step inside the removal
 	// transaction (and rolls back when it fails) is pinned by
-	// TestMemberRemovalTxStepRunsInsideTheTransaction over there.
+	// TestSeatTransitionTxStepRunsInsideTheTransaction over there.
 	tx, err := testCtx.DB().Begin()
 	require.NoError(t, err)
 	_, err = tx.UpdateBySql(
 		"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?",
 		spaceA, "epochRemTarget").Exec()
 	require.NoError(t, err)
-	require.NoError(t, p.bumpEpochsOnSpaceMemberRemoval(
-		tx, spacemod.NewSeatRefFromStored(spaceA, "epochRemTarget")))
+	seatRef, err := spacemod.SeatRefForTest(spaceA, "epochRemTarget")
+	require.NoError(t, err)
+	require.NoError(t, p.bumpEpochsOnSeatTransition(tx, spacemod.SeatTransition{Seat: seatRef}))
 	require.NoError(t, tx.Commit())
 
 	seat, err := testDB.queryMember(inA.ProjectID, "epochRemTarget")
@@ -431,12 +432,12 @@ func TestSpaceMemberRemovalRegistersBothHalves(t *testing.T) {
 		t.Error("the ASYNC cleanup step must stay registered: nothing else closes the project " +
 			"seats of a removed Space member")
 	}
-	if !strings.Contains(body, "RegisterMemberRemovalTxStep(") {
+	if !strings.Contains(body, "RegisterSeatTransitionTxStep(") {
 		t.Fatal("the SYNCHRONOUS tx step must be registered, or member_epoch never moves at " +
 			"Space-removal commit and a peer keeps a revoked grant riding epoch agreement — " +
 			"for minutes on the normal path, forever once the cleanup job is abandoned")
 	}
-	if !strings.Contains(body, "bumpEpochsOnSpaceMemberRemoval") {
+	if !strings.Contains(body, "bumpEpochsOnSeatTransition") {
 		t.Error("the tx step must be the epoch bump; registering something else here would " +
 			"satisfy the check above while leaving the signal unmoved")
 	}

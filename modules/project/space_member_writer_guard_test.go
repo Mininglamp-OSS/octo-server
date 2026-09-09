@@ -129,44 +129,62 @@ var spaceMemberWriterBaseline = map[string]struct {
 	writes int
 	why    string
 }{
+	"modules/space/seat_transition.go": {
+		writes: 2,
+		why: "THE FUNNEL, and the reason the other two modules/space entries shrank. Both " +
+			"writes are the per-member status transition — openSeatTx (0 -> 1) and " +
+			"closeSeatTx (1 -> 0) — and each one resolves the canonical uid out of " +
+			"space_member and runs the registered tx steps before returning. Seven paths " +
+			"used to hand-write that sequence; six of the twelve P1s on this branch were " +
+			"one of those seven missing a step of it. A NEW ENTRY APPEARING IN THIS " +
+			"BASELINE IS THE SIGNAL TO CHECK: a per-member status write outside this file " +
+			"is a door that bypassed the funnel. TestSeatTransitionStepsHaveOneCaller pins " +
+			"the other half — that nothing else calls runSeatTransitionTxSteps directly.",
+	},
 	"modules/space/db_manager.go": {
-		writes: 7,
-		why: "SANCTIONED. The two seat-CLOSING paths — removeMemberLockedOnce and " +
-			"removeMembersForceOnce — run runMemberRemovalTxSteps in the same " +
-			"transaction, which is where bumpMemberEpochForSpaceMemberTx is registered. " +
-			"upsertMembers REOPENS seats (its ON DUPLICATE branch fires on any existing " +
-			"removed row) and now runs runMemberReactivationTxSteps for exactly that " +
-			"case, gated on a locking read of the row's prior status. The previous " +
-			"version of this entry called it \"an INSERT of a seat that did not exist\", " +
-			"which its own function name and comment (upsert / add-REACTIVATE) " +
-			"contradicted — recorded because a baseline whose REASON is false is worse " +
-			"than a missing entry: the counts stay right and the guard reads as green. " +
-			"Of the rest: the admin disband is covered by the read-time Space fold, and " +
-			"the two role writes change space_member.role, which is not part of the " +
-			"project membership answer.",
+		writes: 4,
+		why: "SANCTIONED, and NONE of the four is a per-member status transition — those " +
+			"all moved to seat_transition.go. Enumerated from the SQL: (1) the admin " +
+			"DISBAND at :231, `SET status=0 WHERE space_id=? AND status=1`, whole-Space and " +
+			"needing no bump because an inactive Space folds all of its projects into the " +
+			"absent answer at read time (pkg/project.ProjectEpochsInSpace); (2) " +
+			"upsertMembersOnce's `INSERT ... ON DUPLICATE KEY UPDATE status=1` at :518 — " +
+			"reachable ONLY after openSeatTx has already returned false for this uid, so " +
+			"the row is either absent (a create, with no surviving project seat to reopen) " +
+			"or already active (a no-op write, which must not churn the epoch). That " +
+			"argument depends on the openSeatTx call above it and would stop holding if " +
+			"the ODKU were moved or the call removed; (3) and (4) the two ownership-" +
+			"transfer writes at :653 and :659, both `SET role=...`, and role is not part " +
+			"of the project membership answer.",
 	},
 	"modules/space/db.go": {
-		writes: 11,
-		why: "SANCTIONED. Single-member removal delegates to removeMemberLocked. ALL " +
-			"THREE reactivation writers in this file now run " +
-			"runMemberReactivationTxSteps in the same transaction: reactivateMember, " +
-			"atomicReactivateMemberIfNotFull, and approveJoinApplyAtomic's " +
-			"reactivation branch (memberRows > 0, i.e. an existing row whose status is " +
-			"0 — the status==1 case returns approveAlreadyMember earlier under " +
-			"FOR UPDATE). Reopening a seat makes a SURVIVING project seat reachable " +
-			"again through the Space conjunction with no project-side write, so nothing " +
-			"else would move the epoch and a consumer's cached denial would keep " +
-			"agreeing with it. The previous version of this entry said \"BOTH " +
-			"reactivation paths\" — there were four across this file and db_manager.go, " +
-			"and approveJoinApplyAtomic is the DESIGNED rejoin funnel " +
-			"(resetApprovedApplyForRejoin exists to route a removed member back through " +
-			"it). Enumerate reactivation writers from the SQL, not from the names: two " +
-			"of the four have no form of \"reactivate\" in their signature. The disband " +
-			"paths close every member at once and need no bump: an inactive Space folds " +
-			"all of its projects into the absent answer at read time " +
-			"(pkg/project.ProjectEpochsInSpace). The remaining writes are INSERTs of " +
-			"seats that did not exist (no surviving project seat to reopen) and role " +
-			"changes (role is not part of the project membership answer).",
+		writes: 8,
+		why: "SANCTIONED, and NONE of the eight is a per-member status transition — the " +
+			"three that were (reactivateMember, atomicReactivateMemberIfNotFull, " +
+			"approveJoinApplyAtomic's reactivation branch) now go through openSeatTx. " +
+			"Enumerated from the SQL: the DISBAND at :236 (`SET status=0 WHERE space_id=? " +
+			"AND status=1`, whole-Space, covered by the read-time fold); updateMemberRole " +
+			"at :470 (`SET role=`, not part of the answer); and five INSERTs of seats that " +
+			"did not exist — :173, insertMember/:310, insertMemberNoTx/:315, " +
+			"insertMemberIgnore/:787, :835, and approveJoinApplyAtomic's create branch " +
+			"at :1152. An INSERT needs no bump because there is no surviving project seat " +
+			"for it to make reachable again; a new member reaching a project goes through " +
+			"the project-side write, which bumps on its own. NOTE the count is 8 while " +
+			"that list names 8 statements including two INSERT helpers — enumerate from " +
+			"the SQL when this changes, not from the function names: two of the four " +
+			"reactivation writers this branch missed in round 9 had no form of " +
+			"\"reactivate\" in their signature.",
+	},
+	"modules/space/member_removal_all_spaces.go": {
+		writes: 0,
+		why: "NO WRITER, and this is an assertion rather than a stale entry. #855's " +
+			"\"close this uid's seats in EVERY Space\" path (the BotFather bot-deletion " +
+			"route) used to write the seat itself; it now calls closeSeatTx. When it " +
+			"landed it enqueued the outbox but NOT the tx steps, so a bot deletion moved " +
+			"no epoch and a peer's cached grant outlived it — unbounded once the async job " +
+			"is abandoned. Routing it through the funnel is what makes that omission " +
+			"unwritable rather than merely fixed. A write reappearing in this file fails " +
+			"the count check above; TestBotSeatCloseMovesTheEpoch pins the behaviour.",
 	},
 	"modules/botfather/api_user.go": {
 		writes: 1,
@@ -177,21 +195,6 @@ var spaceMemberWriterBaseline = map[string]struct {
 			"path now runs the removal tx steps, so the epoch moves — see the " +
 			"member_removal_all_spaces.go entry. The remaining write grants a bot a Space " +
 			"seat; admission needs no bump, see mint_obo.go.",
-	},
-	"modules/space/member_removal_all_spaces.go": {
-		writes: 1,
-		why: "SANCTIONED. PR #855's \"close this uid's seats in EVERY Space\" path, which " +
-			"replaced botfather's bare cross-Space UPDATE. closeSeatAllSpacesOne runs " +
-			"runMemberRemovalTxSteps in the same transaction beside the outbox enqueue. It " +
-			"enqueued the outbox but NOT the steps when it landed, so member_epoch did not " +
-			"move and a peer's cached grant outlived a bot deletion for as long as the " +
-			"async cleanup took — unbounded once that job is abandoned. Same registry and " +
-			"same statement as the other two closing paths, because consistency here is " +
-			"correctness rather than tidiness: any path that skips it makes epoch " +
-			"agreement insufficient for that class of uid. TestBotSeatCloseMovesTheEpoch " +
-			"pins it. Down from 3 to 1 when the census started stripping comments: the other " +
-			"two matches were the doc comment's quoted SQL and a commented example, i.e. " +
-			"prose.",
 	},
 	"modules/botfather/command.go": {
 		writes: 0,
