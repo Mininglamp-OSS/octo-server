@@ -203,7 +203,20 @@ func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacem
 	//   - 没有任何扫描报它。五条不受开关控制的扫描是 ownerless / epoch / I2 / I3 /
 	//     removing_stall，没有一条查 D6 的群主正确性。
 	//
-	// 也就是说，上面那个 counter 不是锦上添花，它是这个状态**唯一**的信号。
+	// 也就是说，上面那个 counter 不是锦上添花——但它也不是这个状态的**唯一**信号，
+	// 上一版这么写是把话说过了头。PR #868 第五轮 review 的 P2：预算用尽**且**有
+	// 同步失败时，函数在上面 firstErr 那个分支就带错误返回了，根本走不到这里的打点，
+	// 而那条路径留下的未访问项目和这里一模一样。那条路径有它自己的信号——错误会让
+	// 清理工单重试直到 removalCleanupMaxAttempts 用尽，然后 releaseCleanupJob 高声
+	// 报错并置为 abandoned（modules/space/member_removal.go）。
+	//
+	// 所以准确的说法是：**全部同步成功、只是预算不够**这一种情况，counter 是唯一信号；
+	// 掺了失败的那一种，看 abandoned 工单和它的错误日志。
+	//
+	// 为什么不干脆两条路径都打点：那条路径是带错误返回的，工单会重试二十次，同一次
+	// 移除会打出二十个点，与这里"一次移除一个点"的语义对不上；而且它没跑上面那个
+	// remaining 探测，行数正好是页大小整数倍时其实已经走完了，打了就是误报。
+	// 与其让计数器含义变模糊，不如把话说准。
 	//
 	// 为什么仍然只算 P2 而不是拦路：预算是 cascadeMaxPages × cascadePageSize =
 	// 25 × 200 = **5000 行**，要触到它，同一个 (space_id, uid) 得有五千条以上的历史

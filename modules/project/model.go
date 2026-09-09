@@ -256,8 +256,20 @@ type Resp struct {
 	// modules/opanalytics' channel list already ships member_count as the total,
 	// beside human_member_count and agent_member_count, to the same client teams.
 	//
-	// Restored before the module's first GA, which is the only window where it is
-	// free: nothing had shipped against either meaning yet.
+	// Restored while it is still free, and the reason is checkable from the tags
+	// rather than from a claim about GA. v1.18.0 (2026-09-07) already ships this
+	// field from countActiveMembers -- the TOTAL. The humans-only redefinition
+	// landed in 566e625, which `git tag --contains` places on no release. So this
+	// restores the meaning that IS released and retires the one that never was: a
+	// v1.18.0 client sees no change at all, and only a client built against two
+	// days of unreleased main renames a field.
+	//
+	// The earlier version of this comment said the module "has never been GA, so
+	// nothing had shipped against either meaning". That was wrong -- v1.18.0
+	// carries 42 files under modules/project -- and it was the weaker argument
+	// besides. PR #868's fifth review, which checked the tags instead of taking
+	// the sentence. This is the sentence a future wire change will cite, so it
+	// needs to rest on something measurable.
 	//
 	// The quota (MaxMembers) bounds this number, agents included — an agent reads
 	// the project's messages, so it costs a seat.

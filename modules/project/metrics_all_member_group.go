@@ -158,8 +158,10 @@ var allMemberGroupConvergenceIncomplete = promauto.NewCounter(prometheus.Counter
 		"left holding a possible D6 violation (an all-member group whose creator is not a " +
 		"project owner) that D7 blocks manual repair of and no scan reports; they converge " +
 		"only if one of their own members is next removed, leaves, or changes role. This " +
-		"counter is the only signal that state exists. The resume point is logged as " +
-		"resumeAfterProjectId on the accompanying warning.",
+		"counter is the signal for the case where every sync SUCCEEDED and only the budget " +
+		"ran out; when the budget runs out AND a sync failed, the job returns an error " +
+		"instead and the signal is the abandoned cleanup job with its error log. The resume " +
+		"point is logged as resumeAfterProjectId on the accompanying warning.",
 })
 
 // observeAllMemberGroupConvergenceIncomplete 记一次没走完的收敛。

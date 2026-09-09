@@ -579,9 +579,19 @@ clients: redefined from "everyone" to "humans only", so any project with agents 
 smaller number. The whole discussion was about blast radius — how many clients read it,
 what the fallback costs, whether to measure it first.
 
-The blast radius turned out to be zero. The module has never been GA, so nothing had
-shipped against either meaning. Under the question as asked, that is the end of it: not
-breaking, no action.
+The blast radius turned out to be zero -- though I got the reason wrong, and the fifth
+review caught it by checking something I had only asserted. I wrote that the module "has
+never been GA, so nothing had shipped against either meaning". v1.18.0 (2026-09-07) ships
+42 files under modules/project, including this field, filled from countActiveMembers --
+the total. What never shipped is the humans-only redefinition: `git tag --contains` puts
+566e625 on no release.
+
+So the conclusion held and the argument did not, and the true argument is stronger: this
+restores the meaning that is in a release tag and retires the one that is not. **A
+justification that rests on a status ("never GA") instead of on something countable ("no
+tag contains this commit") is a claim nobody can check without redoing the work** -- and
+this is the sentence a future wire change will cite. Under the question as asked, that is
+the end of it: not breaking, no action.
 
 Asking the second question found something the first could not. This server already ships
 `member_count` — meaning the total — beside `human_member_count` and `agent_member_count`,

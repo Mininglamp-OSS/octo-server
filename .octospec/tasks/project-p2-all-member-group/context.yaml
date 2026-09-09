@@ -1826,9 +1826,15 @@ pr_855_member_count_realigned:
     what: |
       D16 redefined Resp.member_count as "humans only" and added agent_count. Checking the
       client blast radius turned up two facts that together change the question:
-        1. Not breaking. modules/project has existed only since #841 and has never been
-           GA -- the write gate is on in the test environment, but nothing has shipped, so
-           no released client reads either meaning. group / thread / integration each have
+        1. Not breaking -- but for a reason checkable from the tags, not the one first
+           recorded here. v1.18.0 (2026-09-07) DOES ship modules/project (42 files),
+           including Resp.member_count filled from countActiveMembers, i.e. the TOTAL.
+           What never shipped is the humans-only redefinition: `git tag --contains`
+           puts 566e625 on no release. So this restores the released meaning and retires
+           the unreleased one, and a v1.18.0 client sees no change at all.
+           The original wording ("has never been GA, nothing has shipped") was wrong and
+           was the weaker argument; PR #868's fifth review checked the tags.
+           group / thread / integration each have
            their own member_count on their own endpoints; none was touched.
         2. But modules/opanalytics already ships member_count (total),
            human_member_count and agent_member_count on the wire, to the same client
@@ -1859,9 +1865,11 @@ pr_855_member_count_realigned:
       field-for-field. TestCreateProjectSeatsTheCreatorsAgents extended with the same three.
     mutation: "making member_count humans-only again turns both cases red."
     window: |
-      Done before the module's first GA, which is the only time it is free. After that,
-      restoring member_count and renaming agent_count are two breaking changes rather than
-      one field rename in an integration that has not shipped.
+      Done while the humans-only meaning is still unreleased, which is the only time it is
+      free -- see the tag check above; "before first GA" was the wrong way to say it, since
+      v1.18.0 already ships the field with its total meaning. After the humans-only meaning
+      reaches a tag, restoring member_count and renaming agent_count are two breaking
+      changes rather than one field rename against unreleased main.
 
 # PR #868 收到三份 review：两票 APPROVE，一票 CHANGES_REQUESTED（Octo-Q，1 个 P1）。
 # 门禁状态最终是 approved，但那条 P1 成立，连同 yujiawei 的 P2-1/P2-2 是同一类，一并修。
@@ -2367,6 +2375,112 @@ pr_868_round_4_fixed:
       service-container dump that follows the step -- the summary should also go to
       $GITHUB_STEP_SUMMARY, which is served by a separate API. Proposed on the PR, not pushed.
 
+pr_868_round_5_fixed:
+  - id: the-raw-sql-matcher-missed-the-spelling-this-table-already-uses
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-1"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The three raw-SQL regexes were applied per *ast.BasicLit, so a statement split across
+      concatenated literals matched neither half: `"UPDATE robot SET " + "status=0 WHERE ..."`
+      leaves the first fragment with an empty SET clause and the second not beginning with
+      UPDATE. Concatenation is the LIVE style on this very table -- botfather/db.go's two CAS
+      writes are built that way -- so this is not a hypothetical spelling. A disable written
+      like it was invisible: not a primitive, not status-capable, its caller never a door, and
+      the census green while the deletion skipped D14.
+    fix: |
+      foldConcatenatedString flattens the `+` tree; matchRawSQL extracted so the folded and the
+      single-literal paths run the SAME three regexes (two hand-copied rule sets is how the
+      split-spelling hole got in on the dbr side in the first place).
+    mutation: "deleting the fold case reddens both concatenation fixtures. Verified."
+    regression_check: |
+      The live tree's classification is byte-identical after the change -- 3 primitives, 2
+      status-capable writers, the same 6 doors. In particular bindRobotCAS / unbindRobotCAS
+      still do NOT match: they carry status=1 in the WHERE, and the SET-clause capture excludes
+      it. That was the thing to check, since folding can only ADD matches.
+  - id: the-fold-first-aborted-on-non-literals-and-that-was-backwards
+    severity: medium
+    reported_by: "self, mutation-testing the fix above"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The first draft returned "" for the whole expression when any fragment was not a literal,
+      on the reasoning that stitching around a gap invents adjacency. Mutation testing showed
+      the trade is backwards: aborting MISSES real disables (`"UPDATE robot SET status=0 " + v +
+      " WHERE x"` reports as nothing), while skipping's failure mode -- inventing `status=0` out
+      of `"... SET status" + x + "=0"` -- is a false primitive, i.e. a false door and a LOUD red.
+      This file takes loud over silent everywhere else, because a missed deletion is a bot
+      leaving with its Space seats open and nothing reporting it.
+      Worse, my first fixture for this did not pin it at all: it began `"UPDATE robot SET
+      status=" + ...`, and that first literal already matches on its own, so the case passed with
+      the fold and without it. The mutation is what exposed that -- a fixture written to
+      demonstrate a rule, which the rule's deletion left green. Same defect as the file's subject,
+      inside the fix for the file's subject.
+    fix: |
+      Non-literal fragments are skipped, not fatal. The fixture is rebuilt so NEITHER literal
+      matches alone: `"UPDATE robot SET " + placeholder(v) + " status=0 WHERE robot_id=?"`.
+      Kept the negative for the other direction: `"... SET " + col + "=0"` must not match, since
+      the fused text names no column.
+    mutation: "restoring the abort guard now reddens exactly that case. Verified."
+  - id: the-counter-was-called-the-only-signal-and-is-not
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-2"
+    where: modules/project/space_member_removal.go; modules/project/metrics_all_member_group.go
+    what: |
+      Both the comment and the metric Help said this counter is the ONLY signal that the
+      unvisited-projects state exists. When the budget is spent AND a sync failed, the function
+      returns at the firstErr branch above and never reaches the observe call -- while leaving
+      exactly the same residue. So the claim was stronger than the code on a path the code
+      itself takes.
+    fix: |
+      Narrowed rather than widened, and the reason recorded: the error path returns an error, so
+      the cleanup job retries up to removalCleanupMaxAttempts (20) -- observing there would emit
+      twenty points for one removal, against this counter's one-point-per-removal meaning -- and
+      it has not run the `remaining` probe, so it would also fire on the exact-multiple case that
+      is actually complete. That path has its own signal: the abandoned job and releaseCleanupJob's
+      error log. Comment and Help both now say which case each signal covers.
+  - id: the-never-been-GA-justification-is-contradicted-by-the-repos-own-tags
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-5"
+    where: modules/project/model.go; the journal; this file; the PR description
+    what: |
+      The member_count realignment was justified as "the module has never been GA, so nothing
+      had shipped against either meaning". v1.18.0 (2026-09-07) ships 42 files under
+      modules/project INCLUDING Resp.member_count, filled from countActiveMembers -- the total.
+      Verified: `git ls-tree v1.18.0 -- modules/project | wc -l` = 42, and
+      `git tag --contains 566e625` (the humans-only redefinition) is empty.
+      The conclusion survives and the argument is stronger once corrected: this restores the
+      meaning that IS in a release tag and retires the one that never reached one, so a v1.18.0
+      client is unaffected. But the recorded reason was false, and it is the sentence a future
+      wire change will cite.
+    fix: "corrected in all four places, stated as a tag check rather than as a GA status."
+  - id: the-open-item-ledger-still-described-the-retired-meaning-as-current
+    severity: low
+    reported_by: "mochashanyao (Octo-Q) P2-4"
+    where: this file, open_verification
+    what: |
+      The first open_verification entry still listed three items including "the client blast
+      radius of member_count counting humans only (D16)" -- both the count (two remain) and the
+      description (that meaning is what this PR retires) wrong, so a reader following the ledger
+      would go verify semantics that no longer exist. The same sweep had correctly updated
+      project-p2-product-surfaces/brief.md and stopped one file short.
+    fix: "entry rewritten: D2 and D14 remain open, the member_count item is recorded as resolved here."
+  - id: carried-forward-not-fixed
+    severity: low
+    reported_by: "Jerry-Xin (P2 advisory); mochashanyao P2-3"
+    what: |
+      Two guard-completeness gaps are acknowledged and NOT fixed in this round, deliberately:
+        - An UNCALLED status-capable writer escapes the census. Uncalled primitives get their own
+          door; uncalled status-capable writers only become doors through callers. Probe-verified
+          by the reviewer: injecting one leaves the census green with the door set at 6. Zero live
+          instances.
+        - "Both fail loudly, not silently" in the Known limits header is only true of the first
+          half; the same-named-non-primitive exclusion (primitives[f.name] == nil) is silent. No
+          name collision exists today.
+      Both want the same shape of fix (extend the uncalled rule to status-capable writers with the
+      same exemption lookup; make the self-exclusion identity-based) plus one assembly fixture
+      each. That is a mechanism change to the assembly, and this round already changed the
+      classifier; doing both at once is how the last four rounds each produced the next round.
+
 open_verification:
   - "modules/robot/api_manager.go updateRobotStatus writes an unvalidated path segment into
      robot.Status: ParseInt64OrDefault(param, 0) means a malformed segment silently DISABLES the
@@ -2375,10 +2489,14 @@ open_verification:
      that records this endpoint; deliberately NOT fixed there, because that PR touches no
      modules/robot logic. The exemption text points here so the census's load-bearing exemption
      cannot be mistaken for a decision that this is fine."
-  - "The three items in the brief's 'must check before merge' section: the client
-     blast radius of member_count counting humans only (D16), whether the agent
-     picker already excludes self-hosted agents (D2), and whether any caller
-     depends on the synchronicity of botfather's old raw space_member update (D14)."
+  - "TWO items remain from the brief's 'must check before merge' section: whether the
+     agent picker already excludes self-hosted agents (D2), and whether any caller
+     depends on the synchronicity of botfather's old raw space_member update (D14).
+     The third -- the client blast radius of member_count counting humans only -- is
+     RESOLVED by PR #868, which retired that meaning: member_count is every seat again
+     and the humans-only number moved to human_member_count. This entry used to list it
+     as open and described the retired semantics as current, so a reader following it
+     went off to verify a meaning that no longer exists (PR #868's fifth review)."
   - "EXPLAIN for the two I4 scans on production-scale `group` / `group_member`,
      under the PRODUCTION collation shape rather than CI's.
      PR #855's fifth review measured the shape this item was written about and it

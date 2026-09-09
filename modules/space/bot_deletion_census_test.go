@@ -276,24 +276,23 @@ func censusFuncsIn(f *ast.File, file string) []*censusFunc {
 				cf.idents[v.Sel.Name] = true
 			case *ast.Ident:
 				cf.idents[v.Name] = true
+			case *ast.BinaryExpr:
+				// A raw statement spelled across concatenated literals.
+				//
+				// This is the LIVE style on this very table: botfather/db.go's two
+				// CAS writes are `"UPDATE robot SET …" + "WHERE … status=1 …"`.
+				// Matching per-BasicLit sees only the halves, so
+				// `"UPDATE robot SET " + "status=0 WHERE robot_id=?"` matched nothing
+				// — the first half has an empty SET clause, the second does not begin
+				// with UPDATE. A bot disable written that way was invisible to the
+				// census, which then stayed green while the deletion skipped D14.
+				// PR #868's fifth review.
+				cf.matchRawSQL(foldConcatenatedString(v))
 			case *ast.BasicLit:
 				if v.Kind != token.STRING {
 					return true
 				}
-				if rawRobotDisable.MatchString(v.Value) {
-					cf.rawDisablesRobot = true
-				}
-				// Raw UPDATE whose SET clause assigns status any value. Status-capable,
-				// not a primitive — same line the dbr side draws.
-				for _, m := range rawRobotSetClause.FindAllStringSubmatch(v.Value, -1) {
-					if rawStatusAssignment.MatchString(m[1]) {
-						cf.updatesRobotTable = true
-						cf.writesStatusColumn = true
-					}
-				}
-				if rawRobotDelete.MatchString(v.Value) {
-					cf.deletesRobotRow = true
-				}
+				cf.matchRawSQL(v.Value)
 			}
 			return true
 		})
@@ -317,6 +316,67 @@ func calleeName(fun ast.Expr) string {
 }
 
 // stringLit returns the value of a string literal expression, or "".
+// matchRawSQL runs the three raw-SQL matchers over one statement's text.
+//
+// Extracted so the concatenated spelling goes through exactly the same three
+// regexes as the single-literal one. Two code paths applying "the same" rules by
+// hand is how the split-spelling hole got in on the dbr side.
+func (c *censusFunc) matchRawSQL(sql string) {
+	if sql == "" {
+		return
+	}
+	if rawRobotDisable.MatchString(sql) {
+		c.rawDisablesRobot = true
+	}
+	// Raw UPDATE whose SET clause assigns status any value. Status-capable,
+	// not a primitive — same line the dbr side draws.
+	for _, m := range rawRobotSetClause.FindAllStringSubmatch(sql, -1) {
+		if rawStatusAssignment.MatchString(m[1]) {
+			c.updatesRobotTable = true
+			c.writesStatusColumn = true
+		}
+	}
+	if rawRobotDelete.MatchString(sql) {
+		c.deletesRobotRow = true
+	}
+}
+
+// foldConcatenatedString flattens a `+` tree into one string, keeping the literal
+// fragments and SKIPPING the non-literal ones, so a statement split across source
+// lines is matched as the statement it is.
+//
+// Skipping rather than aborting is a deliberate choice, and the first draft had it
+// the other way: a non-literal fragment made the whole expression fold to "". That
+// looked conservative and was not. It MISSES real disables —
+// `"UPDATE robot SET status=" + v + " WHERE robot_id=?"` and
+// `"UPDATE robot SET status=0 " + v + " WHERE x"` are both genuine status writes
+// that the abort rule reports as nothing at all.
+//
+// What skipping costs is invented adjacency: `"… SET status" + x + "=0"` folds to
+// `… SET status=0` and is called a primitive though the SQL says no such thing.
+// That is the fail-CLOSED direction — a false primitive is a false door and a loud
+// red — and this file takes loud over silent everywhere else, because a missed
+// deletion is a bot leaving with its Space seats open and nothing reporting it.
+// A fold that cannot read the statement must not therefore claim the statement is
+// harmless.
+//
+// Pinned in both directions by fixtures: the variable-valued status write must
+// match, and `"… SET " + col + "=0"` must not (the fused text names no column).
+func foldConcatenatedString(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		return stringLit(v)
+	case *ast.BinaryExpr:
+		if v.Op != token.ADD {
+			return ""
+		}
+		return foldConcatenatedString(v.X) + foldConcatenatedString(v.Y)
+	case *ast.ParenExpr:
+		return foldConcatenatedString(v.X)
+	}
+	return ""
+}
+
 func stringLit(e ast.Expr) string {
 	lit, ok := e.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
@@ -747,6 +807,67 @@ func probe(s S, id string, v int) error {
 			src: `package p
 func probe(s S, id string, ref string) error {
 	_, err := s.UpdateBySql("UPDATE robot SET bound_agent_ref=? WHERE robot_id=? AND status=1", ref, id).Exec()
+	return err
+}`,
+		},
+		{
+			// The LIVE spelling on this table. botfather/db.go's two CAS writes are
+			// built exactly this way, so a disable written like it would be too.
+			name: "concatenated raw SQL: a bound status in the SET clause",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+
+		"status=? WHERE robot_id=?", v, id).Exec()
+	return err
+}`,
+			wantStatusCapable: true,
+		},
+		{
+			name: "concatenated raw SQL: literal zero split across the join is still a primitive",
+			src: `package p
+func probe(s S, id string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+
+		"status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// The two live CAS statements, in shape. Folding must not make these
+			// match: status is a GUARD in their WHERE, not a write.
+			name: "NOT a match, concatenated: status=1 guards the WHERE of a bound_agent_ref write",
+			src: `package p
+func probe(s S, id string, ref string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET bound_agent_ref=?, bound_at=NOW() "+
+		"WHERE robot_id=? AND status=1 "+
+		"AND (bound_agent_ref='' OR bound_agent_ref=?)", ref, id, ref).Exec()
+	return err
+}`,
+		},
+		{
+			// Non-literal fragments are SKIPPED, not fatal. Aborting the fold on
+			// them reports this genuine status write as nothing at all — the first
+			// draft of the fold did exactly that.
+			// Neither literal matches alone: the first has an empty SET clause, the
+			// second does not begin with UPDATE. Only skipping the non-literal and
+			// joining what is left produces the statement — which is why this case,
+			// unlike a fixture whose first literal already says `SET status=`,
+			// actually exercises the choice.
+			name: "concatenated raw SQL: a variable BETWEEN literals still yields the disable",
+			src: `package p
+func probe(s S, id string, v int) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+placeholder(v)+" status=0 WHERE robot_id=?", id).Exec()
+	return err
+}`,
+			wantDisables: true,
+		},
+		{
+			// The other half of that choice: skipping fragments can fuse text, so
+			// pin the case where the fusion names no column and must not match.
+			name: "NOT a match, concatenated: the column itself is the variable",
+			src: `package p
+func probe(s S, id string, col string) error {
+	_, err := s.UpdateBySql("UPDATE robot SET "+col+"=0 WHERE robot_id=?", id).Exec()
 	return err
 }`,
 		},
