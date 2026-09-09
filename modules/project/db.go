@@ -20,10 +20,10 @@ import (
 //     has no P0 writer by design. A reflective column list derives from struct
 //     fields, so it would start writing either one the moment somebody adds the
 //     field — and `is_official` would then be written with a value that happens to
-//     equal the default, making the regression invisible. `member_epoch` is
-//     likewise absent from the insert list: it takes the DDL default, so the ONLY
-//     statement in this package that writes that column is `member_epoch =
-//     member_epoch + 1`, which is what makes monotonicity checkable by grep.
+//     equal the default, making the regression invisible. `member_epoch` and
+//     `collaboration_role_epoch` are likewise absent from the insert list: they
+//     take the DDL defaults, so their only writers are atomic `epoch = epoch + 1`
+//     statements, which makes monotonicity checkable by grep.
 //
 //  2. **dbr backtick asymmetry.** Update / InsertInto / DeleteFrom take the bare
 //     table name (dbr quotes it); From / Select need manual backticks. Getting it
@@ -40,7 +40,7 @@ func NewDB(ctx *config.Context) *DB {
 }
 
 // projectInsertColumns is the write-side column list for octo_project. See the
-// type comment for why active_name / is_official / member_epoch are absent.
+// type comment for why active_name / is_official / both epoch columns are absent.
 var projectInsertColumns = []string{
 	"project_id", "space_id", "name", "description", "logo", "creator",
 	"discoverability", "max_members", "status",
@@ -82,7 +82,7 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	var models []*Model
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, status, all_member_group_no, "+
+			"discoverability, max_members, member_epoch, collaboration_role_epoch, status, all_member_group_no, "+
 			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
@@ -105,7 +105,7 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	var models []*Model
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, status, all_member_group_no, "+
+			"discoverability, max_members, member_epoch, collaboration_role_epoch, status, all_member_group_no, "+
 			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
@@ -486,7 +486,7 @@ func (d *DB) countCreatedInWindowTx(tx *dbr.Tx, creator string, from, to time.Ti
 // guard EXPLAINs the string production executes rather than a copy of it, and a
 // copy passes forever once the two drift.
 const sqlListVisibleInSpace = "SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, " +
-	"p.discoverability, p.max_members, p.member_epoch, p.status, " +
+	"p.discoverability, p.max_members, p.member_epoch, p.collaboration_role_epoch, p.status, " +
 	// all_member_group_no on the LIST route too. The wire contract defines
 	// "" as "no group provisioned", so omitting the column here made every
 	// listed project claim it has none — the detail route and the list route

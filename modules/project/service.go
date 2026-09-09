@@ -616,6 +616,13 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 		}
 		return nil, err
 	}
+	// Collaboration roles are descriptive metadata, not authorization. Seed the
+	// built-in catalog in the same transaction as the project so a successful
+	// create never exposes a partially initialized catalog. The built-in key's
+	// unique constraint makes retries and the bounded backfill idempotent.
+	if _, err := p.db.seedBuiltinCollaborationRolesTx(tx, model.ProjectID, now); err != nil {
+		return nil, err
+	}
 	if _, err := p.db.admitMemberTx(tx, &MemberModel{
 		ProjectID: model.ProjectID,
 		UID:       in.Creator,
@@ -2104,6 +2111,18 @@ func (p *Project) beginRemovalWithAgentsTx(
 			return false, nil, err
 		}
 		closedAgents = append(closedAgents, agentUID)
+	}
+	closingUIDs := make([]string, 0, 1+len(closedAgents))
+	closingUIDs = append(closingUIDs, targetUID)
+	closingUIDs = append(closingUIDs, closedAgents...)
+	rolesCleared, err := p.db.deleteMemberCollaborationRolesTx(tx, projectID, closingUIDs)
+	if err != nil {
+		return false, nil, err
+	}
+	if rolesCleared {
+		if err := p.db.bumpCollaborationRoleEpochTx(tx, projectID); err != nil {
+			return false, nil, err
+		}
 	}
 
 	// bumpMemberEpochTx returns the affected-row count now; only createProject checks it (a silent no-op there would ship a project on the absent sentinel). Here the seat write above already established the row exists.

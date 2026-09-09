@@ -1464,6 +1464,15 @@ other = "所选的 AI 分身中有无法加入本项目的，请调整后重试�
 ["err.server.project.role_invalid"]
 other = "项目成员角色无效。"
 
+["err.server.project.collaboration_role_name_invalid"]
+other = "项目协作角色名称无效。"
+
+["err.server.project.collaboration_role_invalid"]
+other = "项目协作角色无效。"
+
+["err.server.project.collaboration_role_target_invalid"]
+other = "该成员不能设置项目协作角色。"
+
 ["err.server.project.permission_denied"]
 other = "你没有权限执行此操作。"
 
@@ -1472,6 +1481,9 @@ other = "你不是该项目的成员。"
 
 ["err.server.project.disabled"]
 other = "项目功能已被管理员关闭。"
+
+["err.server.project.collaboration_role_disabled"]
+other = "项目协作角色修改功能已关闭。"
 
 ["err.server.project.actor_not_space_member"]
 other = "你已不是该空间的有效成员。"
@@ -1491,6 +1503,12 @@ other = "你在该空间创建的项目数量已达上限。"
 ["err.server.project.quota_members"]
 other = "该项目的成员数量已达上限。"
 
+["err.server.project.quota_collaboration_roles"]
+other = "该项目的协作角色数量已达上限。"
+
+["err.server.project.quota_member_collaboration_roles"]
+other = "该成员的协作角色数量已达上限。"
+
 ["err.server.project.quota_daily_create"]
 other = "你今天创建的项目数量已达上限。"
 
@@ -1502,6 +1520,9 @@ other = "项目成员不存在。"
 
 ["err.server.project.name_duplicated"]
 other = "该空间内已存在同名项目。"
+
+["err.server.project.collaboration_role_duplicated"]
+other = "该项目内已存在同名协作角色。"
 
 ["err.server.project.last_owner_must_transfer"]
 other = "请先转让拥有者身份，再退出或降级。"

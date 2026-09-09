@@ -1,0 +1,139 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: paths modules/**/*.go + touches auth/space
+  - id: error-handling
+    source: repo
+    why: paths modules/**/*.go + touches wire-contract
+  - id: rate-limit
+    source: repo
+    why: |
+      paths modules/**/*.go matches. Corrected mid-session: the Plan phase said this
+      rule does not inject, having checked only `touches`. Injection is paths OR
+      touches. It ended up moot — R8 landed as an env, not a route — but the
+      Plan-phase claim was wrong.
+  - id: testing
+    source: repo
+    why: touches test; R10 guard + R8 behavioural tests
+  - id: commit-style
+    source: repo
+    why: paths ** catch-all
+  - id: trust-boundary
+    source: repo
+    why: touches wire-contract
+brief: .octospec/tasks/project-subsystem-fanout/brief.md
+
+scope_note: |
+  Brief 已于 2026-09-09 收窄（用户选方案 B：移出而非删除）。本任务现在只含 R10 +
+  R8-provisioning 两条，均已落地。原先的 9 条阻塞项（R1-R7 / R9 / R11 / R12）连同全部
+  核实结论移入 .octospec/tasks/project-lifecycle-multiconsumer/brief.md，编号沿用不重排。
+  修剪前完整原文备份在 .context/attachments/SeL7SI/brief-full-before-prune.md（不进 git）。
+  拆分后做过对账：13 条一次性挖出的关键结论（签名串 conformance 形状、epoch 创建 bump=1
+  与 #855 D11 冲突、失败分类 401/403/408/429 可重试、Phase7 分身丢事件、NOT EXISTS 阻塞在
+  claim SQL 而非 worker 内存、4 条二级索引、payload 入队即冻结、容器 id 不可推导、锁序、
+  D12、预演测试源码位置、#853 registry 9→4 退化、两个计数器不可混用）全部仍在，无丢失。
+
+split_followup: |
+  新 brief 已按已核实事实更新两处顺序事实：
+  (1) #855 已合入 main (566e625b)，早于 #852，所以 D-3（创建即 bump 到 1）与 #855 D11
+      （保持 0）的冲突改由 #852 rebase 时解决——原 brief 假设的顺序反了。
+  (2) #853 本迭代不合入，且已核实无人依赖它（#852 自带 fixedInternalTokenEnvs 9 条 +
+      main_internaltoken_test.go，零 import pkg/internaltoken；#854/#855/#864 同样零引用）。
+      若未来合入，需显式 append membership token + 3 条遗留 env，否则覆盖面 9→4 静默退化
+      且无测试会红。
+
+decisions:
+  - id: R8-shape
+    decision: env (OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID), applied at boot
+    by: user, after rejecting tools/ binary, `app` subcommand, raw SQL and system_settings
+    note: |
+      The brief's R8 says "i18n envelope + auth + audit", i.e. an HTTP handler. That
+      collides with TestNoHandlerReachesTheProvisioningTable, which forbids any
+      handler-bearing file from touching the provisioning DAO (it enforces D12, also in
+      this brief's load-bearing list). The env form sidesteps the collision rather than
+      weakening the guard — verified: that guard still passes.
+
+      Two costs are inherent to the configmap channel and are documented at the env's
+      declaration: it takes effect on RESTART, and the value PERSISTS after use so every
+      later restart re-reads it. The ghost-requeue that (2) implies is neutralised by
+      making the ROW's own state the idempotency record — the UPDATE matches only
+      `status = abandoned`, so a leftover value is a no-op on an already-rescued project
+      and no "already handled" ledger is needed. Same mechanism covers the multi-replica
+      race (every pod boots with the same value; the status re-check means one wins).
+
+      Brief 已同步为 env 形态（2026-09-09），并写明 D12 冲突是改形态的原因，
+      以及 configmap 通道的两个固有代价与「行状态即幂等凭据」的消解方式。
+
+findings:
+  - id: dispatch-site-count
+    finding: |
+      The brief says adding a subsystem touches 4 sites. It is 5. The two the brief
+      missed (refreshProvisioningMetrics, provisioningTargetLabel) are the dangerous
+      ones: they fail by OMISSION, so a third subsystem provisions correctly and is
+      merely invisible on the dashboards the slice's own security argument rests on.
+      Brief 已改为 5 处（2026-09-09）。注意：Target* 常量声明不算分派点——我第一次改写时
+      误把它算进去导致数目对不上，按代码重新核对后确认被收敛的是 5 处。
+
+guards:
+  - name: TestEveryTargetDecisionReadsTheRegistry
+    status: added, mutation-verified
+    note: |
+      Fails when either previously-silent site regresses to enumerating target
+      constants; names the offending file; green on restore. First mutation attempt
+      produced a FALSE pass — exit=1 came from the test DB panicking, not the guard —
+      so it was re-run against a DB-free harness to get a real signal.
+  - name: TestContainerIDHasOneProducerAndItIgnoresTheProjectID
+    status: retargeted
+    note: |
+      Broke because the octows-/octods- literals moved into the registry. Rewritten to
+      assert the INVARIANT (literals in exactly one table, one producer) rather than a
+      filename, plus a new check that every registry entry declares a non-empty prefix.
+      The single-producer half was not weakened.
+  - name: TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID
+    status: allow-list widened, mutation-verified
+    note: |
+      Repo-wide guard treating the prefix literals as a slice marker; config_provisioning.go
+      is inside the slice but was unlisted. Widening an allow-list is how a guard silently
+      erodes, so it was mutation-tested: planting a prefix literal in api.go still fails it.
+
+verification:
+  - "rebase 到 origin/main@566e625b（#855 已合并）后重跑，全部门禁通过"
+  - "go build ./... clean; gofmt clean; go vet ./modules/project/ clean"
+  - "golangci-lint run ./modules/project/... ./internal/projectprovision/... => 0 issues"
+  - "make i18n-extract-check => exit 0; make i18n-lint => exit 0（无新增裸错误响应）"
+  - |
+    13 个关键测试全部真实执行并通过（-v 逐个列名确认，非空集）：3 个 requeue 行为测试
+    + TestEveryTargetDecisionReadsTheRegistry + 5 个既有供给守卫
+    （NoHandlerReachesTheProvisioningTable / ContainerIDHasOneProducer /
+    NoPackageOutsideTheProvisioningSlice / ProvisioningClientIsConfined /
+    NoLogFieldCarriesTheContainerID）+ 4 个既有供给行为测试。
+  - "go test ./internal/projectprovision/ ./pkg/project/ ./pkg/space/ ./modules/space/ => 全部 ok"
+  - "D12 复核：新 DAO requeueAbandonedProvisioningJobs 仅 worker 一个调用者，该文件无 handler；新 env 不进任何读路径"
+  - "Out of scope 六条逐条核查未触碰；改动全部落在 modules/project/"
+  - "#855 未改动本任务涉及的 5 个供给文件（git show --stat 无输出），无语义交叠"
+
+blocked_by_infra:
+  issue: |
+    modules/project 整包无法稳定跑绿，与本改动无关，已用对照实验证伪。
+  evidence:
+    - "Monitor 实测：共享 test 库表数在测试期间被外部规律性 drop（129 -> 0 -> 重建），本 session 未发过该 drop 命令"
+    - |
+      对照实验：stash 掉全部改动、在纯净 main 上跑同一批失败测试 => 同样 FAIL，
+      同样是 Error 1146 Table doesn't exist。故失败不由本改动引起。
+    - "另一独立成因：#855 合并新增列（all_member_group_no / removing），库若不 drop&recreate 会残留旧 schema 报 1054；重建后 209 个迁移完整应用，两列就位"
+  root_cause: |
+    ~160 个 workspace 共用 testenv-mysql-1 的单个 `test` 库，且 octo-lib/testutil
+    把地址硬编码为 root:demo@tcp(127.0.0.1)/test（testutil/test.go:28，无 env 覆盖），
+    所以无法用私有库隔离。CleanAllTables 只 DELETE 数据不改结构，故 schema 变更后
+    必须显式 drop & recreate（且显式 COLLATE utf8mb4_general_ci）。
+    另外本包 TestMigrationUpDownUpLeavesNoResidue 会对共享库执行本模块迁移的
+    Down→Up，期间相关表真实消失——它自己不并行，但与其他包/其他 workspace 并发时
+    会让对方看到缺表。
+  not_fixable_here: "需要改 octo-lib 支持 env 覆盖 DB 地址，或为每个 workspace 分配独立库；超出本任务范围"
+
+not_done:
+  - "No commit (Implement/Verify 阶段均不提交)。"
+  - "modules/group 整包有 5 个失败（failed to create IM channel，30s 超时），与本改动无关，属 WuKongIM 环境问题。"
+  - "brief 已按方案 B 修剪完成（见 scope_note）；两份 brief 结构校验通过，13 条关键结论对账无丢失。"
+  - "project-lifecycle-multiconsumer 尚无 context.yaml（未进入 Implement 阶段，按流程等其开工时生成）。"
+

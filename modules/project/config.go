@@ -21,7 +21,8 @@ const (
 	// getter in modules/common. Moving it there later is one function; the call
 	// site (createEnabled) does not change. The cost of env is that flipping it
 	// needs a rolling restart in both directions.
-	envCreateEnabled = "OCTO_PROJECT_CREATE_ENABLED"
+	envCreateEnabled            = "OCTO_PROJECT_CREATE_ENABLED"
+	envCollaborationRoleEnabled = "OCTO_PROJECT_COLLABORATION_ROLE_ENABLED"
 
 	// envReconcileEnabled gates ONLY the reconcile scans that JOIN the legacy Space tables
 	// (`space`, `space_member`, `space_member_removal_cleanup`) — I1 violations, abandoned
@@ -49,15 +50,17 @@ const (
 	// Turn it on once the collation conversion recorded in the brief has completed.
 	envReconcileEnabled = "OCTO_PROJECT_RECONCILE_ENABLED"
 
-	envMaxPerSpace    = "OCTO_PROJECT_MAX_PER_SPACE"
-	envMaxPerCreator  = "OCTO_PROJECT_MAX_PER_CREATOR_PER_SPACE"
-	envMaxMembers     = "OCTO_PROJECT_MAX_MEMBERS"
-	envMaxPinned      = "OCTO_PROJECT_MAX_PINNED"
-	envMaxDailyCreate = "OCTO_PROJECT_MAX_DAILY_CREATE"
-	envMemberBatchMax = "OCTO_PROJECT_MEMBER_BATCH_MAX"
-	envDayBoundaryTZ  = "OCTO_PROJECT_DAY_BOUNDARY_TZ"
-	envReconcileEvery = "OCTO_PROJECT_RECONCILE_INTERVAL"
-	envReconcileLimit = "OCTO_PROJECT_RECONCILE_LIMIT"
+	envMaxPerSpace                    = "OCTO_PROJECT_MAX_PER_SPACE"
+	envMaxPerCreator                  = "OCTO_PROJECT_MAX_PER_CREATOR_PER_SPACE"
+	envMaxMembers                     = "OCTO_PROJECT_MAX_MEMBERS"
+	envMaxPinned                      = "OCTO_PROJECT_MAX_PINNED"
+	envMaxDailyCreate                 = "OCTO_PROJECT_MAX_DAILY_CREATE"
+	envMemberBatchMax                 = "OCTO_PROJECT_MEMBER_BATCH_MAX"
+	envCollaborationRoleMaxPerProject = "OCTO_PROJECT_COLLABORATION_ROLE_MAX_PER_PROJECT"
+	envCollaborationRoleMaxPerMember  = "OCTO_PROJECT_COLLABORATION_ROLE_MAX_PER_MEMBER"
+	envDayBoundaryTZ                  = "OCTO_PROJECT_DAY_BOUNDARY_TZ"
+	envReconcileEvery                 = "OCTO_PROJECT_RECONCILE_INTERVAL"
+	envReconcileLimit                 = "OCTO_PROJECT_RECONCILE_LIMIT"
 	// envAllMemberGroupAdmitGrace tunes how long a freshly written project seat is
 	// exempt from I4 scan B. The brief calls the window configurable and the first
 	// implementation hard-coded it; the value that matters is deployment-shaped
@@ -84,7 +87,9 @@ const (
 	// defaultMemberBatchMax bounds one add/remove request structurally, on top of
 	// any byte cap: a well-formed payload of ten thousand uids would otherwise turn
 	// a single request into ten thousand membership transactions.
-	defaultMemberBatchMax = 200
+	defaultMemberBatchMax                 = 200
+	defaultCollaborationRoleMaxPerProject = 50
+	defaultCollaborationRoleMaxPerMember  = 8
 	// defaultDayBoundaryTZ is the business timezone the per-day creation window is
 	// computed in. Rows store UTC; only the window boundary is localized, so the
 	// quota resets at local midnight rather than at 08:00 local.
@@ -116,19 +121,22 @@ const (
 
 // Config is the resolved per-process configuration.
 type Config struct {
-	CreateEnabled bool
+	CreateEnabled            bool
+	CollaborationRoleEnabled bool
 	// ReconcileEnabled gates the three scans that JOIN legacy Space tables. See
 	// envReconcileEnabled for why it is separate from CreateEnabled and why its scope is narrow.
-	ReconcileEnabled  bool
-	MaxPerSpace       int
-	MaxPerCreator     int
-	MaxMembers        int
-	MaxPinned         int
-	MaxDailyCreate    int
-	MemberBatchMax    int
-	DayBoundary       *time.Location
-	ReconcileInterval time.Duration
-	ReconcileLimit    int
+	ReconcileEnabled               bool
+	MaxPerSpace                    int
+	MaxPerCreator                  int
+	MaxMembers                     int
+	MaxPinned                      int
+	MaxDailyCreate                 int
+	MemberBatchMax                 int
+	CollaborationRoleMaxPerProject int
+	CollaborationRoleMaxPerMember  int
+	DayBoundary                    *time.Location
+	ReconcileInterval              time.Duration
+	ReconcileLimit                 int
 	// AllMemberGroupAdmitGrace exempts a project seat written within this window
 	// from I4 scan B, because the admitter runs AFTER the seat transaction commits
 	// (D12) and there is therefore a real interval in which the seat exists and
@@ -157,17 +165,20 @@ func loadConfig() Config {
 	}
 	provisioning, _ := loadProvisioningConfig(os.Getenv)
 	return Config{
-		CreateEnabled:     envBool(envCreateEnabled, false),
-		ReconcileEnabled:  envBool(envReconcileEnabled, false),
-		MaxPerSpace:       envPositiveInt(envMaxPerSpace, defaultMaxPerSpace),
-		MaxPerCreator:     envPositiveInt(envMaxPerCreator, defaultMaxPerCreator),
-		MaxMembers:        envPositiveInt(envMaxMembers, defaultMaxMembers),
-		MaxPinned:         envPositiveInt(envMaxPinned, defaultMaxPinned),
-		MaxDailyCreate:    envPositiveInt(envMaxDailyCreate, defaultMaxDailyCreate),
-		MemberBatchMax:    envPositiveInt(envMemberBatchMax, defaultMemberBatchMax),
-		DayBoundary:       loc,
-		ReconcileInterval: envDuration(envReconcileEvery, defaultReconcileInterval),
-		ReconcileLimit:    envPositiveInt(envReconcileLimit, defaultReconcileLimit),
+		CreateEnabled:                  envBool(envCreateEnabled, false),
+		CollaborationRoleEnabled:       envBool(envCollaborationRoleEnabled, false),
+		ReconcileEnabled:               envBool(envReconcileEnabled, false),
+		MaxPerSpace:                    envPositiveInt(envMaxPerSpace, defaultMaxPerSpace),
+		MaxPerCreator:                  envPositiveInt(envMaxPerCreator, defaultMaxPerCreator),
+		MaxMembers:                     envPositiveInt(envMaxMembers, defaultMaxMembers),
+		MaxPinned:                      envPositiveInt(envMaxPinned, defaultMaxPinned),
+		MaxDailyCreate:                 envPositiveInt(envMaxDailyCreate, defaultMaxDailyCreate),
+		MemberBatchMax:                 envPositiveInt(envMemberBatchMax, defaultMemberBatchMax),
+		CollaborationRoleMaxPerProject: envPositiveInt(envCollaborationRoleMaxPerProject, defaultCollaborationRoleMaxPerProject),
+		CollaborationRoleMaxPerMember:  envPositiveInt(envCollaborationRoleMaxPerMember, defaultCollaborationRoleMaxPerMember),
+		DayBoundary:                    loc,
+		ReconcileInterval:              envDuration(envReconcileEvery, defaultReconcileInterval),
+		ReconcileLimit:                 envPositiveInt(envReconcileLimit, defaultReconcileLimit),
 		AllMemberGroupAdmitGrace: envDuration(
 			envAllMemberGroupAdmitGrace, defaultAllMemberGroupAdmitGrace),
 		MetricsInterval: envDuration(envMetricsEvery, defaultMetricsInterval),

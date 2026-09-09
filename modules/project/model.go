@@ -91,17 +91,18 @@ const (
 // It likewise has no IsOfficial field: no P0 code path writes that column, and
 // leaving it out of the model is what makes that checkable rather than aspirational.
 type Model struct {
-	ID              int64  `db:"id"`
-	ProjectID       string `db:"project_id"`
-	SpaceID         string `db:"space_id"`
-	Name            string `db:"name"`
-	Description     string `db:"description"`
-	Logo            string `db:"logo"`
-	Creator         string `db:"creator"`
-	Discoverability int    `db:"discoverability"`
-	MaxMembers      int    `db:"max_members"`
-	MemberEpoch     int64  `db:"member_epoch"`
-	Status          int    `db:"status"`
+	ID                     int64  `db:"id"`
+	ProjectID              string `db:"project_id"`
+	SpaceID                string `db:"space_id"`
+	Name                   string `db:"name"`
+	Description            string `db:"description"`
+	Logo                   string `db:"logo"`
+	Creator                string `db:"creator"`
+	Discoverability        int    `db:"discoverability"`
+	MaxMembers             int    `db:"max_members"`
+	MemberEpoch            int64  `db:"member_epoch"`
+	CollaborationRoleEpoch int64  `db:"collaboration_role_epoch"`
+	Status                 int    `db:"status"`
 	// AllMemberGroupNo is this project's all-member group, or "" when it has
 	// none yet. "" is the sentinel and the column is NOT NULL, so every
 	// predicate in the feature is written `= ''` / `!= ''` (see D5).
@@ -211,6 +212,14 @@ type roleReq struct {
 	TransferTo string `json:"transfer_to"`
 }
 
+type collaborationRoleNameReq struct {
+	Name string `json:"name"`
+}
+
+type collaborationRoleBindingReq struct {
+	RoleIDs []string `json:"role_ids"`
+}
+
 // ---------- API responses ----------
 
 // Resp is the Project payload returned by list and detail.
@@ -244,9 +253,10 @@ type Resp struct {
 	// messages, so it costs a seat.
 	MemberCount int `json:"member_count"`
 	// AgentCount is the number of active AI agent seats.
-	AgentCount  int   `json:"agent_count"`
-	MemberEpoch int64 `json:"member_epoch"`
-	Status      int   `json:"status"`
+	AgentCount             int   `json:"agent_count"`
+	MemberEpoch            int64 `json:"member_epoch"`
+	CollaborationRoleEpoch int64 `json:"collaboration_role_epoch"`
+	Status                 int   `json:"status"`
 	// AllMemberGroupNo is this project's all-member group, or "" when it has
 	// none yet (provisioning failed and has not been retried; see D4). A client
 	// showing an entry point to the group must handle "" rather than assuming.
@@ -295,8 +305,38 @@ type MemberResp struct {
 	// OwnerUID is the agent's owner (robot.creator_uid); empty for a person and
 	// for an agent whose owner row is gone. It is the join key the client uses
 	// to nest an agent under its owner.
-	OwnerUID  string `json:"owner_uid"`
-	CreatedAt string `json:"created_at"`
+	OwnerUID           string                  `json:"owner_uid"`
+	CollaborationRoles []CollaborationRoleResp `json:"collaboration_roles"`
+	CreatedAt          string                  `json:"created_at"`
+}
+
+const (
+	CollaborationRoleSourceBuiltin = "builtin"
+	CollaborationRoleSourceCustom  = "custom"
+)
+
+type CollaborationRoleModel struct {
+	RoleID         string    `db:"role_id"`
+	ProjectID      string    `db:"project_id"`
+	BuiltinKey     string    `db:"builtin_key"`
+	Name           string    `db:"name"`
+	NormalizedName string    `db:"normalized_name"`
+	Source         string    `db:"source"`
+	CreatorUID     string    `db:"creator_uid"`
+	CreatedAt      time.Time `db:"created_at"`
+	UpdatedAt      time.Time `db:"updated_at"`
+}
+
+type CollaborationRoleResp struct {
+	RoleID     string `json:"role_id"`
+	BuiltinKey string `json:"builtin_key,omitempty"`
+	Name       string `json:"name"`
+	Source     string `json:"source"`
+}
+
+type collaborationRoleCatalogResp struct {
+	CollaborationRoleEpoch int64                   `json:"collaboration_role_epoch"`
+	Roles                  []CollaborationRoleResp `json:"roles"`
 }
 
 // GroupResp is one row of the project group list.

@@ -221,8 +221,17 @@ var (
 	// (`p.member_epoch = q.member_epoch + 1`), which reads one table's column and
 	// writes another's. RE2 has no backreferences, so the two aliases are captured
 	// and compared in Go below rather than in the pattern.
-	epochAssignment = regexp.MustCompile(`(?:\w+\.)?member_epoch\s*=`)
-	epochIncrement  = regexp.MustCompile(`(?:(\w+)\.)?member_epoch\s*=\s*(?:(\w+)\.)?member_epoch\s*\+\s*1`)
+	//
+	// The \b word boundaries come from main (#871), which added a SIBLING epoch column
+	// (collaboration_role_epoch) with its own parallel guard in collaboration_role_test.go
+	// and tightened this one to match. There is no identifier in the tree today that the
+	// unbounded form would falsely match — the boundaries are defensive symmetry with
+	// that sibling, not a fix for an observed miss. Carried across the merge deliberately:
+	// this branch replaced the two inline regexes main tightened, so taking "ours" whole
+	// would have dropped the tightening silently, which is the shape of merge loss that
+	// leaves both sides looking correct.
+	epochAssignment = regexp.MustCompile(`(?:\w+\.)?\bmember_epoch\b\s*=`)
+	epochIncrement  = regexp.MustCompile(`(?:(\w+)\.)?\bmember_epoch\b\s*=\s*(?:(\w+)\.)?\bmember_epoch\b\s*\+\s*1`)
 	// epochPredicate matches the SQL read positions a column name can appear in
 	// with an `=` after it: `WHERE member_epoch = ?`, `AND p.member_epoch = 0`.
 	// Those are comparisons, not writes, and this guard is about the write shape.
@@ -233,7 +242,7 @@ var (
 	// mutations that motivated the exclusion. The alternative — spelling the repair
 	// predicate some other way to dodge a regex — would have hidden a real
 	// comparison from every future reader instead.
-	epochPredicate = regexp.MustCompile(`(?i)\b(?:where|and|or)\s+(?:\w+\.)?member_epoch\s*=`)
+	epochPredicate = regexp.MustCompile(`(?i)\b(?:where|and|or)\s+(?:\w+\.)?\bmember_epoch\b\s*=`)
 )
 
 // columnAt returns where "member_epoch" starts inside a match, so every pattern
@@ -331,10 +340,10 @@ func TestEpochGuardStillCatchesRealWrites(t *testing.T) {
 // in an error string is fine; that is why this does not simply ban the identifier.
 func TestIsOfficialHasNoWriter(t *testing.T) {
 	for _, col := range projectInsertColumns {
-		if col == "is_official" || col == "active_name" || col == "member_epoch" {
+		if col == "is_official" || col == "active_name" || col == "member_epoch" || col == "collaboration_role_epoch" {
 			t.Errorf("projectInsertColumns contains %q; is_official has no P0 writer (D6), "+
-				"active_name is a generated column (MySQL 3105), and member_epoch may only be "+
-				"written as member_epoch + 1", col)
+				"active_name is a generated column (MySQL 3105), and epochs may only be "+
+				"written through their atomic increment statements", col)
 		}
 	}
 

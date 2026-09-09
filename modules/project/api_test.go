@@ -58,6 +58,7 @@ func TestMain(m *testing.M) {
 	// The feature gate is fail-closed, so every write case would 403 without this. The
 	// OFF behaviour is asserted by a case that flips p.cfg on a private router.
 	_ = os.Setenv(envCreateEnabled, "true")
+	_ = os.Setenv(envCollaborationRoleEnabled, "true")
 
 	srv, ctx := testutil.NewTestServer()
 	// testutil.NewTestServer does not install an ErrorRenderer (main.go does), and without
@@ -327,13 +328,15 @@ func TestSchemaColumnsMatchSpaceAndUser(t *testing.T) {
 			"  (TABLE_NAME='space_member' AND COLUMN_NAME IN ('space_id','uid')) OR " +
 			"  (TABLE_NAME='user' AND COLUMN_NAME='uid') OR " +
 			"  (TABLE_NAME='octo_project' AND COLUMN_NAME IN ('space_id','project_id','creator')) OR " +
-			"  (TABLE_NAME='octo_project_member' AND COLUMN_NAME IN ('space_id','uid','project_id')))",
+			"  (TABLE_NAME='octo_project_member' AND COLUMN_NAME IN ('space_id','uid','project_id')) OR " +
+			"  (TABLE_NAME='octo_project_collaboration_role' AND COLUMN_NAME IN ('project_id','role_id','creator_uid')) OR " +
+			"  (TABLE_NAME='octo_project_member_collaboration_role' AND COLUMN_NAME IN ('project_id','uid','role_id')))",
 	).Load(&cols)
 	require.NoError(t, err)
 	require.NotEmpty(t, cols)
 
-	// Both project tables must be present: NotEmpty alone would pass if
-	// octo_project_member were renamed away and only the legacy rows came back.
+	// Every project table must be present: NotEmpty alone would pass if one were
+	// renamed away and only the legacy rows came back.
 	tables := map[string]bool{}
 	for _, c := range cols {
 		tables[c.Table] = true
@@ -344,6 +347,10 @@ func TestSchemaColumnsMatchSpaceAndUser(t *testing.T) {
 	}
 	assert.True(t, tables["octo_project"], "octo_project columns must be in the result")
 	assert.True(t, tables["octo_project_member"], "octo_project_member columns must be in the result")
+	assert.True(t, tables["octo_project_collaboration_role"],
+		"octo_project_collaboration_role columns must be in the result")
+	assert.True(t, tables["octo_project_member_collaboration_role"],
+		"octo_project_member_collaboration_role columns must be in the result")
 }
 
 // TestJoinAcrossSpaceMemberAndUserHasNoCollationError runs the shape the reconcile scan
@@ -459,7 +466,8 @@ func TestMigrationUpDownUpLeavesNoResidue(t *testing.T) {
 		var n int
 		require.NoError(t, db.QueryRow(
 			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() "+
-				"AND TABLE_NAME IN ('octo_project','octo_project_member')").Scan(&n))
+				"AND TABLE_NAME IN ('octo_project','octo_project_member',"+
+				"'octo_project_collaboration_role','octo_project_member_collaboration_role')").Scan(&n))
 		return n
 	}
 	// generatedColumns counts the STORED generated column, and indexOverGenerated the
@@ -479,16 +487,25 @@ func TestMigrationUpDownUpLeavesNoResidue(t *testing.T) {
 				"AND TABLE_NAME = 'octo_project' AND INDEX_NAME = 'uk_octo_project_space_active_name'").Scan(&n))
 		return n
 	}
+	collaborationEpochColumns := func() int {
+		var n int
+		require.NoError(t, db.QueryRow(
+			"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "+
+				"AND TABLE_NAME = 'octo_project' AND COLUMN_NAME = 'collaboration_role_epoch'").Scan(&n))
+		return n
+	}
 
 	assertApplied := func(stage string) {
-		assert.Equal(t, 2, tableCount(), "%s: both tables must exist", stage)
+		assert.Equal(t, 4, tableCount(), "%s: project and collaboration-role tables must exist", stage)
 		assert.Equal(t, 1, generatedColumns(), "%s: active_name must be a generated column", stage)
 		assert.Greater(t, indexOverGenerated(), 0, "%s: the unique index over active_name must exist", stage)
+		assert.Equal(t, 1, collaborationEpochColumns(), "%s: collaboration_role_epoch must exist", stage)
 	}
 	assertGone := func(stage string) {
 		assert.Equal(t, 0, tableCount(), "%s: the Down section must leave no residue", stage)
 		assert.Equal(t, 0, generatedColumns(), "%s: no generated column may survive Down", stage)
 		assert.Equal(t, 0, indexOverGenerated(), "%s: no index may survive Down", stage)
+		assert.Equal(t, 0, collaborationEpochColumns(), "%s: no collaboration epoch may survive Down", stage)
 	}
 
 	// Starting state: sql-migrate applied Up during setup.

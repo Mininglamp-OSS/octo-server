@@ -8,14 +8,18 @@ import (
 // eventually, into whatever queries those logs, so a typo must not become a new
 // action silently.
 const (
-	auditCreate       = "project.create"
-	auditUpdate       = "project.update"
-	auditDisband      = "project.disband"
-	auditMemberAdd    = "project.member_add"
-	auditMemberRemove = "project.member_remove"
-	auditLeave        = "project.leave"
-	auditRoleChange   = "project.role_change"
-	auditCascade      = "project.space_cascade"
+	auditCreate                  = "project.create"
+	auditUpdate                  = "project.update"
+	auditDisband                 = "project.disband"
+	auditMemberAdd               = "project.member_add"
+	auditMemberRemove            = "project.member_remove"
+	auditLeave                   = "project.leave"
+	auditRoleChange              = "project.role_change"
+	auditCollaborationRoleCreate = "project.collaboration_role_create"
+	auditCollaborationRoleRename = "project.collaboration_role_rename"
+	auditCollaborationRoleDelete = "project.collaboration_role_delete"
+	auditCollaborationRoleBind   = "project.collaboration_role_bind"
+	auditCascade                 = "project.space_cascade"
 )
 
 // Audit reasons that are not tied to one call site. Same low-cardinality rule as

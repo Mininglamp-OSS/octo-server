@@ -40,15 +40,15 @@ const containerIDRandomBytes = 16
 // project — and it earns its keep on the subsystem side, where an operator looking
 // at a `workspace.slug` or a `drive_space.id` can tell at a glance that octo-server
 // created it and for which integration.
+//
+// The prefix lives on provisionTargetSpec, so a new subsystem declares it in the
+// registry rather than here.
 func containerIDPrefix(target string) (string, bool) {
-	switch target {
-	case TargetFleet:
-		return "octows-", true
-	case TargetDrive:
-		return "octods-", true
-	default:
+	spec, ok := lookupProvisionTarget(target)
+	if !ok {
 		return "", false
 	}
+	return spec.containerPrefix, true
 }
 
 // newContainerID mints an opaque container id for one target.

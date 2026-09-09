@@ -597,6 +597,131 @@ func TestWorkerRetriesThenAbandons(t *testing.T) {
 	assert.Equal(t, callsBefore, callsAfter)
 }
 
+// TestRequeueRevivesAnAbandonedRowAndReachesReady is the manual re-drive (brief R8).
+//
+// The property that matters is the whole loop, not the UPDATE: an abandoned row is by
+// design NOT claimable (TestWorkerRetriesThenAbandons asserts a later tick cannot
+// resurrect it), so "requeue works" can only mean the row goes back to pending AND the
+// worker then actually drives it to ready. Asserting only the status change would pass
+// even if attempts stayed at max, where the sweep re-abandons the row before any
+// outbound call happens.
+func TestRequeueRevivesAnAbandonedRowAndReachesReady(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	p.cfg.Provisioning.MaxAttempts = 2
+	fleet.setStatus(http.StatusInternalServerError)
+
+	created := createVia(t, r, token, "P")
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	id, containerID := rows[0].ID, rows[0].ContainerID
+
+	// Burn the budget so the row lands in the terminal state the operator is rescuing.
+	p.processProvisioningJobs()
+	makeProvisioningRowDue(t, id)
+	p.processProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	require.Equal(t, provisionStatusAbandoned, rows[0].Status, "precondition: the row must have given up")
+
+	// The peer is healthy again — the situation in which an operator sets the env.
+	fleet.setStatus(http.StatusOK)
+	p.cfg.Provisioning.RequeueProjectID = created.ProjectID
+	p.requeueAbandonedProvisioningAtBoot()
+
+	rows = readProvisioningRows(t, created.ProjectID)
+	require.Equal(t, provisionStatusPending, rows[0].Status, "requeue must make the row claimable again")
+	assert.Equal(t, uint32(0), rows[0].Attempts,
+		"attempts must reset, or the sweep re-abandons the row before a single call goes out")
+	assert.Nil(t, rows[0].FinishedAt, "a pending row must not carry a finished_at")
+	assert.Equal(t, containerID, rows[0].ContainerID,
+		"container_id is the peer's idempotency key: reissuing it orphans any container the "+
+			"earlier attempts already created")
+	assert.Contains(t, rows[0].LastError, "requeued by operator")
+	assert.Contains(t, rows[0].LastError, "retries exhausted",
+		"the original give-up reason must survive: it is the operator's only durable evidence")
+
+	// And the loop closes: the worker drives the revived row to ready.
+	p.processProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusReady, rows[0].Status, "the requeued row must reach ready")
+	_, containers := fleet.snapshot()
+	assert.Equal(t, 1, containers[containerID],
+		"ensure is keyed on the container id, so the retry must land on the SAME container "+
+			"rather than creating a second one")
+}
+
+// TestRequeueIsANoOpOnASecondBootWithTheEnvStillSet is what makes the env form safe.
+//
+// The env value persists in the configmap after it has been applied, so every later
+// restart — a deploy, a node drain, an autoscale event — reads it again. This asserts
+// the row's own state is the idempotency record: a row that already left `abandoned`
+// is not touched, so a leftover value cannot re-drive a healthy project. That is the
+// reason there is no separate "already handled" ledger.
+//
+// It also covers the multi-replica race, which is the same statement: several pods
+// booting with the same value contend on the same rows, and the UPDATE's status
+// re-check means all but one match nothing.
+func TestRequeueIsANoOpOnASecondBootWithTheEnvStillSet(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	created := createVia(t, r, token, "P")
+
+	// A healthy project: the row reaches ready without ever being abandoned.
+	p.processProvisioningJobs()
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	require.Equal(t, provisionStatusReady, rows[0].Status)
+	readyAt, lastError := rows[0].FinishedAt, rows[0].LastError
+
+	// The operator left the env set after an earlier rescue.
+	p.cfg.Provisioning.RequeueProjectID = created.ProjectID
+	callsBefore, _ := fleet.snapshot()
+	p.requeueAbandonedProvisioningAtBoot()
+	p.requeueAbandonedProvisioningAtBoot() // a second pod, or a second restart
+
+	rows = readProvisioningRows(t, created.ProjectID)
+	assert.Equal(t, provisionStatusReady, rows[0].Status,
+		"a leftover env value must not drag a ready row back to pending")
+	assert.Equal(t, readyAt, rows[0].FinishedAt, "finished_at must be untouched")
+	assert.Equal(t, lastError, rows[0].LastError, "a no-op must not append a requeue marker")
+
+	// Nothing was re-driven, so no further ensure call was made.
+	p.processProvisioningJobs()
+	callsAfter, _ := fleet.snapshot()
+	assert.Equal(t, callsBefore, callsAfter,
+		"a no-op requeue must not cause another outbound call")
+}
+
+// TestRequeueLeavesOtherProjectsAlone pins the scoping.
+//
+// The env names ONE project deliberately — exhaustion usually means the peer was down,
+// so a blanket re-drive would re-issue the same doomed calls for every parked row. A
+// requeue that ignored project_id would look identical on the rescued project and only
+// show up as a second walk to abandoned everywhere else.
+func TestRequeueLeavesOtherProjectsAlone(t *testing.T) {
+	fleet := newFakeTarget(t)
+	p, r, token := provisioningSetup(t, fleet)
+	p.cfg.Provisioning.MaxAttempts = 1
+	fleet.setStatus(http.StatusInternalServerError)
+
+	rescued := createVia(t, r, token, "Rescued")
+	bystander := createVia(t, r, token, "Bystander")
+	for _, pid := range []string{rescued.ProjectID, bystander.ProjectID} {
+		rows := readProvisioningRows(t, pid)
+		require.Len(t, rows, 1)
+		p.processProvisioningJobs()
+		rows = readProvisioningRows(t, pid)
+		require.Equal(t, provisionStatusAbandoned, rows[0].Status, "precondition for %s", pid)
+	}
+
+	p.cfg.Provisioning.RequeueProjectID = rescued.ProjectID
+	p.requeueAbandonedProvisioningAtBoot()
+
+	assert.Equal(t, provisionStatusPending, readProvisioningRows(t, rescued.ProjectID)[0].Status)
+	assert.Equal(t, provisionStatusAbandoned, readProvisioningRows(t, bystander.ProjectID)[0].Status,
+		"requeue is scoped to the named project; a blanket re-drive is what this shape exists to avoid")
+}
+
 // panickingEnsurer is a provisionEnsurer that always panics.
 //
 // It exists because the panic path had no test at all, which is exactly why nobody
@@ -1443,6 +1568,46 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		require.Empty(t, problems)
 		require.False(t, cfg.Enabled())
 		assert.Equal(t, []string{TargetFleet}, cfg.ReclaimTargets)
+	})
+
+	// The env NAME is a configmap contract, so it is spelled as a literal here rather
+	// than through envProvisionRequeueProjectID. Keying the fixture with the same
+	// constant the code reads would be a tautology that passes through a rename — and a
+	// rename is silent in the worst way: the operator sets the documented name, the code
+	// reads a different one, the value resolves empty, and requeueAbandonedProvisioningAtBoot
+	// returns before emitting any log line. Same reasoning as the reclaim envs above.
+	t.Run("the requeue env resolves from its documented name", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:                         "fleet",
+			envProvisionFleetURL:                        "https://fleet.internal/api/internal/workspaces/ensure",
+			ProvisionFleetSecretEnv:                     okSecretA,
+			"OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID": "  p-123  ",
+		}))
+		require.Empty(t, problems)
+		assert.Equal(t, "p-123", cfg.RequeueProjectID, "the requeue env did not resolve, or was not trimmed")
+
+		unset, problems := loadProvisioningConfig(env(map[string]string{
+			envProvisionTargets:     "fleet",
+			envProvisionFleetURL:    "https://fleet.internal/api/internal/workspaces/ensure",
+			ProvisionFleetSecretEnv: okSecretA,
+		}))
+		require.Empty(t, problems)
+		assert.Empty(t, unset.RequeueProjectID, "an unset requeue env must resolve empty, not to a stale value")
+	})
+
+	// A rescue instruction that cannot run has to say so. The requeue executes from
+	// startProvisioningWorker, which returns early when nothing is enabled, so without a
+	// problem here the operator gets no output at any level — which is the outcome the
+	// env's own comment promises to prevent.
+	t.Run("the requeue env is refused when no target is enabled", func(t *testing.T) {
+		cfg, problems := loadProvisioningConfig(env(map[string]string{
+			"OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID": "p-123",
+		}))
+		require.Len(t, problems, 1)
+		assert.Contains(t, problems[0].Error(), "OCTO_PROJECT_PROVISION_REQUEUE_PROJECT_ID")
+		assert.False(t, cfg.Enabled())
+		// Still resolved: the value is reported, not silently dropped.
+		assert.Equal(t, "p-123", cfg.RequeueProjectID)
 	})
 
 	t.Run("the retired process-global reclaim env is refused, not ignored", func(t *testing.T) {

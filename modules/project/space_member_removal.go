@@ -539,6 +539,18 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 			}
 			removingAgents = append(removingAgents, agentUID)
 		}
+		closingUIDs := make([]string, 0, 1+len(removingAgents))
+		closingUIDs = append(closingUIDs, uid)
+		closingUIDs = append(closingUIDs, removingAgents...)
+		rolesCleared, err := p.db.deleteMemberCollaborationRolesTx(tx, projectID, closingUIDs)
+		if err != nil {
+			return false, err
+		}
+		if rolesCleared {
+			if err := p.db.bumpCollaborationRoleEpochTx(tx, projectID); err != nil {
+				return false, err
+			}
+		}
 		// Only when a row actually changed. The step is re-run on every job retry, so
 		// an unconditional bump would inflate the epoch on no-op reruns and break the
 		// "a no-op does not change the epoch" rule clients cache against.

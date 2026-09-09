@@ -4,6 +4,19 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-09 — project-collaboration-roles
+
+- Added project-scoped, multi-select collaboration roles for human members while
+  preserving `owner/admin/member` as the sole authorization model.
+- Added four immutable built-ins, owner-managed custom definitions, owner/admin
+  member bindings, roster exposure, an independent epoch, lifecycle cleanup, audit,
+  metrics, quotas, and a default-off write gate.
+- Closed review findings around bounded integrity scans, case-only display renames,
+  and accent-sensitive normalized-name uniqueness.
+- Recorded the implementation and operational boundaries in
+  [journal](journal/shared/project-collaboration-roles.md); reusable pagination guidance
+  is staged in [learnings/pending](learnings/pending/project-collaboration-roles.md).
+
 ## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
 
 - **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的

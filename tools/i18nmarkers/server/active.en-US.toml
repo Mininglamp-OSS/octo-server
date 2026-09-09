@@ -813,6 +813,21 @@ other = "One or more selected AI agents cannot join this project."
 ["err.server.project.batch_too_large"]
 other = "Too many members in a single request."
 
+["err.server.project.collaboration_role_disabled"]
+other = "Project collaboration-role changes are disabled."
+
+["err.server.project.collaboration_role_duplicated"]
+other = "A collaboration role with this name already exists in the project."
+
+["err.server.project.collaboration_role_invalid"]
+other = "The collaboration role is invalid."
+
+["err.server.project.collaboration_role_name_invalid"]
+other = "The collaboration role name is invalid."
+
+["err.server.project.collaboration_role_target_invalid"]
+other = "The collaboration role target is invalid."
+
 ["err.server.project.disabled"]
 other = "The project feature has been disabled by the administrator."
 
@@ -846,8 +861,14 @@ other = "You do not have permission to perform this operation."
 ["err.server.project.query_failed"]
 other = "Failed to query project data."
 
+["err.server.project.quota_collaboration_roles"]
+other = "This project has reached its collaboration role limit."
+
 ["err.server.project.quota_daily_create"]
 other = "You have created too many projects today."
+
+["err.server.project.quota_member_collaboration_roles"]
+other = "This member has reached the collaboration role limit."
 
 ["err.server.project.quota_members"]
 other = "This project has reached its member limit."

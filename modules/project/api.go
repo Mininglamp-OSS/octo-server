@@ -163,6 +163,7 @@ func New(ctx *config.Context) *Project {
 // note added to that package's census.
 func (p *Project) Route(r *wkhttp.WKHttp) {
 	p.startReconcileWorker()
+	p.startCollaborationRoleMaintenance()
 	// 项目侧成员移除级联 worker（D5）。与 Space 那条清理工单各自独立：键不同、
 	// 扇出规模不同，且 Space 的步骤契约规定「任一步骤报错整单重跑」——挂在一起会
 	// 让项目侧的失败去重跑 Space 侧已成功的步骤。
@@ -206,6 +207,12 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		projectScoped.POST("/:project_id/members/remove", p.removeMembersHandler)
 		projectScoped.POST("/:project_id/leave", p.leaveProjectHandler)
 		projectScoped.PUT("/:project_id/members/:uid/role", p.updateMemberRoleHandler)
+
+		projectScoped.GET("/:project_id/collaboration-roles", p.listCollaborationRolesHandler)
+		projectScoped.POST("/:project_id/collaboration-roles", p.createCollaborationRoleHandler)
+		projectScoped.PUT("/:project_id/collaboration-roles/:role_id", p.renameCollaborationRoleHandler)
+		projectScoped.DELETE("/:project_id/collaboration-roles/:role_id", p.deleteCollaborationRoleHandler)
+		projectScoped.PUT("/:project_id/members/:uid/collaboration-roles", p.replaceMemberCollaborationRolesHandler)
 	}
 }
 
@@ -518,21 +525,36 @@ func (p *Project) listMembersHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	uids := make([]string, 0, len(rows))
+	for _, member := range rows {
+		uids = append(uids, member.UID)
+	}
+	rolesByUID, err := p.db.memberCollaborationRoles(row.ProjectID, uids)
+	if err != nil {
+		p.Error("查询项目成员协作角色失败", zap.Error(err), zap.String("projectId", row.ProjectID))
+		respondQueryFailed(c)
+		return
+	}
 	resps := make([]*MemberResp, 0, len(rows))
 	for _, m := range rows {
+		roles := rolesByUID[m.UID]
+		if m.Robot == 1 {
+			roles = []CollaborationRoleResp{}
+		}
 		resps = append(resps, &MemberResp{
 			// D16 — the roster tells people and agents apart, and names each
 			// agent's owner, so a client can nest agents under their owner the
 			// way the Space directory does. Both come from LEFT JOINs, so a
 			// member with no user row reads as robot=0 and owner_uid="" rather
 			// than dropping out of the roster.
-			Robot:     m.Robot,
-			OwnerUID:  m.OwnerUID,
-			UID:       m.UID,
-			Name:      m.Name,
-			Role:      m.Role,
-			InviteUID: m.InviteUID,
-			CreatedAt: formatTime(m.CreatedAt),
+			Robot:              m.Robot,
+			OwnerUID:           m.OwnerUID,
+			UID:                m.UID,
+			Name:               m.Name,
+			Role:               m.Role,
+			InviteUID:          m.InviteUID,
+			CollaborationRoles: roles,
+			CreatedAt:          formatTime(m.CreatedAt),
 		})
 	}
 	c.Response(resps)
@@ -691,24 +713,25 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 // pinned section until the next list fetch.
 func (p *Project) toResp(m *Model, myRole, spaceRole, memberCount, agentCount int, pinned bool) *Resp {
 	return &Resp{
-		ProjectID:        m.ProjectID,
-		SpaceID:          m.SpaceID,
-		Name:             m.Name,
-		Description:      m.Description,
-		Logo:             m.Logo,
-		Creator:          m.Creator,
-		Discoverability:  m.Discoverability,
-		MaxMembers:       p.cfg.effectiveMaxMembers(m.MaxMembers),
-		MemberCount:      memberCount,
-		AgentCount:       agentCount,
-		MemberEpoch:      m.MemberEpoch,
-		Status:           m.Status,
-		AllMemberGroupNo: m.AllMemberGroupNo,
-		Pinned:           pinned,
-		MyRole:           myRole,
-		Capabilities:     capabilitiesFor(myRole, spaceRole),
-		CreatedAt:        formatTime(m.CreatedAt),
-		UpdatedAt:        formatTime(m.UpdatedAt),
+		ProjectID:              m.ProjectID,
+		SpaceID:                m.SpaceID,
+		Name:                   m.Name,
+		Description:            m.Description,
+		Logo:                   m.Logo,
+		Creator:                m.Creator,
+		Discoverability:        m.Discoverability,
+		MaxMembers:             p.cfg.effectiveMaxMembers(m.MaxMembers),
+		MemberCount:            memberCount,
+		AgentCount:             agentCount,
+		MemberEpoch:            m.MemberEpoch,
+		CollaborationRoleEpoch: m.CollaborationRoleEpoch,
+		Status:                 m.Status,
+		AllMemberGroupNo:       m.AllMemberGroupNo,
+		Pinned:                 pinned,
+		MyRole:                 myRole,
+		Capabilities:           capabilitiesFor(myRole, spaceRole),
+		CreatedAt:              formatTime(m.CreatedAt),
+		UpdatedAt:              formatTime(m.UpdatedAt),
 	}
 }
 

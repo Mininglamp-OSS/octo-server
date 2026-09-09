@@ -80,6 +80,22 @@ var (
 		DefaultMessage: "Invalid project member role.",
 		SafeDetailKeys: []string{"field"},
 	})
+	ErrProjectCollaborationRoleNameInvalid = register(codes.Code{
+		ID:             "err.server.project.collaboration_role_name_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The collaboration role name is invalid.",
+		SafeDetailKeys: []string{"field", "max_chars"},
+	})
+	ErrProjectCollaborationRoleInvalid = register(codes.Code{
+		ID:             "err.server.project.collaboration_role_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The collaboration role is invalid.",
+	})
+	ErrProjectCollaborationRoleTargetInvalid = register(codes.Code{
+		ID:             "err.server.project.collaboration_role_target_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The collaboration role target is invalid.",
+	})
 
 	// ---- permission / policy (403) -------------------------------------------
 
@@ -105,6 +121,11 @@ var (
 		ID:             "err.server.project.disabled",
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "The project feature has been disabled by the administrator.",
+	})
+	ErrProjectCollaborationRoleDisabled = register(codes.Code{
+		ID:             "err.server.project.collaboration_role_disabled",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Project collaboration-role changes are disabled.",
 	})
 	// ErrProjectMemberNotSpaceMember is the I1 rejection: the TARGET uid is not
 	// an active member of the project's Space. Checked inside the request
@@ -183,6 +204,18 @@ var (
 		DefaultMessage: "This project has reached its member limit.",
 		SafeDetailKeys: []string{"max"},
 	})
+	ErrProjectQuotaCollaborationRoles = register(codes.Code{
+		ID:             "err.server.project.quota_collaboration_roles",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This project has reached its collaboration role limit.",
+		SafeDetailKeys: []string{"max"},
+	})
+	ErrProjectQuotaMemberCollaborationRoles = register(codes.Code{
+		ID:             "err.server.project.quota_member_collaboration_roles",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This member has reached the collaboration role limit.",
+		SafeDetailKeys: []string{"max"},
+	})
 	// ErrProjectQuotaDailyCreate covers the per-user per-day creation cap.
 	ErrProjectQuotaDailyCreate = register(codes.Code{
 		ID:             "err.server.project.quota_daily_create",
@@ -217,6 +250,11 @@ var (
 		ID:             "err.server.project.name_duplicated",
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "A project with this name already exists in this space.",
+	})
+	ErrProjectCollaborationRoleDuplicated = register(codes.Code{
+		ID:             "err.server.project.collaboration_role_duplicated",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "A collaboration role with this name already exists in the project.",
 	})
 	// ErrProjectLastOwnerMustTransfer covers the last owner leaving or being
 	// demoted without naming a successor. The transfer and the departure happen
