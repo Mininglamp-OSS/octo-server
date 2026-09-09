@@ -390,3 +390,80 @@ func spaceSourceFuncBody(t *testing.T, file, decl string) string {
 	}
 	return kept.String()
 }
+
+// TestBulkUpsertReactivationSurvivesSpellingDrift is the round-11 P1: the hoisted
+// read decided "is this a reactivation" with an exact Go-map lookup against the
+// spelling the DATABASE returned.
+//
+// The hoist keyed priorStatus by row.UID and looked it up with the caller's uid. For a
+// stored `alice` and a requested `ALICE`:
+//
+//   - the locking read finds the row (uid compares case-insensitively) and keys it `alice`
+//   - priorStatus["ALICE"] misses, so reactivating == false
+//   - the INSERT ... ON DUPLICATE KEY UPDATE still HITS, because the unique index matches
+//     under that same collation — the seat flips 0 -> 1
+//   - the reactivation step is skipped: NO BUMP
+//
+// `_verify` then answers member:true while `epochs` keeps answering the value the
+// consumer's denial was cached under — byte-for-byte the round-8 P1 through a new door.
+//
+// Note the polarity, which is why folding alone would not have been enough: at the READ
+// sites FoldID's ASCII-only, strictly-finer design is fail-CLOSED (a miss costs an
+// "absent" answer). Here a miss is fail-OPEN on the invalidation channel, and under
+// 0900_ai_ci `José` and `Jose` are one row to the unique index and two keys to any
+// ASCII fold. So the fact is now derived from the WRITE — a predicated UPDATE whose
+// RowsAffected says whether the seat actually reopened — rather than from a string
+// comparison in Go.
+func TestBulkUpsertReactivationSurvivesSpellingDrift(t *testing.T) {
+	srv, p := setup(t)
+	p.registerSpaceMemberRemovalCleanup()
+
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "driftowner")
+	seedSpaceMember(t, spaceA, "driftowner", 2, 1)
+	// Stored lower-case; the bulk add below asks with the UPPER-case spelling.
+	seedUser(t, "drifttarget")
+	seedSpaceMember(t, spaceA, "drifttarget", 0, 1)
+
+	inProject := createProjectVia(t, srv, spaceA, ownerToken, "drift-rejoin")
+	admitted, err := p.addOneMember(inProject.ProjectID, spaceA, "driftowner", "drifttarget")
+	require.NoError(t, err)
+	require.True(t, admitted)
+
+	removed, err := spacemod.RemoveMemberForTest(
+		testCtx, spaceA, "drifttarget", 2, "driftowner", spacemod.MemberRemoveReasonKicked)
+	require.NoError(t, err)
+	require.True(t, removed)
+
+	// The project seat survived the removal window — that is what makes the reopening
+	// change the membership answer with no project-side write.
+	seat, err := testDB.queryMember(inProject.ProjectID, "drifttarget")
+	require.NoError(t, err)
+	require.NotNil(t, seat)
+	require.Equal(t, MemberStatusActive, seat.Status)
+
+	afterRemoval := epochOf(t, inProject.ProjectID)
+
+	// Re-cased spelling. The collation matches it in SQL, so the seat really does reopen.
+	require.NoError(t, spacemod.UpsertMembersForTest(testCtx, spaceA, []string{"DRIFTTARGET"}))
+
+	var status []int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT status FROM space_member WHERE space_id = ? AND uid = ?", spaceA, "drifttarget").
+		Load(&status)
+	require.NoError(t, err)
+	require.Equal(t, []int{1}, status,
+		"the fixture must actually have reopened the seat under the re-cased spelling — if the "+
+			"upsert missed the row entirely there is no reactivation to detect and this test "+
+			"proves nothing")
+
+	assert.Greater(t, epochOf(t, inProject.ProjectID), afterRemoval,
+		"reopening a seat through a re-cased uid must still move member_epoch. If it does not, "+
+			"the reactivation decision is being made by an exact Go-map lookup against the "+
+			"spelling the DATABASE returned, while the INSERT ... ON DUPLICATE hits under the "+
+			"case-insensitive unique index — the seat reopens and the invalidation signal does "+
+			"not fire, so a consumer's cached DENIAL keeps agreeing with the epoch. Derive the "+
+			"fact from the WRITE (a predicated UPDATE plus RowsAffected), not from a string "+
+			"comparison: folding cannot close it, because 0900_ai_ci is accent-insensitive and "+
+			"any ASCII fold still misses José/Jose")
+}

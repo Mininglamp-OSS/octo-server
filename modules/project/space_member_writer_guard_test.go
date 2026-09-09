@@ -113,7 +113,7 @@ var spaceMemberWriterBaseline = map[string]struct {
 	why    string
 }{
 	"modules/space/db_manager.go": {
-		writes: 6,
+		writes: 7,
 		why: "SANCTIONED. The two seat-CLOSING paths — removeMemberLockedOnce and " +
 			"removeMembersForceOnce — run runMemberRemovalTxSteps in the same " +
 			"transaction, which is where bumpMemberEpochForSpaceMemberTx is registered. " +
@@ -162,7 +162,7 @@ var spaceMemberWriterBaseline = map[string]struct {
 			"seat; admission needs no bump, see mint_obo.go.",
 	},
 	"modules/space/member_removal_all_spaces.go": {
-		writes: 3,
+		writes: 1,
 		why: "SANCTIONED. PR #855's \"close this uid's seats in EVERY Space\" path, which " +
 			"replaced botfather's bare cross-Space UPDATE. closeSeatAllSpacesOne runs " +
 			"runMemberRemovalTxSteps in the same transaction beside the outbox enqueue. It " +
@@ -172,18 +172,33 @@ var spaceMemberWriterBaseline = map[string]struct {
 			"same statement as the other two closing paths, because consistency here is " +
 			"correctness rather than tidiness: any path that skips it makes epoch " +
 			"agreement insufficient for that class of uid. TestBotSeatCloseMovesTheEpoch " +
-			"pins it. The other two matches are the doc comment's quoted SQL and the " +
-			"locking read.",
+			"pins it. Down from 3 to 1 when the census started stripping comments: the other " +
+			"two matches were the doc comment's quoted SQL and a commented example, i.e. " +
+			"prose.",
 	},
 	"modules/botfather/command.go": {
-		writes: 1,
-		why:    "KNOWN GAP — bot axis, the same statement as api_user.go:529. See above.",
+		writes: 0,
+		why: "NO WRITER. #855 replaced the bare `UPDATE space_member SET status=0 WHERE " +
+			"uid=?` here with modules/space.CloseAllSpaceSeats, which runs the removal tx " +
+			"steps (see the member_removal_all_spaces.go entry), so the bot axis is CLOSED " +
+			"rather than a known gap. This entry previously still said \"KNOWN GAP\" while the " +
+			"api_user.go entry above correctly recorded the removal — two contradictory claims " +
+			"about one fact in one file — and the count keeping the guard green came from the " +
+			"comment that QUOTES the deleted statement. The census strips comments now; this " +
+			"stays at 0 so a real writer reappearing here fails instead of matching a stale " +
+			"baseline.",
 	},
 	"modules/botfather/db.go": {
 		writes: 3,
-		why: "ONE INSERT (admission) plus TWO KNOWN GAPS on the bot axis: " +
-			"`DELETE FROM space_member WHERE uid=?` (db.go:231) and its fail-closed " +
-			"`UPDATE ... SET status=0` fallback (db.go:270). See api_user.go above.",
+		why: "ONE INSERT (admission) plus the two writers inside deleteCreatedBotArtifacts — " +
+			"`DELETE FROM space_member WHERE uid=?` (:231) and its fail-closed " +
+			"`UPDATE ... SET status=0` fallback (:270). Both are the COMPENSATION path for a bot " +
+			"creation that FAILED, i.e. a bot that never got far enough to hold a project seat, " +
+			"so there is no surviving seat for them to strand. This entry used to call them " +
+			"KNOWN GAPs on the bot axis, which overstated them: the real bot-deletion axis is " +
+			"closed (see the member_removal_all_spaces.go entry). Left counted rather than " +
+			"exempted because the reasoning is about REACHABILITY — a future change that made " +
+			"this path run against an established bot would need a fresh look.",
 	},
 	"modules/botfather/mint_obo.go": {
 		writes: 1,
@@ -219,7 +234,21 @@ func TestEverySpaceMemberWriterIsAccountedFor(t *testing.T) {
 		if readErr != nil {
 			return readErr
 		}
-		n := len(spaceMemberWrite.FindAllString(string(data), -1))
+		// Comments stripped before matching. Without it the census counted PROSE: a comment
+		// quoting the bare `UPDATE space_member SET status=0` that #855 removed was the
+		// ENTIRE "write" attributed to modules/botfather/command.go, and the baseline entry
+		// then described a statement that no longer exists. The mechanical risk is the
+		// reason rather than the tidiness: in a file whose count includes prose matches,
+		// deleting a comment while adding one real writer preserves the count and the guard
+		// stays green. The epoch guard next door already strips.
+		//
+		// NOT the package's existing stripSourceComments: its block-comment pass treats an
+		// unpaired `/*` as opening a comment that runs to EOF, and `// … /v1/bot/*
+		// authentication` in modules/botfather/mint_obo.go is exactly that — it swallowed the
+		// rest of the file including a real `INSERT INTO space_member`, taking that writer's
+		// count from 1 to 0. A stripper that deletes real code from a census makes the census
+		// under-count, which is the direction that hides a writer. Line comments only here.
+		n := len(spaceMemberWrite.FindAllString(stripLineComments(string(data)), -1))
 		if n == 0 {
 			return nil
 		}
@@ -263,13 +292,46 @@ func TestEverySpaceMemberWriterIsAccountedFor(t *testing.T) {
 		}
 	}
 
-	// The other direction: a baseline entry that no longer matches means the guard
-	// has been silently emptied for that file — the exact way a source guard dies.
-	for file := range spaceMemberWriterBaseline {
-		if _, ok := found[file]; !ok {
-			t.Errorf("spaceMemberWriterBaseline lists %s but the sweep found no "+
-				"space_member write there; either the writer moved (re-point the baseline) "+
-				"or the pattern stopped matching it (fix the pattern)", file)
+	// The other direction: a baseline entry that no longer matches means the guard has been
+	// silently emptied for that file — the exact way a source guard dies.
+	//
+	// EXCEPT for an entry declaring `writes: 0`, which is an assertion in its own right:
+	// "this file MUST NOT write space_member". Those are files whose writer was removed by
+	// an upstream change, kept in the baseline so a reappearance fails the count check
+	// above instead of matching nothing and being silently accepted. Treating them as
+	// stale would force deleting exactly the entries that make a regression visible.
+	for file, entry := range spaceMemberWriterBaseline {
+		if _, ok := found[file]; !ok && entry.writes != 0 {
+			t.Errorf("spaceMemberWriterBaseline lists %s with writes: %d but the sweep found "+
+				"none; either the writer moved (re-point the baseline) or the pattern stopped "+
+				"matching it (fix the pattern). If the writer was legitimately REMOVED, set "+
+				"writes: 0 with the reason rather than deleting the entry — the entry is what "+
+				"makes a reappearance fail.", file, entry.writes)
 		}
 	}
+}
+
+// stripLineComments removes // comments and nothing else, so the census matches CODE
+// rather than prose about code.
+//
+// Line comments only, deliberately. The package's stripSourceComments also handles block
+// comments, and its pass treats an unpaired `/*` as running to EOF — which a Go source
+// file legitimately contains inside a line comment (`/v1/bot/*`), and which then deletes
+// every real statement after it. For a CENSUS that is the dangerous direction: a
+// swallowed writer reads as no writer. Over-stripping is safe for a guard asserting
+// presence; it is not safe for one counting occurrences.
+//
+// A string literal containing "//" would be truncated. None of the swept SQL has one, and
+// a real lexer is not worth it for a guard whose remaining failure mode is over-counting
+// (which shows up as a baseline mismatch, not as silence).
+func stripLineComments(src string) string {
+	var out strings.Builder
+	for _, line := range strings.Split(src, "\n") {
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = line[:idx]
+		}
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	return out.String()
 }

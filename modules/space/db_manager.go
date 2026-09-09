@@ -472,39 +472,65 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// 一条语句取全部目标行的锁与当前 status。放在任何写入之前：循环里就不会在持有
-	// octo_project 锁之后再去要 space_member 锁。
-	var existing []struct {
-		UID    string `db:"uid"`
-		Status int    `db:"status"`
-	}
+	// 一条语句取全部目标行的锁。放在任何写入之前：循环里就不会在持有 octo_project 锁
+	// 之后再去要 space_member 锁（见上面 (b)）。
+	//
+	// 只取锁，**不把结果当判据**。第一版把这条读的结果存进 map[uid]status 再用调用方的
+	// uid 去查，那是本轮 review 抓到的 P1：见下面「判据必须来自写入」。
 	if _, err = tx.SelectBySql(
-		"SELECT uid, status FROM space_member WHERE space_id=? AND uid IN ? FOR UPDATE",
+		"SELECT uid FROM space_member WHERE space_id=? AND uid IN ? FOR UPDATE",
 		spaceId, uids,
-	).Load(&existing); err != nil {
+	).ReturnStrings(); err != nil {
 		return err
-	}
-	priorStatus := make(map[string]int, len(existing))
-	for _, row := range existing {
-		priorStatus[row.UID] = row.Status
 	}
 
 	for _, uid := range uids {
-		status, had := priorStatus[uid]
-		reactivating := had && status == 0
-
-		if _, err := tx.InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
-				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
+		// 判据来自**写入**，不来自 Go 里的字符串比较。
+		//
+		// 上一版是 `priorStatus[uid]`——map 的键是**数据库返回的拼写**，查询用的是**调用方
+		// 的拼写**。而 `space_member.uid` 在生产上是 utf8mb4_0900_ai_ci，大小写与重音都不
+		// 敏感：请求 `ALICE` 而库里存 `alice` 时，加锁读找得到那行、键为 `alice`，Go 查询
+		// 落空 → 判定「不是重新激活」；但下面的 `ON DUPLICATE` 照样命中唯一索引，席位真的
+		// 从 0 翻到 1 —— **席位重开了，失效信号没发**。消费方缓存的那条拒绝会一直和 epoch
+		// 对得上。
+		//
+		// 折叠解决不了这个：FoldID 是刻意 ASCII-only 的，其「严格更细」的论证成立于**读**
+		// 路径，因为那里落空是 fail-CLOSED（多答一次 absent）。这里落空是 fail-OPEN，极性反
+		// 了；而 0900_ai_ci 连重音都不敏感，`José` 与 `Jose` 对唯一索引是一行、对任何 ASCII
+		// 折叠是两个键，折了照样漏。
+		//
+		// 所以先用一条**带谓词的 UPDATE** 去尝试重新激活，让 RowsAffected 回答「这次到底有没
+		// 有把一个已关闭的席位打开」。数据库用它自己的 collation 匹配，Go 侧不再有可漂移的
+		// 比较——同 removeMembersForceOnce 的做法（它也是靠 status 谓词 + RowsAffected 判断
+		// 「这行真的改了吗」，而不是拿调用方拼写查 map）。
+		res, err := tx.UpdateBySql(
+			"UPDATE space_member SET status=1, updated_at=NOW() "+
+				"WHERE space_id=? AND uid=? AND status=0",
 			spaceId, uid,
-		).Exec(); err != nil {
+		).Exec()
+		if err != nil {
+			return err
+		}
+		reactivated, err := res.RowsAffected()
+		if err != nil {
 			return err
 		}
 
-		if reactivating {
-			if err := runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+		// 剩下的两种情形交给 upsert：行不存在（插入）、已经是活跃成员（空写）。
+		// 重新激活的那一行上面已经改过，这条对它是空写，两者都不该动 epoch。
+		if reactivated == 0 {
+			if _, err := tx.InsertBySql(
+				"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
+					"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
+				spaceId, uid,
+			).Exec(); err != nil {
 				return err
 			}
+			continue
+		}
+
+		if err := runMemberReactivationTxSteps(tx, spaceId, uid); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()

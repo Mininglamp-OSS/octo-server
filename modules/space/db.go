@@ -1118,26 +1118,42 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 	// 本函数是**设计好的重新加入漏斗**，不是边缘路径：resetApprovedApplyForRejoin 存在
 	// 的目的就是把陈旧的已通过申请打回待审批，让被移除的人重新申请并从这里回来。
 	// 三个审批入口（空间内 / 管理端 / H5 auth_code）都汇聚到这里。
-	reactivated := memberRows > 0
-	if reactivated {
-		_, err = tx.Update("space_member").
-			Set("status", 1).Set("role", 0).Set("updated_at", time.Now()).
-			Where("space_id=? AND uid=?", spaceId, row.UID).Exec()
-	} else {
-		_, err = tx.InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-			spaceId, row.UID,
-		).Exec()
-	}
+	// 判据来自**写入**，而不是「之前那条读回了几行」。
+	//
+	// `memberRows > 0` 在今天是对的（行数由数据库给出、`row.UID` 也一路是数据库的拼写），
+	// 但那个正确性依赖一段论证，而同类判定在 upsertMembers 上就是靠一段论证塌掉的：那边
+	// 拿调用方拼写去查以数据库拼写为键的 map，在 0900_ai_ci 下漏判、席位重开而信号不发。
+	// 这里改成带 `status=0` 谓词的 UPDATE + RowsAffected，让数据库用自己的 collation 回答
+	// 「这次到底有没有把一个已关闭的席位打开」——判据不再有可漂移的中间量。
+	res, err := tx.UpdateBySql(
+		"UPDATE space_member SET status=1, role=0, updated_at=? "+
+			"WHERE space_id=? AND uid=? AND status=0",
+		time.Now(), spaceId, row.UID,
+	).Exec()
 	if err != nil {
 		return approveFailed, "", err
 	}
-	// 只有重新激活分支需要发失效信号。锁上下文和另外两条已修路径一致：本事务已经
-	// 持有这一行的 FOR UPDATE（上面第 3 步），所以步骤里的枚举读视图晚于该 X 锁。
+	reopened, err := res.RowsAffected()
+	if err != nil {
+		return approveFailed, "", err
+	}
+	if reopened == 0 {
+		// 不是重新激活：要么这行根本不存在（插入），要么它已经是活跃成员——而后者在第 3 步
+		// 就以 approveAlreadyMember 提前返回了，所以走到这里只剩「不存在」。
+		if _, err = tx.InsertBySql(
+			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+			spaceId, row.UID,
+		).Exec(); err != nil {
+			return approveFailed, "", err
+		}
+	}
+	// 只有真的重新打开了席位才发失效信号——判据是上面那条 UPDATE 的 RowsAffected，
+	// 不是任何 Go 侧推断。新插入的席位不发：它此前不存在，所以不可能有存活的项目席位被
+	// 它重新变得可达（新成员进项目要走项目侧写入，那边自己会 bump）。
 	//
-	// 走到这里必然是 status=0 的行：status==1 的情形在第 3 步就以
-	// approveAlreadyMember 提前返回了，所以这不是「空写也 bump」。
-	if reactivated {
+	// 锁上下文与另外三条路径一致：本事务已在第 3 步对这一行取过 FOR UPDATE，所以步骤里
+	// 那条枚举读的视图晚于该 X 锁。
+	if reopened > 0 {
 		if err = runMemberReactivationTxSteps(tx, spaceId, row.UID); err != nil {
 			return approveFailed, "", err
 		}
