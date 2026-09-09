@@ -21,24 +21,30 @@ func newBotAPIDB(ctx *config.Context) *botAPIDB {
 // ==================== Robot Model (User Bot) ====================
 
 type robotModel struct {
-	AppID         string
-	RobotID       string
-	Username      string
-	InlineOn      int
-	Placeholder   string
-	Token         string
-	Version       int64
-	Status        int
-	CreatorUID    string
-	Description   string
-	BotToken      string
-	IMTokenCache  string
-	BotCommands   string
-	AutoApprove   int
-	AccessMode    int
-	AgentPlatform string
-	AgentVersion  string
-	PluginVersion string
+	Kind              string
+	ManagementScope   string
+	ManagementSpaceID string
+	PublicationState  string
+	CreatedBy         string
+	LifecyclePending  int
+	AppID             string
+	RobotID           string
+	Username          string
+	InlineOn          int
+	Placeholder       string
+	Token             string
+	Version           int64
+	Status            int
+	CreatorUID        string
+	Description       string
+	BotToken          string
+	IMTokenCache      string
+	BotCommands       string
+	AutoApprove       int
+	AccessMode        int
+	AgentPlatform     string
+	AgentVersion      string
+	PluginVersion     string
 	// AgentHosting Agent 自报托管形态，小写 ASCII slug（self_hosted / octo_hosted /
 	// <vendor>_hosted）。取值开放、只校验形状，见 register.go 的 agentHostingPattern。
 	// 空串有两种含义，靠 AgentReportedHostingAt 区分：时间戳 NULL = 从未上报，

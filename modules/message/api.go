@@ -34,6 +34,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -571,8 +572,46 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 				httperr.ResponseErrorL(c, errcode.ErrMessagePeerNotInSpace, nil, nil)
 				return
 			}
+			identity, identityErr := botpolicy.Lookup(m.ctx.DB(), peerID)
+			if identityErr != nil {
+				m.Error("查询 Space 私聊目标 Bot 身份失败", zap.Error(identityErr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if identity != nil && identity.Kind == botpolicy.Avatar {
+				allowed, accessErr := botpolicy.CanAccessChannel(m.ctx.DB(), peerID, uid,
+					common.ChannelTypePerson.Uint8(), spaceID)
+				if accessErr != nil {
+					m.Error("校验 Space 数字分身私聊权限失败", zap.Error(accessErr))
+					httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+					return
+				}
+				if !allowed {
+					httperr.ResponseErrorL(c, errcode.ErrMessagePeerNotInSpace, nil, nil)
+					return
+				}
+			}
 		} else {
 			// 个人空间模式（兼容）：检查好友关系
+			identity, identityErr := botpolicy.Lookup(m.ctx.DB(), req.ReceiveChannelID)
+			if identityErr != nil {
+				m.Error("查询私聊目标 Bot 身份失败", zap.Error(identityErr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if identity != nil && identity.Kind == botpolicy.Avatar {
+				allowed, accessErr := botpolicy.CanAccessChannel(m.ctx.DB(), req.ReceiveChannelID, uid,
+					common.ChannelTypePerson.Uint8(), "")
+				if accessErr != nil {
+					m.Error("校验数字分身共同 Space 失败", zap.Error(accessErr))
+					httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+					return
+				}
+				if !allowed {
+					httperr.ResponseErrorL(c, errcode.ErrMessagePeerNotInSpace, nil, nil)
+					return
+				}
+			}
 			sendUserIsFriend, err := m.userService.IsFriend(uid, req.ReceiveChannelID)
 			if err != nil {
 				m.Error("查询发送者与接受者好友关系错误", zap.Error(err))

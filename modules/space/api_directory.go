@@ -19,7 +19,8 @@ const (
 )
 
 type directoryResponse struct {
-	Data []directoryMemberResp `json:"data"`
+	Data             []directoryMemberResp `json:"data"`
+	DigitalEmployees []directoryAgentResp  `json:"digital_employees"`
 }
 
 type directoryMemberResp struct {
@@ -38,6 +39,7 @@ type directoryAgentResp struct {
 	IsFriend          bool    `json:"is_friend"`
 	Hosting           string  `json:"hosting"`
 	HostingReportedAt *string `json:"hosting_reported_at"`
+	BotType           string  `json:"bot_type"`
 }
 
 // listDirectory returns each active human in a verified Space with the
@@ -93,6 +95,12 @@ func (s *Space) listDirectory(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
+	avatars, err := s.db.queryDirectoryAvatars(ctx, spaceID, c.GetLoginUID(), keyword)
+	if err != nil {
+		s.Error("查询空间通讯录数字员工失败", zap.Error(err), zap.String("space_id", spaceID))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+		return
+	}
 
 	resp := make([]directoryMemberResp, 0, len(owners))
 	ownerIndex := make(map[string]int, len(owners))
@@ -125,6 +133,14 @@ func (s *Space) listDirectory(c *wkhttp.Context) {
 			IsFriend:          agent.IsFriend == 1,
 			Hosting:           agent.Hosting,
 			HostingReportedAt: formatDirectoryHostingReportedAt(agent),
+			BotType:           "user_bot",
+		})
+	}
+	digitalEmployees := make([]directoryAgentResp, 0, len(avatars))
+	for _, avatar := range avatars {
+		digitalEmployees = append(digitalEmployees, directoryAgentResp{
+			UID: avatar.UID, Name: avatar.Name, Description: avatar.Description,
+			IsFriend: avatar.IsFriend == 1, BotType: "avatar",
 		})
 	}
 
@@ -138,7 +154,7 @@ func (s *Space) listDirectory(c *wkhttp.Context) {
 		resp = filtered
 	}
 
-	c.Response(directoryResponse{Data: resp})
+	c.Response(directoryResponse{Data: resp, DigitalEmployees: digitalEmployees})
 }
 
 func formatDirectoryHostingReportedAt(agent *directoryAgentModel) *string {

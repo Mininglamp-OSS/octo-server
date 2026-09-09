@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
@@ -195,6 +196,20 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 			}
 			rb.Debug("DM消息路由检测", zap.String("channelID", message.ChannelID), zap.String("fromUID", message.FromUID), zap.String("targetUID", uid), zap.String("realUID", realUID), zap.Bool("isRobot", exist))
 			if exist {
+				identity, identityErr := botpolicy.Lookup(rb.ctx.DB(), realUID)
+				if identityErr != nil {
+					rb.Error("查询 Bot 身份失败", zap.Error(identityErr), zap.String("robotID", realUID))
+					continue
+				}
+				if identity != nil && identity.Kind == botpolicy.Avatar {
+					allowed, accessErr := botpolicy.CanAccessChannel(rb.ctx.DB(), realUID, message.FromUID,
+						common.ChannelTypePerson.Uint8(), "")
+					if accessErr != nil || !allowed {
+						rb.Warn("数字分身私聊因共同 Space 失效而停止路由", zap.Error(accessErr),
+							zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+						continue
+					}
+				}
 				// BotFather 跳过好友关系校验
 				if realUID != "botfather" {
 					// 检查发送者是否为 Bot 创建者（使用缓存减少 DB 查询）

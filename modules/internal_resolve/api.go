@@ -250,7 +250,7 @@ func (m *Module) resolveBotOwner(c *wkhttp.Context) {
 	switch identity.Kind {
 	case botidentity.KindUserBot:
 		c.Response(resolveBotOwnerResponse{UID: uid, Robot: 1, BotCreatorUID: identity.CreatorUID})
-	case botidentity.KindAppBot:
+	case botidentity.KindAppBot, botidentity.KindAvatar:
 		c.Response(resolveBotOwnerResponse{UID: uid, Robot: 1, BotCreatorUID: ""})
 	default:
 		m.Error("resolve-bot-owner: unknown botidentity.Kind — refusing to guess",

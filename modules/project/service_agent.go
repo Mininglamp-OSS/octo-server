@@ -3,6 +3,7 @@ package project
 import (
 	"errors"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 )
@@ -68,7 +69,7 @@ const (
 // 形状不校验取值（见 modules/botfather/sql 的那条迁移）。排除它的理由是：用户在
 // 选择器里看不到的分身，不该能从接口带进来。
 func (p *Project) classifyAgentsTx(
-	tx *dbr.Tx, ownerUID string, uids []string, held map[string]bool,
+	tx *dbr.Tx, spaceID, ownerUID string, uids []string, held map[string]bool,
 ) (map[string]agentEligibility, error) {
 	out := make(map[string]agentEligibility, len(uids))
 	if len(uids) == 0 {
@@ -100,6 +101,17 @@ func (p *Project) classifyAgentsTx(
 		if !row.AccountUsable {
 			// 已停用 / 已销毁的账号。通讯录里看不到它，所以接口也不该接受它。
 			out[uid] = agentEligibility{Reason: agentReasonAccountUnusable}
+			continue
+		}
+		if row.Kind == botpolicy.Avatar {
+			inScope := row.CreatorUID == "" && row.Pending == 0 && row.Publication == botpolicy.Published &&
+				((row.Scope == botpolicy.ScopePlatform && row.SpaceID == "") ||
+					(row.Scope == botpolicy.ScopeSpace && row.SpaceID == spaceID))
+			if !inScope || !held[uid] {
+				out[uid] = agentEligibility{Reason: agentReasonNoSpaceSeat}
+				continue
+			}
+			out[uid] = agentEligibility{OK: true, Reason: agentReasonOKPlaceholder}
 			continue
 		}
 		if row.CreatorUID == "" {

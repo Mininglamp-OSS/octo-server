@@ -366,6 +366,86 @@ func TestAITeamAgentLifecycleAndSessionIdempotency(t *testing.T) {
 	assert.ElementsMatch(t, []string{f.uid, f.botID}, channels[session1.ChannelID])
 }
 
+func TestDigitalAvatarMembershipIsIndependentPerUser(t *testing.T) {
+	resetState(t)
+	suffix := util.GenerUUID()[:8]
+	spaceID := "avatar_team_space_" + suffix
+	avatarID := "avatar_team_" + suffix
+	userA, userB := "avatar_user_a_"+suffix, "avatar_user_b_"+suffix
+	for _, row := range []struct {
+		uid   string
+		name  string
+		robot int
+	}{{userA, "User A", 0}, {userB, "User B", 0}, {avatarID, "Digital employee", 1}} {
+		_, err := testContext.DB().InsertBySql(
+			"INSERT INTO `user` (uid,name,username,short_no,status,robot,is_destroy) VALUES (?,?,?,?,1,?,0)",
+			row.uid, row.name, row.uid, row.uid, row.robot).Exec()
+		require.NoError(t, err)
+	}
+	_, err := testContext.DB().InsertBySql(
+		"INSERT INTO `space` (space_id,name,creator,status) VALUES (?,?,?,1)", spaceID, "Avatar team", userA).Exec()
+	require.NoError(t, err)
+	for _, uid := range []string{userA, userB, avatarID} {
+		_, err = testContext.DB().InsertBySql(
+			"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", spaceID, uid).Exec()
+		require.NoError(t, err)
+	}
+	_, err = testContext.DB().InsertBySql(`INSERT INTO robot
+		(robot_id,status,creator_uid,auto_approve,kind,management_scope,management_space_id,
+		 created_by,publication_state,lifecycle_pending)
+		VALUES (?,1,'',1,'avatar','space',?,'manager','published',0)`, avatarID, spaceID).Exec()
+	require.NoError(t, err)
+
+	fixtureFor := func(uid string) fixture {
+		token := "avatar_team_token_" + uid
+		require.NoError(t, testContext.Cache().Set(testContext.GetConfig().Cache.TokenCachePrefix+token, uid+"@test"))
+		return fixture{uid: uid, botID: avatarID, spaceID: spaceID, token: token}
+	}
+	a, b := fixtureFor(userA), fixtureFor(userB)
+
+	add := func(f fixture) string {
+		w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+avatarID, "", nil)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var response struct {
+			GroupNo string `json:"group_no"`
+		}
+		decodeJSON(t, w, &response)
+		require.NotEmpty(t, response.GroupNo)
+		return response.GroupNo
+	}
+	groupA, groupB := add(a), add(b)
+	require.NotEqual(t, groupA, groupB, "each user owns an independent private container")
+
+	createSession := func(f fixture, key string) string {
+		w := request(t, f, http.MethodPost, "/v1/ai-team/agents/"+avatarID+"/sessions", key, map[string]string{"name": key})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var response struct {
+			SessionID string `json:"session_id"`
+			ChannelID string `json:"channel_id"`
+		}
+		decodeJSON(t, w, &response)
+		require.NotEmpty(t, response.SessionID)
+		return response.ChannelID
+	}
+	channelA := createSession(a, "avatar-a")
+	channelB := createSession(b, "avatar-b")
+
+	w := request(t, a, http.MethodDelete, "/v1/ai-team/agents/"+avatarID, "", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	target, err := aiteampkg.LookupReadySessionTarget(testContext.DB(), channelA, userA)
+	require.NoError(t, err)
+	require.Nil(t, target, "removal must stop this user's active routing")
+	target, err = aiteampkg.LookupReadySessionTarget(testContext.DB(), channelB, userB)
+	require.NoError(t, err)
+	require.NotNil(t, target, "one user's removal must not affect another user")
+
+	restoredGroup := add(a)
+	require.Equal(t, groupA, restoredGroup, "re-adding must reuse and repair the historical container")
+	target, err = aiteampkg.LookupReadySessionTarget(testContext.DB(), channelA, userA)
+	require.NoError(t, err)
+	require.NotNil(t, target, "re-adding restores routing to the preserved historical session")
+}
+
 func TestAITeamGroupAndAgentContainersConvergeTogether(t *testing.T) {
 	f := seedFixture(t)
 	w := request(t, f, http.MethodGet, "/v1/ai-team/agents", "", nil)

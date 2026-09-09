@@ -44,6 +44,12 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 	}
 
 	robotID := getRobotIDFromContext(c)
+	if getBotKindFromContext(c) == BotKindAvatar {
+		if err := ba.checkSendPermission(c, BotKindAvatar, robotID, req.ChannelID, req.ChannelType, false); err != nil {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
+			return
+		}
+	}
 
 	// Group: verify bot is a member
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {

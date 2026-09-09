@@ -17,7 +17,8 @@ import (
 )
 
 type directoryResponseForTest struct {
-	Data []directoryMemberForTest `json:"data"`
+	Data             []directoryMemberForTest `json:"data"`
+	DigitalEmployees []directoryAgentForTest  `json:"digital_employees"`
 }
 
 type directoryMemberForTest struct {
@@ -36,6 +37,7 @@ type directoryAgentForTest struct {
 	IsFriend          bool    `json:"is_friend"`
 	Hosting           string  `json:"hosting"`
 	HostingReportedAt *string `json:"hosting_reported_at"`
+	BotType           string  `json:"bot_type"`
 }
 
 type memberResponseForTest struct {
@@ -191,6 +193,16 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-octo-null-ts", "Octo Null TS", "cloud no ts", "octo_hosted", nil, 1, 1)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-vendor", "Vendor Bot", "third party", "vendor_hosted", &reportedAt, 1, 1)
 	seedDirectoryFriend(t, testutil.UID, "bot-octo")
+	avatarID := "avatar-directory"
+	seedDirectoryUser(t, avatarID, "Digital Employee", 1, 1, 0)
+	_, err = testCtx.DB().InsertBySql(`INSERT INTO robot
+		(robot_id,token,status,creator_uid,description,auto_approve,kind,management_scope,
+		 management_space_id,created_by,publication_state,lifecycle_pending)
+		VALUES (?, ?,1,'','organization managed',1,'avatar','space',?,'manager','published',0)`,
+		avatarID, "token-"+avatarID, spaceID).Exec()
+	require.NoError(t, err)
+	seedDirectoryMember(t, spaceID, avatarID, 0, 1)
+	seedDirectoryFriend(t, testutil.UID, avatarID)
 
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-local", "Local", "excluded", "self_hosted", &reportedAt, 1, 1)
 	seedDirectoryBot(t, spaceID, "owner-real-name", "bot-inactive", "Inactive", "excluded", "octo_hosted", &reportedAt, 0, 1)
@@ -238,6 +250,12 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	require.False(t, nullTS.IsFriend)
 	require.Equal(t, "octo_hosted", nullTS.Hosting)
 	require.Nil(t, nullTS.HostingReportedAt)
+	require.Equal(t, "user_bot", findDirectoryAgent(t, owner.Agents, "bot-octo").BotType)
+	require.Len(t, resp.DigitalEmployees, 1)
+	digitalEmployee := findDirectoryAgent(t, resp.DigitalEmployees, avatarID)
+	require.Equal(t, "avatar", digitalEmployee.BotType)
+	require.Equal(t, "Digital Employee", digitalEmployee.Name)
+	require.True(t, digitalEmployee.IsFriend)
 
 	placeholder := findDirectoryMember(t, resp.Data, "owner-placeholder")
 	require.Equal(t, memberDisplayNamePlaceholderPrefix+"owner-placeholder", placeholder.Name)

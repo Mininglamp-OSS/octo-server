@@ -7,6 +7,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -54,9 +55,20 @@ func (g *Group) provisionAllMemberGroup(ctx *config.Context, seed projectmod.All
 	if seed.ProjectID == "" || seed.SpaceID == "" || seed.Creator == "" {
 		return "", errors.New("group: all-member group seed requires project, space and creator")
 	}
+	members := make([]string, 0, len(seed.Members))
+	for _, uid := range seed.Members {
+		identity, lookupErr := botpolicy.Lookup(ctx.DB(), uid)
+		if lookupErr != nil {
+			return "", fmt.Errorf("group: inspect all-member seed identity: %w", lookupErr)
+		}
+		if identity != nil && identity.Kind == botpolicy.Avatar {
+			continue
+		}
+		members = append(members, uid)
+	}
 	resp, err := g.groupService.CreateGroup(&CreateGroupServiceReq{
 		Creator:   seed.Creator,
-		Members:   seed.Members,
+		Members:   members,
 		Name:      seed.Name,
 		SpaceID:   seed.SpaceID,
 		ProjectID: seed.ProjectID,
@@ -92,6 +104,13 @@ func (g *Group) provisionAllMemberGroup(ctx *config.Context, seed projectmod.All
 func (g *Group) admitToAllMemberGroup(ctx *config.Context, _, groupNo, uid string) error {
 	if groupNo == "" || uid == "" {
 		return errors.New("group: all-member admission requires group_no and uid")
+	}
+	identity, err := botpolicy.Lookup(ctx.DB(), uid)
+	if err != nil {
+		return fmt.Errorf("group: inspect all-member admission identity: %w", err)
+	}
+	if identity != nil && identity.Kind == botpolicy.Avatar {
+		return nil
 	}
 	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {

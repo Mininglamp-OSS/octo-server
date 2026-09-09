@@ -35,6 +35,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -416,26 +417,27 @@ func New(ctx *config.Context) *Robot {
 func (rb *Robot) Route(r *wkhttp.WKHttp) {
 
 	auth := r.Group("/v1", rb.ctx.AuthMiddleware(r))
+	uidLimit := appwkhttp.SharedUIDRateLimiter(r, rb.ctx)
 	{
-		auth.POST("/robot/sync", rb.sync)                            // 同步机器人菜单
-		auth.POST("/robot/inline_query", rb.inlineQuery)             // 机器人行内搜索
-		auth.GET("/robot/commands", rb.getCommands)                  // 查询机器人命令列表
-		auth.PUT("/robot/:robot_id/description", rb.setDescription)  // 设置 Bot 简介
-		auth.PUT("/robot/:robot_id/auto_approve", rb.setAutoApprove) // 设置是否自动通过好友申请
-		auth.GET("/robot/my_bots", rb.myBots)                        // 我的 Bot — 已添加好友的 Bot
+		auth.POST("/robot/sync", rb.sync)                                      // 同步机器人菜单
+		auth.POST("/robot/inline_query", rb.inlineQuery)                       // 机器人行内搜索
+		auth.GET("/robot/commands", rb.getCommands)                            // 查询机器人命令列表
+		auth.PUT("/robot/:robot_id/description", uidLimit, rb.setDescription)  // 设置 Bot 简介
+		auth.PUT("/robot/:robot_id/auto_approve", uidLimit, rb.setAutoApprove) // 设置是否自动通过好友申请
+		auth.GET("/robot/my_bots", uidLimit, rb.myBots)                        // 我的 Bot — 已添加好友的 Bot
 		// bot 群级免@偏好（octo-server#237）：owner 写/读/列群
-		auth.GET("/robot/:robot_id/groups", rb.listGroups)                                  // 列出 bot 所在群 + no_mention
-		auth.PUT("/robot/:robot_id/groups/:group_no/mention_pref", rb.setMentionPref)       // UPSERT 群级免@偏好
-		auth.DELETE("/robot/:robot_id/groups/:group_no/mention_pref", rb.deleteMentionPref) // 删除回退默认（幂等）
-		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", rb.getMentionPref)       // 读群级免@偏好
+		auth.GET("/robot/:robot_id/groups", uidLimit, rb.listGroups)                                  // 列出 bot 所在群 + no_mention
+		auth.PUT("/robot/:robot_id/groups/:group_no/mention_pref", uidLimit, rb.setMentionPref)       // UPSERT 群级免@偏好
+		auth.DELETE("/robot/:robot_id/groups/:group_no/mention_pref", uidLimit, rb.deleteMentionPref) // 删除回退默认（幂等）
+		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", uidLimit, rb.getMentionPref)       // 读群级免@偏好
 		// Bot 级配置（task bot-setting-store）：owner 目录查询 / 批量写 / 删除覆盖。
 		//
 		// SharedUIDRateLimiter 逐路由挂而非挂在整个 auth 组上：本组已有十余个既有
 		// 路由，给整组加限流会改变它们的行为，超出本任务范围。顺序必须在
 		// AuthMiddleware 之后——限流器读不到 uid 会静默 fail-open。
-		auth.GET("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.listBotSettings)
-		auth.PUT("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.updateBotSettings)
-		auth.DELETE("/robot/:robot_id/settings/:key", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteBotSetting)
+		auth.GET("/robot/:robot_id/settings", uidLimit, rb.listBotSettings)
+		auth.PUT("/robot/:robot_id/settings", uidLimit, rb.updateBotSettings)
+		auth.DELETE("/robot/:robot_id/settings/:key", uidLimit, rb.deleteBotSetting)
 	}
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
@@ -635,7 +637,8 @@ func (rb *Robot) authRobot() wkhttp.HandlerFunc {
 			respondRobotAuthCheckFailed(c)
 			return
 		}
-		if robot == nil {
+		if robot == nil || robot.Kind == "avatar" {
+			// Avatars use the capability-gated Bot API, never legacy app-key routes.
 			// Anti-enumeration: the wire collapses to one 401, but log the
 			// specific reason so operators retain visibility.
 			rb.Warn("robot 鉴权失败：机器人不存在", zap.String("robot_id", robotID))
@@ -1417,6 +1420,7 @@ func (rb *Robot) insertSystemRobot() error {
 		}
 		err = rb.db.insertTx(&robot{
 			RobotID: robotID,
+			Kind:    string(botpolicy.User),
 			Status:  int(Enable),
 			Token:   util.GenerUUID(),
 			Version: robotVersion,
@@ -1690,26 +1694,11 @@ func (rb *Robot) setDescription(c *wkhttp.Context) {
 		return
 	}
 
-	// 验证操作者是 Bot 创建者
-	var creatorUID string
-	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)
-	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
-		// A real DB/scan error must not masquerade as 404 — log + 500 (mirrors
-		// assertRobotOwner in mention_pref.go).
-		rb.Error("查询 robot creator 失败", zap.Error(err), zap.String("robot_id", robotID))
-		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
-		return
-	}
-	if creatorUID == "" {
-		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
-		return
-	}
-	if creatorUID != loginUID {
-		httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
+	if rb.assertRobotOwner(c, robotID, loginUID) {
 		return
 	}
 
-	_, err = rb.ctx.DB().Update("robot").Set("description", req.Description).Where("robot_id=?", robotID).Exec()
+	_, err := rb.ctx.DB().Update("robot").Set("description", req.Description).Where("robot_id=?", robotID).Exec()
 	if err != nil {
 		rb.Error("更新 robot description 失败", zap.Error(err), zap.String("robot_id", robotID))
 		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
@@ -1731,22 +1720,17 @@ func (rb *Robot) setAutoApprove(c *wkhttp.Context) {
 		return
 	}
 
-	// 验证操作者是 Bot 创建者
-	var creatorUID string
-	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)
-	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
-		// A real DB/scan error must not masquerade as 404 — log + 500 (mirrors
-		// assertRobotOwner in mention_pref.go).
-		rb.Error("查询 robot creator 失败", zap.Error(err), zap.String("robot_id", robotID))
+	if rb.assertRobotOwner(c, robotID, loginUID) {
+		return
+	}
+	identity, err := botpolicy.Lookup(rb.ctx.DB(), robotID)
+	if err != nil {
+		rb.Error("查询 robot identity 失败", zap.Error(err), zap.String("robot_id", robotID))
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
-	if creatorUID == "" {
-		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
-		return
-	}
-	if creatorUID != loginUID {
-		httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
+	if identity != nil && identity.Kind == botpolicy.Avatar && req.AutoApprove != 1 {
+		respondRobotRequestInvalid(c, "auto_approve")
 		return
 	}
 
@@ -1776,6 +1760,7 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 		CreatorUID  string `db:"creator_uid"`
 		BotCommands string `db:"bot_commands"`
 		AutoApprove int    `db:"auto_approve"`
+		Kind        string `db:"kind"`
 	}
 	var bots []spaceBotRow
 	_, err := rb.ctx.DB().SelectBySql(`
@@ -1783,11 +1768,16 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 			IFNULL(r.description,'') as description, 
 			IFNULL(r.creator_uid,'') as creator_uid,
 			IFNULL(r.bot_commands,'') as bot_commands,
-			IFNULL(r.auto_approve,0) as auto_approve
+			IFNULL(r.auto_approve,0) as auto_approve,
+			IFNULL(r.kind,'user') as kind
 		FROM space_member sm
 		INNER JOIN user u ON sm.uid = u.uid AND u.robot = 1
 		INNER JOIN robot r ON r.robot_id = sm.uid AND r.status = 1
 		WHERE sm.space_id = ? AND sm.status = 1 AND sm.uid != 'botfather'
+		AND (r.kind='user' OR (r.kind='avatar' AND r.creator_uid=''
+			AND r.publication_state='published' AND r.lifecycle_pending=0
+			AND (r.management_scope='platform' OR
+				(r.management_scope='space' AND r.management_space_id=sm.space_id))))
 		ORDER BY u.created_at DESC
 	`, spaceID).Load(&bots)
 	if err != nil {
@@ -1857,6 +1847,10 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 
 	results := make([]map[string]interface{}, 0, len(bots))
 	for _, b := range bots {
+		botType := "user_bot"
+		if b.Kind == string(botpolicy.Avatar) {
+			botType = string(botpolicy.Avatar)
+		}
 		status := "not_added" // 未添加
 		if friendMap[b.UID] {
 			status = "added" // 已添加
@@ -1871,6 +1865,7 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 			"creator_name": creatorNameMap[b.CreatorUID],
 			"bot_commands": b.BotCommands,
 			"auto_approve": b.AutoApprove,
+			"bot_type":     botType,
 			"status":       status,
 		})
 	}
@@ -1888,6 +1883,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 		Description string `db:"description"`
 		CreatorUID  string `db:"creator_uid"`
 		BotCommands string `db:"bot_commands"`
+		Kind        string `db:"kind"`
 	}
 	var bots []myBotRow
 
@@ -1895,12 +1891,22 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 		SELECT f.to_uid as uid, IFNULL(u.name,'') as name,
 			IFNULL(r.description,'') as description,
 			IFNULL(r.creator_uid,'') as creator_uid,
-			IFNULL(r.bot_commands,'') as bot_commands
+			IFNULL(r.bot_commands,'') as bot_commands,
+			IFNULL(r.kind,'user') as kind
 		FROM friend f
 		INNER JOIN user u ON f.to_uid = u.uid AND u.robot = 1
 		INNER JOIN robot r ON r.robot_id = f.to_uid AND r.status = 1
-		WHERE f.uid = ? AND f.is_deleted = 0 AND f.to_uid != 'botfather'`
-	args := []interface{}{loginUID}
+		WHERE f.uid = ? AND f.is_deleted = 0 AND f.to_uid != 'botfather'
+		AND (r.kind='user' OR (r.kind='avatar' AND r.creator_uid=''
+			AND r.publication_state='published' AND r.lifecycle_pending=0 AND EXISTS (
+				SELECT 1 FROM space_member human_sm
+				JOIN user human_u ON human_u.uid=human_sm.uid AND human_u.status=1 AND human_u.is_destroy<>2
+				JOIN space s ON s.space_id=human_sm.space_id AND s.status=1
+				JOIN space_member bot_sm ON bot_sm.space_id=s.space_id AND bot_sm.uid=r.robot_id AND bot_sm.status=1
+				WHERE human_sm.uid=? AND human_sm.status=1
+				AND (r.management_scope='platform' OR
+					(r.management_scope='space' AND r.management_space_id=s.space_id)))))`
+	args := []interface{}{loginUID, loginUID}
 
 	if spaceID != "" {
 		query += ` AND f.to_uid IN (SELECT uid FROM space_member WHERE space_id = ? AND status = 1)`
@@ -1942,6 +1948,10 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 
 	results := make([]map[string]interface{}, 0, len(bots))
 	for _, b := range bots {
+		botType := "user_bot"
+		if b.Kind == string(botpolicy.Avatar) {
+			botType = string(botpolicy.Avatar)
+		}
 		results = append(results, map[string]interface{}{
 			"uid":          b.UID,
 			"name":         b.Name,
@@ -1949,6 +1959,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 			"creator_uid":  b.CreatorUID,
 			"creator_name": creatorNameMap[b.CreatorUID],
 			"bot_commands": b.BotCommands,
+			"bot_type":     botType,
 		})
 	}
 	c.Response(results)

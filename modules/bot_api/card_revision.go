@@ -52,6 +52,12 @@ func (ba *BotAPI) botCardRevisionsClear(c *wkhttp.Context) {
 		return
 	}
 	robotID := getRobotIDFromContext(c)
+	if getBotKindFromContext(c) == BotKindAvatar {
+		if err := ba.checkSendPermission(c, BotKindAvatar, robotID, req.ChannelID, req.ChannelType, false); err != nil {
+			respondSendPermissionError(c, err)
+			return
+		}
+	}
 
 	msgIDInt, perr := strconv.ParseInt(req.MessageID, 10, 64)
 	if perr != nil {

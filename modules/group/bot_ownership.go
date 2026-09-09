@@ -3,6 +3,7 @@ package group
 import (
 	"errors"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -20,6 +21,11 @@ import (
 //   - No system-bot / public-bot whitelist exists yet.
 //   - Whether a bot is auto-kicked when its creator leaves is out of scope.
 var ErrBotOwnershipDenied = errors.New("no permission to invite this bot")
+
+// ErrAvatarOrdinaryGroupDenied keeps organization-managed avatars out of every
+// user-managed group. Their only group membership is the server-owned AI Team
+// projection, admitted through the narrow helpers in admission.go.
+var ErrAvatarOrdinaryGroupDenied = errors.New("digital avatars can only join AI Team groups")
 
 // checkBotOwnership verifies that every bot UID in memberUIDs was created by
 // inviterUID. Non-bot UIDs are ignored. An empty inviterUID or empty
@@ -54,8 +60,10 @@ func checkBotOwnership(session dbr.SessionRunner, inviterUID string, memberUIDs 
 		return nil
 	}
 	type botRow struct {
-		UID        string `db:"uid"`
-		CreatorUID string `db:"creator_uid"`
+		UID          string         `db:"uid"`
+		CreatorUID   string         `db:"creator_uid"`
+		Kind         botpolicy.Kind `db:"kind"`
+		AvatarActive bool           `db:"avatar_active"`
 	}
 	var rows []botRow
 	// LEFT JOIN on robot.status=1 matches the semantics used elsewhere
@@ -64,7 +72,8 @@ func checkBotOwnership(session dbr.SessionRunner, inviterUID string, memberUIDs 
 	// or inactive is treated as having no valid owner, and therefore
 	// cannot be invited by anyone (fail-closed).
 	_, err := session.SelectBySql(
-		"SELECT u.uid AS uid, IFNULL(r.creator_uid,'') AS creator_uid "+
+		"SELECT u.uid AS uid, IFNULL(r.creator_uid,'') AS creator_uid, IFNULL(r.kind,'') AS kind, "+
+			botpolicy.ActiveAvatarSQL("r")+" AS avatar_active "+
 			"FROM `user` u LEFT JOIN robot r ON r.robot_id = u.uid AND r.status = 1 "+
 			"WHERE u.robot = 1 AND u.uid IN ?",
 		uniq,
@@ -73,9 +82,32 @@ func checkBotOwnership(session dbr.SessionRunner, inviterUID string, memberUIDs 
 		return err
 	}
 	for _, r := range rows {
+		if r.Kind == botpolicy.Avatar && r.AvatarActive {
+			continue
+		}
 		if r.CreatorUID == "" || r.CreatorUID != inviterUID {
 			return ErrBotOwnershipDenied
 		}
+	}
+	return nil
+}
+
+// checkAvatarOrdinaryGroupAdmission rejects Avatar membership before an
+// ordinary group invite is persisted. AI Team never uses this entry point: its
+// private and aggregate projections use the transaction-scoped, purpose-checked
+// admission bridge instead. This makes normal-group APIs and service callers
+// fail closed by the same rule.
+func checkAvatarOrdinaryGroupAdmission(session dbr.SessionRunner, memberUIDs []string) error {
+	if len(memberUIDs) == 0 {
+		return nil
+	}
+	var count int
+	err := session.SelectBySql("SELECT COUNT(*) FROM robot WHERE kind='avatar' AND robot_id IN ?", memberUIDs).LoadOne(&count)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return ErrAvatarOrdinaryGroupDenied
 	}
 	return nil
 }

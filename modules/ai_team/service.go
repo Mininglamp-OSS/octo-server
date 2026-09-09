@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -47,7 +48,7 @@ func (s *Service) validateAuthority(spaceID, userUID, botID string) (string, err
 		JOIN space sp ON sp.space_id=? AND sp.status=1
 		JOIN space_member human_sm ON human_sm.space_id=sp.space_id AND human_sm.uid=? AND human_sm.status=1
 		JOIN space_member bot_sm ON bot_sm.space_id=sp.space_id AND bot_sm.uid=r.robot_id AND bot_sm.status=1
-		WHERE r.robot_id=? AND r.creator_uid=? AND r.status=1
+		WHERE r.robot_id=? AND r.status=1 AND `+botpolicy.TeamEligibilitySQL("r", "?", "sp.space_id")+`
 		LIMIT 1`, spaceID, userUID, botID, userUID).Load(&botName)
 	if err != nil {
 		return "", err
@@ -70,9 +71,10 @@ func validateAuthorityTx(tx *dbr.Tx, spaceID, userUID, botID string) error {
 	err = tx.SelectBySql(`
 		SELECT COUNT(*)
 		FROM robot r
+		JOIN space sp ON sp.space_id=? AND sp.status=1
 		JOIN user u ON u.uid=r.robot_id AND u.status=1 AND u.is_destroy<>2
-		JOIN space_member bot_sm ON bot_sm.space_id=? AND bot_sm.uid=r.robot_id AND bot_sm.status=1
-		WHERE r.robot_id=? AND r.creator_uid=? AND r.status=1`, spaceID, botID, userUID).LoadOne(&count)
+		JOIN space_member bot_sm ON bot_sm.space_id=sp.space_id AND bot_sm.uid=r.robot_id AND bot_sm.status=1
+		WHERE r.robot_id=? AND r.status=1 AND `+botpolicy.TeamEligibilitySQL("r", "?", "sp.space_id"), spaceID, botID, userUID).LoadOne(&count)
 	if err != nil {
 		return err
 	}
@@ -239,7 +241,7 @@ func (s *Service) getAgent(spaceID, userUID, botID string, requireAdded bool) (*
 		"IFNULL(a.group_no,'') AS group_no", "a.is_added", "a.container_state", "a.created_at", "a.updated_at",
 		"(SELECT COUNT(*) FROM ai_team_session ats2 JOIN thread t2 ON t2.short_id=ats2.short_id AND t2.group_no=a.group_no WHERE ats2.agent_id=a.id AND ats2.state=2 AND t2.status<>3) AS session_count",
 	).From(dbr.I("ai_team_agent").As("a")).
-		Join(dbr.I("robot").As("r"), "r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci").
+		Join(dbr.I("robot").As("r"), "r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND "+botpolicy.TeamEligibilitySQL("r", "a.user_uid COLLATE utf8mb4_0900_ai_ci", "a.space_id COLLATE utf8mb4_0900_ai_ci")).
 		Join(dbr.I("user").As("u"), "u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND u.status=1 AND u.is_destroy<>2").
 		Join(dbr.I("space").As("sp"), "sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1").
 		Join(dbr.I("space_member").As("human_sm"), "human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1").
@@ -262,7 +264,7 @@ func (s *Service) getAgent(spaceID, userUID, botID string, requireAdded bool) (*
 func (s *Service) eligibleAgentsQuery(spaceID, userUID string, columns ...string) *dbr.SelectStmt {
 	return s.ctx.DB().Select(columns...).
 		From(dbr.I("ai_team_agent").As("a")).
-		Join(dbr.I("robot").As("r"), "r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci").
+		Join(dbr.I("robot").As("r"), "r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND "+botpolicy.TeamEligibilitySQL("r", "a.user_uid COLLATE utf8mb4_0900_ai_ci", "a.space_id COLLATE utf8mb4_0900_ai_ci")).
 		Join(dbr.I("user").As("u"), "u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND u.status=1 AND u.is_destroy<>2").
 		Join(dbr.I("space").As("sp"), "sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1").
 		Join(dbr.I("space_member").As("human_sm"), "human_sm.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND human_sm.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_sm.status=1").
@@ -312,6 +314,7 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	counts := map[AgentGroupType]int64{
 		AgentGroupTypeCloudClone:        0,
 		AgentGroupTypePersonalAssistant: 0,
+		AgentGroupTypeDigitalEmployee:   0,
 	}
 	for _, groupCount := range groupCounts {
 		counts[groupCount.Type] = groupCount.Count
@@ -319,13 +322,17 @@ func (s *Service) ListAgents(spaceID, userUID string, beforeID int64, limit int)
 	page := &AgentPage{Groups: []*AgentGroup{
 		{Type: AgentGroupTypeCloudClone, Count: counts[AgentGroupTypeCloudClone], Items: make([]*Agent, 0)},
 		{Type: AgentGroupTypePersonalAssistant, Count: counts[AgentGroupTypePersonalAssistant], Items: make([]*Agent, 0)},
-		{Type: AgentGroupTypeDigitalEmployee, Count: 0, Items: make([]*Agent, 0)},
+		{Type: AgentGroupTypeDigitalEmployee, Count: counts[AgentGroupTypeDigitalEmployee], Items: make([]*Agent, 0)},
 	}}
 	if len(rows) > limit {
 		rows = rows[:limit]
 		page.NextCursor = fmt.Sprintf("%d", rows[limit-1].ID)
 	}
 	for _, agent := range rows {
+		if agent.GroupType == AgentGroupTypeDigitalEmployee {
+			page.Groups[2].Items = append(page.Groups[2].Items, agent)
+			continue
+		}
 		if agent.GroupType == AgentGroupTypeCloudClone {
 			page.Groups[0].Items = append(page.Groups[0].Items, agent)
 			continue
@@ -645,7 +652,8 @@ func (s *Service) GetSession(spaceID, userUID, shortID string) (*Session, error)
 		JOIN ai_team_agent a ON a.id=ats.agent_id
 		JOIN thread t ON t.short_id=ats.short_id AND t.group_no=a.group_no
 		LEFT JOIN thread_setting ts ON ts.group_no=t.group_no AND ts.short_id=t.short_id AND ts.uid=a.user_uid
-		JOIN robot r ON r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1 AND r.creator_uid=a.user_uid COLLATE utf8mb4_0900_ai_ci
+		JOIN robot r ON r.robot_id=a.bot_id COLLATE utf8mb4_0900_ai_ci AND r.status=1
+			AND `+botpolicy.TeamEligibilitySQL("r", "a.user_uid COLLATE utf8mb4_0900_ai_ci", "a.space_id COLLATE utf8mb4_0900_ai_ci")+`
 		JOIN user bot_u ON bot_u.uid=a.bot_id COLLATE utf8mb4_0900_ai_ci AND bot_u.status=1 AND bot_u.is_destroy<>2
 		JOIN user human_u ON human_u.uid=a.user_uid COLLATE utf8mb4_0900_ai_ci AND human_u.status=1 AND human_u.is_destroy<>2
 		JOIN space sp ON sp.space_id=a.space_id COLLATE utf8mb4_0900_ai_ci AND sp.status=1

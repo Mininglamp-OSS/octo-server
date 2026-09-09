@@ -215,6 +215,11 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "You do not have permission to invite this bot.",
 	})
+	ErrGroupAvatarAITeamOnly = register(codes.Code{
+		ID:             "err.server.group.avatar_ai_team_only",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Digital avatars can only join AI Team groups.",
+	})
 	ErrGroupBotNotInSpace = register(codes.Code{
 		ID:             "err.server.group.bot_not_in_space",
 		HTTPStatus:     http.StatusForbidden,

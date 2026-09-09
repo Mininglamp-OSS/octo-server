@@ -24,7 +24,7 @@ const (
 	AgentGroupTypeDigitalEmployee   AgentGroupType = "digital_employee"
 
 	agentHostingOctoHosted = "octo_hosted"
-	agentGroupSQL          = "CASE WHEN r.agent_hosting='" + agentHostingOctoHosted + "' THEN '" + string(AgentGroupTypeCloudClone) + "' ELSE '" + string(AgentGroupTypePersonalAssistant) + "' END"
+	agentGroupSQL          = "CASE WHEN r.kind='avatar' THEN '" + string(AgentGroupTypeDigitalEmployee) + "' WHEN r.agent_hosting='" + agentHostingOctoHosted + "' THEN '" + string(AgentGroupTypeCloudClone) + "' ELSE '" + string(AgentGroupTypePersonalAssistant) + "' END"
 )
 
 type Agent struct {

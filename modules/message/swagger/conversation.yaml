@@ -77,6 +77,10 @@ paths:
                     channel_type:
                       type: string
                       description: "频道类型"
+                    bot_type:
+                      type: string
+                      enum: [user_bot, app_bot, avatar]
+                      description: "私聊对端的权威 Bot 类型；非 Bot 或非私聊时省略"
                     unread:
                       type: integer
                       description: "未读数量"

@@ -294,3 +294,56 @@ func CloseAllSpaceSeats(ctx *config.Context, uid, operatorUID, reason string) (c
 	}
 	return closed, err
 }
+
+// MemberRemovalCleanupProgress reports unfinished cleanup owned by the Space
+// removal outbox. Lifecycle callers use it before allowing a removed identity
+// to be reactivated, so stale group/project projections cannot be restored by
+// a remove-then-add race.
+func MemberRemovalCleanupProgress(ctx *config.Context, uid, reason string) (pending, abandoned int, err error) {
+	if ctx == nil || uid == "" || !IsMemberRemoveReason(reason) {
+		return 0, 0, errors.New("space: invalid removal cleanup progress query")
+	}
+	type stateCount struct {
+		Status uint8 `db:"status"`
+		Count  int   `db:"count"`
+	}
+	var rows []stateCount
+	_, err = ctx.DB().SelectBySql(`SELECT status,COUNT(*) AS count
+		FROM space_member_removal_cleanup WHERE uid=? AND reason=? AND status IN (?,?) GROUP BY status`,
+		uid, reason, removalCleanupPending, removalCleanupAbandoned).Load(&rows)
+	if err != nil {
+		return 0, 0, fmt.Errorf("space: query removal cleanup progress: %w", err)
+	}
+	for _, row := range rows {
+		switch row.Status {
+		case removalCleanupPending:
+			pending += row.Count
+		case removalCleanupAbandoned:
+			abandoned += row.Count
+		}
+	}
+	return pending, abandoned, nil
+}
+
+// RetryAbandonedMemberRemovalCleanups explicitly reopens exhausted jobs after
+// an administrator has fixed the external dependency and requests a retry.
+// Automatic workers preserve the attempt ceiling and never hot-loop them.
+func RetryAbandonedMemberRemovalCleanups(ctx *config.Context, uid, reason string) (int64, error) {
+	if ctx == nil || uid == "" || !IsMemberRemoveReason(reason) {
+		return 0, errors.New("space: invalid removal cleanup retry")
+	}
+	result, err := ctx.DB().UpdateBySql(`UPDATE space_member_removal_cleanup
+		SET status=?,attempts=0,next_attempt_at=?,lease_owner='',lease_until=NULL,finished_at=NULL,last_error=''
+		WHERE uid=? AND reason=? AND status=?`, removalCleanupPending, time.Now().UTC(), uid, reason, removalCleanupAbandoned).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("space: retry abandoned removal cleanups: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("space: read retried removal cleanup count: %w", err)
+	}
+	if affected > 0 {
+		kickRemovalWorker()
+	}
+	return affected, nil
+}

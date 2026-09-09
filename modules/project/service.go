@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
@@ -563,7 +564,7 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	// that can expire, which is the same reason P0 moved the creator's own I1 check in
 	// here (see the comment on lockSpaceSeatRowTx above).
 	if len(agentUIDs) > 0 {
-		verdicts, err := p.classifyAgentsTx(tx, in.Creator, agentUIDs, agentSeats)
+		verdicts, err := p.classifyAgentsTx(tx, in.SpaceID, in.Creator, agentUIDs, agentSeats)
 		if err != nil {
 			return nil, err
 		}
@@ -1147,13 +1148,21 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 		return false, err
 	}
 	isAgentTarget := class.IsBot || spacepkg.IsSystemBot(uid)
+	isAvatar := class.IsBot && class.AccountUsable && class.Kind == botpolicy.Avatar &&
+		class.OwnerUID == "" && class.Pending == 0 && class.Publication == botpolicy.Published &&
+		((class.Scope == botpolicy.ScopePlatform && class.SpaceID == "") ||
+			(class.Scope == botpolicy.ScopeSpace && class.SpaceID == spaceID))
 	isOwnAgent := class.IsBot &&
 		class.AccountUsable &&
 		!spacepkg.IsSystemBot(uid) &&
 		class.OwnerUID != "" &&
 		class.OwnerUID == actorUID &&
 		class.Hosting != agentHostingSelfHosted
-	if isOwnAgent {
+	if isAvatar {
+		if !canManageMembers(actorRole) {
+			return false, errPermissionDenied
+		}
+	} else if isOwnAgent {
 		// D15 — the narrow capability, held by any active project member.
 		if !canManageOwnAgents(actorRole) {
 			return false, errPermissionDenied

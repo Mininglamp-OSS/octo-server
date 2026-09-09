@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
@@ -267,7 +268,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		}
 		spaceID := ""
 		if req.ChannelType == common.ChannelTypePerson.Uint8() {
-			spaceID = ba.resolveBotActiveSpaceID(c, robotID)
+			spaceID = ba.resolvedDMSpaceID(c, botKind, robotID)
 		}
 		webLoginURL := ""
 		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
@@ -293,7 +294,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 			payload = ba.enrichBotPayloadWithResolvedSpaceID(robotID, payload, spaceID)
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
-		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
+		payload = ba.enrichBotPayloadWithResolvedSpaceID(robotID, payload, ba.resolvedDMSpaceID(c, botKind, robotID))
 	}
 
 	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through
@@ -467,6 +468,32 @@ func ensureMap(m map[string]interface{}) map[string]interface{} {
 // take the OBO friend-gate bypass.
 func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, channelID string, channelType uint8, hasOBOContext bool) error {
 	switch botKind {
+	case BotKindAvatar:
+		if hasOBOContext {
+			return errBotSendPermNotFriend
+		}
+		if channelType == common.ChannelTypePerson.Uint8() {
+			spaceID, err := botpolicy.ResolveAvatarDMSharedSpace(ba.ctx.DB(), robotID, channelID,
+				strings.TrimSpace(c.GetHeader("X-Space-ID")))
+			if err != nil {
+				ba.Error("avatar DM Space authorization failed", zap.Error(err))
+				return errBotSendPermCheckFailed
+			}
+			if spaceID == "" {
+				return errBotSendPermNotFriend
+			}
+			c.Set(CtxKeyAvatarDMSpace, spaceID)
+			return nil
+		}
+		allowed, err := botpolicy.CanAccessChannel(ba.ctx.DB(), robotID, channelID, channelType, c.GetHeader("X-Space-ID"))
+		if err != nil {
+			ba.Error("avatar channel authorization failed", zap.Error(err))
+			return errBotSendPermCheckFailed
+		}
+		if !allowed {
+			return errBotSendPermNotGroupMember
+		}
+		return nil
 	case BotKindApp:
 		// Rule 1: App Bot only supports DM
 		if channelType != common.ChannelTypePerson.Uint8() {
@@ -625,6 +652,15 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 		ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageBotKind, sendPermissionReasonUnknown)
 		return errBotSendPermCheckFailed
 	}
+}
+
+func (ba *BotAPI) resolvedDMSpaceID(c *wkhttp.Context, botKind, robotID string) string {
+	if botKind == BotKindAvatar {
+		spaceID, _ := c.Get(CtxKeyAvatarDMSpace)
+		resolved, _ := spaceID.(string)
+		return resolved
+	}
+	return ba.resolveBotActiveSpaceID(c, robotID)
 }
 
 func (ba *BotAPI) queryBotGroupMemberCount(groupNo, robotID string) (int, error) {
@@ -980,6 +1016,12 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	if robotID == "" {
 		ba.respondBotAPIIdentityMissing(c)
 		return
+	}
+	if getBotKindFromContext(c) == BotKindAvatar {
+		if err := ba.checkSendPermission(c, BotKindAvatar, robotID, req.ChannelID, req.ChannelType, false); err != nil {
+			respondSendPermissionError(c, err)
+			return
+		}
 	}
 
 	// 解散守卫（企业微信式只读）：群解散后禁止 bot 编辑历史消息。

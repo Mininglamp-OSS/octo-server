@@ -43,6 +43,18 @@ change-log convention (§7). Newest first.
   [journal](journal/shared/project-collaboration-roles.md); reusable pagination guidance
   is staged in [learnings/pending](learnings/pending/project-collaboration-roles.md).
 
+## 2026-09-09 — digital-avatar-bot-kind
+
+- **Added** — organisation-managed `robot.kind=avatar` with platform/Space
+  administration, publication and credential lifecycle, discovery, Space
+  enrollment and independent AI Team membership.
+- **Protected** — Avatar Bot API uses a fail-closed allowlist. Ordinary and
+  project groups are denied even for stale member rows; only server-managed AI
+  Team containers and their threads are valid group resources.
+- **Verified** — administrator, isolation, lifecycle, project, AI Team,
+  forbidden-route and regression coverage is recorded in
+  [verification](tasks/digital-avatar-bot-kind/verification.md).
+
 ## 2026-09-09 — ai-team-all-bots-group projection resource fix
 
 - **Fixed** — removed the connection-scoped MySQL named lock from aggregate

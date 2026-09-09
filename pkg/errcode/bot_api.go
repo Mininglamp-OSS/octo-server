@@ -19,6 +19,10 @@ import (
 // surface their message on the wire — callers MUST log the underlying err with
 // full context (zap.Error) before responding.
 var (
+	ErrBotAPIAvatarUnsupported = register(codes.Code{
+		ID: "err.server.bot_api.avatar_unsupported", HTTPStatus: http.StatusForbidden,
+		DefaultMessage: "Digital avatars are not permitted to perform this operation.",
+	})
 	// ---- validation (400) ----------------------------------------------------
 
 	// ErrBotAPIRequestInvalid is the catch-all for missing/malformed request

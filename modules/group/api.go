@@ -1246,6 +1246,14 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
+		if errors.Is(err, ErrAvatarOrdinaryGroupDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupAvatarAITeamOnly, nil, nil)
+			return
+		}
+		if errors.Is(err, ErrBotOwnershipDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
+			return
+		}
 		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
 		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
 		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
@@ -1644,6 +1652,19 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	if botErr := checkAvatarOrdinaryGroupAdmission(g.ctx.DB(), req.Members); botErr != nil {
+		if errors.Is(botErr, ErrAvatarOrdinaryGroupDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupAvatarAITeamOnly, nil, nil)
+			return
+		}
+		if errors.Is(botErr, ErrBotOwnershipDenied) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
+			return
+		}
+		g.Error("检查 Avatar 群 Space 失败", zap.Error(botErr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
 
 	// 判断是否允许系统账号进入群聊
 	tStep = time.Now()
@@ -1851,6 +1872,9 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	if groupModel == nil {
 		g.Error("群不存在，拒绝加人", zap.String("group_no", groupNo))
 		return nil, errors.New("群不存在！")
+	}
+	if botErr := checkAvatarOrdinaryGroupAdmission(tx, members); botErr != nil {
+		return nil, botErr
 	}
 	// 跨 Space 外部成员标识：与 scanjoin / Service.AddGroupMembers 语义对齐。
 	// 群属于某 Space 时，不在 Space 的成员标记 is_external=1 并写 source_space_id，

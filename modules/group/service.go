@@ -1223,6 +1223,16 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	if req.Creator == "" {
 		return nil, errors.New("creator is required")
 	}
+	admissionUIDs := append([]string(nil), req.Members...)
+	if req.BotUID != "" {
+		admissionUIDs = append(admissionUIDs, req.BotUID)
+	}
+	if err := checkBotOwnership(s.ctx.DB(), req.Creator, admissionUIDs); err != nil {
+		return nil, err
+	}
+	if err := checkAvatarOrdinaryGroupAdmission(s.ctx.DB(), admissionUIDs); err != nil {
+		return nil, err
+	}
 	// Members MAY be empty — a group of just its creator is a legitimate group.
 	//
 	// This used to be rejected here, and the rejection has to go for P2: a project
@@ -1598,6 +1608,9 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	}
 	if groupModel == nil || groupModel.Status == GroupStatusDisband {
 		return nil, errors.New("group not found or disbanded")
+	}
+	if err := checkAvatarOrdinaryGroupAdmission(s.ctx.DB(), req.Members); err != nil {
+		return nil, err
 	}
 
 	// 成员去重、过滤空值

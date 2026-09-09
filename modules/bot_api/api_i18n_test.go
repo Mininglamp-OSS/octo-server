@@ -35,7 +35,7 @@ func httperrLWS(c *wkhttp.Context, code codes.Code) {
 // an HTTP-200 in-band error via c.Response(gin.H{"status":0,"msg":err.Error()}),
 // which is not an error *response* (wire 200) and so is not bannable here.
 func TestBotAPINoLegacyResponseError(t *testing.T) {
-	files := []string{
+	files := []string{"avatar_policy.go",
 		"auth.go", "register.go", "commands.go", "events.go", "mention_pref.go",
 		"sync.go", "typing.go", "send.go", "threads.go", "file.go", "groups.go",
 		"voice_adapter.go", "obo_api.go", "resolve_targets.go", "space_principal.go", "incoming_webhook.go",

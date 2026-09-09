@@ -3,6 +3,7 @@ package project
 import (
 	"fmt"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -39,10 +40,15 @@ import (
 
 // agentRow 是一次分身资格判定的输入。
 type agentRow struct {
-	UID        string `db:"uid"`
-	CreatorUID string `db:"creator_uid"`
-	Hosting    string `db:"hosting"`
-	Robot      int    `db:"robot"`
+	UID         string         `db:"uid"`
+	CreatorUID  string         `db:"creator_uid"`
+	Hosting     string         `db:"hosting"`
+	Robot       int            `db:"robot"`
+	Kind        botpolicy.Kind `db:"kind"`
+	Scope       string         `db:"management_scope"`
+	SpaceID     string         `db:"management_space_id"`
+	Publication string         `db:"publication_state"`
+	Pending     int            `db:"lifecycle_pending"`
 	// AccountUsable mirrors the contact directory: u.status = 1 AND
 	// COALESCE(u.is_destroy, 0) <> 2. D2 says the eligibility rule matches the
 	// picker, and this is the half that was missing.
@@ -71,6 +77,9 @@ func (d *DB) queryAgentRowsTx(tx *dbr.Tx, uids []string) (map[string]agentRow, e
 	_, err := tx.SelectBySql(
 		"SELECT u.uid AS uid, IFNULL(r.creator_uid, '') AS creator_uid, "+
 			"IFNULL(r.agent_hosting, '') AS hosting, u.robot AS robot, "+
+			"IFNULL(r.kind, '') AS kind, IFNULL(r.management_scope, '') AS management_scope, "+
+			"IFNULL(r.management_space_id, '') AS management_space_id, IFNULL(r.publication_state, '') AS publication_state, "+
+			"IFNULL(r.lifecycle_pending, 0) AS lifecycle_pending, "+
 			// 账号本身是否可用。D2 说资格口径与通讯录一致，而通讯录过的是
 			// u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2
 			// （modules/space/db_directory.go）。前一版只看 user.robot 和 robot.status，
@@ -192,6 +201,11 @@ type agentClass struct {
 	// 这一位决定该不该放行。把它并进 IsBot 会让一个已停用的 bot 落到**人类**分支，
 	// 也就是上一轮刚修掉的那个洞的另一种入口。
 	AccountUsable bool
+	Kind          botpolicy.Kind
+	Scope         string
+	SpaceID       string
+	Publication   string
+	Pending       int
 }
 
 // queryAgentClassTx 读一个 uid 的分身事实（D2 / D15）。
@@ -219,14 +233,22 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 		return agentClass{}, nil
 	}
 	var rows []*struct {
-		Robot         int    `db:"robot"`
-		CreatorUID    string `db:"creator_uid"`
-		Hosting       string `db:"hosting"`
-		AccountUsable bool   `db:"account_usable"`
+		Robot         int            `db:"robot"`
+		CreatorUID    string         `db:"creator_uid"`
+		Hosting       string         `db:"hosting"`
+		AccountUsable bool           `db:"account_usable"`
+		Kind          botpolicy.Kind `db:"kind"`
+		Scope         string         `db:"management_scope"`
+		SpaceID       string         `db:"management_space_id"`
+		Publication   string         `db:"publication_state"`
+		Pending       int            `db:"lifecycle_pending"`
 	}
 	_, err := tx.SelectBySql(
 		"SELECT u.robot AS robot, IFNULL(r.creator_uid, '') AS creator_uid, "+
-			"  IFNULL(r.agent_hosting, '') AS hosting, "+
+			"  IFNULL(r.agent_hosting, '') AS hosting, IFNULL(r.kind, '') AS kind, "+
+			"  IFNULL(r.management_scope, '') AS management_scope, IFNULL(r.management_space_id, '') AS management_space_id, "+
+			"  IFNULL(r.publication_state, '') AS publication_state, "+
+			"  IFNULL(r.lifecycle_pending, 0) AS lifecycle_pending, "+
 			"  (u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2) AS account_usable "+
 			"FROM `user` u "+
 			"LEFT JOIN `robot` r ON r.robot_id = u.uid AND r.status = 1 "+
@@ -244,6 +266,11 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 		OwnerUID:      rows[0].CreatorUID,
 		Hosting:       rows[0].Hosting,
 		AccountUsable: rows[0].AccountUsable,
+		Kind:          rows[0].Kind,
+		Scope:         rows[0].Scope,
+		SpaceID:       rows[0].SpaceID,
+		Publication:   rows[0].Publication,
+		Pending:       rows[0].Pending,
 	}, nil
 }
 

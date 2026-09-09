@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -427,6 +428,27 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			spaceID = "" // 非成员降级，避免伪造 space_id 写入 DM payload
 		}
 	}
+	if isBotTarget {
+		identity, identityErr := botpolicy.Lookup(f.ctx.DB(), toUser.UID)
+		if identityErr != nil {
+			f.Error("friend apply: query bot identity failed", zap.Error(identityErr), zap.String("bot", toUser.UID))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if identity != nil && identity.Kind == botpolicy.Avatar {
+			allowed, accessErr := botpolicy.CanAccessChannel(f.ctx.DB(), toUser.UID, fromUID,
+				common.ChannelTypePerson.Uint8(), spaceID)
+			if accessErr != nil {
+				f.Error("friend apply: check avatar Space authority failed", zap.Error(accessErr), zap.String("bot", toUser.UID))
+				respondUserError(c, errcode.ErrUserQueryFailed)
+				return
+			}
+			if !allowed {
+				respondUserError(c, errcode.ErrUserBotNotInSpace)
+				return
+			}
+		}
+	}
 
 	// 设置token
 	token := util.GenerUUID()
@@ -573,6 +595,19 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 // 确认好友
 // autoApproveFriend Bot 自动通过好友申请
 func (f *Friend) autoApproveFriend(fromUID string, botUID string, token string, spaceID string) {
+	identity, identityErr := botpolicy.Lookup(f.ctx.DB(), botUID)
+	if identityErr != nil {
+		f.Error("auto approve: query bot identity failed", zap.Error(identityErr), zap.String("bot", botUID))
+		return
+	}
+	if identity != nil && identity.Kind == botpolicy.Avatar {
+		allowed, accessErr := botpolicy.CanAccessChannel(f.ctx.DB(), botUID, fromUID, common.ChannelTypePerson.Uint8(), spaceID)
+		if accessErr != nil || !allowed {
+			f.Warn("auto approve: avatar no longer shares an active Space with requester",
+				zap.Error(accessErr), zap.String("bot", botUID), zap.String("user", fromUID))
+			return
+		}
+	}
 	// 建立双向好友关系
 	tx, err := f.ctx.DB().Begin()
 	if err != nil {

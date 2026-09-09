@@ -166,3 +166,31 @@ func (d *DB) queryDirectoryAgents(ctx context.Context, spaceID, loginUID, keywor
 	_, err := d.session.SelectBySql(query, args...).LoadContext(ctx, &agents)
 	return agents, err
 }
+
+// queryDirectoryAvatars returns published organization-managed identities as
+// their own directory section. They have no human creator, so attaching them
+// to queryDirectoryOwners would either hide them or invent ownership.
+func (d *DB) queryDirectoryAvatars(ctx context.Context, spaceID, loginUID, keyword string) ([]*directoryAgentModel, error) {
+	query := `SELECT '' AS creator_uid,r.robot_id AS uid,IFNULL(u.name,'') AS name,
+		IFNULL(r.description,'') AS description,CASE WHEN f.uid IS NULL THEN 0 ELSE 1 END AS is_friend,
+		'' AS hosting,NULL AS hosting_reported_at,0 AS agent_count
+		FROM robot r
+		JOIN user u ON u.uid=r.robot_id AND u.robot=1 AND u.status=1 AND u.is_destroy<>2
+		JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
+		JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		LEFT JOIN friend f ON f.uid=? AND f.to_uid=r.robot_id AND f.is_deleted=0
+		WHERE r.kind='avatar' AND r.status=1 AND r.creator_uid=''
+		AND r.publication_state='published' AND r.lifecycle_pending=0
+		AND ((r.management_scope='platform' AND r.management_space_id='') OR
+			(r.management_scope='space' AND r.management_space_id=s.space_id))`
+	// The placeholders are the requested Space first, then the viewer UID.
+	args := []interface{}{spaceID, loginUID}
+	if keyword != "" {
+		query += ` AND IFNULL(u.name,'') LIKE ?` + likeEscapeClause
+		args = append(args, buildLikePattern(keyword))
+	}
+	query += ` ORDER BY r.robot_id ASC`
+	var avatars []*directoryAgentModel
+	_, err := d.session.SelectBySql(query, args...).LoadContext(ctx, &avatars)
+	return avatars, err
+}

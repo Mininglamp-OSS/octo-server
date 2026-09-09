@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
@@ -96,6 +97,29 @@ func encodeGroupsCursor(id int64) string {
 // (api.go:1199-1230)，但区分 404（robot 不存在）/ 403（非 owner）/ 500（DB 故障）。
 // 返回 true 表示已写出错误响应、调用方应直接 return。
 func (rb *Robot) assertRobotOwner(c *wkhttp.Context, robotID, loginUID string) bool {
+	identity, identityErr := botpolicy.Lookup(rb.ctx.DB(), robotID)
+	if identityErr != nil {
+		rb.Error("查询 robot identity 失败", zap.Error(identityErr), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return true
+	}
+	if identity != nil && identity.Kind == botpolicy.Avatar {
+		if identity.PublicationState == botpolicy.Deleted {
+			httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
+			return true
+		}
+		allowed, manageErr := botpolicy.CanManageAvatar(rb.ctx.DB(), identity, loginUID, c.CheckLoginRoleIsSuperAdmin() == nil)
+		if manageErr != nil {
+			rb.Error("校验 Avatar 管理权限失败", zap.Error(manageErr), zap.String("robot_id", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return true
+		}
+		if !allowed {
+			httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
+			return true
+		}
+		return false
+	}
 	var creatorUID string
 	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").
 		From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)

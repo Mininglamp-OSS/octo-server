@@ -172,7 +172,7 @@ func (s *store) queryBotByToken(botToken string) (*botIdentity, error) {
 		CreatorUID string
 	}
 	found, err := s.session.Select("robot_id", "creator_uid").From("robot").
-		Where("bot_token=? AND bot_token!='' AND status=1", botToken).
+		Where("bot_token=? AND bot_token!='' AND status=1 AND kind='user' AND creator_uid!=''", botToken).
 		Load(&row)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, fmt.Errorf("usersecret: query bot by token: %w", err)

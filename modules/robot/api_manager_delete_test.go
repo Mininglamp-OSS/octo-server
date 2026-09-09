@@ -17,9 +17,10 @@ import (
 
 func setupRobotManagerDeleteTest(t *testing.T) (http.Handler, *Manager) {
 	t.Helper()
-	s, ctx := testutil.NewTestServer()
+	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
-	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	route := wkhttp.New()
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 
 	const managerToken = "robot-manager-delete-token"
 	require.NoError(t, ctx.Cache().Set(
@@ -32,8 +33,8 @@ func setupRobotManagerDeleteTest(t *testing.T) (http.Handler, *Manager) {
 	})
 
 	m := NewManager(ctx)
-	m.Route(s.GetRoute())
-	return s.GetRoute(), m
+	m.Route(route)
+	return route, m
 }
 
 func deleteManagedRobot(t *testing.T, route http.Handler, robotID string) *httptest.ResponseRecorder {

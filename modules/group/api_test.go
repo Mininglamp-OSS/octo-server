@@ -44,7 +44,7 @@ func TestMain(m *testing.M) {
 		// and crashes with "Illegal mix of collations". The thread
 		// package's main_test.go already sets the correct collation here;
 		// keep group's manually-built fixture in sync.
-		db.Exec("CREATE TABLE IF NOT EXISTS `robot` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `token` VARCHAR(100) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `status` SMALLINT NOT NULL DEFAULT 1, `creator_uid` VARCHAR(40) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+		db.Exec("CREATE TABLE IF NOT EXISTS `robot` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `token` VARCHAR(100) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `status` SMALLINT NOT NULL DEFAULT 1, `creator_uid` VARCHAR(40) NOT NULL DEFAULT '', `kind` VARCHAR(16) NOT NULL DEFAULT 'user', `management_scope` VARCHAR(16) NOT NULL DEFAULT '', `management_space_id` VARCHAR(40) NOT NULL DEFAULT '', `created_by` VARCHAR(40) NOT NULL DEFAULT '', `publication_state` VARCHAR(16) NOT NULL DEFAULT 'draft', `lifecycle_pending` TINYINT NOT NULL DEFAULT 0, `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 		// MySQL 8.0 不支持 `CREATE INDEX ... IF NOT EXISTS`（那是 MariaDB/Postgres
 		// 的写法），原来的写法每次都以 1064 语法错误静默失败——db.Exec 的 error
 		// 没人看，于是这两个索引在本 package 的测试库里从来就不存在。

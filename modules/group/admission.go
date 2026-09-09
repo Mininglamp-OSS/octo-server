@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botpolicy"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
@@ -334,6 +335,19 @@ func AdmitAITeamContainerMembersTx(
 		parent.Purpose != aiteampkg.GroupPurpose || parent.ProjectID != "" {
 		return false, errors.New("group: AI-team container admission target mismatch")
 	}
+	// Purpose is not an authority grant. The private container must be backed by
+	// the persisted AI Team relation in the same transaction, otherwise any
+	// internal caller able to insert a purpose-tagged group could place an Avatar
+	// into a non-AI conversation.
+	var agentCount int
+	if err = tx.SelectBySql(`SELECT COUNT(*) FROM ai_team_agent
+		WHERE space_id=? AND user_uid=? AND bot_id=? AND group_no=? AND is_added=1`,
+		spaceID, ownerUID, botUID, groupNo).LoadOne(&agentCount); err != nil {
+		return false, fmt.Errorf("group: validate AI-team container relation: %w", err)
+	}
+	if agentCount != 1 {
+		return false, errors.New("group: AI-team container relation mismatch")
+	}
 
 	var before []*aiTeamActiveMember
 	if _, err = tx.SelectBySql(
@@ -369,7 +383,7 @@ func AdmitAITeamContainerMembersTx(
 			InviteUID: ownerUID,
 			Robot:     1,
 		},
-	}, AdmissionEntryCreateGroup); err != nil {
+	}, AdmissionEntryAITeamGroup); err != nil {
 		return false, err
 	}
 
@@ -482,8 +496,8 @@ func SyncAITeamGroupMembersTx(
 		_, err = tx.SelectBySql(`SELECT r.robot_id FROM robot r
 			JOIN user u ON u.uid=r.robot_id AND u.status=1 AND u.is_destroy<>2
 			JOIN space_member sm ON sm.space_id=? AND sm.uid=r.robot_id AND sm.status=1
-			WHERE r.creator_uid=? AND r.status=1 AND r.robot_id IN ?
-			ORDER BY r.robot_id FOR UPDATE OF r`, spaceID, ownerUID, uniqueBots).Load(&authorized)
+			WHERE r.status=1 AND `+botpolicy.TeamEligibilitySQL("r", "?", "?")+` AND r.robot_id IN ?
+			ORDER BY r.robot_id FOR UPDATE OF r`, spaceID, ownerUID, spaceID, uniqueBots).Load(&authorized)
 		if err != nil {
 			return false, fmt.Errorf("group: validate AI-team group bots: %w", err)
 		}
@@ -646,6 +660,34 @@ func (d *DB) admitOrRestoreMembersTx(
 ) error {
 	if len(admissions) == 0 {
 		return nil
+	}
+	// This is the final admission choke point. Public and service paths reject
+	// Avatar membership earlier for a precise response, but event and repair
+	// paths also arrive here. An Avatar is valid only for a server-owned AI Team
+	// projection, never for a regular or project group.
+	avatarUIDs := make([]string, 0, len(admissions))
+	for _, admission := range admissions {
+		if admission.UID != "" {
+			avatarUIDs = append(avatarUIDs, admission.UID)
+		}
+	}
+	if len(avatarUIDs) > 0 {
+		var avatarCount int
+		if err := tx.SelectBySql("SELECT COUNT(*) FROM robot WHERE kind='avatar' AND robot_id IN ?", avatarUIDs).LoadOne(&avatarCount); err != nil {
+			return fmt.Errorf("group: query avatar admission target: %w", err)
+		}
+		if avatarCount > 0 {
+			if entry != AdmissionEntryAITeamGroup {
+				return ErrAvatarOrdinaryGroupDenied
+			}
+			var purpose string
+			if err := tx.Select("purpose").From("`group`").Where("group_no=?", groupNo).LoadOne(&purpose); err != nil {
+				return fmt.Errorf("group: query AI-team admission target: %w", err)
+			}
+			if purpose != aiteampkg.GroupPurpose && purpose != aiteampkg.TeamGroupPurpose {
+				return ErrAvatarOrdinaryGroupDenied
+			}
+		}
 	}
 
 	uids := make([]string, 0, len(admissions))
