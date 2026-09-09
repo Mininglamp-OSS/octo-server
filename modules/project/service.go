@@ -1709,13 +1709,14 @@ func (p *Project) leaveProjectOnce(projectID, spaceID, uid, transferTo string) (
 			// the transfer is established as necessary. The seat was already locked up front
 			// (one statement, ahead of the project row), so this is a map lookup rather than a
 			// second lock.
-			if transferTo != "" && !projectpkg.FoldedHas(heldSeats, transferTo) {
-				return "", errNotSpaceMember
-			}
-			if err := p.promoteSuccessorTx(tx, projectID, transferTo, uid, now); err != nil {
+			// No seat check here any more: promoteSuccessorTx does the lookup and the
+			// canonicalisation as one operation, so the two cannot disagree. Splitting
+			// them is what let a folded CHECK pass a raw spelling to the WRITE.
+			promoted, err := p.promoteSuccessorTx(tx, projectID, heldSeats, transferTo, uid, now)
+			if err != nil {
 				return "", err
 			}
-			successorPromoted = transferTo
+			successorPromoted = promoted
 		}
 	}
 
@@ -1848,13 +1849,12 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 		if owners <= 1 {
 			// The successor's Space seat becomes relevant exactly here — see leaveProjectOnce.
 			// Already locked in the single up-front statement, so this is a map lookup.
-			if transferTo != "" && !projectpkg.FoldedHas(heldSeats, transferTo) {
-				return false, "", errNotSpaceMember
-			}
-			if err := p.promoteSuccessorTx(tx, projectID, transferTo, targetUID, now); err != nil {
+			// Same funnel as the leave door — see there.
+			promoted, err := p.promoteSuccessorTx(tx, projectID, heldSeats, transferTo, targetUID, now)
+			if err != nil {
 				return false, "", err
 			}
-			successorPromoted = transferTo
+			successorPromoted = promoted
 		}
 	}
 
@@ -1901,13 +1901,63 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 // exclusive request on the same row, and modules/space does take exclusive space_member locks
 // (disband takes a range). A three-way cycle was reachable; this placement removes it instead
 // of arguing about it. (yujiawei Q2, PR #841 round 1.)
-func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, successorUID, departingUID string, now time.Time) error {
-	if successorUID == "" || successorUID == departingUID {
-		return errLastOwnerMustTransfer
+// # It resolves the successor itself, and returns the spelling it promoted
+//
+// Both transfer doors used to fold the seat-set CHECK and then hand this function the
+// caller's raw bytes, which is the fifth instance on this branch of a comparison being
+// widened while the write it guards was left alone. Here the consequence is the worst
+// of the five: the last owner naming a case variant of THEMSELVES passed the folded
+// seat check, slipped the byte-exact self-transfer guard below, resolved through
+// octo_project_member's case-insensitive collation onto their OWN row, no-opped the
+// role update on its `role <> ?` predicate, and then departed — leaving an active
+// project with zero owners, which this module documents as unrecoverable (role change
+// and disband are owner-only; a Space admin has read access only).
+//
+// So the resolution lives HERE rather than at each door: this is the only function that
+// performs the promotion, so a door added later cannot get it wrong by forgetting a
+// step. It takes the seat set, resolves the successor to the spelling that set holds,
+// compares BOTH sides folded, and returns the canonical spelling for the caller to use
+// as the audit value and the member-cache invalidation key — a key built from the
+// caller's bytes invalidates an entry nobody reads.
+//
+// # Three barriers, and what the tests actually pin
+//
+// The resolution, the folded self-compare, and the affected-rows check below are
+// INDEPENDENT: each one alone refuses the self-transfer that reached the zero-owner
+// state. Measured, not assumed — reverting any single one of them leaves
+// transfer_spelling_test.go green, and only reverting all three turns it red.
+//
+// Written down because a green suite would otherwise read as evidence that each barrier
+// is load-bearing, and it is not. If you are removing one of them, the tests will not
+// tell you; the argument for keeping all three is that they fail in different ways —
+// the resolution is also what supplies the audit value and the cache key, the folded
+// compare is what produces the RIGHT error instead of a downstream one, and the
+// affected-rows check is the only one that does not depend on any Go-side comparison
+// being right.
+func (p *Project) promoteSuccessorTx(
+	tx *dbr.Tx, projectID string, heldSeats map[string]bool,
+	successorUID, departingUID string, now time.Time,
+) (string, error) {
+	if successorUID == "" {
+		return "", errLastOwnerMustTransfer
 	}
+	// The seat check and the canonicalisation are one operation, so they cannot
+	// disagree. The doors used to do the check and drop the answer.
+	resolved, ok := projectpkg.FoldedLookup(heldSeats, successorUID)
+	if !ok {
+		return "", errNotSpaceMember
+	}
+	// Folded on BOTH sides. The database compares these two under a case-insensitive
+	// collation; a byte-exact guard here means Go and MySQL disagree about whether the
+	// successor is the departing owner, and the direction of that disagreement is
+	// fail-OPEN.
+	if projectpkg.FoldID(resolved) == projectpkg.FoldID(departingUID) {
+		return "", errLastOwnerMustTransfer
+	}
+	successorUID = resolved
 	successor, err := p.db.queryMemberTx(tx, projectID, successorUID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// The successor must not be a seat that is CLOSING, and this is the sharpest
 	// case of the rule rather than another instance of it. countActiveOwnersTx
@@ -1917,12 +1967,24 @@ func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, successorUID, depart
 	// the guard itself. Nothing in P0 or P1 can promote a member without an owner,
 	// so the project would be unmanageable with no path back.
 	if successor == nil || successor.Status != MemberStatusActive || successor.Removing != 0 {
-		return errMemberNotFound
+		return "", errMemberNotFound
 	}
-	if _, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now); err != nil {
-		return err
+	// The affected-rows result is checked, not discarded. It is 0 exactly when the row
+	// is already an owner — which, with the self-transfer guard above now folded, means
+	// a promotion that changed nothing and must not be reported as a transfer.
+	promoted, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now)
+	if err != nil {
+		return "", err
 	}
-	return nil
+	if !promoted {
+		return "", errLastOwnerMustTransfer
+	}
+	// The row's own bytes. Equal to `resolved` today by the admission invariant — the
+	// project seat is written with the spelling space_member returned — so this is the
+	// same value by construction rather than a second, independently-earned guarantee.
+	// Stated that way on purpose: a mutation swapping the two passes every test here,
+	// and a comment implying otherwise would be claiming coverage that does not exist.
+	return successor.UID, nil
 }
 
 // ---------- helpers ----------

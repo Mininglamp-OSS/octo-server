@@ -116,6 +116,14 @@ func (p *Project) classifyAgentsTx(
 			out[uid] = agentEligibility{Reason: agentReasonSelfHosted}
 			continue
 		}
+		// EXACT match on purpose, and if you widen it you must also rebind what gets
+		// WRITTEN. An exact hit means uid is byte-equal to the spelling the seat set holds,
+		// so the write below is canonical for free. Swapping this for FoldedHas alone —
+		// the obvious fix for the fail-CLOSED refusal of a case-variant uid — keeps the
+		// gate passing while the write keeps the caller's bytes. That is exactly how the
+		// two ownership-transfer doors ended up able to leave a project with zero owners
+		// (round 13). Use projectpkg.FoldedLookup and reassign, as admission and the
+		// transfer funnel do.
 		if !held[uid] {
 			// I1：分身也必须是本 Space 的活跃成员。botfather 建 bot 时会写
 			// space_member，所以正常路径下这一条总是成立；不成立意味着这个 bot
