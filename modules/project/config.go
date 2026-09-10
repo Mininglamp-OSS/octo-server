@@ -25,8 +25,11 @@ const (
 	envCollaborationRoleEnabled = "OCTO_PROJECT_COLLABORATION_ROLE_ENABLED"
 
 	// envReconcileEnabled gates ONLY the reconcile scans that JOIN the legacy Space tables
-	// (`space`, `space_member`, `space_member_removal_cleanup`) — I1 violations, abandoned
-	// cleanup leak, and orphan projects.
+	// (`space`, `space_member`, `space_member_removal_cleanup`) — FIVE of them, in two
+	// blocks: I1 violations, abandoned cleanup leak and orphan projects
+	// (reconcile.go, the first gated block), plus the two I4 all-member-group scans
+	// (the second). The startup Warn names all five; comments that say "three" are
+	// counting one block and are the reason this sentence now says where to look.
 	//
 	// It exists because those three fail with MySQL 1267 on any database where the legacy
 	// tables have drifted to utf8mb4_0900_ai_ci while this module's tables are pinned to
@@ -123,8 +126,9 @@ const (
 type Config struct {
 	CreateEnabled            bool
 	CollaborationRoleEnabled bool
-	// ReconcileEnabled gates the three scans that JOIN legacy Space tables. See
-	// envReconcileEnabled for why it is separate from CreateEnabled and why its scope is narrow.
+	// ReconcileEnabled gates the five scans that JOIN legacy Space tables, in two
+	// blocks — see envReconcileEnabled for the list, for why it is separate from
+	// CreateEnabled, and for why its scope is narrow.
 	ReconcileEnabled               bool
 	MaxPerSpace                    int
 	MaxPerCreator                  int

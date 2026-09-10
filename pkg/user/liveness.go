@@ -60,8 +60,12 @@ const (
 // two batch readers do.
 //
 // Absent from the map means "not a live account"; the map is never nil on success.
-// Like pkg/space.ActiveMembers this takes a *dbr.Session, so it runs outside any
-// caller transaction and proves nothing about state at COMMIT time.
+//
+// Like pkg/space.ActiveMembers this takes a dbr.SessionRunner: passed a *dbr.Session
+// it runs outside any caller transaction and proves nothing about state at COMMIT
+// time, and passed a *dbr.Tx it joins that transaction's snapshot.
+// pkg/project.ProjectMemberships passes a *dbr.Tx on purpose — see the note there —
+// so a caller in that position must not be "simplified" back to the session.
 func ActiveAccounts(session dbr.SessionRunner, uids []string) (map[string]bool, error) {
 	live := make(map[string]bool, len(uids))
 	lookup := make([]string, 0, len(uids))

@@ -35,11 +35,21 @@ func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, er
 // failed. Absent from the map means "not an active member of that Space"; the
 // map is never nil on success.
 //
-// Like CheckMembership this takes a *dbr.Session, so it runs outside any caller
-// transaction and proves nothing about state at COMMIT time. That is the
-// long-standing shape of the Space half of every group admission check, and
-// changing it is a behaviour change on every group join in the product — see
-// modules/group/admission.go for why the project half does NOT copy it.
+// The parameter is dbr.SessionRunner, satisfied by both *dbr.Session and *dbr.Tx,
+// and which one a caller passes changes what the answer MEANS:
+//
+//   - a *dbr.Session runs outside any caller transaction and proves nothing about
+//     state at COMMIT time. That is the long-standing shape of the Space half of
+//     every group admission check, and changing it is a behaviour change on every
+//     group join in the product — see modules/group/admission.go for why the
+//     project half does NOT copy it.
+//   - a *dbr.Tx joins the caller's snapshot. pkg/project.ProjectMemberships passes
+//     one deliberately: its four reads have to describe ONE instant, because an
+//     answer torn across a Space ban carries a denial beside a live epoch and the
+//     peer's cache has no bound on that combination.
+//
+// So do not "simplify" a *dbr.Tx caller back to the session. It is not a stylistic
+// choice there; it is the fix.
 func ActiveMembers(session dbr.SessionRunner, spaceID string, uids []string) (map[string]bool, error) {
 	active := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {

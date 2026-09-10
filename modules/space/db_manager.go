@@ -228,13 +228,19 @@ func (d *managerDB) forceDisbandSpace(spaceId string, operatorUID string) ([]str
 		Where("space_id=?", spaceId).Exec(); err != nil {
 		return nil, err
 	}
+	// 规范化 space_id，与用户侧 disbandSpace 同一处理、同一理由：这行刚被上面那条
+	// UPDATE X 锁住，加锁读不等人也不建立 read view；工单的两列必须同源。见 SpaceRef。
+	spaceRef, err := ResolveSpaceIDTx(tx, spaceId)
+	if err != nil {
+		return nil, err
+	}
 	if _, err = tx.Update("space_member").Set("status", 0).Set("updated_at", now).
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
 		return nil, err
 	}
 	// 批量入队：本事务正握着 space_member 的 FOR UPDATE 范围锁，逐条 INSERT 会把
 	// 上万次往返都压在锁内，期间所有并发加入路径全部阻塞。
-	if err := enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+	if err := enqueueMemberRemovalCleanupBatchTx(tx, spaceRef, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -21,8 +21,11 @@
 package project
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -601,11 +604,23 @@ func FoldedLookup(set map[string]bool, want string) (string, bool) {
 // status = 1, and by step 3 the row is disbanded forever.
 //
 // So the sentinel is refused at the read layer. The window then costs
-// availability (the peer gets a 500 and retries, and the scan repairs the row
-// within one rotation) instead of costing a permanent grant, which is the trade
-// this whole module makes everywhere else. It also removes the rollback
-// runbook's dependency on the reconcile loop still being enabled: with the loop
-// off, the endpoint refuses instead of silently handing out the collision.
+// availability instead of costing a permanent grant, which is the trade this
+// whole module makes everywhere else.
+//
+// How long that window actually is: the peer gets a 500 and retries, and the
+// handler repairs the named row out of band on the way out
+// (modules/internal_membership -> RepairAbsentSentinelEpoch), so the practical
+// bound is ONE request. Do NOT read it as "the reconcile scan fixes it within one
+// rotation" — that claim was wrong and is corrected on SentinelAnomalyError
+// above: scanEpochSanity walks a bounded page budget per tick behind a persisted
+// cursor, a row written by a not-yet-upgraded pod carries the highest id, and on
+// a large octo_project reaching it takes hours. The refusal is also per-BATCH, so
+// during that window every request whose batch of 50 contains the id fails, not
+// just requests naming it.
+//
+// It also removes the rollback runbook's dependency on the reconcile loop still
+// being enabled: with the loop off, the endpoint refuses instead of silently
+// handing out the collision.
 func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs []string) (map[string]int64, error) {
 	out := make(map[string]int64, len(projectIDs))
 	if spaceID == "" || len(projectIDs) == 0 {
@@ -724,35 +739,17 @@ func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs 
 // invalidation signal that moves when the seat closes is therefore not bounded at
 // all. Moving it at removal commit is what makes the peer contract's "epoch
 // agreement means the cache is still good" true for this path.
-// membershipTearHook runs immediately after ProjectMemberships' epoch read.
 //
-// It exists so a test can commit a Space ban at EXACTLY the point where this function
-// used to tear — between the epoch stamp and the narrowing reads — and assert the
-// answer it produces. Without it the interleaving is a race and the test would be
-// probabilistic, which on this branch has repeatedly meant "green for the wrong
-// reason".
-//
-// Unexported, so nothing outside this package can set it, and nil in every binary but
-// the one running this package's tests. The cost on the request path is one nil
-// comparison.
-var membershipTearHook func()
-
-// SetMembershipTearHookForTest installs the hook above and returns a function that
-// removes it.
-//
-// Exported because the engine harness for this package's statements lives in
-// modules/project — pkg/project is a predicate package with no database of its own,
-// which is why its statements had no engine lane until that file was written. Refuses
-// outside a test binary for the same reason modules/space's removal seams do: "nothing
-// calls it" is a property of the current tree, not a boundary.
-func SetMembershipTearHookForTest(fn func()) (restore func(), err error) {
-	if !testing.Testing() {
-		return nil, errors.New("project: the membership tear hook is test-only")
-	}
-	membershipTearHook = fn
-	return func() { membershipTearHook = nil }, nil
-}
-
+// This enumeration covers the project, seat and Space axes. It does NOT cover the
+// ACCOUNT axis, and read top-to-bottom it used to look as if it did. A super-admin
+// ban or an account destroy flips step 4's answer below while moving no epoch —
+// the epoch is per PROJECT and the ban is per USER, so there is no per-project row
+// for it to bump. Both directions ride epoch agreement unboundedly: a grant cached
+// before the ban stays good, and a denial cached during it stays denied until some
+// unrelated membership change happens to bump that project. The only bound on that
+// axis is a time bound on the consumer's side; it is out of scope for this branch
+// and specified in docs/project-membership-cache-bound-proposal.md, and the reason
+// OCTO_MEMBERSHIP_INTERNAL_TOKEN stays unset until the peer implements it.
 func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	roles := make(map[string]int, len(uids))
 	if spaceID == "" || projectID == "" {
@@ -775,17 +772,51 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	// absent sentinel, so 0 != E; unbanned gives E != 0). It cannot close an answer
 	// torn ACROSS the ban commit, because that answer carries both halves.
 	//
-	// Read-only, no locks, four point reads. MySQL 8's default REPEATABLE READ
-	// establishes the view at the first read in the transaction and holds it for the
-	// rest — measured on 8.0.33 rather than assumed: with a ban committed by another
-	// connection between two reads, the in-transaction reader still sees status = 1
-	// while a plain-session reader sees 0.
+	// Read-only, no locks, four point reads — and the isolation level is NAMED here
+	// rather than inherited, which is the half of this fix that is easy to leave out.
+	//
+	// REPEATABLE READ establishes the view at the first read in the transaction and
+	// holds it for the rest — measured on 8.0.33 rather than assumed: with a ban
+	// committed by another connection between two reads, the in-transaction reader
+	// still sees status = 1 while a plain-session reader sees 0.
+	//
+	// A bare Begin() would take whatever `transaction_isolation` the server happens
+	// to carry, and NOTHING in this repository sets it: not pkg/db, not the DSN
+	// template, not a boot check. Under READ COMMITTED each statement takes a fresh
+	// view, this transaction linearises nothing, and the torn denial comes straight
+	// back — silently, on the authorization oracle only, with no error and no log
+	// line.
+	//
+	// Two measurements, kept apart because they were taken by different people and
+	// say different things. A reviewer set `transaction_isolation` GLOBALLY to
+	// READ-COMMITTED on 8.0.46 and found that with a bare Begin() the two
+	// hook-driven cases in modules/project/torn_verify_test.go fail in exactly the
+	// original torn shape, and pass with this form. Independently, here: reverting
+	// this call to Begin() leaves those two cases GREEN on an RR server — they
+	// inherit the ambient level, so they measure the deployment — while
+	// TestProjectMembershipsPinsItsOwnIsolationLevel, which runs against a session
+	// pinned to READ COMMITTED, fails with member=false beside the live epoch.
+	//
+	// That is the whole argument for naming the level: the property is not "the
+	// engine we happen to test on is REPEATABLE READ".
+	//
+	// Scoping: `SET TRANSACTION ISOLATION LEVEL` with neither GLOBAL nor SESSION
+	// applies to the next transaction only, and go-sql-driver/mysql issues it
+	// immediately before START TRANSACTION. So this borrows nothing from the pooled
+	// connection and leaves nothing on it for the next borrower.
+	//
+	// ReadOnly is not decoration: it turns "someone added a write to this path" into
+	// a driver error instead of a review question — the same discipline SeatRef
+	// applies on the write side.
 	//
 	// The answer this produces is a point-in-time one: a ban that commits after the
 	// first read belongs to the NEXT answer. The peer learns about it from the epoch
 	// channel, whose IsActiveSpace fold turns the project absent and breaks agreement
 	// — which is a bound, and the torn denial had none.
-	tx, err := session.Begin()
+	tx, err := session.BeginTx(context.Background(), &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
 	if err != nil {
 		return 0, nil, err
 	}
@@ -795,8 +826,8 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 
 	// Step 1 — epoch + existence, in that order. See the doc comment.
 	epochs, err := ProjectEpochsInSpace(tx, spaceID, []string{projectID})
-	if membershipTearHook != nil {
-		membershipTearHook()
+	if hook := membershipTearHook.Load(); hook != nil {
+		(*hook)()
 	}
 	if err != nil {
 		return 0, nil, err
@@ -922,6 +953,47 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 		roles[folded] = r.Role
 	}
 	return epoch, roles, nil
+}
+
+// membershipTearHook runs immediately after ProjectMemberships' epoch read.
+//
+// It exists so a test can commit a Space ban at EXACTLY the point where that function
+// used to tear — between the epoch stamp and the narrowing reads — and assert the
+// answer it produces. Without it the interleaving is a race and the test would be
+// probabilistic, which on this branch has repeatedly meant "green for the wrong
+// reason".
+//
+// Unexported, so nothing outside this package can set it, and nil in every binary but
+// the one running this package's tests. The cost on the request path is one atomic
+// load.
+//
+// It lives BELOW ProjectMemberships rather than above it, and that is not cosmetic:
+// a comment block with no blank line before a declaration is that declaration's doc
+// comment. Declared above, this comment swallowed the whole read-order contract into
+// the documentation of an unexported var and `go doc ProjectMemberships` printed
+// nothing. Inserting a blank line does not fix that — it only detaches the contract
+// from everything — so the seam moved instead. TestProjectMembershipsKeepsItsDoc-
+// Comment holds the line.
+//
+// atomic rather than a plain func value because a plain one is a data race the moment
+// any test on this path calls t.Parallel(); today none does, which makes it latent
+// rather than absent.
+var membershipTearHook atomic.Pointer[func()]
+
+// SetMembershipTearHookForTest installs the hook above and returns a function that
+// removes it.
+//
+// Exported because the engine harness for this package's statements lives in
+// modules/project — pkg/project is a predicate package with no database of its own,
+// which is why its statements had no engine lane until that file was written. Refuses
+// outside a test binary for the same reason modules/space's removal seams do: "nothing
+// calls it" is a property of the current tree, not a boundary.
+func SetMembershipTearHookForTest(fn func()) (restore func(), err error) {
+	if !testing.Testing() {
+		return nil, errors.New("project: the membership tear hook is test-only")
+	}
+	membershipTearHook.Store(&fn)
+	return func() { membershipTearHook.Store(nil) }, nil
 }
 
 // dedupeNonEmpty drops empty and repeated ids while preserving first-seen order.

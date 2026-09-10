@@ -249,11 +249,19 @@ func (d *DB) disbandSpace(spaceId, operatorUID string) ([]string, error) {
 		Where("space_id=?", spaceId).Exec(); err != nil {
 		return nil, err
 	}
+	// 规范化 space_id：上面那条 UPDATE 已经把这行 X 锁住了，所以这次加锁读不等任何人，
+	// 也不会提前建立 read view。工单里的 uid 来自 space_member（规范拼写），space_id
+	// 必须同源，否则异步级联按 (space_id, uid) 查 octo_project_member 会枚举到 0 个
+	// 席位并「成功」收工。见 SpaceRef。
+	spaceRef, err := ResolveSpaceIDTx(tx, spaceId)
+	if err != nil {
+		return nil, err
+	}
 	if _, err = tx.Update("space_member").Set("status", 0).Set("updated_at", now).
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
 		return nil, err
 	}
-	if err = enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+	if err = enqueueMemberRemovalCleanupBatchTx(tx, spaceRef, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

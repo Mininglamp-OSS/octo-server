@@ -306,6 +306,22 @@ func (p *Project) lockSeatsTx(
 	// case. Fail-closed, but a real caller refused: the same shape this branch treated as
 	// a blocker on the read path. pkg/user.ActiveAccounts' own comment prescribes exactly
 	// this, and this path was not doing it.
+	//
+	// # Why this reads from the SESSION and not from tx, which looks like a one-word fix
+	//
+	// It is a TOCTOU: a ban committing between this read and the transaction's commit is
+	// not seen. ActiveAccounts widened to dbr.SessionRunner in this branch, so passing
+	// `tx` compiles — and it would ALSO be the transaction's first non-locking read,
+	// because lockSpaceSeatsTx above is a locking one. Under REPEATABLE READ that is
+	// where the consistent-read view gets assigned, and every plain SELECT after this
+	// point in the transaction — the per-project and per-space member counts the quotas
+	// are checked against — would then answer from a snapshot taken here rather than
+	// under the locks. Over-admission is a worse failure than the window this closes,
+	// and this branch has already shipped one instance of exactly that shape.
+	//
+	// So it stays on the session until someone audits every consistency read downstream
+	// of this call. The window is one statement wide and the ban revokes the actor's
+	// sessions anyway, so the exposure is a request already in flight.
 	liveAccounts, err := userpkg.ActiveAccounts(p.db.session, []string{actorUID})
 	if err != nil {
 		return nil, fmt.Errorf("project: check actor account liveness: %w", err)

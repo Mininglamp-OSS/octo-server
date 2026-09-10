@@ -433,6 +433,35 @@ func TestVerifyRejectsDuplicateUIDsRatherThanCollapsing(t *testing.T) {
 	}
 }
 
+// TestVerifyRejectsUIDsThatAreDuplicatesUNDERTHEFOLD is the half a byte-exact
+// check could not see.
+//
+// "u1" and "U1" are two spellings of ONE identity to every table behind this
+// endpoint — octo_project_member is utf8mb4_general_ci and space_member / user are
+// utf8mb4_0900_ai_ci, and both are case-insensitive — so the byte-exact check
+// admitted them and the handler produced two entries for one row. Neither answer
+// was wrong, which is why this was the last unfolded comparison here rather than a
+// defect anyone could observe going wrong: it is a consistency fix, and it belongs
+// with the others because "every comparison in this module folds" is a property a
+// reviewer can check in one pass, while "every comparison except that one" is not.
+func TestVerifyRejectsUIDsThatAreDuplicatesUNDERTHEFOLD(t *testing.T) {
+	s := &stubStore{epoch: 5, roles: map[string]int{"u1": 0}}
+	w := doPost(t, newRouter(newTestModule(s)), testInternalToken,
+		verifyRequest{SpaceID: "s", ProjectID: "p", UIDs: []string{"u1", "U1"}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400: u1 and U1 name one identity to every table this endpoint "+
+			"reads, so asking about both is the same caller bug as asking twice in the "+
+			"same case; got %d (%s)", w.Code, w.Body.String())
+	}
+
+	// And the fold must not swallow genuinely distinct uids.
+	w = doPost(t, newRouter(newTestModule(s)), testInternalToken,
+		verifyRequest{SpaceID: "s", ProjectID: "p", UIDs: []string{"u1", "u2"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("two distinct uids must still be accepted; got %d (%s)", w.Code, w.Body.String())
+	}
+}
+
 func TestVerifyAcceptsExactlyTheBatchLimit(t *testing.T) {
 	uids := make([]string, maxBatchUIDs)
 	for i := range uids {

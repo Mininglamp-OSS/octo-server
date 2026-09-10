@@ -33,3 +33,26 @@ var configured = promauto.NewGauge(prometheus.GaugeOpts{
 		"collides with a sibling capability's token, in which case every request is refused " +
 		"with the same 401 a wrong token gets.",
 })
+
+// peerMaxCacheAge publishes the peer-side cache bound the operator declared when
+// enabling this capability (PeerMaxCacheAgeEnv), in seconds. 0 means no bound is in
+// force, which is also the value when the capability is off.
+//
+// It exists so the enablement gate is answerable from monitoring rather than from
+// somebody's memory of a PR discussion. The account axis — a ban or a destroy moves
+// no member_epoch — is bounded on the CONSUMER's side and by nothing here, so "what
+// bound did we actually agree, and is it still what is deployed" is an operational
+// question with no other answer.
+//
+// Publishing the number rather than a 0/1 flag is the same choice the env makes: a
+// flag would say the box was ticked, and the value is the contract.
+var peerMaxCacheAge = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "octo",
+	Subsystem: "internal_membership",
+	Name:      "peer_max_cache_age_seconds",
+	Help: "The time bound, in seconds, that the peer is declared to place on decisions it " +
+		"caches from these endpoints (OCTO_MEMBERSHIP_INTERNAL_PEER_MAX_CACHE_AGE_SECONDS). " +
+		"0 when the capability is disabled or the declaration was rejected. This is the " +
+		"worst-case window in which a banned or destroyed account keeps an authorization it " +
+		"no longer holds, because member_epoch is per project and an account ban is per user.",
+})

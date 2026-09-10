@@ -213,14 +213,24 @@ var (
 		Help: "Active projects with zero active owners. Unmanageable and unrepairable in P0; " +
 			"a non-zero value needs manual intervention.",
 	})
-	// epochAnomalies counts observed member_epoch regressions. Best-effort: the
-	// authoritative guarantee is the write discipline (member_epoch + 1 only),
-	// because a read-only scan running on every pod cannot establish monotonicity.
+	// epochAnomalies counts observed member_epoch regressions AND sentinel repairs.
+	// Best-effort for the regression half: the authoritative guarantee is the write
+	// discipline (member_epoch + 1 only), because a read-only scan running on every
+	// pod cannot establish monotonicity.
+	//
+	// The sentinel-repair increment is the one operators are told to act on — it
+	// means an instance is still writing 0 — so it belongs in the Help text. It was
+	// missing, and the rollout doc named this series by its Go identifier, so the
+	// alert rule an operator would have written did not exist.
+	//
+	// Scrapes as `project_member_epoch_anomalies_total`.
 	epochAnomalies = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "member_epoch_anomalies_total",
-		Help: "Observed member_epoch regressions or negative values (best-effort; monotonicity " +
-			"is guaranteed by the write discipline, not by this counter).",
+		Help: "member_epoch anomalies: observed regressions or negative values (best-effort; " +
+			"monotonicity is guaranteed by the write discipline, not by this counter), plus " +
+			"each ACTIVE project found on the reserved absent-epoch sentinel and repaired — " +
+			"that last case means an instance is still inserting at the old column default.",
 	})
 
 	// reconcileDuration times each scan so a scan that starts costing real time is

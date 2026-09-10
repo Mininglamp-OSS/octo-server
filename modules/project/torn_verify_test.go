@@ -49,6 +49,7 @@ import (
 	"testing"
 
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	"github.com/gocraft/dbr/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -111,11 +112,29 @@ func TestVerifyNeverStampsADenialWithALiveEpoch(t *testing.T) {
 
 // TestVerifyStepsShareOneSnapshot is the mechanism the assertion above rests on.
 //
-// Stated separately because the test above would also pass if ProjectMemberships had
+// Stated separately because the case above would also pass if ProjectMemberships had
 // simply stopped reading the Space — which would be a much worse fix. This one shows
 // the answer is consistent BECAUSE the steps see one instant, not because a step was
 // removed: the seat is still reported, and it is reported through the same space-half
-// read that observes bans in the steady state.
+// read that denies in the steady state.
+//
+// # Why this drives the SEAT axis and not the Space-ban axis
+//
+// It used to close the Space, like the case above, and mutation testing by two
+// reviewers showed the steady-state half was then vacuous: disabling the
+// space.ActiveMembers conjunction entirely left both cases in this file GREEN. The
+// reason is structural. On a banned Space, step 1's round-5 fold already turns the
+// project absent and ProjectMemberships returns before step 3 runs at all, so
+// "the steady state still denies" was satisfied by the fold rather than by the
+// conjunction it claimed to pin.
+//
+// The discriminating shape leaves the project and the Space both ACTIVE and closes
+// only the Space SEAT. Step 1 passes, step 2 still finds the project seat — the
+// Space→project cascade is asynchronous and has not run — so step 3 is the only
+// thing left that can deny, and it must.
+//
+// Recorded at length because "green for the wrong reason" is the failure mode this
+// branch has shipped three times, and this file's own header warns about it.
 func TestVerifyStepsShareOneSnapshot(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -124,10 +143,19 @@ func TestVerifyStepsShareOneSnapshot(t *testing.T) {
 
 	created := createProjectVia(t, srv, spaceA, token, "torn-snapshot")
 
+	closed := false
 	restore, err := projectpkg.SetMembershipTearHookForTest(func() {
-		_, execErr := testCtx.DB().Exec(
-			"UPDATE `space` SET status = 0, updated_at = NOW() WHERE space_id = ?", spaceA)
+		if closed {
+			return
+		}
+		closed = true
+		res, execErr := testCtx.DB().Exec(
+			"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?",
+			spaceA, "snapOwner")
 		require.NoError(t, execErr)
+		n, execErr := res.RowsAffected()
+		require.NoError(t, execErr)
+		require.EqualValues(t, 1, n, "the hook must actually have closed the seat")
 	})
 	require.NoError(t, err)
 	defer restore()
@@ -135,17 +163,131 @@ func TestVerifyStepsShareOneSnapshot(t *testing.T) {
 	_, roles, err := projectpkg.ProjectMemberships(
 		testCtx.DB(), spaceA, created.ProjectID, []string{"snapOwner"})
 	require.NoError(t, err)
+	require.True(t, closed, "the hook must have run, or this case proves nothing")
 	assert.Contains(t, roles, projectpkg.FoldID("snapOwner"),
-		"the narrowing reads must see the Space the epoch was read from. A ban that commits "+
-			"after the first read belongs to the NEXT answer, not to this one — and the peer "+
-			"learns about it from the epoch channel, whose IsActiveSpace fold turns the "+
-			"project absent and breaks agreement.")
+		"the narrowing reads must see the Space membership the epoch was read from. A "+
+			"seat closing after the first read belongs to the NEXT answer, not to this "+
+			"one — and that removal bumped the epoch in its own transaction, so the peer "+
+			"is told about it through the channel that has a bound.")
 
-	// And the steady state still denies, so the space half is genuinely still consulted.
+	// And a call that STARTS after the seat is closed must deny. The project and the
+	// Space are both still active here, so step 1's fold cannot produce this answer:
+	// only the space-half conjunction can.
 	_, roles, err = projectpkg.ProjectMemberships(
 		testCtx.DB(), spaceA, created.ProjectID, []string{"snapOwner"})
 	require.NoError(t, err)
 	assert.NotContains(t, roles, projectpkg.FoldID("snapOwner"),
-		"a call that STARTS after the ban must deny — otherwise the snapshot fix would have "+
-			"been a removal of the Space conjunction rather than a linearisation of it")
+		"a uid whose SPACE seat is closed must be denied even though the project seat "+
+			"survives — otherwise the snapshot fix would have been a removal of the "+
+			"space-half conjunction rather than a linearisation of it, and the "+
+			"asynchronous cascade's whole window would be a live grant")
+
+	// The fixture has to be the discriminating one, so pin it rather than trusting the
+	// prose above: the project seat MUST still be open, or the denial above proves
+	// nothing about step 3.
+	var open []int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM `octo_project_member` "+
+			"WHERE project_id = ? AND uid = ? AND status = 1 AND removing = 0",
+		created.ProjectID, "snapOwner").Load(&open)
+	require.NoError(t, err)
+	require.Equal(t, 1, open[0],
+		"the project seat must still be open for this case to isolate the space half; "+
+			"if the cascade became synchronous, step 2 now does the denying and this "+
+			"case has silently stopped testing the conjunction")
+}
+
+// TestProjectMembershipsPinsItsOwnIsolationLevel is the difference between a test
+// that MEASURES the deployment and a test that asserts the contract.
+//
+// The two cases above open their transaction on the shared session, so they inherit
+// whatever `transaction_isolation` the server carries. On the CI and dev engines that
+// is REPEATABLE READ, which means they would go on passing if the fix's transaction
+// silently degraded to READ COMMITTED — and nothing in this repository sets that
+// variable: not pkg/db, not the DSN template, not a boot check. A reviewer measured
+// exactly that on 8.0.46: with the server globally at READ-COMMITTED and a bare
+// session.Begin(), both cases above fail in the original torn shape.
+//
+// So this one takes the level away. It runs ProjectMemberships against a session
+// whose own default is READ COMMITTED and asserts the answer is STILL consistent,
+// which is only true if the function names its isolation level rather than inheriting
+// it. Nothing here is skipped when the ambient level happens to be right — that is
+// the point.
+func TestProjectMembershipsPinsItsOwnIsolationLevel(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "isoOwner")
+	seedSpaceMember(t, spaceA, "isoOwner", 0, 1)
+
+	created := createProjectVia(t, srv, spaceA, token, "iso-verify")
+
+	epochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
+	require.NoError(t, err)
+	live := epochs[projectpkg.FoldID(created.ProjectID)]
+	require.NotZero(t, live)
+
+	// A pool of exactly ONE connection, so "the session default is READ COMMITTED" is a
+	// property of the connection the transaction will actually run on rather than of a
+	// connection it might get. go-sql-driver's ResetSession only performs a liveness
+	// check — it does not send COM_RESET_CONNECTION — so the SET SESSION below survives
+	// the checkout/checkin that happens between statements.
+	conn, err := dbr.Open("mysql", testCtx.GetConfig().DB.MySQLAddr, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	session := conn.NewSession(nil)
+
+	_, err = session.DB.Exec("SET SESSION transaction_isolation = 'READ-COMMITTED'")
+	require.NoError(t, err, "this case needs SESSION scope only — it must not require "+
+		"SUPER, and it must not disturb any other connection")
+	require.Equal(t, "READ-COMMITTED", sessionIsolation(t, session),
+		"the fixture must actually be hostile, or this case proves nothing")
+
+	banned := false
+	restore, err := projectpkg.SetMembershipTearHookForTest(func() {
+		if banned {
+			return
+		}
+		banned = true
+		_, execErr := testCtx.DB().Exec(
+			"UPDATE `space` SET status = 0, updated_at = NOW() WHERE space_id = ?", spaceA)
+		require.NoError(t, execErr)
+	})
+	require.NoError(t, err)
+	defer restore()
+
+	epoch, roles, err := projectpkg.ProjectMemberships(
+		session, spaceA, created.ProjectID, []string{"isoOwner"})
+	require.NoError(t, err)
+	require.True(t, banned, "the hook must have run, or this case proves nothing")
+
+	_, isMember := roles[projectpkg.FoldID("isoOwner")]
+	assert.False(t, !isMember && epoch == live,
+		"the answer tore even though the function opens its own transaction (got "+
+			"member=%v, epoch=%d, live=%d).\n\n"+
+			"That means the transaction inherited this session's READ COMMITTED, under "+
+			"which every statement takes a fresh view and the transaction linearises "+
+			"nothing. ProjectMemberships must ask for REPEATABLE READ explicitly — "+
+			"BeginTx with sql.TxOptions — so its correctness is a property of the code "+
+			"rather than of whatever transaction_isolation the operator left set.",
+		isMember, epoch, live)
+
+	// And the pin must be scoped to that one transaction. `SET TRANSACTION ISOLATION
+	// LEVEL` with neither GLOBAL nor SESSION applies to the next transaction only; if
+	// it ever became a session-scoped write, this pooled connection would carry
+	// REPEATABLE READ back to whoever borrowed it next.
+	assert.Equal(t, "READ-COMMITTED", sessionIsolation(t, session),
+		"ProjectMemberships must not leave its isolation level behind on the pooled "+
+			"connection — the next borrower did not ask for it")
+}
+
+// sessionIsolation reads the connection's own default, not the transaction's.
+func sessionIsolation(t *testing.T, session *dbr.Session) string {
+	t.Helper()
+	var got []string
+	_, err := session.SelectBySql("SELECT @@SESSION.transaction_isolation").Load(&got)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	return got[0]
 }

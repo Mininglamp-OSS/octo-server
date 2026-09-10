@@ -2,6 +2,7 @@ package internal_membership
 
 import (
 	"errors"
+	"strconv"
 	"time"
 )
 
@@ -21,6 +22,51 @@ const (
 	// exclusion checks without a second copy of the literal drifting out of
 	// sync with this constant.
 	MembershipInternalTokenEnv = "OCTO_MEMBERSHIP_INTERNAL_TOKEN"
+
+	// PeerMaxCacheAgeEnv is the second half of the enablement gate: the operator
+	// declares, in seconds, the time bound the PEER places on decisions it caches
+	// from these endpoints. Setting the token without it does not enable the
+	// capability.
+	//
+	// # Why the release condition is an env and not a sentence
+	//
+	// member_epoch cannot be a sufficient invalidation signal, and not because of
+	// any defect: it is keyed per PROJECT while one of the four axes that decide
+	// the answer — a super-admin ban or an account destroy — is per USER. A ban
+	// moves no epoch, so a cached grant keeps its agreement and a cached denial
+	// survives the unban. Nothing on this side can close that; the bound has to
+	// exist on the consumer. See docs/project-membership-cache-bound-proposal.md.
+	//
+	// That made the safety argument for shipping "the peer implements a TTL, and
+	// the token stays unset until they do" — a promise living in a PR description
+	// and a rollout document, with the only observable being a gauge nobody had a
+	// reason to watch. This branch's whole discipline is that a mistake worth
+	// making impossible should be made INEXPRESSIBLE rather than documented, and
+	// the branch had not applied it to its own release condition. Now enabling the
+	// capability requires stating the bound, and the stated value is published as
+	// a metric so "did anyone actually agree a number" is answerable at any time.
+	//
+	// It carries the VALUE rather than being a yes/no acknowledgement because the
+	// value is the contract. When §3.1 of the proposal lands and the answers start
+	// carrying max_age_seconds on the wire, this is where that number comes from —
+	// no second source to drift.
+	//
+	// This is NOT a claim that the peer honours it. The server cannot verify that
+	// from here; §5 of the proposal specifies the measured gate (observe the
+	// peer's re-verification interval) that eventually can. It is the difference
+	// between an unstated assumption and a stated one.
+	PeerMaxCacheAgeEnv = "OCTO_MEMBERSHIP_INTERNAL_PEER_MAX_CACHE_AGE_SECONDS"
+
+	// peerMaxCacheAgeCeilingSeconds is where a "bound" stops being one.
+	//
+	// The value is the worst-case window in which a banned or destroyed account
+	// keeps an authorization it no longer holds. Five minutes is already generous
+	// for that — the proposal suggests starting at 30s and tuning against measured
+	// _verify load — and past it the declaration would be a formality that reads as
+	// a bound in the ConfigMap while behaving like none. Refusing an absurd value
+	// is the point: an operator who "satisfies" the gate with 86400 has satisfied
+	// nothing, and would have done it believing otherwise.
+	peerMaxCacheAgeCeilingSeconds = 300
 
 	// Sibling fixed internal-token envs this module refuses to collide with, so
 	// one leaked value can never grant two capabilities.
@@ -194,4 +240,43 @@ func resolveMembershipInternalToken(getenv func(string) string) (string, error) 
 		}
 	}
 	return token, nil
+}
+
+// resolvePeerCacheAgeBound reads the declared peer-side cache bound.
+//
+// Only consulted when the token resolved: with the capability off the declaration
+// is irrelevant, and reporting it would be noise on every deployment that has
+// correctly left this whole module disabled.
+//
+// Returned error messages name the ENV and the offending value. Unlike the token,
+// the value here is not a secret — it is a duration an operator has to be able to
+// read back out of a log line to fix it.
+func resolvePeerCacheAgeBound(getenv func(string) string) (int, error) {
+	if getenv == nil {
+		return 0, errors.New(PeerMaxCacheAgeEnv + " lookup unavailable; membership internal API disabled")
+	}
+	raw := getenv(PeerMaxCacheAgeEnv)
+	if raw == "" {
+		return 0, errors.New(MembershipInternalTokenEnv + " is set but " + PeerMaxCacheAgeEnv +
+			" is not; membership internal API disabled. These endpoints answer a peer that " +
+			"caches authorization decisions, and member_epoch cannot invalidate an account " +
+			"ban or destroy — the epoch is per project and the ban is per user. The peer " +
+			"must bound its cached decisions by TIME; set this to that bound in seconds " +
+			"(1.." + strconv.Itoa(peerMaxCacheAgeCeilingSeconds) + ", 30 is the suggested " +
+			"starting point). See docs/project-membership-cache-bound-proposal.md")
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.New(PeerMaxCacheAgeEnv + " must be a whole number of seconds, got " +
+			strconv.Quote(raw) + "; membership internal API disabled")
+	}
+	if seconds < 1 || seconds > peerMaxCacheAgeCeilingSeconds {
+		return 0, errors.New(PeerMaxCacheAgeEnv + " must be between 1 and " +
+			strconv.Itoa(peerMaxCacheAgeCeilingSeconds) + " seconds, got " + strconv.Itoa(seconds) +
+			"; membership internal API disabled. This value is the worst-case window in which " +
+			"a banned or destroyed account keeps an authorization it no longer holds, so a " +
+			"number large enough to be indistinguishable from no bound is refused rather than " +
+			"accepted with a warning")
+	}
+	return seconds, nil
 }

@@ -28,6 +28,11 @@ type Module struct {
 	ctx           *config.Context
 	store         membershipStore
 	internalToken string
+	// peerCacheAgeSeconds is the bound the operator declared on the peer's side
+	// (PeerMaxCacheAgeEnv). Held so §3.1 of the cache-bound proposal — answering
+	// with max_age_seconds on the wire — has one source when it lands, rather than
+	// re-reading the environment from a handler.
+	peerCacheAgeSeconds int
 	log.Log
 
 	// repairing collapses concurrent out-of-band sentinel repairs of the SAME project
@@ -35,10 +40,22 @@ type Module struct {
 	repairing sync.Map
 }
 
-// New loads the token at construction. When it is unset, too short or collides
-// with a sibling capability's token, the reason is logged and every request is
-// refused — the module still mounts, so a misconfigured deployment fails closed
-// on the endpoint rather than failing to boot the whole server.
+// New loads the enablement configuration at construction. When any part of it is
+// missing or invalid the reason is logged and every request is refused — the
+// module still mounts, so a misconfigured deployment fails closed on the endpoint
+// rather than failing to boot the whole server.
+//
+// Two things have to be right, not one. The token is the credential; the declared
+// peer cache bound is the RELEASE CONDITION, and it is enforced here rather than
+// promised in a document because these endpoints hand a peer authorization answers
+// whose account axis member_epoch structurally cannot invalidate. See
+// PeerMaxCacheAgeEnv.
+//
+// Refusing to enable rather than panicking is deliberate and matches the rest of
+// this module: one capability's misconfiguration must not take down a server whose
+// other two dozen modules are serving real traffic. The distinction an operator needs — "off because
+// nobody configured it" versus "off because I configured it wrong" — is carried by
+// the ERROR line and the configured gauge, not by the process exiting.
 func New(ctx *config.Context) *Module {
 	logger := log.NewTLog("InternalMembership")
 	token, tokenErr := resolveMembershipInternalToken(os.Getenv)
@@ -52,6 +69,25 @@ func New(ctx *config.Context) *Module {
 		token = ""
 		logger.Error(tokenErr.Error())
 	}
+	// Only asked when the token resolved: on the overwhelmingly common deployment
+	// where this module is simply off, a second ERROR line about a bound nobody
+	// needs is noise that trains operators to ignore this logger.
+	peerCacheAge := 0
+	if token != "" {
+		var boundErr error
+		peerCacheAge, boundErr = resolvePeerCacheAgeBound(os.Getenv)
+		if boundErr != nil {
+			// Same clearing discipline as above, and the same reason: the gate is
+			// worth nothing if a future edit can leave the token live beside a
+			// logged error.
+			token = ""
+			peerCacheAge = 0
+			logger.Error(boundErr.Error())
+		}
+	}
+	// Published whatever the outcome, so 0 means "no bound is in force" on both the
+	// unset and the rejected paths rather than only on one of them.
+	peerMaxCacheAge.Set(float64(peerCacheAge))
 	// Published beside the log line, not instead of it. The endpoints answer 401
 	// for "unset" and for "wrong" alike (see respondUnauthorized), so this gauge is
 	// where an operator gets the distinction the wire deliberately withholds — and
@@ -62,7 +98,13 @@ func New(ctx *config.Context) *Module {
 	} else {
 		configured.Set(1)
 	}
-	return &Module{ctx: ctx, store: dbStore{ctx: ctx}, internalToken: token, Log: logger}
+	return &Module{
+		ctx:                 ctx,
+		store:               dbStore{ctx: ctx},
+		internalToken:       token,
+		peerCacheAgeSeconds: peerCacheAge,
+		Log:                 logger,
+	}
 }
 
 // Route mounts the membership endpoints under /v1/internal.
@@ -346,10 +388,32 @@ type verifyMemberAnswer struct {
 
 // verifyResponse carries the project's current epoch alongside the answers.
 //
-// The epoch is read BEFORE the seats (see pkg/project.ProjectMemberships), so it
-// is never newer than the membership data it accompanies. A consumer caching
-// these answers keyed by (uid, project, member_epoch) is therefore safe: the
-// worst case is an extra re-verification, never a stale grant.
+// The epoch is read BEFORE the seats and in the SAME snapshot (see
+// pkg/project.ProjectMemberships), so it is never newer than the membership data it
+// accompanies and never describes a different instant from it.
+//
+// # What caching by (uid, project, member_epoch) does and does not buy
+//
+// SAFE on the project, seat and Space axes. Every one of those changes bumps
+// member_epoch in the transaction that makes the change, so a cached answer whose
+// epoch still agrees is still true, and the worst case is an extra re-verification.
+//
+// NOT SAFE on the ACCOUNT axis, and a consumer must not read the paragraph above as
+// if it were. A super-admin ban or an account destroy writes only the `user` row: it
+// revokes sessions, kicks devices and bans the IM channel, and it moves NO
+// member_epoch, because the epoch is per PROJECT and the ban is per USER — there is
+// no per-project row for it to bump. This endpoint's answer flips (the account half
+// is conjoined at read time) while the epoch channel keeps answering the same value,
+// so both directions ride epoch agreement with no bound:
+//
+//   - a GRANT cached before the ban keeps its agreement and stays authorized;
+//   - a DENIAL cached during the ban survives the unban, until some unrelated
+//     membership change happens to bump that project — in a quiet project, never.
+//
+// So a consumer MUST additionally bound its cached decisions by time. That bound is
+// specified in docs/project-membership-cache-bound-proposal.md and is NOT implemented
+// on either side yet, which is the reason OCTO_MEMBERSHIP_INTERNAL_TOKEN stays unset
+// until the peer ships it. Do not treat the epoch as a complete invalidation channel.
 type verifyResponse struct {
 	ProjectID   string               `json:"project_id"`
 	MemberEpoch int64                `json:"member_epoch"`
@@ -383,6 +447,9 @@ type verifyResponse struct {
 // check is that every requested uid gets exactly one answer; silently collapsing
 // duplicates would return fewer answers than uids and trip that check as if the
 // server had dropped one. Rejecting names the caller's bug at the caller.
+//
+// "Duplicate" means duplicate under the FOLD, not byte-equal: `["u1","U1"]` names
+// one identity to every table behind this endpoint and is refused as such.
 func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 	req, err := decodeVerifyRequest(c)
 	if err != nil {
@@ -409,14 +476,25 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 		return
 	}
 	uids := make([]string, 0, len(req.UIDs))
+	// Duplicate detection folds, because the DATABASE folds.
+	//
+	// This was the last byte-exact comparison in the endpoint, and a byte-exact one
+	// answers the wrong question: `["u1","U1"]` is two spellings of ONE identity
+	// under every collation these tables use, so it passed and produced two entries
+	// for one row. Both entries were identical and correct, which is why it was not
+	// a fail-open — but the caller's stated check is "exactly one answer per
+	// requested uid", and two answers for one identity is the same class of
+	// surprise as one answer for two, arrived at from the other side. Rejecting
+	// names the caller's bug at the caller, which is what the paragraph on this
+	// handler already promised for the exact-duplicate case.
 	seen := make(map[string]bool, len(req.UIDs))
 	for _, raw := range req.UIDs {
 		uid := raw
-		if uid == "" || uid != strings.TrimSpace(uid) || seen[uid] {
+		if uid == "" || uid != strings.TrimSpace(uid) || seen[projectpkg.FoldID(uid)] {
 			respondInvalidParam(c, "uids")
 			return
 		}
-		seen[uid] = true
+		seen[projectpkg.FoldID(uid)] = true
 		uids = append(uids, uid)
 	}
 
@@ -451,9 +529,11 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 // project is carrying the value the integration contract reserves for "does not
 // exist", which only happens while a not-yet-upgraded pod or a rolled-back
 // binary is still inserting at the column default. The endpoint refuses rather
-// than serving it (see pkg/project.ProjectEpochsInSpace), and the reconcile scan
-// repairs the row on its next rotation — but if the scan is disabled, this line
-// is the only thing telling the operator why the peer is getting 500s. It names
+// than serving it (see pkg/project.ProjectEpochsInSpace) and repairs the named
+// row out of band on the way out, so the peer's retry normally succeeds — that,
+// not the reconcile scan, is what bounds the window. The scan is a backstop
+// whose cursor can take hours to reach the row (see repairSentinelOutOfBand).
+// This line is what tells the operator why the peer saw 500s at all. It names
 // the project id, which the wrapped error carries.
 //
 // Both cases answer the same 500 on the wire. The caller must not be able to
@@ -479,8 +559,10 @@ func (m *Module) logLookupFailure(op string, err error, spaceID string, count in
 			"but the refusal did not name it, so it cannot be repaired here. The project's "+
 			"epoch-sanity scan repairs the row and runs UNGATED (modules/project/reconcile.go "+
 			"schedules it outside the OCTO_PROJECT_RECONCILE_ENABLED branch, which covers only "+
-			"the three legacy-JOIN scans), so there is no switch to turn on: watch the "+
-			"member_epoch anomaly gauge and check the reconcile worker is alive.",
+			"the five legacy-JOIN scans), so there is no switch to turn on. Watch the counter "+
+			"project_member_epoch_anomalies_total — it increments on each repair — and check "+
+			"the reconcile worker is alive. Expect the recovery to take as long as the scan "+
+			"cursor needs to reach the row, which on a large octo_project is hours.",
 			fields...)
 		return
 	}

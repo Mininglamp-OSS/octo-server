@@ -79,18 +79,26 @@ func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, seat SeatRef, operatorUID, reason
 
 // enqueueMemberRemovalCleanupBatchTx 一次性为多个成员写出清理工单。
 //
+// 收 SpaceRef 而不是裸 space_id，理由和单条版收 SeatRef 完全一样，只是换了一列：
+// 这批工单里的 space_id 会被异步级联拿去查 octo_project_member（collation 更严）。
+// 两个解散入口此前都直接把 `c.Param("space_id")` 传进来 —— uid 是从 space_member
+// 读出来的规范拼写，space_id 却是调用方的，于是级联按 (space_id, uid) 匹配不到任何
+// 项目席位，工单**成功**收工，整个 Space 的项目席位永久留在 status=1。见 seatref.go
+// 里 SpaceRef 的说明。
+//
 // 解散场景会在同一个事务里为全体成员入队，而那个事务正握着 space_member 的
 // FOR UPDATE 范围锁；逐条 INSERT 意味着上万次往返都在锁内完成，期间任何并发的
 // 加入路径（atomicAddMemberIfNotFull / approveJoinApply 都要在同一范围上取
 // FOR UPDATE）全部阻塞，甚至撞上 innodb_lock_wait_timeout。多值 INSERT 分批发出，
 // 把锁内往返从 N 次压到 N/batch 次。
-func enqueueMemberRemovalCleanupBatchTx(tx *dbr.Tx, spaceID string, uids []string, operatorUID, reason string) error {
+func enqueueMemberRemovalCleanupBatchTx(tx *dbr.Tx, space SpaceRef, uids []string, operatorUID, reason string) error {
 	if len(uids) == 0 {
 		return nil
 	}
-	if spaceID == "" {
+	if space.IsZero() {
 		return errors.New("space: removal cleanup requires space_id")
 	}
+	spaceID := space.SpaceID()
 	if !IsMemberRemoveReason(reason) {
 		return fmt.Errorf("space: unknown member removal reason %q", reason)
 	}

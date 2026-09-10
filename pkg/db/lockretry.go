@@ -43,10 +43,33 @@ func IsRetryableLockErr(err error) bool {
 // and the cost of being wrong is not a retry — it is a 500 on a security-relevant
 // write, or a rolled-back member removal.
 //
-// fn must own its whole transaction: a retry re-runs it from BEGIN, which is only
-// sound because InnoDB has already rolled the failed attempt back. Anything fn
-// wrote — including outbox rows — is gone with it, so a retry cannot duplicate a
-// side effect that lives in the same transaction.
+// fn must own its whole transaction — meaning it BEGINs, and it rolls back on every
+// exit it does not commit on. That requirement, not the engine, is what makes a
+// retry from BEGIN sound.
+//
+// Stating it that way because the reason given here before was wrong for half the
+// retryable set. It said the retry is safe "because InnoDB has already rolled the
+// failed attempt back", which is true for 1213 — a deadlock victim is rolled back
+// whole — and FALSE for 1205: with innodb_rollback_on_timeout at its default OFF, a
+// lock wait timeout rolls back only the failing STATEMENT and leaves the transaction
+// open. Every fn today is a *Once function holding `defer tx.RollbackUnlessCommitted()`,
+// so the transaction does get discarded and the helper is sound — but by the caller's
+// discipline, not by the engine's. The wrong reason would have licensed an fn that
+// leaves its rollback to InnoDB, and that fn would re-run from BEGIN with the previous
+// attempt's statements still holding locks.
+//
+// Anything fn wrote — including outbox rows — is gone with the rollback, so a retry
+// cannot duplicate a side effect that lives in the same transaction.
+//
+// # Known, deliberately not changed here: the 1205 latency budget
+//
+// Retries are immediate and identical for both codes. On 1205 the caller has already
+// waited innodb_lock_wait_timeout — measured at 50s on the 8.0.46 engine used for this
+// branch — so three attempts is up to 150s of one request holding a pooled connection.
+// A backoff would make that worse rather than better, and the right shape is probably
+// to retry 1213 with jitter and surface 1205 immediately. That is a behaviour change
+// across eight call sites in two modules, so it belongs in its own change with its own
+// load test, not in a branch about membership epochs.
 func RetryOnLockConflict(fn func() error) error {
 	var lastErr error
 	for attempt := 0; attempt < LockRetryAttempts; attempt++ {

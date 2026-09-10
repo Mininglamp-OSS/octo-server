@@ -77,6 +77,32 @@ UPDATE `octo_project` SET `member_epoch` = `member_epoch` + 1 WHERE `member_epoc
 -- it was meant to remove it from, and it would move an epoch BACKWARDS, which
 -- every consumer of this column is entitled to assume never happens.
 --
+-- WHY THE DDL DEFAULT STAYS 0, WHICH LOOKS LIKE AN OVERSIGHT AND IS NOT.
+--
+-- The obvious companion to this backfill is
+-- ALTER TABLE octo_project ALTER COLUMN member_epoch SET DEFAULT 1, so a
+-- statement that OMITS the column stops landing on the reserved value. It has
+-- been proposed in review and it does not work as a one-line change, measured
+-- rather than argued: with the default at 1 a freshly created project reads 2,
+-- and two cases go red (TestFreshProjectEpochIsNeverTheAbsentSentinel,
+-- TestCreateProjectSeatsTheCreatorsAgents).
+--
+-- The reason is that the create path already compensates for the 0 default. It
+-- inserts the row, then runs the SAME bumpMemberEpochTx every other membership
+-- write runs, with the affected-row count checked -- because this column may only
+-- ever be written as member_epoch + 1, a rule TestIsOfficialHasNoWriter and
+-- TestMemberEpochOnlyEverIncrements enforce between them. Seeding the value at
+-- INSERT instead is exactly the write shape those guards exist to forbid. So
+-- moving the default means either fresh projects start at 2, or the create path
+-- stops bumping and the write discipline gets a second, exempt shape.
+--
+-- What the default would have bought is the ROLLBACK direction: a pre-branch
+-- binary omits the column and starts its projects on the sentinel. That window is
+-- already bounded to one request by the read-layer refusal plus the request
+-- triggered out-of-band repair (see the Down section below), so the default is a
+-- tidiness improvement rather than a safety one. Left to a follow-up, with this
+-- note here so the next reviewer does not spend a round re-deriving it.
+--
 -- Rolling back the binary is safe for READERS: the old code reads the column
 -- without caring that some values are one higher than it would have written.
 --
@@ -84,11 +110,22 @@ UPDATE `octo_project` SET `member_epoch` = `member_epoch` + 1 WHERE `member_epoc
 -- comment used to carry would have been misled. The old create path inserts at
 -- the column default 0 again, this migration stays recorded as applied so
 -- rolling forward never re-runs it, and every project created in between sits on
--- the value the integration contract reserves for "does not exist". The
--- reconcile scan repairs those rows within one rotation -- that is why the
--- rollback direction is survivable at all -- so a rollback MUST keep the
--- reconcile loop running, and an operator should expect one epoch bump (hence
--- one consumer re-verify) per affected project. See
+-- the value the integration contract reserves for "does not exist".
+--
+-- What makes the rollback direction survivable is the READ-LAYER refusal plus the
+-- out-of-band repair the refusal triggers: a request naming such a project is
+-- answered 500 and the handler lifts that one row off the sentinel on its way
+-- out, so the practical window is one request. The reconcile scan is a backstop
+-- and NOT the bound -- an earlier version of this comment said it repairs those
+-- rows "within one rotation" and that was wrong. scanEpochSanity walks a bounded
+-- page budget per tick behind a persisted cursor, a row written by an
+-- un-upgraded pod carries the highest id, and on a large octo_project reaching
+-- it takes hours. The refusal is per BATCH of ids, so during that window every
+-- request whose batch contains the id fails, not only requests naming it.
+--
+-- A rollback should still keep the reconcile loop running (it is what repairs
+-- rows nobody happens to query), and an operator should expect one epoch bump --
+-- hence one consumer re-verify -- per affected project. See
 -- docs/project-member-epoch-rollout.md.
 --
 -- No apostrophes in any comment in this file, on purpose -- the migration test in
