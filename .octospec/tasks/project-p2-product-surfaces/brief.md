@@ -474,8 +474,11 @@ admission transaction」, which P1 called a separate task and nobody has opened.
   review and worth its own task: 20+ modules carry a `swagger/api.yaml` and this one carries
   none across all twelve routes. The consequence is not tidiness — the two things client teams
   actually need are written only in Go doc comments they will never read: that `member_count`
-  counts humans on the project row (#855's D16) and humans **plus agents** on this PR's group
-  list, differing by one for a group holding a blacklisted member; and that the sidebar's
+  is **every active seat** on the project row, with the split in `human_member_count` /
+  `agent_member_count` (#855's D16 as amended by #868 — it shipped as humans-only for one
+  release cycle and was put back before GA, so anything written from the older wording would
+  bake in the retired meaning), and humans **plus agents** on this PR's group list, differing
+  by one for a group holding a blacklisted member; and that the sidebar's
   `project_id` is withheld entirely on the no-`X-Space-ID` path. `sidebar.yaml`'s `sidebarItem`
   is three fields behind as well (`project_id`, `space_id`, `my_source_space_id`) — declined
   here as pre-existing drift from #153, which is a scoping call in favour of that task rather

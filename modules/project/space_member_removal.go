@@ -161,8 +161,9 @@ func (p *Project) registerAllMemberGroupOwnerFinalizer() {
 // "every project whose seat we just closed" and not "every project where they were an
 // owner"; queryProjectIDsForSpaceMemberPage's comment carries why both of the narrower
 // sets are wrong. Paged with the cascade's own budget so one member of a thousand
-// projects cannot hold the lease for the whole walk, and a spent budget returns the same
-// retryable error the cascade uses.
+// projects cannot hold the lease for the whole walk. A spent budget does NOT ask for a
+// retry — unlike the cascade, whose retries shrink their own input; see the note at the
+// end of this function for why a retry here could not make progress.
 func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacemod.MemberRemoval) error {
 	if removal.SpaceID == "" || removal.UID == "" {
 		return nil
@@ -207,10 +208,8 @@ func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacem
 		return fmt.Errorf("project: converge all-member group owner (%d of %d failed): %w",
 			failed, synced+failed, firstErr)
 	}
-	// The budget ran out on a full page. Confirm a project really remains before asking
-	// for a retry: a count that is an exact multiple of the page size lands here with
-	// nothing left, and returning an error then would re-run the whole job for no reason.
-	// Same one-row check the cascade does, for the same reason.
+	// 预算在一个满页上用完了。确认真的还有项目没走到——行数正好是页大小整数倍时
+	// 也会走到这里，而那种情况其实已经走完了。
 	remaining, err := p.db.queryProjectIDsForSpaceMemberPage(removal.SpaceID, removal.UID, after, 1)
 	if err != nil {
 		return fmt.Errorf("project: confirm remaining projects after convergence budget: %w", err)
@@ -218,10 +217,68 @@ func (p *Project) convergeAllMemberGroupOwners(_ *config.Context, removal spacem
 	if len(remaining) == 0 {
 		return nil
 	}
-	p.Warn("全员群群主收敛达到单次页数上限，返回可重试错误以便工单重新认领",
+
+	// 走到这里**不要求重试**，而级联的同一处是要求的。上一版这里返回
+	// errCascadeIncomplete，并在注释里说"与级联同一条可重试错误"——那句话是错的，
+	// 第十一轮 review 的 P2-3 拆穿了它，而且拆穿的正是让重试有意义的那半：
+	//
+	// 级联查的是**活跃**席位，它关掉的行会离开自己的结果集，所以每一次重试都从一个更小
+	// 的集合开始，最终收敛。这里的查询**故意不带 status 过滤**（带了就返回空集、什么都
+	// 收敛不了，见 queryProjectIDsForSpaceMemberPage），于是重试从 project_id > '' 重新
+	// 走同样的前 5000 行，永远走不到第 5001 行——直到工单把尝试次数烧光、置为 abandoned。
+	// 那是一次注定失败的重试，代价是整条工单（含已经成功的每个步骤）跟着重跑二十遍。
+	//
+	// 可达性不是假设的：octo_project_member 的行从不删除（重新加入是 UPDATE，见
+	// 20260904000001_project_core.sql），而每 Space 的项目配额只按**活跃**项目算，所以
+	// 同一个 (space_id, uid) 的历史行数没有上限。
+	//
+	// 放弃的是什么，说清楚——上一版只说了"这一次不收敛，等它们自己的下一次成员变动"，
+	// 那是**处置**，不是**残留状态**。PR #868 第二轮 review 的 P2-2 要求把后者点名，
+	// 因为它比"延后"重：
+	//
+	//   - 留下的是一次 D6 违反。群侧级联挑继任者用的是 querySuccessorForProjectGroupTx
+	//     （group/db.go），按资历、以 I2 收窄——条件是"项目的活跃成员"，**不是**项目
+	//     owner。这个错配正是本 finalizer 存在的理由（见本文件开头）。所以没被访问到的
+	//     项目，可能挂着一个群主不是 owner 的全员群。
+	//   - 人工修不了。群主转让是 D7 拦住的六个入口之一，而这个群仍然项目直属，
+	//     IsAllMemberGroup 为真，守卫照常生效。
+	//   - 没有任何扫描报它。五条不受开关控制的扫描是 ownerless / epoch / I2 / I3 /
+	//     removing_stall，没有一条查 D6 的群主正确性。
+	//
+	// 也就是说，上面那个 counter 不是锦上添花——但它也不是这个状态的**唯一**信号，
+	// 上一版这么写是把话说过了头。PR #868 第五轮 review 的 P2：预算用尽**且**有
+	// 同步失败时，函数在上面 firstErr 那个分支就带错误返回了，根本走不到这里的打点，
+	// 而那条路径留下的未访问项目和这里一模一样。那条路径有它自己的信号——错误会让
+	// 清理工单重试直到 removalCleanupMaxAttempts 用尽，然后 releaseCleanupJob 高声
+	// 报错并置为 abandoned（modules/space/member_removal.go）。
+	//
+	// 所以准确的说法是：**全部同步成功、只是预算不够**这一种情况，counter 是唯一信号；
+	// 掺了失败的那一种，看 abandoned 工单和它的错误日志。
+	//
+	// 为什么不干脆两条路径都打点：那条路径是带错误返回的，工单会重试二十次，同一次
+	// 移除会打出二十个点，与这里"一次移除一个点"的语义对不上；而且它没跑上面那个
+	// remaining 探测，行数正好是页大小整数倍时其实已经走完了，打了就是误报。
+	// 与其让计数器含义变模糊，不如把话说准。
+	//
+	// 为什么仍然只算 P2 而不是拦路：预算是 cascadeMaxPages × cascadePageSize =
+	// 25 × 200 = **5000 行**，要触到它，同一个 (space_id, uid) 得有五千条以上的历史
+	// octo_project_member 行。而且这些项目在旧代码下同样从来没被收敛过——重试因为
+	// after 每次调用都重置，会把这 25 页重走一遍，但永远越不过第 5000 行——所以这不是
+	// 回退，只是把一个既有残留说清楚。
+	//
+	// 这段上一版写的是"十万行"，二十倍于真值，而同一个注释块往上二十行就写着 5000。
+	// PR #868 第四轮 review 抓到的：一个用来支撑"可达性极低、所以不拦路"的数字，
+	// 错在放大的方向上，等于替这个决定虚报了二十倍的安全边际。数字要么量过，要么别写。
+	//
+	// 要真正做到"这一次就走完"，需要把游标持久化到工单行上，而那张表属于 modules/space，
+	// 为一个 project 侧收敛动作加列是把分层反过来——真需要时单独立项，和一条 D6 群主
+	// 正确性扫描一起。
+	observeAllMemberGroupConvergenceIncomplete()
+	p.Warn("全员群群主收敛用尽单次页数预算，剩余项目留给它们各自的下一次成员变动",
 		zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID),
-		zap.Int("synced", synced), zap.Int("maxPages", cascadeMaxPages))
-	return errCascadeIncomplete
+		zap.Int("synced", synced), zap.Int("maxPages", cascadeMaxPages),
+		zap.Int("pageSize", cascadePageSize), zap.String("resumeAfterProjectId", after))
+	return nil
 }
 
 // cleanupSpaceMemberProjects closes every project seat a removed Space member still

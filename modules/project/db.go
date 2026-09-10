@@ -592,7 +592,7 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 	return rows, nil
 }
 
-// fillMemberCounts sets SeatCount (every active seat) and MemberCount (the human
+// fillMemberCounts sets SeatCount (every active seat) and HumanCount (the human
 // half) on each listed project.
 //
 // Two single-table reads for the whole page, not one join per card: read the
@@ -665,7 +665,7 @@ func (d *DB) fillMemberCounts(rows []*listRow) error {
 		}
 	}
 	for _, row := range rows {
-		row.MemberCount = humans[row.ProjectID]
+		row.HumanCount = humans[row.ProjectID]
 		row.SeatCount = total[row.ProjectID]
 	}
 	return nil
@@ -675,19 +675,24 @@ func (d *DB) fillMemberCounts(rows []*listRow) error {
 type listRow struct {
 	Model
 	MyRole int `db:"my_role"`
-	// MemberCount counts HUMANS only (D16), the same split the detail route
-	// reports — so one field cannot mean two things depending on which endpoint
-	// the client called.
+	// HumanCount counts HUMANS only, the same split the detail route reports — so
+	// one number cannot mean two things depending on which endpoint the client
+	// called. It becomes `human_member_count` on the wire.
+	//
+	// Named HumanCount rather than MemberCount because Resp.MemberCount is the
+	// TOTAL: two structs one function apart holding a field of the same name and
+	// opposite meaning is how the wrong one gets passed, and this pair is one
+	// `toResp` argument away from each other.
 	//
 	// Filled by fillMemberCounts after the page loads, not by the statement: the
 	// join that used to produce it crossed into `user` with a COLLATE, once per
 	// listed project.
-	MemberCount int
+	HumanCount int
 	// SeatCount is every active seat, humans and agents together. Agents are the
 	// DIFFERENCE rather than a third count: see the query for the measurement
 	// behind that choice.
 	//
-	// Filled by fillMemberCounts out of the same roster read as MemberCount, so
+	// Filled by fillMemberCounts out of the same roster read as HumanCount, so
 	// the two agree by construction rather than across two read views.
 	SeatCount int
 	// Pinned is the CALLER's pin, not a property of the project — the same row
@@ -700,23 +705,24 @@ type listRow struct {
 //
 // The race this comment used to describe is gone, and the history is worth keeping
 // because it decides what the clamp is for. SeatCount was computed by the page
-// statement while MemberCount came from fillMemberCounts afterwards — two
+// statement while the human half came from fillMemberCounts afterwards — two
 // statements, no enclosing transaction, two read views, so a member added between
-// them made `MemberCount > SeatCount` reachable in normal operation and the clamp
+// them made `HumanCount > SeatCount` reachable in normal operation and the clamp
 // load-bearing. PR #855's tenth review established that. PR-5 then had to move
 // seat_count into fillMemberCounts for cost (see the statement), and one roster
 // read for both counts removes the race as a side effect: humans + agents == seats
-// by construction now, so `member_count + agent_count == seat_count` holds on the
-// wire rather than holding usually.
+// by construction now, so `human_member_count + agent_member_count == member_count`
+// holds on the wire rather than holding usually. (toResp derives member_count from
+// the two halves, so that identity is now true by construction on both routes.)
 //
 // So the clamp is back to being defensive, and stays: it costs nothing, and a
 // future edit that gives the two counts different predicates would otherwise put a
 // negative agent count on the wire, which a client renders as "-3 agents".
 func (r *listRow) AgentCount() int {
-	if r.SeatCount <= r.MemberCount {
+	if r.SeatCount <= r.HumanCount {
 		return 0
 	}
-	return r.SeatCount - r.MemberCount
+	return r.SeatCount - r.HumanCount
 }
 
 // countActiveMembers counts active seats in a project.
@@ -1288,7 +1294,24 @@ func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int)
 //
 // Keyset paging rather than the cascade's "just take the next page" trick: that one
 // works because closing a seat removes the row from its own result set, and this
-// query has no such filter, so LIMIT alone would re-read page one forever.
+// query has no such filter, so LIMIT alone would re-read page one forever. That same
+// absence is why a spent page budget here does NOT ask for a retry — see
+// convergeAllMemberGroupOwners.
+//
+// Measured plan (MySQL 8.0.46, 10k octo_project_member rows over 200 uids x 50 Spaces,
+// after ANALYZE):
+//
+//	ref idx_octo_project_member_space_uid  key_len=324  ref=const,const  rows=50
+//	Extra: Using where; Using filesort
+//
+// The index seeks straight to the (space_id, uid) range, which is the part that has to
+// be right. The filesort is expected and accepted rather than overlooked: the index is
+// (space_id, uid, status), so inside that range rows are ordered by `status` and then by
+// the primary key, never by project_id — and constraining `status` is exactly what this
+// query must not do. What bounds the cost is the set itself: one row per project this
+// member has ever been in, sorted in memory. Recorded because every other new statement
+// in this change carries its plan, and a reader would notice this one did not.
+// PR #855s eleventh review, the nit.
 func (d *DB) queryProjectIDsForSpaceMemberPage(spaceID, uid, afterProjectID string, limit int) ([]string, error) {
 	var ids []string
 	_, err := d.session.SelectBySql(

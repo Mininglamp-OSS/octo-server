@@ -1642,6 +1642,545 @@ pr_855_round_10_fixed:
       project that stays without a group until someone with higher privilege happens
       to write, and every admission in between is skipped with reasonAdmitSkippedNoGroup.
 
+# PR #855 merged as 566e625. The eleventh review APPROVED it and recorded three P2s plus a
+# nit and a coverage gap, explicitly as owned fast-follows. This section is that follow-up,
+# on a fresh branch off the merged main.
+pr_855_round_11_fixed:
+  - id: the-census-guard-did-not-have-the-property-its-commit-claimed
+    severity: medium
+    reported_by: "yujiawei P2-1 (executed, with two mutations)"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The round-10 commit message said "a fourth door added tomorrow fails this test the
+      moment it is written". Not true, in two spellings.
+      (a) The HARD delete was invisible: the matcher knew `UPDATE robot SET status=0` and
+      `.Update("robot")` and nothing else, so a `DeleteFrom("robot")` door passed. The
+      reviewer proved it by adding one. Worse, that spelling is already in the tree --
+      deleteCreatedBotArtifacts uses it (modules/botfather/db.go:239) and registers as a
+      primitive only via the raw UPDATE in its fail-closed fallback. It passed the
+      anti-vacuity list for the WRONG REASON, which is precisely why that list could not
+      expose the blind spot.
+      (b) The two halves can live in different functions: updateRobotInfo holds the
+      `.Update("robot")` with no literal, a caller holds `{"status": 0}` with no Update.
+      Neither half is a primitive and the caller is not a door.
+    fix: |
+      Hard delete recognised in both spellings (`DeleteFrom("robot")` and raw
+      `DELETE FROM robot`). The split spelling is resolved one hop: functions that write
+      the robot table with a caller-supplied field map are collected first, and a function
+      holding a literal `"status": 0` that calls one becomes a DOOR.
+      Not an exemption entry: recording updateRobotInfo as exempt would have said its
+      callers may skip D14, which is false.
+    a-fix-that-failed-its-own-mutation-first: |
+      The first attempt classified the split-spelling function as a PRIMITIVE. Primitives
+      are skipped by the "a primitive is not a door onto itself" rule, and nothing called
+      it, so nothing was asserted and the mutation stayed green. The classification is
+      load-bearing: in that shape the deletion site IS the function holding the literal,
+      because the Update it borrows lives in a generic helper that is not itself a
+      deletion. Caught only by running the mutation.
+    mutation: |
+      Both of the reviewer's probes now turn it red: a DeleteFrom("robot") door, and a
+      caller passing {"status": 0} to updateRobotInfo. Baseline still green, still finding
+      3 primitives and 4 doors.
+  - id: the-finalizers-retry-could-not-make-progress
+    severity: medium
+    reported_by: "yujiawei P2-3"
+    where: modules/project/space_member_removal.go, modules/project/metrics_all_member_group.go
+    what: |
+      convergeAllMemberGroupOwners returned errCascadeIncomplete on a spent page budget,
+      with a comment claiming parity with the cascade's retryable error. The claim is false
+      in exactly the half that makes retry useful: the cascade re-queries ACTIVE seats, so
+      the rows it closes leave its own result set and each retry starts smaller. This query
+      deliberately has no status filter (with one it returns the empty set and converges
+      nothing), so a retry re-reads from project_id > '' and walks the same first 5000 rows
+      forever -- until the job burns its attempt budget and is marked abandoned, dragging
+      every already-successful cleanup step through twenty pointless re-runs.
+      Reachable rather than theoretical: octo_project_member rows are never deleted
+      (rejoining is an UPDATE) and the per-Space quota counts only ACTIVE projects, so the
+      historical row count for one (space_id, uid) is unbounded.
+    fix: |
+      A spent budget no longer asks for a retry: it counts a new metric reason
+      counter of its own (project_all_member_group_owner_convergence_incomplete_total, NOT a
+      kind on the sync-failure counter -- see the entry below for why that was rejected), logs
+      the resume cursor, and returns nil. What is given up is
+      stated in the code: the projects past the budget are not converged this time, and
+      wait for their own next kick / leave / role change -- all three of which already call
+      the same sync. Persisting the cursor would need a column on
+      space_member_removal_cleanup, which belongs to modules/space; inverting that layering
+      for a project-side finalizer is its own task.
+    test: TestOwnerConvergenceDoesNotAskForARetryItCannotWin, plus TestOwnerConvergenceStillWalksEveryPageWithinBudget as the control
+    mutation: "putting errCascadeIncomplete back turns the first case red."
+  - id: the-attribution-re-read-narrowed-the-window-without-closing-it
+    severity: medium
+    reported_by: "yujiawei P2-2"
+    resolution: "documented, not closed -- the suggested fix introduces a deadlock"
+    where: modules/group/all_member_group.go
+    what: |
+      The round-10 fix re-read the group row in-transaction, but non-locking. That read is
+      the transaction's first, so it OPENS the read view: a detach committing after it is
+      invisible, the group_member locks taken next do not revalidate the group row, and the
+      sync goes on to promote or demote creators in a group that is now Space-direct.
+      The review is right about all of that, and right that the comment declining FOR SHARE
+      cited the wrong subject (that argument is about the octo_project_member role read).
+    what-i-did-and-why-not-the-suggested-fix: |
+      Took FOR SHARE, ran the suites, then this branch's own code review found the reason it
+      cannot stay: it introduces an ABBA deadlock that did not exist before.
+      P1's cascade, handOverProjectGroupIfCreator (project_cascade.go:282), locks
+      group_member FOR UPDATE first (queryGroupCreatorTx) and then, on the no-successor
+      path, takes an exclusive lock on the SAME group row (detachGroupFromProjectTx) --
+      group_member then group. The owner sync with FOR SHARE is group then group_member.
+      Both reach the same all-member group: the cascade's detach branch needs "no group
+      member is still in the project", which a one-person project satisfies exactly when its
+      owner leaves. Concurrent, that is ABBA and MySQL kills one side with 1213.
+      Reverted to the non-locking read, with the window, its consequence and its prerequisite
+      written into the code instead of waved at.
+    the-real-ordering-defect-is-one-file-over: |
+      The declared lock order is
+      space_member -> space -> project -> group -> group_member -> octo_project_member.
+      handOverProjectGroupIfCreator takes group_member before group, which INVERTS it. That
+      inversion is what makes the correct fix here unsafe. Straightening it is its own change
+      on a load-bearing P1 path and needs its own analysis and cases; recorded as a follow-up
+      rather than ridden along on a fast-follow.
+    what-the-remaining-window-costs: |
+      A detach has to commit inside the gap between this transaction's first read and its
+      group_member writes. The end state is a Space-direct group with a possibly-wrong
+      creator -- and being Space-direct it is no longer under D7, so an ordinary owner
+      transfer repairs it. Materially different from the unrepairable state round 10 fixed.
+  - id: the-one-new-statement-shipped-without-its-plan
+    severity: low
+    reported_by: "yujiawei, the nit"
+    where: modules/project/db.go
+    fix: |
+      queryProjectIDsForSpaceMemberPage now carries its measured plan, like every other new
+      statement in this change. MySQL 8.0.46, 10k rows over 200 uids x 50 Spaces, after
+      ANALYZE: `ref idx_octo_project_member_space_uid key_len=324 ref=const,const rows=50`,
+      `Using where; Using filesort`. The index seeks to the (space_id, uid) range, which is
+      the part that must be right; the filesort is expected, because the index is
+      (space_id, uid, status) and constraining status is exactly what this query must not
+      do. Bounded by the set: one row per project the member was ever in.
+  - id: the-gate-tests-name-outgrew-its-coverage
+    severity: low
+    reported_by: "yujiawei, the coverage note"
+    where: modules/project/review8_reconcile_gate_test.go
+    what: |
+      runReconcile now runs ten scans, five gated and five not. The list of ungated scans in
+      the test still named two, so i2, i3 and removing_stall were asserted nowhere -- an
+      edit that accidentally gated one would pass a test whose name claims it covers exactly
+      the gated set. i2 is the one that matters: a violation there is a person seeing a
+      project group they are not in. The file header also read "two of the five ... the
+      other five", which is seven against an actual ten.
+    fix: "all five ungated scans asserted; header arithmetic corrected."
+    mutation: "gating scanI2Violations now turns it red; before this it did not."
+  - id: the-census-still-skipped-a-handler-that-deletes-inline
+    severity: medium
+    reported_by: "self, /code-review on this branch"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Teaching the matcher the hard-delete spelling created a third instance of the same
+      bug it was fixing. A handler that runs `DeleteFrom("robot")` INLINE is classified a
+      primitive, and "a primitive is not a door onto itself" then excludes it from the door
+      set -- so step 3 never checks it for D14 routing. That rule silently assumes every
+      primitive is a db-layer helper with a handler above it, which is true of all three
+      today and false for an inline one.
+    fix: |
+      A primitive nothing calls is its own door. Stated as a rule rather than left to the
+      assumption, since this is now the third time the same assumption produced a hole.
+    mutation: "a handler with an inline DeleteFrom(\"robot\") and no seam now turns it red."
+  - id: the-budget-spent-signal-was-filed-as-a-failure
+    severity: low
+    reported_by: "self, /code-review on this branch"
+    where: modules/project/metrics_all_member_group.go
+    what: |
+      owner_budget_spent was added as a `kind` on all_member_group_sync_failures_total,
+      whose Help says it counts failed sync attempts. It is not a failure: the projects
+      reached were converged. Any alert summing that counter across kinds would page on a
+      normal event -- and telling that it was normal would require already knowing this kind
+      exists, which defeats the alert.
+    fix: |
+      its own counter, all_member_group_owner_convergence_incomplete_total.
+      Scope, added in round 3: this was caught in the working tree BEFORE the first commit on
+      this branch -- `git log -S owner_budget_spent --all -- modules/project` is empty, so no
+      commit anywhere ever carried that kind. Recording it is right; describing it as a defect
+      the PR repaired in shipped code is not, and the PR description said exactly that.
+  - id: one-metric-shipped-under-a-different-namespace-from-its-six-siblings
+    severity: low
+    reported_by: "self, while checking a merge-impact list"
+    where: pkg/project/all_member_group.go
+    what: |
+      AllMemberGroupGuardFailures registered under namespace `octo_project` -- named after
+      the table prefix rather than the module -- while the feature's other six metrics use
+      `project`, and every other module in the repo uses one namespace per module (`group`,
+      `dmwork`). It is the single metric an operator most needs, because D7 fails open and
+      this counter is the only thing separating a database hiccup from the guard having been
+      off since Tuesday. Under a different prefix it would not appear beside its siblings on
+      a dashboard, and a merge-impact list written from the sibling names had it wrong.
+    fix: |
+      Renamed to `project_all_member_group_guard_failures_total`. Done now because the
+      feature is off by default and no dashboard exists yet; later it is a breaking rename.
+
+# D16 的计数口径在 GA 前改回来了。不是 review 提的，是核实"是否 breaking"时查出来的。
+pr_855_member_count_realigned:
+  - id: one-server-two-meanings-of-member_count
+    severity: medium
+    reported_by: "self, while answering whether the D16 semantic change was breaking"
+    where: modules/project/{model,api,db}.go
+    what: |
+      D16 redefined Resp.member_count as "humans only" and added agent_count. Checking the
+      client blast radius turned up two facts that together change the question:
+        1. Not breaking -- but for a reason checkable from the tags, not the one first
+           recorded here. v1.18.0 (2026-09-07) DOES ship modules/project (42 files),
+           including Resp.member_count filled from countActiveMembers, i.e. the TOTAL.
+           What never shipped is the humans-only redefinition: `git tag --contains`
+           puts 566e625 on no release. So this restores the released meaning and retires
+           the unreleased one, and a v1.18.0 client sees no change at all.
+           The original wording ("has never been GA, nothing has shipped") was wrong and
+           was the weaker argument; PR #868's fifth review checked the tags.
+           group / thread / integration each have
+           their own member_count on their own endpoints; none was touched.
+        2. But modules/opanalytics already ships member_count (total),
+           human_member_count and agent_member_count on the wire, to the same client
+           teams. So the server now means two different things by one field name, and
+           `agent_count` is separately taken by the Space directory, where it means "how
+           many agents this OWNER has".
+      Nothing catches that: both spellings compile, both return an int, and a client author
+      who learned the opanalytics convention renders the wrong number in projects.
+    fix: |
+      member_count restored to EVERY active seat -- its pre-D16 meaning and opanalytics'
+      meaning -- with the split moved to human_member_count and agent_member_count, named
+      for the existing precedent rather than the shorter agent_count.
+      D16's original argument survives intact: a project with one person and two of their
+      agents should not render "3 人". That is a statement about what the client DISPLAYS,
+      and the display fix is for it to read human_member_count. Redefining member_count
+      bought the same outcome and charged one namespace collision for it.
+      toResp derives member_count as humans + agents rather than reading a third count:
+      both callers already produce the two halves from two statements, so a separately-read
+      total could disagree with them, and the identity a client renders
+      (member_count == human + agent) now holds by construction.
+      listRow.MemberCount renamed HumanCount for the same reason -- two structs one
+      function-argument apart holding a same-named field of opposite meaning is how the
+      wrong one gets passed.
+    test: |
+      TestListRouteSplitsTheRosterAndTheThreeCountsAddUp -- new, and it covers the path that
+      had none: the LIST route, where the two halves come from two statements. It asserts
+      the three fields on a mixed roster, that they add up, and that the detail route agrees
+      field-for-field. TestCreateProjectSeatsTheCreatorsAgents extended with the same three.
+    mutation: "making member_count humans-only again turns both cases red."
+    window: |
+      Done while the humans-only meaning is still unreleased, which is the only time it is
+      free -- see the tag check above; "before first GA" was the wrong way to say it, since
+      v1.18.0 already ships the field with its total meaning. After the humans-only meaning
+      reaches a tag, restoring member_count and renaming agent_count are two breaking
+      changes rather than one field rename against unreleased main.
+
+# PR #868 收到三份 review：两票 APPROVE，一票 CHANGES_REQUESTED（Octo-Q，1 个 P1）。
+# 门禁状态最终是 approved，但那条 P1 成立，连同 yujiawei 的 P2-1/P2-2 是同一类，一并修。
+pr_868_review_fixed:
+  - id: the-census-drew-its-line-on-spelling-and-called-it-semantics
+    severity: high
+    reported_by: "mochashanyao P1; yujiawei P2-1 found the same class from another angle"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The one-hop rule keyed on a literal `"status": 0` in the CALLER, so it could not see
+      either live endpoint that turns a bot off:
+        updateRobotStatus  PUT /robot/status/{id}/{status}  robot.Status = int(status)
+                           -> updateRobot -> UPDATE robot SET version=?, status=?
+        robotUpdate        PUT /robots/{id}                 fields["status"] = *req.Status
+                           -> updateRobotInfo
+      updateRobot's write is BYTE-IDENTICAL to deleteRobotSoft's, which this file classifies
+      as a deletion primitive whose doors must route through D14. The only difference is that
+      one spells the zero as a literal. And the first door's zero is the DEFAULT for a
+      malformed path parameter, so it is reachable by accident.
+      Worse than the miss: my step-0 comment justified it -- "correct, it is a reversible
+      disable, not a deletion". deleteRobotSoft is exactly as reversible. That was a semantic
+      story told about a syntactic behaviour, and it would have taught the next reader that
+      the gap was a decision.
+      yujiawei's angle: the `.Set("status", 0)` chain (182 uses in the tree) was unmatched too,
+      and such a function landed in the benign-helper set -- so the guard did not merely miss
+      the door, it filed it under harmless and then used it to accuse that door's callers.
+    fix: |
+      The rule is now effect-based. A function that writes the robot table's status column
+      with ANY value -- literal, variable, or a caller-supplied field map -- is STATUS-CAPABLE,
+      and every caller of one is a door candidate. Both dbr spellings of a literal zero
+      (SetMap entry and Set chain) now make a function a primitive.
+      What happens to the two doors is a DECISION recorded in d14ExemptDoors with its residue
+      spelled out, not an omission in a matcher: disable is not delete (reversible, releases no
+      username, rotates no token), and round 11 already ruled that whether a disable should
+      release the project seat is a PRODUCT question. Recording the exemption is the honest
+      move; routing them through D14 would be answering that question myself.
+    a-false-positive-the-widening-produced-and-what-it-taught: |
+      The first widening flagged bot_api's applyAgentReport, because it hands SetMap a map it
+      builds itself. "Not a literal" is not the same as "the caller's": a locally built map has
+      knowable columns (all agent_*, never status), a parameter does not. Narrowed to
+      `SetMap(p)` where p is one of the function's own parameters -- which also narrows what
+      used to be flagged, so callers of setDescription / updateBotCommands /
+      updateRobotIMTokenCache are no longer accused of being bot-deletion doors (yujiawei P2-6).
+    mutation: |
+      Five probes, each killing exactly one fixture: remove the Set-chain branch; remove the
+      dbr hard-delete branch; remove the raw-SQL hard-delete branch; remove the SetMap-param
+      branch; and widen SetMap back to "any non-literal" (the false-positive regression).
+  - id: the-matchers-that-close-the-blind-spots-were-themselves-unguarded
+    severity: medium
+    reported_by: "yujiawei P2-2 -- the one he said he would fix before merge"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The census asserts an OUTCOME over the tree. It says nothing about whether each matcher
+      branch can still SEE its shape. yujiawei verified by deletion: remove the hard-delete
+      branch, or step 0, or the uncalled-primitive rule, and the suite stays green -- because
+      nothing in the tree spells those shapes today. That is the same defect the PR was fixing
+      (round 11: the census passed for the wrong reason), moved one abstraction level up.
+    fix: |
+      TestCensusMatcherSeesEverySpellingItClaimsTo -- ten fixtures parsed from source strings,
+      one per matched shape plus three that must NOT match (status zero on another table, a
+      locally built map, a table whose name merely starts with robot). Source strings rather
+      than the repository, because a branch covering a shape the tree does not contain can only
+      be exercised that way. The scanner was split into censusFuncsIn so both drivers share one
+      classifier.
+    note: |
+      This is the exit criterion yujiawei proposes for the whole chain, and it is the right one:
+      guards that assert their own detection paths, not just their outcomes.
+  - id: four-comments-and-two-records-left-stale-by-this-work
+    severity: low
+    reported_by: "yujiawei P2-4/P2-5, mochashanyao P2 x2"
+    fix: |
+      - db_agent.go: the identity read "member_count + agent_count == seats", i.e. after #868
+        "seats + agents == seats", naming a field that no longer exists. Now stated as
+        human_member_count + agent_member_count == member_count. The eighth review had already
+        corrected this same comment once.
+      - roster_counts_test.go: justified itself on the list route being "the only path where the
+        two numbers come from TWO statements". PR-5 moved seat_count into fillMemberCounts, so
+        both come from one roster read -- which this PR's own db.go and api.go comments say. Two
+        comments in one PR stating opposite facts about one function. Re-argued on what is
+        actually true: the two routes compute their halves in DIFFERENT CODE and must agree.
+      - reconcile.go: said the ungated pair "touch only this module's own tables", the narrower
+        of the two reasons -- and giving the narrow one is how the gate test's header ended up
+        asserting a smaller set than the code had.
+      - context.yaml: recorded the budget-spent event as "a new metric reason
+        (owner_budget_spent)" while the code ships a dedicated counter, with the same block
+        recording that the kind was REJECTED. An operator writing an alert from it would have
+        queried a series that does not exist.
+      - project-p2-product-surfaces/brief.md: still recorded member_count as humans-only, and
+        that paragraph is explicitly earmarked as the source for the not-yet-written Swagger
+        contract -- so leaving it would have written the retired semantics into the contract at
+        the moment it was created.
+  - id: the-pr-description-claimed-coverage-that-was-not-committed
+    severity: low
+    reported_by: "both reviewers, independently"
+    what: |
+      The Testing section said the census guard "executes against both of the reviewer's own
+      probes and against an inline-deletion door". Those were throwaway mutations I ran, not
+      committed fixtures. Overstating coverage in the description of a PR whose subject is a
+      guard that passed for the wrong reason.
+    fix: "description corrected, and the fixtures now actually exist (entry above)."
+
+pr_868_round_3_fixed:
+  - id: the-exemptions-were-config-that-nothing-checked
+    severity: high
+    reported_by: "yujiawei (review 5149568590, the APPROVE); mochashanyao reproduced the same mutation independently"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 made the census EFFECT-based and recorded updateRobotStatus / robotUpdate in
+      d14ExemptDoors. Both reviewers then deleted the status-capable door loop and the whole
+      suite stayed green: the door set drops from 6 to 4 and those two endpoints simply leave
+      the census. Nothing noticed, because neither is reachable through a primitive, and the
+      known-door anti-vacuity list names only the three that are.
+      So the entire mechanism round 2 added was deletable while green, and the exemption
+      entries -- which read like assertions -- were config that nothing consumed. An exemption
+      nothing checks is indistinguishable from a matcher that was deleted.
+    fix: |
+      Every key in d14ExemptDoors must appear in the door set the census actually found; a
+      recorded exemption for a door the matcher can no longer see is now an error, with the
+      two readings (renamed/removed vs matcher regressed) named in the message. Plus the
+      matching anti-vacuity loop on statusCapableWriters for updateRobot / updateRobotInfo,
+      since those two are what make the endpoints visible in the first place.
+    mutation: |
+      deleting the status-capable door loop now reddens TWO cases -- the exemption-consumption
+      assertion in the census, and the assembly fixture below. Verified.
+  - id: the-classifier-was-fixtured-but-the-assembly-was-not
+    severity: high
+    reported_by: "yujiawei P?; mochashanyao, same round"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2's answer to "a branch with no example quietly stops working" was fixtures for
+      censusFuncsIn -- the CLASSIFIER. The door ASSEMBLY was still driven only by whatever the
+      repository happens to contain, and both branches there have the same property: delete the
+      uncalled-primitive rule and the door set is byte-identical, because all three real
+      primitives have callers today.
+      That is the third recurrence of one defect at a third level: the census (round 11), the
+      classifier branches (round 1), the assembly (round 2).
+    fix: |
+      assembleCensus extracted from the test body and driven by synthetic packages in
+      TestCensusDoorAssemblyIsPinned -- four cases: a caller of a status-capable writer is a
+      door; a primitive nothing calls is its own door; a primitive WITH a caller makes the
+      caller the door and not itself; a writer that never touches status leaves its callers
+      alone.
+    mutation: "deleting the uncalled-primitive rule now reddens the inline-handler case. Verified."
+  - id: the-Set-chain-branch-still-had-no-fixture-of-its-own
+    severity: medium
+    reported_by: "yujiawei, same round"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 added `cf.writesStatusColumn = true` on the `.Set("status", ...)` chain, but the
+      only chain fixture wrote a literal zero -- which setsStatusZero already covers. Deleting
+      the writesStatusColumn line left the fixture passing, so the status-capable half of that
+      branch was untested.
+    fix: 'a `.Set("status", v)` fixture with a VARIABLE, asserted wantStatusCapable.'
+    mutation: "deleting that line now reddens exactly that case. Verified."
+  - id: the-fixture-header-claimed-a-precision-it-did-not-have
+    severity: low
+    reported_by: "self, while mutation-verifying the three above"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The header said "deleting any single detection branch turns exactly one case below red".
+      Measured across all nine branches: true for eight, false for the ninth. The
+      `Update("robot")` table guard reddens five, because it is not a spelling but the
+      precondition every robot-table shape is built on.
+    fix: |
+      Header now states the measurement instead of the slogan, including the exception. The
+      property that matters -- no branch is deletable while green -- is stated separately and
+      is what was actually verified.
+  - id: the-description-listed-a-defect-that-never-shipped
+    severity: low
+    reported_by: "self, checking the description against git history"
+    where: PR #868 description; this file, the-budget-spent-signal-was-filed-as-a-failure
+    what: |
+      The Changes list said "`owner_budget_spent` was filed as a `kind` on the sync-FAILURE
+      counter ... It has its own counter", which reads as a defect this PR repaired in shipped
+      code. `git log -S owner_budget_spent --all -- modules/project` is empty: no commit ever
+      carried that kind. It existed only in this branch's working tree, and /code-review
+      caught it before the first commit.
+      Small, but it is the second description-overstatement in one PR, in a PR whose subject is
+      guards that claim more than they check.
+    fix: |
+      The bullet now says what is true -- the counter is new, and the kind it briefly was
+      never left this branch. Description and this file corrected together.
+
+pr_868_round_3_advisory_taken:
+  - id: the-justification-said-expensive-about-a-ten-line-reorder
+    severity: medium
+    reported_by: "yujiawei P2-1 (both of that review's advisory passes reached it independently)"
+    where: modules/group/all_member_group.go
+    what: |
+      The comment explaining why FOR SHARE was reverted said the window can only be closed
+      after the cascade's lock order is straightened, i.e. that closing it is a cross-module
+      change to a P1 path. The ABBA analysis behind the revert is right; the conclusion drawn
+      from it is not. Verified the reviewer's alternative against the code: the txGroup read is
+      used only for validation (nil / disbanded / reassigned), and nothing between it and the
+      creator lock depends on its result. Moving it AFTER the `group_member ... FOR UPDATE` and
+      making it locking gives this function the order group_member -> group -- the cascade's own
+      order, so no ABBA, and the two paths then serialize on group_member so the detach cannot
+      land in the window. Cost: one extra lock in the already-detached case, which early-returns.
+      A justification that says "expensive" about a ten-line local reorder tells the next reader
+      not to look. That is the same failure as the round-2 comment that called a matcher gap
+      correct on semantic grounds.
+    fix: |
+      The comment now says the window CAN be closed locally, describes the reorder, and gives
+      the real reason for not doing it here: it changes lock acquisition on a P1-adjacent path
+      and deserves its own concurrency test, which is scheduling, not difficulty. The cascade's
+      own inversion is named as a separate matter and explicitly NOT a precondition.
+    not_changed: "the reorder itself. The reviewer asked for the justification, not the fix."
+  - id: the-spent-budget-comment-described-the-disposition-not-the-residue
+    severity: medium
+    reported_by: "yujiawei P2-2 (one of its advisory passes rated this P1)"
+    where: modules/project/space_member_removal.go
+    what: |
+      The comment framed the give-up as deferral -- "those projects wait for their own next
+      membership change". What it left out is what the intermediate state IS. All three of the
+      reviewer's claims check out against the code:
+        - querySuccessorForProjectGroupTx (group/db.go) picks by seniority narrowed by I2, i.e.
+          any ACTIVE project member, not an active project OWNER. That mismatch is the reason
+          this finalizer exists at all.
+        - a human cannot repair it: owner transfer is one of the six D7-guarded handlers, and
+          the group is still project-bound, so IsAllMemberGroup is true and the guard applies.
+        - nothing reports it: the five ungated scans are ownerless / epoch / I2 / I3 /
+          removing_stall, none of which asserts D6 owner correctness.
+      So the new counter is not a nicety, it is the only signal this state exists.
+    fix: |
+      The residue is now named as a D6 violation, with the three points above and the reason it
+      is still P2 (reachability is 5000 rows -- 25 pages x 200 -- for one (space_id, uid), and the
+      same projects were never converged under the old code either: `after` resets per invocation,
+      so a retry re-walks all 25 pages and never advances past row 5000, so this is
+      not a regression). The cursor-persistence follow-up now carries a D6 owner-correctness
+      scan alongside it.
+  - id: the-flat-name-space-was-visible-but-unstated
+    severity: low
+    reported_by: "yujiawei P2-4"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      primitives, statusCapableWriters and the f.calls[name] lookup are keyed by bare function
+      name, repo-wide, while d14ExemptDoors is keyed "file:func" and says why. The asymmetry is
+      deliberate -- an exemption must not be inherited by a same-named function elsewhere -- but
+      only one half of it was written down.
+    fix: "stated in Known limits, with which direction each half fails in (loudly, both)."
+  - id: the-status-flags-are-per-function-not-per-statement
+    severity: low
+    reported_by: "yujiawei P2-5"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      writesStatusColumn / setsStatusZero are set from any `.Set` or key-value in the body,
+      independent of which table the surrounding statement targets. A function that updates
+      `robot` in one statement and writes `"status": 0` to another table in a second is
+      classified as a deletion primitive. Round 2 widened the numerator, so the surface grew.
+      Fail-closed: a false primitive is a false door and a loud failure.
+    fix: |
+      Pinned rather than narrowed -- a twelfth fixture asserting the current over-match, with
+      the reason in place, so the day someone scopes the flags to a statement this case tells
+      them the behaviour changed on purpose. Narrowing it means tracking dbr builder chains
+      through locals, which is a different tool.
+  - id: the-remeasured-header-changed-again
+    severity: low
+    reported_by: "self, after adding the twelfth fixture"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The header's measurement was re-run after the over-match fixture landed and the numbers
+      moved: seven of nine branches redden exactly one case, not eight. `Update("robot")`
+      reddens six (was five) and the key-value `"status": 0` branch now reddens two, both
+      because they are shapes several fixtures are built out of rather than spellings of their
+      own.
+    fix: "header re-measured and rewritten. The invariant claim -- none deletable while green -- is unchanged and still verified."
+
+pr_868_round_3_superseded_review_items:
+  - id: the-raw-sql-side-never-got-round-2s-widening
+    severity: medium
+    reported_by: "yujiawei P2-4 in the superseding review (5149568590); first-pass found it independently"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 taught the dbr side to see a status write with any value (`.Set("status", v)`,
+      `SetMap(param)`). The raw-SQL side was left matching only the literal zero, so
+      `UpdateBySql("UPDATE robot SET status=? ...")` was neither a primitive nor status-capable.
+      The reviewer enumerated every raw write to the table and confirmed no live miss today --
+      which is precisely the condition this file exists to stop depending on.
+    fix: |
+      rawRobotSetClause captures the SET clause and rawStatusAssignment looks for the status
+      column THERE. The capture is load-bearing, not cosmetic: two live statements write
+      bound_agent_ref with status=1 in their WHERE, and a regex matching `status =` anywhere in
+      the string would call both of them bot disables. Two fixtures: the bound status write
+      (status-capable) and the WHERE-only guard (no match).
+    mutation: |
+      deleting the branch reddens the bound-status fixture; widening the match from the capture
+      back to the whole string reddens the WHERE-only fixture. Both verified. Door and
+      status-capable sets on the tree are unchanged, matching the reviewer's enumeration.
+  - id: the-counter-help-read-as-a-guarantee
+    severity: low
+    reported_by: "yujiawei P2-3 in the superseding review"
+    where: modules/project/metrics_all_member_group.go
+    what: |
+      The Help said the unvisited projects "are picked up by their own next membership change".
+      That is a guarantee about an event that may never come, on a counter that -- per the same
+      review's own finding -- is the only signal the state exists at all.
+    fix: |
+      Help now names the residue (a possible D6 violation D7 blocks repair of and no scan
+      reports), states the convergence as conditional on one of that project's own members being
+      removed / leaving / changing role, says this counter is the only signal, and points at
+      resumeAfterProjectId on the accompanying warning as the manual resume point.
+  - id: the-branch-sweep-moved-again
+    severity: low
+    reported_by: "self, after adding the raw-SQL branch"
+    where: modules/space/bot_deletion_census_test.go
+    what: "ten branches now, not nine; eight redden exactly one case, not seven."
+    fix: |
+      Header re-measured a third time this round. Also states why the SET-clause capture is
+      mutated separately from the branch: deleting it and widening it are different failures,
+      and only the second one reaches the live WHERE-clause shape.
+
 verify:
   rules_rechecked:
     - id: space-isolation
@@ -1760,11 +2299,354 @@ verify:
         arguments.
 
 # Cannot be verified from here; must be checked before merge.
+pr_868_round_4_fixed:
+  - id: the-number-carrying-the-severity-call-was-twenty-times-too-big
+    severity: medium
+    reported_by: "mochashanyao P2-1 (Octo-Q); yujiawei flagged the same arithmetic independently"
+    where: modules/project/space_member_removal.go; this file
+    what: |
+      The comment justifying "P2, not blocking" for the residual D6 violation put the page budget
+      at 十万行 (100,000). cascadePageSize = 200 and cascadeMaxPages = 25, so it is 5000 -- as the
+      constants' own comment says at :40, and as the SAME comment block says twenty lines earlier
+      ("走同样的前 5000 行"). The error is in the direction that flatters the decision: it claimed
+      twenty times more safety margin than exists, for accepting an invariant violation that D7
+      blocks manual repair of and no scan reports.
+      A second sentence was wrong the other way: "the retry could not pass page one". `after`
+      resets per invocation, so a retry re-walks all 25 pages and simply never advances past row
+      5000.
+      I had also repeated the reviewer's own earlier 100k figure without checking it. Both of us
+      carried it for two rounds.
+    fix: |
+      Both corrected in code and in this file, with the arithmetic spelled out (25 x 200) so the
+      next reader can check it in one line rather than trusting it, and the retry restated as
+      re-walking the budget rather than stalling at page one.
+  - id: the-degrade-comment-was-wrong-on-count-shape-and-table
+    severity: medium
+    reported_by: "mochashanyao P2-2"
+    where: modules/project/api.go
+    what: |
+      toResp's comment said the (total, 0) fallback "fires only after two consecutive COUNT
+      failures over the same table". splitSeatCounts returns (total, 0) when countActiveSeatsByKind
+      FAILS and the countActiveMembers fallback SUCCEEDS -- one failure, not two; two failures
+      return (0, 0). And countActiveSeatsByKind is not a COUNT over one table: it is two SELECTs,
+      over octo_project_member and then user. Wrong on the failure count, the statement shape and
+      the table, in one sentence.
+      This is the same class as the db_agent.go comment this PR already corrected twice for
+      describing a statement that does not exist -- in the same file, in the same round.
+    fix: "restated to how the code actually branches, with both failure paths named."
+  - id: an-exemption-was-absorbing-an-unfiled-validation-defect
+    severity: medium
+    reported_by: "mochashanyao P2-3"
+    where: modules/space/bot_deletion_census_test.go; modules/robot/api_manager.go
+    what: |
+      The updateRobotStatus exemption closed by noting that this door's 0 is the default for a
+      malformed parameter. That sentence is not a product question -- it is an unvalidated write.
+      Verified: status := ParseInt64OrDefault(c.Param("status"), 0) then robot.Status = int(status),
+      with no check against the legal status set. PUT /robot/status/{id}/abc silently disables a
+      bot; /999 writes 999 into a state column.
+      The trap is specific to what this PR did: making d14ExemptDoors load-bearing means the census
+      now asserts this door is FOUND, so it will never surface it as a finding again. A recorded
+      exemption would have become permanent cover for a validation bug.
+    fix: |
+      The exemption text now separates the two explicitly -- the product decision is exempt, the
+      parameter validation is not -- and points here. NOT fixed in code: this PR touches no
+      modules/robot logic, and adding validation to a super-admin write is a behaviour change that
+      wants its own test and review rather than a ride on a fast-follow.
+    open: |
+      modules/robot/api_manager.go updateRobotStatus must validate `status` against the legal set
+      and refuse malformed input, instead of defaulting a parse failure to 0 (= disable). Same
+      check belongs on robotUpdate's optional status field.
+  - id: the-unreadable-shard-2-failure-was-identified-by-a-reviewer
+    severity: low
+    reported_by: "mochashanyao, P2 CI note"
+    where: CI, E2E Test (2/4) at 94f85c17
+    what: |
+      I could not read which package failed -- get_job_logs caps returned content at ~8KB of tail
+      and that tail was the WuKongIM teardown dump, the log archive and blob hosts are blocked by
+      this environment's egress policy, and rerun-failed-jobs returns 403. The reviewer could read
+      it: ~10 bot-settings cases dying at modules/robot/bot_setting_integration_test.go:60 with
+      "sql: database is closed" -- a module this PR does not touch.
+      Independently confirmed afterwards by the rebase onto c16f8c1, whose fresh full run passed
+      shard 2. Two shards on this branch needed a runner-level retry within the hour, which points
+      at the runner/service-container layer rather than at any package.
+    fix: |
+      Nothing in this PR. Recorded because the diagnosis cost a round, and because the mitigation
+      ci/run-e2e-shard.sh already carries (reprint the FAIL lines last) is defeated by the
+      service-container dump that follows the step -- the summary should also go to
+      $GITHUB_STEP_SUMMARY, which is served by a separate API. Proposed on the PR, not pushed.
+
+pr_868_round_5_fixed:
+  - id: the-raw-sql-matcher-missed-the-spelling-this-table-already-uses
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-1"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The three raw-SQL regexes were applied per *ast.BasicLit, so a statement split across
+      concatenated literals matched neither half: `"UPDATE robot SET " + "status=0 WHERE ..."`
+      leaves the first fragment with an empty SET clause and the second not beginning with
+      UPDATE. Concatenation is the LIVE style on this very table -- botfather/db.go's two CAS
+      writes are built that way -- so this is not a hypothetical spelling. A disable written
+      like it was invisible: not a primitive, not status-capable, its caller never a door, and
+      the census green while the deletion skipped D14.
+    fix: |
+      foldConcatenatedString flattens the `+` tree; matchRawSQL extracted so the folded and the
+      single-literal paths run the SAME three regexes (two hand-copied rule sets is how the
+      split-spelling hole got in on the dbr side in the first place).
+    mutation: "deleting the fold case reddens both concatenation fixtures. Verified."
+    regression_check: |
+      The live tree's classification is byte-identical after the change -- 3 primitives, 2
+      status-capable writers, the same 6 doors. In particular bindRobotCAS / unbindRobotCAS
+      still do NOT match: they carry status=1 in the WHERE, and the SET-clause capture excludes
+      it. That was the thing to check, since folding can only ADD matches.
+  - id: the-fold-first-aborted-on-non-literals-and-that-was-backwards
+    severity: medium
+    reported_by: "self, mutation-testing the fix above"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The first draft returned "" for the whole expression when any fragment was not a literal,
+      on the reasoning that stitching around a gap invents adjacency. Mutation testing showed
+      the trade is backwards: aborting MISSES real disables (`"UPDATE robot SET status=0 " + v +
+      " WHERE x"` reports as nothing), while skipping's failure mode -- inventing `status=0` out
+      of `"... SET status" + x + "=0"` -- is a false primitive, i.e. a false door and a LOUD red.
+      This file takes loud over silent everywhere else, because a missed deletion is a bot
+      leaving with its Space seats open and nothing reporting it.
+      Worse, my first fixture for this did not pin it at all: it began `"UPDATE robot SET
+      status=" + ...`, and that first literal already matches on its own, so the case passed with
+      the fold and without it. The mutation is what exposed that -- a fixture written to
+      demonstrate a rule, which the rule's deletion left green. Same defect as the file's subject,
+      inside the fix for the file's subject.
+    fix: |
+      Non-literal fragments are skipped, not fatal. The fixture is rebuilt so NEITHER literal
+      matches alone: `"UPDATE robot SET " + placeholder(v) + " status=0 WHERE robot_id=?"`.
+      Kept the negative for the other direction: `"... SET " + col + "=0"` must not match, since
+      the fused text names no column.
+    mutation: "restoring the abort guard now reddens exactly that case. Verified."
+  - id: the-counter-was-called-the-only-signal-and-is-not
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-2"
+    where: modules/project/space_member_removal.go; modules/project/metrics_all_member_group.go
+    what: |
+      Both the comment and the metric Help said this counter is the ONLY signal that the
+      unvisited-projects state exists. When the budget is spent AND a sync failed, the function
+      returns at the firstErr branch above and never reaches the observe call -- while leaving
+      exactly the same residue. So the claim was stronger than the code on a path the code
+      itself takes.
+    fix: |
+      Narrowed rather than widened, and the reason recorded: the error path returns an error, so
+      the cleanup job retries up to removalCleanupMaxAttempts (20) -- observing there would emit
+      twenty points for one removal, against this counter's one-point-per-removal meaning -- and
+      it has not run the `remaining` probe, so it would also fire on the exact-multiple case that
+      is actually complete. That path has its own signal: the abandoned job and releaseCleanupJob's
+      error log. Comment and Help both now say which case each signal covers.
+  - id: the-never-been-GA-justification-is-contradicted-by-the-repos-own-tags
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-5"
+    where: modules/project/model.go; the journal; this file; the PR description
+    what: |
+      The member_count realignment was justified as "the module has never been GA, so nothing
+      had shipped against either meaning". v1.18.0 (2026-09-07) ships 42 files under
+      modules/project INCLUDING Resp.member_count, filled from countActiveMembers -- the total.
+      Verified: `git ls-tree v1.18.0 -- modules/project | wc -l` = 42, and
+      `git tag --contains 566e625` (the humans-only redefinition) is empty.
+      The conclusion survives and the argument is stronger once corrected: this restores the
+      meaning that IS in a release tag and retires the one that never reached one, so a v1.18.0
+      client is unaffected. But the recorded reason was false, and it is the sentence a future
+      wire change will cite.
+    fix: "corrected in all four places, stated as a tag check rather than as a GA status."
+  - id: the-open-item-ledger-still-described-the-retired-meaning-as-current
+    severity: low
+    reported_by: "mochashanyao (Octo-Q) P2-4"
+    where: this file, open_verification
+    what: |
+      The first open_verification entry still listed three items including "the client blast
+      radius of member_count counting humans only (D16)" -- both the count (two remain) and the
+      description (that meaning is what this PR retires) wrong, so a reader following the ledger
+      would go verify semantics that no longer exist. The same sweep had correctly updated
+      project-p2-product-surfaces/brief.md and stopped one file short.
+    fix: "entry rewritten: D2 and D14 remain open, the member_count item is recorded as resolved here."
+  - id: the-mutation-harness-reported-nothing-ran-as-nothing-failed
+    severity: medium
+    reported_by: "self, re-running the branch sweep after the refactor"
+    where: the sweep procedure, not the tree
+    what: |
+      After extracting matchRawSQL the branch sweep was re-run to keep the header's claim true,
+      and it came back 0 red for ALL eleven branches. That reads as "every branch is deletable
+      while green" -- the worst possible result -- and it was wrong. TestMain was panicking on
+      stale migration state left by the previous package's run, so no test body executed, and a
+      harness that counts "--- FAIL" lines cannot tell "nothing failed" from "nothing ran".
+      Two ways this could have gone wrong and one did: had the numbers looked plausible instead
+      of uniformly zero, the false measurement would have been believed and written into the
+      header as fact.
+    fix: |
+      The sweep now drops and recreates the test database first, records a BASELINE run and its
+      subtest count, and marks any mutation whose subtest count differs -- or whose output
+      contains a panic or build error -- as INVALID rather than as a result. Re-run under that
+      procedure: eleven branches, none deletable while green.
+      Written into the test header too, because the next person to re-measure needs the
+      procedure, not just the numbers.
+  - id: carried-forward-not-fixed
+    severity: low
+    reported_by: "Jerry-Xin (P2 advisory); mochashanyao P2-3"
+    what: |
+      Two guard-completeness gaps are acknowledged and NOT fixed in this round, deliberately:
+        - An UNCALLED status-capable writer escapes the census. Uncalled primitives get their own
+          door; uncalled status-capable writers only become doors through callers. Probe-verified
+          by the reviewer: injecting one leaves the census green with the door set at 6. Zero live
+          instances.
+        - "Both fail loudly, not silently" in the Known limits header is only true of the first
+          half; the same-named-non-primitive exclusion (primitives[f.name] == nil) is silent. No
+          name collision exists today.
+      Both want the same shape of fix (extend the uncalled rule to status-capable writers with the
+      same exemption lookup; make the self-exclusion identity-based) plus one assembly fixture
+      each. That is a mechanism change to the assembly, and this round already changed the
+      classifier; doing both at once is how the last four rounds each produced the next round.
+
+pr_868_round_6_fixed:
+  - id: the-exemption-consumption-rule-was-only-built-on-one-of-the-two-maps
+    severity: medium
+    reported_by: "yujiawei P2 (maintainability), review 5153473178"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 3 made d14ExemptDoors load-bearing: every key must appear in the door set the census
+      actually found. d14ExemptPrimitives never got the same rule -- its keys were only ever read
+      to SKIP a primitive, so a key naming a function that no longer exists exempts nothing while
+      still reading like a decision. That is the exact vacuity class this file exists to catch,
+      missing from the half of the mechanism built to catch it.
+      Masked today only by coincidence: the single key also appears in the hardcoded
+      known-primitives list, so a RENAME is caught -- but by the routing assertion firing on the
+      newly un-exempted primitive, not by anything checking the exemption itself.
+    fix: "the symmetric loop: every d14ExemptPrimitives key must be found as a primitive."
+    mutation: |
+      The first mutation I tried did NOT isolate it: renaming the key also un-exempts a real
+      primitive, so the D14-routing assertion fires and the test is red with or without the new
+      loop. The mutation that isolates it is a STALE key -- one naming no function at all, which
+      is the scenario the finding describes. With the loop: red, naming the key. Without: green.
+      Verified both ways. Worth recording because the first mutation looked like it confirmed the
+      fix and confirmed nothing.
+  - id: the-status-capable-predicate-was-hand-copied-into-the-fixture-test
+    severity: low
+    reported_by: "yujiawei nit, same review"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      assembleCensus and the fixture table each spelled out "updates robot AND not a primitive AND
+      (writes status OR takes a field map)". A change to the assembly's rule would have been
+      caught only by the assembly test, leaving the fixture table asserting a rule the census no
+      longer uses -- while presenting itself as the authoritative list of what the matcher sees.
+    fix: |
+      One method, isStatusCapableWriter, called from both. Same reason the raw-SQL matchers were
+      merged into matchRawSQL this round: two copies of a rule drift, and this file has now had
+      that happen twice.
+    mutation: |
+      Narrowing the shared predicate (dropping takesFieldMapParam) now reddens all three tests --
+      the census, the fixture table and the assembly. Before the extraction it would have reddened
+      the fixture table only by coincidence of the two copies agreeing.
+  - id: merged-main-rather-than-rebasing
+    severity: low
+    reported_by: "self"
+    what: |
+      main moved to c69995af (#827, #854) while round 5 was in review, and the branch went
+      mergeable_state=dirty. The conflict was ONE file, .octospec/log.md, where both sides had
+      appended entries; no code file overlapped between main's two commits and this branch.
+      Resolved by keeping both blocks, main's entry first. Verified by set-difference against both
+      parents that no line from either side was lost, rather than by reading the result -- the
+      check that would have caught the log.md truncation this branch already made once.
+
+pr_868_round_7_fixed:
+  - id: the-raw-sql-matchers-failed-open-on-four-spellings
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2, review 5154235498"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      rawRobotDisable and rawRobotSetClause both required the literal shape `update robot set`,
+      so four spellings classified as NOTHING -- not a primitive, not status-capable, callers
+      never door candidates:
+        UPDATE robot r SET r.status=0            (table alias)
+        UPDATE robot AS r SET status=0           (AS form)
+        UPDATE robot SET `status`=0              (backticked column)
+        INSERT INTO robot ... ON DUPLICATE KEY UPDATE status=0
+      Reproduced by running the three regexes against each: all four produce nothing.
+      The severity is not the count of spellings. Every other gap in this file is argued as
+      fail-CLOSED -- an over-match is a false door and a loud red, never a missed deletion --
+      and the fixture table calls itself the authoritative list. These four were the opposite,
+      in a file whose header says so. A stated guarantee the code did not hold, which is this
+      PR's own subject.
+    fix: |
+      One shape for the whole raw side: strip backticks first (normalizeRawSQL), capture the
+      clause a statement ASSIGNS in (rawRobotAssignClause with an optional alias in either
+      spelling, plus rawRobotUpsertClause for the upsert), then apply two rules to that clause --
+      any status assignment is status-capable, a literal zero is a primitive.
+      Deriving the primitive from the SAME capture is the structural fix: the old version matched
+      the table twice, in two patterns, and only one of them ever learned anything.
+    mutation: |
+      Eleven deletable branches, all red. Four weakenings, all red: drop the alias tolerance
+      (2 cases), stop stripping backticks (1), match status anywhere in the statement instead of
+      inside the clause (3 -- all the WHERE-guard fixtures, the live shape), abort the fold on a
+      non-literal instead of skipping (1). Six new fixtures.
+    regression_check: |
+      Widening can only ADD matches, so the check was the live tree: classification byte-identical
+      -- 3 primitives, 2 status-capable writers, the same 6 doors. bindRobotCAS / unbindRobotCAS
+      still do not match, now verified with an alias fixture as well as without.
+  - id: the-ledger-and-the-journal-still-carried-the-GA-claim-this-PR-retracted
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2, same review"
+    where: brief.md:299 and :525; log.md
+    what: |
+      Round 5 corrected "the module has never been GA" in model.go, the journal and this file --
+      and stopped three files short. brief.md:299, brief.md:525 and log.md still recorded the
+      retracted argument as the resolution of a launch-gating checklist item, and brief.md is the
+      file project-p2-product-surfaces names as the source for the not-yet-written Swagger
+      contract. So the item that gates launch rested on a premise the same PR identifies as false,
+      in the document a future contract will be written from.
+      This is the same failure as round 5's own finding -- one sweep, one file short -- committed
+      by the same sweep that fixed it.
+    fix: |
+      All three restated in the tag-checkable form: v1.18.0 ships modules/project including
+      member_count as the total; `git tag --contains 566e625` is empty. Swept afterwards for any
+      remaining occurrence; the only hits left are the corrections quoting the old wording.
+  - id: the-mutation-harness-was-wrong-twice-more-in-the-other-direction
+    severity: low
+    reported_by: "self, running the round-7 sweep"
+    what: |
+      Round 5 taught the sweep to reject runs where nothing executed. This round it was wrong
+      twice the other way: its build-error detector matched testify's own "expected: true" output
+      and called every valid run INVALID; and a mutation applied by string replacement silently
+      did nothing when the pattern did not match, reporting a branch as UNPINNED when it had
+      never been removed. The second one is the dangerous shape -- it produced a plausible
+      "red=0" for the alias group, which is exactly the result that would have been believed.
+    fix: |
+      Detector anchored to real build/panic signals, and every mutation now asserts its pattern
+      matched before running. Both written into the test header, since the procedure is what the
+      next person re-measuring needs.
+  - id: still-carried-forward
+    severity: low
+    what: |
+      NOT fixed, and now recorded accurately in Known limits rather than claimed away:
+        - an UNCALLED status-capable writer escapes the census (uncalled primitives get their own
+          door; uncalled status-capable writers only become doors through callers). Zero live
+          instances, reviewer-probed.
+        - `primitives` is keyed by bare name and assigned last-write-wins, so two same-named
+          bot-disabling functions collapse silently. Keying by file:func would close it. Zero live
+          collisions.
+      Both change the ASSEMBLY. This round changed the classifier's raw-SQL half; doing both at
+      once is how each of the last five rounds produced the next. The header's "both fail loudly"
+      sentence, which was false about the second of these, is corrected.
+
 open_verification:
-  - "The three items in the brief's 'must check before merge' section: the client
-     blast radius of member_count counting humans only (D16), whether the agent
-     picker already excludes self-hosted agents (D2), and whether any caller
-     depends on the synchronicity of botfather's old raw space_member update (D14)."
+  - "modules/robot/api_manager.go updateRobotStatus writes an unvalidated path segment into
+     robot.Status: ParseInt64OrDefault(param, 0) means a malformed segment silently DISABLES the
+     bot, and any integer is written through to the state column. robotUpdate's optional status
+     field wants the same check. Found by PR #868's fourth review while reading the D14 exemption
+     that records this endpoint; deliberately NOT fixed there, because that PR touches no
+     modules/robot logic. The exemption text points here so the census's load-bearing exemption
+     cannot be mistaken for a decision that this is fine."
+  - "TWO items remain from the brief's 'must check before merge' section: whether the
+     agent picker already excludes self-hosted agents (D2), and whether any caller
+     depends on the synchronicity of botfather's old raw space_member update (D14).
+     The third -- the client blast radius of member_count counting humans only -- is
+     RESOLVED by PR #868, which retired that meaning: member_count is every seat again
+     and the humans-only number moved to human_member_count. This entry used to list it
+     as open and described the retired semantics as current, so a reader following it
+     went off to verify a meaning that no longer exists (PR #868's fifth review)."
   - "EXPLAIN for the two I4 scans on production-scale `group` / `group_member`,
      under the PRODUCTION collation shape rather than CI's.
      PR #855's fifth review measured the shape this item was written about and it

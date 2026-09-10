@@ -267,6 +267,8 @@ func TestMemberEpochAndCapabilitiesAreInTheResponses(t *testing.T) {
 	assert.Equal(t, resp.MemberEpoch, listResp[0].MemberEpoch)
 	assert.Equal(t, RoleOwner, listResp[0].MyRole)
 	assert.Equal(t, 2, listResp[0].MemberCount)
+	assert.Equal(t, 2, listResp[0].HumanMemberCount, "both members are human here")
+	assert.Zero(t, listResp[0].AgentMemberCount)
 }
 
 // ---------- permission matrix ----------

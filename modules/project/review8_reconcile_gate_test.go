@@ -9,13 +9,21 @@ package project
 // so all three would sit at zero forever and read as "no violations" on the module whose entire
 // purpose is to be the invariant safety net.
 //
-// The gate's SCOPE is the part worth pinning, not just its existence. Two of the five scans —
-// the ones that touch only this module's own tables — run unconditionally, because gating them
-// would trade working observability for nothing, and scanOwnerlessProjects detects a state P0
-// cannot repair. The other five are gated, for two different reasons that both end in "off by
-// default": the three cross-Space scans cannot survive the collation drift, and the two I4 scans
-// can but are too expensive under it (a full scan of `group` with a temporary table that defeats
-// their own LIMIT paging, every five minutes on every pod). PR #855's tenth review, P2-1.
+// The gate's SCOPE is the part worth pinning, not just its existence. runReconcile runs TEN
+// scans, five gated and five not.
+//
+// The five ungated ones run unconditionally because every comparison they make that crosses
+// into the pinned schema carries an explicit COLLATE, so they survive the drift the gate
+// exists for: gating them would trade working observability for nothing. The five gated ones
+// are off by default for two different reasons that reach the same place — the three
+// cross-Space scans cannot survive the drift at all, and the two I4 scans can but are too
+// expensive under it (a full scan of `group` with a temporary table that defeats their own
+// LIMIT paging, every five minutes on every pod).
+//
+// The arithmetic in this header used to read "two of the five … the other five", which is
+// seven against an actual ten, and the test matched the comment rather than the code: three
+// ungated scans were asserted nowhere. PR #855s tenth review (P2-1) and eleventh (the gate-test
+// coverage note).
 
 import (
 	"regexp"
@@ -62,10 +70,19 @@ func TestReconcileGateCoversExactlyTheGatedScans(t *testing.T) {
 	// ReconcileLimit stops bounding the work. Both are report-only, so what waiting
 	// costs is the reporting. PR #855's tenth review, P2-1.
 	gated := []string{"i1_violations", "abandoned", "orphan", "i4_missing", "i4_gap"}
-	ownTables := []string{"ownerless", "epoch"}
+	// All FIVE ungated scans, not the two this list used to name.
+	//
+	// runReconcile grew to ten scans and the ungated half grew with it, but this list
+	// stayed at the two it was written with — so i2, i3 and removing_stall were asserted
+	// nowhere, and an edit that accidentally moved one inside the gate would pass a test
+	// whose name says it covers exactly the gated set. i2 is the one that makes this
+	// matter: the surrounding comment in runReconcile calls it the invariant "with
+	// teeth", because a violation is a person seeing a project group they are not in.
+	// PR #855s eleventh review.
+	ungated := []string{"ownerless", "epoch", "i2", "i3", "removing_stall"}
 
 	before := map[string]uint64{}
-	for _, s := range append(append([]string{}, gated...), ownTables...) {
+	for _, s := range append(append([]string{}, gated...), ungated...) {
 		before[s] = scanRuns(t, s)
 	}
 
@@ -83,11 +100,13 @@ func TestReconcileGateCoversExactlyTheGatedScans(t *testing.T) {
 				"their measured plans are a full scan of `group` with a temporary table that "+
 				"defeats their own paging, every five minutes on every pod", s)
 	}
-	for _, s := range ownTables {
+	for _, s := range ungated {
 		assert.Greater(t, scanRuns(t, s), before[s],
-			"%s touches only this module's own tables, so gating it would lose working "+
-				"observability for nothing — scanOwnerlessProjects in particular detects a state "+
-				"P0 cannot repair", s)
+			"%s must run with the gate off. Every comparison it makes that crosses into the "+
+				"pinned schema carries an explicit COLLATE, so it survives the drift; gating it "+
+				"would trade working observability for nothing. scanOwnerlessProjects detects a "+
+				"state P0 cannot repair, and i2 is the invariant with teeth — a violation there "+
+				"is a person seeing a project group they are not in", s)
 	}
 
 	// Flag ON — everything runs.
