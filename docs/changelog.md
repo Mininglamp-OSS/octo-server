@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] - 2026-09-11
+
+### Project 协作
+- Project 支持同一 Space 内重名、字面名称搜索及 `X-Total-Count` 列表计数；GET 列表为纯读，仅返回已有且当前有权访问的显式创建 Project，空列表不产生写入。
+- 成员批量入口 `POST /v1/projects/:project_id/members/add` 原子应用成员/管理员角色；新增专用 Owner 转让 `PUT /v1/projects/:project_id/owner`；退出 `POST /v1/projects/:project_id/leave` 按唯一 Owner 规则校验。
+- 群 Project 关系支持 `GET/PUT/DELETE /v1/groups/:group_no/project` 的查询、绑定、换绑和解除，并支持 `POST /v1/group/create` 从 Project 创建群；原生群成员席位独立于 Project 关系并在解除关联后保留。
+- 关联群支持个人置顶：新增 `PUT /v1/projects/:project_id/groups/:group_no/setting`，Project 成员可独立置顶关联群入口；列表返回 `pinned`，置顶项在分页前按服务端时间排序。解绑后隐藏、同一 Project 重绑恢复偏好，且不改变原生群成员关系或聊天权限。
+- 新增 Project 成员单查 `GET /v1/projects/:project_id/members/:uid`：沿用 `MemberResp` 列表投影和 Project 角色，按 `project_id + uid` 直接有界读取；同一 RR 只读事务复核调用者组织/Project 成员资格，未知或已移除目标返回既有 not-found，目标账号/Space 状态不额外改变成员列表语义，响应仅是 Project 关系事实而非 Drive 授权决定；Drive 可用原始用户 session `token` 携带路径 selector 获取关系事实。
+- `GET /v1/group/my` 的 `role=owner|admin|owner,admin` 筛选与 `space_id` 组合收口，先校验 active Space 并排除解散群、非活跃成员、外部管理脏角色及已撤权 Space；无 `role` 保持旧查询，仅补齐群角色回填。
+
 ## [v1.1.2] - 2026-03-05
 
 ### 新功能

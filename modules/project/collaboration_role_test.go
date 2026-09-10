@@ -281,7 +281,7 @@ func TestCollaborationRolesAreClearedWhenMemberLeavesAndNotRestored(t *testing.T
 
 	w = doJSON(t, srv, http.MethodPost,
 		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
-		map[string]any{"uids": []string{"m1"}})
+		addMembersPayload("m1"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	member := rosterMember(t, created.ProjectID, ownerToken, "m1")
@@ -308,7 +308,7 @@ func TestCollaborationRoleRejectsInvalidSetsAndAgents(t *testing.T) {
 	seedAgent(t, spaceA, "agent1", "owner1", "octo_hosted")
 	w = doJSON(t, srv, http.MethodPost,
 		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
-		map[string]any{"uids": []string{"agent1"}})
+		addMembersPayload("agent1"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	w = doJSON(t, srv, http.MethodPut,
 		"/v1/projects/"+created.ProjectID+"/members/agent1/collaboration-roles", ownerToken,

@@ -41,7 +41,7 @@ func TestCascadeDeactivatesEverySeatAndIsIdempotent(t *testing.T) {
 	// rather than just the first one it finds.
 	second := createProjectVia(t, srv, spaceA, ownerTok, "second")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+second.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"leaver"}})
+		ownerTok, addMembersPayload("leaver"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	epochFirstBefore := epochOf(t, first.ProjectID)

@@ -83,8 +83,9 @@ func (p *Project) classifyAgentsTx(
 			continue
 		}
 		if spacepkg.IsSystemBot(uid) {
-			// 系统 bot 在 I2 里是被豁免的（不需要项目席位就能进项目群），
-			// 所以给它一个席位既无意义也会让豁免与席位两套机制互相干扰。
+			// System bots are platform-managed identities, not user-owned Project
+			// agent seats. Rejecting them here also keeps the agent API from
+			// exposing the platform bot whitelist as a Project roster.
 			out[uid] = agentEligibility{Reason: agentReasonSystemBot}
 			continue
 		}
@@ -161,13 +162,6 @@ func ineligibleAgentReasons(uids []string, verdicts map[string]agentEligibility)
 	}
 	return reasons
 }
-
-// canManageOwnAgents 是 D15(b) 的窄能力：任何活跃项目成员都可以带自己的分身进来、
-// 把自己的分身移出去，不需要 canManageMembers。
-//
-// 单独成为一个能力位而不是让客户端从 role 推导，与 capabilitiesFor 的整体口径一致：
-// 客户端一旦自己推导权限矩阵，它就会在矩阵第一次变化时与服务端分叉。
-func canManageOwnAgents(projectRole int) bool { return isProjectMember(projectRole) }
 
 // agentNotEligibleError carries the ineligible SUBSET out to the handler.
 //

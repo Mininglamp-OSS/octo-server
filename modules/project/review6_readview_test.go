@@ -21,6 +21,7 @@ package project
 // FOR UPDATE and is therefore fresh. Only the aggregate that AUTHORISES the write is stale.
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -44,16 +45,6 @@ func holdProjectRow(t *testing.T, projectID string) *dbr.Tx {
 	return tx
 }
 
-// activeOwnerCount reads the authoritative owner count outside any transaction.
-func activeOwnerCount(t *testing.T, projectID string) int {
-	t.Helper()
-	var n int
-	require.NoError(t, testCtx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE project_id = ? AND status = ? AND role = ?",
-		projectID, MemberStatusActive, RoleOwner).LoadOne(&n))
-	return n
-}
-
 func activeMemberCount(t *testing.T, projectID string) int {
 	t.Helper()
 	var n int
@@ -63,60 +54,76 @@ func activeMemberCount(t *testing.T, projectID string) int {
 	return n
 }
 
-// TestConcurrentLastOwnerDeparturesCannotLeaveAProjectOwnerless is the P0 reproducer.
-//
-// Two owners leave concurrently. Each transaction re-reads its OWN membership row FOR UPDATE
-// (fresh) but counts owners with a plain SELECT answered from a snapshot opened before the
-// project row lock — so both see 2 owners, both pass "you are not the last owner", and the
-// project ends with none. There is no path back in P0: role change and disband are owner-only,
-// a Space admin has read access only, and no reconcile scan looks for this state.
-func TestConcurrentLastOwnerDeparturesCannotLeaveAProjectOwnerless(t *testing.T) {
+// activeOwnerCount reads the authoritative sole-owner invariant outside any transaction.
+func activeOwnerCount(t *testing.T, projectID string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM `octo_project_member` "+
+			"WHERE project_id = ? AND status = ? AND removing = 0 AND role = ?",
+		projectID, MemberStatusActive, RoleOwner).LoadOne(&n))
+	return n
+}
+
+// TestConcurrentOwnerTransfersKeepOneOwner starts from the normal sole-Owner
+// state and races two valid successor choices. The dedicated transfer operation
+// must serialize the handoff: exactly one request succeeds, the winner is the
+// only Owner, and the original Owner becomes an Admin.
+func TestConcurrentOwnerTransfersKeepOneOwner(t *testing.T) {
 	srv, p := setup(t)
-	ownerTok, _, created := projectWithMembers(t, srv, "co2")
+	ownerTok, _, created := projectWithMembers(t, srv, "successor1", "successor2")
 	pid := created.ProjectID
+	r := mountProject(t, p)
 
-	// Make co2 a second owner.
-	w := doJSON(t, srv, "PUT", "/v1/projects/"+pid+"/members/co2/role", ownerTok,
-		map[string]any{"role": RoleOwner})
-	require.Equal(t, 200, w.Code, "body: %s", w.Body.String())
-	require.Equal(t, 2, activeOwnerCount(t, pid), "precondition: two owners")
+	require.Equal(t, 1, activeOwnerCount(t, pid), "precondition: one Owner")
 
-	// W: the concurrent departure. Holds the project row and closes co2's seat.
-	txW := holdProjectRow(t, pid)
-	defer txW.RollbackUnlessCommitted()
-	_, err := txW.UpdateBySql(
-		"UPDATE `octo_project_member` SET status = ?, updated_at = ? "+
-			"WHERE project_id = ? AND uid = ? AND status = ?",
-		MemberStatusRemoved, time.Now().UTC(), pid, "co2", MemberStatusActive).Exec()
-	require.NoError(t, err)
-	_, err = txW.UpdateBySql(
-		"UPDATE `octo_project` SET member_epoch = member_epoch + 1 WHERE project_id = ? AND status = 1",
-		pid).Exec()
-	require.NoError(t, err)
-
-	// A: the real leave, in flight. Its first statement opens the read view; it then blocks
-	// on the project row lock W is holding.
-	type outcome struct{ err error }
-	done := make(chan outcome, 1)
-	go func() {
-		_, lErr := p.leaveProject(pid, spaceA, "owner1", "")
-		done <- outcome{err: lErr}
-	}()
-	time.Sleep(700 * time.Millisecond) // let A open its snapshot and park on the lock
-
-	require.NoError(t, txW.Commit()) // now A proceeds, with a snapshot from before this commit
-
-	var got outcome
-	select {
-	case got = <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("leaveProject 未在 15s 内返回")
+	type result struct {
+		code int
+		body string
 	}
+	start := make(chan struct{})
+	done := make(chan result, 2)
+	for _, successor := range []string{"successor1", "successor2"} {
+		successor := successor
+		go func() {
+			<-start
+			w := doOn(t, r, http.MethodPut, "/v1/projects/"+pid+"/owner", ownerTok,
+				map[string]any{"uid": successor})
+			done <- result{code: w.Code, body: w.Body.String()}
+		}()
+	}
+	close(start)
 
-	assert.ErrorIs(t, got.err, errLastOwnerMustTransfer,
-		"owner1 IS the last owner once W committed; the guard must see that and refuse")
+	results := []result{<-done, <-done}
+	successes := 0
+	for _, got := range results {
+		if got.code == http.StatusOK {
+			successes++
+		}
+	}
+	require.Equal(t, 1, successes,
+		"two simultaneous valid handoffs must commit exactly one transfer: %+v", results)
+
 	assert.Equal(t, 1, activeOwnerCount(t, pid),
-		"a project must never be left with zero owners — there is no path back in P0")
+		"concurrent transfers must never create multiple active Owners")
+	former, err := p.db.queryMember(pid, "owner1")
+	require.NoError(t, err)
+	require.NotNil(t, former)
+	assert.Zero(t, former.Removing)
+	assert.Equal(t, MemberStatusActive, former.Status)
+	assert.Equal(t, RoleAdmin, former.Role,
+		"the original sole Owner must become Admin after the winning handoff")
+
+	winners := 0
+	for _, uid := range []string{"successor1", "successor2"} {
+		member, err := p.db.queryMember(pid, uid)
+		require.NoError(t, err)
+		require.NotNil(t, member)
+		if member.Status == MemberStatusActive && member.Removing == 0 && member.Role == RoleOwner {
+			winners++
+		}
+	}
+	assert.Equal(t, 1, winners, "exactly one valid successor must hold Owner")
 }
 
 // TestConcurrentAddsCannotExceedTheMemberQuota is the same root cause on the add path.

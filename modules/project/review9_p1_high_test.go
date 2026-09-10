@@ -12,8 +12,6 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -115,79 +113,6 @@ func TestDisbandDoesNotStrandASeatAtRemovingOne(t *testing.T) {
 	_ = p
 }
 
-// ---------- HIGH-2 ----------
-
-// TestCascadeSkipsADisbandedProjectGroup.
-//
-// queryProjectGroupNosWithActiveMember had no group-status filter, so a
-// DISBANDED project group the departing member still has a row in was handed to
-// RemoveGroupMembers — which refuses a disbanded group outright ("group not
-// found or disbanded"). Every attempt failed identically, so the job burned all
-// eight attempts, was marked abandoned (terminal), and left the seat stuck at
-// removing = 1 permanently. One disbanded group anywhere in a project was enough
-// to break removal for every member still in it.
-//
-// Skipping is the right answer rather than "remove them anyway": a disbanded
-// group grants nothing, its rows are left in place by group disband itself, and
-// there is no API that would clean them up.
-func TestCascadeSkipsADisbandedProjectGroup(t *testing.T) {
-	srv, p := setup(t)
-	_, _, created := projectWithMembers(t, srv, "member1")
-
-	live := "g-live-" + util.GenerUUID()[:8]
-	dead := "g-dead-" + util.GenerUUID()[:8]
-	seedProjectGroupWithMembers(t, live, spaceA, created.ProjectID, "owner1", "owner1", "member1")
-	seedProjectGroupWithMembers(t, dead, spaceA, created.ProjectID, "owner1", "owner1", "member1")
-	// 2 is modules/group's GroupStatusDisband. Spelled out because modules/project
-	// must not import modules/group.
-	_, err := testCtx.DB().UpdateBySql(
-		"UPDATE `group` SET status = 2 WHERE group_no = ?", dead).Exec()
-	require.NoError(t, err)
-
-	beginRemovalWithoutDraining(t, p, created.ProjectID, "member1")
-	drainRemovalCascade(t, p)
-
-	status, removing := seatState(t, created.ProjectID, "member1")
-	assert.Equal(t, MemberStatusRemoved, status,
-		"the removal must complete: a disbanded group in the project must not be able to "+
-			"abandon the job and strand the seat")
-	assert.Equal(t, 0, removing)
-	assert.False(t, groupMemberActive(t, live, "member1"),
-		"the live project group must still be cleaned up")
-}
-
-// ---------- HIGH-3 ----------
-
-// TestI2ScanExaminesEveryMemberOfAGroupThatSpansAPage.
-//
-// The I2 cursor advanced to the LAST GROUP ID the page touched, so the next page
-// started strictly after that group — and any member rows of that group beyond
-// the page boundary were never examined. The comment claimed this was
-// "self-correcting: the next rotation sees them", which is false: the pages fall
-// on the same boundary every rotation, so the same members are skipped forever.
-//
-// A group with more members than one page, whose LAST member (by uid order) is
-// not in the project, is the sharpest form: the one row that matters is the one
-// that is always cut off.
-func TestI2ScanExaminesEveryMemberOfAGroupThatSpansAPage(t *testing.T) {
-	srv, p := setup(t)
-	_, _, created := projectWithMembers(t, srv, "member1")
-
-	// uid ordering matters: the intruder must sort last, so it lands past the
-	// page boundary rather than inside the first page.
-	groupNo := "g-span-" + util.GenerUUID()[:8]
-	seedProjectGroupWithMembers(t, groupNo, spaceA, created.ProjectID, "owner1",
-		"owner1", "member1", "zz-intruder")
-
-	p.cfg.ReconcileLimit = 2 // strictly fewer than the group's three members
-	resetCursorsForTest()
-	p.scanI2Violations()
-
-	assert.Equal(t, float64(1), promtestutil.ToFloat64(i2Violations),
-		"the member past the page boundary must be examined; with the old cursor the scan "+
-			"jumped over the rest of the group and reported zero violations forever")
-}
-
 // ---------- HIGH-4 ----------
 
 // TestAClosingSeatCannotAdministerTheProject.
@@ -234,22 +159,21 @@ func TestAClosingSeatCannotAdministerTheProject(t *testing.T) {
 
 // TestLastOwnerCannotTransferToAClosingMember.
 //
-// promoteSuccessorTx accepted any successor with status = 1, while
-// countActiveOwnersTx already excludes removing = 1. The two together produce
-// the exact outcome the last-owner guard exists to prevent: the departing owner
-// hands ownership to a seat that is on its way out, the cascade closes it
-// moments later, and the project is left ACTIVE WITH ZERO OWNERS — unmanageable,
-// with nothing in P0 or P1 able to promote a member without an owner.
+// The dedicated owner-transfer endpoint must reject a successor whose Project seat is closing.
+// Otherwise the transfer could commit ownership to a member the cascade closes moments later,
+// leaving an active project with zero owners and no administrative path.
 func TestLastOwnerCannotTransferToAClosingMember(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv, "member1")
 	beginRemovalWithoutDraining(t, p, created.ProjectID, "member1")
 
-	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
-		ownerTok, map[string]any{"transfer_to": "member1"})
-	assert.NotEqual(t, http.StatusOK, w.Code,
-		"the sole owner must not be allowed to transfer to a seat that is closing: body=%s",
-		w.Body.String())
+	w := doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID+"/owner",
+		ownerTok, map[string]any{"uid": "member1"})
+	assertProjectErrorCode(t, w, "err.server.project.member_not_found")
+
+	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
+		ownerTok, nil)
+	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
 
 	status, removing := seatState(t, created.ProjectID, "owner1")
 	assert.Equal(t, MemberStatusActive, status, "the owner must still hold their seat")

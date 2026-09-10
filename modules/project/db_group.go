@@ -1,7 +1,11 @@
 package project
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -25,7 +29,7 @@ import (
 // leaves a repairable gap that a reconcile scan reports; a missing read hook
 // silently answers the wrong thing to the client.
 //
-// # No COLLATE in either statement, deliberately
+// # No COLLATE in either legacy membership statement, deliberately
 //
 // The module's rule is that a COLLATE belongs exactly where a legacy column
 // (`group`, `group_member`, created in 2019 with no explicit collation, measured
@@ -109,9 +113,9 @@ const sqlListMyProjectGroupsByProjectIDs = "SELECT g.project_id, " + projectGrou
 // granularity. There is no self-join path into a group either, so the wider list
 // would not even be actionable.
 //
-// This is also why the handler needs no permission gate beyond projectMiddleware:
-// the predicate IS the gate. A Space admin who never joined the project gets an
-// empty list rather than a refusal, which is the correct answer and leaks nothing.
+// The relation endpoint has its own Project-wide projection below. This legacy
+// helper remains deliberately native-membership-scoped for category/sidebar
+// surfaces that render actual chat rooms.
 //
 // # Disbanded groups are excluded, and that filter is load-bearing
 //
@@ -299,13 +303,11 @@ func (d *DB) listMyProjectGroupResponsesByProjectIDs(spaceID, uid string, projec
 	return result, nil
 }
 
-// ListMyProjectGroups is the in-process equivalent of
-// GET /v1/projects/:project_id/groups. Category uses it for a Project sidebar
-// section rather than copying this modules membership, blacklist, and disband
-// predicates into a second query.
+// ListMyProjectGroups is the in-process legacy native-membership-scoped
+// projection used by category/sidebar chat-room surfaces. It is intentionally
+// not the relation-only GET /v1/projects/:project_id/groups endpoint.
 //
-// It follows that endpoint's default page, including its 50-row bound. A
-// sidebar section is not a bypass for the endpoint's pagination contract.
+// It follows the legacy default page, including its 50-row bound.
 func ListMyProjectGroups(ctx *config.Context, spaceID, projectID, uid string) ([]*GroupResp, error) {
 	if ctx == nil || spaceID == "" || projectID == "" || uid == "" {
 		return []*GroupResp{}, nil
@@ -314,13 +316,134 @@ func ListMyProjectGroups(ctx *config.Context, spaceID, projectID, uid string) ([
 	return db.listMyProjectGroupResponses(spaceID, projectID, uid, 0, projectDefaultPageLimit)
 }
 
-// ListMyProjectGroupsByProjectIDs is the batched sidebar equivalent of
-// ListMyProjectGroups. Each Project keeps the endpoint's default 50-row page
-// bound while the database cost remains two queries for the whole request.
+// ListMyProjectGroupsByProjectIDs is the batched legacy sidebar equivalent of
+// ListMyProjectGroups. Each Project keeps the default 50-row bound while the
+// database cost remains two queries for the whole request.
 func ListMyProjectGroupsByProjectIDs(ctx *config.Context, spaceID, uid string, projectIDs []string) (map[string][]*GroupResp, error) {
 	if ctx == nil {
 		return map[string][]*GroupResp{}, nil
 	}
 	db := NewDB(ctx)
 	return db.listMyProjectGroupResponsesByProjectIDs(spaceID, uid, projectIDs, projectDefaultPageLimit)
+}
+
+// ProjectGroupRelation is the relation-only projection used by
+// GET /v1/projects/:project_id/groups. It deliberately carries no native
+// membership, ACL, or chat fields.
+type ProjectGroupRelation struct {
+	GroupNo   string  `json:"group_no" db:"group_no"`
+	Name      string  `json:"name" db:"name"`
+	ProjectID string  `json:"project_id" db:"project_id"`
+	LinkedBy  *string `json:"linked_by" db:"project_linked_by"`
+	Pinned    bool    `json:"pinned" db:"pinned"`
+}
+
+type projectGroupRelationRow struct {
+	GroupNo       string  `db:"group_no"`
+	Name          string  `db:"name"`
+	ProjectID     string  `db:"project_id"`
+	ProjectLinked *string `db:"project_linked_by"`
+	Pinned        bool    `db:"pinned"`
+}
+
+// projectGroupLike escapes LIKE metacharacters while keeping the query's
+// collation literal. The endpoint's keyword is a literal substring, not a
+// pattern supplied by the caller.
+func projectGroupLike(keyword string) string {
+	escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(keyword)
+	return "%" + escaped + "%"
+}
+
+func (d *DB) listProjectGroupRelations(
+	ctx context.Context, projectID, spaceID, actorUID, keyword string, offset, limit int,
+) ([]ProjectGroupRelation, int64, error) {
+	if d == nil || d.session == nil {
+		return nil, 0, fmt.Errorf("project: group relation database unavailable")
+	}
+	projectID = strings.TrimSpace(projectID)
+	spaceID = strings.TrimSpace(spaceID)
+	actorUID = strings.TrimSpace(actorUID)
+	keyword = strings.TrimSpace(keyword)
+	if projectID == "" || spaceID == "" || actorUID == "" {
+		return nil, 0, ErrGroupProjectInvalid
+	}
+	if utf8.RuneCountInString(keyword) > 30 {
+		return nil, 0, fmt.Errorf("%w: keyword", ErrGroupProjectInvalid)
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = projectDefaultPageLimit
+	}
+	tx, err := d.session.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: begin Project group list: %v", ErrGroupProjectDependency, err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	access, err := AuthorizeGroupProjectReadTx(tx, actorUID, projectID, spaceID)
+	if err != nil {
+		return nil, 0, err
+	}
+	countWhere := "g.space_id = ? AND g.project_id = ? AND g.status <> ?"
+	countArgs := []interface{}{access.SpaceID, access.ProjectID, groupStatusDisband}
+	if keyword != "" {
+		countWhere += " AND g.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'"
+		countArgs = append(countArgs, []byte(projectGroupLike(keyword)))
+	}
+	var total int64
+	if err := tx.SelectBySql("SELECT COUNT(*) FROM `group` g WHERE "+countWhere, countArgs...).LoadOne(&total); err != nil {
+		return nil, 0, fmt.Errorf("%w: count Project groups: %v", ErrGroupProjectDependency, err)
+	}
+
+	query := "SELECT g.group_no, g.name, g.project_id, g.project_linked_by, " +
+		"IFNULL(s.pinned, 0) AS pinned " +
+		"FROM `group` g LEFT JOIN `octo_project_group_user_setting` s ON " +
+		"s.space_id = g.space_id COLLATE utf8mb4_general_ci " +
+		"AND s.project_id = g.project_id COLLATE utf8mb4_general_ci " +
+		"AND s.group_no = g.group_no COLLATE utf8mb4_general_ci " +
+		"AND s.uid = ? " +
+		"WHERE " + countWhere +
+		" ORDER BY IFNULL(s.pinned, 0) DESC, " +
+		"CASE WHEN s.pinned = 1 THEN s.pinned_at END DESC, " +
+		"g.id ASC, g.group_no ASC LIMIT ? OFFSET ?"
+	pageArgs := append([]interface{}{actorUID}, countArgs...)
+	pageArgs = append(pageArgs, limit, offset)
+	var rows []*projectGroupRelationRow
+	if _, err := tx.SelectBySql(query, pageArgs...).Load(&rows); err != nil {
+		return nil, 0, fmt.Errorf("%w: list Project groups: %v", ErrGroupProjectDependency, err)
+	}
+	result := make([]ProjectGroupRelation, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		linkedBy := normalizedProjectLinkedBy(row.ProjectLinked)
+		result = append(result, ProjectGroupRelation{
+			GroupNo:   row.GroupNo,
+			Name:      row.Name,
+			ProjectID: row.ProjectID,
+			LinkedBy:  linkedBy,
+			Pinned:    row.Pinned,
+		})
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, 0, fmt.Errorf("%w: commit Project group list: %v", ErrGroupProjectDependency, err)
+	}
+	return result, total, nil
+}
+
+func normalizedProjectLinkedBy(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	v := strings.TrimSpace(*value)
+	if v == "" {
+		return nil
+	}
+	return &v
 }

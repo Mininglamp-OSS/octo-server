@@ -776,6 +776,7 @@ func TestProcessMemberRemovalCleanupsIsNotReentrant(t *testing.T) {
 	}})
 	defer restore()
 
+	waitForMemberRemovalWorkerIdle(t)
 	f.processMemberRemovalCleanups()
 	assert.Equal(t, 1, inner, "重入的那次必须直接返回，不得再执行一轮")
 }

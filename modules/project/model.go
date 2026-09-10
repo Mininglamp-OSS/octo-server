@@ -6,9 +6,8 @@ import "time"
 
 // Project status (octo_project.status).
 const (
-	// StatusDisbanded — the project has been disbanded. Terminal: its name is
-	// released (the active_name generated column goes NULL) and every read path
-	// treats it as nonexistent.
+	// StatusDisbanded — the project has been disbanded. Read paths treat it
+	// as nonexistent; project names are independent labels.
 	StatusDisbanded = 0
 	// StatusNormal — active.
 	StatusNormal = 1
@@ -46,15 +45,12 @@ func IsValidRole(r int) bool { return r == RoleCommon || r == RoleAdmin || r == 
 
 // Discoverability (octo_project.discoverability).
 //
-// Named for what it is. These values filter the Space project list and directory
-// search; they are NOT a security boundary — a Space admin can still enumerate
-// project metadata. Calling the field "visibility" or "secret" would invite
-// readers to treat it as isolation, which it is not.
+// Project discoverability is retained for storage compatibility; all Project
+// reads still require an active Space identity and active Project membership.
 const (
-	// DiscoverabilitySpaceListed — appears in the Space project list.
+	// DiscoverabilitySpaceListed — legacy display classification.
 	DiscoverabilitySpaceListed = 0
-	// DiscoverabilityUnlisted — hidden from the list; reachable by its members
-	// and by Space admins.
+	// DiscoverabilityUnlisted — legacy display classification.
 	DiscoverabilityUnlisted = 1
 )
 
@@ -128,10 +124,9 @@ type MemberModel struct {
 	// while Status is still MemberStatusActive.
 	//
 	// Every authorization read treats Removing == 1 as a NON-member — the member
-	// list, the group admission gate, the middleware's role resolution. Status
-	// stays active until the group detach finishes, and that is what keeps I2
-	// from being literally violated by the removal itself: the group_member rows
-	// that have not been cleaned up yet still belong to a member of record.
+	// list and middleware's role resolution use this clause. Status stays active
+	// until the removal worker finishes registered cleanup; native group membership
+	// is independent and is not mutated by this Project-side seat close.
 	Removing  int       `db:"removing"`
 	InviteUID string    `db:"invite_uid"`
 	CreatedAt time.Time `db:"created_at"`
@@ -189,14 +184,24 @@ type settingReq struct {
 	Pinned *bool `json:"pinned"`
 }
 
+// memberAdd is the per-target role contract for an atomic members/add batch.
+// Role 0 (member) is the default when omitted; RoleOwner is never accepted
+// here because owner changes have a dedicated atomic transfer endpoint.
+type memberAdd struct {
+	UID  string `json:"uid"`
+	Role int    `json:"role"`
+}
+
 type membersReq struct {
+	Members []memberAdd `json:"members"`
+}
+
+type memberUIDsReq struct {
 	UIDs []string `json:"uids"`
 }
 
-type leaveReq struct {
-	// TransferTo names the successor when the caller is the last owner. Leaving
-	// without it is rejected rather than silently producing an ownerless project.
-	TransferTo string `json:"transfer_to"`
+type ownerTransferReq struct {
+	UID string `json:"uid"`
 }
 
 type roleReq struct {
@@ -207,9 +212,6 @@ type roleReq struct {
 	// handler was hardened against in round 1. Matches updateReq, where every optional
 	// field is a pointer for the same reason.
 	Role *int `json:"role"`
-	// TransferTo is required when demoting the last owner, for the same reason as
-	// in leaveReq.
-	TransferTo string `json:"transfer_to"`
 }
 
 type collaborationRoleNameReq struct {
@@ -313,11 +315,6 @@ type Capabilities struct {
 	CanChangeRole   bool `json:"can_change_role"`
 	CanLeave        bool `json:"can_leave"`
 	CanViewMembers  bool `json:"can_view_members"`
-	// CanManageOwnAgents is the narrow capability D15 adds: any active project
-	// member may seat and unseat THEIR OWN agents, without holding
-	// CanManageMember. It is deliberately not derivable from the role number —
-	// an ordinary member has it and cannot manage anyone else.
-	CanManageOwnAgents bool `json:"can_manage_own_agents"`
 }
 
 // MemberResp is one row of the project member roster.
@@ -416,17 +413,6 @@ type GroupResp struct {
 	// populations are still different — a group's roster is not a project's — but
 	// the QUESTION the name asks is now the same everywhere.
 	MemberCount int `json:"member_count"`
-}
-
-// memberRosterModel is the member roster joined to `user` for display names.
-type memberRosterModel struct {
-	MemberModel
-	Name string `db:"name"`
-	// Robot / OwnerUID come from `user` and `robot` respectively, both LEFT
-	// JOINed: a member whose user row is missing must still appear (see
-	// listMembers), and a robot row is absent for every person.
-	Robot    int    `db:"robot"`
-	OwnerUID string `db:"owner_uid"`
 }
 
 const respTimeFormat = "2006-01-02 15:04:05"

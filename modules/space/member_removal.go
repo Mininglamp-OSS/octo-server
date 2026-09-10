@@ -279,7 +279,9 @@ func (s *Space) afterMembersRemoved(spaceID string, uids []string, operatorUID, 
 	}
 	s.invalidateSpaceMemberCache(spaceID)
 
+	removalCleanupAsyncRunning.Add(1)
 	go func() {
+		defer removalCleanupAsyncRunning.Add(-1)
 		defer func() {
 			if r := recover(); r != nil {
 				s.Error("成员移除收尾 panic", zap.Any("recover", r), zap.String("spaceId", spaceID))
@@ -410,9 +412,15 @@ func (s *Space) sweepExhaustedMemberRemovalCleanups() {
 //
 // 触发源有两个：afterMembersRemoved 起的 goroutine，和每 10s 一次的定时器；而定时器
 // 是「先安排下一次、再执行本次」（timingwheel 每次 firing 都 `go task()`），并不会等
-// 上一轮跑完。一次大解散后队列里堆着成千条工单，一轮 20 条的批次可能跑几分钟，
+// 上一轮跑完。一次大解散后队列里堆着成千条工单，一轮 20 条批次可能跑几分钟，
 // 期间会叠起几十个并发批次，各自占着 DB 连接猛打 WuKongIM。同一时刻只允许一轮。
 var removalCleanupRunning atomic.Bool
+
+// removalCleanupAsyncRunning counts afterMembersRemoved goroutines so tests
+// can join prior asynchronous cleanup before reusing the shared test context.
+// The counter is observational only; production scheduling remains
+// non-blocking.
+var removalCleanupAsyncRunning atomic.Int64
 
 // processMemberRemovalCleanups 认领并执行一批清理工单。
 //

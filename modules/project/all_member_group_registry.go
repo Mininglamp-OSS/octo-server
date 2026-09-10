@@ -6,7 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 )
 
-// 全员群的四个反向注册点（P2）。
+// 全员群的两个反向注册点（建群、改名）。
 //
 // # 为什么又是反向注册
 //
@@ -27,16 +27,13 @@ import (
 //
 // 代价被显式接受并各自有兜底：
 //
-//   - provisioner 失败 → 项目已创建、all_member_group_no 为空串。D4：下一个写路径
-//     在租约保护下补建，I4 扫描 A 报出来。
-//   - admitter 失败 → 项目席位已提交、人不在全员群里。D12：I4 扫描 B 报出来。
-//   - owner / rename 同步失败 → 群主或群名与项目不一致。只记日志加指标；群主那一路
-//     还有 P1 的「群主离开项目时移交」兜底。
+//   - provisioner 失败 → 项目已创建、all_member_group_no 为空串。初次建群失败不会回滚
+//     Project；后续显式创建或补偿路径可再次尝试。
+//   - rename 同步失败 → 群名与项目不一致。只记日志加指标。
 //
 // # 契约
 //
-// 与 cascade_registry.go 的步骤契约一致，且都必须**幂等**：调用方会在补建和重试
-// 路径上重复调用它们。
+// 与 cascade_registry.go 的步骤契约一致，且都必须**幂等**。
 
 // AllMemberGroupSeed 是一次建群请求。
 type AllMemberGroupSeed struct {
@@ -60,35 +57,6 @@ type AllMemberGroupSeed struct {
 // 「分身的项目席位写进去了吗」这件事由不变量本身回答，而不是由调用顺序回答。
 type AllMemberGroupProvisioner func(ctx *config.Context, seed AllMemberGroupSeed) (string, error)
 
-// AllMemberGroupAdmitter 把一个 uid 放进已有的全员群（D12）。
-//
-// 实现照 modules/group/preset_group_admission.go 的 admitToPresetGroup：自带事务、
-// 自取版本号、走唯一准入口、提交后 IM 订阅。幂等——已在群里则整条语句是空操作。
-type AllMemberGroupAdmitter func(ctx *config.Context, spaceID, groupNo, uid string) error
-
-// AllMemberGroupOwnerTransfer 确保全员群的群主是这个项目的活跃 owner（D6）。
-//
-// 签名刻意**不**接受"新群主是谁"。项目可以有多个 owner
-// （countActiveOwnersTx 与「最后一个 owner 必须先转让」两处都以此为前提），所以
-// "把群主换成刚刚被提升的那个人"是错的：原群主如果本来就是 owner，这次提升与他
-// 无关，把群交给新人等于凭空改变了谁控制这个群。
-//
-// 正确的判定需要"群当前的群主是谁"，而那是群侧的状态。于是这个钩子被写成**自决**
-// 的：群侧读出群主，用 pkg/project 问它是不是本项目的活跃 owner，是就什么都不做，
-// 不是才移交给一个活跃 owner。这样一来：
-//
-//   - 幂等，可以在任何一次 owner 变动之后无条件调用；
-//   - 多 owner 的情形天然正确；
-//   - 项目侧不需要知道群的任何状态，方向仍然是 group → project。
-//
-// 实现要复用群侧既有的转让原语，而不是自己写一遍 UPDATE：转让要处理旧群主降级、
-// 版本号推进、以及客户端的成员变更同步。
-//
-// 这条路径**绕过** D7 的 handler 层保护，这是有意的：保护挡的是"人手动转让全员群
-// 群主"，而这里正是项目侧驱动的那次转让。保护只加在 HTTP handler 上，服务层不加，
-// 就是为了让这条路径和 P1 的级联都能通过。
-type AllMemberGroupOwnerTransfer func(ctx *config.Context, projectID, groupNo string) error
-
 // AllMemberGroupRename 把全员群名改成 name（D8）。best-effort。
 //
 // projectID 传的是**发起这次改名的项目**，群侧用它给写加一道归属栅栏：
@@ -100,8 +68,6 @@ type AllMemberGroupRename func(ctx *config.Context, projectID, groupNo, name str
 var (
 	allMemberGroupMu       sync.RWMutex
 	allMemberGroupProvish  AllMemberGroupProvisioner
-	allMemberGroupAdmitFn  AllMemberGroupAdmitter
-	allMemberGroupOwnerFn  AllMemberGroupOwnerTransfer
 	allMemberGroupRenameFn AllMemberGroupRename
 )
 
@@ -111,20 +77,6 @@ func RegisterAllMemberGroupProvisioner(fn AllMemberGroupProvisioner) {
 	allMemberGroupMu.Lock()
 	defer allMemberGroupMu.Unlock()
 	allMemberGroupProvish = fn
-}
-
-// RegisterAllMemberGroupAdmitter 由 modules/group 在构造时调用。
-func RegisterAllMemberGroupAdmitter(fn AllMemberGroupAdmitter) {
-	allMemberGroupMu.Lock()
-	defer allMemberGroupMu.Unlock()
-	allMemberGroupAdmitFn = fn
-}
-
-// RegisterAllMemberGroupOwnerTransfer 由 modules/group 在构造时调用。
-func RegisterAllMemberGroupOwnerTransfer(fn AllMemberGroupOwnerTransfer) {
-	allMemberGroupMu.Lock()
-	defer allMemberGroupMu.Unlock()
-	allMemberGroupOwnerFn = fn
 }
 
 // RegisterAllMemberGroupRename 由 modules/group 在构造时调用。
@@ -140,44 +92,26 @@ func allMemberGroupProvisioner() AllMemberGroupProvisioner {
 	return allMemberGroupProvish
 }
 
-func allMemberGroupAdmitter() AllMemberGroupAdmitter {
-	allMemberGroupMu.RLock()
-	defer allMemberGroupMu.RUnlock()
-	return allMemberGroupAdmitFn
-}
-
-func allMemberGroupOwnerTransfer() AllMemberGroupOwnerTransfer {
-	allMemberGroupMu.RLock()
-	defer allMemberGroupMu.RUnlock()
-	return allMemberGroupOwnerFn
-}
-
 func allMemberGroupRename() AllMemberGroupRename {
 	allMemberGroupMu.RLock()
 	defer allMemberGroupMu.RUnlock()
 	return allMemberGroupRenameFn
 }
 
-// AllMemberGroupHooksRegisteredForTest reports whether all four hooks are wired.
+// AllMemberGroupHooksRegisteredForTest reports whether the two remaining hooks are wired.
 //
-// Exported for modules/group's construction test. The feature's worst failure
-// mode is a SILENT one — an unregistered provisioner means every project is
-// created with no group, each occurrence logged and counted but nothing failing
-// — so "did construction actually register them" needs to be assertable from the
-// module that does the registering.
+// Exported for modules/group's construction test. A missing provisioner means every project is
+// created without its initial group; a missing rename hook leaves metadata inconsistent. The
+// group module can assert construction without exposing its implementation.
 func AllMemberGroupHooksRegisteredForTest() bool {
 	allMemberGroupMu.RLock()
 	defer allMemberGroupMu.RUnlock()
-	return allMemberGroupProvish != nil && allMemberGroupAdmitFn != nil &&
-		allMemberGroupOwnerFn != nil && allMemberGroupRenameFn != nil
+	return allMemberGroupProvish != nil && allMemberGroupRenameFn != nil
 }
 
-// AllMemberGroupHooksSnapshot holds the four registered hooks so a test can put
-// them back.
+// AllMemberGroupHooksSnapshot holds the two registered hooks so a test can put them back.
 type AllMemberGroupHooksSnapshot struct {
 	provision AllMemberGroupProvisioner
-	admit     AllMemberGroupAdmitter
-	owner     AllMemberGroupOwnerTransfer
 	rename    AllMemberGroupRename
 }
 
@@ -197,8 +131,6 @@ func SnapshotAllMemberGroupHooksForTest() AllMemberGroupHooksSnapshot {
 	defer allMemberGroupMu.RUnlock()
 	return AllMemberGroupHooksSnapshot{
 		provision: allMemberGroupProvish,
-		admit:     allMemberGroupAdmitFn,
-		owner:     allMemberGroupOwnerFn,
 		rename:    allMemberGroupRenameFn,
 	}
 }
@@ -208,7 +140,5 @@ func RestoreAllMemberGroupHooksForTest(s AllMemberGroupHooksSnapshot) {
 	allMemberGroupMu.Lock()
 	defer allMemberGroupMu.Unlock()
 	allMemberGroupProvish = s.provision
-	allMemberGroupAdmitFn = s.admit
-	allMemberGroupOwnerFn = s.owner
 	allMemberGroupRenameFn = s.rename
 }

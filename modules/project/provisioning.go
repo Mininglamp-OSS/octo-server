@@ -54,15 +54,10 @@ func containerIDPrefix(target string) (string, bool) {
 // newContainerID mints an opaque container id for one target.
 //
 // **Not a function of project_id, and this is the load-bearing property of the
-// whole slice.** A derived id (`project:<project_id>`, `p-<project_id>`) was the
-// first design and is rejected under eager provisioning, because
-// listVisibleInSpace lets any active Space member read the project_id of every
-// space_listed project in that Space while fleet's workspace gate admits on octo
-// Space membership alone and then materializes the caller as a workspace member
-// with a row nothing ever deletes. Derivability is what completes that chain from
-// "can list projects" to "is permanently a member of every project's workspace"
-// (brief P-3). A source guard asserts nothing in this package builds a container id
-// out of a project id.
+// whole slice.** A Project list response exposes project IDs only to callers
+// who are eligible to read the corresponding project. Deriving a target
+// container ID from that public identifier would still turn a readable ID into
+// a capability, so the ID must remain opaque until the downstream gates narrow.
 //
 // crypto/rand, and an error is fatal to the create: a container id we could not
 // randomize must never be written. Returning a fallback (a counter, a timestamp,

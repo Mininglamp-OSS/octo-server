@@ -134,6 +134,8 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 		groups.PUT("/:group_no/bot_admin/:uid", protectAIContainer, g.botAdminSet)                            // 设置Bot管理员
 		groups.DELETE("/:group_no/bot_admin/:uid", protectAIContainer, g.botAdminRemove)                      // 移除Bot管理员
 	}
+	// Group↔Project relation routes own their transaction-level authorization.
+	g.routeProject(r)
 	openGroups := r.Group("/v1/groups")
 	{ // 获取群头像
 		openGroups.GET("/:group_no/avatar", g.avatarGet) // 获取群头像
@@ -238,14 +240,6 @@ func (g *Group) disband(c *wkhttp.Context) {
 	if err != nil {
 		g.Error("查询用户群内身份错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	// D7 —— 全员群不能被解散。它随项目结束而结束，没有别的等价物。
-	//
-	// 放在群主判定**之后**：先回答"你有没有权限做这件事"，再回答"这件事对这个群
-	// 允不允许"。反过来会让一个普通成员通过一条错误消息知道这个群是某项目的全员群。
-	if loginMember != nil && loginMember.Role == MemberRoleCreator &&
-		g.refuseIfAllMemberGroup(c, group, allMemberGroupActionDisband) {
 		return
 	}
 	if loginMember == nil || loginMember.Role != MemberRoleCreator {
@@ -974,41 +968,161 @@ func (g *Group) groupDetailGet(c *wkhttp.Context) {
 // list 我保存的群聊
 func (g *Group) list(c *wkhttp.Context) {
 	loginUID := c.MustGet("uid").(string)
-	spaceID := c.Query("space_id")
+	rawSpaceID := c.Query("space_id")
+	spaceID := strings.TrimSpace(rawSpaceID)
+	roles, hasRole, validRole := parseGroupMyRoles(c.Query("role"))
+	if !validRole {
+		respondGroupRequestInvalid(c, "role")
+		return
+	}
 
-	if spaceID != "" {
-		// Space 模式：返回该 Space 下用户加入的所有群
-		groups, err := g.db.queryGroupsWithMemberUIDAndSpaceID(loginUID, spaceID)
+	if hasRole && spaceID != "" {
+		inSpace, err := spacepkg.CheckMembership(g.ctx.DB(), spaceID, loginUID)
+		if err != nil {
+			g.Error("检查 Space 成员失败", zap.Error(err), zap.String("uid", loginUID), zap.String("space_id", spaceID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !inSpace {
+			respondGroupForbidden(c)
+			return
+		}
+	}
+	if hasRole {
+		models, err := g.db.queryGroupsWithMemberUIDAndRoles(loginUID, spaceID, roles)
+		if err != nil {
+			g.Error("查询角色群列表失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		g.respondGroupMyModels(c, loginUID, models, true, true)
+		return
+	}
+
+	if rawSpaceID != "" {
+		// Space mode keeps the legacy query value unchanged for callers that
+		// historically relied on the stored-space lookup semantics.
+		models, err := g.db.queryGroupsWithMemberUIDAndSpaceID(loginUID, rawSpaceID)
 		if err != nil {
 			g.Error("查询Space群列表失败", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 			return
 		}
-		resps := make([]*GroupResp, 0)
-		for _, model := range groups {
-			groupResp := &GroupResp{}
-			resp := groupResp.fromModel(model)
-			// 查询成员数
-			memberCount, err := g.db.QueryMemberCount(model.GroupNo)
-			if err == nil {
-				resp.MemberCount = int(memberCount)
-			}
-			resps = append(resps, resp)
-		}
-		c.Response(resps)
+		g.respondGroupMyModels(c, loginUID, models, true, false)
 		return
 	}
 
-	models, err := g.db.querySavedGroups(loginUID)
+	// No query parameters deliberately remains the saved-groups mode.
+	detailModels, err := g.db.querySavedGroups(loginUID)
 	if err != nil {
 		g.Error("查询我保存的群聊失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
-	resps := make([]*GroupResp, 0)
+	g.respondGroupMyDetails(c, loginUID, detailModels)
+}
+
+func parseGroupMyRoles(raw string) (roles []int, hasRole, valid bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false, true
+	}
+	seen := make(map[int]struct{}, 2)
+	for _, part := range strings.Split(raw, ",") {
+		switch strings.TrimSpace(part) {
+		case "owner":
+			seen[MemberRoleCreator] = struct{}{}
+		case "admin":
+			seen[MemberRoleManager] = struct{}{}
+		default:
+			return nil, true, false
+		}
+	}
+	for _, role := range []int{MemberRoleCreator, MemberRoleManager} {
+		if _, ok := seen[role]; ok {
+			roles = append(roles, role)
+		}
+	}
+	if len(roles) == 0 {
+		return nil, true, false
+	}
+	return roles, true, true
+}
+
+func (g *Group) groupMyExternalMap(loginUID string) map[string]string {
+	externalMap, err := g.db.QueryExternalGroupNosForUser(loginUID)
+	if err != nil {
+		g.Warn("查询外部群来源Space失败", zap.Error(err), zap.String("uid", loginUID))
+		return nil
+	}
+	return externalMap
+}
+
+func (g *Group) respondGroupMyModels(c *wkhttp.Context, loginUID string, models []*Model, includeMemberCount, rewriteExternalSpace bool) {
+	groupNos := make([]string, 0, len(models))
 	for _, model := range models {
-		groupResp := &GroupResp{}
-		resps = append(resps, groupResp.from(model))
+		if model != nil {
+			groupNos = append(groupNos, model.GroupNo)
+		}
+	}
+	roleMap, err := g.db.queryGroupMyRoles(loginUID, groupNos)
+	if err != nil {
+		g.Error("查询群角色失败", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
+	var externalMap map[string]string
+	if rewriteExternalSpace {
+		externalMap = g.groupMyExternalMap(loginUID)
+	}
+	memberCounts := make(map[string]int64, len(groupNos))
+	if includeMemberCount && len(groupNos) > 0 {
+		var countErr error
+		memberCounts, countErr = g.db.queryGroupMemberCounts(groupNos)
+		if countErr != nil {
+			g.Error("查询群成员数量失败", zap.Error(countErr), zap.String("uid", loginUID))
+			memberCounts = make(map[string]int64)
+		}
+	}
+	resps := make([]*GroupResp, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		resp := (&GroupResp{}).fromModel(model)
+		resp.Role = roleMap[model.GroupNo]
+		if rewriteExternalSpace {
+			resp.SetEffectiveSpaceIDFromMap(externalMap)
+		}
+		if includeMemberCount {
+			resp.MemberCount = int(memberCounts[model.GroupNo])
+		}
+		resps = append(resps, resp)
+	}
+	c.Response(resps)
+}
+
+func (g *Group) respondGroupMyDetails(c *wkhttp.Context, loginUID string, models []*DetailModel) {
+	groupNos := make([]string, 0, len(models))
+	for _, model := range models {
+		if model != nil {
+			groupNos = append(groupNos, model.GroupNo)
+		}
+	}
+	roleMap, err := g.db.queryGroupMyRoles(loginUID, groupNos)
+	if err != nil {
+		g.Error("查询群角色失败", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
+	resps := make([]*GroupResp, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		resp := (&GroupResp{}).from(model)
+		resp.Role = roleMap[model.GroupNo]
+		resps = append(resps, resp)
 	}
 	c.Response(resps)
 }
@@ -1170,7 +1284,7 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	} else {
 		realUids = req.Members
 	}
-	if len(realUids) == 0 {
+	if req.ProjectID == "" && len(realUids) == 0 {
 		httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotFriend, nil, nil)
 		return
 	}
@@ -1208,15 +1322,6 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		g.Error("创建群失败！", zap.Error(err))
-		// 准入被拒是**调用方错误**，不是服务端故障：这个 uid 不能进这个项目的群。
-		// 落到下面的 ErrGroupStoreFailed（Internal=true）有三重代价——渲染器会
-		// 把 message 藏掉，客户端分不清「稍后重试」和「永远不行」；http_status
-		// 变成 5xx，把本功能最常见的一次拒绝变成一条 on-call 告警；而 P1 专为
-		// 这次拒绝注册的错误码从此不可达，本地化文案永远不会出现。
-		if errors.Is(err, ErrAdmissionRefused) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
-			return
-		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1715,11 +1820,6 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			return
 		}
 		g.Error("添加群成员失败", zap.Error(err))
-		// 与建群同理：准入被拒是 400，不是 500。见 groupCreate 处的说明。
-		if errors.Is(err, ErrAdmissionRefused) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
-			return
-		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -1802,14 +1902,8 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 		g.Error("查询群信息失败", zap.Error(err))
 		return nil, errors.New("查询群信息失败")
 	}
-	// 群行查不到就不再往下走（I2 / D3）。
-	//
-	// 原来下游是 `if groupModel != nil { admitSpaceID, admitProjectID = ... }`：
-	// 查不到时两者留空，准入口拿到的是「这不是项目群」这个断言，于是整批放行。
-	// 这与 preset_group_admission.go 为自己那条路径写下的理由是同一条——空
-	// project_id 是一个 fail-OPEN 的捷径，只要群行读不到就自动生效。两个调用方
-	// （memberAdd、邀请确认）都作用在已存在的群上，且此函数上方已校验操作者是
-	// 该群成员，所以这里读不到群行只可能是并发解散或数据损坏，都不该继续加人。
+	// The group row is required before applying the native Space and
+	// allow_external checks below. Project attribution is not consulted here.
 	if groupModel == nil {
 		g.Error("群不存在，拒绝加人", zap.String("group_no", groupNo))
 		return nil, errors.New("群不存在！")
@@ -2008,19 +2102,10 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			hasNewExternal = true
 		}
 	}
-	// 收口到唯一准入口（I2 / D3）。此前这里是「ExistMemberDelete 会话查询 →
-	// 分支 → InsertMemberTx / recoverMemberTx」，每个 uid 两次往返且带竞态；
-	// 现在整批一条 upsert，插入与恢复的列语义在 admission.go 里有实测记录。
-	//
-	// groupModel 在本函数前半段已按 groupNo 查出（外部成员判定要用它），
-	// 直接复用，不额外查一次；查不到已在上面直接返回，所以这里无需再判空——
-	// 判空会重新引入「空 project_id = 不是项目群」的放行分支。
-	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, groupModel.SpaceID, groupModel.ProjectID,
-		admissions, AdmissionEntryInviteConfirm); err != nil {
+	// The native primitive atomically inserts or restores members. Project
+	// membership is intentionally independent from native group membership.
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, admissions); err != nil {
 		g.Error("添加群成员失败！", zap.Error(err))
-		if errors.Is(err, ErrAdmissionRefused) {
-			return nil, err
-		}
 		return nil, errors.New("添加群成员失败！")
 	}
 
@@ -2801,16 +2886,9 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	// 收口到唯一准入口（A5）。扫码入群是自助路径：扫码者自己决定加入，没有
-	// 任何管理员参与，所以它必须和被邀请入群受同一道闸门约束。
-	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, group.SpaceID, group.ProjectID,
-		[]MemberAdmission{scanAdmission}, AdmissionEntryScanJoin); err != nil {
-		tx.Rollback()
-		g.Error("添加群成员失败！", zap.Error(err))
-		if errors.Is(err, ErrAdmissionRefused) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
-			return
-		}
+	// Scan-join uses the same native insert-or-restore primitive as invitations;
+	// Project membership is not a prerequisite for native group membership.
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{scanAdmission}); err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -2961,21 +3039,6 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 	groupModel, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
-		return
-	}
-
-	// D7 —— 全员群的群主不能手动转让。它始终跟着项目 owner 走（D6），由项目侧
-	// 在 owner 变动时驱动同步。
-	//
-	// 放在群主判定之后：只有群主本人会看到这条拒绝，别人先拿到 creator_only。
-	// 这一路仍在任何写入之前——下面才开始改成员角色。
-	//
-	// 放在 getGroupInfo **之后**并复用它读到的群行，而不是用按群号的那个版本。
-	// 前一版用了 refuseIfAllMemberGroupByNo，它自己发一次 QueryWithGroupNo，而紧
-	// 接着的 getGroupInfo 就是同一条查询：Space 直属群多 1 次、普通项目群多 2 次，
-	// 而 C1 纪律给的额度是 0 和 1。守卫注释里把这条写成硬要求，这里却是四个调用点
-	// 里唯一违反它的。TestAllMemberGroupGuardAddsNoQueryOnANonProjectGroup 现在钉住它。
-	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionTransfer) {
 		return
 	}
 
@@ -3192,17 +3255,9 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 判断群是否存在
-	removeGroupInfo, err := g.getGroupInfo(groupNo)
+	_, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
-		return
-	}
-	// D7 —— 全员群里不能踢人。要把谁移出这个群，就是要把他移出这个项目。
-	//
-	// 放在这里而不是等操作者身份查完：这个 handler 后面会走 RemoveGroupMembers，
-	// 那条路径带 IM 退订、系统消息、bot 连带移除等一串副作用，守卫必须在任何副作用
-	// 之前。存在性已经由上面那次 getGroupInfo 回答过，所以这条拒绝不多说什么。
-	if g.refuseIfAllMemberGroup(c, removeGroupInfo, allMemberGroupActionRemove) {
 		return
 	}
 	var loginMember *MemberModel
@@ -3564,20 +3619,6 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
-	// D7 —— 全员群不能退。要离开这个群，就是要离开这个项目。
-	//
-	// 位置是被这个 handler 的既有顺序决定的，不是随便挑的：**下面那次
-	// IMRemoveSubscriber 发生在成员校验之前**。守卫若放在成员校验旁边，一次被拒的
-	// 退群会先把人从 IM 频道上摘掉——人还在群里，却再也收不到消息，而且没有任何
-	// 路径会把订阅加回来。那是一个比这里的取舍严重得多的缺陷。
-	//
-	// 代价是这条拒绝先于"你是不是群成员"给出，于是一个非成员能从中读出这个群是
-	// 某项目的全员群。这个泄露是有界的：上面那次 getGroupInfo 已经用 404 与否
-	// 回答了"这个群存不存在"，而下面的 not_in_group 也一样——群的存在性在这个
-	// handler 上本来就不是秘密，多出来的只是"它属于某个项目"。
-	if g.refuseIfAllMemberGroup(c, groupInfo, allMemberGroupActionExit) {
-		return
-	}
 	// 调用IM的移除订阅者
 	err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
 		ChannelID:   groupNo,
@@ -3895,21 +3936,6 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
 		return
 	}
-	// D7 —— 全员群里不能拉黑。
-	//
-	// 拉黑是**第五条**改变活跃成员集合的群面路径，而且很容易被漏掉：它不叫"移除"，
-	// 也不走 RemoveGroupMembers，它把 group_member.status 翻成 Blacklist 并做 IM
-	// 退订。对 I4 来说结果与踢人完全一样——这个人还是项目成员，却不在全员群的活跃
-	// 成员集合里，于是 I4 扫描 B 报出一个缺口，而且没有任何东西会修复它：项目侧的
-	// 席位没变，准入器只在新加入时跑。
-	//
-	// 解除拉黑（A11）那半边不挡：它是把人**放回**活跃集合，方向与 I4 一致，而且
-	// 已经受 I2 准入闸门约束。挡住它反而会让一个已经被拉黑的成员永远出不来。
-	//
-	// 要把谁挡在项目之外，就把他移出项目——那条路径会连群带席位一起处理。
-	if action == "add" && g.refuseIfAllMemberGroup(c, &group.Model, allMemberGroupActionBlacklist) {
-		return
-	}
 	// #354 · Bot 跟人走：拉黑/解除拉黑级联到目标用户名下在群的 bot
 	// （robot.creator_uid 命中）。旧行为只动用户本人，其 bot 仍 status=Normal，
 	// 被拉黑用户可经自己的 bot 旁路读群/子区内容，绕过 ExistMemberActive
@@ -3933,37 +3959,20 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	// A11 —— 解除拉黑是一条准入路径，必须过闸门。
-	//
-	// 它不碰 InsertMemberTx / recoverMemberTx，只把 status 翻回 Normal，然后
-	// 重新订阅 IM 频道（见下方 IMAddSubscriber）和群内子区。如果闸门只装在那两个
-	// 原语里，一个被移出项目的人只要曾经被拉黑过，就能被解除拉黑重新拿到项目群的
-	// 全部访问权——不经过任何准入检查。
-	//
-	// 拉黑方向（收回权限）不需要闸门，但两个方向共用同一个事务，免得后来的人
-	// 以为只有一条分支需要事务。
+	// Blacklist changes use the native group manager policy above. Restoring a
+	// member is deliberately independent from Project membership.
 	if txErr := func() error {
 		tx, beginErr := g.ctx.DB().Begin()
 		if beginErr != nil {
 			return beginErr
 		}
 		defer tx.RollbackUnlessCommitted()
-		if status == int(common.GroupMemberStatusNormal) {
-			if gateErr := g.db.assertAdmissibleTx(tx, group.SpaceID, group.ProjectID,
-				targetUIDs, AdmissionEntryUnblacklist); gateErr != nil {
-				return gateErr
-			}
-		}
 		if updErr := g.db.updateMembersStatusTx(tx, version, groupNo, status, targetUIDs); updErr != nil {
 			return updErr
 		}
 		return tx.Commit()
 	}(); txErr != nil {
 		g.Error("添加或移除群成员黑名单错误", zap.Error(txErr))
-		if errors.Is(txErr, ErrAdmissionRefused) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
-			return
-		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -4964,10 +4973,11 @@ type groupReq struct {
 	SpaceID string   `json:"space_id"` // Space ID（可选）
 	// ProjectID 把新群挂到某个项目下（可选，必须与 space_id 同时传）。
 	//
-	// 一旦设置就不可更改（不变量 I3）：没有任何接口能改群的项目归属，源码守卫
-	// 也禁止在创建路径和 detach 步骤之外写这一列。要换项目只能新建群。
+	// 关联、换绑、解绑通过 /v1/groups/:group_no/project 完成；关系写入会同时
+	// 更新 project_linked_by，并在同一事务内重验 Project 与原生群授权。
 	//
-	// 非空时，群的成员集合从此受不变量 I2 约束——加人时必须是该项目的活跃成员。
+	// 非空时，群的成员集合受快照规则与准入闸门约束；后续 Project 成员变更
+	// 不会同步已存在的原生群成员。
 	ProjectID   string `json:"project_id"`   // 所属项目 ID（可选，需配合 space_id）
 	CategoryID  string `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
 	AvatarText  string `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
@@ -4975,7 +4985,7 @@ type groupReq struct {
 }
 
 func (g groupReq) Check() error {
-	if len(g.Members) <= 0 {
+	if g.ProjectID == "" && len(g.Members) <= 0 {
 		return errors.New("群成员不能为空！")
 	}
 	if g.ProjectID != "" && g.CategoryID != "" {

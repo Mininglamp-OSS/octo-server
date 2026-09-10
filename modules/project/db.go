@@ -2,6 +2,7 @@ package project
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,13 +35,67 @@ type DB struct {
 	session *dbr.Session
 }
 
+// spaceSeatRefs records the primary-key identity observed before a write
+// transaction begins. It is preparation only; every resolved lock query
+// rechecks the id, uid, Space, status, and account rows under its transaction
+// locks before a caller treats a seat as eligible.
+type spaceSeatRefs map[string]int64
+
+// resolveSpaceSeatIDs prepares exact space_member primary keys without holding
+// locks or opening the caller's transaction. A later locking read must
+// revalidate the returned identities: a removed or recreated row is deliberately
+// reported as absent rather than authorizing from a stale preparation result.
+func (d *DB) resolveSpaceSeatIDs(spaceID string, uids []string) (spaceSeatRefs, error) {
+	refs := make(spaceSeatRefs, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return refs, nil
+	}
+	unique := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		unique = append(unique, uid)
+	}
+	if len(unique) == 0 {
+		return refs, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(unique)), ",")
+	args := make([]interface{}, 0, len(unique)+1)
+	args = append(args, spaceID)
+	for _, uid := range unique {
+		args = append(args, uid)
+	}
+	var rows []struct {
+		ID  int64  `db:"id"`
+		UID string `db:"uid"`
+	}
+	if _, err := d.session.SelectBySql(
+		"SELECT id, uid FROM `space_member` "+
+			"WHERE space_id = ? AND uid IN ("+placeholders+") "+
+			"ORDER BY id",
+		args...,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("project: resolve space seat ids: %w", err)
+	}
+	for _, row := range rows {
+		refs[row.UID] = row.ID
+	}
+	return refs, nil
+}
+
 // NewDB builds the DAO against the process-wide dbr session.
 func NewDB(ctx *config.Context) *DB {
 	return &DB{ctx: ctx, session: ctx.DB()}
 }
 
-// projectInsertColumns is the write-side column list for octo_project. See the
-// type comment for why active_name / is_official / both epoch columns are absent.
+// projectInsertColumns is the write-side column list for octo_project. The
+// generated active_name column and non-Project-managed fields are absent.
 var projectInsertColumns = []string{
 	"project_id", "space_id", "name", "description", "logo", "creator",
 	"discoverability", "max_members", "status",
@@ -52,11 +107,8 @@ var projectInsertColumns = []string{
 
 // ---------- project ----------
 
-// insertProjectTx writes one project row inside tx.
-//
-// A duplicate ACTIVE name surfaces as a MySQL 1062 on uk_octo_project_space_active_name;
-// callers map that to ErrProjectNameDuplicated rather than pre-checking, so two
-// concurrent creates cannot both pass a check and then both insert.
+// insertProjectTx writes one project row inside tx. Project names are labels,
+// so this DAO intentionally performs no name uniqueness check.
 func (d *DB) insertProjectTx(tx *dbr.Tx, m *Model) error {
 	_, err := tx.InsertInto("octo_project").
 		Columns(projectInsertColumns...).
@@ -120,8 +172,8 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 }
 
 // updateProfileTx applies a partial profile update. The caller passes only the
-// columns it means to change; active_name / is_official / member_epoch can never
-// appear because setColumns is built from an allow-list, not from the payload.
+// columns it means to change; generated active_name and storage-managed fields
+// never appear because setColumns is built from an allow-list.
 func (d *DB) updateProfileTx(tx *dbr.Tx, projectID string, set map[string]interface{}, now time.Time) error {
 	if len(set) == 0 {
 		return nil
@@ -281,251 +333,6 @@ func (d *DB) countCreatedInWindowTx(tx *dbr.Tx, creator string, from, to time.Ti
 	return count, nil
 }
 
-// sqlListVisibleInSpace is the statement listVisibleInSpace runs.
-//
-// A named constant for the same reason sqlListMyProjectGroups is one: the plan
-// guard EXPLAINs the string production executes rather than a copy of it, and a
-// copy passes forever once the two drift.
-const sqlListVisibleInSpace = "SELECT p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, " +
-	"p.discoverability, p.max_members, p.member_epoch, p.collaboration_role_epoch, p.status, " +
-	// all_member_group_no on the LIST route too. The wire contract defines
-	// "" as "no group provisioned", so omitting the column here made every
-	// listed project claim it has none — the detail route and the list route
-	// disagreeing about the same project, and a client hiding the entry
-	// point to a group that exists.
-	"p.all_member_group_no, " +
-	"p.created_at, p.updated_at, " +
-	"IFNULL(pm.role, ?) AS my_role, " +
-	// D16's two counts are BOTH computed after the page loads, by
-	// fillMemberCounts, out of one roster read. Neither is in this
-	// statement, and the reason each left is different:
-	//
-	//   - member_count was a correlated join into `user` with a COLLATE on
-	//     the driving side — twenty `user` probes per page that the
-	//     production collation shape turns into twenty scans. PR #855's
-	//     eighth review.
-	//   - seat_count was a correlated aggregate, which was nearly free
-	//     while LIMIT 20 short-circuited the scan and stopped being free
-	//     the moment PR-5's ORDER BY made this statement sort every
-	//     visible project in the Space: it then ran once per SORTED row,
-	//     not once per returned row. Measured on 2000 visible projects,
-	//     4000 seats: 1667 subquery loops and 13.5ms with it here, 7.9ms
-	//     without. See fillMemberCounts for where it went and ORDER BY
-	//     below for what remains.
-	//
-	// Keeping seat_count here and member_count there would also have kept
-	// them under two different read views, which is what the previous round
-	// had to document as an inexactness. One read, one arithmetic.
-	"IFNULL(s.pinned, 0) AS pinned " +
-	"FROM `octo_project` p " +
-	// `removing = 0` on the JOIN as well as on the count: without it a member
-	// whose seat is closing keeps my_role, and — worse — keeps
-	// `pm.uid IS NOT NULL`, which is the clause that reveals UNLISTED
-	// projects. So a departing member would go on seeing projects they are
-	// not supposed to be able to enumerate, for the whole cascade window,
-	// while the member_count beside them already excluded them.
-	"LEFT JOIN `octo_project_member` pm " +
-	"  ON pm.project_id = p.project_id AND pm.uid = ? AND pm.status = 1 " +
-	"     AND pm.removing = 0 " +
-	// The caller-specific pin. A LEFT JOIN rather than a correlated
-	// subquery because it also drives the ORDER BY, and it costs one
-	// equality probe on uk_octo_project_user_setting (project_id, uid) —
-	// the same key the upsert is idempotent on, which is why this table
-	// needs no second index.
-	"LEFT JOIN `octo_project_user_setting` s " +
-	// Both sides are octo_project*, i.e. both general_ci. No COLLATE: one
-	// between two same-collation columns is not free — an explicit COLLATE
-	// has coercibility 0, so the other side is converted per row and its
-	// index stops serving the predicate. PR #855 measured that exact cost
-	// on this schema.
-	"  ON s.project_id = p.project_id AND s.uid = ? " +
-	"WHERE p.space_id = ? AND p.status = ? " +
-	"  AND (p.discoverability = ? OR pm.uid IS NOT NULL) " +
-	// Pinned first, most recently pinned before the rest, then the
-	// pre-existing order UNCHANGED. Two properties are load-bearing:
-	//
-	//   - Totality. p.id is unique, so the three keys together are a total
-	//     order however the first two tie. OFFSET pagination silently drops
-	//     and duplicates rows across pages under a non-total ORDER BY, and
-	//     this list is paginated.
-	//
-	//     Totality is not stability, and the two are easy to conflate. pinned
-	//     and pinned_at are MUTABLE between page requests, so a pin from
-	//     another device between page 1 and page 2 still moves rows across the
-	//     offset boundary — the same exposure every OFFSET-paginated list in
-	//     this module has. Totality only rules out the ordering ITSELF being
-	//     the cause.
-	//   - IFNULL rather than relying on NULL ordering. An unpinned project
-	//     has no row here, so s.pinned is NULL; MySQL sorts NULL lowest, so
-	//     plain DESC would happen to be right today. Writing it out means a
-	//     reader does not have to know that, and a future port to a database
-	//     that orders NULLs the other way does not silently invert the list.
-	"ORDER BY IFNULL(s.pinned, 0) DESC, s.pinned_at DESC, p.id DESC " +
-	"LIMIT ? OFFSET ?"
-
-// listVisibleInSpace returns the projects in spaceID that uid may see — the caller's
-// own pinned ones first, then newest first — with the caller's role attached.
-//
-// "newest first" alone was true until PR #861 added pinning and left this line
-// behind; the ORDER BY below is the authority and now says three keys, not one.
-//
-// Visibility is one SQL statement rather than a filter in Go so an unlisted project can never
-// transit the process boundary: a space_listed project is visible to any Space member, an
-// unlisted one only to its own members. Filtering after the fetch would put the decision on the
-// response-shaping path, which is where existence oracles come from.
-//
-// A Space admin gets NO widening here, deliberately. The brief grants them the real payload on
-// the DETAIL route only, and scopes "a Space admin can still enumerate project metadata" to the
-// P2 admin surface (the endpoint that will own is_official). Widening the P0 user-facing list
-// would ship a slice of that P2 capability early, and "unlisted" would stop meaning what it
-// says on the one route where users read it.
-func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*listRow, error) {
-	var rows []*listRow
-	_, err := d.session.SelectBySql(sqlListVisibleInSpace,
-		roleNonMember, uid, uid, spaceID, StatusNormal, DiscoverabilitySpaceListed, limit, offset,
-	).Load(&rows)
-	if err != nil {
-		return nil, fmt.Errorf("project: list projects in space: %w", err)
-	}
-	if err := d.fillMemberCounts(rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-// fillMemberCounts sets SeatCount (every active seat) and HumanCount (the human
-// half) on each listed project.
-//
-// Two single-table reads for the whole page, not one join per card: read the
-// active seat rows for the listed projects, then ask `user` which of those uids
-// are bots. Neither statement crosses the pinned/legacy schema boundary, so
-// neither needs a COLLATE and neither can lose an index to one — which is the
-// whole reason the join that used to do this was removed. PR #855s eighth review.
-//
-// Both counts come from THE SAME roster read, which is what makes the arithmetic
-// exact: every uid in it is either a bot or not, so humans + agents == seats by
-// construction rather than by two aggregates hoping to agree. seat_count used to
-// be computed by the page statement instead, i.e. under a different read view —
-// the inexactness the previous round had to document. PR-5 moved it here for a
-// second reason, cost: its ORDER BY makes the page statement sort every visible
-// project in the Space, so a correlated aggregate in that statement runs once per
-// SORTED row rather than once per returned row (measured: 1667 loops on a
-// 2000-project Space).
-//
-// The seats read is per PAGE, not per Space, so it stays proportional to what the
-// client asked for.
-func (d *DB) fillMemberCounts(rows []*listRow) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	projectIDs := make([]string, 0, len(rows))
-	for _, row := range rows {
-		projectIDs = append(projectIDs, row.ProjectID)
-	}
-
-	var seats []struct {
-		ProjectID string `db:"project_id"`
-		UID       string `db:"uid"`
-	}
-	if _, err := d.session.SelectBySql(
-		"SELECT project_id, uid FROM `octo_project_member` "+
-			"WHERE project_id IN ? AND status = ? AND removing = 0",
-		projectIDs, MemberStatusActive,
-	).Load(&seats); err != nil {
-		return fmt.Errorf("project: read seats for list counts: %w", err)
-	}
-	if len(seats) == 0 {
-		return nil
-	}
-
-	uidSet := make(map[string]struct{}, len(seats))
-	for _, seat := range seats {
-		uidSet[seat.UID] = struct{}{}
-	}
-	uids := make([]string, 0, len(uidSet))
-	for uid := range uidSet {
-		uids = append(uids, uid)
-	}
-	var botUIDs []string
-	if _, err := d.session.SelectBySql(
-		"SELECT uid FROM `user` WHERE uid IN ? AND robot = 1", uids,
-	).Load(&botUIDs); err != nil {
-		return fmt.Errorf("project: classify seats for list counts: %w", err)
-	}
-	bots := make(map[string]struct{}, len(botUIDs))
-	for _, uid := range botUIDs {
-		bots[uid] = struct{}{}
-	}
-
-	humans := make(map[string]int, len(rows))
-	total := make(map[string]int, len(rows))
-	for _, seat := range seats {
-		total[seat.ProjectID]++
-		if _, isBot := bots[seat.UID]; !isBot {
-			humans[seat.ProjectID]++
-		}
-	}
-	for _, row := range rows {
-		row.HumanCount = humans[row.ProjectID]
-		row.SeatCount = total[row.ProjectID]
-	}
-	return nil
-}
-
-// listRow carries a project plus the caller-relative fields the list computes.
-type listRow struct {
-	Model
-	MyRole int `db:"my_role"`
-	// HumanCount counts HUMANS only, the same split the detail route reports — so
-	// one number cannot mean two things depending on which endpoint the client
-	// called. It becomes `human_member_count` on the wire.
-	//
-	// Named HumanCount rather than MemberCount because Resp.MemberCount is the
-	// TOTAL: two structs one function apart holding a field of the same name and
-	// opposite meaning is how the wrong one gets passed, and this pair is one
-	// `toResp` argument away from each other.
-	//
-	// Filled by fillMemberCounts after the page loads, not by the statement: the
-	// join that used to produce it crossed into `user` with a COLLATE, once per
-	// listed project.
-	HumanCount int
-	// SeatCount is every active seat, humans and agents together. Agents are the
-	// DIFFERENCE rather than a third count: see the query for the measurement
-	// behind that choice.
-	//
-	// Filled by fillMemberCounts out of the same roster read as HumanCount, so
-	// the two agree by construction rather than across two read views.
-	SeatCount int
-	// Pinned is the CALLER's pin, not a property of the project — the same row
-	// reads 1 for one user and 0 for the next. It comes from the LEFT JOIN, so an
-	// unpinned project reads 0 rather than dropping out of the list.
-	Pinned int `db:"pinned"`
-}
-
-// AgentCount is the agent half of D16's split, derived from the two counts.
-//
-// The race this comment used to describe is gone, and the history is worth keeping
-// because it decides what the clamp is for. SeatCount was computed by the page
-// statement while the human half came from fillMemberCounts afterwards — two
-// statements, no enclosing transaction, two read views, so a member added between
-// them made `HumanCount > SeatCount` reachable in normal operation and the clamp
-// load-bearing. PR #855's tenth review established that. PR-5 then had to move
-// seat_count into fillMemberCounts for cost (see the statement), and one roster
-// read for both counts removes the race as a side effect: humans + agents == seats
-// by construction now, so `human_member_count + agent_member_count == member_count`
-// holds on the wire rather than holding usually. (toResp derives member_count from
-// the two halves, so that identity is now true by construction on both routes.)
-//
-// So the clamp is back to being defensive, and stays: it costs nothing, and a
-// future edit that gives the two counts different predicates would otherwise put a
-// negative agent count on the wire, which a client renders as "-3 agents".
-func (r *listRow) AgentCount() int {
-	if r.SeatCount <= r.HumanCount {
-		return 0
-	}
-	return r.SeatCount - r.HumanCount
-}
-
 // countActiveMembers counts active seats in a project.
 func (d *DB) countActiveMembers(projectID string) (int, error) {
 	var count int
@@ -590,160 +397,145 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 	return len(found) > 0, nil
 }
 
-// lockSpaceSeatsTx takes the shared lock on SEVERAL space_member rows in ONE statement and
-// reports which of the requested uids hold an active seat in an active Space.
+// lockSpaceSeatTargets orders prepared seat identities by their clustered
+// primary key. The preparation query is deliberately outside the write
+// transaction; this helper never treats it as authorization.
+func lockSpaceSeatTargets(uids []string, refs spaceSeatRefs) []struct {
+	uid string
+	id  int64
+} {
+	targets := make([]struct {
+		uid string
+		id  int64
+	}, 0, len(uids))
+	seen := make(map[int64]struct{}, len(uids))
+	for _, uid := range uids {
+		id, ok := refs[uid]
+		if !ok || id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		targets = append(targets, struct {
+			uid string
+			id  int64
+		}{uid: uid, id: id})
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].id < targets[j].id
+	})
+	return targets
+}
+
+// lockSpaceSeatRowsTx takes shared locks on several prepared space_member rows
+// in clustered-primary-key order, without joining space. It is used before a
+// create takes the exclusive Space lock, so the first locking read must not
+// open a consistent-read view through the space table.
 //
-// One statement is the whole point, and it is a lock-ORDER fix rather than a round-trip
-// optimisation. modules/space's disband takes `space_member WHERE space_id=? AND status=1
-// FOR UPDATE` (lockActiveMemberUIDsTx), a range lock acquired ROW BY ROW in index order —
-// clustered-key (id) order. A path that locks two seats in two statements holds the first while
-// waiting for the second, so whenever the second row precedes the first in id order the cycle
-// with that scan closes and InnoDB reports Error 1213. Reproduced on MySQL 8.0.33 against the
-// real addOneMember, with the DISBAND SCAN as the victim — and disband is a step of the
-// member-removal security cascade.
-//
-// Sorting the uids ascending does NOT fix this: the disband scan orders by id, not by uid, so
-// any order this module chooses can still oppose it. Handing InnoDB one `uid IN (...)` predicate
-// lets it acquire the rows in ITS scan order, which is the same order the disband scan uses —
-// there is then no "second row" being waited for while the first is held.
-//
-// The predicate is CheckMembership's (space_member.status = 1 AND space.status = 1), and it keeps
-// the JOIN onto `space` because callers here do not lock the `space` row, so the JOIN is their
-// only activeness check. Deliberately NOT CheckMembershipForCleanup's relaxed variant: this is an
-// authorization decision and a banned Space must never pass one. (The reconcile scans ask the
-// opposite question and correctly use the relaxed form — see queryI1ViolationPage.)
-//
-// The read view that JOIN opens is no longer load-bearing, because every aggregate that authorises
-// a write is now a locking read (see countActiveOwnersTx).
-//
-// Why a lock at all, rather than calling pkg/space.CheckMembership: that function takes a
-// *dbr.Session, so it runs on a DIFFERENT pooled connection in its own implicit transaction. A
-// read there proves nothing about the state at COMMIT time — a Space removal committing in between
-// yields a project seat with no Space seat, closed only later by the asynchronous cascade.
-//
-// `FOR SHARE OF sm` locks space_member only, never `space`. Locking `space` too would put a shared
-// lock on the row Space disband updates, inventing a contention path this module has no reason to
-// create. Needs MySQL 8.0.1+ for the OF clause; verified on 8.0.33.
-//
-// vs. Space MEMBER REMOVAL: it takes FOR UPDATE on the same space_member row, so it blocks here
-// until this transaction commits; the cascade step reads space_member without a lock, so there is
-// no cycle with it either.
-//
-// Returns the set of uids that DO hold a seat. Callers decide which absence means what, since
-// actor and target absences carry different sentinels.
-// lockSpaceSeatRowsTx is lockSpaceSeatRowTx for a SET of uids: a shared lock on
-// each one's space_member row, taken in ONE statement, WITHOUT joining `space`.
-//
-// # Why not lockSpaceSeatsTx
-//
-// Because that one JOINs `space`, and createProject cannot afford it. A table
-// outside the `FOR SHARE OF` list is read as a CONSISTENT read, which OPENS the
-// transaction's read view — and in createProject this is the first statement, so
-// every creation quota counted after it would be answered from a snapshot taken
-// before the `space` row lock. That is not hypothetical: six concurrent creates
-// all passed MaxPerSpace=1 when the single-uid path had this shape, which is why
-// lockSpaceSeatRowTx exists at all and why
-// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin pins it. That guard caught
-// this function's absence — the agent seats were being locked through the
-// JOINing helper, reopening exactly the defect P0 closed.
-//
-// Nothing is lost by dropping the JOIN: createProject re-checks the Space's
-// activeness under the exclusive `space` lock immediately afterwards, which is
-// the authoritative check anyway.
-//
-// One statement rather than one per uid: the round-trips inside the transaction
-// then do not grow with the number of agents, and the rows are taken as a single
-// deterministic set instead of one at a time in caller-controlled order, which is
-// a deadlock shape.
-func (d *DB) lockSpaceSeatRowsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+// resolveSpaceSeatIDs supplies exact row identities before the transaction
+// starts. The id IN range is therefore bounded to the requested seats and
+// FORCE INDEX (PRIMARY) makes the lock acquisition path the same ascending id
+// order as Space disband's space_member scan. The id/uid comparison after the
+// locking read rejects a removed/recreated or otherwise mismatched row.
+func (d *DB) lockSpaceSeatRowsTx(
+	tx *dbr.Tx, spaceID string, uids []string, refs spaceSeatRefs,
+) (map[string]bool, error) {
 	held := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {
 		return held, nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(uids)), ",")
-	args := make([]interface{}, 0, len(uids)+1)
-	args = append(args, spaceID)
-	for _, uid := range uids {
-		args = append(args, uid)
+	targets := lockSpaceSeatTargets(uids, refs)
+	if len(targets) == 0 {
+		return held, nil
 	}
-	var found []string
+	idPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(targets)), ",")
+	uidPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(targets)), ",")
+	args := make([]interface{}, 0, len(targets)*2+1)
+	for _, target := range targets {
+		args = append(args, target.id)
+	}
+	args = append(args, spaceID)
+	for _, target := range targets {
+		args = append(args, target.uid)
+	}
+	var found []struct {
+		ID  int64  `db:"id"`
+		UID string `db:"uid"`
+	}
 	_, err := tx.SelectBySql(
-		"SELECT uid FROM `space_member` "+
-			"WHERE space_id = ? AND uid IN ("+placeholders+") AND status = 1 "+
-			"ORDER BY uid FOR SHARE",
+		"SELECT sm.id, sm.uid FROM `space_member` sm FORCE INDEX (PRIMARY) "+
+			"STRAIGHT_JOIN `user` u ON u.uid = sm.uid AND u.status = 1 AND IFNULL(u.is_destroy, 0) <> 2 "+
+			"WHERE sm.id IN ("+idPlaceholders+") AND sm.space_id = ? AND sm.uid IN ("+uidPlaceholders+") "+
+			"AND sm.status = 1 ORDER BY sm.id ASC FOR SHARE OF sm, u",
 		args...,
 	).Load(&found)
 	if err != nil {
 		return nil, fmt.Errorf("project: lock space seat rows: %w", err)
 	}
-	for _, uid := range found {
-		held[uid] = true
+	expected := make(map[int64]string, len(targets))
+	for _, target := range targets {
+		expected[target.id] = target.uid
+	}
+	for _, row := range found {
+		if expected[row.ID] == row.UID {
+			held[row.UID] = true
+		}
 	}
 	return held, nil
 }
 
-func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+// lockSpaceSeatsTx is the authorization form of lockSpaceSeatRowsTx. It keeps
+// the active-Space predicate and locks the requested membership and account
+// rows, but never locks space itself. The exact primary-key probes preserve
+// the same space_member -> space -> project lock order used by creation.
+func (d *DB) lockSpaceSeatsTx(
+	tx *dbr.Tx, spaceID string, uids []string, refs spaceSeatRefs,
+) (map[string]bool, error) {
 	held := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {
 		return held, nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(uids)), ",")
-	args := make([]interface{}, 0, len(uids)+1)
-	args = append(args, spaceID)
-	for _, uid := range uids {
-		args = append(args, uid)
+	targets := lockSpaceSeatTargets(uids, refs)
+	if len(targets) == 0 {
+		return held, nil
 	}
-	var found []string
+	idPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(targets)), ",")
+	uidPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(targets)), ",")
+	args := make([]interface{}, 0, len(targets)*2+1)
+	for _, target := range targets {
+		args = append(args, target.id)
+	}
+	args = append(args, spaceID)
+	for _, target := range targets {
+		args = append(args, target.uid)
+	}
+	var found []struct {
+		ID  int64  `db:"id"`
+		UID string `db:"uid"`
+	}
 	_, err := tx.SelectBySql(
-		"SELECT sm.uid FROM `space_member` sm "+
-			"INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
-			"WHERE sm.space_id = ? AND sm.uid IN ("+placeholders+") AND sm.status = 1 "+
-			"FOR SHARE OF sm",
+		"SELECT sm.id, sm.uid FROM `space_member` sm FORCE INDEX (PRIMARY) "+
+			"STRAIGHT_JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"STRAIGHT_JOIN `user` u ON u.uid = sm.uid AND u.status = 1 AND IFNULL(u.is_destroy, 0) <> 2 "+
+			"WHERE sm.id IN ("+idPlaceholders+") AND sm.space_id = ? AND sm.uid IN ("+uidPlaceholders+") "+
+			"AND sm.status = 1 ORDER BY sm.id ASC FOR SHARE OF sm, u",
 		args...,
 	).Load(&found)
 	if err != nil {
 		return nil, fmt.Errorf("project: lock space seats in tx: %w", err)
 	}
-	for _, uid := range found {
-		held[uid] = true
+	expected := make(map[int64]string, len(targets))
+	for _, target := range targets {
+		expected[target.id] = target.uid
+	}
+	for _, row := range found {
+		if expected[row.ID] == row.UID {
+			held[row.UID] = true
+		}
 	}
 	return held, nil
-}
-
-// lockSpaceSeatRowTx takes the shared lock on uid's space_member row and nothing else — no
-// JOIN onto `space`.
-//
-// It exists for createProject, and the missing JOIN is the entire point. `FOR SHARE OF sm`
-// locks sm, but a table NOT named in the OF list is read as a CONSISTENT read, and a
-// consistent read is what OPENS the transaction's read view. Put this statement first and
-// every later plain SELECT — including all three creation-quota counts — is answered from a
-// snapshot taken before the `space` row lock was acquired, so two concurrent creates both
-// count 0 and both insert. That is not a subtle degradation of the quota, it removes it:
-// reproduced as six concurrent creates all succeeding against MaxPerSpace=1.
-//
-// Verified directly on MySQL 8.0.33: `SELECT ... FROM sm JOIN sp ... FOR SHARE OF sm`
-// followed by `SELECT COUNT(*)` does NOT see a row another session committed in between,
-// while the same pair without the JOIN does.
-//
-// Dropping the JOIN loses nothing here. The caller takes `space ... FOR UPDATE` immediately
-// afterwards and refuses anything but status = 1, so Space activeness is checked more
-// strongly than the JOIN checked it — under an exclusive lock rather than in a snapshot.
-// Callers that do NOT lock the `space` row must keep using
-// lockSpaceSeatsTx, whose JOIN is their only activeness check.
-func (d *DB) lockSpaceSeatRowTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
-	if spaceID == "" || uid == "" {
-		return false, nil
-	}
-	var found []int
-	_, err := tx.SelectBySql(
-		"SELECT 1 FROM `space_member` WHERE uid = ? AND space_id = ? AND status = 1 "+
-			"LIMIT 1 FOR SHARE",
-		uid, spaceID,
-	).Load(&found)
-	if err != nil {
-		return false, fmt.Errorf("project: lock space seat row: %w", err)
-	}
-	return len(found) > 0, nil
 }
 
 // checkSpaceSeatForCleanupTx answers "does uid still hold their Space seat, so cleanup must
@@ -829,8 +621,8 @@ func (d *DB) queryMemberTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, err
 // exactly "nothing changed". Testing `!= 1` instead would classify every
 // reactivation as a no-op.
 //
-// The role is only reset on reactivation, never on a row that is already active:
-// re-adding a member who happens to be an admin must not silently demote them.
+// The role is only reset when a seat is inactive or closing, never on a row that
+// is already active: re-adding an active admin must not silently demote them.
 //
 // ⚠️ ASSIGNMENT ORDER IS LOAD-BEARING. MySQL evaluates ON DUPLICATE KEY UPDATE
 // assignments left to right, and a column read on the right-hand side sees the value
@@ -846,9 +638,9 @@ func (d *DB) admitMemberTx(tx *dbr.Tx, m *MemberModel) (bool, error) {
 			"(project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) "+
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE "+
-			// -- reads of the OLD status must all precede `status = 1` --
-			"  role = IF(status = 0, VALUES(role), role), "+
-			"  invite_uid = IF(status = 0, VALUES(invite_uid), invite_uid), "+
+			// -- reads of the OLD status/removing must all precede `status = 1` --
+			"  role = IF(status = 0 OR removing = 1, VALUES(role), role), "+
+			"  invite_uid = IF(status = 0 OR removing = 1, VALUES(invite_uid), invite_uid), "+
 			"  updated_at = IF(status = 0 OR removing = 1, VALUES(updated_at), updated_at), "+
 			// -- from here on `status` reads as 1 --
 			"  space_id = VALUES(space_id), "+
@@ -875,9 +667,10 @@ func (d *DB) admitMemberTx(tx *dbr.Tx, m *MemberModel) (bool, error) {
 	return affected > 0, nil
 }
 
-// deactivateMemberTx closes one seat and reports whether a row actually changed.
-// The status filter is what makes the Space-cascade step idempotent: a rerun finds
-// no active row, affects zero rows, and therefore does not bump the epoch again.
+// deactivateMemberTx closes one non-owner seat and reports whether a row changed.
+// The unique Owner identity is retained when the Space seat disappears; auth
+// still denies the absent Space seat, and a later transfer remains possible if
+// the user rejoins. The status filter makes the cleanup idempotent.
 func (d *DB) deactivateMemberTx(tx *dbr.Tx, projectID, uid string, now time.Time) (bool, error) {
 	// `removing` is cleared here for the same reason disbandProjectTx clears it,
 	// and this is the path that actually reaches the state: the Space cascade
@@ -889,7 +682,8 @@ func (d *DB) deactivateMemberTx(tx *dbr.Tx, projectID, uid string, now time.Time
 		Set("status", MemberStatusRemoved).
 		Set("removing", 0).
 		Set("updated_at", now).
-		Where("project_id = ? AND uid = ? AND status = ?", projectID, uid, MemberStatusActive).
+		Where("project_id = ? AND uid = ? AND status = ? AND role <> ?", projectID, uid,
+			MemberStatusActive, RoleOwner).
 		Exec()
 	if err != nil {
 		return false, fmt.Errorf("project: deactivate member: %w", err)
@@ -930,15 +724,12 @@ func (d *DB) updateMemberRoleTx(tx *dbr.Tx, projectID, uid string, role int, now
 	return affected > 0, nil
 }
 
-// countActiveOwnersTx counts active owners, used by the last-owner guard.
 // countActiveOwnersTx counts the project's active owners as a LOCKING read.
 //
-// `FOR SHARE` is not optional here, and the reason is the same read-view trap
-// lockSpaceSeatRowTx exists for. Every caller's transaction opens with
-// lockSpaceSeatsTx, which JOINs `space` — a table outside the `FOR SHARE OF`
-// list, therefore a CONSISTENT read, therefore the statement that opens the read view. A plain
-// COUNT(*) after it is answered from a snapshot taken BEFORE lockActiveProjectTx, so the
-// project row lock does not protect this count at all.
+// `FOR SHARE` is not optional here. Every write path prepares its space-member
+// primary keys before BEGIN, then takes the resolved authorization lock through
+// lockSpaceSeatsTx. That helper JOINs `space` outside the FOR SHARE list, so a
+// plain COUNT(*) after it would still answer from the transaction's old view.
 //
 // The consequence is not a soft one. Reproduced on MySQL 8.0.33: two owners leaving
 // concurrently each read 2, each pass "you are not the last owner", and the project ends with
@@ -963,108 +754,22 @@ func (d *DB) countActiveOwnersTx(tx *dbr.Tx, projectID string) (int, error) {
 	return count, nil
 }
 
-// listMembers returns the roster joined to `user` for display names, paged.
-//
-// LEFT JOIN, not INNER: a member whose user row is missing must still appear, or
-// the roster silently disagrees with the member count and with what the removal
-// endpoints accept.
-func (d *DB) listMembers(projectID string, offset, limit int) ([]*memberRosterModel, error) {
-	var rows []*memberRosterModel
-	_, err := d.session.SelectBySql(
-		"SELECT pm.project_id, pm.uid, pm.space_id, pm.role, pm.status, pm.invite_uid, "+
-			"pm.created_at, pm.updated_at, IFNULL(u.name, '') AS name, "+
-			// D16 — 名册要能区分人和分身，并给出分身的所有者，客户端才能像通讯录
-			// 那样把分身挂在人下面。两个 JOIN 都是 LEFT：没有 user 行的成员必须仍
-			// 然出现（见下面的注释），而 robot 行对每一个真人都不存在。
-			//
-			// robot 的 COLLATE 是必须的：`robot` 与 `user` 都是未声明 COLLATE 的
-			// 老表（生产库 utf8mb4_0900_ai_ci），octo_project_member 明确是
-			// general_ci，隐式比较在生产上报 1267 而在 CI 上一路绿灯。
-			// u.uid 那个 JOIN 是既有代码，未加 COLLATE。上一版这里写着"它比较的是
-			// 两张老表（user / octo_project_member）"——**这句是错的**，而且与上面
-			// 两行自相矛盾：octo_project_member 由它自己的迁移 pin 成 general_ci。
-			// 所以那个比较是 general_ci ⟷ 0900_ai_ci，在生产上会报 1267，本函数
-			// 在转换落地之前根本执行不了（PR #855 第五轮 review 实测确认）。
-			//
-			// 不在本次改它：那是 P0 留下的、跟着排序规则转换一起走的既有账，
-			// 改它等于顺带改动一条已在生产跑着的查询计划。但它是 D16 的名册接口，
-			// 开关一开就是用户可见的，所以"转换已落地（或这个 JOIN 已 pin）"是
-			// 上线前的硬门槛，记在 open_verification 里。
-			"IFNULL(u.robot, 0) AS robot, IFNULL(r.creator_uid, '') AS owner_uid "+
-			"FROM `octo_project_member` pm "+
-			"LEFT JOIN `user` u ON u.uid = pm.uid "+
-			"LEFT JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci AND r.status = 1 "+
-			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 "+
-			"ORDER BY pm.role DESC, pm.created_at ASC LIMIT ? OFFSET ?",
-		projectID, MemberStatusActive, limit, offset,
-	).Load(&rows)
-	if err != nil {
-		return nil, fmt.Errorf("project: list members: %w", err)
-	}
-	return rows, nil
-}
-
-// queryActiveProjectIDsForSpaceMember returns up to limit active project ids the
-// uid still holds a seat in, within one Space. Bounded on purpose: the
-// Space-removal cascade walks it in pages so one member of a thousand projects
-// cannot hold a cleanup lease for the whole walk.
+// queryActiveProjectIDsForSpaceMember returns up to limit active non-Owner project ids the
+// uid still holds a seat in, within one Space. Owner identities are intentionally preserved
+// when their Space seat disappears, so they are not cleanup work. Excluding them here keeps a
+// page made entirely of preserved Owner rows from making the cascade report no progress forever.
+// Bounded on purpose: the Space-removal cascade walks it in pages so one member of a thousand
+// projects cannot hold a cleanup lease for the whole walk.
 func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int) ([]string, error) {
 	var ids []string
 	_, err := d.session.SelectBySql(
 		"SELECT project_id FROM `octo_project_member` "+
-			"WHERE space_id = ? AND uid = ? AND status = ? AND removing = 0 "+
+			"WHERE space_id = ? AND uid = ? AND status = ? AND removing = 0 AND role <> ? "+
 			"ORDER BY project_id LIMIT ?",
-		spaceID, uid, MemberStatusActive, limit,
+		spaceID, uid, MemberStatusActive, RoleOwner, limit,
 	).Load(&ids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active projects of space member: %w", err)
-	}
-	return ids, nil
-}
-
-// queryProjectIDsForSpaceMemberPage returns up to limit project ids in one Space
-// where the uid has a member row, ACTIVE OR NOT, ordered by project_id and starting
-// strictly after afterProjectID.
-//
-// The status filter is deliberately absent, which is the whole difference from
-// queryActiveProjectIDsForSpaceMember. Its caller is the post-cleanup owner
-// convergence (registerAllMemberGroupOwnerFinalizer), which runs AFTER the cascade
-// has closed this member's seats — so filtering on status = active would return the
-// empty set and converge nothing. Filtering on role = owner would be wrong for a
-// second reason: the group's creator is not guaranteed to be a project owner (the
-// sync deliberately leaves a former owner in place when the project has none), so a
-// departing non-owner can still be the creator the group cascade hands over.
-//
-// Keyset paging rather than the cascade's "just take the next page" trick: that one
-// works because closing a seat removes the row from its own result set, and this
-// query has no such filter, so LIMIT alone would re-read page one forever. That same
-// absence is why a spent page budget here does NOT ask for a retry — see
-// convergeAllMemberGroupOwners.
-//
-// Measured plan (MySQL 8.0.46, 10k octo_project_member rows over 200 uids x 50 Spaces,
-// after ANALYZE):
-//
-//	ref idx_octo_project_member_space_uid  key_len=324  ref=const,const  rows=50
-//	Extra: Using where; Using filesort
-//
-// The index seeks straight to the (space_id, uid) range, which is the part that has to
-// be right. The filesort is expected and accepted rather than overlooked: the index is
-// (space_id, uid, status), so inside that range rows are ordered by `status` and then by
-// the primary key, never by project_id — and constraining `status` is exactly what this
-// query must not do. What bounds the cost is the set itself: one row per project this
-// member has ever been in, sorted in memory. Recorded because every other new statement
-// in this change carries its plan, and a reader would notice this one did not.
-// PR #855s eleventh review, the nit.
-func (d *DB) queryProjectIDsForSpaceMemberPage(spaceID, uid, afterProjectID string, limit int) ([]string, error) {
-	var ids []string
-	_, err := d.session.SelectBySql(
-		"SELECT project_id FROM `octo_project_member` "+
-			"WHERE space_id = ? AND uid = ? AND project_id > ? "+
-			"ORDER BY project_id LIMIT ?",
-		spaceID, uid, afterProjectID, limit,
-	).Load(&ids)
-	if err != nil {
-		return nil, fmt.Errorf("project: query projects of space member: %w", err)
 	}
 	return ids, nil
 }

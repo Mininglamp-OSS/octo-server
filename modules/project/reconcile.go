@@ -68,28 +68,12 @@ type reconcileCursors struct {
 	abandonedProject string
 	abandonedUID     string
 	abandonRun       int
-	// P1 scans. Both rotate over `group`.id, which is why they reuse the
-	// idResume/idSave pair rather than the composite cursor the member scans need.
-	// i2Group / i2UID form the composite cursor over (group.id, group_member.uid).
-	// A single-int64 cursor is NOT enough here and that cost a real defect: the I2
-	// page is bounded on member rows, so it cuts groups in half, and resuming at
-	// "the group after the last one seen" skipped every member past the boundary
-	// on every rotation. See queryI2Page.
-	i2Group int64
-	i2UID   string
-	i2Run   int
+	// P1's I3 scan rotates over `group`.id and reuses the idResume/idSave pair.
 	i3Group int64
 	i3Run   int
-	// P2 scans (invariant I4). i4Missing rotates over octo_project.id alone;
-	// i4Gap needs the composite (project id, member uid) for the same reason I2
-	// does — its page is bounded on MEMBER rows and therefore cuts projects in
-	// half, so a project-only cursor would skip every member past the boundary on
-	// every rotation.
+	// P2's missing-pointer scan rotates over octo_project.id.
 	i4Missing    int64
 	i4MissingRun int
-	i4GapProject int64
-	i4GapUID     string
-	i4GapRun     int
 }
 
 var cursors reconcileCursors
@@ -131,44 +115,6 @@ func (c *reconcileCursors) abandonedSave(project, uid string, running int, done 
 	c.abandonedProject, c.abandonedUID, c.abandonRun = project, uid, running
 }
 
-// i2Resume / i2Save are the mixed (int64, string) composite cursor the I2
-// rotation needs. Same contract as i1Resume/i1Save: a COMPLETED rotation resets
-// to the start and drops the running total, an incomplete one keeps both so the
-// next tick continues where this one stopped.
-func (c *reconcileCursors) i2Resume() (int64, string, int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.i2Group, c.i2UID, c.i2Run
-}
-
-func (c *reconcileCursors) i2Save(group int64, uid string, running int, done bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if done {
-		c.i2Group, c.i2UID, c.i2Run = 0, "", 0
-		return
-	}
-	c.i2Group, c.i2UID, c.i2Run = group, uid, running
-}
-
-// i4GapResume / i4GapSave are the mixed (int64, string) composite cursor the I4
-// gap rotation needs. Same contract as i2Resume/i2Save.
-func (c *reconcileCursors) i4GapResume() (int64, string, int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.i4GapProject, c.i4GapUID, c.i4GapRun
-}
-
-func (c *reconcileCursors) i4GapSave(project int64, uid string, running int, done bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if done {
-		c.i4GapProject, c.i4GapUID, c.i4GapRun = 0, "", 0
-		return
-	}
-	c.i4GapProject, c.i4GapUID, c.i4GapRun = project, uid, running
-}
-
 // idResume / idSave are the same contract for the single-int64-cursor rotations.
 func (c *reconcileCursors) idResume(cursor *int64, running *int) (int64, int) {
 	c.mu.Lock()
@@ -207,10 +153,8 @@ func resetCursorsForTest() {
 	cursors.epoch = 0
 	cursors.ownerless, cursors.ownerlessRun = 0, 0
 	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
-	cursors.i2Group, cursors.i2UID, cursors.i2Run = 0, "", 0
 	cursors.i3Group, cursors.i3Run = 0, 0
 	cursors.i4Missing, cursors.i4MissingRun = 0, 0
-	cursors.i4GapProject, cursors.i4GapUID, cursors.i4GapRun = 0, "", 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly
@@ -235,8 +179,8 @@ func (p *Project) startReconcileWorker() {
 		// announced is worse than a broken one: the gauges sit at zero and read as "no
 		// violations". This line is what makes "we never turned it on" findable.
 		if !p.cfg.ReconcileEnabled {
-			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目 / I4 缺群 / I4 缺员"+
-				"五项无监控，五个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
+			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目 / I4 缺群"+
+				"四项无监控，相关 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
 				zap.String("env", envReconcileEnabled))
 		}
 		p.ctx.Schedule(jitter(p.cfg.ReconcileInterval), p.runReconcile)
@@ -271,74 +215,28 @@ func (p *Project) runReconcile() {
 	}()
 	// These three JOIN the legacy Space tables, so they are the ones that fail with 1267 on a
 	// collation-drifted database — which production is measured to be. See envReconcileEnabled:
-	// running them there produces three permanently-failing scans whose gauges never publish,
-	// i.e. a monitor that reads as healthy while having never run.
+	// running them there produces permanently-failing scans whose gauges never publish.
 	if p.cfg.ReconcileEnabled {
 		p.scanI1Violations()
 		p.scanAbandonedCleanupLeak()
 		p.scanOrphanProjects()
 	}
 
-	// Ungated, along with the three P1 scans below. The general reason covers all five:
-	// every comparison any of them makes that crosses into the pinned schema carries an
-	// explicit COLLATE, so they survive the drift the gate exists for. These two happen also
-	// to touch only this module's own tables, which is the narrower reason this comment used
-	// to give — and giving the narrow one is how review8_reconcile_gate_test.go's header ended
-	// up asserting a smaller set than the code had. PR #868s review, P2-5.
-	//
-	// Keeping them outside the gate matters: scanOwnerlessProjects detects a state P0 cannot
-	// repair, which is precisely what should not be waiting on an ops window.
+	// Ownerless, epoch, attribution, and removal-machinery scans remain ungated.
+	// Their cross-schema comparisons carry explicit COLLATE; scans touching only
+	// this module's tables have no collation dependency.
 	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
-	// P1: the group-binding invariants. I2 is the one with teeth — there is no
-	// read-path filter behind it, so a violation is a person seeing a project
-	// group they are not in. I3 catches attribution that survived a failed
-	// detach. The stall scan is deliberately separate from I2: it means the
-	// machinery stopped, not that the invariant broke.
-	//
-	// OUTSIDE the gate, on purpose. I2 and I3 do JOIN legacy tables, but every
-	// comparison that crosses into the pinned schema carries an explicit COLLATE,
-	// so they survive the drift the gate exists for — asserted, not assumed, by
-	// TestP1ScansSurviveCollationDrift against a deliberately drifted database.
-	// Gating them would default the invariant with teeth to "no monitoring", which
-	// is the failure P0's round 5 was about, arrived at from the other side. The
-	// stall scan touches only this module's own table.
-	p.scanI2Violations()
+	// P1's attribution and removal-machinery scans are independent of native
+	// group membership. I3 catches a broken Project attribution; the stall scan
+	// reports cleanup machinery that stopped. Both remain report-only.
 	p.scanI3Violations()
 	p.scanRemovingStalls()
-	// P2: the two halves of I4. I2 above is the subset direction (nobody in a
-	// project group who is not in the project); these are the superset direction,
-	// and only for the all-member group.
-	//
-	// INSIDE the gate, but for a different reason than the three above — and the
-	// difference is worth stating, because the previous version got it wrong by
-	// answering the wrong question.
-	//
-	// These two do survive the drift: every crossing carries an explicit COLLATE,
-	// and TestP2StatementsSurviveCollationDrift proves it against a deliberately
-	// drifted database. That was the whole argument for keeping them ungated, and
-	// it is true — it is just not the question. SURVIVING 1267 is not the same as
-	// being affordable. Under the production collation shape their own measured
-	// plans are `g ALL key=NULL rows=<all groups>` plus `Using temporary` for scan
-	// A, and `Using temporary; Using filesort` for scan B; the temporary table
-	// also defeats the ORDER BY / LIMIT paging both scans depend on, so
-	// ReconcileLimit stops bounding the work. Shipping them on by default is a
-	// five-minute full scan of a core IM table on every pod, for as long as the
-	// collation conversion stays unscheduled.
-	//
-	// So they ride the same switch: off until the conversion lands, then on with
-	// the rest. Both scans are REPORT ONLY, so nothing is lost while they wait
-	// except the reporting — and the gate's startup Warn says so out loud, which
-	// is the property that makes "we never turned it on" findable.
-	// PR #855's tenth review, P2-1.
-	//
-	// REPORT ONLY, both of them. Scan A has a repair (D4's rebuild) and it lives
-	// on the write paths, not here — a reconcile worker that also writes
-	// group_member stops being the invariant's witness and becomes another thing
-	// that can break it.
+	// The I4 missing-pointer scan is gated because its join against the legacy
+	// `group` table can be expensive under the production collation shape.
+	// It is report-only; provisioning retries remain on write paths.
 	if p.cfg.ReconcileEnabled {
 		p.scanMissingAllMemberGroups()
-		p.scanAllMemberGroupGaps()
 	}
 }
 

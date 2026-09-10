@@ -27,7 +27,7 @@ func projectWithMembers(t *testing.T, srv *server.Server, uids ...string) (strin
 	created := createProjectVia(t, srv, spaceA, ownerTok, "p")
 	if len(uids) > 0 {
 		w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-			ownerTok, map[string]any{"uids": uids})
+			ownerTok, addMembersPayload(uids...))
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 		var outcomes []memberOutcome
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
@@ -36,6 +36,19 @@ func projectWithMembers(t *testing.T, srv *server.Server, uids ...string) (strin
 		}
 	}
 	return ownerTok, tokens, created
+}
+func addMembersPayload(uids ...string) map[string]any {
+	members := make([]map[string]any, 0, len(uids))
+	for _, uid := range uids {
+		members = append(members, map[string]any{"uid": uid, "role": RoleCommon})
+	}
+	return map[string]any{"members": members}
+}
+
+func addMemberWithRolePayload(uid string, role int) map[string]any {
+	return map[string]any{
+		"members": []map[string]any{{"uid": uid, "role": role}},
+	}
 }
 
 // ---------- invariant I1, synchronous half ----------
@@ -50,22 +63,16 @@ func TestAddRejectsNonSpaceMember(t *testing.T) {
 	// A user with no Space seat at all.
 	seedUser(t, "nobody")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"nobody"}})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	var outcomes []memberOutcome
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
-	require.Len(t, outcomes, 1)
-	assert.False(t, outcomes[0].OK)
-	assert.Equal(t, reasonNotSpaceMember, outcomes[0].Reason)
+		ownerTok, addMembersPayload("nobody"))
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
 
 	// A user whose Space seat was removed.
 	seedUser(t, "exmember")
 	seedSpaceMember(t, spaceA, "exmember", 0, 1)
 	removeSpaceMember(t, spaceA, "exmember")
 	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"exmember"}})
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
-	assert.Equal(t, reasonNotSpaceMember, outcomes[0].Reason)
+		ownerTok, addMembersPayload("exmember"))
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
 }
 
 // TestAddRejectsMemberOfAnotherSpace covers the cross-Space half of I1: active in Space
@@ -78,11 +85,8 @@ func TestAddRejectsMemberOfAnotherSpace(t *testing.T) {
 	seedSpaceMember(t, spaceB, "bOnly", 0, 1)
 
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"bOnly"}})
-	var outcomes []memberOutcome
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
-	require.Len(t, outcomes, 1)
-	assert.Equal(t, reasonNotSpaceMember, outcomes[0].Reason)
+		ownerTok, addMembersPayload("bOnly"))
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
 }
 
 // TestAddRejectsWhenSpaceIsBanned covers the authorization side of the banned-Space
@@ -118,15 +122,17 @@ func TestAddRejectsWhenSpaceIsBanned(t *testing.T) {
 	// The middleware gate reads the database every request since the Q3 merge, so a ban
 	// refuses the NEXT request outright with the folded not-found envelope.
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"later"}})
+		ownerTok, addMembersPayload("later"))
 	assertProjectErrorCode(t, w, "err.server.project.not_found")
 
 	// The transactional layer independently refuses the TARGET — exercised directly, because
 	// the middleware gate above now stops the request before the handler runs. This is the
 	// guarantee that holds even if a future change reintroduces a cached caller gate.
+	refs, refsErr := p.db.resolveSpaceSeatIDs(spaceA, []string{"later"})
+	require.NoError(t, refsErr)
 	tx, txErr := p.db.session.Begin()
 	require.NoError(t, txErr)
-	held, err := p.db.lockSpaceSeatsTx(tx, spaceA, []string{"later"})
+	held, err := p.db.lockSpaceSeatsTx(tx, spaceA, []string{"later"}, refs)
 	require.NoError(t, err)
 	assert.False(t, held["later"],
 		"the authorization predicate must fail for a banned Space, cache or no cache")
@@ -141,7 +147,7 @@ func TestMemberEpochStrictlyIncreasesOnEveryWrite(t *testing.T) {
 	srv, _ := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "m1", "m2")
 
-	// The add during seeding already moved it twice (one per admitted member).
+	// The atomic add during seeding moved the epoch once for the whole batch.
 	afterAdd := epochOf(t, created.ProjectID)
 	assert.Greater(t, afterAdd, int64(0), "admitting members must move the epoch")
 
@@ -184,7 +190,7 @@ func TestMemberEpochUnchangedOnNoOpWrites(t *testing.T) {
 
 	// Re-adding an already-active member.
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"m1"}})
+		ownerTok, addMembersPayload("m1"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.Equal(t, baseline, epochOf(t, created.ProjectID),
 		"re-adding an active member is a no-op and must not move the epoch")
@@ -257,24 +263,32 @@ func TestMemberEpochAndCapabilitiesAreInTheResponses(t *testing.T) {
 	assert.False(t, mResp.Capabilities.CanManageMember)
 	assert.True(t, mResp.Capabilities.CanLeave)
 
-	// And it is present in the list.
+	// Find the project under test by semantic ID; the list can contain any
+	// number of explicitly created Projects.
 	list := doJSON(t, srv, http.MethodGet, "/v1/space/"+spaceA+"/projects", ownerTok, nil)
 	require.Equal(t, http.StatusOK, list.Code)
 	var listResp []*Resp
 	require.NoError(t, json.Unmarshal(list.Body.Bytes(), &listResp))
-	require.Len(t, listResp, 1)
-	assert.Equal(t, resp.MemberEpoch, listResp[0].MemberEpoch)
-	assert.Equal(t, RoleOwner, listResp[0].MyRole)
-	assert.Equal(t, 2, listResp[0].MemberCount)
-	assert.Equal(t, 2, listResp[0].HumanMemberCount, "both members are human here")
-	assert.Zero(t, listResp[0].AgentMemberCount)
+	var listed *Resp
+	for _, item := range listResp {
+		if item.ProjectID == created.ProjectID {
+			listed = item
+			break
+		}
+	}
+	require.NotNil(t, listed)
+	assert.Equal(t, resp.MemberEpoch, listed.MemberEpoch)
+	assert.Equal(t, RoleOwner, listed.MyRole)
+	assert.Equal(t, 2, listed.MemberCount)
+	assert.Equal(t, 2, listed.HumanMemberCount, "both members are human here")
+	assert.Zero(t, listed.AgentMemberCount)
 }
 
 // ---------- permission matrix ----------
 
-// TestAdminCannotRemoveOrDemoteAdminOrOwner pins the transitive protection. Without it
-// "admin" is effectively "owner": one admin demotes every peer and the owner.
-func TestAdminCannotRemoveOrDemoteAdminOrOwner(t *testing.T) {
+// TestAdminMayManagePeerAdminsButNotOwner pins the transitive protection:
+// admins manage every non-owner seat, including peer admins.
+func TestAdminMayManagePeerAdminsButNotOwner(t *testing.T) {
 	srv, _ := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "admin1", "admin2", "plain1")
 	for _, uid := range []string{"admin1", "admin2"} {
@@ -284,15 +298,14 @@ func TestAdminCannotRemoveOrDemoteAdminOrOwner(t *testing.T) {
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	}
 
-	// admin1 removing admin2 is refused.
+	// admin1 may remove a peer admin.
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
 		tokens["admin1"], map[string]any{"uids": []string{"admin2"}})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	var outcomes []memberOutcome
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
 	require.Len(t, outcomes, 1)
-	assert.False(t, outcomes[0].OK)
-	assert.Equal(t, reasonPermissionDenied, outcomes[0].Reason)
+	assert.True(t, outcomes[0].OK)
 
 	// admin1 removing the owner is refused.
 	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
@@ -300,11 +313,11 @@ func TestAdminCannotRemoveOrDemoteAdminOrOwner(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
 	assert.Equal(t, reasonPermissionDenied, outcomes[0].Reason)
 
-	// admin1 changing anyone's role is refused outright: role change is owner-only.
+	// Admins may change non-owner roles.
 	w = doJSON(t, srv, http.MethodPut,
 		"/v1/projects/"+created.ProjectID+"/members/plain1/role", tokens["admin1"],
 		map[string]any{"role": RoleAdmin})
-	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	// But admin1 removing an ordinary member is allowed.
 	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
@@ -313,47 +326,42 @@ func TestAdminCannotRemoveOrDemoteAdminOrOwner(t *testing.T) {
 	assert.True(t, outcomes[0].OK, "reason: %s", outcomes[0].Reason)
 }
 
-// TestLastOwnerMustTransferBeforeLeavingOrBeingDemoted pins that a project cannot be
-// left ownerless, and that the transfer is atomic.
-func TestLastOwnerMustTransferBeforeLeavingOrBeingDemoted(t *testing.T) {
+// TestOwnerTransferIsDedicatedAndAtomic pins the ownership cutover contract.
+func TestOwnerTransferIsDedicatedAndAtomic(t *testing.T) {
 	srv, p := setup(t)
-	ownerTok, _, created := projectWithMembers(t, srv, "successor1")
+	ownerTok, tokens, created := projectWithMembers(t, srv, "successor1")
 
-	// Leaving without a successor is refused.
+	// Owner cannot leave or demote through the ordinary role paths.
+	leaveErr := p.leaveProject(created.ProjectID, spaceA, "owner1")
+	assert.ErrorIs(t, leaveErr, errLastOwnerMustTransfer,
+		"the service guard must protect the sole Owner even if middleware is bypassed")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave", ownerTok, nil)
-	assertProjectErrorCode(t, w, "err.server.project.last_owner_must_transfer")
-
-	// Self-demotion without a successor is refused too.
+	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
 	w = doJSON(t, srv, http.MethodPut,
 		"/v1/projects/"+created.ProjectID+"/members/owner1/role", ownerTok,
 		map[string]any{"role": RoleCommon})
-	assertProjectErrorCode(t, w, "err.server.project.last_owner_must_transfer")
+	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
 
-	// With a successor both the promotion and the departure land — one transaction, so
-	// there is never a window with two owners or none.
-	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave", ownerTok,
-		map[string]any{"transfer_to": "successor1"})
+	w = doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID+"/owner", ownerTok,
+		map[string]any{"uid": "successor1"})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-
 	successor, err := p.db.queryMember(created.ProjectID, "successor1")
 	require.NoError(t, err)
 	require.NotNil(t, successor)
 	assert.Equal(t, RoleOwner, successor.Role)
-	assert.Equal(t, MemberStatusActive, successor.Status)
-
-	// Removal is two-phase since P1 (D4): the request sets removing=1 and the
-	// worker closes the seat. Drive the cascade, then assert the same end state
-	// this case always asserted.
-	drainRemovalCascade(t, p)
 	former, err := p.db.queryMember(created.ProjectID, "owner1")
 	require.NoError(t, err)
 	require.NotNil(t, former)
-	assert.Equal(t, MemberStatusRemoved, former.Status)
+	assert.Equal(t, RoleAdmin, former.Role)
+
+	// The former owner remains an active member and can leave as an admin.
+	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave", tokens["owner1"], nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 }
 
-// TestOwnerCannotRemoveThemselvesViaRemoveEndpoint pins that self-removal must go
-// through leave, which carries the transfer rule. Allowing it here would let the last
-// owner delete their own seat and leave the project unmanageable.
+// TestOwnerCannotRemoveThemselvesViaRemoveEndpoint pins that self-removal must be
+// refused by the batch remove path. Owners must use the dedicated owner-transfer
+// endpoint before leaving; allowing removal here would make the project unmanageable.
 func TestOwnerCannotRemoveThemselvesViaRemoveEndpoint(t *testing.T) {
 	srv, _ := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv, "m1")
@@ -366,14 +374,15 @@ func TestOwnerCannotRemoveThemselvesViaRemoveEndpoint(t *testing.T) {
 	assert.Equal(t, reasonPermissionDenied, outcomes[0].Reason)
 }
 
-// TestRemovedMemberIsDeniedOnTheVeryNextRequest proves the membership cache is
-// invalidated SYNCHRONOUSLY, in the request that removed them. Deferring it to a worker
-// would leave the removed member authorized for up to a full 60s TTL.
+// TestRemovedMemberIsDeniedOnTheVeryNextRequest proves that a member removed
+// from a Project is denied immediately. The response uses the same semantic 404
+// envelope as an unknown Project, so revocation cannot leave a permission window
+// or disclose membership history.
 func TestRemovedMemberIsDeniedOnTheVeryNextRequest(t *testing.T) {
 	srv, _ := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "m1")
 
-	// Warm the cache: the member reads the roster, which populates project:member:*.
+	// Warm the read path before removing the member.
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/members", tokens["m1"], nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
@@ -383,23 +392,27 @@ func TestRemovedMemberIsDeniedOnTheVeryNextRequest(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	w = doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/members", tokens["m1"], nil)
-	assertProjectErrorCode(t, w, "err.server.project.not_member")
+	assertProjectErrorCode(t, w, "err.server.project.not_found")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, http.StatusNotFound, decodeProjectEnvelope(t, w.Body.Bytes()).Error.HTTPStatus)
 }
 
-// TestRosterIsMembersOnlyEvenForListedProjects pins that discoverability governs
-// metadata, not the roster: a Space member who has not joined can see a space_listed
-// project's metadata but not who is in it.
-func TestRosterIsMembersOnlyEvenForListedProjects(t *testing.T) {
+// TestNonMemberCannotReadListedProject covers the single Project-member read boundary.
+func TestNonMemberCannotReadListedProject(t *testing.T) {
 	srv, _ := setup(t)
 	_, _, created := projectWithMembers(t, srv)
 	strangerTok := seedUser(t, "stranger")
 	seedSpaceMember(t, spaceA, "stranger", 0, 1)
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, strangerTok, nil)
-	require.Equal(t, http.StatusOK, w.Code, "a space_listed project's metadata is visible")
+	assertProjectErrorCode(t, w, "err.server.project.not_found")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, http.StatusNotFound, decodeProjectEnvelope(t, w.Body.Bytes()).Error.HTTPStatus)
 
 	w = doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/members", strangerTok, nil)
-	assertProjectErrorCode(t, w, "err.server.project.not_member")
+	assertProjectErrorCode(t, w, "err.server.project.not_found")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, http.StatusNotFound, decodeProjectEnvelope(t, w.Body.Bytes()).Error.HTTPStatus)
 }
 
 // TestRoleValidationRejectsUnknownRole covers the enum guard.
@@ -410,6 +423,39 @@ func TestRoleValidationRejectsUnknownRole(t *testing.T) {
 		"/v1/projects/"+created.ProjectID+"/members/m1/role", ownerTok,
 		map[string]any{"role": 9})
 	assertProjectErrorCode(t, w, "err.server.project.role_invalid")
+}
+
+func TestAddMembersPersistsRequestedRoles(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv)
+	for _, uid := range []string{"admin-add", "member-add"} {
+		seedUser(t, uid)
+		seedSpaceMember(t, spaceA, uid, 0, 1)
+	}
+
+	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerTok, map[string]any{"members": []map[string]any{
+			{"uid": "admin-add", "role": RoleAdmin},
+			{"uid": "member-add", "role": RoleCommon},
+		}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var outcomes []memberOutcome
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
+	require.Len(t, outcomes, 2)
+	for _, outcome := range outcomes {
+		assert.True(t, outcome.OK, "adding %s failed: %s", outcome.UID, outcome.Reason)
+	}
+
+	admin, err := p.db.queryMember(created.ProjectID, "admin-add")
+	require.NoError(t, err)
+	require.NotNil(t, admin)
+	assert.Equal(t, RoleAdmin, admin.Role)
+
+	member, err := p.db.queryMember(created.ProjectID, "member-add")
+	require.NoError(t, err)
+	require.NotNil(t, member)
+	assert.Equal(t, RoleCommon, member.Role)
 }
 
 // TestSanitizeUIDsDeduplicates pins that the same uid twice in one batch does not take
@@ -426,11 +472,11 @@ func TestCanActOnTargetRole(t *testing.T) {
 		actor, target int
 		want          bool
 	}{
-		{RoleOwner, RoleOwner, true},
+		{RoleOwner, RoleOwner, false},
 		{RoleOwner, RoleAdmin, true},
 		{RoleOwner, RoleCommon, true},
 		{RoleAdmin, RoleOwner, false},
-		{RoleAdmin, RoleAdmin, false},
+		{RoleAdmin, RoleAdmin, true},
 		{RoleAdmin, RoleCommon, true},
 		{RoleCommon, RoleCommon, false},
 		{roleNonMember, RoleCommon, false},
@@ -439,6 +485,24 @@ func TestCanActOnTargetRole(t *testing.T) {
 		assert.Equal(t, tc.want, canActOnTargetRole(tc.actor, tc.target),
 			"actor=%d target=%d", tc.actor, tc.target)
 	}
+}
+
+func TestNormalizeMemberAddsDeduplicatesAndRejectsConflicts(t *testing.T) {
+	got, err := normalizeMemberAdds([]memberAdd{
+		{UID: " a ", Role: RoleCommon},
+		{UID: "a", Role: RoleCommon},
+		{UID: "b", Role: RoleAdmin},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []memberAdd{{UID: "a", Role: RoleCommon}, {UID: "b", Role: RoleAdmin}}, got)
+
+	_, err = normalizeMemberAdds([]memberAdd{
+		{UID: "a", Role: RoleCommon},
+		{UID: "a", Role: RoleAdmin},
+	})
+	assert.ErrorIs(t, err, errMemberRoleConflict)
+	_, err = normalizeMemberAdds([]memberAdd{{UID: "owner", Role: RoleOwner}})
+	assert.ErrorIs(t, err, errMemberRoleInvalid)
 }
 
 // TestReactivationResetsRoleAndTimestamps pins the ON DUPLICATE KEY UPDATE assignment
@@ -482,7 +546,7 @@ func TestReactivationResetsRoleAndTimestamps(t *testing.T) {
 
 	// Re-add.
 	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"m1"}})
+		ownerTok, addMembersPayload("m1"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	back, err := p.db.queryMember(created.ProjectID, "m1")
@@ -500,10 +564,90 @@ func TestReactivationResetsRoleAndTimestamps(t *testing.T) {
 		ownerTok, map[string]any{"role": RoleAdmin})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"m1"}})
+		ownerTok, addMemberWithRolePayload("m1", RoleAdmin))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	stillAdmin, err := p.db.queryMember(created.ProjectID, "m1")
 	require.NoError(t, err)
 	assert.Equal(t, RoleAdmin, stillAdmin.Role,
 		"re-adding an active admin must not silently demote them")
+}
+
+func TestReactivationWhileRemovalIsPendingUsesRequestedRole(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv, "pending-role")
+
+	w := doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/members/pending-role/role", ownerTok,
+		map[string]any{"role": RoleAdmin})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/remove", ownerTok,
+		map[string]any{"uids": []string{"pending-role"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	pending, err := p.db.queryMember(created.ProjectID, "pending-role")
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	require.Equal(t, MemberStatusActive, pending.Status)
+	require.Equal(t, 1, pending.Removing)
+
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		map[string]any{"members": []map[string]any{
+			{"uid": "pending-role", "role": RoleCommon},
+		}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	rejoined, err := p.db.queryMember(created.ProjectID, "pending-role")
+	require.NoError(t, err)
+	require.NotNil(t, rejoined)
+	assert.Equal(t, MemberStatusActive, rejoined.Status)
+	assert.Zero(t, rejoined.Removing)
+	assert.Equal(t, RoleCommon, rejoined.Role,
+		"re-admission of a closing seat must apply the requested role")
+}
+
+func TestReactivationWhileRemovalIsPendingCountsAgainstMemberQuota(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, tokens, created := projectWithMembers(t, srv, "pending-quota")
+	_ = tokens
+
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE octo_project SET max_members = 2 WHERE project_id = ?", created.ProjectID,
+	).Exec()
+	require.NoError(t, err)
+
+	w := doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/members/pending-quota/role", ownerTok,
+		map[string]any{"role": RoleAdmin})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/remove", ownerTok,
+		map[string]any{"uids": []string{"pending-quota"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	seedUser(t, "quota-new")
+	seedSpaceMember(t, spaceA, "quota-new", 0, 1)
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		addMembersPayload("quota-new"))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		addMembersPayload("pending-quota"))
+	assertProjectErrorCode(t, w, "err.server.project.quota_members")
+
+	pending, err := p.db.queryMember(created.ProjectID, "pending-quota")
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, MemberStatusActive, pending.Status)
+	assert.Equal(t, 1, pending.Removing,
+		"quota refusal must leave the pending removal intact")
+	assert.Equal(t, RoleAdmin, pending.Role,
+		"quota refusal must not change the pending member role")
+	active, err := p.db.countActiveMembers(created.ProjectID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, active,
+		"closing seats that would be reactivated count toward the cap")
 }

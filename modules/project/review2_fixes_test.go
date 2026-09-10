@@ -18,7 +18,7 @@ import (
 // --- P1 #1: createProject did not check the creator's Space seat inside the transaction ---
 
 func TestCreateChecksCreatorSpaceSeatInsideTransaction(t *testing.T) {
-	srv, p := setup(t)
+	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
 	token := seedUser(t, "gone1")
 	seedSpaceMember(t, spaceA, "gone1", 0, 1)
@@ -41,13 +41,15 @@ func TestCreateChecksCreatorSpaceSeatInsideTransaction(t *testing.T) {
 
 	var n int
 	require.NoError(t, testCtx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project` WHERE space_id = ?", spaceA).LoadOne(&n))
-	assert.Equal(t, 0, n, "no project may be created by a non-member")
+		"SELECT COUNT(*) FROM `octo_project` WHERE space_id = ? AND name = ?",
+		spaceA, "should-not-exist").LoadOne(&n))
+	assert.Zero(t, n, "the rejected create must not leave its named project behind")
 	require.NoError(t, testCtx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE space_id = ? AND uid = ?",
-		spaceA, "gone1").LoadOne(&n))
-	assert.Equal(t, 0, n, "no owner seat may survive the rejected create")
-	_ = p
+		"SELECT COUNT(*) FROM `octo_project_member` pm "+
+			"INNER JOIN `octo_project` p ON p.project_id = pm.project_id "+
+			"WHERE p.space_id = ? AND p.name = ? AND pm.uid = ?",
+		spaceA, "should-not-exist", "gone1").LoadOne(&n))
+	assert.Zero(t, n, "no owner seat may survive the rejected create")
 }
 
 func TestCreateRejectedWhenSpaceWentInactive(t *testing.T) {
@@ -221,14 +223,14 @@ func TestOwnershipCannotTransferToExSpaceMember(t *testing.T) {
 	require.NotNil(t, member)
 	require.Equal(t, MemberStatusActive, member.Status, "precondition: seat not yet cascaded")
 
-	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave", ownerTok,
-		map[string]any{"transfer_to": "heir1"})
+	w := doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID+"/owner", ownerTok,
+		map[string]any{"uid": "heir1"})
 	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
 
-	// Same guard on the role-change path.
+	// Owner is also not assignable through the normal role endpoint.
 	w = doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID+"/members/owner1/role",
-		ownerTok, map[string]any{"role": RoleCommon, "transfer_to": "heir1"})
-	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
+		ownerTok, map[string]any{"role": RoleOwner})
+	assertProjectErrorCode(t, w, "err.server.project.role_invalid")
 
 	// The owner still owns it, so the project stayed manageable.
 	owner, err := NewDB(testCtx).queryMember(created.ProjectID, "owner1")
@@ -260,57 +262,35 @@ func TestCascadeSkipsSeatWhenMemberRejoinedBeforeTheShortTransaction(t *testing.
 	assert.Equal(t, MemberStatusActive, member.Status)
 }
 
-// --- P1 #6: reported, and deliberately NOT resolved in P0 ---
+// --- Space removal preserves the unique Project Owner identity ---
 //
-// The review asked for the cascade to hand ownership over or disband. Both are product
-// decisions — one silently changes who controls a project, the other destroys data — and the
-// brief scopes this step to "deactivate every active row for (space_id, uid) and bump
-// member_epoch when rows were affected". So P0 keeps the documented end state and makes it
-// visible; the resolution is an Open question in the brief.
-//
-// These cases pin the scope rather than the (absent) behaviour, so that a later change which
-// quietly adds auto-promotion or auto-disband has to update them.
-
-// TestCascadeClosesSoleOwnerSeatWithoutPromotingOrDisbanding pins the P0 contract: the seat is
-// closed, the project stays as it was, and nobody is promoted behind the operator's back.
-func TestCascadeClosesSoleOwnerSeatWithoutPromotingOrDisbanding(t *testing.T) {
+// Losing a Space seat denies authorization but does not rewrite the Project
+// roster. The owner can transfer ownership after rejoining the Space.
+func TestCascadePreservesSoleOwnerSeat(t *testing.T) {
 	srv, p := setup(t)
 	_, _, created := projectWithMembers(t, srv, "member1", "member2")
+	_ = srv
 
 	rolesBefore := memberRoles(t, created.ProjectID)
-
 	removeSpaceMember(t, spaceA, "owner1")
 	require.NoError(t, runCascade(t, p, spaceA, "owner1", "admin", spacemod.MemberRemoveReasonKicked))
 
-	// The departing owner's seat is closed — that part IS required.
-	gone, err := p.db.queryMember(created.ProjectID, "owner1")
+	owner, err := p.db.queryMember(created.ProjectID, "owner1")
 	require.NoError(t, err)
-	assert.Equal(t, MemberStatusRemoved, gone.Status)
+	require.NotNil(t, owner)
+	assert.Equal(t, MemberStatusActive, owner.Status)
+	assert.Equal(t, RoleOwner, owner.Role)
 
-	// The project is NOT disbanded: the cascade must not destroy data.
 	var status int
 	require.NoError(t, testCtx.DB().SelectBySql(
 		"SELECT status FROM `octo_project` WHERE project_id = ?", created.ProjectID).LoadOne(&status))
-	assert.Equal(t, StatusNormal, status, "the cascade must not disband the project")
+	assert.Equal(t, StatusNormal, status)
 
-	// And nobody was promoted: every remaining member keeps the role they had.
 	rolesAfter := memberRoles(t, created.ProjectID)
 	for uid, before := range rolesBefore {
-		if uid == "owner1" {
-			continue
-		}
 		assert.Equal(t, before, rolesAfter[uid],
-			"member %s must keep role %d; the cascade must not promote anyone", uid, before)
+			"member %s must keep role %d after Space removal", uid, before)
 	}
-
-	// The documented consequence: the project now has no owner. Asserted so the end state is
-	// pinned rather than merely described in a comment.
-	var owners int
-	require.NoError(t, testCtx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE project_id = ? AND status = ? AND role = ?",
-		created.ProjectID, MemberStatusActive, RoleOwner).LoadOne(&owners))
-	assert.Equal(t, 0, owners,
-		"P0 end state: an ownerless project. Resolution is an Open question, not a silent fix")
 }
 
 // memberRoles snapshots uid -> role for the active roster.
@@ -362,7 +342,7 @@ func TestAbandonedLeakCountsSeatsNotJobs(t *testing.T) {
 	ownerTok, _, first := projectWithMembers(t, srv, "leaker")
 	second := createProjectVia(t, srv, spaceA, ownerTok, "second")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+second.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"leaker"}})
+		ownerTok, addMembersPayload("leaker"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	// One abandoned job, two leaked seats. The old COUNT-of-jobs reported 1.
@@ -393,7 +373,7 @@ func TestAbandonedLeakScanPagesWithoutRepeating(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		pr := createProjectVia(t, srv, spaceA, ownerTok, "paged-"+string(rune('a'+i)))
 		w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+pr.ProjectID+"/members/add",
-			ownerTok, map[string]any{"uids": []string{"pager"}})
+			ownerTok, addMembersPayload("pager"))
 		require.Equal(t, http.StatusOK, w.Code)
 	}
 	removeSpaceMember(t, spaceA, "pager")

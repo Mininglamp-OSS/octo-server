@@ -11,23 +11,18 @@ import (
 //
 // # Why removal is two-phase
 //
-// A project seat gates group admission (I2). If removal flipped status to 0 and
-// then detached groups asynchronously, there would be a window in which
-// octo_project_member says "not a member" while group_member rows for that uid
-// still exist in the project's groups — I2 violated, by the removal itself,
-// every time.
-//
-// So the order is inverted: `removing = 1` is set in the SAME transaction that
-// begins the removal, `status` stays 1, and the worker flips status only after
-// the groups are detached. Every authorization read treats removing = 1 as a
-// non-member, so the seat stops granting anything immediately, while the rows
-// that have not been cleaned up yet still belong to a member of record.
+// `removing = 1` is set in the SAME transaction that begins the removal, while
+// `status` stays active until the worker has completed every registered cleanup
+// step. Every authorization read treats removing = 1 as a non-member, so the
+// seat stops granting access immediately without coupling this module to native
+// group membership. If no cleanup step is registered, the worker closes the seat
+// directly; an empty registry must not create an endless retry loop.
 //
 // The states, and what each means to a reader:
 //
 //	status=1 removing=0  — an ordinary active member
 //	status=1 removing=1  — seat closing; NOT a member for any authorization
-//	                       purpose; group rows may still exist
+//	                       purpose; registered cleanup may still be pending
 //	status=0 removing=0  — removed, cleanup finished
 //	status=0 removing=1  — must not exist; the reconcile scan reports it
 
@@ -123,10 +118,10 @@ func (d *DB) finishMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.T
 // checkSpaceSeatForCleanupTx re-check inside deactivateSeatForCascade, and as
 // cleanupSpaceMemberGroups's.
 //
-// A cancellation landing mid-batch leaves the member in the project but out of
-// some of its groups. That is NOT an invariant violation — the subset relation
-// still holds — it is visible in the member lists, and an admin can re-add. Say
-// so here, or the next reader will "fix" it into something worse.
+// A cancellation landing mid-batch can leave an external cleanup step partially
+// complete. That is not a Project membership invariant violation: native group
+// membership and Project membership are independent facts, and the worker
+// re-checks the seat before any subsequent step.
 func (d *DB) lockMemberForCascadeTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(

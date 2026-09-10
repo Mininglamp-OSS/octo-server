@@ -186,8 +186,8 @@ func TestWriteRejectionsAreBrokenDownByEntryPoint(t *testing.T) {
 	// Path 1 — member add, target holds no Space seat.
 	seedUser(t, "e31a")
 	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"e31a"}})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		ownerTok, addMembersPayload("e31a"))
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
 
 	assert.Equal(t, addBefore+1, before(entryMemberAdd, reasonNotSpaceMember),
 		"the add rejection must be counted under its own entry point")
@@ -216,32 +216,22 @@ func TestWriteRejectionsAreBrokenDownByEntryPoint(t *testing.T) {
 		"and must not disturb the add path's counter")
 }
 
-// ---------- P2-4: transfer_to is validated even when no transfer can happen ----------
+// ---------- P2-4: owner transfer is a dedicated operation ----------
 
-// TestLeaveIgnoresAnIrrelevantTransferTo pins that a successor is only required to hold a Space
-// seat when a transfer will actually happen.
-//
-// requireSpaceSeatsTx refuses any named uid without an active Space seat, and leave passed
-// transferTo unconditionally — before the code has established that a transfer is needed at all.
-// So an ordinary member, or an owner who is not the last one, sending
-// {"transfer_to": "<a colleague who left the Space last month>"} was refused for a successor
-// irrelevant to their departure (PR #841 round 4, P2-4).
-func TestLeaveIgnoresAnIrrelevantTransferTo(t *testing.T) {
+// TestOrdinaryMemberCanLeaveWithoutOwnerTransfer keeps the ordinary-member path
+// independent from ownership transfer. A successor is selected only by the dedicated owner
+// endpoint; leaving an ordinary seat never validates or promotes one.
+func TestOrdinaryMemberCanLeaveWithoutOwnerTransfer(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "p24a", "p24b")
 	pid := created.ProjectID
-	_ = ownerTok
 
 	// p24b left the Space last month: a real project seat, no Space seat.
 	removeSpaceMember(t, spaceA, "p24b")
 
-	// p24a is an ordinary member. Their departure needs no transfer at all, so naming a
-	// seatless successor must not refuse it.
-	successor, err := p.leaveProject(pid, spaceA, "p24a", "p24b")
-	assert.NoError(t, err,
-		"an ordinary member's leave needs no transfer, so an irrelevant transfer_to must not "+
-			"block it")
-	assert.Empty(t, successor, "and nobody was promoted")
+	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+pid+"/leave", tokens["p24a"], nil)
+	require.Equal(t, http.StatusOK, w.Code, "an ordinary member must leave without transfer: %s",
+		w.Body.String())
 
 	// Two-phase removal (D4): drive the cascade before reading the end state.
 	drainRemovalCascade(t, p)
@@ -250,13 +240,13 @@ func TestLeaveIgnoresAnIrrelevantTransferTo(t *testing.T) {
 	require.NotNil(t, seat)
 	assert.Equal(t, MemberStatusRemoved, seat.Status, "the leave must have taken effect")
 
-	// The last owner IS required to name a successor who still holds a Space seat — the
-	// protection must stay for the case it was written for.
-	_, lastErr := p.leaveProject(pid, spaceA, "owner1", "p24b")
-	assert.ErrorIs(t, lastErr, errNotSpaceMember,
-		"the LAST owner's transfer target must still be an active Space member, or the cascade "+
-			"closing that seat leaves the project ownerless")
-	_ = tokens
+	// The sole Owner cannot leave until the dedicated transfer operation succeeds. Its target
+	// still has no Space seat, so the transfer is refused and the Owner remains protected.
+	w = doJSON(t, srv, http.MethodPut, "/v1/projects/"+pid+"/owner", ownerTok,
+		map[string]any{"uid": "p24b"})
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
+	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+pid+"/leave", ownerTok, nil)
+	assertProjectErrorCode(t, w, "err.server.project.permission_denied")
 }
 
 // ---------- P2-2: the per-row alert log must be capped ----------

@@ -24,12 +24,12 @@ import (
 // requireSpaceSeatsTx.
 //
 // P2 added a SEVENTH, which is why the list no longer stops at the requireSpaceSeatsTx
-// callers: creating a project with agent_uids takes its own seat locks
-// (lockSpaceSeatRowTx for the creator, lockSpaceSeatRowsTx for the agents) rather than
-// going through requireSpaceSeatsTx, so a guard scoped to that function's callers could
-// not see it. The brief lists the create-with-agents path as load-bearing here for that
-// reason. Keep the list exhaustive against every write that takes a space_member lock,
-// not just the ones that take it through one helper.
+// callers: creating a project with agent_uids takes the creator and agent seat locks through
+// the resolved lockSpaceSeatRowsTx statement rather than going through requireSpaceSeatsTx.
+// A guard scoped to that function's callers could not see it. The brief lists the
+// create-with-agents path as load-bearing here for that reason. Keep the list exhaustive
+// against every write that takes a space_member lock, not just the ones that take it through
+// one helper.
 func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, tokens, created := projectWithMembers(t, srv, "admin9")
@@ -63,21 +63,17 @@ func TestWritePathsRevalidateTheActorSpaceSeatInTx(t *testing.T) {
 		"removeMember must refuse an actor without a Space seat")
 
 	// leaveProject
-	_, lErr := p.leaveProject(created.ProjectID, spaceID, "admin9", "")
+	lErr := p.leaveProject(created.ProjectID, spaceID, "admin9")
 	assert.ErrorIs(t, lErr, errNotSpaceMember,
 		"leaveProject must refuse an actor without a Space seat")
-
 	// changeMemberRole (demote someone)
-	_, _, cErr := p.changeMemberRole(created.ProjectID, spaceID, "admin9", "owner1", RoleCommon, "")
+	_, cErr := p.changeMemberRole(created.ProjectID, spaceID, "admin9", "owner1", RoleCommon)
 	assert.ErrorIs(t, cErr, errNotSpaceMember,
 		"changeMemberRole must refuse an actor without a Space seat")
 
-	// addMember — the sixth path, and the one this guard used to skip while claiming to
-	// drive "each privileged write" (PR #841 round 2, yujiawei P1-1 / Jerry-Xin B-1). Its
-	// exposure is the widest of the six: addMembers runs one transaction per target and
-	// breaks the batch only on errPermissionDenied / errProjectGone, so an actor whose Space
-	// seat closes mid-batch would otherwise have every remaining uid of a 200-uid batch
-	// admitted and audited under them.
+	// addMember — the narrow single-target seam used by create/legacy callers. The public
+	// members/add endpoint validates and commits its entire batch atomically; this direct call
+	// keeps the actor-seat guard covered without bypassing that HTTP contract.
 	seedUser(t, "fresh1")
 	seedSpaceMember(t, spaceA, "fresh1", 0, 1)
 	admitted, aErr := p.addOneMember(created.ProjectID, spaceID, "admin9", "fresh1")

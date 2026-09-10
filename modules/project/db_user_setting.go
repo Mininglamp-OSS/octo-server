@@ -103,9 +103,8 @@ func (d *DB) queryProjectPinned(projectID, uid string) (bool, error) {
 // string production executes, not a copy that can drift into passing forever.
 //
 // The LEFT JOIN carries the membership half of the visibility rule, and removing = 0
-// for the same reason listVisibleInSpace carries it — a seat that is closing counts
-// as gone everywhere else. pm.uid IS NOT NULL is the clause that admits an unlisted
-// project the caller is actually in.
+// keeps a closing seat out of the list predicate as well. pm.uid IS NOT NULL is the
+// clause that admits an unlisted project the caller is actually in.
 const sqlCountPinnedInSpace = "SELECT COUNT(*) FROM octo_project_user_setting s " +
 	"INNER JOIN octo_project p ON p.project_id = s.project_id " +
 	"LEFT JOIN octo_project_member pm " +
@@ -127,11 +126,9 @@ const sqlCountPinnedInSpace = "SELECT COUNT(*) FROM octo_project_user_setting s 
 // outbox made for a different reason (a worker touching every row of a large fan-out
 // per job) that does not apply to one probe per pin.
 //
-// # It counts exactly the pins the caller's own list shows, and that is the contract
-//
-// Not "every pinned row". The quota predicate MIRRORS listVisibleInSpace, because a
-// quota that counts rows the list does not show produces a refusal the user cannot
-// act on: "you have pinned 6" while their screen shows 5, with no sixth to remove.
+// Not "every pinned row". The quota predicate mirrors the project list predicate,
+// because a quota that counts rows the list does not show produces a refusal the user
+// cannot act on: "you have pinned 6" while their screen shows 5, with no sixth to remove.
 //
 // Two states reach that, and PR #861s review found the second after the first was
 // already handled:
@@ -146,11 +143,10 @@ const sqlCountPinnedInSpace = "SELECT COUNT(*) FROM octo_project_user_setting s 
 //     membership half is the same trap by the other door: a member who pins an
 //     unlisted project and is then removed from it lands in the identical state.
 //
-// So the visibility half of listVisibleInSpace comes along:
+// So the visibility half of the project list predicate comes along:
 // (space_listed OR an active member row). A caller whose project becomes visible
-// again while they are over the cap converges through unpin, which is never
-// refused — the same situation the code already accepts for a cap lowered by
-// configuration.
+// again while they are over the cap converges through unpin, which is never refused —
+// the same situation the code already accepts for a cap lowered by configuration.
 //
 // Note what this does NOT do: a Space admin can point-read an unlisted project they
 // never joined (projectMiddleware allows it) but that project is absent from their

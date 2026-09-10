@@ -1,16 +1,10 @@
 package group
 
-// Source guard for invariant I2 (D8).
+// Source guard for native Group membership writes.
 //
-// I2 is enforced in ONE place — admitOrRestoreMembersTx / assertAdmissibleTx in
-// admission.go — and there is no read-path filter behind it. A new code path
-// that writes group_member directly does not produce a subtly wrong result; it
-// produces a member who sees a project group they are not in, receives its
-// messages and can post in it. So the funnel needs something that FAILS when a
-// path bypasses it, because the alternative — a comment asking future authors to
-// use the funnel — is exactly what this module already had: 「与
-// Service.AddGroupMembers 保持一致」 appears five times, and the invariant still
-// drifted across eleven implementations.
+// Every group_member write must use the shared transaction primitive so that
+// insert/restore semantics, versions, and native membership columns cannot
+// drift across callers. Project relation authorization is a separate concern.
 //
 // # Why a tree walk and not a fixed file list
 //
@@ -94,19 +88,16 @@ var groupMemberWriteAllowlist = map[string][]string{
 	// never admit anyone, and routing it through the removal funnel would emit
 	// removal system messages for a group that never existed.
 	"modules/group/service.go": {`DeleteFrom("group_member"`},
+	// Project-backed group creation has the same post-commit compensation
+	// contract: if WuKongIM channel creation fails, remove its just-committed
+	// native member rows without emitting ordinary removal events.
+	"modules/group/service_project_create.go": {`DeleteFrom("group_member"`},
 }
 
 // projectIDWriteNeedles catch an UPDATE that changes a group's project
-// attribution. I3 makes attribution immutable in v1: there is no re-parenting
-// endpoint, and the only writes permitted are the create path (which INSERTs the
-// group with its project_id) and the detach step (which reverts a group to
-// Space-direct when its project is disbanded, or when no successor is left to
-// own it).
-//
-// Without this, "re-parent a group into another project" is a one-line change
-// that silently moves a group full of members into a project none of them are
-// in — I2 violated for every existing member at once, with no admission path
-// involved and therefore nothing else to catch it.
+// attribution. Relation writes are now allowed only through the dedicated
+// atomic Group↔Project DAO primitive; ordinary group paths still cannot
+// rewrite project_id.
 var projectIDWriteNeedles = []string{
 	`Set("project_id"`,
 	"set project_id",
@@ -116,8 +107,11 @@ var projectIDWriteNeedles = []string{
 var projectIDWriteAllowlist = map[string][]string{
 	// The detach step reverts project groups to Space-direct.
 	"modules/group/project_cascade.go": projectIDWriteNeedles,
-	// The DAO primitive the detach step calls.
+	// The legacy detach primitive.
 	"modules/group/db.go": projectIDWriteNeedles,
+	// Relation bind/rebind/unbind updates both project_id and project_linked_by
+	// atomically after the transaction service has revalidated both sides.
+	"modules/group/db_project.go": projectIDWriteNeedles,
 }
 
 func TestNoGroupMemberWritesOutsideTheAdmissionFunnel(t *testing.T) {
@@ -125,26 +119,20 @@ func TestNoGroupMemberWritesOutsideTheAdmissionFunnel(t *testing.T) {
 		"group_member",
 		groupMemberWriteNeedles,
 		groupMemberWriteAllowlist,
-		"every group_member write must go through modules/group/db.go's primitives, "+
-			"which are reachable only from admitOrRestoreMembersTx (admission) or "+
-			"RemoveGroupMembers (removal). A direct write bypasses invariant I2, and "+
-			"there is no read-path filter behind I2 to catch it.")
+		"which are reachable only from admitOrRestoreMembersTx (admission) or "+
+			"RemoveGroupMembers (removal). Direct writes bypass the shared native "+
+			"membership semantics.")
 }
 
-func TestNoProjectIDRewritesOutsideTheDetachStep(t *testing.T) {
+func TestNoProjectIDRewritesOutsideRelationAndDetachPrimitives(t *testing.T) {
 	assertNoWritesOutsideAllowlist(t,
 		"group.project_id",
 		projectIDWriteNeedles,
 		projectIDWriteAllowlist,
-		"a group's project attribution is immutable in v1 (I3). The create path sets "+
-			"it at INSERT; the disband/no-successor detach step reverts it to the empty "+
-			"sentinel. Re-parenting a group would move every existing member into a "+
-			"project they are not in, violating I2 wholesale with no admission path "+
-			"involved.")
+		"project_id may change only through the dedicated relation primitive or the "+
+			"legacy detach primitive. Every relation update must pair project_id with "+
+			"project_linked_by and revalidate Project/group authorization in one transaction.")
 }
-
-// assertNoWritesOutsideAllowlist walks the WHOLE module root and reports every
-// non-test .go file that contains a forbidden needle it is not allowlisted for.
 func assertNoWritesOutsideAllowlist(
 	t *testing.T,
 	subject string,
@@ -381,11 +369,9 @@ func TestAdmissionPrimitivesAreCalledOnlyFromTheFunnel(t *testing.T) {
 		admissionPrimitiveNeedles,
 		admissionPrimitiveAllowlist,
 		"InsertMember / InsertMemberTx / recoverMemberTx write a member row without "+
-			"consulting invariant I2. Admissions go through admitOrRestoreMembersTx, "+
-			"which enforces the composite gate on BOTH the insert and the restore "+
-			"branch. (The primitives stay exported only because 41 existing test "+
-			"files build fixtures with them; this guard is what makes 'callable only "+
-			"from the funnel' true.)")
+			"the shared admission semantics. All production admissions go through "+
+			"admitOrRestoreMembersTx, while test fixtures retain the exported "+
+			"helpers for compatibility.")
 }
 
 // groupDBHolders — the non-test files outside modules/group that legitimately
@@ -451,9 +437,9 @@ func TestDeclaredHoldersDoNotWriteMembership(t *testing.T) {
 			for _, needle := range admissionPrimitiveNeedles {
 				require.NotContains(t, code, needle,
 					"%s:%d holds a *group.DB to %s and calls %s on it — a membership write "+
-						"outside the admission funnel does not consult I2. Route it through "+
-						"the group service, or reverse-register a step the way modules/space "+
-						"receives its preset-group admitter: %s",
+						"outside the admission funnel bypasses shared native semantics. "+
+						"Route it through the group service, or reverse-register a step "+
+						"the way modules/space receives its preset-group admitter: %s",
 					file, i+1, why, needle, strings.TrimSpace(line))
 			}
 		}

@@ -238,23 +238,13 @@ func (p *Project) spaceIDParamMiddleware() wkhttp.HandlerFunc {
 }
 
 // projectMiddleware resolves the :project_id path parameter into a verified
-// project, its Space, and the caller's role in both.
+// project and the caller's active Project/Space roles. Project membership is
+// required for every mutating route and for group/collaboration reads.
 //
-// Three refusals all render the SAME anti-enumeration response
-// (respondProjectNotFound), and that sameness is the security property:
-//
-//  1. the project does not exist;
-//  2. it exists in a Space the caller is not a member of;
-//  3. it exists, is unlisted, and the caller is neither a member nor a Space admin.
-//
-// Answering 403 for (2) would tell an outsider that a given project id is real and
-// which of their probes landed in a foreign tenant. Same shape as modules/channel
-// folding not-found into forbidden (modules/channel/api.go:179-194). The
-// distinguishing reason goes to the log line only.
-//
-// A disbanded project is case (1) for everyone. Note this is NOT the
-// project_create_enabled flag's behaviour — that gate keeps reads working; disband
-// is terminal.
+// A missing/disbanded project, a caller without an active Space seat, and a
+// caller without an active Project seat all render the same anti-enumeration
+// response. Project detail, roster, and single-member GET routes defer that
+// decision to their authoritative RR read service; see the early path below.
 func (p *Project) projectMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		projectID := c.Param("project_id")
@@ -284,6 +274,18 @@ func (p *Project) projectMiddleware() wkhttp.HandlerFunc {
 			return
 		}
 
+		if c.Request.Method == "GET" &&
+			(c.FullPath() == "/v1/projects/:project_id" ||
+				c.FullPath() == "/v1/projects/:project_id/members" ||
+				c.FullPath() == "/v1/projects/:project_id/members/:uid") {
+			// Space-seat and Project-seat checks in one RR snapshot. Do not
+			// reject from this pre-resolver's potentially stale view.
+			c.Set(ctxKeyProjectRow, row)
+			c.Set(ctxKeyProjectRole, roleNonMember)
+			c.Set(ctxKeySpaceRole, 0)
+			c.Next()
+			return
+		}
 		// Space membership and Space role answer the SAME predicate
 		// (space_member.status=1 AND space.status=1), so they are ONE read, not two: MemberRole
 		// returns ok=false exactly when CheckMembership would return false. The earlier version
@@ -324,9 +326,10 @@ func (p *Project) projectMiddleware() wkhttp.HandlerFunc {
 			return
 		}
 
-		if row.Discoverability == DiscoverabilityUnlisted &&
-			projectRole == roleNonMember && spaceRole < spacepkg.MemberRoleAdmin {
-			p.Debug("unlisted 项目对非成员按不存在响应",
+		if projectRole == roleNonMember {
+			// Project membership is the read and write boundary. Space admins
+			// do not bypass it; a Space role is never an implicit Project seat.
+			p.Debug("调用者不是项目成员，按不存在响应",
 				zap.String("projectId", projectID), zap.String("uid", uid))
 			respondProjectNotFound(c)
 			c.Abort()

@@ -72,7 +72,7 @@ func TestEveryWritePathEmitsAnAuditEntry(t *testing.T) {
 			"must be audited like any other")
 
 	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
-		map[string]any{"uids": []string{"m1", "m2"}})
+		addMembersPayload("m1", "m2"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	w = doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID+"/members/m1/role", ownerTok,
@@ -155,8 +155,8 @@ func TestWriteRejectionIsBrokenDownByEntryPoint(t *testing.T) {
 	otherBefore := testutil.ToFloat64(writeRejected.WithLabelValues(entryRoleChange, reasonNotSpaceMember))
 
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"outsider"}})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		ownerTok, addMembersPayload("outsider"))
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
 
 	after := testutil.ToFloat64(writeRejected.WithLabelValues(entryMemberAdd, reasonNotSpaceMember))
 	assert.Equal(t, before+1, after, "the rejection must be counted against member_add")

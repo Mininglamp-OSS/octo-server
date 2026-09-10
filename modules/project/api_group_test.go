@@ -34,6 +34,20 @@ func seedInactiveGroupMemberRow(t *testing.T, groupNo, uid string, isDeleted, st
 	require.NoError(t, err)
 }
 
+// seedGroupMemberRow writes a normal native member for relation fixtures. Native
+// membership is intentionally independent from the Project relation itself, so
+// callers use this only when a fixture needs a concrete group_member row.
+func seedGroupMemberRow(t *testing.T, groupNo, uid string) {
+	t.Helper()
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, role, `version`, status, vercode, is_deleted, "+
+			"invite_uid, robot, forbidden_expir_time, is_external, source_space_id, created_at) "+
+			"VALUES (?, ?, 0, 1, ?, ?, 0, '', 0, 0, 0, '', NOW())",
+		groupNo, uid, int(common.GroupMemberStatusNormal), util.GenerUUID(),
+	).Exec()
+	require.NoError(t, err)
+}
+
 // disbandGroupRow flips a group to disbanded the way the group module does —
 // status only, group_member rows deliberately left in place.
 func disbandGroupRow(t *testing.T, groupNo string) {
@@ -51,6 +65,13 @@ func decodeGroupList(t *testing.T, w *httptest.ResponseRecorder) []*GroupResp {
 	return resp
 }
 
+func decodeProjectGroupRelations(t *testing.T, w *httptest.ResponseRecorder) []ProjectGroupRelation {
+	t.Helper()
+	var resp []ProjectGroupRelation
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp), "body: %s", w.Body.String())
+	return resp
+}
+
 func groupNosOf(list []*GroupResp) []string {
 	out := make([]string, 0, len(list))
 	for _, g := range list {
@@ -61,21 +82,16 @@ func groupNosOf(list []*GroupResp) []string {
 
 // ---------- the list ----------
 
-// TestListProjectGroupsReturnsOnlyMyGroups is the endpoint's whole access-control
-// story in one case: the list is scoped to the caller's own membership, so a
-// project member sees the project groups they are IN and nothing else.
-//
-// The stand-in all-member group is a free negative: stubAllMemberGroup inserts a
-// real `group` row attributed to the project but its admitter is a no-op, so it is
-// a project group nobody is a member of. If the handler ever widens to "every
-// group in the project", this case fails on that row alone.
-func TestListProjectGroupsReturnsOnlyMyGroups(t *testing.T) {
+// TestListProjectGroupsReturnsAllAssociatedGroups verifies that relation listing
+// is scoped by Project membership, not native group membership. A caller sees
+// every live relation even when they hold no group_member row.
+func TestListProjectGroupsReturnsAllAssociatedGroups(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-mine")
+	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-associated")
 
 	mine := util.GenerUUID()
 	theirs := util.GenerUUID()
@@ -85,9 +101,9 @@ func TestListProjectGroupsReturnsOnlyMyGroups(t *testing.T) {
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{mine}, groupNosOf(decodeGroupList(t, w)),
-		"the list must be the caller's own groups: a project group they hold no seat in "+
-			"discloses a group name they cannot act on, and I2 is a ceiling, not a floor")
+	assert.Equal(t, []string{allMember.groupNo, mine, theirs}, groupNosOf(decodeGroupList(t, w)),
+		"the relation list must include initial provisioning and must not filter on native group membership")
+	assert.Equal(t, "3", w.Header().Get("X-Total-Count"))
 }
 
 // TestListProjectGroupsExcludesDisbandedGroups covers the filter that is load-bearing
@@ -99,7 +115,7 @@ func TestListProjectGroupsReturnsOnlyMyGroups(t *testing.T) {
 // expected state, not corruption.
 func TestListProjectGroupsExcludesDisbandedGroups(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -115,57 +131,38 @@ func TestListProjectGroupsExcludesDisbandedGroups(t *testing.T) {
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{live}, groupNosOf(decodeGroupList(t, w)),
+	assert.Equal(t, []string{allMember.groupNo, live}, groupNosOf(decodeGroupList(t, w)),
 		"a disbanded group keeps its group_member rows, so only the status filter excludes it")
 }
 
-// TestListProjectGroupsExcludesInactiveMembership pins the STRICTER of the two
-// membership predicates in the tree.
-//
-// A row with is_deleted = 1 is someone who left; a row with status <> 1 is not a
-// normal member. Either one passing would put a group the caller has left back in
-// their project tree.
-func TestListProjectGroupsExcludesInactiveMembership(t *testing.T) {
+// TestListProjectGroupsIgnoresNativeMemberState verifies that a relation list
+// remains stable when native group membership changes independently.
+func TestListProjectGroupsIgnoresNativeMemberState(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-inactive")
+	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-native-state")
 
 	left := util.GenerUUID()
 	abnormal := util.GenerUUID()
 	seedProjectGroup(t, left, spaceA, created.ProjectID)
 	seedProjectGroup(t, abnormal, spaceA, created.ProjectID)
-	seedInactiveGroupMemberRow(t, left, "owner1", 1, 1)     // left the group
-	seedInactiveGroupMemberRow(t, abnormal, "owner1", 0, 0) // not a normal member
+	seedInactiveGroupMemberRow(t, left, "owner1", 1, 1)
+	seedInactiveGroupMemberRow(t, abnormal, "owner1", 0, 0)
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Empty(t, decodeGroupList(t, w),
-		"is_deleted = 0 AND status = 1 is the canonical active-member predicate; a read that "+
-			"checks only is_deleted returns groups the caller has left")
+	assert.Equal(t, []string{allMember.groupNo, left, abnormal}, groupNosOf(decodeGroupList(t, w)),
+		"native group membership is independent from Project relation visibility")
 }
 
-// TestListProjectGroupsHidesAGroupThatBlacklistedMe pins the one case where this
-// endpoint's membership predicate DIVERGES from the older group surfaces, so the
-// divergence is a decision with a test behind it rather than a side effect.
-//
-// Blacklisting sets group_member.status = GroupMemberStatusBlacklist and leaves
-// is_deleted = 0 — the blacklist branch of modules/group's
-// ExistMemberActiveInternal spells that out. GET /v1/group/my filters is_deleted
-// alone, so it still shows the group; this endpoint requires status = Normal, so
-// it does not. That is deliberate: blacklisting is how a group denies access, and
-// ExistMemberActive is the hardening line in front of group and thread reads for
-// exactly this uid, so listing the group here would advertise a room the caller
-// cannot open.
-//
-// The assertion covers both halves. Asserting only the absence would let a future
-// change that ALSO broke /v1/group/my pass while destroying the property that
-// makes this divergence deliberate rather than a bug.
-func TestListProjectGroupsHidesAGroupThatBlacklistedMe(t *testing.T) {
+// TestListProjectGroupsIncludesBlacklistedNativeMember verifies that native
+// blacklist state does not alter Project relation metadata visibility.
+func TestListProjectGroupsIncludesBlacklistedNativeMember(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -177,36 +174,18 @@ func TestListProjectGroupsHidesAGroupThatBlacklistedMe(t *testing.T) {
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Empty(t, decodeGroupList(t, w),
-		"a group that blacklisted the caller must not appear in their project tree: the "+
-			"access gates already refuse them, so listing it advertises a room they cannot open")
-
-	// The other half of the divergence, asserted so it cannot drift silently.
-	mine := doJSON(t, srv, http.MethodGet, "/v1/group/my?space_id="+spaceA, ownerTok, nil)
-	require.Equal(t, http.StatusOK, mine.Code, "body: %s", mine.Body.String())
-	assert.Contains(t, mine.Body.String(), banned,
-		"GET /v1/group/my filters is_deleted alone and still shows the group - if THIS "+
-			"stops being true the divergence documented in listMyProjectGroups is gone and "+
-			"its comment is now wrong")
+	assert.Equal(t, []string{allMember.groupNo, banned}, groupNosOf(decodeGroupList(t, w)))
 }
-
-// TestListProjectGroupsPagesInCreationOrder is the pagination CORRECTNESS case, as
-// distinct from the bounds case below.
-//
-// Without it a swapped LIMIT/OFFSET pair ships green: they are adjacent ints with
-// no compiler check, and page 1 (offset 0) reads correctly either way. It is also
-// the only case that exercises the ORDER BY the module leans on for not dropping
-// or duplicating rows between pages.
 func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-paging")
 
 	// Seeded in order, so `group`.id ascends with the slice index.
-	want := make([]string, 0, 3)
+	want := []string{allMember.groupNo}
 	for i := 0; i < 3; i++ {
 		groupNo := util.GenerUUID()
 		seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
@@ -222,7 +201,7 @@ func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
 	// Page through one at a time: each page must be exactly the next element, and
 	// the union must be the whole set with nothing dropped or repeated.
 	var seen []string
-	for page := 1; page <= 3; page++ {
+	for page := 1; page <= 4; page++ {
 		w := doJSON(t, srv, http.MethodGet,
 			fmt.Sprintf("%s?page=%d&limit=1", base, page), ownerTok, nil)
 		require.Equal(t, http.StatusOK, w.Code, "page %d body: %s", page, w.Body.String())
@@ -254,7 +233,7 @@ func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
 // to object.
 func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	seedSpace(t, spaceB, 1)
 	ownerTok := seedUser(t, "owner1")
@@ -276,57 +255,48 @@ func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Empty(t, decodeGroupList(t, w),
-		"a Space-direct group, another project's group and a group carrying this project's "+
-			"id in another Space are all groups the caller is in; none belongs to THIS "+
-			"project's list, and only g.space_id = ? excludes the third")
+	assert.Equal(t, []string{allMember.groupNo}, groupNosOf(decodeGroupList(t, w)),
+		"only the initial all-member relation belongs to this project; a Space-direct group, "+
+			"another project's group and a cross-Space group carrying this project's id stay out")
 }
 
-// TestListProjectGroupsCountsActiveMembersOnly pins member_count against the same
-// predicate the list itself uses, so the number cannot disagree with the row it
-// sits on.
-func TestListProjectGroupsCountsActiveMembersOnly(t *testing.T) {
+// TestListProjectGroupsDoesNotExposeNativeMemberCounts keeps the relation DTO
+// free of chat membership metadata and proves the row remains visible.
+func TestListProjectGroupsDoesNotExposeNativeMemberCounts(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	seedUser(t, "mate")
-	seedUser(t, "quitter")
-	seedUser(t, "banned")
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-count")
 
 	groupNo := util.GenerUUID()
 	seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
 	seedGroupMemberRow(t, groupNo, "owner1")
-	seedGroupMemberRow(t, groupNo, "mate")
 	seedInactiveGroupMemberRow(t, groupNo, "quitter", 1, 1)
-	// The blacklisted row is what pins the status half of the count predicate, and
-	// PR #861's review found it missing: with only the quitter, dropping
-	// `AND status = ?` from countActiveGroupMembers still read 2 and still passed.
-	// The blacklist case elsewhere in this file cannot cover it either — there the
-	// caller is the banned one, so they get an empty list and no count is observed.
 	seedInactiveGroupMemberRow(t, groupNo, "banned", 0, int(common.GroupMemberStatusBlacklist))
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	list := decodeGroupList(t, w)
-	require.Len(t, list, 1)
-	assert.Equal(t, 2, list[0].MemberCount,
-		"neither the member who left nor the blacklisted one may be counted: a count that "+
-			"disagrees with the list it sits in makes the endpoint contradict ITSELF, which "+
-			"is worse than the accepted cross-surface difference with QueryMemberCount")
+	require.Len(t, list, 2)
+	assert.Contains(t, groupNosOf(list), allMember.groupNo)
+	var relation *GroupResp
+	for _, item := range list {
+		if item.GroupNo == groupNo {
+			relation = item
+			break
+		}
+	}
+	require.NotNil(t, relation)
+	assert.Equal(t, groupNo, relation.GroupNo)
+	assert.Equal(t, 0, relation.MemberCount,
+		"relation DTOs must not smuggle native chat member counts into the Project surface")
 }
 
-// TestListProjectGroupsGivesANonMemberAnEmptyList pins the decision NOT to add a
-// role gate.
-//
-// A Space admin can read a space_listed project's metadata without joining it. The
-// roster refuses them (who is in a project is not part of its metadata), but this
-// endpoint has nothing to withhold: it returns only groups the caller is already in.
-// Answering 403 here would make "you are not a project member" observable on a route
-// that currently discloses nothing.
-func TestListProjectGroupsGivesANonMemberAnEmptyList(t *testing.T) {
+// TestListProjectGroupsRefusesNonProjectMembers keeps the Project membership
+// boundary from widening to Space-admin read access.
+func TestListProjectGroupsRefusesNonProjectMembers(t *testing.T) {
 	srv, _ := setup(t)
 	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
@@ -336,57 +306,12 @@ func TestListProjectGroupsGivesANonMemberAnEmptyList(t *testing.T) {
 	seedSpaceMember(t, spaceA, "spaceadmin", 1, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-nonmember")
 
-	groupNo := util.GenerUUID()
-	seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
-	seedGroupMemberRow(t, groupNo, "owner1")
-
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", adminTok, nil)
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Empty(t, decodeGroupList(t, w),
-		"a Space admin who never joined has no groups here; the true answer is an empty "+
-			"list, not a refusal")
-}
-
-// TestListProjectGroupsRefusalsAreIndistinguishable inherits projectMiddleware's
-// anti-enumeration contract on the new route, and asserts the three refusals against
-// EACH OTHER rather than against a status code — comparing each to 400 would pass
-// even if the bodies differed, which is the whole thing being prevented.
-func TestListProjectGroupsRefusalsAreIndistinguishable(t *testing.T) {
-	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
-	seedSpace(t, spaceA, 1)
-	seedSpace(t, spaceB, 1)
-	ownerTok := seedUser(t, "owner1")
-	strangerTok := seedUser(t, "stranger")
-	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	seedSpaceMember(t, spaceA, "stranger", 0, 1)
-	// The foreign project lives in a Space the stranger has no seat in.
-	foreignOwnerTok := seedUser(t, "owner2")
-	seedSpaceMember(t, spaceB, "owner2", 0, 1)
-	foreign := createProjectVia(t, srv, spaceB, foreignOwnerTok, "groups-foreign")
-
-	unlistedProject := createProjectVia(t, srv, spaceA, ownerTok, "groups-unlisted")
-	upd := doJSON(t, srv, http.MethodPut, "/v1/projects/"+unlistedProject.ProjectID, ownerTok,
-		map[string]any{"discoverability": DiscoverabilityUnlisted})
-	require.Equal(t, http.StatusOK, upd.Code, "body: %s", upd.Body.String())
-
-	nonexistent := doJSON(t, srv, http.MethodGet,
-		"/v1/projects/"+util.GenerUUID()+"/groups", strangerTok, nil)
-	crossSpace := doJSON(t, srv, http.MethodGet,
-		"/v1/projects/"+foreign.ProjectID+"/groups", strangerTok, nil)
-	unlisted := doJSON(t, srv, http.MethodGet,
-		"/v1/projects/"+unlistedProject.ProjectID+"/groups", strangerTok, nil)
-
-	assertProjectErrorCode(t, nonexistent, "err.server.project.not_found")
-	for name, w := range map[string]*httptest.ResponseRecorder{
-		"cross-space": crossSpace,
-		"unlisted":    unlisted,
-	} {
-		assert.Equal(t, nonexistent.Code, w.Code, "%s: status must match nonexistent", name)
-		assert.JSONEq(t, nonexistent.Body.String(), w.Body.String(),
-			"%s must be byte-identical to a nonexistent project: telling them apart is an "+
-				"oracle for which project ids are real and which Space they live in", name)
-	}
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assertProjectErrorCode(t, w, "err.server.project.not_found")
+	env := decodeProjectEnvelope(t, w.Body.Bytes())
+	assert.Equal(t, http.StatusNotFound, env.Error.HTTPStatus,
+		"direct read refusals use D14 wire 400 with semantic 404")
 }
 
 // TestListProjectGroupsPaginationIsBounded re-applies pageParams' own regression to
@@ -476,74 +401,45 @@ func TestListProjectGroupsIncludesTheAllMemberGroup(t *testing.T) {
 	assert.Equal(t, later, list[1].GroupNo)
 }
 
-// seedProjectGroupWithAvatar seeds a project group with the avatar columns SET, so
-// the display fields can be asserted against values that are distinguishable from
-// each other and from the zero value.
-func seedProjectGroupWithAvatar(t *testing.T, groupNo, spaceID, projectID, name, avatarText string, avatarColor int) {
-	t.Helper()
-	_, err := testCtx.DB().InsertBySql(
-		"INSERT INTO `group` (group_no, name, creator, status, `version`, space_id, project_id, "+
-			"is_named, avatar_text, avatar_color, is_upload_avatar) "+
-			"VALUES (?, ?, '', 1, 1, ?, ?, 1, ?, ?, 1)",
-		groupNo, name, spaceID, projectID, avatarText, avatarColor,
-	).Exec()
-	require.NoError(t, err)
-}
-
-// TestListProjectGroupsMapsEveryDisplayField covers the six fields the handler
-// hand-maps in a struct literal, which until PR #861's review nothing asserted:
-// every case went through group_no and member_count only.
-//
-// Two failure modes it catches, both of which ship green otherwise. A copy-paste
-// slip in the literal — AvatarText: g.Name — reads plausibly and renders wrong on
-// every project card. And changing AvatarColor from *int to int would turn null,
-// which means "derive the colour from group_no", into 0, which is a real palette
-// index: every unstyled group would silently acquire the first colour. That is
-// exactly the client-side drift the field set's own comment says it exists to
-// prevent, so it is worth more than a comment.
-func TestListProjectGroupsMapsEveryDisplayField(t *testing.T) {
+// TestListProjectGroupsReturnsRelationMetadata verifies that the endpoint
+// exposes only relation fields, including the nullable actor for legacy rows.
+func TestListProjectGroupsReturnsRelationMetadata(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
+	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-fields")
+	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-relation-fields")
 
-	styled := util.GenerUUID()
-	seedProjectGroupWithAvatar(t, styled, spaceA, created.ProjectID, "关键供应商来料异常", "来料", 3)
-	seedGroupMemberRow(t, styled, "owner1")
+	legacy := util.GenerUUID()
+	current := util.GenerUUID()
+	seedProjectGroup(t, legacy, spaceA, created.ProjectID)
+	seedProjectGroup(t, current, spaceA, created.ProjectID)
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `group` SET project_linked_by = ? WHERE group_no = ?", "owner1", current,
+	).Exec()
+	require.NoError(t, err)
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	list := decodeGroupList(t, w)
-	require.Len(t, list, 1)
-	g := list[0]
-
-	assert.Equal(t, styled, g.GroupNo)
-	assert.Equal(t, "关键供应商来料异常", g.Name, "name must come from name, not from another column")
-	assert.Equal(t, 1, g.IsNamed)
-	assert.Equal(t, "来料", g.AvatarText,
-		"avatar_text must come from avatar_text: a literal that reads g.Name here renders "+
-			"plausibly and is wrong on every card")
-	require.NotNil(t, g.AvatarColor, "a set palette index must survive the mapping")
-	assert.Equal(t, 3, *g.AvatarColor)
-	assert.Equal(t, 1, g.IsUploadAvatar)
-
-	// The unset case, which is the one a type change breaks.
-	plain := util.GenerUUID()
-	seedProjectGroup(t, plain, spaceA, created.ProjectID)
-	seedGroupMemberRow(t, plain, "owner1")
-
-	w = doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	byNo := map[string]*GroupResp{}
-	for _, item := range decodeGroupList(t, w) {
+	list := decodeProjectGroupRelations(t, w)
+	require.Len(t, list, 3)
+	byNo := map[string]ProjectGroupRelation{}
+	for _, item := range list {
 		byNo[item.GroupNo] = item
 	}
-	require.Contains(t, byNo, plain)
-	assert.Nil(t, byNo[plain].AvatarColor,
-		"an unset avatar_color must stay null — it means \"derive the colour from "+
-			"group_no\", and a non-pointer field would report 0, which is a real palette index")
-	assert.Empty(t, byNo[plain].AvatarText)
-	assert.Zero(t, byNo[plain].IsUploadAvatar)
+
+	require.Contains(t, byNo, legacy)
+	assert.Equal(t, created.ProjectID, byNo[legacy].ProjectID)
+	assert.Nil(t, byNo[legacy].LinkedBy)
+	require.Contains(t, byNo, current)
+	require.Contains(t, byNo, allMember.groupNo)
+	assert.Equal(t, "owner1", derefProjectLinkedBy(byNo[current].LinkedBy))
+}
+
+func derefProjectLinkedBy(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

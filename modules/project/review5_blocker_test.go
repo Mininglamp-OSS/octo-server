@@ -153,75 +153,6 @@ func TestCreateProjectDoesNotDeadlockAgainstTheSpaceDisbandLockOrder(t *testing.
 		"with the Space disbanded first, create must refuse cleanly rather than fail on a lock: %v", got.err)
 }
 
-// ---------- N-1: the wire classification B-1 made reachable ----------
-
-// withAddSeam swaps the add seam so every target before failOn is admitted for real.
-func withAddSeamOn(t *testing.T, p *Project, failOn string, inject error, calls *int) {
-	t.Helper()
-	orig := p.addOneFn
-	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
-		*calls++
-		if uid == failOn {
-			return false, inject
-		}
-		return orig(projectID, spaceID, actorUID, uid)
-	}
-	t.Cleanup(func() { p.addOneFn = orig })
-}
-
-// TestActorLevelSpaceSeatLossStopsTheAddBatchAndIsNamedCorrectly covers the classification
-// Jerry-Xin asked to land with B-1: before it, an actor whose Space seat closed mid-batch fell
-// to the default arm, so their own expired standing was reported per uid as "store_failed"
-// while the loop kept opening one doomed transaction for every remaining target.
-func TestActorLevelSpaceSeatLossStopsTheAddBatchAndIsNamedCorrectly(t *testing.T) {
-	srv, p := setup(t)
-	ownerTok, _, created := projectWithMembers(t, srv)
-	for _, uid := range []string{"a1", "a2", "a3"} {
-		seedUser(t, uid)
-		seedSpaceMember(t, spaceA, uid, 0, 1)
-	}
-	r := mountProject(t, p)
-
-	calls := 0
-	withAddSeamOn(t, p, "a2", errActorNotSpaceMember, &calls)
-
-	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"a1", "a2", "a3"}})
-	require.Equal(t, http.StatusOK, w.Code,
-		"a1 committed, so the honest answer is a per-target report: %s", w.Body.String())
-
-	var outcomes []memberOutcome
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
-	require.Len(t, outcomes, 3, "every uid must be accounted for: %s", w.Body.String())
-	assert.True(t, outcomes[0].OK, "a1 was admitted before the actor's seat closed")
-	assert.Equal(t, reasonNotSpaceMember, outcomes[1].Reason,
-		"the actor's own missing Space seat must not be reported as store_failed")
-	assert.Equal(t, outcomeNotAttempted, outcomes[2].Reason,
-		"the tail really was never attempted")
-	assert.Equal(t, 2, calls,
-		"the batch must STOP at the actor-level failure, not open a transaction per remaining uid")
-}
-
-// TestActorLevelSpaceSeatLossWithNothingCommittedIsOneStatusCode pins the other half of the
-// contract: with nothing committed, a single status code is the honest answer — and it must
-// name the Space seat, not the project role. Sending the caller to check their project role
-// would point them at the one thing that is still intact.
-func TestActorLevelSpaceSeatLossWithNothingCommittedIsOneStatusCode(t *testing.T) {
-	srv, p := setup(t)
-	ownerTok, _, created := projectWithMembers(t, srv)
-	seedUser(t, "b1")
-	seedSpaceMember(t, spaceA, "b1", 0, 1)
-	r := mountProject(t, p)
-
-	calls := 0
-	withAddSeamOn(t, p, "b1", errActorNotSpaceMember, &calls)
-
-	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"b1"}})
-	assertProjectErrorCode(t, w, "err.server.project.actor_not_space_member")
-	assert.Equal(t, 1, calls, "the batch must not continue past an actor-level refusal")
-}
-
 // TestActorLevelSpaceSeatLossOnRemoveIsClassifiedToo covers the same classification on the
 // removal endpoint, which drives its loop in the HANDLER rather than the service — so it had
 // the defect in its own shape: the default arm both mislabelled the refusal and kept the loop
@@ -264,152 +195,27 @@ func TestActorLevelSpaceSeatLossOnRemoveReportsWhatCommitted(t *testing.T) {
 	assert.Equal(t, 2, calls, "the handler must stop rather than run e3")
 }
 
-// TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch is the switch-order guard.
-//
-// errActorNotSpaceMember WRAPS errNotSpaceMember, so a `case errors.Is(err, errNotSpaceMember)`
-// arm placed above the actor arm would swallow the actor-level refusal — and, read the other
-// way, an actor arm written too broadly would stop the batch on an ordinary rejected uid. This
-// pins the target-level direction: one uid without a Space seat is one rejected uid, and the
-// rest of the batch still runs.
-func TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch(t *testing.T) {
+// TestTargetLevelSpaceSeatLossRejectsAtomicAddBatch pins the target-level I1 refusal under the
+// current all-or-nothing members/add contract. A missing target seat rejects the transaction
+// and must not leave later targets partially admitted.
+func TestTargetLevelSpaceSeatLossRejectsAtomicAddBatch(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv)
 	for _, uid := range []string{"c1", "c2"} {
 		seedUser(t, uid)
 		seedSpaceMember(t, spaceA, uid, 0, 1)
 	}
-	// c1 has no Space seat at all — a genuine TARGET-level refusal, no seam needed.
 	seedUser(t, "c0")
 	r := mountProject(t, p)
 
 	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"c0", "c1", "c2"}})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-
-	var outcomes []memberOutcome
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
-	require.Len(t, outcomes, 3, "the batch must have continued past the rejected uid: %s", w.Body.String())
-	assert.Equal(t, reasonNotSpaceMember, outcomes[0].Reason, "c0 holds no Space seat")
-	assert.True(t, outcomes[1].OK, "c1 must still have been admitted")
-	assert.True(t, outcomes[2].OK, "c2 must still have been admitted")
-	assert.NotEqual(t, outcomeNotAttempted, outcomes[2].Reason,
-		"a target-level refusal must not label the rest of the batch not_attempted")
-}
-
-// ---------- the read-view trap ----------
-
-// TestNoWriteAuthorisingAggregateIsANonLockingRead is the PACKAGE-WIDE read-visibility guard.
-//
-// Round 2 introduced a guard for this exact cause and scoped it to createProject; round 3 then
-// found the same trap on the five paths it did not visit, with worse consequences (a project
-// left with zero owners, a bypassable member cap, a disband that skipped a member's cache).
-// The lesson is the scope, not the cause: the cause was already named correctly.
-//
-// The rule: inside a write transaction, any aggregate or seat-set read whose RESULT AUTHORISES
-// the write must be a LOCKING read. Every write transaction in this module opens with
-// lockSpaceSeatsTx, which JOINs `space`; a table outside a `FOR SHARE OF` list is
-// a consistent read, and a consistent read opens the read view. So every plain SELECT after it
-// is answered from a snapshot older than lockActiveProjectTx, and the project row lock protects
-// nothing about it.
-//
-// Enforced structurally rather than per call site: enumerate the tx-scoped reads of
-// octo_project_member and require each to carry FOR SHARE or FOR UPDATE.
-func TestNoWriteAuthorisingAggregateIsANonLockingRead(t *testing.T) {
-	// The judgement is "executed on a *dbr.Tx", not "appears in the file". A plain COUNT(*) on
-	// this table is perfectly fine on a *dbr.Session — the list endpoint's member_count column
-	// and the metrics collector both do it, neither is inside a write transaction and neither
-	// authorises anything.
-	found := 0
-	for _, f := range moduleSourceFiles(t) {
-		joined := stripComments(mustRead(t, f))
-		for _, stmt := range txSelectStatements(joined) {
-			if !strings.Contains(stmt, "octo_project_member") {
-				continue
-			}
-			found++
-			locking := strings.Contains(stmt, "FOR SHARE") || strings.Contains(stmt, "FOR UPDATE")
-			assert.True(t, locking,
-				"%s: this transaction-scoped read of octo_project_member is not a locking read.\n"+
-					"  %s\n"+
-					"Its read view opened at the transaction's FIRST statement — the JOINing seat "+
-					"check, before lockActiveProjectTx — so the project row lock protects nothing "+
-					"about it. Reproduced consequences of exactly this: a project left with ZERO "+
-					"owners (unrecoverable in P0, undetected by every reconcile scan), a bypassable "+
-					"member cap, and a disband that skipped a member's cache invalidation.",
-				f, strings.TrimSpace(stmt))
-		}
+		ownerTok, addMembersPayload("c0", "c1", "c2"))
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
+	for _, uid := range []string{"c0", "c1", "c2"} {
+		member, err := p.db.queryMember(created.ProjectID, uid)
+		require.NoError(t, err)
+		assert.Nil(t, member, "an atomic target-level refusal must admit nobody, including %s", uid)
 	}
-	assert.GreaterOrEqual(t, found, 4,
-		"expected at least the four known transaction-scoped reads of octo_project_member "+
-			"(owner count, member count, member row, disband seat list); found %d — the parser "+
-			"probably stopped matching, which would make this guard vacuous", found)
-}
-
-// txSelectStatements returns the SQL text of every SelectBySql executed on a *dbr.Tx, from the
-// joined (comment-free, concatenation-glued) source. `tx.SelectBySql(` is the only way this
-// package issues a transaction-scoped read.
-func txSelectStatements(joined string) []string {
-	const marker = "tx.SelectBySql("
-	var out []string
-	for i := 0; ; {
-		j := strings.Index(joined[i:], marker)
-		if j < 0 {
-			return out
-		}
-		from := i + j + len(marker)
-		rest := joined[from:]
-		end := len(rest)
-		for _, term := range []string{").Load", ").Exec", ").ReturnInt", ").LoadOne"} {
-			if k := strings.Index(rest, term); k >= 0 && k < end {
-				end = k
-			}
-		}
-		out = append(out, rest[:end])
-		i = from
-	}
-}
-
-// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin keeps the narrower createProject-specific
-// half: that path must not merely take a LOCKING read, it must avoid opening a read view at all
-// before the `space` lock, because its quota counts run after it.
-func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
-	fn := implBody(t, readLinesWithoutComments(t, "service.go"),
-		"func (p *Project) createProject")
-	assert.Contains(t, fn, "lockSpaceSeatRowTx",
-		"createProject must take the JOIN-free seat lock")
-	// Names the helper that EXISTS. The previous version forbade checkSpaceMembershipForWriteTx,
-	// which has since been deleted — so the assertion would have been vacuously true forever,
-	// which is the failure mode this file's own header is about. lockSpaceSeatsTx is the JOINing
-	// helper every other write path uses, and it is the one createProject must not adopt.
-	assert.NotContains(t, fn, "lockSpaceSeatsTx",
-		"createProject must NOT use the JOINing seat helper: the JOIN onto `space` is a "+
-			"consistent read, so it opens the read view before the `space` lock and every "+
-			"creation quota is then counted from a stale snapshot (six concurrent creates all "+
-			"passed MaxPerSpace=1 when this regressed)")
-
-	// ORDER, not just presence. Presence alone was satisfiable with the two locks swapped back
-	// into the B-3 order — the reproduced Error 1213 whose victim was the operator's Space
-	// disband (PR #841 round 4, P2-3). The behavioural reproducer covers it too, but it costs a
-	// live MySQL and a 700ms barrier; this costs a string comparison.
-	seat := strings.Index(fn, "lockSpaceSeatRowTx(")
-	spaceRow := strings.Index(fn, "lockSpaceRowTx(")
-	require.Positive(t, seat, "createProject must take the seat lock")
-	require.Positive(t, spaceRow, "createProject must lock the space row")
-	assert.Less(t, seat, spaceRow,
-		"createProject must take the creator's space_member SHARED lock BEFORE the exclusive "+
-			"lock on `space`. The reverse is the order modules/space records as a prior Error "+
-			"1213 incident: both disband paths lock space_member and then update space, so "+
-			"holding X(space) while waiting for S(space_member) closes the cycle — reproduced, "+
-			"with the operator's disband as InnoDB's victim.")
-
-	// The JOIN-free helper must stay JOIN-free.
-	helper := funcBody(t, readLinesWithoutComments(t, "db.go"),
-		"func (d *DB) lockSpaceSeatRowTx(")
-	assert.NotContains(t, strings.ToUpper(helper), "JOIN",
-		"lockSpaceSeatRowTx must not grow a JOIN: that is exactly what opens the read view")
-	assert.Contains(t, helper, "FOR SHARE",
-		"the seat check must still be a LOCKING read, or a concurrent Space removal can "+
-			"commit between it and the insert")
 }
 
 // mustRead reads a source file in this package.

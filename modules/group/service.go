@@ -953,10 +953,8 @@ type GroupResp struct {
 	SpaceID                  string    `json:"space_id"`                    // Space ID
 	// ProjectID 群所属项目；空串 = 直属 Space。P2 开始下发。
 	//
-	// 客户端要靠它把项目群归到项目名下展示，也要靠它知道这个群的成员是由项目
-	// 决定的（全员群还会被 D7 的四道保护挡住若干操作，客户端最好别把那些按钮
-	// 画出来）。P1 建立了这一列并让 I2 依赖它，但刻意没有下发——那是留给 P2 的
-	// 第一项透出工作。
+	// 客户端要靠它把项目群归到项目名下展示。ProjectID 只表达关系事实；
+	// 原生群成员与角色仍由群权限独立管理，Project 成员变化不会在这里自动同步。
 	//
 	// 只加字段、不改任何既有字段：老客户端读不到它，行为与今天完全一致。
 	ProjectID       string `json:"project_id"`        // 所属项目 ID（空串=直属 Space）
@@ -1094,8 +1092,7 @@ type CreateGroupServiceReq struct {
 	Members []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
 	Name    string   // 群名称（可为空，Service 会自动生成）
 	SpaceID string   // Space ID（可为空）
-	// ProjectID 群的项目归属（可为空=直属 Space）。非空时群成员受 I2 约束，
-	// 包括创建者自己——他不是该项目成员的话，建群会在准入闸门处被拒。
+	// ProjectID 群的项目归属（可为空=直属 Space）。
 	ProjectID   string // 所属项目 ID（可为空）
 	BotUID      string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
 	CategoryID  string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
@@ -1208,6 +1205,12 @@ type UpdateGroupAvatarCustomServiceReq struct {
 
 // CreateGroup 创建群（统一入口，Web 和 Bot 共用）
 func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceResp, error) {
+	if req == nil {
+		return nil, errors.New("request is required")
+	}
+	if strings.TrimSpace(req.ProjectID) != "" {
+		return s.CreateProjectGroup(req)
+	}
 	if req.Creator == "" {
 		return nil, errors.New("creator is required")
 	}
@@ -1218,12 +1221,11 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// member is the project owner. Refusing that would make "create a project"
 	// silently produce a project with no group in the most common case there is.
 	//
-	// The HTTP handler's own check is UNCHANGED (groupReq.Check still requires at
-	// least one member), so a user creating a group by hand still cannot create an
-	// empty one. What is relaxed is the SERVICE contract, for callers that are not
-	// a person filling in a form. The distinction matters: the handler rule is a
-	// product rule about a form, this one was a guard against an empty insert, and
-	// the insert below is not empty — the creator is always added.
+	// Project-backed HTTP creation also permits an empty request member list:
+	// CreateProjectGroup replaces it with the locked active Project-member snapshot.
+	// Space-direct HTTP creation still requires a form member because it has no
+	// authoritative snapshot to initialize from. The insert below remains non-empty
+	// because the creator is always admitted.
 
 	var skippedMembers []string
 	// 跨 Space 外部成员标识：key=uid, value=source_space_id（uid 的默认 Space）
@@ -1349,10 +1351,8 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
 	// group_member 的 is_external_* 标记在同一事务内一致（与 ADD / DELETE
 	// 路径对称，bot-only 外部不会 flip 群标记）。
-	// 建群时的项目归属。空串=直属 Space。handler 已校验过它属于同一个 Space
-	// 且项目处于活跃状态；「创建者本人是不是该项目成员」由下面的准入闸门在事务
-	// 内判定，那才是不会过期的判定点。
-	newGroupProjectID := req.ProjectID
+	// Project-backed creation is routed to CreateProjectGroup above, so this
+	// path always creates a Space-direct group.
 	initialAdmissions := make([]MemberAdmission, 0, len(memberUsers))
 
 	isExternalGroup := 0
@@ -1433,16 +1433,8 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	if len(realMemberUIDs) == 0 {
 		return nil, errors.New("no valid member to add")
 	}
-	// 收口到唯一准入口（A3）。newGroupProjectID 来自建群请求的 project_id：
-	// handler 已经校验过它存在、活跃、属于同一个 Space，且调用方在这个 Space 里；
-	// 「调用方是不是这个项目的成员」故意不在那里查，而是由下面这道闸门在**建群
-	// 事务内、持锁状态下**判定——放在 handler 里查是一次会过期的读。
-	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID,
-		initialAdmissions, AdmissionEntryCreateGroup); err != nil {
+	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, initialAdmissions); err != nil {
 		s.Error("insert members failed", zap.Error(err), zap.String("groupNo", groupNo))
-		if errors.Is(err, ErrAdmissionRefused) {
-			return nil, err
-		}
 		return nil, errors.New("failed to insert group member")
 	}
 
@@ -1453,16 +1445,13 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			s.Error("generate bot member version failed", zap.Error(err))
 			return nil, err
 		}
-		// 收口到唯一准入口（A4）。Bot 走的是与人相同的闸门：只有 pkg/space 白名单
-		// 里的系统 bot 才对项目成员资格豁免，普通 bot 需要显式的项目席位，否则
-		// 「邀请一个 bot」就成了往项目群里塞监听者的旁路。
-		err = s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID, []MemberAdmission{{
+		err = s.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{{
 			UID:       req.BotUID,
 			Version:   botMemberVersion,
 			Role:      MemberRoleCommon,
 			InviteUID: req.Creator,
 			Robot:     1,
-		}}, AdmissionEntryCreateGroupBot)
+		}})
 		if err != nil {
 			s.Error("insert bot member failed", zap.Error(err))
 			// Bot 加入失败不阻断建群
@@ -1728,13 +1717,10 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		}
 	}
 
-	// 收口到唯一准入口（I2 / D3）。原先是每个 uid 一次 ExistMemberDelete 会话查询
-	// 加一次 insert/recover，且单个失败时 continue；现在整批一条 upsert，失败即整批
-	// 回滚。原子失败优于部分成功：部分成功会让下面的成员添加事件通告一批人，其中
-	// 有些并没有真的写进去。
+	// The native admission primitive performs the atomic insert-or-restore;
+	// Project membership is intentionally not part of native group admission.
 	insStart := time.Now()
-	if err := s.db.admitOrRestoreMembersTx(tx, req.GroupNo, groupModel.SpaceID, groupModel.ProjectID,
-		admissions, AdmissionEntryAddMembers); err != nil {
+	if err := s.db.admitOrRestoreMembersTx(tx, req.GroupNo, admissions); err != nil {
 		s.Error("add group members failed", zap.Error(err), zap.String("groupNo", req.GroupNo))
 		return nil, err
 	}
@@ -1952,10 +1938,6 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// 真正关掉它需要让 handOverGroupCreator 也按 uid 序取那两把锁，并给
 	// (group_no, created_at) 补索引让继任者扫描不再锁全群 —— 都记在 follow-up。
 	//
-	// P1 起这个 follow-up 多了第二个调用方：handOverProjectGroupIfCreator
-	// （modules/group/project_cascade.go）形状完全一样——先锁创建者行，再锁
-	// 继任者扫描命中的行，而那次扫描同样没有服务其 ORDER BY 的索引。
-	// 后果同样有界（工单退避重试），但 follow-up 现在要覆盖两处，不是一处。
 	//
 	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
 	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。

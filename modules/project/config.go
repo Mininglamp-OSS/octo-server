@@ -61,13 +61,7 @@ const (
 	envDayBoundaryTZ                  = "OCTO_PROJECT_DAY_BOUNDARY_TZ"
 	envReconcileEvery                 = "OCTO_PROJECT_RECONCILE_INTERVAL"
 	envReconcileLimit                 = "OCTO_PROJECT_RECONCILE_LIMIT"
-	// envAllMemberGroupAdmitGrace tunes how long a freshly written project seat is
-	// exempt from I4 scan B. The brief calls the window configurable and the first
-	// implementation hard-coded it; the value that matters is deployment-shaped
-	// (how slow the admitter's IM call is under load), so it belongs in an env var
-	// beside the other reconcile knobs rather than in a constant.
-	envAllMemberGroupAdmitGrace = "OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE"
-	envMetricsEvery             = "OCTO_PROJECT_METRICS_INTERVAL"
+	envMetricsEvery                   = "OCTO_PROJECT_METRICS_INTERVAL"
 )
 
 // Defaults. The three project/member caps come from the brief; the batch cap and
@@ -101,20 +95,16 @@ const (
 	// gain (modules/space/member_removal.go:281-284 makes the same call).
 	defaultReconcileInterval = 5 * time.Minute
 	defaultReconcileLimit    = 500
-	// defaultAllMemberGroupAdmitGrace: generous against a path measured in
-	// hundreds of milliseconds, short relative to how long a real gap persists
-	// (nothing retries the admission, so a genuine failure stays until an admin
-	// re-adds the member). See (*Project).admitGrace's own comment.
-	defaultAllMemberGroupAdmitGrace = 5 * time.Minute
 	// defaultMetricsInterval is sparser still: the distribution gauges aggregate
 	// whole tables, and those aggregates get slowest exactly when the numbers
 	// matter most (after a backlog).
 	defaultMetricsInterval = 15 * time.Minute
 )
 
-// Field length caps.
+// Field length caps follow the Project contract. Name is measured in Unicode
+// code points (the HTTP layer uses utf8.RuneCountInString), not bytes.
 const (
-	maxNameChars        = 64
+	maxNameChars        = 30
 	maxDescriptionChars = 500
 	maxLogoChars        = 200
 )
@@ -137,12 +127,7 @@ type Config struct {
 	DayBoundary                    *time.Location
 	ReconcileInterval              time.Duration
 	ReconcileLimit                 int
-	// AllMemberGroupAdmitGrace exempts a project seat written within this window
-	// from I4 scan B, because the admitter runs AFTER the seat transaction commits
-	// (D12) and there is therefore a real interval in which the seat exists and
-	// the group row does not. Without it the scan reports the design.
-	AllMemberGroupAdmitGrace time.Duration
-	MetricsInterval          time.Duration
+	MetricsInterval                time.Duration
 	// Provisioning is the eager subsystem-container configuration (brief D2).
 	// Zero value = inert: no outbox row is enqueued and no worker starts, which is
 	// the default until an operator names a target. See config_provisioning.go.
@@ -179,9 +164,7 @@ func loadConfig() Config {
 		DayBoundary:                    loc,
 		ReconcileInterval:              envDuration(envReconcileEvery, defaultReconcileInterval),
 		ReconcileLimit:                 envPositiveInt(envReconcileLimit, defaultReconcileLimit),
-		AllMemberGroupAdmitGrace: envDuration(
-			envAllMemberGroupAdmitGrace, defaultAllMemberGroupAdmitGrace),
-		MetricsInterval: envDuration(envMetricsEvery, defaultMetricsInterval),
+		MetricsInterval:                envDuration(envMetricsEvery, defaultMetricsInterval),
 		// Rejected targets are dropped rather than fatal; the reasons ride along on
 		// ProvisioningConfig.Problems for New() to log. See loadProvisioningConfig.
 		Provisioning: provisioning,

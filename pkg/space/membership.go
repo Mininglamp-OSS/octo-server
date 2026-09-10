@@ -61,6 +61,30 @@ func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[str
 	return active, nil
 }
 
+// ActiveMembersTx is the transaction-scoped form of ActiveMembers. It keeps
+// the exact Space predicate while allowing a caller-owned transaction to use
+// one repeatable-read snapshot with its other authorization checks.
+func ActiveMembersTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+	active := make(map[string]bool, len(uids))
+	if tx == nil || spaceID == "" || len(uids) == 0 {
+		return active, nil
+	}
+	var found []string
+	_, err := tx.SelectBySql(
+		"SELECT sm.uid FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.space_id = ? AND sm.uid IN ? AND sm.status = 1",
+		spaceID, uids,
+	).Load(&found)
+	if err != nil {
+		return nil, err
+	}
+	for _, uid := range found {
+		active[uid] = true
+	}
+	return active, nil
+}
+
 // CheckMembershipForCleanup answers a different question from CheckMembership:
 // "does uid still hold their seat in this Space, so removal cleanup must SKIP?"
 //
