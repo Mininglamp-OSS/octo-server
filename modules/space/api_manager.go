@@ -978,11 +978,15 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 	}
 	c.Response(map[string]interface{}{
 		"invite_code": code,
-		"space_id":    spaceId,
-		"creator":     operator,
-		"max_uses":    model.MaxUses,
-		"expires_at":  expiresStr,
-		"status":      model.Status,
+		// The row's spelling, matching what was stored. Nothing writes off this echo
+		// — later invite operations key on the code — so the only cost of returning
+		// the URL parameter was a console showing a spelling the database does not
+		// hold. Truthful for free.
+		"space_id":   sp.SpaceId,
+		"creator":    operator,
+		"max_uses":   model.MaxUses,
+		"expires_at": expiresStr,
+		"status":     model.Status,
 	})
 }
 

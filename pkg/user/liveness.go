@@ -62,7 +62,7 @@ const (
 // Absent from the map means "not a live account"; the map is never nil on success.
 // Like pkg/space.ActiveMembers this takes a *dbr.Session, so it runs outside any
 // caller transaction and proves nothing about state at COMMIT time.
-func ActiveAccounts(session *dbr.Session, uids []string) (map[string]bool, error) {
+func ActiveAccounts(session dbr.SessionRunner, uids []string) (map[string]bool, error) {
 	live := make(map[string]bool, len(uids))
 	lookup := make([]string, 0, len(uids))
 	seen := make(map[string]bool, len(uids))

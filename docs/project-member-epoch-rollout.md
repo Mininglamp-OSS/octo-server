@@ -262,7 +262,7 @@ member:false（Space 合取看得见这次关闭），而 `epochs` 一直答删�
    `modules/space.CloseAllSpaceSeats`：按 Space 逐个、在事务内关席位并写清理工单，
    关席位失败会让整次删除中止，而不是留下没人能扫到的残留。
 2. 本片补上它缺的那一半 —— 那条路径写了 outbox 但**没跑事务内步骤**，所以 epoch 仍然不动。
-   现在 `closeSeatAllSpacesOne` 在同一事务里跑 `runMemberRemovalTxSteps`，与另外两条关席位
+   现在 `closeOneSeatAndEnqueueTx` 在同一事务里经 `closeSeatTx` 跑 `runSeatTransitionTxSteps`，与另外两条关席位
    路径共用同一个注册表、同一条 bump 语句。
 
 **为什么必须是同一条语句、同一个注册表**：关席位的路径有三条（单成员移除、管理端批量移除、

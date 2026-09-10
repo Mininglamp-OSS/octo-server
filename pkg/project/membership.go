@@ -23,6 +23,7 @@ package project
 import (
 	"errors"
 	"sort"
+	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/user"
@@ -605,7 +606,7 @@ func FoldedLookup(set map[string]bool, want string) (string, bool) {
 // this whole module makes everywhere else. It also removes the rollback
 // runbook's dependency on the reconcile loop still being enabled: with the loop
 // off, the endpoint refuses instead of silently handing out the collision.
-func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []string) (map[string]int64, error) {
+func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs []string) (map[string]int64, error) {
 	out := make(map[string]int64, len(projectIDs))
 	if spaceID == "" || len(projectIDs) == 0 {
 		return out, nil
@@ -723,14 +724,80 @@ func ProjectEpochsInSpace(session *dbr.Session, spaceID string, projectIDs []str
 // invalidation signal that moves when the seat closes is therefore not bounded at
 // all. Moving it at removal commit is what makes the peer contract's "epoch
 // agreement means the cache is still good" true for this path.
+// membershipTearHook runs immediately after ProjectMemberships' epoch read.
+//
+// It exists so a test can commit a Space ban at EXACTLY the point where this function
+// used to tear — between the epoch stamp and the narrowing reads — and assert the
+// answer it produces. Without it the interleaving is a race and the test would be
+// probabilistic, which on this branch has repeatedly meant "green for the wrong
+// reason".
+//
+// Unexported, so nothing outside this package can set it, and nil in every binary but
+// the one running this package's tests. The cost on the request path is one nil
+// comparison.
+var membershipTearHook func()
+
+// SetMembershipTearHookForTest installs the hook above and returns a function that
+// removes it.
+//
+// Exported because the engine harness for this package's statements lives in
+// modules/project — pkg/project is a predicate package with no database of its own,
+// which is why its statements had no engine lane until that file was written. Refuses
+// outside a test binary for the same reason modules/space's removal seams do: "nothing
+// calls it" is a property of the current tree, not a boundary.
+func SetMembershipTearHookForTest(fn func()) (restore func(), err error) {
+	if !testing.Testing() {
+		return nil, errors.New("project: the membership tear hook is test-only")
+	}
+	membershipTearHook = fn
+	return func() { membershipTearHook = nil }, nil
+}
+
 func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	roles := make(map[string]int, len(uids))
 	if spaceID == "" || projectID == "" {
 		return 0, roles, nil
 	}
 
+	// ONE SNAPSHOT for every step below, and it is a correctness requirement rather
+	// than a tidiness one.
+	//
+	// These steps used to run on the plain session, so each read saw its own instant.
+	// A Space ban committing between step 1 and step 3 produced an answer that was
+	// internally inconsistent in the one direction that has no bound: step 1 stamped
+	// the live epoch E, step 3's `INNER JOIN space ... AND s.status = 1` observed the
+	// ban and emptied the answer, and the response went out as member:false beside E.
+	// The peer keys its cached DECISION on (uid, project, member_epoch); unbanning
+	// writes only the `space` row — no seat, no bump — so the epoch channel answers E
+	// again, agreement holds, and the denial never expires.
+	//
+	// Round 5's read-time fold closes the STEADY-state directions (banned folds to the
+	// absent sentinel, so 0 != E; unbanned gives E != 0). It cannot close an answer
+	// torn ACROSS the ban commit, because that answer carries both halves.
+	//
+	// Read-only, no locks, four point reads. MySQL 8's default REPEATABLE READ
+	// establishes the view at the first read in the transaction and holds it for the
+	// rest — measured on 8.0.33 rather than assumed: with a ban committed by another
+	// connection between two reads, the in-transaction reader still sees status = 1
+	// while a plain-session reader sees 0.
+	//
+	// The answer this produces is a point-in-time one: a ban that commits after the
+	// first read belongs to the NEXT answer. The peer learns about it from the epoch
+	// channel, whose IsActiveSpace fold turns the project absent and breaks agreement
+	// — which is a bound, and the torn denial had none.
+	tx, err := session.Begin()
+	if err != nil {
+		return 0, nil, err
+	}
+	// Rollback rather than commit: nothing here writes, and rolling back releases the
+	// read view just as commit would.
+	defer tx.RollbackUnlessCommitted()
+
 	// Step 1 — epoch + existence, in that order. See the doc comment.
-	epochs, err := ProjectEpochsInSpace(session, spaceID, []string{projectID})
+	epochs, err := ProjectEpochsInSpace(tx, spaceID, []string{projectID})
+	if membershipTearHook != nil {
+		membershipTearHook()
+	}
 	if err != nil {
 		return 0, nil, err
 	}
@@ -758,7 +825,7 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 		UID  string `db:"uid"`
 		Role int    `db:"role"`
 	}
-	_, err = session.SelectBySql(
+	_, err = tx.SelectBySql(
 		"SELECT uid, role FROM `octo_project_member` "+
 			"WHERE project_id = ? AND space_id = ? AND uid IN ? "+
 			"  AND status = 1 AND removing = 0",
@@ -784,7 +851,7 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	for _, r := range rows {
 		seated = append(seated, r.UID)
 	}
-	inSpace, err := space.ActiveMembers(session, spaceID, seated)
+	inSpace, err := space.ActiveMembers(tx, spaceID, seated)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -831,7 +898,7 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 			stillSeated = append(stillSeated, r.UID)
 		}
 	}
-	liveAccounts, err := user.ActiveAccounts(session, stillSeated)
+	liveAccounts, err := user.ActiveAccounts(tx, stillSeated)
 	if err != nil {
 		return 0, nil, err
 	}

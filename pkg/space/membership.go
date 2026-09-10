@@ -40,7 +40,7 @@ func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, er
 // long-standing shape of the Space half of every group admission check, and
 // changing it is a behaviour change on every group join in the product — see
 // modules/group/admission.go for why the project half does NOT copy it.
-func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[string]bool, error) {
+func ActiveMembers(session dbr.SessionRunner, spaceID string, uids []string) (map[string]bool, error) {
 	active := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {
 		return active, nil
@@ -75,7 +75,7 @@ func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[str
 // It exists for callers that hold no uid: a peer-facing predicate answering
 // about a project or a container, where the parent Space's state is part of the
 // answer but there is nobody whose membership to check.
-func IsActiveSpace(session *dbr.Session, spaceID string) (bool, error) {
+func IsActiveSpace(session dbr.SessionRunner, spaceID string) (bool, error) {
 	if spaceID == "" {
 		return false, nil
 	}

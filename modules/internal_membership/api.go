@@ -476,8 +476,11 @@ func (m *Module) logLookupFailure(op string, err error, spaceID string, count in
 		// the reconcile scan is the only recovery. Kept as a distinct branch rather
 		// than folded into the generic one, because the operator action differs.
 		m.Error(op+": refused — an ACTIVE project holds the contract's absent-epoch sentinel, "+
-			"but the refusal did not name it, so it cannot be repaired here. This clears itself "+
-			"once the project reconcile scan repairs the row; if that loop is disabled, enable it.",
+			"but the refusal did not name it, so it cannot be repaired here. The project's "+
+			"epoch-sanity scan repairs the row and runs UNGATED (modules/project/reconcile.go "+
+			"schedules it outside the OCTO_PROJECT_RECONCILE_ENABLED branch, which covers only "+
+			"the three legacy-JOIN scans), so there is no switch to turn on: watch the "+
+			"member_epoch anomaly gauge and check the reconcile worker is alive.",
 			fields...)
 		return
 	}
