@@ -1310,9 +1310,13 @@ func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
 	// 一条已耗尽、租约过期 → 扫描应把它推成 abandoned；另一条保持 pending。
 	seedExhaustedJob(t, deadSpace, removalCleanupMaxAttempts, time.Now().UTC().Add(-time.Hour))
 	// 把 pending 那条的 created_at 往前挪，好让「最老待处理年龄」有个可断言的下界。
+	//
+	// 11 分钟而不是 10：下面断言的下界是 600 秒，而年龄是按整秒算的。夹具正好写 600 秒
+	// 时，写入落在秒边界后半程就会读回 599，测试随机变红（实测 3 次里红 1 次）。
+	// 放宽断言会削弱它——它要证明的是「年龄反映真实积压」——所以留余量的是夹具。
 	_, err = testCtx.DB().Exec(
 		"UPDATE space_member_removal_cleanup SET created_at=? WHERE space_id=?",
-		time.Now().UTC().Add(-10*time.Minute), pendingSpace)
+		time.Now().UTC().Add(-11*time.Minute), pendingSpace)
 	require.NoError(t, err)
 
 	f.sweepExhaustedMemberRemovalCleanups()

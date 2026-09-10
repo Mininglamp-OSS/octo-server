@@ -71,23 +71,35 @@ type welcomeConfigResp struct {
 // response and report "handled" on failure). A request can only ever affect the
 // path :space_id, so space isolation is enforced by construction. Returns the
 // caller uid and ok=false when a response was already written.
-func (s *Space) authorizeSpaceAdmin(c *wkhttp.Context, spaceId string) (loginUID string, ok bool) {
+// It RETURNS the canonical space_id, because rebinding its own parameter would be a
+// value copy the callers never see.
+//
+// That is not hypothetical: the first version of this rebinding did exactly that, and
+// TestEverySpaceActiveCheckRebindsTheSpaceID passed — the call site was syntactically
+// `spaceId, refused := ...`, which is what that guard checks, while putWelcome and
+// deleteWelcome went on writing octo_space_welcome_config keyed by the caller's
+// spelling. A guard that checks the shape of a statement cannot see where the value
+// goes; returning it is what makes the callers' compiler check it for us.
+func (s *Space) authorizeSpaceAdmin(
+	c *wkhttp.Context, spaceId string,
+) (loginUID, canonicalSpaceID string, ok bool) {
 	loginUID = c.GetLoginUID()
 	spaceId, refused := s.checkSpaceActive(c, spaceId)
 	if refused {
-		return "", false
+		return "", "", false
 	}
 	if s.requireSpaceAdmin(c, spaceId, loginUID) {
-		return "", false
+		return "", "", false
 	}
-	return loginUID, true
+	return loginUID, spaceId, true
 }
 
 // getWelcome returns the per-Space config (if any) plus the effective config so
 // the admin UI can show whether a global fallback is in play.
 func (s *Space) getWelcome(c *wkhttp.Context) {
 	spaceId := c.Param("space_id")
-	if _, ok := s.authorizeSpaceAdmin(c, spaceId); !ok {
+	_, spaceId, ok := s.authorizeSpaceAdmin(c, spaceId)
+	if !ok {
 		return
 	}
 
@@ -108,7 +120,7 @@ func (s *Space) getWelcome(c *wkhttp.Context) {
 // combination is valid. The target Space is the path Space (already active).
 func (s *Space) putWelcome(c *wkhttp.Context) {
 	spaceId := c.Param("space_id")
-	loginUID, ok := s.authorizeSpaceAdmin(c, spaceId)
+	loginUID, spaceId, ok := s.authorizeSpaceAdmin(c, spaceId)
 	if !ok {
 		return
 	}
@@ -201,7 +213,7 @@ func (s *Space) putWelcome(c *wkhttp.Context) {
 // an absent config returns deleted=false with 200.
 func (s *Space) deleteWelcome(c *wkhttp.Context) {
 	spaceId := c.Param("space_id")
-	loginUID, ok := s.authorizeSpaceAdmin(c, spaceId)
+	loginUID, spaceId, ok := s.authorizeSpaceAdmin(c, spaceId)
 	if !ok {
 		return
 	}

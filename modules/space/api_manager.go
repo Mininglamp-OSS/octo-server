@@ -927,7 +927,13 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 
 	operator := c.GetLoginUID()
 	model := &InvitationModel{
-		SpaceId: spaceId,
+		// sp.SpaceId, not the URL parameter. Every seat created by redeeming this
+		// invitation inherits this column (executeJoinSpace -> atomicAddMemberIfNotFull,
+		// and approveJoinApplyAtomicOnce through space_join_apply), so a drifted value
+		// here poisons the seat rather than just the invitation — and a poisoned seat
+		// makes the removal funnel hand its tx step drifted bytes, freezing member_epoch
+		// while membership changes. The row is already loaded above.
+		SpaceId: sp.SpaceId,
 		Creator: operator,
 		Status:  1,
 	}
