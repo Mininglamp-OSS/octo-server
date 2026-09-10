@@ -32,6 +32,13 @@ var (
 	testDB  *DB
 )
 
+func projectTestMySQLAddr() string {
+	if addr := os.Getenv("OCTO_TEST_MYSQL_ADDR"); addr != "" {
+		return addr
+	}
+	return "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+}
+
 // TestMain builds the shared test server for this package.
 //
 // No fixture DDLs. The external test package in this directory
@@ -458,7 +465,7 @@ func TestIsOfficialStaysZeroThroughCRUD(t *testing.T) {
 // are the parts that would survive a partial drop and then collide on re-create.
 func TestMigrationUpDownUpLeavesNoResidue(t *testing.T) {
 	setup(t)
-	db, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true")
+	db, err := sql.Open("mysql", projectTestMySQLAddr())
 	require.NoError(t, err)
 	defer db.Close()
 

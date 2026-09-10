@@ -86,6 +86,20 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 			respondStoreFailed(c)
 			return
 		}
+		if *req.Pinned {
+			// applyPin commits before this best-effort hook runs. A pin is an
+			// explicit request to surface the Project in the caller's personal
+			// Follow sidebar, including for a Space-listed Project the caller can
+			// see without holding a Project seat. The list path repairs a transient
+			// failure, so a sidebar write must not turn a committed pin into a 5xx.
+			p.provisionSidebarSection(row.ProjectID, row.SpaceID, uid)
+		} else {
+			// An explicit unpin is also an explicit removal from Follow. The
+			// pinned=0 setting prevents the membership repair path from bringing it
+			// back; this hook hides the retained ordering row without coupling this
+			// module to category's table.
+			p.removeSidebarSection(row.ProjectID, row.SpaceID, uid)
+		}
 	}
 
 	// Respond with the project as the caller now sees it, so the client can render
@@ -132,18 +146,21 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 // operation that changes nothing — the shape of bug where turning a toggle on
 // twice fails the second time.
 func (p *Project) applyPin(row *Model, uid string, pinned bool) error {
-	// One read serves both directions, and it is what keeps either direction from
-	// writing a row that changes nothing: unpinning something never pinned used to
-	// INSERT a pinned = 0 tombstone, and nothing anywhere deletes those.
+	// An explicit false is not equivalent to the absence of a setting row. Active
+	// Project members are followed by default, so the sidebar repair path needs a
+	// pinned=0 tombstone to distinguish an opt-out from "never chose". Always
+	// upserting here also makes the first unpin durable for auto-provisioned members.
+	if !pinned {
+		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
+	}
+
+	// A repeated pin is a true no-op and must not consume quota again.
 	already, err := p.db.queryProjectPinned(row.ProjectID, uid)
 	if err != nil {
 		return err
 	}
-	if already == pinned {
+	if already {
 		return nil
-	}
-	if !pinned {
-		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
 	}
 
 	tx, err := p.db.session.Begin()

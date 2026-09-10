@@ -125,7 +125,8 @@ type SidebarItem struct {
 	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
 	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
 	MySourceSpaceID string `json:"my_source_space_id,omitempty"`
-	// ProjectID 是该条目所属项目的 ID，口径与上面的 SpaceID 逐档对齐：
+	// ProjectID / ProjectName 是该条目所属项目的标识和名称，口径与上面的
+	// SpaceID 逐档对齐：
 	//   - GROUP: group 表的 project_id；
 	//   - COMMUNITY_TOPIC: 父群的 project_id（与 SpaceID 同一把 key 取，
 	//     两者不可能对不上）；
@@ -142,14 +143,15 @@ type SidebarItem struct {
 	// 客户端靠它在消息列表里按项目分组。P1 建立了这一列，#855 把它下发到
 	// GroupResp 和群详情，这里是同一次透出剩下的一跳。
 	//
-	// 取值不额外发查询：CollectGroupSpaceAndProjectMaps 与 SpaceID 共用同一次
-	// GetGroups，见那个函数的注释。
-	ProjectID  string  `json:"project_id,omitempty"`
-	Timestamp  int64   `json:"timestamp"`
-	Unread     int     `json:"unread"`
-	IsPinned   bool    `json:"is_pinned"`
-	IsFollowed bool    `json:"is_followed"`
-	CategoryID *string `json:"category_id,omitempty"`
+	// ProjectID 与 SpaceID 共用同一次 GetGroups；ProjectName 在项目 ID 去重后
+	// 以一条受当前 Space 约束的批量查询补齐，绝不按 sidebar 条目逐条查询。
+	ProjectID   string  `json:"project_id,omitempty"`
+	ProjectName string  `json:"project_name,omitempty"`
+	Timestamp   int64   `json:"timestamp"`
+	Unread      int     `json:"unread"`
+	IsPinned    bool    `json:"is_pinned"`
+	IsFollowed  bool    `json:"is_followed"`
+	CategoryID  *string `json:"category_id,omitempty"`
 	// CategorySort 暴露给客户端的"类别之间排序权重"，来源是 group_category.sort
 	// （PR #21 review by lml2468 blocker #3）。改类别顺序会 bump follow_version
 	// 并改变这里返回的值，与 /category/sort 接口及 swagger 一致。
@@ -680,6 +682,11 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
+	if projectNames, nameErr := sb.loadSidebarProjectNames(spaceID, items); nameErr != nil {
+		sb.Warn("sidebar sync: project name query failed (non-fatal, project_name omitted)", zap.Error(nameErr))
+	} else {
+		applySidebarProjectNames(items, projectNames)
+	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
 	for _, item := range items {
@@ -736,6 +743,54 @@ func filterAITeamSidebarItems(items []*SidebarItem, protected map[string]struct{
 		}
 	}
 	return out
+}
+
+// loadSidebarProjectNames resolves only Project IDs that are already present in
+// this response after the Space-scoped project-id gate and AI-container filter.
+// It therefore cannot add a new Project association or widen the no-Space-ID
+// path; a database failure merely omits the additive display name.
+func (sb *Sidebar) loadSidebarProjectNames(spaceID string, items []*SidebarItem) (map[string]string, error) {
+	if spaceID == "" {
+		return map[string]string{}, nil
+	}
+	ids := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, item := range items {
+		if item.ProjectID == "" {
+			continue
+		}
+		if _, ok := seen[item.ProjectID]; ok {
+			continue
+		}
+		seen[item.ProjectID] = struct{}{}
+		ids = append(ids, item.ProjectID)
+	}
+	if len(ids) == 0 {
+		return map[string]string{}, nil
+	}
+	var rows []*struct {
+		ProjectID string `db:"project_id"`
+		Name      string `db:"name"`
+	}
+	_, err := sb.ctx.DB().Select("project_id", "name").From("octo_project").
+		Where("space_id=? AND status=1 AND project_id IN ?", spaceID, ids).
+		Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("load sidebar project names: %w", err)
+	}
+	names := make(map[string]string, len(rows))
+	for _, row := range rows {
+		names[row.ProjectID] = row.Name
+	}
+	return names, nil
+}
+
+func applySidebarProjectNames(items []*SidebarItem, names map[string]string) {
+	for _, item := range items {
+		if item.ProjectID != "" {
+			item.ProjectName = names[item.ProjectID]
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -57,6 +57,22 @@ func TestTheProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
 			"would silently lose this index; that is what this assertion exists to catch")
 }
 
+func TestTheBatchProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
+	setup(t)
+	p := New(testCtx)
+	rows := explainRows(t, p.db.session, sqlListMyProjectGroupsByProjectIDs,
+		"plan_probe_space", []string{"plan_probe_project_a", "plan_probe_project_b"},
+		groupStatusDisband, "plan_probe_uid", 1)
+
+	require.NotEmpty(t, rows)
+	for _, row := range rows {
+		assert.NotEqual(t, "ALL", derefOr(row.Type, ""),
+			"the batched sidebar Project-group list must not scan table %q", derefOr(row.Table, ""))
+		assert.NotEmpty(t, derefOr(row.Key, ""),
+			"the batched sidebar Project-group list must use an index for table %q", derefOr(row.Table, ""))
+	}
+}
+
 // TestThePinQuotaCountReachesItsRowsByAnIndex covers the other statement this PR
 // added on a write path.
 //
@@ -111,6 +127,7 @@ func TestTheProjectStatementsAreWhatProductionRuns(t *testing.T) {
 		constant  string
 	}{
 		{"db_group.go", "func (d *DB) listMyProjectGroups(", "sqlListMyProjectGroups"},
+		{"db_group.go", "func (d *DB) listMyProjectGroupResponsesByProjectIDs(", "sqlListMyProjectGroupsByProjectIDs"},
 		{"db_user_setting.go", "func (d *DB) countPinnedInSpaceTx(", "sqlCountPinnedInSpace"},
 		{"db.go", "func (d *DB) listVisibleInSpace(", "sqlListVisibleInSpace"},
 	} {

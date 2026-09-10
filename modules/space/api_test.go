@@ -32,6 +32,13 @@ var (
 	testSpaceDB *DB
 )
 
+func spaceTestMySQLAddr() string {
+	if addr := os.Getenv("OCTO_TEST_MYSQL_ADDR"); addr != "" {
+		return addr
+	}
+	return "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+}
+
 // TestMain 确保 space 迁移所依赖的外部表存在，并创建共享测试服务器。
 //
 // OCTO_MASTER_KEY 必须在 NewTestServer 之前设置：space 包通过
@@ -44,7 +51,7 @@ func TestMain(m *testing.M) {
 		_ = os.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	}
 
-	db, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true")
+	db, err := sql.Open("mysql", spaceTestMySQLAddr())
 	if err != nil {
 		panic("连接测试数据库失败: " + err.Error())
 	}

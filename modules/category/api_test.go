@@ -31,15 +31,19 @@ import (
 // resetSpaceInviteRateLimit.
 func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 	t.Helper()
-	rdsClient := redis.NewClient(&redis.Options{
-		Addr:     ctx.GetConfig().DB.RedisAddr,
-		Password: ctx.GetConfig().DB.RedisPass,
-	})
-	defer rdsClient.Close()
-	keys, err := rdsClient.Keys("ratelimit:uid:*").Result()
-	if err == nil && len(keys) > 0 {
-		_ = rdsClient.Del(keys...).Err()
+	clear := func() error {
+		rdsClient := redis.NewClient(&redis.Options{
+			Addr:     ctx.GetConfig().DB.RedisAddr,
+			Password: ctx.GetConfig().DB.RedisPass,
+		})
+		defer rdsClient.Close()
+		return rdsClient.Del("ratelimit:uid:" + testutil.UID).Err()
 	}
+	require.NoError(t, clear())
+	// A rate-limit test deliberately drains the shared process-wide bucket.
+	// Clear it on exit as well, so -shuffle cannot make the next test observe
+	// that test's exhausted state.
+	t.Cleanup(func() { require.NoError(t, clear()) })
 }
 
 // ---------- helpers ----------

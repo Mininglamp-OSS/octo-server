@@ -4978,6 +4978,9 @@ func (g groupReq) Check() error {
 	if len(g.Members) <= 0 {
 		return errors.New("群成员不能为空！")
 	}
+	if g.ProjectID != "" && g.CategoryID != "" {
+		return errors.New("project groups cannot be assigned to categories")
+	}
 	return nil
 }
 

@@ -25,17 +25,53 @@ func EnsureDefaultCategory(ctx *config.Context, uid, spaceID string) error {
 		return err
 	}
 	if existing != nil {
-		return nil
+		return db.ensureSidebarSection(uid, spaceID, sidebarSectionTypeCategory, existing.CategoryID, existing.Sort)
 	}
 	maxSort, err := db.maxSortByUIDAndSpaceID(uid, spaceID)
 	if err != nil {
 		return err
 	}
-	return db.insertDefaultCategory(&CategoryModel{
+	category := &CategoryModel{
 		CategoryID: util.GenerUUID(),
 		SpaceID:    spaceID,
 		UID:        uid,
 		Name:       defaultCategoryNamePlaceholder,
 		Sort:       maxSort + 1,
-	})
+	}
+	if err := db.insertDefaultCategory(category); err != nil {
+		return err
+	}
+	// INSERT IGNORE may have lost a race. Re-read so the section points at the
+	// winning default category rather than an unpersisted UUID from this call.
+	actual, err := db.queryDefaultCategory(uid, spaceID)
+	if err != nil || actual == nil {
+		return err
+	}
+	return db.ensureSidebarSection(uid, spaceID, sidebarSectionTypeCategory, actual.CategoryID, actual.Sort)
+}
+
+// EnsureProjectSidebarSection is the best-effort hook registered into
+// modules/project. It only creates a personal ordering entry; the sidebar read
+// predicate remains the authority for visibility (an active Project seat, or a
+// pinned Space-listed Project).
+func EnsureProjectSidebarSection(ctx *config.Context, uid, spaceID, projectID string) error {
+	if ctx == nil || uid == "" || spaceID == "" || projectID == "" {
+		return nil
+	}
+	db := newCategoryDB(ctx)
+	nextSort, err := db.maxSidebarSectionSort(uid, spaceID)
+	if err != nil {
+		return err
+	}
+	return db.ensureSidebarSection(uid, spaceID, sidebarSectionTypeProject, projectID, nextSort+1)
+}
+
+// HideProjectSidebarSection records an explicit unpin without deleting the
+// ordering row. Re-pinning can therefore restore the Project at its previous
+// position, while status=2 keeps it out of the shared section order.
+func HideProjectSidebarSection(ctx *config.Context, uid, spaceID, projectID string) error {
+	if ctx == nil || uid == "" || spaceID == "" || projectID == "" {
+		return nil
+	}
+	return newCategoryDB(ctx).hideSidebarSection(uid, spaceID, sidebarSectionTypeProject, projectID)
 }

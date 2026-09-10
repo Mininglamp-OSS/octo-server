@@ -831,21 +831,22 @@ func (p *Project) pinnedOrFalse(projectID, uid string) bool {
 //
 // Clamping rather than rejecting: a page far past the end is not an error, it is an empty
 // page, and that is what every other list endpoint here returns.
+const (
+	projectDefaultPageLimit = 50
+	projectMaxPageLimit     = 200
+	// projectMaxPage * projectMaxPageLimit stays far inside int64 and inside any plausible table size.
+	projectMaxPage = 100000
+)
+
 func pageParams(c *wkhttp.Context) (int, int) {
-	const (
-		defaultLimit = 50
-		maxLimit     = 200
-		// maxPage * maxLimit stays far inside int64 and inside any plausible table size.
-		maxPage = 100000
-	)
-	limit := defaultLimit
+	limit := projectDefaultPageLimit
 	if v := strings.TrimSpace(c.Query("limit")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}
-	if limit > maxLimit {
-		limit = maxLimit
+	if limit > projectMaxPageLimit {
+		limit = projectMaxPageLimit
 	}
 	page := 1
 	if v := strings.TrimSpace(c.Query("page")); v != "" {
@@ -853,8 +854,8 @@ func pageParams(c *wkhttp.Context) (int, int) {
 			page = n
 		}
 	}
-	if page > maxPage {
-		page = maxPage
+	if page > projectMaxPage {
+		page = projectMaxPage
 	}
 	return (page - 1) * limit, limit
 }

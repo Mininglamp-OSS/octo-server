@@ -680,6 +680,9 @@ other = "该群组不属于任何空间。"
 ["err.server.category.space_mismatch"]
 other = "群组和分类不在同一空间。"
 
+["err.server.category.project_group_cannot_categorize"]
+other = "项目群组不能加入手动分类。"
+
 ["err.server.category.space_member_required"]
 other = "你不是该空间成员。"
 

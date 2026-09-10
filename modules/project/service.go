@@ -379,6 +379,14 @@ func (p *Project) createProject(in createInput) (*Model, error) {
 		return model, err
 	}
 
+	// The project and all initial seats are committed by createProjectOnce before
+	// this best-effort hook runs. A failure is repaired by category's list-path
+	// backstop and must never roll the new project back.
+	p.provisionSidebarSection(model.ProjectID, model.SpaceID, model.Creator)
+	for _, uid := range withoutUID(sanitizeUIDs(in.AgentUIDs), model.Creator) {
+		p.provisionSidebarSection(model.ProjectID, model.SpaceID, uid)
+	}
+
 	// Provision the all-member group AFTER the transaction commits, and after the
 	// retry loop rather than inside it: a lock-conflict retry re-runs
 	// createProjectOnce, and a provisioner call inside the closure would run once
@@ -1458,6 +1466,11 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	}
 	if changed {
 		p.invalidateProjectMemberCache(projectID, uid)
+		// This runs only after the member transaction commits. The reverse-
+		// registered category hook opens its own transaction, so calling it before
+		// commit would both lengthen the project lock and create an entry for a
+		// member write that may still roll back.
+		p.provisionSidebarSection(projectID, spaceID, uid)
 	}
 	return changed, nil
 }
