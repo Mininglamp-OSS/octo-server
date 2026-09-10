@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -85,5 +86,21 @@ func respondGroupProjectError(c *wkhttp.Context, err error) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 	default:
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+	}
+}
+
+// mapCreateProjectGroupError translates only the expected Project admission
+// sentinels. CreateProjectGroup also returns ordinary DB/IM failures; those
+// must stay on groupCreate's internal store_failed path rather than falling
+// through respondGroupProjectError's generic query_failed mapping.
+func mapCreateProjectGroupError(err error) (error, bool) {
+	switch {
+	case errors.Is(err, projectmod.ErrGroupProjectInvalid),
+		errors.Is(err, projectmod.ErrGroupProjectNotFound),
+		errors.Is(err, projectmod.ErrGroupProjectForbidden),
+		errors.Is(err, projectmod.ErrGroupProjectSpaceConflict):
+		return mapProjectAccessError(err), true
+	default:
+		return nil, false
 	}
 }

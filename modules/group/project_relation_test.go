@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
@@ -202,4 +203,106 @@ func TestProjectRelationRejectsDisabledActorAcrossBoundAndNativePaths(t *testing
 	_, err = g.unbindGroupProject(actorUID, groupNo)
 	require.ErrorIs(t, err, errProjectRelationForbidden,
 		"a disabled actor cannot unbind a native relation")
+}
+
+func TestProjectMemberWithoutNativeManagerCannotBindOrUnbind(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	g := New(ctx)
+
+	spaceID := "space-relation-manager-" + util.GenerUUID()[:8]
+	projectID := "project-relation-manager-" + util.GenerUUID()[:8]
+	actorUID := "relation-project-member-" + util.GenerUUID()[:8]
+	ownerUID := "relation-native-owner-" + util.GenerUUID()[:8]
+	bindGroupNo := "group-relation-bind-" + util.GenerUUID()[:8]
+	unbindGroupNo := "group-relation-unbind-" + util.GenerUUID()[:8]
+
+	seedSpaceSeat(t, ctx, spaceID, actorUID)
+	seedProject(t, ctx, projectID, spaceID)
+	seedProjectMember(t, ctx, projectID, spaceID, actorUID, 0)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, status, is_destroy, robot) VALUES (?, ?, 1, 0, 0)",
+		actorUID, "Project member without native manager",
+	).Exec()
+	require.NoError(t, err)
+
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: bindGroupNo, Name: "Unbound relation", Creator: ownerUID,
+		Status: GroupStatusNormal, Version: 1, SpaceID: spaceID,
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: bindGroupNo, UID: ownerUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: bindGroupNo, UID: actorUID, Role: MemberRoleCommon,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+
+	beforeBindMembers := relationMemberSnapshot(t, ctx, bindGroupNo)
+	_, err = g.bindGroupProject(actorUID, bindGroupNo, projectID)
+	require.ErrorIs(t, err, errProjectRelationForbidden)
+	assert.Equal(t, beforeBindMembers, relationMemberSnapshot(t, ctx, bindGroupNo),
+		"failed bind must not change native group membership")
+	assertGroupProjectRelationRow(t, ctx, bindGroupNo, "", "")
+
+	linkedBy := ownerUID
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: unbindGroupNo, Name: "Bound relation", Creator: ownerUID,
+		Status: GroupStatusNormal, Version: 1, SpaceID: spaceID,
+		ProjectID: projectID, ProjectLinkedBy: &linkedBy,
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: unbindGroupNo, UID: ownerUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: unbindGroupNo, UID: actorUID, Role: MemberRoleCommon,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+
+	beforeUnbindMembers := relationMemberSnapshot(t, ctx, unbindGroupNo)
+	_, err = g.unbindGroupProject(actorUID, unbindGroupNo)
+	require.ErrorIs(t, err, errProjectRelationForbidden)
+	assert.Equal(t, beforeUnbindMembers, relationMemberSnapshot(t, ctx, unbindGroupNo),
+		"failed unbind must not change native group membership")
+	assertGroupProjectRelationRow(t, ctx, unbindGroupNo, projectID, linkedBy)
+}
+
+type relationMemberSnapshotRow struct {
+	UID       string `db:"uid"`
+	Role      int    `db:"role"`
+	Status    int    `db:"status"`
+	IsDeleted int    `db:"is_deleted"`
+}
+
+func relationMemberSnapshot(t *testing.T, ctx *config.Context, groupNo string) []relationMemberSnapshotRow {
+	t.Helper()
+	var rows []relationMemberSnapshotRow
+	_, err := ctx.DB().SelectBySql(
+		"SELECT uid, role, status, is_deleted FROM group_member WHERE group_no=? ORDER BY uid",
+		groupNo,
+	).Load(&rows)
+	require.NoError(t, err)
+	return rows
+}
+
+func assertGroupProjectRelationRow(t *testing.T, ctx *config.Context, groupNo, wantProjectID, wantLinkedBy string) {
+	t.Helper()
+	var row struct {
+		ProjectID  string  `db:"project_id"`
+		ProjectUID *string `db:"project_linked_by"`
+	}
+	err := ctx.DB().SelectBySql(
+		"SELECT project_id, project_linked_by FROM `group` WHERE group_no=?",
+		groupNo,
+	).LoadOne(&row)
+	require.NoError(t, err)
+	assert.Equal(t, wantProjectID, row.ProjectID)
+	if wantLinkedBy == "" {
+		assert.True(t, row.ProjectUID == nil || *row.ProjectUID == "")
+		return
+	}
+	require.NotNil(t, row.ProjectUID)
+	assert.Equal(t, wantLinkedBy, *row.ProjectUID)
 }

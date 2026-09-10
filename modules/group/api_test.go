@@ -141,6 +141,7 @@ func TestGroupCreate(t *testing.T) {
 func TestGroupCreate_WithCategoryID(t *testing.T) {
 	s, ctx := newTestServer(t)
 	f := New(ctx)
+	resetGroupUIDRateLimit(t, ctx)
 
 	ensureGroupCategorySchema(t, ctx)
 
@@ -209,8 +210,8 @@ func TestGroupCreate_WithCategoryID(t *testing.T) {
 }
 
 func TestGroupCreate_WithCategoryID_NoSpaceID(t *testing.T) {
-	s, _ := newTestServer(t)
-
+	s, ctx := newTestServer(t)
+	resetGroupUIDRateLimit(t, ctx)
 	// 传 category_id 但不传 space_id → 应报错
 	w := httptest.NewRecorder()
 	req, err := http.NewRequest("POST", "/v1/group/create", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
@@ -226,6 +227,7 @@ func TestGroupCreate_WithCategoryID_NoSpaceID(t *testing.T) {
 
 func TestGroupCreate_WithCategoryID_NotFound(t *testing.T) {
 	s, ctx := newTestServer(t)
+	resetGroupUIDRateLimit(t, ctx)
 	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-cat-notfound"
@@ -255,6 +257,7 @@ func TestGroupCreate_WithCategoryID_NotFound(t *testing.T) {
 
 func TestGroupCreate_WithCategoryID_NotOwned(t *testing.T) {
 	s, ctx := newTestServer(t)
+	resetGroupUIDRateLimit(t, ctx)
 	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-cat-notowned"

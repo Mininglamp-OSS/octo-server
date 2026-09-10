@@ -27,11 +27,9 @@ var errPinQuotaExceeded = errors.New("project: pin quota exceeded")
 //
 // # Why there is no role check
 //
-// Anyone who can SEE the project can pin it, and projectMiddleware has already
-// decided who that is. A Space admin who never joined a space_listed project gets
-// it in their list, so they can pin it — pinning is a fact about the caller, not a
-// membership fact, which is also why the row lives in its own table rather than on
-// octo_project_member.
+// decided that the caller is an active Project member. Pinning is a fact about
+// the caller, not a membership mutation, which is why the row lives in its own
+// table rather than on octo_project_member.
 //
 // # Why the feature gate applies
 //
@@ -89,8 +87,7 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 		if *req.Pinned {
 			// applyPin commits before this best-effort hook runs. A pin is an
 			// explicit request to surface the Project in the caller's personal
-			// Follow sidebar, including for a Space-listed Project the caller can
-			// see without holding a Project seat. The list path repairs a transient
+			// Follow sidebar. The list path repairs a transient provisioning
 			// failure, so a sidebar write must not turn a committed pin into a 5xx.
 			p.provisionSidebarSection(row.ProjectID, row.SpaceID, uid)
 		} else {

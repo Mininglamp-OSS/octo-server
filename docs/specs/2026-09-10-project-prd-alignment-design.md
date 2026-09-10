@@ -162,6 +162,16 @@
 - 关联群个人置顶设计已实现：`PUT /v1/projects/:project_id/groups/:group_no/setting` 只写当前用户在当前 Space/Project/群关系下的偏好；`GET /v1/projects/:project_id/groups` 返回 `pinned` 并在分页前按置顶时间排序。偏好不授予原生群聊天权限，解绑后隐藏、同一 Project 重新关联后恢复。
 - 已使用真实 MySQL、Redis、WuKongIM 完成 Project 定向测试、group 关系测试、真实 TCP HTTP pin/list/cancel 及解绑重绑 smoke；`go build ./...`、i18n 一致性检查和本地化 lint 通过。
 
+## PR887 审查收口（2026-09-11）
+
+- B1：置顶配额计数与 membership-only 列表谓词一致；仅 Project 正常且调用者席位 `status=active AND removing=0` 的已置顶项目计入。成员被移除或席位进入 closing 后，历史偏好保留但不再占用槽位，重新具备有效成员资格后可恢复。
+- B2：`POST /v1/group/create` 只将预期 Project 准入拒绝映射为本地化 D14 envelope：不存在项目携带语义 `404`，非成员/禁用目标携带语义 `403`，跨 Space 携带语义 `409`；legacy wire status 仍为 `400`，未知数据库或 IM 失败仍走内部 `store_failed`。
+- N1：Project-backed Group creation 在认证后挂载共享 UID 限流，与其他用户写入口使用同一 UID bucket。
+- N2a/N2b：关系 bind/unbind 继续同时要求 Project 成员资格和原生群 owner/admin；缺少任一资格时不修改原生成员或关系。已有 active 成员的不同角色重复添加拒绝整批请求，不保留部分新成员或隐式改角。
+- N3：同步修正钩子、I2、Project 名称上限及管理员移除语义的注释，注释与当前实现和规格保持一致。
+- N4：管理群日期边界的环境敏感基线本轮不改；MySQL `SYSTEM` 为 `+0800` 时 Group 验证使用 `TZ=Asia/Shanghai`，Project 验证使用 `TZ=UTC`，不把基线波动归因于本变更。
+- 本轮用真实 TCP `http.Server` 和 MySQL 验证了 B1“移除成员达到上限后仍可置顶新可见 Project”以及 B2 非 Project 创建者/跨 Space 的本地化 4xx 响应；随后 `go build ./...`、`make i18n-extract-check` 和 `make i18n-lint` 均通过。
+
 ## 未决事项
 
 无产品决策待确认。外部客户端的契约切换和资源侧实时判权验收由对应维护者负责，不属于本设计阶段已验证的事实。

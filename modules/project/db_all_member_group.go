@@ -125,7 +125,7 @@ func (d *DB) releaseAllMemberGroupProvision(projectID string, deadline time.Time
 //
 // 结果是项目指向 Ga —— A 那份更旧的名册快照建出来的群，窗口期内加进项目的人一个都
 // 不在里面；而带着完整名册的 Gb 留成一个普通项目群，于是这个 Space 里出现两个以项目
-// 命名的群。缺的那些人是 I4 缺口，扫描 B 过了宽限期才报，而且没有自动修复。
+// 命名的群。这里记录的是建群快照竞态；Project 关系和原生群成员是独立事实。
 //
 // 租约超时不是异常路径：allMemberGroupLease 的注释自己说，IM 建频道是"这里唯一可能
 // 慢到分钟级的部分"，2 分钟是按它的数量级取的——超出它正是租约被设计出来要处理的情况。

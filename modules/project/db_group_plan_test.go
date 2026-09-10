@@ -87,8 +87,7 @@ func TestThePinQuotaCountReachesItsRowsByAnIndex(t *testing.T) {
 	sess := p.db.session
 
 	rows := explainRows(t, sess, sqlCountPinnedInSpace,
-		MemberStatusActive, "plan_probe_uid", "plan_probe_space", StatusNormal,
-		DiscoverabilitySpaceListed)
+		"plan_probe_space", StatusNormal, MemberStatusActive, "plan_probe_uid")
 
 	require.NotEmpty(t, rows, "EXPLAIN returned no rows; the assertions below would be vacuous")
 	for _, row := range rows {

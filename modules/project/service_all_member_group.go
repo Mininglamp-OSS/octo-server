@@ -86,7 +86,7 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 		// 把 on-call 指到错的地方。PR #855 第五轮 review。
 		//
 		// 无论哪一种，刚建出来的这个群都是一个普通项目群（group.project_id 已指向
-		// 本项目，I2 照常约束它）。不静默删除：删一个已经建好、已经发出创建通知、
+		// 本项目，关联元数据与原生群成员彼此独立）。不静默删除：删一个已经建好、已经发出创建通知、
 		// 已经有 IM 频道的群，比留着它更危险。
 		p.Warn("全员群写回落空（指针已被他人登记 / 租约已被他人认领 / 项目已解散），本次建出的群将作为普通项目群留存",
 			zap.String("projectId", projectID), zap.String("groupNo", groupNo))
@@ -100,7 +100,8 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 
 // syncAllMemberGroupName 把全员群名改成项目名（D8）。best-effort。
 //
-// 群名上限（50 rune）短于项目名上限（64 rune），截断由群侧做——截断规则属于群。
+// 群名上限（50 rune）短于项目提交名上限（30 rune），但历史项目名仍可能达到 legacy 64
+// rune；截断由群侧做——截断规则属于群。
 func (p *Project) syncAllMemberGroupName(projectID, name string) {
 	if name == "" {
 		return

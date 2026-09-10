@@ -35,7 +35,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
-	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -93,7 +92,7 @@ func New(ctx *config.Context) *Group {
 func (g *Group) Route(r *wkhttp.WKHttp) {
 	group := r.Group("/v1/group", g.ctx.AuthMiddleware(r))
 	{
-		group.POST("/create", g.groupCreate)
+		group.POST("/create", appwkhttp.SharedUIDRateLimiter(r, g.ctx), g.groupCreate)
 		group.GET("/my", g.list)                            //我保存的群
 		group.GET("/forbidden_times", g.forbiddenTimesList) // 获取禁言时常列表
 	}
@@ -1150,21 +1149,20 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 
 	// 校验 project_id。
 	//
-	// 四道门，顺序有意如此：
+	// 这段只做请求级别的门禁：
 	//
 	//  1. 必须同时给 space_id —— 项目本身就活在某个 Space 里，没有 Space 的项目群
 	//     无从谈起。
 	//  2. 功能开关必须打开。这是 brief D1 说的唯一回滚手段：关掉它只是「不再产生
 	//     新的项目群」，已有项目群的成员约束照常强制——设计文档明确不允许放松
 	//     已有约束。开关与 appconfig 的 project_on 是同一个值。
-	//  3. 调用方本人必须在这个 Space 里。见下面那段：Space 成员校验在 Service 里，
-	//     也就是在这之后，所以不先问这一句，第 4 道门就成了一个人人可用的探测器。
-	//  4. 项目必须存在、活跃、且属于同一个 Space。三种失败回同一个错误码，不区分
-	//     ——区分开就等于把建群变成一个探测器：拿着一个自己看不见的 project_id，
-	//     用一个自己有权限的 Space 就能问出「它存不存在、在哪个 Space」。
+	//  3. 调用方本人必须在这个 Space 里。项目存在、归属 Space、创建者 Project
+	//     成员资格和显式目标资格都由 CreateProjectGroup 在事务内持锁复核。
 	//
-	// 「创建者本人是不是这个项目的成员」不在这里查。那是准入闸门的事，发生在建群
-	// 事务内、持锁状态下；放在这里查是一次会过期的读。
+	// 不在这里重复读取 Project：那是一次会过期的快照，而且会把
+	// CreateProjectGroup 的 ErrGroupProjectNotFound / ErrGroupProjectSpaceConflict
+	// 预期结果吞成一个 generic unavailable。已通过 Space 门禁的调用方应收到
+	// service 的明确业务 sentinel；未知错误仍走内部 store_failed。
 	if req.ProjectID != "" {
 		if req.SpaceID == "" {
 			respondGroupRequestInvalid(c, "space_id")
@@ -1176,16 +1174,6 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
 			return
 		}
-		// 先确认调用方自己在这个 Space 里，再去问项目存不存在。
-		//
-		// 顺序不是风格问题。Space 成员校验被放在 Service 里（见下方 CreateGroup），
-		// 也就是**在这段之后**；于是先查项目就把建群接口变成了一个探测器：任何
-		// 持有效 token 的人都能拿 space_id + project_id 组合去问「这个项目在不在
-		// 这个 Space」，而这正是上一条注释说要避免的事——只不过它防住了「三种失败
-		// 回同一个码」，没防住「根本不该被回答」。
-		//
-		// 失败回同一个 ErrGroupProjectUnavailable，而不是一个「你不在这个 Space」
-		// 的专属错误：区分开来同样是在回答问题。真正的原因进日志。
 		creatorInSpace, err := spacepkg.CheckMembership(g.ctx.DB(), req.SpaceID, creator)
 		if err != nil {
 			g.Error("查询 Space 成员失败", zap.Error(err))
@@ -1196,20 +1184,6 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 			g.Warn("建项目群：调用方不在该 Space，不回答项目是否存在",
 				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID),
 				zap.String("creator", creator))
-			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
-			return
-		}
-		ok, err := projectpkg.ResolveForGroup(g.ctx.DB(), req.SpaceID, req.ProjectID)
-		if err != nil {
-			g.Error("查询项目失败", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-			return
-		}
-		if !ok {
-			// The distinguishing reason (absent / disbanded / other Space) stays
-			// in the log, never on the wire.
-			g.Warn("项目不可用：不存在、已解散，或不属于该 Space",
-				zap.String("projectId", req.ProjectID), zap.String("spaceId", req.SpaceID))
 			httperr.ResponseErrorL(c, errcode.ErrGroupProjectUnavailable, nil, nil)
 			return
 		}
@@ -1321,8 +1295,12 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 		AvatarColor: req.AvatarColor,
 	})
 	if err != nil {
-		g.Error("创建群失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		if relationErr, ok := mapCreateProjectGroupError(err); ok {
+			respondGroupProjectError(c, relationErr)
+		} else {
+			g.Error("创建群失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		}
 		return
 	}
 

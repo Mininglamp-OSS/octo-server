@@ -550,6 +550,59 @@ func TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget(t *testing.T) {
 			"doors made it unreachable")
 }
 
+// TestRemovedMemberAtPinCapCanPinVisibleProject proves that a Project seat closed
+// through the real remove API no longer makes its stale pin consume quota.
+//
+// The removed project must disappear from the caller's list, while another visible
+// project remains pinnable at the same cap. This exercises the state transition
+// instead of manufacturing an inactive member row with a direct SQL fixture.
+func TestRemovedMemberAtPinCapCanPinVisibleProject(t *testing.T) {
+	srv, p := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	memberTok := seedUser(t, "mate")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	seedSpaceMember(t, spaceA, "mate", 0, 1)
+
+	max := p.cfg.MaxPinned
+	created := make([]*Resp, 0, max+1)
+	for i := 0; i <= max; i++ {
+		project := createProjectVia(t, srv, spaceA, ownerTok,
+			fmt.Sprintf("removed-at-cap-%d", i))
+		created = append(created, project)
+		require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
+			"/v1/projects/"+project.ProjectID+"/members/add", ownerTok,
+			addMembersPayload("mate")).Code)
+		if i < max {
+			require.Equal(t, http.StatusOK, setPinned(t, srv, project.ProjectID, memberTok, true).Code,
+				"pin %d of %d must succeed", i+1, max)
+		}
+	}
+	assert.Equal(t, max, countPinnedForTest(t, spaceA, "mate"))
+	require.Contains(t, listProjectIDs(t, srv, spaceA, memberTok), created[0].ProjectID)
+
+	removed := doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created[0].ProjectID+"/members/remove", ownerTok,
+		map[string]any{"uids": []string{"mate"}})
+	require.Equal(t, http.StatusOK, removed.Code, "body: %s", removed.Body.String())
+	drainRemovalCascade(t, p)
+	flushProjectCache(t, testCtx)
+
+	assert.Equal(t, max-1, countPinnedForTest(t, spaceA, "mate"),
+		"the stale pin on a removed Project must not consume a quota slot")
+	listed := listProjectIDs(t, srv, spaceA, memberTok)
+	assert.NotContains(t, listed, created[0].ProjectID,
+		"a removed Project must no longer be visible to the former member")
+	assert.Contains(t, listed, created[max].ProjectID,
+		"an unpinned Project where membership remains must stay visible")
+
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created[max].ProjectID, memberTok, true).Code,
+		"the freed slot must allow pinning a still-visible Project")
+	assert.Equal(t, max, countPinnedForTest(t, spaceA, "mate"))
+	assert.True(t, pinnedFlags(t, srv, spaceA, memberTok)[created[max].ProjectID])
+}
+
 // countPinnedForTest reaches the quota predicate directly, so the assertion is about
 // what the CAP counts rather than about what a particular endpoint answers.
 func countPinnedForTest(t *testing.T, spaceID, uid string) int {

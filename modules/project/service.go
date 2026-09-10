@@ -974,10 +974,9 @@ func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (
 
 // removeMember closes one seat.
 //
-// The target's role is re-read under a row lock inside the transaction, not taken
-// from an earlier unlocked read: the transitive-protection rule ("an admin may not
-// remove an admin or the owner") is only sound if the role it checks cannot change
-// between the check and the write.
+// from an earlier unlocked read: the transitive-protection rule ("an admin may
+// remove a peer admin but not the owner") is only sound if the role it checks
+// cannot change between the check and the write.
 func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 	if targetUID == actorUID {
 		// Self-removal goes through leave, which carries the last-owner transfer rule.

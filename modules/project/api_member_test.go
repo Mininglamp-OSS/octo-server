@@ -458,6 +458,42 @@ func TestAddMembersPersistsRequestedRoles(t *testing.T) {
 	assert.Equal(t, RoleCommon, member.Role)
 }
 
+// TestAddMembersRejectsExistingActiveRoleConflictAtomically covers the service-level
+// role conflict that request normalization cannot see. A conflicting active seat must
+// reject the whole batch, leaving both the old role and every new target unchanged.
+func TestAddMembersRejectsExistingActiveRoleConflictAtomically(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv)
+	for _, uid := range []string{"existing", "new"} {
+		seedUser(t, uid)
+		seedSpaceMember(t, spaceA, uid, 0, 1)
+	}
+
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		addMemberWithRolePayload("existing", RoleAdmin)).Code)
+
+	w := doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		map[string]any{"members": []map[string]any{
+			// Put the new target first so an implementation that mutates while
+			// walking the batch would leave observable partial state.
+			{"uid": "new", "role": RoleCommon},
+			{"uid": "existing", "role": RoleCommon},
+		}})
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assertProjectErrorCode(t, w, "err.server.project.member_role_conflict")
+
+	existing, err := p.db.queryMember(created.ProjectID, "existing")
+	require.NoError(t, err)
+	require.NotNil(t, existing)
+	assert.Equal(t, RoleAdmin, existing.Role,
+		"the conflicting active member must retain the original role")
+	added, err := p.db.queryMember(created.ProjectID, "new")
+	require.NoError(t, err)
+	assert.Nil(t, added, "a new target in the rejected batch must not be persisted")
+}
+
 // TestSanitizeUIDsDeduplicates pins that the same uid twice in one batch does not take
 // the project row lock twice and report two outcomes for one seat.
 func TestSanitizeUIDsDeduplicates(t *testing.T) {
