@@ -80,7 +80,7 @@ func (m *BotMention) internalAuthMiddleware() wkhttp.HandlerFunc {
 			respondBotMentionUnauthorized(c)
 			c.Abort()
 			if m.metrics != nil {
-				m.metrics.ObserveIngress("unauthorized", time.Since(started))
+				m.metrics.ObserveIngress("unauthorized", metricKindUnknown, time.Since(started))
 			}
 			return
 		}
@@ -91,9 +91,10 @@ func (m *BotMention) internalAuthMiddleware() wkhttp.HandlerFunc {
 func (m *BotMention) create(c *wkhttp.Context) {
 	started := time.Now()
 	result := "error"
+	docKind := metricKindUnknown
 	defer func() {
 		if m.metrics != nil {
-			m.metrics.ObserveIngress(result, time.Since(started))
+			m.metrics.ObserveIngress(result, docKind, time.Since(started))
 		}
 	}()
 
@@ -110,6 +111,7 @@ func (m *BotMention) create(c *wkhttp.Context) {
 		return
 	}
 
+	docKind = mention.DocKind
 	claimKey := mentionClaimKey(mention.BotUID, mention.IdempotencyKey)
 	fingerprint := mentionFingerprint(mention)
 	existing, err := m.claims.Lookup(claimKey, fingerprint)
@@ -126,7 +128,7 @@ func (m *BotMention) create(c *wkhttp.Context) {
 		return
 	}
 
-	if !m.gate.Allows(mention.DocID, mention.SpaceID) {
+	if !m.gate.AllowsKind(mention.DocKind, mention.DocID, mention.SpaceID) {
 		result = "disabled"
 		m.logOutcome(mention, result, 0, claimKey)
 		c.Response(mentionIngressResponse{Accepted: false, Replay: false, Reason: "disabled"})
@@ -250,6 +252,7 @@ func decodeMentionRequest(c *wkhttp.Context) (mentionRequest, error) {
 func (m *BotMention) logOutcome(mention normalizedMention, result string, eventID int64, claimKey string) {
 	m.Info("bot mention ingress completed",
 		zap.String("result", result),
+		zap.String("doc_kind", mention.DocKind),
 		zap.Int64("event_id", eventID),
 		zap.String("bot_uid", mention.BotUID),
 		zap.String("idempotency_hash", mentionClaimLogHash(claimKey)),
