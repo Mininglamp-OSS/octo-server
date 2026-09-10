@@ -1,0 +1,395 @@
+package space
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/gocraft/dbr/v2"
+)
+
+// 清理工单状态
+const (
+	removalCleanupPending   uint8 = 0
+	removalCleanupDone      uint8 = 1
+	removalCleanupAbandoned uint8 = 2
+)
+
+const (
+	// removalCleanupLease 一次认领的租约时长。worker 崩溃后租约到期即可被其它副本接管。
+	//
+	// 必须显著长于一次作业的实际耗时：群级联要逐个群做 IM 退订 + 发 Tip + 子区/置顶
+	// 清理，几十个群就能跑上几分钟。租约一旦在作业跑到一半时过期，另一个 worker 会
+	// 合法地重新认领并**并发执行同一条工单**——per-claim owner 只能让晚到的那次写入
+	// 落空，挡不住重复执行本身（重复的系统消息、重复的 IM 调用）。
+	// 步骤契约要求幂等，租约足够长则是第一道防线。
+	removalCleanupLease = 10 * time.Minute
+	// removalCleanupMaxAttempts 超过后置为 abandoned，不再无限重试。
+	// 配合下面的退避，总窗口约 70 分钟：这是隔离性清理，短窗口下一次稍长的 IM /
+	// DB 故障就会把所有待处理工单打成 abandoned，而 abandoned 没有任何东西会重新
+	// 驱动，被移除的人就一直留在群里、IM 群订阅也还在。到达上限只打 error 日志，
+	// 需要人工介入——目前没有自动 reconcile。
+	removalCleanupMaxAttempts uint32 = 20
+	// removalCleanupBatchSize 单次调度最多处理的工单数，避免一次占满 DB 连接。
+	removalCleanupBatchSize = 20
+)
+
+// memberRemovalCleanupJob 一条待执行的会话面清理工单。
+type memberRemovalCleanupJob struct {
+	ID          uint64 `db:"id"`
+	SpaceID     string `db:"space_id"`
+	UID         string `db:"uid"`
+	OperatorUID string `db:"operator_uid"`
+	Reason      string `db:"reason"`
+	Attempts    uint32 `db:"attempts"`
+}
+
+// enqueueMemberRemovalCleanupTx 在成员移除的同一事务内写出清理工单（transactional
+// outbox）。调用方必须已经确认这次移除真的改动了成员行——对不存在 / 已移除的成员
+// 入队会产出一条永远无事可做的工单。
+func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, spaceID, uid, operatorUID, reason string) error {
+	if spaceID == "" || uid == "" {
+		return errors.New("space: removal cleanup requires space_id and uid")
+	}
+	if !IsMemberRemoveReason(reason) {
+		return fmt.Errorf("space: unknown member removal reason %q", reason)
+	}
+	// next_attempt_at 由 Go 侧算，不要用 CURRENT_TIMESTAMP(3)：认领时是拿 Go 的
+	// time 去比这一列，而 CURRENT_TIMESTAMP 走的是 MySQL 会话时区。两个时钟一旦
+	// 不同源（部署镜像 TZ=Asia/Shanghai，而 DSN 未指定 loc 时驱动按 UTC 发送），
+	// 新工单会整整一个时区偏移都认领不到。写读两侧都走 Go 的 UTC 即自洽。
+	_, err := tx.InsertBySql(
+		"INSERT INTO space_member_removal_cleanup (space_id, uid, operator_uid, reason, status, next_attempt_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?)",
+		spaceID, uid, operatorUID, reason, removalCleanupPending, time.Now().UTC(),
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("space: enqueue removal cleanup: %w", err)
+	}
+	return nil
+}
+
+// enqueueMemberRemovalCleanupBatchTx 一次性为多个成员写出清理工单。
+//
+// 解散场景会在同一个事务里为全体成员入队，而那个事务正握着 space_member 的
+// FOR UPDATE 范围锁；逐条 INSERT 意味着上万次往返都在锁内完成，期间任何并发的
+// 加入路径（atomicAddMemberIfNotFull / approveJoinApply 都要在同一范围上取
+// FOR UPDATE）全部阻塞，甚至撞上 innodb_lock_wait_timeout。多值 INSERT 分批发出，
+// 把锁内往返从 N 次压到 N/batch 次。
+func enqueueMemberRemovalCleanupBatchTx(tx *dbr.Tx, spaceID string, uids []string, operatorUID, reason string) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	if spaceID == "" {
+		return errors.New("space: removal cleanup requires space_id")
+	}
+	if !IsMemberRemoveReason(reason) {
+		return fmt.Errorf("space: unknown member removal reason %q", reason)
+	}
+	const perStatement = 200
+	now := time.Now().UTC()
+	for start := 0; start < len(uids); start += perStatement {
+		end := start + perStatement
+		if end > len(uids) {
+			end = len(uids)
+		}
+		chunk := uids[start:end]
+		placeholders := make([]string, 0, len(chunk))
+		args := make([]interface{}, 0, len(chunk)*6)
+		for _, uid := range chunk {
+			if uid == "" {
+				continue
+			}
+			placeholders = append(placeholders, "(?, ?, ?, ?, ?, ?)")
+			args = append(args, spaceID, uid, operatorUID, reason, removalCleanupPending, now)
+		}
+		if len(placeholders) == 0 {
+			continue
+		}
+		sql := "INSERT INTO space_member_removal_cleanup " +
+			"(space_id, uid, operator_uid, reason, status, next_attempt_at) VALUES " +
+			strings.Join(placeholders, ",")
+		if _, err := tx.InsertBySql(sql, args...).Exec(); err != nil {
+			return fmt.Errorf("space: enqueue removal cleanup batch: %w", err)
+		}
+	}
+	return nil
+}
+
+// claimMemberRemovalCleanup 认领一条到期且未被租约占用的工单。
+//
+// SKIP LOCKED 让多副本并行推进而不互相阻塞；租约（lease_owner/lease_until）保证
+// 同一工单在租约内只被一个执行者持有。没有可认领的工单时返回 (nil, nil)。
+//
+// owner 必须**每次认领都不同**（见 newRemovalClaimOwner）：进程级的固定 owner 会让
+// 同进程内两个 goroutine 的 `AND lease_owner=?` 守卫同时成立，租约就形同虚设。
+// now 请传 UTC，与 next_attempt_at 的写入侧保持同一个时钟。
+func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemovalCleanupJob, error) {
+	if owner == "" {
+		return nil, errors.New("space: removal cleanup claim owner required")
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("space: begin removal cleanup claim: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var job memberRemovalCleanupJob
+	err = tx.SelectBySql(
+		"SELECT id, space_id, uid, operator_uid, reason, attempts "+
+			"FROM space_member_removal_cleanup "+
+			"WHERE status=? AND attempts<? AND next_attempt_at<=? "+
+			"AND (lease_until IS NULL OR lease_until<=?) "+
+			// 刻意不写 ORDER BY id。加上它，优化器会认为「按主键顺序扫、取第一条命中」
+			// 更划算，于是放弃 idx_..._pending 改走 PRIMARY —— 实测 EXPLAIN 从
+			// type=range/key=idx_pending 变成 type=index/key=PRIMARY。abandoned 行永不
+			// 删除且集中在低 id 段，扫描长度于是随部署年龄单调增长，每次认领都要
+			// 从 id=1 爬过所有终态行才够到第一条待办。
+			// FIFO 本来也不是保证：SKIP LOCKED 已经让多副本的实际取件顺序不确定。
+			"LIMIT 1 FOR UPDATE SKIP LOCKED",
+		removalCleanupPending, removalCleanupMaxAttempts, now, now,
+	).LoadOne(&job)
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("space: select removal cleanup job: %w", err)
+	}
+
+	// attempts<removalCleanupMaxAttempts 这个条件在认领处、而不是只在释放处。
+	//
+	// 释放路径（releaseCleanupJob）只覆盖「作业跑完并返回了错误」。进程被 SIGKILL /
+	// OOM / pod 驱逐打死时谁也走不到那里，行就停在 pending 上，attempts 也不再变。
+	// 认领处若不设防，租约一到期它又被认领、再打死一次进程，如此无限。危害不止于
+	// 这一条：每被认领一次，它就占掉本轮批次的一个名额（processMemberRemovalCleanups
+	// 单轮上限 removalCleanupBatchSize），本该在同一轮里被处理的健康工单就被挤了出去。
+	//
+	// 这个论证**不依赖**取件顺序——上面那条 SELECT 已经刻意去掉了 ORDER BY（原因见
+	// 那里的注释）。名额被白占与它排在第几位无关，所以这道设防照样必要。
+	//
+	// 卡在认领处之后，这条行再也不会被取走，于是需要 abandonExhaustedMemberRemovalCleanups
+	// 把它推到终态——否则它会变成一条永远 pending、永远不动、也永远没人看见的僵尸。
+	//
+	// attempts 在**认领时**自增，而不是等到失败释放时。
+	//
+	// 释放路径只覆盖「作业跑完并返回了错误」。进程在作业中途被杀（OOM、Pod 驱逐）
+	// 时谁也没机会写 attempts：租约到期后同一行被重新认领，计数原地不动，
+	// 一条必然打死进程的作业就能无限循环、永远到不了 abandoned。
+	// 认领即计数让这种情况自我收敛，也让 attempts 真实反映「试过几次」。
+	result, err := tx.UpdateBySql(
+		"UPDATE space_member_removal_cleanup SET lease_owner=?, lease_until=?, attempts=attempts+1 WHERE id=? AND status=?",
+		owner, now.Add(removalCleanupLease), job.ID, removalCleanupPending,
+	).Exec()
+	if err != nil {
+		return nil, fmt.Errorf("space: claim removal cleanup job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return nil, errors.New("space: invalid removal cleanup claim result")
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("space: commit removal cleanup claim: %w", err)
+	}
+	// SELECT 读到的是自增前的值，这里对齐成库里的值，让调用方的
+	// 「已经试到第几次」判断不必再去猜偏移量。
+	job.Attempts++
+	return &job, nil
+}
+
+// abandonExhaustedMemberRemovalCleanups 把「预算已耗尽、租约已过期、却还停在 pending」
+// 的工单推到 abandoned，返回本次推动的行数。
+//
+// 这是 releaseCleanupJob 那条同名转换的**进程外**补集。那一条只在作业跑完并返回错误时
+// 触发；进程被硬杀时没有任何代码有机会执行，行就留在 pending 上。配合认领处新加的
+// attempts 上限，这种行不会再被认领——没有这条扫描，它就永远停在那里，既不重试也不
+// 报错，运维看到的是一条「pending 很久」的记录而不是一条失败。
+//
+// 租约条件不能省，而且要留一整个租约周期的宽限。
+//
+// 一条正在跑最后一次尝试的工单，attempts 同样等于上限，但租约还在执行者手上；只按
+// attempts 判死会抢先写终态。仅仅要求「租约已过期」还不够：本文件开头就写了群级联
+// 「几十个群就能跑上几分钟」，跑过 10 分钟租约是**预期内**的。那种情况下作业还在
+// 正常推进、随后会成功，却会被扫描判成 abandoned 并触发「需人工介入」告警，而它
+// 自己的 finish 因为 status 已变而落空、只留下一句误导的「租约已易主」。
+// 所以门槛是 lease_until <= now - removalCleanupLease：进程真死了才够得着。
+//
+// 同时要求 lease_until IS NOT NULL：从没被认领过的行不该被扫描碰。
+//
+// 不复用 finishMemberRemovalCleanup：那个要求调用方持有租约，而这里的前提恰恰是
+// 租约的主人已经不存在了。
+//
+// 与认领互斥、因此不需要额外加锁：认领要求 attempts<max，本扫描要求 attempts>=max，
+// 两个谓词不相交，同一行不可能同时被两边选中。单条 UPDATE 自身原子，够了。
+func (d *DB) abandonExhaustedMemberRemovalCleanups(now time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	// 先只读地选出 id，再按主键更新。
+	//
+	// 不能写成单条带 WHERE 的 UPDATE：attempts 不在任何索引里，可选的访问路径只有
+	// status，于是 REPEATABLE READ 下这条 UPDATE 会对**整个 status=0 范围**加
+	// next-key 锁 —— LIMIT 限制的是「改了几行」，不是「锁了几行」。实测：正是这条
+	// 语句会让另一个连接里那条全新、不冲突的入队 INSERT 报
+	// ERROR 1205 Lock wait timeout。而入队就发生在移除事务内部、且是 fail-closed 的，
+	// 结果就是队列一积压、踢人就随机失败。
+	// SELECT 是非锁定读，UPDATE 只按主键锁点名的那几行，两边都不再扫范围。
+	var ids []uint64
+	_, err := d.session.SelectBySql(
+		"SELECT id FROM space_member_removal_cleanup "+
+			"WHERE status=? AND attempts>=? AND lease_until IS NOT NULL AND lease_until<=? "+
+			"LIMIT ?",
+		removalCleanupPending, removalCleanupMaxAttempts, now.Add(-removalCleanupLease), limit,
+	).Load(&ids)
+	if err != nil {
+		return 0, fmt.Errorf("space: select exhausted removal cleanups: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_member_removal_cleanup "+
+			"SET status=?, finished_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"WHERE id IN ? AND status=?",
+		removalCleanupAbandoned, now, "sweep: retries exhausted",
+		ids, removalCleanupPending,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("space: sweep exhausted removal cleanups: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("space: read removal cleanup sweep result: %w", err)
+	}
+	return affected, nil
+}
+
+// finishMemberRemovalCleanup 把工单置为终态（done / abandoned），要求仍持有租约。
+// 租约易主时返回 false，调用方据此放弃写入——另一个 worker 已经接手。
+// attempts 不在这里动：认领时已经计过（见 claimMemberRemovalCleanup），
+// 所以一条 abandoned 行的 attempts 天然等于 removalCleanupMaxAttempts，
+// 运维可以直接按这个阈值查出被放弃的工单。
+func (d *DB) finishMemberRemovalCleanup(id uint64, owner string, status uint8, lastError string) (bool, error) {
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_member_removal_cleanup "+
+			"SET status=?, finished_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"WHERE id=? AND status=? AND lease_owner=?",
+		status, time.Now().UTC(), truncateCleanupError(lastError), id, removalCleanupPending, owner,
+	).Exec()
+	if err != nil {
+		return false, fmt.Errorf("space: finish removal cleanup job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("space: read removal cleanup finish result: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// releaseMemberRemovalCleanup 执行失败后释放租约并按指数退避安排下次尝试。
+//
+// 不再自增 attempts —— 认领时已经计过了（见 claimMemberRemovalCleanup）。
+// 两处都加会让计数翻倍，退避和放弃阈值一起提前一半。
+func (d *DB) releaseMemberRemovalCleanup(id uint64, owner string, attempts uint32, lastError string) error {
+	next := time.Now().UTC().Add(memberRemovalRetryDelay(attempts))
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_member_removal_cleanup "+
+			"SET next_attempt_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"WHERE id=? AND status=? AND lease_owner=?",
+		next, truncateCleanupError(lastError), id, removalCleanupPending, owner,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("space: release removal cleanup job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return errors.New("space: removal cleanup lease ownership lost on release")
+	}
+	return nil
+}
+
+// removalCleanupRetention 终态工单的保留期。
+//
+// 每次踢人 / 退出 / 强制移除 / 解散都会留下一行，只翻状态从不删除；解散几个大空间
+// 就是几万行。留一段时间供排障，之后清掉，避免这张表和 pending 索引无限膨胀，
+// 把每 10s 一次的认领扫描越拖越慢。
+const removalCleanupRetention = 14 * 24 * time.Hour
+
+// purgeFinishedMemberRemovalCleanups 删除超过保留期的**已完成**工单，返回删除行数。
+// 单次有上限，避免一条 DELETE 锁住大量行。
+//
+// 只删 done，abandoned 一律保留：那是「隔离性清理最终放弃了」的唯一持久记录，
+// 除了一条 error 日志之外没有别的东西记得它，删掉就再也查不出来了。
+func (d *DB) purgeFinishedMemberRemovalCleanups(before time.Time, limit int) (int64, error) {
+	result, err := d.session.UpdateBySql(
+		"DELETE FROM space_member_removal_cleanup WHERE status=? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
+		removalCleanupDone, before, limit,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("space: purge finished removal cleanups: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// memberRemovalRetryDelay 指数退避，封顶 5 分钟。
+//
+// 注意先算再夹，不要先把 attempt 夹到 8：2^8 = 256s < 300s，那样 5 分钟的上限
+// 永远取不到，实际封顶变成 4m16s，整个重试预算也跟着缩水。
+func memberRemovalRetryDelay(attempt uint32) time.Duration {
+	const maxDelay = 5 * time.Minute
+	if attempt > 12 { // 2^12 秒已远超上限，再大只会让移位溢出
+		return maxDelay
+	}
+	delay := time.Second * time.Duration(1<<attempt)
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+// truncateCleanupError 把失败摘要收敛成可安全写入 last_error 的合法 UTF-8。
+//
+// 两件事都必须做，缺一不可 —— 任何非法字节写进 utf8mb4 列，strict 模式都会
+// 拒掉整条 UPDATE，于是 attempts 不增、next_attempt_at 不推进：本来用来保护重试的
+// 函数反而把退避弄断，工单在租约到期后被反复认领且永远到不了 abandoned。
+//
+//  1. **先清洗**：错误串里可能夹着任意位置的非法字节（上游代理的错误页、IM 返回体
+//     的裸字节）。只修末尾被截断的那个 rune 挡不住中间的非法字节；只有整串清洗才行。
+//  2. **再按 rune 边界截断**：清洗后再切，切点自然落在合法边界上。
+//
+// 列宽 255 是字符数，这里按字节截断，因此永远不会超列。
+func truncateCleanupError(s string) string {
+	const max = 255
+	cleaned := strings.ToValidUTF8(s, "")
+	if len(cleaned) <= max {
+		return cleaned
+	}
+	truncated := cleaned[:max]
+	// 退到最近的 rune 边界。必须是循环而不是「削一个字节」：cleaned 已是合法
+	// UTF-8，但在 max 处切开可能砍掉一个 4 字节 rune 的后 1~3 字节，而
+	// DecodeLastRuneInString 对悬空序列每次只报 (RuneError, 1)，削一次仍会留下
+	// 半个 rune（实测 "a"*252 + 😀 截断后尾部残留 f0 9f）。非法字节写进
+	// last_error 会被 MySQL 以 Incorrect string value 拒掉整条 release，
+	// 工单就卡在 running 上白等一轮租约。cleaned 合法 ⇒ 最多转 3 次。
+	for len(truncated) > 0 {
+		r, size := utf8.DecodeLastRuneInString(truncated)
+		if r != utf8.RuneError || size > 1 {
+			break // 收在完整 rune 上（U+FFFD 本身合法，size=3，不该被削）
+		}
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated
+}
+
+// lockActiveMemberUIDsTx 事务内**加锁**读取 Space 的活跃成员 UID，用于解散时逐个入队。
+//
+// FOR UPDATE 不是可选的：普通 SELECT 是快照读，与随后那条把全员置 0 的 UPDATE
+// （当前读）看到的行集可能不一致，夹在中间提交的新成员会被置 0 却拿不到清理工单。
+func lockActiveMemberUIDsTx(tx *dbr.Tx, spaceID string) ([]string, error) {
+	var uids []string
+	_, err := tx.SelectBySql(
+		"SELECT uid FROM space_member WHERE space_id=? AND status=1 FOR UPDATE", spaceID,
+	).Load(&uids)
+	return uids, err
+}

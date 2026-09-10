@@ -1,0 +1,141 @@
+---
+type: Journal
+title: "Journal: my-ai-team-sessions"
+description: Record of isolated one-human/one-Bot AI session containers and thread-backed conversations
+tags: [ai-team, bot, thread, isolation, acl, wukongim, i18n]
+timestamp: 2026-09-07T15:42:31+08:00
+task: my-ai-team-sessions
+source: self
+---
+
+# Journal: my-ai-team-sessions
+
+## What was done
+
+- Added the feature-gated `/v1/ai-team` API and durable agent/session records.
+- Lazily provisions one dedicated parent group per `(space_id,user_uid,bot_id)`;
+  each parent contains exactly the owner and their active User Bot, while each
+  conversation is a thread with idempotent DB and WuKongIM provisioning.
+- Routes ordinary user messages in a ready AI thread to the persisted Bot target
+  and emits a stable full-channel runtime session key and input ID.
+- Protects dedicated parents from ordinary group, manager, thread and Bot API
+  mutations, while preserving authoritative Space-member lifecycle cleanup.
+- Filters both the dedicated parent and its topic channels from ordinary group,
+  recent-conversation and follow/sidebar results.
+- Keeps the operator-owned global auto-archive setting unchanged and structurally
+  exempts AI-session threads from the stale-thread archive worker.
+
+## Structural learnings
+
+- A dedicated AI container is a business purpose, not a new transport group type.
+  Keeping `group_type` unchanged preserves WuKongIM protocol behavior while the
+  server-owned `purpose` field drives ACL and visibility policy.
+- Hiding only the parent is insufficient: WuKongIM exposes thread conversations as
+  independent type-5 channel IDs, so recent/follow filtering must normalize each
+  topic back to its parent before applying the purpose filter.
+- The unique association constraint is necessary but not sufficient. Serializing
+  the association row with `FOR UPDATE` ensures concurrent first-session requests
+  converge before either allocates the parent group.
+- DB, parent IM channel and thread IM channel cannot be one transaction. Persisting
+  provisioning state and retrying create-or-update makes response loss converge
+  without allocating a second parent or thread.
+
+## Verification and boundaries
+
+- Build, unit suite, four E2E/API shards, focused AI/message tests, `go vet`, i18n
+  checks and direct WuKongIM type-17 persistence passed. Exact evidence is in
+  `.octospec/tasks/my-ai-team-sessions/verification.md`.
+- A migration round-trip test proves the feature does not overwrite an existing
+  operator-owned `thread.auto_archive_enabled` value.
+- The full pilote2e package still has an unrelated existing card-template catalog
+  fixture failure; its direct WuKongIM persistence test passes.
+- Client and external adapter E1-E5 remain deployment-level handoff checks; this PR
+  does not claim those repositories were exercised.
+
+## Upstream-main integration
+
+- Merging `origin/main` at `96b3b926` brought in #846's single group-member
+  admission funnel and its whole-tree source guard. The guard caught the AI
+  container's intentionally atomic but direct two-row member insert.
+- The integration keeps the AI association/group/session transaction intact via a
+  narrow group-owned admission bridge. Before writing, the bridge locks and checks
+  that the parent belongs to the requested Space and owner, has
+  `purpose=ai_session_container`, and has no project binding; it then admits exactly
+  the owner and Bot through the shared funnel.
+- Conflict resolution in `modules/space/api.go` preserves both invariants: preset
+  groups reject AI containers and project-bound groups, then use the upstream
+  registered admission entry for ordinary Space-direct groups.
+- Build, vet, the 52-package unit suite, all four E2E/API shards, i18n checks and the
+  focused WuKongIM persistence test were rerun successfully after the merge.
+
+## Final review hardening
+
+- Kept mixed-collation conversion on the new AI tables, preserving indexed access
+  on the legacy identity, Space and group columns; the regression fixture now uses
+  realistic indexes, shipped service calls and an `EXPLAIN FORMAT=JSON` guard.
+- Prevented org-sync events from adding or deleting AI-container members.
+- Made add/re-add and session creation repair Space-cleanup membership loss through
+  the shared admission funnel, reject any third member, and reconcile the parent
+  plus retained session channels in WuKongIM before returning ready state.
+- Prevented failed retries from overwriting ready session state and aligned rename
+  locking with the agent -> session -> thread order.
+- Separated product-visible group lookup from authoritative Bot lifecycle lookup,
+  so deleting a User Bot also reaches its hidden AI container and is allowed to
+  remove the protected Bot membership through the normal removal funnel.
+- Re-ran build, vet, 52 unit packages, all four API/E2E shards, i18n checks and the
+  focused WuKongIM persistence test successfully.
+
+## Review convergence follow-up
+
+- Added one group lifecycle-cleanup service and routed all three Bot deletion
+  surfaces through it, including protected AI-container membership removal.
+- Closed the remaining org-directory and category mutation/read bypasses with
+  DB-backed regression coverage.
+- Made AI session retention structural in `ArchiveStaleBatch`; removed the
+  migration-time write that overwrote an operator's global auto-archive setting.
+- Re-ran all six affected module suites plus build, vet and i18n checks on isolated
+  MySQL/Redis/WuKongIM test services.
+
+## CI asynchronous-test hardening
+
+- E2E shard 2 showed that `space_member_removal_cleanup.attempts` advances when a
+  worker claims a job, before registered cleanup callbacks execute. Waiting on that
+  field did not synchronize the test with the callback or the full cascade.
+- The project cascade regression now counts callback execution atomically and waits
+  for the persisted release error, which is written only after every registered step
+  has run. This removes both the ordering flake and the callback counter data race.
+- The focused regression and the complete `modules/project` package passed with the
+  CI-equivalent race detector and shuffled execution.
+
+## Destructive lifecycle and hidden-surface closure
+
+- The super-admin Bot deletion path now validates the persisted robot row before
+  entering group cleanup, preventing a mistyped human UID from triggering a
+  destructive membership cascade.
+- Lifecycle cleanup preserves the shared removal primitive's intentional creator
+  no-op as a warning rather than converting it into a permanent 500. New ownership
+  transfers reject Bot targets, preventing creation of that unreachable owner state.
+- Owner mention-preference endpoints, Bot target resolution, and manager group
+  listings now reject or hide AI containers; target resolution also hides their
+  thread channels.
+- DB-backed focused tests and the complete affected `group`, `robot`, and `bot_api`
+  packages passed, followed by build, vet, i18n, and diff gates.
+- The final route-family sweep moved the incoming-webhook protection into the
+  shared actor resolver after membership authorization, covering all four
+  user/Bot and group/thread mounts without exposing a purpose oracle.
+- The deprecated recent-conversation response and operational analytics now hide
+  protected parents and session threads too, including stale analytics dimensions
+  created before a group acquired the protected purpose.
+
+## Review-fix stacked PR
+
+- Applied the hidden-container predicate to the two shared group aggregates used
+  by the manager list and statistics dashboard, keeping enumeration and totals on
+  the same population.
+- Initialized both page result slices so a zero-row query preserves the wire
+  contract as `items: []` rather than `items: null`.
+- Kept soft-deleted sessions in the durable idempotency ledger and made same-key
+  replay return the existing conflict response explicitly.
+- Restricted automatic title extraction to text messages. Structured content now
+  uses established content-type display text, so media metadata cannot become a
+  session title.

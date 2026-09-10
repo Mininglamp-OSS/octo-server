@@ -179,11 +179,11 @@ func TestSidebar_FollowTab_BackfillsStatus(t *testing.T) {
 	}
 
 	sb := NewSidebar(ctx)
-	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, "")
+	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, nil, "")
 
 	lastMsgAt, statusMap, _, err := sb.loadThreadLastMsgAt(threadExtRows)
 	require.NoError(t, err)
-	items = mergeThreadEntries(items, threadExtRows, lastMsgAt, categorySetting, nil, nil, nil, "", nil, statusMap)
+	items = mergeThreadEntries(items, threadExtRows, lastMsgAt, categorySetting, nil, nil, nil, nil, "", nil, statusMap)
 	backfillThreadStatus(items, statusMap)
 
 	byID := map[string]*SidebarItem{}
@@ -226,7 +226,7 @@ func TestSidebar_RecentTab_BackfillsStatus(t *testing.T) {
 	}
 
 	sb := NewSidebar(ctx)
-	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, nil, "")
 	statusMap, err := sb.loadThreadStatuses(items)
 	require.NoError(t, err)
 	backfillThreadStatus(items, statusMap)
@@ -268,7 +268,7 @@ func TestSidebar_RecentTab_FailOpenOnStatusError(t *testing.T) {
 	stubConvs := []*config.SyncUserConversationResp{
 		{ChannelID: "g310e____thr", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Timestamp: 100},
 	}
-	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, nil, "")
 
 	// Mirror the handler's recent branch: query may fail → fail open.
 	statusMap, qerr := sb.loadThreadStatuses(items)

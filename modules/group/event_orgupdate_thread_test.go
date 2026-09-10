@@ -75,3 +75,38 @@ func TestHandleOrgOrDeptEmployeeUpdate_DeleteAlsoCleansThreads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, postCount, "组织结构更新删人必须同步清理子区成员/订阅（YUJ-4185 P1-2）")
 }
+
+func TestHandleOrgOrDeptEmployeeUpdate_SkipsAITeamContainerMutations(t *testing.T) {
+	svc, userDB := setupServiceTest(t)
+	s := svc.(*Service)
+	f := New(s.ctx)
+
+	insertTestUsers(t, userDB, "ai_owner", "ai_bot", "org_new_member")
+	const groupNo = "g_orgupdate_ai_container"
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: groupNo, Name: "AI container", Creator: "ai_owner",
+		SpaceID: "space_orgupdate_ai", Status: GroupStatusNormal,
+		Purpose: "ai_session_container",
+	}))
+	for _, member := range []*MemberModel{
+		{GroupNo: groupNo, UID: "ai_owner", Role: MemberRoleCreator, Status: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID())},
+		{GroupNo: groupNo, UID: "ai_bot", Role: MemberRoleCommon, Status: 1, Robot: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID())},
+	} {
+		require.NoError(t, f.db.InsertMember(member))
+	}
+
+	payload := config.MsgOrgOrDeptEmployeeUpdateReq{Members: []*config.OrgOrDeptEmployeeVO{
+		{Operator: "org", EmployeeUid: "org_new_member", GroupNo: groupNo, Action: "add"},
+		{Operator: "org", EmployeeUid: "ai_owner", GroupNo: groupNo, Action: "delete"},
+	}}
+	var commitErr error
+	f.handleOrgOrDeptEmployeeUpdate([]byte(util.ToJson(payload)), func(err error) { commitErr = err })
+	require.NoError(t, commitErr)
+
+	var activeUIDs []string
+	_, err := f.ctx.DB().Select("uid").From("group_member").
+		Where("group_no=? AND is_deleted=0", groupNo).OrderBy("uid").Load(&activeUIDs)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ai_bot", "ai_owner"}, activeUIDs,
+		"org-sync add/delete actions must leave the two-member AI container unchanged")
+}

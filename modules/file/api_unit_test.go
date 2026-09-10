@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -204,10 +205,14 @@ type mockService struct {
 	composeErr         error
 	lastObjectPath     string
 	lastGetObjectPath  string
+	lastContentType    string
 	lastContentDisp    string
 	lastFileSize       int64
 	presignedGetErr    error
 	lastGetDisposition string
+	// uploadCalls 记录 UploadFile 被调用的次数：被拒的上传必须一次都不调用 ——
+	// 要防的是字节落进对象存储，不是状态码。
+	uploadCalls int
 	// downloadURL/downloadURLErr let a test control what DownloadURL returns
 	// (the value uploadFile reports as `path`). Zero values preserve the legacy
 	// ("", nil) behavior every existing test relies on.
@@ -224,6 +229,8 @@ func (m *mockService) DownloadImage(url string, ctx context.Context) (io.ReadClo
 }
 
 func (m *mockService) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+	m.uploadCalls++
+	m.lastObjectPath = filePath
 	return nil, nil
 }
 
@@ -240,6 +247,7 @@ func (m *mockService) GetFile(path string) (io.ReadCloser, string, error) {
 
 func (m *mockService) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
 	m.lastObjectPath = objectPath
+	m.lastContentType = contentType
 	m.lastContentDisp = contentDisposition
 	m.lastFileSize = fileSize
 	return "https://example.com/upload?" + objectPath, "https://example.com/download/" + objectPath, nil
@@ -277,6 +285,17 @@ func TestBuildContentDisposition(t *testing.T) {
 			`inline; filename="report\\2024.pdf"; filename*=UTF-8''report%5C2024.pdf`},
 		{"ascii with semicolon", "report;final.pdf",
 			`inline; filename="report;final.pdf"; filename*=UTF-8''report%3Bfinal.pdf`},
+		// GH#760: consecutive spaces are collapsed in the quoted ASCII
+		// fallback (it is a signed header value and must survive SigV4
+		// Trimall unchanged), while filename* keeps the user's name exactly.
+		{"ascii with consecutive spaces", "my  file.pdf",
+			`inline; filename="my file.pdf"; filename*=UTF-8''my%20%20file.pdf`},
+		{"unicode with consecutive spaces", "报告  文档.pdf",
+			`inline; filename="__ __.pdf"; filename*=UTF-8''` + url.PathEscape("报告  文档.pdf")},
+		{"leading and trailing spaces", "  spaced.pdf  ",
+			`inline; filename="spaced.pdf"; filename*=UTF-8''` + url.PathEscape("  spaced.pdf  ")},
+		{"all whitespace degrades to file", "   ",
+			`inline; filename="file"; filename*=UTF-8''%20%20%20`},
 	}
 
 	for _, tt := range tests {
@@ -884,10 +903,15 @@ func TestGetUploadCredentials_FileSizeValidation(t *testing.T) {
 			wantMsgContain: "正整数",
 		},
 		{
-			name:           "fileSize over MaxFileSize is rejected",
-			queryParams:    fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
-			wantStatus:     http.StatusBadRequest,
-			wantMsgContain: "MB",
+			// 超限响应改走 httperr 本地化信封后，这条直驱测试（gin.CreateTestContext，
+			// 没有 route，因而没有 ErrorRenderer）只能看到兜底 renderer 的
+			// {msg,status}，msg 是未插值的模板、details 也不下发。上限值本身的
+			// 断言因此挪到有 renderer 的集成路径：
+			// policy_integration_test.go:TestPresignedOversizeReportsExactCap
+			// 那里验证渲染后的精确文案与 max_size_kb 详情，覆盖比这里更强。
+			name:        "fileSize over MaxFileSize is rejected",
+			queryParams: fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
+			wantStatus:  http.StatusBadRequest,
 		},
 		{
 			name:           "fileSize exactly MaxFileSize is accepted",
@@ -1605,4 +1629,142 @@ func TestUploadFile_StickerAcceptsWebp(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	_, has := resp["sticker_handle"]
 	require.True(t, has, "accepted webp sticker should mint a handle")
+}
+
+// TestGetUploadCredentials_ContentTypeContract drives the handler itself,
+// which is the only way to guard the GH#760 content-type half.
+//
+// Asserting `echoed == signed` through the mock cannot catch a regression:
+// the mock records whatever the handler passes it, so dropping the
+// normalization makes both sides equally dirty and the equality still holds.
+// The property that actually bites is on the emitted value — it must be a
+// SigV4 Trimall fixed point and a legal header value — so that is what is
+// asserted here, on the response body and the value handed to the service.
+//
+// The caller-supplied contentType only survives when mime.TypeByExtension
+// cannot resolve the extension, so these cases use `.ini`, which is
+// allow-listed and unmapped even in images that ship /etc/mime.types. The
+// require below fails loudly rather than silently passing if that ever
+// changes in some environment.
+func TestGetUploadCredentials_ContentTypeContract(t *testing.T) {
+	require.Empty(t, mime.TypeByExtension(".ini"),
+		"this test needs an allow-listed extension with no MIME mapping so the caller's contentType survives")
+
+	tests := []struct {
+		name        string
+		contentType string
+		want        string
+	}{
+		{"clean value passes through", "text/plain", "text/plain"},
+		{"whitespace run is collapsed", `text/plain;  charset=utf-8`, "text/plain; charset=utf-8"},
+		{"tab run is collapsed", "text/plain;\t\tcharset=utf-8", "text/plain; charset=utf-8"},
+		{"surrounding whitespace is trimmed", "  text/plain  ", "text/plain"},
+		// GH#760 review P2-2: "  " is not "" so a default applied before the
+		// collapse would never fire, and the collapsed "" would drop out of
+		// the signed header set entirely.
+		{"whitespace-only falls back to the default", "   ", "application/octet-stream"},
+		{"empty falls back to the default", "", "application/octet-stream"},
+		// GH#760 review P2-1: a control byte makes the header unsendable, so
+		// the value degrades to the default rather than being mangled.
+		{"control byte falls back to the default", "application/x\x01y", "application/octet-stream"},
+		{"DEL falls back to the default", "application/x\x7fy", "application/octet-stream"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSvc := &mockService{}
+			f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet,
+				"/v1/file/upload/credentials?type=chat&fileSize=1024&filename=notes.ini&contentType="+
+					url.QueryEscape(tt.contentType), nil)
+
+			f.getUploadCredentials(&wkhttp.Context{Context: c})
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+			var resp map[string]interface{}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			echoed, ok := resp["contentType"].(string)
+			require.True(t, ok, "response must carry contentType; body: %s", w.Body.String())
+
+			assert.Equal(t, tt.want, echoed)
+			assert.Equal(t, echoed, mockSvc.lastContentType,
+				"the client is told to echo %q but %q was handed to the signer", echoed, mockSvc.lastContentType)
+
+			// The two properties the 403 actually depends on.
+			assert.Equal(t, echoed, strings.Join(strings.Fields(echoed), " "),
+				"echoed contentType must be a SigV4 Trimall fixed point")
+			assert.False(t, containsInvalidHeaderByte(echoed),
+				"echoed contentType must be a legal header value, got %q", echoed)
+		})
+	}
+}
+
+// TestUploadFile_AcceptsServerGeneratedPathShapes 钉住 getFilePath 自己签发的
+// ?path= 形态必须可上传。
+//
+// 背景：本 PR 曾一度加过一道「?path= 扩展名必须等于 filename 扩展名」的门，
+// 结果打断了服务端自己发出的上传 URL —— workplace 横幅/应用图标的 path 不带
+// 扩展名（getFilePath 的 TypeWorkplaceBanner / TypeWorkplaceAppIcon 分支），
+// 而 :525 那段「修复客户端上传路径缺少扩展名的问题」的兼容代码也随之变成死
+// 代码。那道门已回退。
+//
+// 这些用例存在的意义是：任何未来想再收紧 ?path= 的改动，必须先让这张表全绿。
+// 收紧本身不是坏事，但要基于对真实流量形态的分析，而不是只覆盖"想得到的两种"。
+func TestUploadFile_AcceptsServerGeneratedPathShapes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name     string
+		fileType string
+		path     string
+		filename string
+		wantKey  string
+	}{
+		{
+			name: "无扩展名的 path 由兼容代码补全", fileType: "chat",
+			path: "/10000/HASH", filename: "x.png", wantKey: "chat/10000/HASH.png",
+		},
+		{
+			name: "有扩展名文本但缺点号", fileType: "chat",
+			path: "/10000/HASHpng", filename: "x.png", wantKey: "chat/10000/HASH.png",
+		},
+		{
+			name: "workplace 横幅：path 以目录结尾", fileType: "workplacebanner",
+			path: "/workplace/banner/", filename: "x.png", wantKey: "workplacebanner/workplace/banner.png",
+		},
+		{
+			name: "workplace 应用图标：path 以目录结尾", fileType: "workplaceappicon",
+			path: "/workplace/appicon/", filename: "x.png", wantKey: "workplaceappicon/workplace/appicon.png",
+		},
+		{
+			name: "path 与 filename 扩展名一致", fileType: "chat",
+			path: "/10000/x.png", filename: "x.png", wantKey: "chat/10000/x.png",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+			mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/" + tc.wantKey}
+			f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+			body, contentType := newMultipartFile(t, tc.filename, pngOfSize(t, 8, 8))
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request, _ = http.NewRequest(http.MethodPost,
+				"/v1/file/upload?type="+tc.fileType+"&path="+url.QueryEscape(tc.path), body)
+			c.Request.Header.Set("Content-Type", contentType)
+			c.Set("uid", "10000")
+
+			f.uploadFile(&wkhttp.Context{Context: c})
+
+			require.Equal(t, http.StatusOK, rec.Code,
+				"服务端自己签发的 path 形态必须可上传; body: %s", rec.Body.String())
+			assert.Equal(t, tc.wantKey, mockSvc.lastObjectPath,
+				"存储 key 必须以校验过的扩展名结尾")
+		})
+	}
 }

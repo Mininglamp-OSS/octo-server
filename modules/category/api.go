@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -42,6 +43,8 @@ func (c *Category) Route(r *wkhttp.WKHttp) {
 		spaces.POST("/:space_id/categories", c.create)
 		spaces.GET("/:space_id/categories", c.list)
 		spaces.PUT("/:space_id/categories/sort", c.sort)
+		spaces.GET("/:space_id/sidebar-sections", c.listSidebarSections)
+		spaces.PUT("/:space_id/sidebar-sections/sort", c.sortSidebarSections)
 		spaces.PUT("/:space_id/categories/:category_id", c.update)
 		spaces.DELETE("/:space_id/categories/:category_id", c.delete)
 	}
@@ -101,7 +104,7 @@ func (c *Category) create(ctx *wkhttp.Context) {
 		return
 	}
 	nextSort++
-	err = c.db.insertCategory(&CategoryModel{
+	err = c.db.createCategoryAndSidebar(&CategoryModel{
 		CategoryID: categoryID,
 		SpaceID:    spaceID,
 		UID:        loginUID,
@@ -140,86 +143,70 @@ func (c *Category) list(ctx *wkhttp.Context) {
 		return
 	}
 
-	// 兜底：确保 (uid, spaceID) 下默认分类存在（GH octo-server#1228）。
-	// 创建 space / 加入 space 路径已在 space 模块预先补一条；此处为老用户 / 异常路径
-	// 的防御性补偿。INSERT IGNORE 幂等，失败降级为 warn，不中断列表返回。
-	if err := EnsureDefaultCategory(c.ctx, loginUID, spaceID); err != nil {
-		c.Warn("确保默认分类失败（降级继续）", zap.Error(err), zap.String("uid", loginUID), zap.String("spaceID", spaceID))
-	}
-
-	categories, err := c.db.queryCategoriesByUIDAndSpaceID(loginUID, spaceID)
+	result, err := c.listCategoryResponses(loginUID, spaceID)
 	if err != nil {
-		c.Error("查询类别失败", zap.Error(err))
+		c.Error("查询类别列表失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
+	ctx.Response(result)
+}
 
-	groups, err := c.db.queryUserGroupsInSpace(loginUID, spaceID)
+func (c *Category) listCategoryResponses(uid, spaceID string) ([]categoryResp, error) {
+	// The migration handles existing data. These two idempotent read-path guards
+	// keep a missing default or section row from making the list permanently empty
+	// after an interrupted deployment or a legacy direct write.
+	if err := EnsureDefaultCategory(c.ctx, uid, spaceID); err != nil {
+		c.Warn("确保默认分类失败（降级继续）", zap.Error(err), zap.String("uid", uid), zap.String("spaceID", spaceID))
+	}
+	rawCategories, err := c.db.queryRawCategoryModels(uid, spaceID)
 	if err != nil {
-		c.Error("查询群组失败", zap.Error(err))
-		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
-		return
+		return nil, err
+	}
+	if err := c.db.ensureCategorySidebarSections(rawCategories); err != nil {
+		return nil, err
+	}
+	categories, err := c.db.queryCategoriesByUIDAndSpaceID(uid, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := c.db.queryUserGroupsInSpace(uid, spaceID)
+	if err != nil {
+		return nil, err
 	}
 
-	// 按 category_id 分组
 	categoryGroupMap := make(map[string][]groupInCategoryResp)
 	var uncategorized []groupInCategoryResp
-	for _, g := range groups {
-		gr := groupInCategoryResp{
-			GroupNo:      g.GroupNo,
-			Name:         g.GroupName,
-			CategorySort: g.CategorySort,
+	for _, group := range groups {
+		resp := groupInCategoryResp{GroupNo: group.GroupNo, Name: group.GroupName, CategorySort: group.CategorySort}
+		if group.CategoryID == nil || *group.CategoryID == "" {
+			uncategorized = append(uncategorized, resp)
+			continue
 		}
-		if g.CategoryID == nil || *g.CategoryID == "" {
-			uncategorized = append(uncategorized, gr)
-		} else {
-			categoryGroupMap[*g.CategoryID] = append(categoryGroupMap[*g.CategoryID], gr)
-		}
+		categoryGroupMap[*group.CategoryID] = append(categoryGroupMap[*group.CategoryID], resp)
 	}
 
-	// 如果有未分类群组，确保默认分类存在
 	if len(uncategorized) > 0 {
-		defaultCat, err := c.db.queryDefaultCategory(loginUID, spaceID)
+		defaultCategory, err := c.db.queryDefaultCategory(uid, spaceID)
 		if err != nil {
-			c.Error("查询默认类别失败", zap.Error(err))
-			httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
-			return
+			return nil, err
 		}
-		if defaultCat == nil {
-			maxSort, err := c.db.maxSortByUIDAndSpaceID(loginUID, spaceID)
+		if defaultCategory == nil {
+			if err := EnsureDefaultCategory(c.ctx, uid, spaceID); err != nil {
+				return nil, err
+			}
+			categories, err = c.db.queryCategoriesByUIDAndSpaceID(uid, spaceID)
 			if err != nil {
-				c.Error("查询排序值失败", zap.Error(err))
-				httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
-				return
-			}
-			newDefault := &CategoryModel{
-				CategoryID: util.GenerUUID(),
-				SpaceID:    spaceID,
-				UID:        loginUID,
-				Name:       defaultCategoryNamePlaceholder,
-				Sort:       maxSort + 1,
-				IsDefault:  intPtr(1),
-			}
-			if err = c.db.insertDefaultCategory(newDefault); err != nil {
-				c.Error("创建默认类别失败", zap.Error(err))
-				httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
-				return
-			}
-			// INSERT IGNORE 后重查，确保拿到实际行（防并发竞态）
-			categories, err = c.db.queryCategoriesByUIDAndSpaceID(loginUID, spaceID)
-			if err != nil {
-				c.Error("查询类别失败", zap.Error(err))
-				httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
-				return
+				return nil, err
 			}
 		}
 	}
 
 	result := make([]categoryResp, 0, len(categories))
 	defaultSeen := false
-	for _, cat := range categories {
-		catID := cat.CategoryID
-		if cat.isDefault() {
+	for _, category := range categories {
+		categoryID := category.CategoryID
+		if category.isDefault() {
 			if defaultSeen {
 				continue
 			}
@@ -227,37 +214,24 @@ func (c *Category) list(ctx *wkhttp.Context) {
 			if uncategorized == nil {
 				uncategorized = make([]groupInCategoryResp, 0)
 			}
-			explicit := categoryGroupMap[cat.CategoryID]
-			merged := make([]groupInCategoryResp, 0, len(uncategorized)+len(explicit))
-			merged = append(merged, uncategorized...)
-			merged = append(merged, explicit...)
-			displayName := cat.Name
-			if displayName == defaultCategoryNamePlaceholder {
-				displayName = defaultCategoryName()
+			explicit := categoryGroupMap[category.CategoryID]
+			groups := make([]groupInCategoryResp, 0, len(uncategorized)+len(explicit))
+			groups = append(groups, uncategorized...)
+			groups = append(groups, explicit...)
+			name := category.Name
+			if name == defaultCategoryNamePlaceholder {
+				name = defaultCategoryName()
 			}
-			result = append(result, categoryResp{
-				CategoryID: &catID,
-				Name:       displayName,
-				Sort:       cat.Sort,
-				IsDefault:  true,
-				Groups:     merged,
-			})
-		} else {
-			catGroups := categoryGroupMap[cat.CategoryID]
-			if catGroups == nil {
-				catGroups = make([]groupInCategoryResp, 0)
-			}
-			result = append(result, categoryResp{
-				CategoryID: &catID,
-				Name:       cat.Name,
-				Sort:       cat.Sort,
-				IsDefault:  false,
-				Groups:     catGroups,
-			})
+			result = append(result, categoryResp{CategoryID: &categoryID, Name: name, Sort: category.Sort, IsDefault: true, Groups: groups})
+			continue
 		}
+		groups := categoryGroupMap[category.CategoryID]
+		if groups == nil {
+			groups = make([]groupInCategoryResp, 0)
+		}
+		result = append(result, categoryResp{CategoryID: &categoryID, Name: category.Name, Sort: category.Sort, Groups: groups})
 	}
-
-	ctx.Response(result)
+	return result, nil
 }
 
 // update 更新类别名称
@@ -351,6 +325,14 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
+	// Keep the unified order authoritative: a deleted category has no visible
+	// section either. This is transactional with the category tombstone so a
+	// read never observes one without the other.
+	if err = c.db.hideSidebarSectionTx(tx, loginUID, cat.SpaceID, sidebarSectionTypeCategory, categoryID); err != nil {
+		c.Error("隐藏侧边栏分类分区失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
+		return
+	}
 
 	// 2. 采集该分组下用户名下的群编号列表（在解绑前先读，否则丢失对应关系）。
 	// FOR UPDATE 锁住目标 group_setting 行：本路径走 group_setting → version → ext
@@ -428,6 +410,17 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 		httperr.ResponseErrorL(ctx, errcode.ErrCategorySpaceMemberRequired, nil, nil)
 		return
 	}
+	rawCategories, err := c.db.queryRawCategoryModels(loginUID, spaceID)
+	if err != nil {
+		c.Error("查询原始类别失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
+		return
+	}
+	if err := c.db.ensureCategorySidebarSections(rawCategories); err != nil {
+		c.Error("确保类别侧边栏分区失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
+		return
+	}
 
 	var req sortCategoriesReq
 	if err := ctx.BindJSON(&req); err != nil {
@@ -476,12 +469,12 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// The legacy request can express category order only, not Project entries.
+	// Reassign the requested categories within the category slots that already
+	// exist in the unified order so an old client cannot move an interleaved
+	// Project as a side effect of a category-only drag.
 	for i, catID := range req.CategoryIDs {
-		_, err := tx.Update("group_category").
-			Set("sort", i).
-			Where("category_id=?", catID).
-			Exec()
-		if err != nil {
+		if err := c.db.updateSidebarSectionSortTx(tx, loginUID, spaceID, sidebarSectionTypeCategory, catID, categories[i].Sort); err != nil {
 			c.Error("更新排序失败", zap.Error(err), zap.String("categoryID", catID))
 			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
@@ -542,16 +535,40 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		return
 	}
 
-	// 查询群所属 Space
-	var groupSpaceID string
-	_, err = c.db.session.Select("IFNULL(space_id,'')").From("`group`").
+	// Check the server-owned purpose only after membership succeeds so a caller
+	// cannot use this route to distinguish an inaccessible group from a private
+	// AI container whose identifier they guessed.
+	protected, err := aiteampkg.IsProtectedGroup(c.ctx.DB(), groupNo)
+	if err != nil {
+		c.Error("查询AI容器用途失败", zap.Error(err), zap.String("group_no", groupNo))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(ctx, errcode.ErrAITeamContainerProtected, nil, nil)
+		return
+	}
+
+	// Query the server-owned Project attribution together with the group Space.
+	// Membership has already been checked above, so this branch cannot be used to
+	// probe a Project group the caller cannot access.
+	var groupRow struct {
+		SpaceID   string `db:"space_id"`
+		ProjectID string `db:"project_id"`
+	}
+	err = c.db.session.Select("IFNULL(space_id,'') AS space_id", "IFNULL(project_id,'') AS project_id").From("`group`").
 		Where("group_no=?", groupNo).
-		Load(&groupSpaceID)
+		LoadOne(&groupRow)
 	if err != nil {
 		c.Error("查询群信息失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
+	if groupRow.ProjectID != "" && req.CategoryID != "" {
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryProjectGroupCannotCategorize, nil, nil)
+		return
+	}
+	groupSpaceID := groupRow.SpaceID
 	if groupSpaceID == "" {
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryGroupSpaceMissing, nil, nil)
 		return

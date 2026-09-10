@@ -42,11 +42,32 @@ other = "服务器内部错误。"
 ["err.server.notify.card_not_allowed"]
 other = "内部通知接口不允许发送卡片消息。"
 
+["err.server.common.oidc_initial_space_invalid"]
+other = "初始空间不存在或已解散，请填写一个正常状态的空间 ID。"
+
 ["err.server.common.space_welcome_config_invalid"]
 other = "空间欢迎语配置无效，请检查目标空间是否存在且未解散、生效时间格式，以及欢迎语文案是否非空且未超长。"
 
 ["err.server.common.thread_archive_window_ordering"]
 other = "子区自动归档窗口不能短于最近会话的子区活跃窗口，否则子区会在活跃窗口生效前就被归档、导致该窗口的配置不起作用。请同时提交这两项，或先调大归档窗口。"
+
+["err.server.file.extension_list_too_long"]
+other = "扩展名列表原始长度过长，最多 {{.max_bytes}} 字节。"
+
+["err.server.file.extension_list_too_large"]
+other = "扩展名列表过长，最多 {{.max_entries}} 项，且单项不超过 {{.max_length}} 个字符。"
+
+["err.server.file.upload_too_large"]
+other = "文件大小超过限制，最大 {{.max_size}}。"
+
+["err.server.common.file_extension_not_allowlistable"]
+other = "该扩展名在服务端内置禁止清单中（可执行文件/脚本类），不能通过配置放开。如确有业务需要，请联系服务端评估。"
+
+["err.server.common.file_upload_size_ordering"]
+other = "全局单文件上传上限不能小于自定义贴纸的上传上限，否则贴纸会先被全局上限拦住、导致贴纸上限的配置不起作用。请同时提交这两项，或先调大全局上限。"
+
+["err.server.common.manager_mfa_smtp_invalid"]
+other = "管理控制台 MFA 所需的 SMTP 配置无效。"
 
 ["err.server.notify.card_invalid"]
 other = "卡片通知请求无效。"
@@ -286,6 +307,9 @@ other = "超级管理员账号不能删除。"
 ["err.server.user.dashboard_reader_target_ineligible"]
 other = "该账号不符合运营看板只读授权条件。"
 
+["err.server.user.manager_role_target_ineligible"]
+other = "该账号不符合该管理角色的授权条件。"
+
 ["err.server.user.manager_role_changed"]
 other = "目标账号角色已变化，请刷新后重试。"
 
@@ -381,6 +405,27 @@ other = "发送邮箱验证码失败。"
 ["err.server.user.email_rate_limited"]
 other = "验证码发送过于频繁，请 1 分钟后再试。"
 
+["err.server.user.manager_mfa_settings_unavailable"]
+other = "管理控制台 MFA 配置尚未就绪。"
+
+["err.server.user.manager_mfa_misconfigured"]
+other = "管理控制台 MFA 当前不可用。"
+
+["err.server.user.manager_mfa_challenge_invalid"]
+other = "管理控制台 MFA Challenge 无效或已过期。"
+
+["err.server.user.manager_mfa_code_invalid"]
+other = "管理控制台验证码无效。"
+
+["err.server.user.manager_mfa_rate_limited"]
+other = "管理控制台验证码发送过于频繁，请稍后再试。"
+
+["err.server.user.manager_mfa_verify_locked"]
+other = "验证码连续多次输入错误，验证已临时锁定，请稍后再试。"
+
+["err.server.user.manager_email_mfa_enable_email_required"]
+other = "开启管理控制台 MFA 前，当前超管必须配置有效邮箱。"
+
 # ---- err.server.user.* (Phase 2.1 modules/user/api_usernamelogin.go migration) ----
 
 ["err.server.user.username_register_disabled"]
@@ -457,6 +502,9 @@ other = "不能将外部成员设为管理员。"
 
 ["err.server.group.external_cannot_be_owner"]
 other = "不能将群主转让给外部成员。"
+
+["err.server.group.bot_cannot_be_owner"]
+other = "不能将群主转让给机器人。"
 
 ["err.server.group.external_join_forbidden"]
 other = "该群已禁止外部成员加入，请联系群管理员。"
@@ -632,6 +680,9 @@ other = "该群组不属于任何空间。"
 ["err.server.category.space_mismatch"]
 other = "群组和分类不在同一空间。"
 
+["err.server.category.project_group_cannot_categorize"]
+other = "项目群组不能加入手动分类。"
+
 ["err.server.category.space_member_required"]
 other = "你不是该空间成员。"
 
@@ -725,6 +776,12 @@ other = "绑定会话已过期或无效，请重新发起。"
 
 ["err.server.oidc.bind_claims_incomplete"]
 other = "身份提供方未返回创建账号所需的账号信息。"
+
+["err.server.oidc.exchange_request_invalid"]
+other = "请求无效。"
+
+["err.server.oidc.exchange_token_rejected"]
+other = "SSO 令牌已失效，请重新登录。"
 
 # ---- err.server.incomingwebhook.* (modules/incomingwebhook push path, PR #31 D23) ----
 
@@ -862,7 +919,7 @@ other = "不支持的消息类型。"
 other = "不支持的文件类型。"
 
 ["err.server.robot.file_too_large"]
-other = "文件大小超过限制。"
+other = "文件大小超过限制，最大 {{.max_size}}。"
 
 ["err.server.robot.no_fields_to_update"]
 other = "没有需要更新的字段。"
@@ -1055,7 +1112,7 @@ other = "请求数量超过上限。"
 other = "内容大小超过限制。"
 
 ["err.server.bot_api.file_too_large"]
-other = "文件大小超过限制。"
+other = "文件大小超过限制，最大 {{.max_size}}。"
 
 ["err.server.bot_api.payload_too_large"]
 other = "上传文件大小超过限制。"
@@ -1089,6 +1146,9 @@ other = "机器人不是该群管理员。"
 
 ["err.server.bot_api.cannot_remove_privileged"]
 other = "群主和管理员不能通过机器人 API 移除。"
+
+["err.server.bot_api.all_member_group_protected"]
+other = "这是项目的全员群，请到项目中管理成员。"
 
 ["err.server.bot_api.not_space_member"]
 other = "不是该空间成员。"
@@ -1367,6 +1427,18 @@ other = "该幂等键已用于不同的请求。"
 ["err.server.bot_mention.store_failed"]
 other = "文档评论机器人事件处理失败。"
 
+["err.server.bot_task.forbidden"]
+other = "该来源无权向指定机器人投递任务。"
+
+["err.server.bot_task.in_progress"]
+other = "使用此幂等键的任务仍在接收中。"
+
+["err.server.bot_task.idempotency_conflict"]
+other = "此幂等键已用于其他任务。"
+
+["err.server.bot_task.store_failed"]
+other = "接收机器人任务失败。"
+
 # ---- modules/notification：账号级快捷静音 ----
 
 ["err.server.notification.pause.invalid_time"]
@@ -1374,3 +1446,127 @@ other = "通知暂停时间无效。"
 
 ["err.server.notification.pause.update_failed"]
 other = "更新通知暂停状态失败。"
+
+# ---- modules/project：Space 内项目协作层（P0：成员池） ----
+
+["err.server.project.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.project.name_invalid"]
+other = "项目名称不能为空，且不能超过长度上限。"
+
+["err.server.project.field_too_long"]
+other = "该字段超出长度上限。"
+
+["err.server.project.batch_too_large"]
+other = "单次请求的成员数量过多。"
+
+["err.server.project.agent_not_eligible"]
+other = "所选的 AI 分身中有无法加入本项目的，请调整后重试。"
+
+["err.server.project.role_invalid"]
+other = "项目成员角色无效。"
+
+["err.server.project.collaboration_role_name_invalid"]
+other = "项目协作角色名称无效。"
+
+["err.server.project.collaboration_role_invalid"]
+other = "项目协作角色无效。"
+
+["err.server.project.collaboration_role_target_invalid"]
+other = "该成员不能设置项目协作角色。"
+
+["err.server.project.permission_denied"]
+other = "你没有权限执行此操作。"
+
+["err.server.project.not_member"]
+other = "你不是该项目的成员。"
+
+["err.server.project.disabled"]
+other = "项目功能已被管理员关闭。"
+
+["err.server.project.collaboration_role_disabled"]
+other = "项目协作角色修改功能已关闭。"
+
+["err.server.project.actor_not_space_member"]
+other = "你已不是该空间的有效成员。"
+
+["err.server.project.member_not_space_member"]
+other = "目标用户不是该空间的有效成员。"
+
+["err.server.project.quota_pinned"]
+other = "置顶项目数已达上限。"
+
+["err.server.project.quota_per_space"]
+other = "该空间的项目数量已达上限。"
+
+["err.server.project.quota_per_creator"]
+other = "你在该空间创建的项目数量已达上限。"
+
+["err.server.project.quota_members"]
+other = "该项目的成员数量已达上限。"
+
+["err.server.project.quota_collaboration_roles"]
+other = "该项目的协作角色数量已达上限。"
+
+["err.server.project.quota_member_collaboration_roles"]
+other = "该成员的协作角色数量已达上限。"
+
+["err.server.project.quota_daily_create"]
+other = "你今天创建的项目数量已达上限。"
+
+["err.server.project.not_found"]
+other = "项目不存在。"
+
+["err.server.project.member_not_found"]
+other = "项目成员不存在。"
+
+["err.server.project.name_duplicated"]
+other = "该空间内已存在同名项目。"
+
+["err.server.project.collaboration_role_duplicated"]
+other = "该项目内已存在同名协作角色。"
+
+["err.server.project.last_owner_must_transfer"]
+other = "请先转让拥有者身份，再退出或降级。"
+
+["err.server.project.query_failed"]
+other = "查询项目数据失败。"
+
+["err.server.project.store_failed"]
+other = "保存项目数据失败。"
+
+# ---- modules/ai_team：我的 AI 团队 ----
+
+["err.server.ai_team.request_invalid"]
+other = "AI 团队请求参数有误。"
+
+["err.server.ai_team.disabled"]
+other = "AI 团队功能已被管理员关闭。"
+
+["err.server.ai_team.forbidden"]
+other = "你无权在当前空间使用该 AI。"
+
+["err.server.ai_team.not_found"]
+other = "AI 团队资源不存在。"
+
+["err.server.ai_team.idempotency_conflict"]
+other = "该幂等键已用于不同的请求。"
+
+["err.server.ai_team.container_protected"]
+other = "AI 会话专用群不能通过普通群接口修改。"
+
+["err.server.ai_team.store_failed"]
+other = "保存 AI 团队数据失败。"
+
+["err.server.ai_team.im_unavailable"]
+other = "AI 会话尚未就绪，请稍后重试。"
+
+["err.server.group.project_member_required"]
+other = "只有该项目的成员才能被加入这个群聊。"
+
+["err.server.group.all_member_group_protected"]
+other = "这是项目的全员群，请到项目中管理成员。"
+
+["err.server.group.project_unavailable"]
+other = "该项目不可用。"

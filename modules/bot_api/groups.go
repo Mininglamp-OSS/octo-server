@@ -13,9 +13,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/gin-gonic/gin"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -48,12 +50,12 @@ func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	var err error
 	if spaceID != "" {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ?",
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose = ''",
 			robotID, spaceID,
 		).Load(&groups)
 	} else {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0",
+			"SELECT gm.group_no, g.name, g.space_id FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.purpose = ''",
 			robotID,
 		).Load(&groups)
 	}
@@ -518,6 +520,9 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	groupNo := c.Param("group_no")
+	if ba.rejectAIContainerMutation(c, groupNo) {
+		return
+	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
@@ -592,6 +597,9 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	groupNo := c.Param("group_no")
+	if ba.rejectAIContainerMutation(c, groupNo) {
+		return
+	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
@@ -677,6 +685,9 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	groupNo := c.Param("group_no")
+	if ba.rejectAIContainerMutation(c, groupNo) {
+		return
+	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
@@ -685,11 +696,21 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	}
 
 	// 解散守卫（企业微信式只读）：群解散后禁止 bot 移除成员。
-	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
-		ba.Error("查询群是否已解散错误", zap.Error(err))
+	//
+	// project_id 与 status 同一条查询读回，供下面的 D7 守卫短路用——Space 直属群
+	// 因此在这条路径上也是零额外查询（C1）。
+	groupStatus, groupProjectID, err := ba.queryGroupStatusAndProject(groupNo)
+	if err != nil {
+		// A missing group row arrives as dbr.ErrNotFound and is refused here, the
+		// same as before this handler read the two columns together. Answering
+		// "not disbanded, no project" for a group that does not exist would let the
+		// request walk past both guards to be refused later by ExistMember — a
+		// different code, a later stage, and one fewer signal.
+		ba.Error("查询群状态失败", zap.Error(err), zap.String("groupNo", groupNo))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
-	} else if disbanded {
+	}
+	if groupStatus == group.GroupStatusDisband {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 		return
 	}
@@ -766,6 +787,29 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 		}
 	}
 
+	// D7 —— 项目全员群里不能踢人，这条路径也不例外。
+	//
+	// Web 侧的守卫挂在 handler 上，而这个接口**直接调服务层原语**，绕过了它。
+	// 服务层不能挡（P1 的项目级联、Space 级联、BotFather 删 bot 都从那里走），
+	// 所以每一个直调服务层的 handler 都要自己挡一次——这就是其中一个。
+	//
+	// 不挡的话，一个 bot_admin 能把普通成员从全员群里踢掉，而他的项目席位纹丝不动：
+	// I4 出现一个缺口，且没有任何东西会修复——席位没变，级联不会再看它，准入器只在
+	// 新加入时跑。
+	if protected, perr := ba.isProjectAllMemberGroup(groupNo, groupProjectID); perr != nil {
+		// 放行并记日志，与 Web 侧守卫同一个取舍：这道守卫保护的是产品语义而不是
+		// 安全边界，fail-closed 会让一次数据库抖动变成"所有项目群都踢不了人"。
+		//
+		// 与 Web 侧共用同一个计数器：仪表盘上"D7 还在判定吗"这个问题应该只问一次。
+		projectpkg.AllMemberGroupGuardFailures.WithLabelValues("remove").Inc()
+		ba.Error("判定是否为项目全员群失败，放行本次移除", zap.Error(perr), zap.String("groupNo", groupNo))
+	} else if protected {
+		ba.Warn("拒绝 bot 从项目全员群移除成员，请走项目侧入口",
+			zap.String("groupNo", groupNo), zap.String("robotID", robotID))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIAllMemberGroupProtected, nil, nil)
+		return
+	}
+
 	removeResp, err := ba.groupService.RemoveGroupMembers(&group.RemoveGroupMembersServiceReq{
 		GroupNo:      groupNo,
 		Members:      filteredMembers,
@@ -779,6 +823,28 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	}
 
 	c.Response(map[string]interface{}{"ok": true, "removed": removeResp.Removed})
+}
+
+func (ba *BotAPI) rejectAIContainerMutation(c *wkhttp.Context, groupNo string) bool {
+	protected, err := aiteampkg.IsProtectedGroup(ba.ctx.DB(), groupNo)
+	if err != nil {
+		ba.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", groupNo))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return true
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		return true
+	}
+	return false
+}
+
+func (ba *BotAPI) protectAIContainerMutation(c *wkhttp.Context) {
+	if ba.rejectAIContainerMutation(c, c.Param("group_no")) {
+		c.Abort()
+		return
+	}
+	c.Next()
 }
 
 // sendGroupMdNotification sends GROUP.md event notification.
@@ -813,4 +879,25 @@ func (ba *BotAPI) sendGroupMdNotification(groupNo string, updatedBy string, vers
 		FromUID:     updatedBy,
 		Payload:     []byte(util.ToJson(payload)),
 	})
+}
+
+// isProjectAllMemberGroup reports whether groupNo is the all-member group of the
+// project it belongs to.
+//
+// Reads group.project_id directly, as this module already reads the `group`
+// table elsewhere, and defers the judgement to pkg/project so the bot API and
+// the Web handlers cannot drift about what "the all-member group" means.
+//
+// A Space-direct group short-circuits with no project query at all: this runs on
+// a member-removal path, and a check that runs and passes is still latency on
+// every ordinary removal.
+func (ba *BotAPI) isProjectAllMemberGroup(groupNo, projectID string) (bool, error) {
+	if groupNo == "" || projectID == "" {
+		// C1: a Space-direct group costs zero queries here. projectID comes from the
+		// row this handler already read for its disband check, so the caller pays
+		// nothing for it — which is what the Web-side guard gets for free from the
+		// group row its handlers have in hand.
+		return false, nil
+	}
+	return projectpkg.IsAllMemberGroup(ba.ctx.DB(), projectID, groupNo)
 }

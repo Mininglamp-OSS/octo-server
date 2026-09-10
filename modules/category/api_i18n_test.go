@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 
@@ -30,7 +31,21 @@ func httperrL(c *wkhttp.Context, code codes.Code) {
 // trip the guard. The c.Error(...) zap LOG calls are not responses and are
 // intentionally allowed (they match neither banned token).
 func TestCategoryNoLegacyResponseError(t *testing.T) {
-	files := []string{"api.go"}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read category source directory: %v", err)
+	}
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "api") || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		files = append(files, entry.Name())
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		t.Fatal("no category API source files found")
+	}
 	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", "c.Response(\""}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {
@@ -232,6 +247,14 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "不属于任何空间",
+		},
+		{
+			name:            "ErrCategoryProjectGroupCannotCategorize surfaces conflict zh-CN copy",
+			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrCategoryProjectGroupCannotCategorize) },
+			wantCodeID:      "err.server.category.project_group_cannot_categorize",
+			wantSemStatus:   http.StatusConflict,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "项目群组不能加入手动分类",
 		},
 		{
 			name:            "ErrCategoryQueryFailed (Internal=true) collapses to shared internal copy",

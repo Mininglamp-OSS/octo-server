@@ -62,3 +62,21 @@ func TestHaveCommonSpaceEmptyArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckMembershipForCleanupEmptyArgs(t *testing.T) {
+	ok, err := CheckMembershipForCleanup(nil, "", "uid1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("expected false for empty spaceID")
+	}
+
+	ok, err = CheckMembershipForCleanup(nil, "space1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("expected false for empty uid")
+	}
+}

@@ -2,7 +2,7 @@
 
 // Docs-notify E2E: end-to-end proof that a POST to the real
 // /v1/internal/notify handler with a structured DocsCard field results in a
-// type-17 card persisted in WuKongIM under the /d/{doc_id}?sp={space_id}
+// type-17 card persisted in WuKongIM under the /d/{doc_id}
 // deep link, delivered by the shared notification bot. Mirrors
 // summary_card_wukongim_test.go — same integration stack requirements
 // (MySQL 127.0.0.1:3306 root/demo/test, Redis 127.0.0.1:6379,
@@ -88,7 +88,7 @@ type wkhttpRouter interface {
 // contract body to the real POST /v1/internal/notify handler, has
 // modules/notify build the docs card server-side, and confirms the type-17
 // card persisted in WuKongIM carries the docs-flavoured deep link
-// (/d/{doc_id}?sp={space}) and the reserved metadata.octo.variant identifier.
+// (/d/{doc_id}) and the reserved metadata.octo.variant identifier.
 func TestDocsNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
@@ -163,8 +163,8 @@ func TestDocsNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 
 	payloadJSON := compactJSON(msg)
 	// Deep-link points at octo-web /d/:docId (already live) — not /s/:taskId.
-	assert.Contains(t, payloadJSON, "https://im.example.com/d/d_pilote2e_http?sp="+e2eSpaceID,
-		"docs deep-link must be /d/{doc_id}?sp={space} — that's the whole reason for a separate producer")
+	assert.Contains(t, payloadJSON, "https://im.example.com/d/d_pilote2e_http",
+		"docs deep-link must be /d/{doc_id} — that's the whole reason for a separate producer")
 	// Reserved namespace variant identifier so renderers can style docs cards
 	// distinctly from summary cards later without re-parsing content.
 	assert.Contains(t, payloadJSON, `"variant":"docs.shared"`,
@@ -258,7 +258,7 @@ func TestSummaryAndDocsNotify_NoRegression(t *testing.T) {
 			if bytes.Contains([]byte(pj), []byte("/s/TN_regression_1?sp="+e2eSpaceID)) {
 				sawSummary = true
 			}
-			if bytes.Contains([]byte(pj), []byte("/d/d_regression_1?sp="+e2eSpaceID)) {
+			if bytes.Contains([]byte(pj), []byte("/d/d_regression_1")) {
 				sawDocs = true
 			}
 		}

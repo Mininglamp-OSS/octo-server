@@ -44,13 +44,17 @@
 3. **禁止客户端手搓 type-17 map**:Decision 14 仍生效 —— `payload` 若被
    `cardmsg.IsCardPayload` 判为卡片(`type=17`)一律 400
    `err.server.notify.card_not_allowed`,无论走 `Card` 还是 `DocsCard`。
-4. **响应契约不变**:仍返回 `NotifyResp{delivered:[], filtered:{uid:reason}}`。
-   reason 词表与 summary 一致(`not_space_member` / `target_denied`
-   / `dispatch_failed` / `busy` / `send_failed`) —— docs-backend 可**照抄**
-   smart-summary 的 dedup / retry / sweep 状态机。
+4. **响应结构不变**:仍返回 `NotifyResp{delivered:[], filtered:{uid:reason}}`。
+   通用 reason 词表与 summary 一致(`not_space_member` / `target_denied`
+   / `dispatch_failed` / `busy` / `send_failed`)。`commented` 另有终态 reason
+   `bot_recipient`:普通 Bot 和系统 Bot 不接收普通评论通知,调用方不得重试;
+   该过滤先于 Space 成员校验,因此非成员 Bot 也返回 `bot_recipient`,而不是
+   `not_space_member`;Bot 身份查询失败时整次请求失败且零投递。过滤不依赖
+   `doc_comment_mention` 的 feature gate 或 allowlist:专用事件未启用或文档未
+   命中 allowlist 时,对 Bot 保持静默是有意行为。其他 docs card kind 不受影响。
 5. **模板/文案/链接归属 octo-server**:docs-backend **只发原始字段**;卡片布局、
    按钮文案(查看详情)、FactSet 标签(操作人 / 时间)、attribution
-   (「Alice 分享了文档」)、`/d/{doc_id}?sp={space_id}` deep-link、
+   (「Alice 分享了文档」)、`/d/{doc_id}` deep-link、
    `metadata.octo.variant` / `metadata.octo.source` 全部由 octo-server
    `pkg/cardtmpl` + `modules/notify.buildDocsCard` + `i18n.OutboundLanguage`
    生成。docs-backend 不再拼「XX 分享了 <link>」这类降级文本(旧字段作废;
@@ -74,6 +78,9 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
     "kind":       "shared",            // "shared" | "commented" | "access_requested"
     "title":      "产品设计方案",         // 原始标题(server 负责转义/截断)
     "actor_name": "Alice",             // 预格式化的操作人显示名;空则用「有人」/「Someone」兜底
+    "requester_space_name": "产品空间",  // access_requested 可选;申请人来源 Space 展示名
+    "requested_bot_names": ["助手 A"],   // access_requested 可选;最多 50 项,每项最多 120 runes
+    "requested_role": "reader",         // access_requested: reader | commenter | writer | admin
     "excerpt":    "Q3 上线计划已确认",    // 可选预览/评论/申请说明;≤ 300 runes 截断
     "updated_at": "2026-07-13 15:04"   // 已格式化的时间字符串;空则省略「时间」行
   }
@@ -85,7 +92,7 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
 
 ## 三个约定（对齐 summary-notify）
 
-- **标识 `doc_id`(不是自增 `id`)**:deep-link `/d/{doc_id}?sp={space_id}` 用
+- **标识 `doc_id`(不是自增 `id`)**:deep-link `/d/{doc_id}` 用
   docs-backend 侧不可枚举的文档标识 —— 与 octo-web `/d/:docId` 独立路由
   (已在线;冷加载 + 登录跳转 + XIN-398 多会话 sid 恢复)对齐。**这是 docs-notify
   与 summary-notify 的关键差异:docs 侧「查看详情」按钮开箱可用**,
@@ -108,6 +115,9 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
 | `kind` | 触发场景:分享 = `shared`;评论 = `commented`;访问申请 = `access_requested` |
 | `title` | 文档 `title` 字段(空则用「无标题」兜底 —— docs-backend 侧决策) |
 | `actor_name` | 触发者的显示名(docs-backend 已 resolve;匿名场景可留空) |
+| `requester_space_name` | 访问申请人的来源 Space 展示名；可空，octo-server 截断到 200 runes |
+| `requested_bot_names` | 同时申请权限的 AI 助手展示名；可空，最多 50 项，每项截断到 120 runes |
+| `requested_role` | 访问申请角色；允许 `reader | commenter | writer | admin`（大小写不敏感）；空值兼容旧调用并按 `reader` 展示；未知非空值按契约错误拒绝，整次通知零投递 |
 | `excerpt` | 分享:留空 / 简短介绍;评论:评论内容摘要;访问申请:申请理由 |
 | `updated_at` | 触发事件的时间戳格式化字符串(docs-backend 时区) |
 
@@ -145,7 +155,7 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
    - per-recipient dedup(避免同一评论触发多次通知);
    - 消费 `NotifyResp{delivered,filtered}` —— 只认 `delivered[]` 判真送达,
      `filtered` 内标记为 `not_space_member` / `busy` / `dispatch_failed` 的
-     可延时重试;
+     可按业务延时重试;`bot_recipient` 是终态过滤,不得重试;
    - **不实现自身文本降级路径** —— server 侧已负责;发失败即上报错误让
      调用方按业务重试(与 smart-summary 侧的 `Sweep` 一致)。
 

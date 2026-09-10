@@ -213,18 +213,18 @@ func TestLegacyDocsNotificationsReachTransportWithRenderProfile(t *testing.T) {
 	}
 }
 
-func TestDocsApplicantOutcomesReachTransportWithRenderProfile(t *testing.T) {
+func TestDocsTerminalMutationsDoNotSendApplicantOutcomeToTransport(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		state       cardactiondispatch.State
-		inputs      map[string]interface{}
-		wantVariant string
+		name       string
+		state      cardactiondispatch.State
+		inputs     map[string]interface{}
+		wantStatus string
 	}{
-		{name: "approved", state: cardactiondispatch.StateApproved, wantVariant: "docs.access_granted"},
+		{name: "approved", state: cardactiondispatch.StateApproved, wantStatus: "已允许"},
 		{
 			name: "denied", state: cardactiondispatch.StateDenied,
-			inputs:      map[string]interface{}{cardtmpl.DocsDenyReasonInputID: "scope mismatch"},
-			wantVariant: "docs.access_denied",
+			inputs:     map[string]interface{}{cardtmpl.DocsDenyReasonInputID: "scope mismatch"},
+			wantStatus: "已拒绝",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,8 +232,9 @@ func TestDocsApplicantOutcomesReachTransportWithRenderProfile(t *testing.T) {
 			defer wk.close()
 			ctx := newTestContext(t, wk)
 			ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
-			sender, transport := newPlatformDispatchSender(t, cardmsg.ProfileV1, "")
-			finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{}, sender)
+			_, transport := newPlatformDispatchSender(t, cardmsg.ProfileV1, "")
+			mutator := &captureCardMutator{}
+			finalizer, err := NewDocsActionFinalizer(ctx, mutator)
 			require.NoError(t, err)
 
 			err = finalizer.Finalize(context.Background(), cardactiondispatch.Event{
@@ -250,11 +251,18 @@ func TestDocsApplicantOutcomesReachTransportWithRenderProfile(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			payload := requirePlatformTransportPayload(t, transport, cardmsg.ProfileV1)
-			card := payload["card"].(map[string]interface{})
-			metadata := card["metadata"].(map[string]interface{})
-			octo := metadata["octo"].(map[string]interface{})
-			assert.Equal(t, tc.wantVariant, octo["variant"])
+			// A Docs decision has one terminal surface: mutate the original request
+			// card. It must not enqueue a separate approved/denied applicant card.
+			require.Len(t, mutator.requests, 1)
+			mutation := mutator.requests[0]
+			assert.Equal(t, "message-1", mutation.MessageID)
+			assert.Equal(t, "reviewer-1", mutation.ChannelID)
+			assert.Contains(t, mutation.ContentEdit, tc.wantStatus)
+			assert.NotContains(t, mutation.ContentEdit, "Action.Submit")
+			if tc.state == cardactiondispatch.StateDenied {
+				assert.Contains(t, mutation.ContentEdit, "scope mismatch")
+			}
+			assert.Empty(t, transport.snapshot(), "must not send a second applicant outcome card")
 		})
 	}
 }

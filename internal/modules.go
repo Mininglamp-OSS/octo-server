@@ -22,6 +22,7 @@ package modules
 // 引入模块
 import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/agentmailgateway"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/ai_team"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 
@@ -30,6 +31,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 
 	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_mention"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_task"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 
 	_ "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
@@ -49,6 +51,10 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/oidc"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/opanalytics"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/openapi"
+	// `project` is the Space-internal collaboration layer. It imports modules/space
+	// (reverse-registered member-removal cleanup step); modules/space imports it back from
+	// nowhere, and modules/group will import it in P1.
+	_ "github.com/Mininglamp-OSS/octo-server/modules/project"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/qrcode"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/report"
 	// PR-C: modules/runtime removed; runtime/bot orchestration owned by

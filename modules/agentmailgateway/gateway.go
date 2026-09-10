@@ -22,8 +22,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -31,15 +33,20 @@ const (
 	envGatewaySecret  = "OCTO_MAIL_GATEWAY_SECRET"
 	envGatewayTimeout = "OCTO_MAIL_GATEWAY_TIMEOUT"
 
-	gatewayRoutePrefix          = "/v1/mail-gateway"
-	mailAPIPrefix               = "/webapi/v0"
-	maxRequestBytes             = int64(64 << 20)
-	maxResponseBytes            = int64(64 << 20)
-	largeRequestThreshold       = int64(1 << 20)
-	maxConcurrentLargeRequests  = 4
-	maxInFlightRequestBodyBytes = maxConcurrentLargeRequests * maxRequestBytes
-	defaultLargeRequestSlotWait = 5 * time.Second
-	defaultTimeout              = 30 * time.Second
+	gatewayRoutePrefix             = "/v1/mail-gateway"
+	mailAPIPrefix                  = "/webapi/v0"
+	maxRequestBytes                = int64(64 << 20)
+	maxResponseBytes               = int64(64 << 20)
+	largeRequestThreshold          = int64(1 << 20)
+	maxConcurrentLargeRequests     = 4
+	maxConcurrentBufferedResponses = 4
+	maxInFlightRequestBodyBytes    = maxConcurrentLargeRequests * maxRequestBytes
+	maxInFlightResponseBodyBytes   = maxConcurrentBufferedResponses * maxResponseBytes
+	responseBufferChunkBytes       = 256 << 10
+	defaultLargeRequestSlotWait    = 5 * time.Second
+	defaultResponseBodyBudgetWait  = 5 * time.Second
+	defaultTimeout                 = 30 * time.Second
+	provisioningCacheEntries       = 4096
 )
 
 var allowedMethods = map[string]struct{}{
@@ -49,10 +56,11 @@ var allowedMethods = map[string]struct{}{
 }
 
 var (
-	errGatewayNotConfigured  = errors.New("Agent Mail gateway is not configured")
-	errBodyTooLarge          = errors.New("body exceeds gateway limit")
-	errLargeRequestSlotWait  = errors.New("timed out waiting for a large request slot")
-	errRequestBodyBudgetWait = errors.New("timed out waiting for request body budget")
+	errGatewayNotConfigured   = errors.New("Agent Mail gateway is not configured")
+	errBodyTooLarge           = errors.New("body exceeds gateway limit")
+	errLargeRequestSlotWait   = errors.New("timed out waiting for a large request slot")
+	errRequestBodyBudgetWait  = errors.New("timed out waiting for request body budget")
+	errResponseBodyBudgetWait = errors.New("timed out waiting for response body budget")
 )
 
 type gatewayConfig struct {
@@ -76,19 +84,29 @@ type Gateway struct {
 	largeRequestSlots    chan struct{}
 	largeRequestSlotWait time.Duration
 	requestBodyBudget    *semaphore.Weighted
+	// responseBodyBudget reserves the worst-case size for each buffered HTTP/2
+	// response and remains held until the buffered body is written downstream.
+	responseBodyBudget     *semaphore.Weighted
+	responseBodyBudgetWait time.Duration
+	provisionIdentity      func(context.Context, string, string) error
+	resolveLocalpart       func(context.Context, string) (string, error)
+	provisioned            *lru.Cache[string, struct{}]
+	provisioningFlights    singleflight.Group
 }
 
 func New(ctx *config.Context) *Gateway {
 	cfg, err := loadGatewayConfig()
 	g := &Gateway{
-		ctx:                  ctx,
-		Log:                  log.NewTLog("AgentMailGateway"),
-		cfg:                  cfg,
-		now:                  time.Now,
-		nonceSource:          randomNonceSource(),
-		largeRequestSlots:    make(chan struct{}, maxConcurrentLargeRequests),
-		largeRequestSlotWait: defaultLargeRequestSlotWait,
-		requestBodyBudget:    semaphore.NewWeighted(maxInFlightRequestBodyBytes),
+		ctx:                    ctx,
+		Log:                    log.NewTLog("AgentMailGateway"),
+		cfg:                    cfg,
+		now:                    time.Now,
+		nonceSource:            randomNonceSource(),
+		largeRequestSlots:      make(chan struct{}, maxConcurrentLargeRequests),
+		largeRequestSlotWait:   defaultLargeRequestSlotWait,
+		requestBodyBudget:      semaphore.NewWeighted(maxInFlightRequestBodyBytes),
+		responseBodyBudget:     semaphore.NewWeighted(maxInFlightResponseBodyBytes),
+		responseBodyBudgetWait: defaultResponseBodyBudgetWait,
 	}
 	if err != nil {
 		if errors.Is(err, errGatewayNotConfigured) {
@@ -98,6 +116,13 @@ func New(ctx *config.Context) *Gateway {
 		}
 	}
 	g.client = newGatewayHTTPClient(cfg.timeout)
+	if cache, cacheErr := lru.New[string, struct{}](provisioningCacheEntries); cacheErr == nil {
+		g.provisioned = cache
+	} else {
+		g.Error("Agent Mail provisioning cache is unavailable", zap.Error(cacheErr))
+	}
+	g.provisionIdentity = g.provisionGatewayIdentity
+	g.resolveLocalpart = g.gatewayLocalpart
 	return g
 }
 
@@ -197,6 +222,11 @@ func (g *Gateway) proxy(c *wkhttp.Context) {
 	}
 	if c.Request.ContentLength > maxRequestBytes {
 		respondGatewayError(c, errcode.ErrAgentMailGatewayPayloadTooLarge)
+		return
+	}
+	if err := g.ensureProvisioned(c.Request.Context(), uid, spaceID); err != nil {
+		g.Warn("Failed to provision Agent Mail gateway identity", zap.String("uid", uid), zap.String("space_id", spaceID), zap.Error(err))
+		respondGatewayError(c, errcode.ErrAgentMailGatewayUnavailable)
 		return
 	}
 	releaseLargeRequest, err := g.acquireLargeRequestSlot(c.Request)
@@ -339,6 +369,26 @@ func (g *Gateway) proxy(c *wkhttp.Context) {
 		respondGatewayError(c, errcode.ErrAgentMailGatewayBadResponse)
 		return
 	}
+	if unknownLength && c.Request.ProtoMajor >= 2 {
+		releaseResponseBodyBudget, err := g.acquireResponseBodyBudget(c.Request.Context())
+		if err != nil {
+			respondGatewayError(c, errcode.ErrAgentMailGatewayUnavailable)
+			return
+		}
+		defer releaseResponseBodyBudget()
+		// The gateway cannot reliably expose a later upstream truncation after an
+		// HTTP/2 status is committed. Validate the complete bounded body first, then
+		// forward it as a known-length response.
+		bufferedBody, bufferedLength, err := readBoundedResponseBody(response.Body, maxResponseBytes)
+		if err != nil {
+			g.Error("Agent Mail upstream response could not be buffered safely", zap.Error(err))
+			respondGatewayError(c, errcode.ErrAgentMailGatewayBadResponse)
+			return
+		}
+		response.Body = io.NopCloser(bufferedBody)
+		response.ContentLength = bufferedLength
+		unknownLength = false
+	}
 	if unknownLength && !(c.Request.ProtoMajor == 1 && c.Request.ProtoMinor >= 1) {
 		g.Error("Agent Mail response stream cannot expose truncation to a non-HTTP/1.1 client")
 		respondGatewayError(c, errcode.ErrAgentMailGatewayBadResponse)
@@ -437,6 +487,52 @@ func readBoundedBody(reader io.Reader, limit int64) ([]byte, error) {
 		return nil, errBodyTooLarge
 	}
 	return body, nil
+}
+
+// readBoundedResponseBody retains the complete response in fixed-size chunks.
+// Unlike io.ReadAll, this avoids geometrically reallocating and copying a large
+// contiguous slice while preserving the validate-before-commit requirement.
+func readBoundedResponseBody(reader io.Reader, limit int64) (io.Reader, int64, error) {
+	if reader == nil {
+		return bytes.NewReader(nil), 0, nil
+	}
+	var (
+		chunks []io.Reader
+		total  int64
+	)
+	for total <= limit {
+		remaining := limit + 1 - total
+		chunkSize := int64(responseBufferChunkBytes)
+		if remaining < chunkSize {
+			chunkSize = remaining
+		}
+		chunk := make([]byte, int(chunkSize))
+		filled := 0
+		cleanEOF := false
+		for filled < len(chunk) {
+			n, err := reader.Read(chunk[filled:])
+			filled += n
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
+				return nil, 0, err
+			}
+			cleanEOF = true
+			break
+		}
+		if filled > 0 {
+			total += int64(filled)
+			chunks = append(chunks, bytes.NewReader(chunk[:filled]))
+		}
+		if total > limit {
+			return nil, 0, errBodyTooLarge
+		}
+		if cleanEOF {
+			return io.MultiReader(chunks...), total, nil
+		}
+	}
+	return nil, 0, errBodyTooLarge
 }
 
 func copyBoundedBody(dst io.Writer, src io.Reader, limit int64) error {
@@ -795,6 +891,31 @@ func (g *Gateway) acquireRequestBodyBudget(request *http.Request) (func(), error
 	var once sync.Once
 	return func() {
 		once.Do(func() { g.requestBodyBudget.Release(reservation) })
+	}, nil
+}
+
+func (g *Gateway) acquireResponseBodyBudget(ctx context.Context) (func(), error) {
+	if g.responseBodyBudget == nil {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	wait := g.responseBodyBudgetWait
+	if wait <= 0 {
+		wait = defaultResponseBodyBudgetWait
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	if err := g.responseBodyBudget.Acquire(waitCtx, maxResponseBytes); err != nil {
+		if ctx.Err() != nil {
+			return func() {}, ctx.Err()
+		}
+		return func() {}, errResponseBodyBudgetWait
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { g.responseBodyBudget.Release(maxResponseBytes) })
 	}, nil
 }
 

@@ -105,8 +105,13 @@ func New(ctx *config.Context) *Webhook {
 		}
 	}
 	if oppo.PackageName != "" {
-		pushMap[common.DeviceTypeOPPO] = map[string]Push{
-			ctx.GetConfig().Push.OPPO.PackageName: NewOPPOPush(oppo.AppID, oppo.AppKey, oppo.AppSecret, oppo.MasterSecret, ctx),
+		oppoPusher := NewOPPOPush(oppo.AppID, oppo.AppKey, oppo.AppSecret, oppo.MasterSecret, ctx)
+		if oppoPusher.configErr != nil {
+			log.Error("OPPO push configuration is invalid; pusher disabled", zap.Error(oppoPusher.configErr))
+		} else {
+			pushMap[common.DeviceTypeOPPO] = map[string]Push{
+				oppo.PackageName: oppoPusher,
+			}
 		}
 	}
 	if vivo.PackageName != "" {

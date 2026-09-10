@@ -28,7 +28,35 @@ func httperrL(c *wkhttp.Context, code codes.Code) {
 // guard. The c.ResponseError(common.ErrData.Error(), ...) zap LOG calls are not
 // responses and are intentionally allowed (they match neither banned token).
 func TestGroupNoLegacyResponseError(t *testing.T) {
-	files := []string{"api.go", "api_manager.go", "invite.go", "api_welcome.go"}
+	// The file list is DISCOVERED, not hard-coded.
+	//
+	// It used to be []string{"api.go", "api_manager.go", "invite.go",
+	// "api_welcome.go"}, and a hard-coded list cannot see a new file — which is
+	// the failure mode that matters, because nobody adds a handler by editing
+	// api.go, they add it by writing a new one. The task brief calls this shape
+	// out by name, and P1 adds three files to this package.
+	//
+	// Safe to widen: at the time of the change NO non-test file in this package
+	// contained any banned token, so scanning the directory flags nothing that
+	// the list was deliberately excluding. If a future file must genuinely keep
+	// a raw response (an OAuth2-style browser redirect, say), add it to
+	// tools/lint-direct-error-response/baseline.txt the way the repo already
+	// tracks those, rather than shrinking this scan back to a list.
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read modules/group: %v", err)
+	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files = append(files, name)
+	}
+	if len(files) == 0 {
+		t.Fatal("discovered no source files: the scan would pass vacuously")
+	}
 	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", "c.Response(\""}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {

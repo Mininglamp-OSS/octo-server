@@ -64,9 +64,17 @@ func TestV3RegistersPendingAndResultWithoutMutatingV2(t *testing.T) {
 			if !strings.Contains(text, "申请原因") || !strings.Contains(text, "林澈") {
 				t.Errorf("RenderCard(%s) dropped result handoff context: %s", tc.state, text)
 			}
-			if !strings.Contains(text, "Q3 产品规划") || !strings.Contains(text, tc.permission) ||
-				!strings.Contains(text, "处理于 刚刚") {
+			if !strings.Contains(text, "Q3 产品规划") || !strings.Contains(text, tc.permission) {
 				t.Errorf("RenderCard(%s) dropped source/permission context: %s", tc.state, text)
+			}
+			if !strings.Contains(text, "申请于") || !strings.Contains(text, "处理于 刚刚") {
+				t.Errorf("RenderCard(%s) dropped terminal footer times: %s", tc.state, text)
+			}
+			if !strings.Contains(text, `"text":"林澈"`) {
+				t.Errorf("RenderCard(%s) dropped operator below processed time: %s", tc.state, text)
+			}
+			if strings.Contains(text, "申请人已获得") || strings.Contains(text, `"style":"good"`) {
+				t.Errorf("RenderCard(%s) retained duplicate terminal result block: %s", tc.state, text)
 			}
 			if tc.state == docsaccessrequest.StateRejected && !strings.Contains(text, "信息不完整") {
 				t.Errorf("RenderCard(rejected) dropped rejection reason: %s", text)
@@ -293,5 +301,112 @@ func TestV3UsesStableRenderProfileWithoutChangingV2(t *testing.T) {
 	}
 	if _, ok := v2["render_profile"]; ok {
 		t.Error("frozen 0.2.0 must remain on the legacy renderer")
+	}
+}
+
+func TestV3PendingRendersRequestedBotNamesAndSourceSpaceWithoutEmptyReason(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	fields := json.RawMessage(`{
+		"requestId":"r1","state":"pending",
+		"document":{"docId":"d1","title":"测试"},
+		"requester":{"name":"超级管理员","sourceSpaceName":"123"},
+		"permission":{"roleLabel":"可评论"},
+		"requestReason":"",
+		"requestedBotNames":["小呆呆","猪猪侠"]
+	}`)
+	payload, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, docsaccessrequest.StatePending, fields,
+		cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, want := range []string{"申请者：", "超级管理员", "123", "申请权限：", "可评论", "同时申请权限的 AI 助手（2）", "小呆呆、猪猪侠"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("card missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "申请原因") {
+		t.Fatalf("empty reason section rendered: %s", text)
+	}
+	if strings.Contains(text, "申请成为此文档") {
+		t.Fatalf("duplicate request banner rendered: %s", text)
+	}
+	if strings.Contains(text, "?sp=") {
+		t.Fatalf("Docs deep link retained legacy sp: %s", text)
+	}
+}
+
+func TestV3PendingCapsVisibleBotNames(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	fields := json.RawMessage(`{
+		"requestId":"r-many","state":"pending",
+		"document":{"docId":"d-many","title":"测试"},
+		"requester":{"name":"申请人","sourceSpaceName":"test Space"},
+		"permission":{"roleLabel":"可评论"},
+		"requestedBotNames":["助手1","助手2","助手3","助手4","助手5","助手6","助手7","助手8","助手9","助手10"]
+	}`)
+	payload, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3,
+		docsaccessrequest.StatePending, fields,
+		cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, want := range []string{"test Space", "申请权限：", "可评论", "同时申请权限的 AI 助手（10）", "等 3 个"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("card missing %q: %s", want, text)
+		}
+	}
+	// Full names remain in server-authored submit data so terminal cards preserve
+	// context; only the visible TextBlock is capped.
+	if !strings.Contains(text, `"text":"助手1、助手2、助手3、助手4、助手5、助手6、助手7，等 3 个"`) ||
+		!strings.Contains(text, `"maxLines":2`) {
+		t.Fatalf("visible Bot summary was not capped to two lines: %s", text)
+	}
+}
+
+func TestV3PendingTruncatesSingleOversizedBotNameToOneLine(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	const longName = "这是一个非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常长的助手名称"
+	fields := json.RawMessage(`{
+		"requestId":"r-long","state":"pending",
+		"document":{"docId":"d-long","title":"测试"},
+		"requester":{"name":"申请人"},
+		"permission":{"roleLabel":"只读"},
+		"requestedBotNames":["` + longName + `"]
+	}`)
+	payload, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3,
+		docsaccessrequest.StatePending, fields,
+		cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	if !strings.Contains(text, `非常非常非常非…`) || !strings.Contains(text, `"maxLines":2`) {
+		t.Fatalf("oversized Bot name was not capped to two visible lines: %s", text)
+	}
+	if !strings.Contains(text, `"requested_bot_names":["`+longName+`"]`) {
+		t.Fatalf("full Bot name was not preserved in action data: %s", text)
 	}
 }

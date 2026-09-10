@@ -45,10 +45,48 @@ func TestMain(m *testing.M) {
 		// package's main_test.go already sets the correct collation here;
 		// keep group's manually-built fixture in sync.
 		db.Exec("CREATE TABLE IF NOT EXISTS `robot` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `token` VARCHAR(100) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `status` SMALLINT NOT NULL DEFAULT 1, `creator_uid` VARCHAR(40) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
-		db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS `robot_id_robot_index` ON `robot` (`robot_id`)")
+		// MySQL 8.0 不支持 `CREATE INDEX ... IF NOT EXISTS`（那是 MariaDB/Postgres
+		// 的写法），原来的写法每次都以 1064 语法错误静默失败——db.Exec 的 error
+		// 没人看，于是这两个索引在本 package 的测试库里从来就不存在。
+		//
+		// 后果不只是「少个索引」：级联移除用的
+		//   SELECT ... FROM group_member gm JOIN robot r ON r.robot_id = gm.uid
+		//   WHERE ... AND r.creator_uid = ? FOR UPDATE
+		// 在没有 idx_robot_creator_uid 时退化成 robot 全表扫描，且因为带 FOR UPDATE，
+		// 会把**整张 robot 表**加上 X 锁。实测：无索引时 120 次高争用并发操作里有 8 次
+		// 撞上 MySQL 死锁（1213）；补上索引后 360 次并发操作 0 死锁。也就是说测试库
+		// 此前一直在跑一个比线上严苛得多、且与线上不同的锁形态。
+		//
+		// 线上这两个索引由 modules/robot 的迁移建立
+		// （20210926000001 建 robot_id 唯一索引，20260226000002 建 idx_robot_creator_uid），
+		// 但 modules/robot 不在本 package 的依赖集里，迁移不会跑，只能在这里手工对齐。
+		ensureRobotTestIndex(db, "robot_id_robot_index",
+			"CREATE UNIQUE INDEX `robot_id_robot_index` ON `robot` (`robot_id`)")
+		ensureRobotTestIndex(db, "idx_robot_creator_uid",
+			"CREATE INDEX `idx_robot_creator_uid` ON `robot` (`creator_uid`)")
 		db.Exec("CREATE TABLE IF NOT EXISTS `robot_menu` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `cmd` VARCHAR(100) NOT NULL DEFAULT '', `remark` VARCHAR(100) NOT NULL DEFAULT '', `type` VARCHAR(100) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 	}
 	os.Exit(m.Run())
+}
+
+// ensureRobotTestIndex 幂等地补一个 robot 表索引：MySQL 没有 CREATE INDEX 的
+// IF NOT EXISTS，只能先查 information_schema 再建。建失败直接 panic —— 索引缺失
+// 会让 FOR UPDATE 级联查询退化成全表加锁，静默吞掉正是这段代码原来的 bug。
+func ensureRobotTestIndex(db *sql.DB, indexName, ddl string) {
+	var n int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM information_schema.STATISTICS "+
+			"WHERE table_schema = DATABASE() AND table_name = 'robot' AND index_name = ?",
+		indexName,
+	).Scan(&n); err != nil {
+		panic("check robot test index " + indexName + ": " + err.Error())
+	}
+	if n > 0 {
+		return
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		panic("create robot test index " + indexName + ": " + err.Error())
+	}
 }
 
 func ensureGroupCategorySchema(t *testing.T, ctx *config.Context) {

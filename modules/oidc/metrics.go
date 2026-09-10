@@ -81,9 +81,69 @@ func bindResultLabels() []string {
 	}
 }
 
+// exchangeResultLabels /exchange 端点的结果维度。失败原因收敛到很少几类,
+// 因为该端点是反枚举的(401 一个码吞掉所有 IdP 侧失败),细分只用于内部可观测。
+func exchangeResultLabels() []string {
+	return []string{
+		"ok",
+		"bad_request",          // 400:JSON 错 / access_token 空
+		"identity_fail",        // 401:IdP 拒绝 / 信封失败 / 网络错误
+		"resolve_fail",         // 401:ResolveOrLink 失败(冲突/内部错)
+		"issue_fail",           // 401:IssueSession 失败
+		"identity_insert_fail", // 401:identity 行写入失败(非 duplicate)
+		"race_recovered",       // 200:并发首登竞态,已恢复
+
+		// 凭据归属判定的五个结果,全部是"外呼前就地拒绝"。它们的出现次数是观测
+		// "有客户端在往错误端点发凭据"的唯一信号,所以必须能被预先告警 ——
+		// 覆盖完整性由 metrics_label_coverage_test.go 扫源码钉住。
+		"own_business_jwt",     // 401:业务 JWT 发到了 /exchange(该发 /exchange-jwt)
+		"own_credential",       // 401:会话 token / uk_ / bf_ / app_
+		"unverifiable_jwt",     // 401:JWT 形态但验签器未配置,无法归属
+		"provenance_undecided", // 500:会话存储不可用,判不出归属
+		"verifier_unavailable", // 500:验签器构造失败,拒绝一切凭据
+	}
+}
+
+// exchangeJWTResultLabels /exchange-jwt 端点结果维度。与 /exchange 保持同样的
+// 收敛策略,只是 identity_fail 在本地验签下对应"签名错/过期/claims 非法"。
+func exchangeJWTResultLabels() []string {
+	return []string{
+		"ok",
+		"bad_request",          // 400:JSON 错 / access_token 空
+		"token_rejected",       // 401:HS256 签名错 / exp 过期 / userId 缺失
+		"resolve_fail",         // 401:ResolveOrLink 失败
+		"issue_fail",           // 401:IssueSession 失败
+		"identity_insert_fail", // 401:identity 行写入失败(非 duplicate)
+		"race_recovered",       // 200:并发首登竞态,已恢复
+
+		// 401:验签通过,但兑换台账拒绝(首次兑换超过 F / 距上次兑换超过 T)。
+		// 与 token_rejected 分开:前者是"这张凭据不成立",后者是"凭据成立但这次
+		// 兑换不该发生"。两条曲线混在一起,就没法回答"客户端是不是拿旧 token 在
+		// 反复兑换"这个问题。细分原因在 exchange_jwt_redemption_total 上。
+		"redeem_refused",
+	}
+}
+
+// initialSpaceJoinResultLabels 「OIDC 建号自动加入初始 Space」的结果维度
+// (task oidc-auto-join-initial-space)。
+//
+// 取值与 space.InitialSpaceJoinOutcome 一一对应,那边是真源,这里只是把它列全好
+// 让 init 预热成零值序列。加分支时两边一起改,否则新 result 在 dashboard 上会
+// 以"凭空冒出的序列"出现。
+//
+// 这条曲线是该功能唯一的线上可观测入口:加入失败**不允许**影响登录,所以用户侧
+// 完全无感,只有 space_full / space_inactive / error 的计数会涨。运维告警应该挂
+// 在这三个 label 上,而不是等用户报"登录了但用不了"。
+func initialSpaceJoinResultLabels() []string {
+	return []string{"ok", "already_member", "space_full", "space_inactive", "error"}
+}
+
 // init 把每个声明的 label 都预热成 0 值序列。Prometheus 在没观察到样本前不会
 // 暴露 series,导致 Grafana"区分不出零次"和"未注册"两种状态。
 func init() {
+	for _, l := range initialSpaceJoinResultLabels() {
+		metricInitialSpaceJoinTotal.WithLabelValues(l).Add(0)
+	}
 	for _, l := range callbackResultLabels() {
 		metricCallbackTotal.WithLabelValues(l).Add(0)
 	}
@@ -107,6 +167,19 @@ func init() {
 		for _, r := range bindResultLabels() {
 			metricBindRequestTotal.WithLabelValues(ep, r).Add(0)
 		}
+	}
+	// /exchange 结果标签预热。
+	for _, l := range exchangeResultLabels() {
+		metricExchangeResult.WithLabelValues(l).Add(0)
+	}
+	// /exchange-jwt 结果标签预热。
+	for _, l := range exchangeJWTResultLabels() {
+		metricBearerExchangeResult.WithLabelValues(l).Add(0)
+	}
+	// 兑换台账判定结果预热。degraded_* 两个尤其需要预热:它们平时为零,而运维
+	// 要能在 Redis 故障**之前**就把告警挂上去。
+	for _, l := range redemptionOutcomeLabels() {
+		metricBearerRedemptionTotal.WithLabelValues(l).Add(0)
 	}
 }
 
@@ -179,4 +252,49 @@ var (
 		Help:      "End-to-end OIDC self-service bind handler latency in seconds.",
 		Buckets:   []float64{.02, .05, .1, .25, .5, 1, 2},
 	}, []string{"endpoint"})
+
+	// 只在"本次 callback / bind create 真的建了号"时 +1,所以它同时也是
+	// "OIDC 建号数"的近似计数;老用户重复登录不会碰它。
+	metricInitialSpaceJoinTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "initial_space_join_total",
+		Help:      "Auto-join of an OIDC-created account into the configured initial Space, by result (ok|already_member|space_full|space_inactive|error). Only counted when the account was actually created by this request.",
+	}, []string{"result"})
+
+	metricExchangeTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_total",
+		Help:      "Total number of /exchange requests entering the handler.",
+	})
+	metricExchangeResult = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_result_total",
+		Help:      "Total number of /exchange responses by terminal result.",
+	}, []string{"result"})
+
+	metricBearerExchangeTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_jwt_total",
+		Help:      "Total number of /exchange-jwt (bearer JWT) requests entering the handler.",
+	})
+	metricBearerExchangeResult = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_jwt_result_total",
+		Help:      "Total number of /exchange-jwt responses by terminal result.",
+	}, []string{"result"})
+
+	// metricBearerRedemptionTotal 兑换台账的判定分布(redemption_ledger.go)。
+	//
+	// 三条运维曲线都在这里:
+	//   - admit_repeat  客户端是否复用同一张 token 反复兑换。长期为零才谈得上把
+	//                   语义收紧成一次性消费;
+	//   - reject_*      两个边界各自拦下了多少,判断 F/T 配得是不是太紧;
+	//   - degraded_*    Redis 故障期间的准入,应当告警(会自愈);
+	//   - unconfigured_* 台账根本没装上 —— T 永远不生效,且不会自愈。与 degraded_*
+	//                   分开正是为了让一次接线回归不被读成"Redis 在抖"。
+	metricBearerRedemptionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_jwt_redemption_total",
+		Help:      "Bearer-JWT redemption ledger decisions (admit_first|admit_repeat|reject_stale_first|reject_idle|degraded_admit|degraded_reject|unconfigured_admit|unconfigured_reject).",
+	}, []string{"outcome"})
 )

@@ -198,10 +198,10 @@ func TestDefaultFollowedGroupGuard_MixedPayload_PartialFiltering(t *testing.T) {
 	const uid, space = "u1", "s1"
 	g := newGuard(
 		&fakeCategoryFilter{allowed: map[string]bool{
-			"g-keep":         true, // survives both stages
-			"g-no-member":    true, // survives Stage 1, dropped at Stage 2
-			"g-also-keep":    true, // survives both stages
-			"g-wrong-space":  true, // survives Stage 1, dropped at Stage 2
+			"g-keep":        true, // survives both stages
+			"g-no-member":   true, // survives Stage 1, dropped at Stage 2
+			"g-also-keep":   true, // survives both stages
+			"g-wrong-space": true, // survives Stage 1, dropped at Stage 2
 			// g-no-category is absent → Stage 1 drops it
 		}},
 		&fakeChannelAuth{rejectWith: map[string]error{

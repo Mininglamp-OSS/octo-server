@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -214,4 +215,26 @@ func TestSessionRolloutHelpTextMatchesTheEnforcedBounds(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, strings.Contains(string(source), "Redis SCAN count hint (1-10000)"),
 		"the --batch-size help text names the enforced range")
+}
+
+// TestOperatorConfigLoadAnnouncesTheFileItResolved restores an echo the shared
+// loader dropped.
+//
+// The server prints "Using config file: …" on startup; the operator commands
+// used to inherit it and lost it when the loader was factored out. That line is
+// the one piece of evidence tying a cutover's output to the endpoints it acted
+// on — and the config path is exactly what got a session-rollout run pointed at
+// 127.0.0.1:6379 on 2026-08-11.
+//
+// It goes to stderr, not stdout: `session-rollout status` emits JSON that
+// runbooks pipe into jq, and a bare line above it makes that unparseable.
+func TestOperatorConfigLoadAnnouncesTheFileItResolved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "operator.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("db:\n  mysqlAddr: root:demo@tcp(127.0.0.1)/test\n"), 0o600))
+
+	var notice bytes.Buffer
+	_, err := operatorConfigViper(path, &notice)
+	require.NoError(t, err)
+	require.Contains(t, notice.String(), path,
+		"an operator command must say which config file it resolved")
 }

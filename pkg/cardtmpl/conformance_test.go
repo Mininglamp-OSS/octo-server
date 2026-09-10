@@ -325,10 +325,19 @@ func assertInteractionLocked(t *testing.T, card map[string]any, ir cardtmpl.Inte
 				id, got, decl.AssociatedInputs)
 		}
 	}
-	// OpenUrl id 集合子集 (视图详情按钮等 optional,不做严格相等)
-	for id := range wantOpenURLIDs {
-		if _, ok := findActionByID(card, id); !ok {
+	// Declared OpenUrl actions must exist and carry no undeclared data payload.
+	for id, decl := range wantOpenURLIDs {
+		action, ok := findActionByID(card, id)
+		if !ok {
 			t.Errorf("A15c OpenUrl action[id=%s] not present in card body/actions", id)
+			continue
+		}
+		data, _ := action["data"].(map[string]any)
+		gotKeys, wantKeys := mapKeys(data), append([]string(nil), decl.DataKeys...)
+		sort.Strings(gotKeys)
+		sort.Strings(wantKeys)
+		if !equalStringSlices(gotKeys, wantKeys) {
+			t.Errorf("A15c Action.OpenUrl[id=%s] data keys drift: got=%v want=%v", id, gotKeys, wantKeys)
 		}
 	}
 }

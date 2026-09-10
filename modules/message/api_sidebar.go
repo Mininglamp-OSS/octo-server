@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,6 +53,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -122,12 +124,34 @@ type SidebarItem struct {
 	// 与 v1 SyncUserConversationResp.MySourceSpaceID 字段口径一致
 	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
 	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
-	MySourceSpaceID string  `json:"my_source_space_id,omitempty"`
-	Timestamp       int64   `json:"timestamp"`
-	Unread          int     `json:"unread"`
-	IsPinned        bool    `json:"is_pinned"`
-	IsFollowed      bool    `json:"is_followed"`
-	CategoryID      *string `json:"category_id,omitempty"`
+	MySourceSpaceID string `json:"my_source_space_id,omitempty"`
+	// ProjectID / ProjectName 是该条目所属项目的标识和名称，口径与上面的
+	// SpaceID 逐档对齐：
+	//   - GROUP: group 表的 project_id；
+	//   - COMMUNITY_TOPIC: 父群的 project_id（与 SpaceID 同一把 key 取，
+	//     两者不可能对不上）；
+	//   - PERSON: 留空 —— DM 不属于任何项目。
+	// 空串 = 直属 Space，与 group.project_id 的哨兵值一致；omitempty，所以老客户端
+	// 的 payload 逐字节不变。
+	//
+	// 例外，客户端必须知道：不带 X-Space-ID 的请求上，本字段整条链路一律为空串
+	// （见 projectMapForSpaceScope）。也就是说在那条路径上空串有第二个含义——
+	// 「服务端没有下发」，而不是「直属 Space」，两者在 payload 上不可区分。要按
+	// 项目分组的客户端在那条路径上应当认为自己没有项目信息，而不是把这些条目
+	// 归进直属 Space 分组。带 X-Space-ID 时不存在这个歧义。
+	//
+	// 客户端靠它在消息列表里按项目分组。P1 建立了这一列，#855 把它下发到
+	// GroupResp 和群详情，这里是同一次透出剩下的一跳。
+	//
+	// ProjectID 与 SpaceID 共用同一次 GetGroups；ProjectName 在项目 ID 去重后
+	// 以一条受当前 Space 约束的批量查询补齐，绝不按 sidebar 条目逐条查询。
+	ProjectID   string  `json:"project_id,omitempty"`
+	ProjectName string  `json:"project_name,omitempty"`
+	Timestamp   int64   `json:"timestamp"`
+	Unread      int     `json:"unread"`
+	IsPinned    bool    `json:"is_pinned"`
+	IsFollowed  bool    `json:"is_followed"`
+	CategoryID  *string `json:"category_id,omitempty"`
 	// CategorySort 暴露给客户端的"类别之间排序权重"，来源是 group_category.sort
 	// （PR #21 review by lml2468 blocker #3）。改类别顺序会 bump follow_version
 	// 并改变这里返回的值，与 /category/sort 接口及 swagger 一致。
@@ -467,11 +491,29 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	if len(threadExtRows) > 0 {
 		extraParentGroupNos = uniqueThreadParentGroupNos(threadExtRows)
 	}
-	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, extraParentGroupNos, sb.groupService)
+	groupSpaceMap, groupProjectMap, ok := CollectGroupSpaceAndProjectMaps(
+		conversations, extraParentGroupNos, sb.groupService)
 	if !ok {
-		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
+		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID / ProjectID will be empty)")
 		groupSpaceMap = map[string]string{}
+		groupProjectMap = map[string]string{}
 	}
+	// project_id ships ONLY on the Space-scoped path.
+	//
+	// Without an X-Space-ID the handler skips FilterRawConversationsBySpace
+	// entirely (see step 2 above), and only COMMUNITY_TOPIC items then get the
+	// fail-closed parent-membership check YUJ-4185 added — plain GROUP items get
+	// none, and decideConvKeepInSpace never had a membership predicate. So a
+	// removed member whose IM conversation row outlives the removal still receives
+	// the item on that path.
+	//
+	// That hole is pre-existing and belongs to project-p2-read-path-hardening, not
+	// here: closing it means adding a membership predicate for every group item,
+	// not for project ones. What this line does is refuse to WIDEN it. PR #861's
+	// review raised it and the requester chose this over the alternative of
+	// arguing that an opaque project id is harmless to a caller who can resolve
+	// nothing with it.
+	groupProjectMap = projectMapForSpaceScope(spaceID, groupProjectMap)
 
 	// 2g. externalGroupMap：当前 user 作为外部成员加入的 (groupNo -> source_space_id)
 	//     映射，用来回填 SidebarItem.MySourceSpaceID（GH octo-server#153 Round-2 P1）。
@@ -493,7 +535,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
-		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, groupProjectMap, externalGroupMap, defaultSpaceID)
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -514,7 +556,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 				selfCreatedThreads[key] = struct{}{}
 			}
 		}
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID, selfCreatedThreads, threadStatusMap)
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, groupProjectMap, externalGroupMap, defaultSpaceID, selfCreatedThreads, threadStatusMap)
 
 		// GH octo-server#310：把 thread 生命周期状态回填到 thread 条目。statusMap
 		// 来自 loadThreadLastMsgAt（复用 QueryActiveByGroupShortIDs 已 SELECT 的
@@ -590,7 +632,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			cutoffs = recentCutoffs{}
 			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
 		}
-		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, groupProjectMap, externalGroupMap, defaultSpaceID)
 		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
 		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
@@ -631,6 +673,21 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		items = dropArchivedThreadItems(items)
 	}
 
+	// Dedicated AI parent groups and their thread conversations live only in
+	// /v1/ai-team. Hiding just the parent would still leak every session through
+	// target_type=5, so filter both shapes from one authoritative purpose query.
+	items, err = sb.excludeAITeamItems(items)
+	if err != nil {
+		sb.Error("sidebar sync: AI container filter failed (fail-closed)", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	if projectNames, nameErr := sb.loadSidebarProjectNames(spaceID, items); nameErr != nil {
+		sb.Warn("sidebar sync: project name query failed (non-fatal, project_name omitted)", zap.Error(nameErr))
+	} else {
+		applySidebarProjectNames(items, projectNames)
+	}
+
 	// 4. Enrich pinned flag (follow tab items also need it)
 	for _, item := range items {
 		k := channelKey(item.TargetID, uint8(item.TargetType))
@@ -658,6 +715,82 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		Version:       respVersion,
 		FollowVersion: followVersion,
 	})
+}
+
+func (sb *Sidebar) excludeAITeamItems(items []*SidebarItem) ([]*SidebarItem, error) {
+	keys := make([][2]string, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, [2]string{item.TargetID, strconv.Itoa(item.TargetType)})
+	}
+	protected, err := aiteampkg.ExcludeProtectedItems(sb.ctx.DB(), keys)
+	if err != nil || len(protected) == 0 {
+		return items, err
+	}
+	return filterAITeamSidebarItems(items, protected), nil
+}
+
+func filterAITeamSidebarItems(items []*SidebarItem, protected map[string]struct{}) []*SidebarItem {
+	out := make([]*SidebarItem, 0, len(items))
+	for _, item := range items {
+		groupNo := item.TargetID
+		if item.TargetType == int(common.ChannelTypeCommunityTopic) {
+			if parts := strings.Split(groupNo, "____"); len(parts) == 2 {
+				groupNo = parts[0]
+			}
+		}
+		if _, hidden := protected[groupNo]; !hidden {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// loadSidebarProjectNames resolves only Project IDs that are already present in
+// this response after the Space-scoped project-id gate and AI-container filter.
+// It therefore cannot add a new Project association or widen the no-Space-ID
+// path; a database failure merely omits the additive display name.
+func (sb *Sidebar) loadSidebarProjectNames(spaceID string, items []*SidebarItem) (map[string]string, error) {
+	if spaceID == "" {
+		return map[string]string{}, nil
+	}
+	ids := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, item := range items {
+		if item.ProjectID == "" {
+			continue
+		}
+		if _, ok := seen[item.ProjectID]; ok {
+			continue
+		}
+		seen[item.ProjectID] = struct{}{}
+		ids = append(ids, item.ProjectID)
+	}
+	if len(ids) == 0 {
+		return map[string]string{}, nil
+	}
+	var rows []*struct {
+		ProjectID string `db:"project_id"`
+		Name      string `db:"name"`
+	}
+	_, err := sb.ctx.DB().Select("project_id", "name").From("octo_project").
+		Where("space_id=? AND status=1 AND project_id IN ?", spaceID, ids).
+		Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("load sidebar project names: %w", err)
+	}
+	names := make(map[string]string, len(rows))
+	for _, row := range rows {
+		names[row.ProjectID] = row.Name
+	}
+	return names, nil
+}
+
+func applySidebarProjectNames(items []*SidebarItem, names map[string]string) {
+	for _, item := range items {
+		if item.ProjectID != "" {
+			item.ProjectName = names[item.ProjectID]
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1257,43 @@ func appendThreadParentGroupNos(groupNos []string, threadExtRows []*convext.Mode
 // Uses the 4-underscore separator convention matching the thread package.
 const threadSeparator = "____"
 
+// projectMapForSpaceScope drops the project map on the no-X-Space-ID path.
+//
+// A named function rather than an inline `if`, because the property it enforces is
+// worth a test of its own: this is the only thing standing between the sidebar's
+// project_id and a caller the no-Space path never checked for membership. An inline
+// condition is testable only through the whole handler, which has no HTTP rig here.
+//
+// Returns an EMPTY map rather than nil so every construction site keeps reading a
+// map — a nil map reads fine in Go, but the empty value makes the intent obvious to
+// the next reader and cannot be mistaken for "not built yet".
+//
+// # It drops the map for EVERY target type, including the one that was checked
+//
+// Reviewer yujiawei's follow-up on PR #861: the blanket drop is wider than the hole
+// it refuses to widen. filterThreadConvsByParentMembership runs on ALL paths, this
+// one included, and is fail-closed through ExistMembersActive — so a COMMUNITY_TOPIC
+// item here HAS had its parent membership verified, and its project_id is blanked
+// anyway. Only plain GROUP items are the unchecked ones.
+//
+// Gating per target type was the alternative and is worse, for the reason PR-2 exists
+// to serve: SpaceID and ProjectID are read at the same site with the same key so that
+// a group and its own thread cannot disagree about one conversation. Per-type gating
+// makes exactly that happen on this path — the topic would carry a project_id while
+// its parent group, in the same response, would not. A client grouping by project
+// would split one project across two buckets, which is a worse answer than having no
+// project information at all.
+//
+// So the drop stays blanket, and the cost is that "" means two things on this path:
+// 直属 Space, and "not evaluated". That is written into the ProjectID field comment
+// rather than left here, because the client team reads the field, not this function.
+func projectMapForSpaceScope(spaceID string, projectMap map[string]string) map[string]string {
+	if spaceID == "" {
+		return map[string]string{}
+	}
+	return projectMap
+}
+
 func parseThreadChannelIDSidebar(channelID string) (groupNo, shortID string, err error) {
 	idx := strings.Index(channelID, threadSeparator)
 	if idx <= 0 || idx+len(threadSeparator) >= len(channelID) {
@@ -1155,6 +1325,7 @@ func buildFollowItems(
 	groupExts map[string]*convext.Model,
 	dmCategorySorts map[string]int,
 	groupSpaceMap map[string]string,
+	groupProjectMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 ) []*SidebarItem {
@@ -1181,6 +1352,7 @@ func buildFollowItems(
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
 				SpaceID:           groupSpaceMap[conv.ChannelID],
+				ProjectID:         groupProjectMap[conv.ChannelID],
 				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID),
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
@@ -1248,7 +1420,8 @@ func buildFollowItems(
 				ChannelType: conv.ChannelType,
 				ChannelID:   conv.ChannelID,
 				// thread 继承父群 SpaceID（GH octo-server#153）。
-				SpaceID: groupSpaceMap[groupNo],
+				SpaceID:   groupSpaceMap[groupNo],
+				ProjectID: groupProjectMap[groupNo],
 				// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
 				// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
 				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
@@ -1287,6 +1460,7 @@ func buildRecentItems(
 	cutoffs recentCutoffs,
 	pinnedSet map[string]struct{},
 	groupSpaceMap map[string]string,
+	groupProjectMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 ) []*SidebarItem {
@@ -1310,16 +1484,19 @@ func buildRecentItems(
 		// Round-3 (GH#154 Round-2 Finding 2)：externalGroupMap[k]="" 时兜底到
 		// defaultSpaceID，与 decideConvKeepInSpace 同口径。
 		spaceID := ""
+		projectID := ""
 		mySourceSpaceID := ""
 		switch conv.ChannelType {
 		case common.ChannelTypeGroup.Uint8():
 			spaceID = groupSpaceMap[conv.ChannelID]
+			projectID = groupProjectMap[conv.ChannelID]
 			mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID)
 		case common.ChannelTypeCommunityTopic.Uint8():
 			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
 			if err == nil {
 				parentID = groupNo
 				spaceID = groupSpaceMap[groupNo]
+				projectID = groupProjectMap[groupNo]
 				mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID)
 			}
 		}
@@ -1329,6 +1506,7 @@ func buildRecentItems(
 			ChannelType:     conv.ChannelType,
 			ChannelID:       conv.ChannelID,
 			SpaceID:         spaceID,
+			ProjectID:       projectID,
 			MySourceSpaceID: mySourceSpaceID,
 			Timestamp:       conv.Timestamp,
 			Unread:          conv.Unread,
@@ -1386,6 +1564,7 @@ func mergeThreadEntries(
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
 	groupSpaceMap map[string]string,
+	groupProjectMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 	// selfCreatedThreads 的键是 ext.TargetID，命中表示该子区由 loginUID 本人创建
@@ -1467,7 +1646,8 @@ func mergeThreadEntries(
 			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 			ChannelID:   ext.TargetID,
 			// thread 继承父群 SpaceID（GH octo-server#153）。
-			SpaceID: groupSpaceMap[groupNo],
+			SpaceID:   groupSpaceMap[groupNo],
+			ProjectID: groupProjectMap[groupNo],
 			// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
 			// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
 			MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),

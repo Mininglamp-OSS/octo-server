@@ -57,11 +57,22 @@ func (s *fakeSyncStore) RotateRefresh(oldID int64, newRT *RefreshModel) error {
 	return nil
 }
 
-// fakeKiller 内存版 sessionKiller,记录被踢的 uid 序列。
+// fakeKiller 内存版 sessionKiller。
+//
+// 把"踢全部"和"踢单端"分开记账,这样测试可以断言的不只是"踢了谁",而是
+// **踢的范围** —— 后者才是 logout 的爆炸半径。
 type fakeKiller struct {
-	mu    sync.Mutex
-	kicks []string
-	err   error
+	mu          sync.Mutex
+	kicks       []string
+	deviceKicks []deviceKick
+	err         error
+	deviceErr   error
+}
+
+// deviceKick 一次按端踢线的调用记录。
+type deviceKick struct {
+	UID        string
+	DeviceFlag uint8
 }
 
 func (k *fakeKiller) Kick(_ context.Context, uid string) error {
@@ -70,10 +81,24 @@ func (k *fakeKiller) Kick(_ context.Context, uid string) error {
 	k.kicks = append(k.kicks, uid)
 	return k.err
 }
+
+func (k *fakeKiller) KickDevice(_ context.Context, uid string, deviceFlag uint8) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.deviceKicks = append(k.deviceKicks, deviceKick{UID: uid, DeviceFlag: deviceFlag})
+	return k.deviceErr
+}
+
 func (k *fakeKiller) snapshot() []string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	return append([]string(nil), k.kicks...)
+}
+
+func (k *fakeKiller) deviceSnapshot() []deviceKick {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return append([]deviceKick(nil), k.deviceKicks...)
 }
 
 // scriptedRefresher 按 plain RT 字符串映射到响应,任意未命中即返 invalid_grant。
@@ -154,12 +179,12 @@ func newWorkerHarness(t *testing.T, dueSpecs []dueSpec) (*SyncWorker, *fakeSyncS
 // state 通过 token 字段建模:空字符串 = 无人持有;非空 = 持有者 token。
 // acquireErr / releaseErr 用于 Redis 故障注入。
 type fakeLock struct {
-	mu          sync.Mutex
-	holder      string
-	acquireErr  error
-	releaseErr  error
-	acquireCnt  int
-	releaseCnt  int
+	mu         sync.Mutex
+	holder     string
+	acquireErr error
+	releaseErr error
+	acquireCnt int
+	releaseCnt int
 }
 
 func (l *fakeLock) Acquire(_ context.Context, _ string, token string, _ time.Duration) (bool, error) {
@@ -561,10 +586,10 @@ func TestSyncWorker_StartStop_CleanShutdown(t *testing.T) {
 // 同时验证 fellThrough:errors.As 命中走结构化路径(false),字串兜底命中(true)。
 func TestIsInvalidGrant(t *testing.T) {
 	cases := []struct {
-		name             string
-		err              error
-		wantInvalid      bool
-		wantFellThrough  bool
+		name            string
+		err             error
+		wantInvalid     bool
+		wantFellThrough bool
 	}{
 		{"nil", nil, false, false},
 		{"oauth2 RetrieveError invalid_grant", &oauth2.RetrieveError{ErrorCode: "invalid_grant"}, true, false},

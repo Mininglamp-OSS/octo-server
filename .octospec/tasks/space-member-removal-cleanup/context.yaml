@@ -1,0 +1,91 @@
+schema_version: 1
+task: space-member-removal-cleanup
+brief: .octospec/tasks/space-member-removal-cleanup/brief.md
+resolved_at: 2026-08-21T01:56:05+00:00
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      This task is the enforcement half of Space membership. A removed member
+      currently keeps group message access and a live WuKongIM group
+      subscription inside a Space they no longer belong to. The fix must close
+      that boundary without overshooting. The group cascade also reaches
+      sub-thread membership and per-Space pinned rows. Person-channel whitelist
+      isolation was split out to space-member-dm-isolation after review.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Removal handlers keep the existing localized envelope
+      (httperr.ResponseErrorL + pkg/errcode). Cascade and IM failures are logged
+      and retried by the durable event, never surfaced as new user-facing codes,
+      and no raw c.ResponseError / c.JSON / AbortWithStatusJSON is introduced.
+      Any new handler file joins the module's NoLegacyResponseError guard list.
+  - id: testing
+    source: repo
+    load_bearing: true
+    why: >
+      Regression coverage must exercise the real removal handlers and the real
+      cascade boundary with synthetic identifiers, including the multi-Space and
+      friendship carve-outs (the primary regression risk), the Space-prefixed
+      bot DM channel form, batch partial failure, and idempotent event replay.
+  - id: data-integrity-note
+    source: task
+    load_bearing: true
+    why: >
+      Not a rule file — recorded here because Plan review overturned a load-bearing
+      assumption. modules/base/event is a fire-once dispatcher: a failed listener
+      is marked Fail and never re-selected (api.go:128 + db.go:49), and multiple
+      listeners share one status row whose version_lock is never incremented
+      (db.go:34), so last-writer-wins. The cascade therefore owns its own durable
+      retry record (user_session_revocation_intent pattern) and listeners call
+      commit(nil); no design may assume the event timer will retry.
+  - id: rate-limit
+    source: repo
+    load_bearing: false
+    why: >
+      No new HTTP route and no request-frequency policy change. The cascade's IM
+      fan-out is bounded by the affected peer and group sets rather than by
+      request rate, and must not hand-roll a Redis counter.
+  - id: trust-boundary
+    source: repo
+    load_bearing: false
+    why: >
+      No adapter or external-content parsing changes. The new client-facing
+      surface is additive (one Person ChannelResp field, one CMD delivery) and
+      server enforcement does not depend on any client honoring it.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Plan produces the brief only. Implement records RED/GREEN evidence without
+      production identifiers; Finish uses an English Conventional Commit subject.
+
+security_notes:
+  - Tests and examples use synthetic UIDs, Space IDs, and group numbers only.
+  - Removal does not revoke sessions or erase message history; both are out of
+    scope by design and must not be added opportunistically.
+
+# --- Implement phase: rules actually injected and read in full ---
+injected:
+  - id: space-isolation
+    source: repo
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+  - id: trust-boundary
+    source: repo
+    applied: false
+    note: >
+      Matched via the wire-contract touches tag, read in full, and found not to
+      apply: the rule governs adapter/external-content escaping (markdown
+      injection, URL-destination breakout, adapter parity). This change adds no
+      adapter and renders no external content. Recorded rather than silently
+      dropped.

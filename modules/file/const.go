@@ -2,11 +2,11 @@ package file
 
 import (
 	"bytes"
-	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Mininglamp-OSS/octo-server/modules/common"
 )
 
 // fileServiceAwsS3 is the cfg.FileService value that activates the
@@ -132,8 +132,14 @@ const (
 	TypeWorkplaceAppIcon Type = "workplaceappicon"
 )
 
-// MaxFileSize 最大文件大小（100MB）
-const MaxFileSize int64 = 100 * 1024 * 1024
+// MaxFileSize 单文件上限的**代码默认值**（100MB）。
+//
+// Deprecated: 生产路径一律用 MaxUploadSize()（policy.go），它读 system_setting
+// 的 file.max_size_kb 并在未配置时回落到本常量。直接引用本常量的代码不会跟随
+// 运营调整 —— 改动前 modules/bot_api 与 modules/robot 的 multipart 路径各有一份
+// `const maxSize = 100 * 1024 * 1024` 复制，正是这个问题的实例。
+// 保留它是因为默认值需要一个单一出处，且 const_test.go 以它为等价性基线。
+const MaxFileSize int64 = common.DefaultFileMaxSizeKB * 1024
 
 // StickerMaxFileSize 自定义贴纸单文件上限（1MB）。贴纸是高频内联渲染的小图，
 // 收紧到 1MB（对标业界：Discord 贴纸 512KB、微信 ~1MB），避免大图占用与卡顿。
@@ -170,7 +176,10 @@ func stickerUploadExt(filename string) string {
 	return ".gif"
 }
 
-// allowedExtensions 允许上传的文件扩展名
+// allowedExtensions 允许上传的文件扩展名 baseline。
+//
+// **只读**：运行期不得写入。运营侧的增减在 policy.go 派生成不可变快照，
+// 见该文件顶部说明。改动前 loadExtensionsFromEnv() 会原地改写它。
 var allowedExtensions = map[string]bool{
 	// 图片
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -205,7 +214,10 @@ var allowedExtensions = map[string]bool{
 	".dmg": true, ".pkg": true, ".deb": true, ".rpm": true, ".appimage": true,
 }
 
-// blockedExtensions 禁止上传的文件扩展名（可执行文件）
+// blockedExtensions 禁止上传的文件扩展名（可执行文件）baseline。
+//
+// **只读，且不可通过任何配置撤销**：policy.go 的派生把它放在减号右边，
+// system_setting / env 无论写什么都无法把这里的扩展名放进 allowed。
 var blockedExtensions = map[string]bool{
 	".exe": true, ".bat": true, ".sh": true, ".cmd": true,
 	".msi": true, ".dll": true, ".com": true, ".scr": true,
@@ -217,84 +229,21 @@ var blockedExtensions = map[string]bool{
 	".cgi": true, ".py": true, ".rb": true, ".pl": true,
 }
 
-func init() {
-	loadExtensionsFromEnv()
-}
-
-// loadExtensionsFromEnv 读取环境变量，追加扩展名到白名单/黑名单。
-// 仅在 init() 中调用，不可在运行时重复调用（map 无并发写保护）。
-// DM_FILE_EXTRA_ALLOWED: 逗号分隔的额外允许扩展名，如 ".svg,.heic" 或 "svg,heic"
-// DM_FILE_EXTRA_BLOCKED: 逗号分隔的额外禁止扩展名，如 ".xyz,.abc"
-// 注：init() 阶段 zap logger 尚未初始化，此处使用 stdlib log。
-func loadExtensionsFromEnv() {
-	normalizeExt := func(raw string) string {
-		ext := strings.ToLower(strings.TrimSpace(raw))
-		if ext == "" || ext == "." || ext == ".." {
-			return ""
-		}
-		if strings.ContainsAny(ext, `/\`) {
-			return ""
-		}
-		if !strings.HasPrefix(ext, ".") {
-			ext = "." + ext
-		}
-		// 过滤 "..exe" 这类多连续点号的畸形输入：补全后仍含 ".." 则无效
-		if strings.Contains(ext, "..") {
-			return ""
-		}
-		return ext
-	}
-
-	var addedAllowed, addedBlocked []string
-
-	if val := os.Getenv("DM_FILE_EXTRA_ALLOWED"); val != "" {
-		for _, raw := range strings.Split(val, ",") {
-			ext := normalizeExt(raw)
-			if ext == "" {
-				continue
-			}
-			if blockedExtensions[ext] {
-				log.Printf("[file] DM_FILE_EXTRA_ALLOWED: %q 已在黑名单中，将被忽略", ext)
-				continue
-			}
-			allowedExtensions[ext] = true
-			addedAllowed = append(addedAllowed, ext)
-		}
-	}
-	if val := os.Getenv("DM_FILE_EXTRA_BLOCKED"); val != "" {
-		for _, raw := range strings.Split(val, ",") {
-			ext := normalizeExt(raw)
-			if ext == "" {
-				continue
-			}
-			blockedExtensions[ext] = true
-			addedBlocked = append(addedBlocked, ext)
-			// 若同一扩展名也出现在 EXTRA_ALLOWED 中，从白名单清除保持状态一致
-			delete(allowedExtensions, ext)
-		}
-	}
-
-	if len(addedAllowed) > 0 {
-		log.Printf("[file] DM_FILE_EXTRA_ALLOWED 已加载: %v", addedAllowed)
-	}
-	if len(addedBlocked) > 0 {
-		log.Printf("[file] DM_FILE_EXTRA_BLOCKED 已加载: %v", addedBlocked)
-	}
-}
-
-// IsAllowedExtension 检查文件扩展名是否允许上传
-func IsAllowedExtension(ext string) bool {
-	ext = strings.ToLower(ext)
-	if blockedExtensions[ext] {
-		return false
-	}
-	return allowedExtensions[ext]
-}
-
-// IsBlockedExtension 检查文件扩展名是否被禁止
-func IsBlockedExtension(ext string) bool {
-	return blockedExtensions[strings.ToLower(ext)]
-}
+// ---------------------------------------------------------------------------
+// 运行期扩展名策略见 policy.go。
+//
+// 改动前这里有一个 init() → loadExtensionsFromEnv()，读 DM_FILE_EXTRA_ALLOWED /
+// DM_FILE_EXTRA_BLOCKED 后**直接改写上面两张 map**，并自陈「不可在运行时重复
+// 调用（map 无并发写保护）」——所以改一次白名单要重启全部 pod。
+//
+// 现在两张 map 是只读 baseline：env 与 system_setting 的值在 policy.go 里派生成
+// 不可变快照（allowed = (base ∪ extra) − blocked），原子发布。env 的解析语义
+// 未变（common.NormalizeFileExtension 与改动前的 normalizeExt 逐字节一致），
+// DB 未配置时行为与改动前完全相同。
+//
+// IsAllowedExtension / IsBlockedExtension / MaxUploadSize 都在 policy.go，
+// 函数签名保持不变，modules/bot_api 与 modules/robot 的调用点无需改动。
+// ---------------------------------------------------------------------------
 
 // sanitizeFilename 清洗文件名，去除路径分隔符、CRLF、控制字符等危险字符
 func sanitizeFilename(name string) string {

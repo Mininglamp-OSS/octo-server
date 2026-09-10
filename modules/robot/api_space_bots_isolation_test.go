@@ -105,7 +105,7 @@ func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 func getSpaceBots(t *testing.T, s *server.Server, ctx *config.Context, spaceID string) *httptest.ResponseRecorder {
 	t.Helper()
 	resetUIDRateLimit(t, ctx)
-	spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
+	_ = spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/v1/robot/space_bots?space_id="+spaceID, nil)
 	req.Header.Set("token", testutil.Token)
@@ -238,7 +238,7 @@ func TestSpaceBots_MissingSpaceIDKeepsBusinessError(t *testing.T) {
 	const spaceID = "sb_iso_hdr"
 	seedIsolationSpace(t, ctx, spaceID, "sb_iso_bot_hdr", testutil.UID)
 	resetUIDRateLimit(t, ctx)
-	spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
+	_ = spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
 
 	w2 := httptest.NewRecorder()
 	req2, _ := http.NewRequest(http.MethodGet, "/v1/robot/space_bots", nil)

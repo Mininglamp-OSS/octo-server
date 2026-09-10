@@ -1,0 +1,2775 @@
+# octospec Implement-phase record for task project-p2-all-member-group.
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
+# tier available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml).
+# The brief's tags are: space, isolation, acl, error-response, i18n, rate-limit,
+# wire-contract, migration, testing, commit. All six repo rules match.
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go matches every file this task touches; brief tags
+      carry space / isolation / acl. Drives: the all-member group is created
+      with the project's own space_id and project_id so I2 keeps gating it;
+      agent eligibility (D2/D15) is decided server-side inside the create
+      transaction with a locked space_member read, never from the client's
+      agent_uids list; D13 closes an agent's seat by robot.creator_uid, the
+      same field the group side already uses, so the two cannot disagree about
+      whose agent it is; D14 routes bot deletion through the Space removal
+      outbox so the seat-closing cascade actually runs for bots.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + pkg/errcode/**; brief tags error-response / i18n /
+      wire-contract. Drives: err.server.project.agent_not_eligible and
+      err.server.group.all_member_group_protected registered in pkg/errcode,
+      httperr.ResponseErrorL everywhere, 5xx <=> Internal=true, zh-CN
+      translations, i18n-extract-check + i18n-lint, and adding every new file to
+      TestGroupNoLegacyResponseError / TestProjectNoLegacyResponseError (both
+      scan fixed file lists and cannot see a new file on their own).
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tag rate-limit. The task adds no route --
+      agent_uids rides the existing create route and the agent rules ride
+      members/add|remove, both already behind AuthMiddleware +
+      SharedUIDRateLimiter. Binds two ways: the provisioner / admitter hooks and
+      the I4 scans are not HTTP paths and must not grow a Redis counter, and the
+      D4 rebuild lease is a correctness lease on a table row, not a rate limiter.
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by touches:wire-contract, not by paths -- no inbound adapter, no
+      markdown rendering, no URL destinations. Two clauses apply. "Bound the
+      payload": agent_uids is capped at MemberBatchMax (200) like every other
+      member batch. And the anti-enumeration shape: the six agent-ineligibility
+      reasons collapse to one code with the submitted uids echoed back, so
+      "not yours" / "not a bot" / "another Space" / "does not exist" are
+      byte-identical on the wire, matching P1's project_unavailable precedent.
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go. Drives: testutil.NewTestServer + CleanAllTables,
+      explicit ratelimit:uid:* reset on UID-limited routes, and the
+      non-regression rule that no EXISTING test file may be edited -- an edited
+      assertion is a changed contract. New behaviour lands in new test files.
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ** -- English Conventional Commits; PR description in English.
+
+brief: .octospec/tasks/project-p2-all-member-group/brief.md
+
+# Confirmed by the requester on 2026-09-07: D1-D17 all take the brief's
+# recommended defaults. D6 / D7 / D8 are in scope (their "optional" markers were
+# removed in that same confirmation).
+scope_changes: []
+
+# Assumptions taken where the brief left a choice; each reversible at one site.
+assumptions:
+  - id: d14-keeps-the-synchronous-group-loop
+    decision: |
+      D14 replaces ONLY botfather's raw `UPDATE space_member SET status=0` with
+      the transactional outbox entry. Its existing synchronous group-removal
+      loop stays exactly as it is.
+      Why: the loop enumerates the bot's groups with GetGroupsWithMemberUID,
+      which is NOT Space-scoped, while the outbox is keyed (space_id, uid) and
+      its group step queries queryGroupsWithMemberUIDAndSpaceID. Replacing the
+      loop with the outbox would silently drop every group whose space_id is ''
+      -- a coverage regression dressed up as a refactor. Keeping both is safe
+      because the group step is idempotent by construction: it re-reads the
+      member row and returns nil when the row is already gone.
+      The brief's own Out of scope says D14 只接 Space 席位这一段, so this is
+      the reading it intends; recorded because "route bot deletion through the
+      outbox" could be read as replacing the loop.
+  - id: bot-deleted-is-its-own-removal-reason
+    decision: |
+      A new MemberRemoveReasonBotDeleted = "bot_deleted" rather than reusing
+      MemberRemoveReasonForceRemoved (the brief allowed either).
+      Why: the group cascade branches on Reason to decide whether to emit the
+      "X 被 Y 移出群聊" system message. botfather today passes
+      SuppressRemoveNotice: true and says in a comment that keeping it that way
+      is deliberate -- the sentence is factually wrong for a globally deleted
+      bot. Reusing force_removed would make the cascade emit that message into
+      every group the synchronous loop failed to clean, which is precisely the
+      "a refactor changed user-visible behaviour" failure the same comment warns
+      about. A distinct reason lets the group step suppress it by name.
+
+# Defects found DURING implementation, by the repo's own guards. Recorded because
+# each one was a real hole in the change, not a test being fussy.
+defects_found:
+  - id: create-took-the-joining-seat-lock
+    where: modules/project/service.go createProjectOnce
+    what: |
+      The first version locked the agents' Space seats with lockSpaceSeatsTx,
+      which JOINs `space`.
+    why_it_matters: |
+      A table outside that statement's `FOR SHARE OF` list is read as a
+      CONSISTENT read, which OPENS the transaction's read view. In
+      createProjectOnce it would have been the first such statement, so every
+      creation quota counted afterwards would answer from a snapshot taken
+      before the `space` row lock -- the exact defect P0 closed and documented
+      (six concurrent creates all passed MaxPerSpace=1).
+    caught_by: TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin
+    fix: |
+      New lockSpaceSeatRowsTx: the batch form of lockSpaceSeatRowTx, one
+      statement, no JOIN. Nothing is lost -- createProject rechecks the Space
+      under the exclusive `space` lock immediately afterwards.
+  - id: agent-seat-read-was-not-a-locking-read
+    where: modules/project/db_agent.go queryOwnedAgentSeatsTx
+    what: |
+      D13 read the departing member's agent seats with a plain SELECT inside the
+      removal transaction.
+    why_it_matters: |
+      The read view opens at the transaction's first statement, so an agent seat
+      committed after that is invisible: the owner leaves, the agent's seat stays
+      active, and nothing revisits it. That is the precise end state D13 exists
+      to prevent, reintroduced by the query meant to prevent it.
+    caught_by: TestNoWriteAuthorisingAggregateIsANonLockingRead
+    fix: "FOR UPDATE OF pm -- locking, and scoped so `robot` (outside the declared lock order) is not locked."
+  - id: collate-applied-between-two-legacy-tables
+    where: modules/project/db_agent.go queryAgentRowsTx
+    what: "An explicit COLLATE on `robot` JOIN `user`, both of which are legacy tables."
+    why_it_matters: |
+      P1's reconcile header states the rule in both directions: crossing the two
+      schemas needs COLLATE, and adding one between two same-collation columns
+      makes the predicate non-sargable, giving up the index for nothing. The
+      first version got the second half wrong.
+    caught_by: "review, prompted by the P1 header; the drift test then confirmed the corrected form"
+    fix: "COLLATE removed there; kept only where octo_project* meets group/group_member/user/robot, always on the driving side's values."
+  - id: roster-join-broke-the-collation-probe
+    where: modules/project/review8_collation_test.go
+    what: "listMembers now LEFT JOINs `robot`, which the drift probe database did not create."
+    why_it_matters: |
+      Not a code defect but a coverage one: without the table the probe failed
+      with "table doesn't exist" instead of the 1267 it asserts, so the drift
+      evidence for the roster query silently stopped being evidence.
+    fix: "`robot` added to collationProbeTables as a legacy table (it is one, created in 2019 with no COLLATE)."
+
+# Scoped out during implementation, with the reason. NOT silently dropped.
+not_delivered:
+  - id: d7-guard-not-behind-a-tree-walking-source-guard
+    what: |
+      A guard that a NEW group handler mutating membership must consult
+      refuseIfAllMemberGroup.
+    why_not: |
+      The forbidden thing is not a syntactic pattern -- it is "a new handler that
+      changes who is in a group", which no string match identifies. What IS
+      pinned is the inverse and it is the load-bearing half:
+      TestAllMemberGroupProtectionIsNotInTheServiceLayer stops the refusal from
+      being pushed down into the primitives, where it would block the cascades
+      that maintain I2 and I4.
+    consequence: "A future handler added on the four protected shapes has to remember the guard; the I4 reconcile scans are what would report the resulting drift."
+  - id: i4-is-stated-as-an-equality-and-only-one-direction-is-policed
+    what: |
+      A scan for EXTRA members of an all-member group -- someone in the group who
+      is not an active project member.
+    why_not: |
+      I4 is written as an equality, and both reconcile scans measure the missing
+      direction only. The reachable case is the repo-wide system-bot exemption:
+      assertAdmissibleTx waives the I2 check for whitelisted bots and memberAdd is
+      deliberately NOT D7-guarded, so a group manager can add fileHelper or
+      botfather to an all-member group and nothing reports it.
+      Left as is because the exemption is repo-wide and P2 is not the place to
+      revisit it -- narrowing it here would give the all-member group a different
+      bot rule from every other group -- and because a "report the extras" scan
+      would flag exactly the members the exemption is designed to allow. What is
+      NOT policed and should be said plainly: any OTHER way an extra could appear
+      would go unreported too.
+    consequence: "The equality holds in the direction the invariant was written for; extras exist only through the system-bot exemption today, and nothing would report a second source if one appeared. PR #855s fifth review nit."
+
+# Corrections to earlier entries in this file, kept rather than edited away so the
+# reasoning that was wrong stays visible.
+corrections:
+  - id: end-to-end-coverage-was-wrongly-scoped-out
+    superseded: real-provisioner-covered-only-indirectly
+    what_was_claimed: |
+      That the seam between modules/project and modules/group could not be tested
+      end to end, because modules/project must never import modules/group.
+    why_that_was_wrong: |
+      The import ban constrains the PACKAGE, not the test BINARY. The external
+      test package modules/project/project_external_test.go already blank-imports
+      octo-server/internal, so module.Setup registers every module and
+      modules/group's real provisioner, admitter, owner sync and rename are all
+      live in that binary. The claim also conflated two obstacles: the import
+      rule, which does not apply, and the absence of a WuKongIM broker in the
+      development environment, which is an environment gap and not a design
+      constraint. Raised by the requester.
+    what_was_done: |
+      modules/project/all_member_group_e2e_test.go: seven cases through the REAL
+      modules/group implementation, covering create with agents, add, remove with
+      the agent cascade, disband, the D7 refusals, rename, and D14's bot deletion
+      closing a project seat. They assert on the actual group and group_member
+      rows, not on stand-in call counts.
+  - id: stand-ins-were-not-restoring-the-real-hooks
+    what: |
+      stubAllMemberGroup installed stand-in hooks and deliberately did not restore
+      them, on the reasoning that the registry is latest-wins and every case that
+      cares installs its own.
+    why_that_was_wrong: |
+      The end-to-end cases care and do NOT install their own -- they depend on the
+      real hooks module.Setup registered. Since the registry is process-wide, an
+      in-package case leaving a stand-in behind disabled the feature for every
+      later case in the same binary. The symptom was the honest one: all seven
+      end-to-end cases passed when run alone and failed in a full run.
+    fix: |
+      Snapshot/restore added to the registry and used by every case that installs
+      a stand-in. modules/space's member-removal registry carries the same warning
+      about the same hazard; this now follows it. Verified under
+      `go test -race -shuffle=on`.
+
+# Findings from /code-review (high effort) on the full branch diff. All eight were
+# real; all eight are fixed on this branch. Listed because several were defects
+# the implementation's own tests could not have caught -- the stand-ins agreed
+# with the bug.
+review_findings_fixed:
+  - id: rebuild-seeded-the-immutable-creator
+    severity: highest
+    what: |
+      ensureAllMemberGroup passed octo_project.creator as the group owner.
+    why: |
+      That column never changes. Once the founder has left the project, the
+      admission gate refuses them -- they are not an active member -- so every
+      rebuild claimed the lease, failed, released it, and the project could NEVER
+      get its group back. Reconcile scan A would report it forever with nothing
+      able to repair it, which is precisely the failure the rebuild exists to
+      prevent.
+    fix: "queryActiveOwnerForProvision (senior active owner, same rule as pkg/project.PickActiveOwner); skip with a Warn when the project has no owner."
+    test: TestRebuildUsesAnActiveOwnerNotTheOriginalCreator
+  - id: project-side-lookup-checked-only-half-the-predicate
+    severity: high
+    what: |
+      queryAllMemberGroupNo read the project pointer without verifying the group
+      still carries project_id, while pkg/project.IsAllMemberGroup checks both.
+    why: |
+      After P1 detaches a group to Space-direct (creator left, no successor -- a
+      state scan A documents as unclearable), the pointer remains. The admitter
+      would then put new project members into a group the project no longer owns,
+      the rename would rename it, and the owner sync would change its creator.
+      Two predicates answering the same question differently.
+    fix: "the lookup now joins `group` and requires status <> disband AND project_id = the project."
+    test: TestQueryAllMemberGroupNoIgnoresADetachedGroup
+  - id: blacklist-was-a-fifth-unguarded-removal-path
+    severity: high
+    what: |
+      The blacklist handler flips group_member.status to Blacklist and
+      unsubscribes from IM, with no D7 guard.
+    why: |
+      For I4 that is identical to a removal -- the uid stays a project member and
+      leaves the all-member group active set -- but it does not go through
+      RemoveGroupMembers and is not called "remove", so it was missed. Nothing
+      repairs the resulting scan-B gap: the project seat is unchanged and the
+      admitter only runs on a fresh add. Same shape as P1's A11.
+    fix: "guarded on action=add only; un-blacklist stays open because it restores a member and is already under the I2 gate."
+  - id: owner-sync-missed-the-common-departure
+    severity: high
+    fix: "syncAllMemberGroupOwner now runs on every successful leave and every successful removal, not only when a successor was promoted."
+    why: |
+      A non-last owner leaving names no successor, so the sync was skipped -- but
+      P1's cascade then hands the group over by GROUP seniority, which can land on
+      an ordinary project member whom D7 forbids from transferring, leaving or
+      disbanding it. The hook is self-deciding and idempotent, so the two do not
+      race: whichever runs last converges on "the creator is an active owner".
+  - id: member-count-meant-two-things
+    severity: medium
+    fix: "the list query splits humans and agents with two bounded correlated subqueries, so list cards and the detail route agree (D16)."
+  - id: agent-check-ran-before-the-permission-gate
+    severity: medium
+    what: |
+      An ordinary member got a per-uid agent_not_eligible for somebody else's live
+      bot and an actor-level permission_denied for a human.
+    why: |
+      That is the enumeration oracle ErrProjectAgentNotEligible was registered to
+      prevent, handed to the least privileged caller there is.
+    fix: "ownership is decided first, then the permission gate; the agent-specific refusal is only reachable by a caller who already holds member-management rights."
+    test: TestAnOrdinaryMemberCannotTellAnAgentFromAHuman
+  - id: quota-refusal-reported-the-global-cap
+    severity: low
+    fix: "effectiveMaxMembers(in.MaxMembers), so a per-request max_members override is reported as the limit the refusal was measured against."
+  - id: rename-idempotence-compared-untruncated-names
+    severity: low
+    fix: |
+      Compare the truncated name. A project name over 50 runes never equalled the
+      truncated group name, so every update carrying `name` re-renamed the group
+      and pushed a version bump to every member -- an idempotence check that was
+      constant-false exactly on the longest names.
+
+# Second /code-review pass, after the eight fixes above. The original eight were
+# confirmed gone; six NEW findings, all real, all fixed. Recorded separately
+# because one of them was caused by a fix in the first round -- a tightened read
+# without the matching write.
+review_round_2_fixed:
+  - id: tightening-the-read-deadlocked-the-rebuild
+    severity: highest
+    caused_by: project-side-lookup-checked-only-half-the-predicate
+    what: |
+      Round 1 made queryAllMemberGroupNo verify the group side. The claim CAS was
+      left keyed on all_member_group_no being empty, and P1 leaves the pointer set
+      when it detaches a group.
+    why: |
+      The lookup then said "no group" while the claim said "already has one", so
+      ensureAllMemberGroup proceeded and the claim failed on every attempt -- with
+      no error and no metric. The rebuild never ran, every later admission
+      no-opped, and scan A reported a project nothing could repair. Two predicates
+      disagreeing about one fact: the same shape as the bug round 1 was fixing.
+    fix: "clearStaleAllMemberGroupPointer, run by ensureAllMemberGroup before the claim, with a Warn so the correction is visible."
+    test: TestRebuildRecoversAProjectWhoseGroupWasDetached
+  - id: list-route-omitted-the-group-pointer
+    severity: high
+    fix: "listVisibleInSpace selects all_member_group_no. Omitting it made every listed project report the empty sentinel, which the contract defines as 'no group provisioned' -- the list and the detail route disagreeing about the same project."
+  - id: bot-api-removal-bypassed-d7
+    severity: high
+    what: "modules/bot_api's member-remove calls the service-layer primitive directly, so the Web-side D7 guard does not cover it."
+    why: |
+      A bot admin could take an ordinary member out of an all-member group while
+      their project seat stayed active. I4 broken with nothing to repair it: the
+      seat is unchanged, so no cascade revisits it.
+    fix: "guarded there too, with its own bot_api error code; the service layer stays open, as D7 requires."
+    note: "api_manager's removeMember re-dispatches into the guarded Web handler and was already safe."
+  - id: reconcile-p2-header-claimed-coverage-it-did-not-have
+    severity: medium
+    what: "The file header said the P2 statements had been added to TestP1ScansSurviveCollationDrift. They had not."
+    fix: |
+      TestP2StatementsSurviveCollationDrift now runs the two I4 scans, the group
+      lookup, the stale-pointer clear, the seat split and both pkg/project
+      predicates against a drifted database and again after conversion. Writing it
+      immediately paid: it caught that listMembers must NOT be in that list,
+      because its pre-existing un-COLLATEd `user` join is what
+      TestCollationDriftBreaks... asserts DOES fail under drift. Two contradictory
+      contracts on one statement, avoided by running the test rather than
+      reasoning about it.
+  - id: sum-over-an-empty-roster-returned-null
+    severity: low
+    fix: "COALESCE around both SUMs in countActiveSeatsByKind. An empty active roster is reachable (P0's cascade can close the last seat) and scanning NULL into an int errored, making every detail read log a warning and fall back."
+  - id: a12-was-missing-from-the-hard-coded-entry-lists
+    severity: low
+    what: "The new admission entry was not added to the two by-hand enumerations that ARE the I2 per-entry guarantee."
+    fix: |
+      Added to both, plus TestEveryAdmissionEntryConstantIsInTheGuardLists, which
+      reads the constants out of admission.go and compares -- so the next entry
+      cannot be forgotten the same way. Exactly the failure mode P1's D8 gives as
+      the reason to prefer guards that enumerate over guards that match strings.
+
+# Third /code-review pass, run on the pushed branch. Six findings, all verified
+# against the code before fixing; the two audit gaps below were found while fixing
+# them and are the same omission on the other write path.
+review_round_3_fixed:
+  - id: all-member-group-could-be-left-with-no-creator
+    severity: critical
+    where: modules/group/all_member_group.go ensureAllMemberGroupOwner
+    what: |
+      It read the successor's group_member row without a lock, promoted with
+      UpdateMemberRoleTx (which affects zero rows on a soft-deleted row and reports
+      no error), then demoted the sitting creator unconditionally.
+    why: |
+      A concurrent soft-delete of the successor's row between the read and the
+      write leaves the group with NO creator -- and D7 then makes that unfixable
+      from the group side: nobody can transfer, leave or disband it. The repo
+      already had the answer: project_cascade.go:335 locks the successor FOR UPDATE
+      and hard-fails if the promote did not land.
+    fix: "SELECT 1 ... FOR UPDATE on the successor, updateMemberRoleIfLiveTx, and a hard error if !promoted BEFORE the demote."
+  - id: i4-scan-a-filtered-in-the-where
+    severity: high
+    where: modules/project/reconcile_p2.go queryMissingAllMemberGroupPage
+    what: "`g.id IS NULL` was a WHERE predicate, so LIMIT bounded rows RETURNED."
+    why: |
+      In the HEALTHY case the predicate matches nothing, so the statement walked
+      the whole of octo_project with a `group` lookup per row, every tick. The cost
+      was highest exactly when there was nothing to report. Same defect P1 fixed in
+      queryI2Page, reintroduced.
+    fix: "flag-over-base-page: (g.id IS NULL) AS violating, skipped in the loop."
+    test: |
+      TestReconcileP2QueriesAreBounded and
+      TestP2PagedQueriesUseTheFlagOverBasePageShape, mirroring
+      reconcile_p1_bounds_test.go -- neither existing guard read this file, which is
+      how the regression got in. Confirmed non-vacuous by mutating the source and
+      watching both assertions fire.
+  - id: agent-refusal-echoed-every-submitted-uid
+    severity: medium
+    where: modules/project/api.go respondCreateError
+    what: |
+      ineligibleAgentUIDs was computed and only logged; details.uids carried the
+      whole submitted list, contradicting D3 and the helper's own doc comment.
+    why: "One bad uid in a batch of ten told the client all ten were refused, leaving the user to re-pick from scratch to find the one that was wrong."
+    fix: |
+      agentNotEligibleError carries the ineligible subset out of the transaction
+      (Unwrap keeps errors.Is on the sentinel true, so the per-uid members/add path
+      is unchanged). respondCreateError no longer TAKES the submitted list -- having
+      it in scope is what made echoing it the easy thing to write.
+    test: "TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent now asserts the eligible agent is NOT named."
+  - id: re-add-was-a-silent-no-op-for-the-documented-i4-repair
+    severity: medium
+    where: modules/project/service.go addMembers
+    what: "admitAllMemberGroup ran only when the seat write changed something."
+    why: |
+      An I4 scan-B gap is exactly the state where the seat already exists, so the
+      operator action the gauge points at -- an admin re-adds the member -- did
+      nothing, quietly, however many times it was tried.
+    fix: "the admission runs on every add that did not error. The cost is one idempotent round-trip per already-member; the projection being self-healing is worth it."
+    test: TestReAddingAnActiveMemberReAdmitsThemToTheGroup
+  - id: agent-seats-left-no-audit-trail
+    severity: medium
+    where: modules/project/api.go (create) and service.go (D13 removal)
+    what: |
+      The agent seats written inside the create transaction, and the agent seats
+      D13 closes when their owner is kicked or leaves, emitted no audit entry.
+    why: |
+      The acceptance criterion is that every write path leaves one, and
+      TestEveryWritePathEmitsAnAuditEntry passed vacuously here because it never
+      sends agent_uids and seeds no agents. "How did this bot get access to the
+      project" was unanswerable from the trail.
+    fix: |
+      auditMemberAdd with reason agent_on_create at create; auditMemberRemove with
+      reason agent_follows_owner in the two post-commit loops that already
+      invalidate the agents' caches (closedAgents does not leave the service, which
+      is why the audit sits there rather than in the handler -- the same split
+      space_member_removal.go uses).
+    test: TestAgentSeatsAreAudited
+  - id: new-code-orphaned-a-neighbours-doc-comment
+    severity: low
+    where: pkg/errcode/bot_api.go
+    fix: |
+      ErrBotAPIAllMemberGroupProtected had been inserted between
+      ErrBotAPICannotRemovePrivileged's doc comment and its declaration, so that
+      comment -- which describes uid Details -- documented a code that registers no
+      SafeDetailKeys. Declaration moved back under its own comment, and the new code
+      now says explicitly why it carries no detail keys.
+
+# PR #855 human review (yujiawei, MEMBER) on head 153a8a9: one blocking finding,
+# four spec items, thirteen non-blocking. All fixed except two, recorded below.
+pr_855_review_fixed:
+  - id: space-cascade-never-removed-an-agent-from-groups-its-owner-was-not-in
+    severity: blocking
+    where: modules/project/space_member_removal.go deactivateSeatForCascade
+    what: |
+      The path closed a departing member's agents' project seats DIRECTLY and
+      enqueued nothing, on a comment claiming modules/group's
+      cleanupSpaceMemberGroups already covered them because RemoveGroupMembers
+      pulls a leaver's bots out with them (#354).
+    why_that_was_wrong: |
+      That covers only the groups THE LEAVER IS IN: cleanupSpaceMemberGroups
+      enumerates the departing person's groups and cascades their bots within
+      those. An agent sitting in a project group its owner never joined is never
+      visited -- and D15 makes that arrangement ordinary, since any member may
+      seat their own agent and any member may create a project group.
+    consequence: |
+      An I2 violation nothing repairs: the agent holds no project seat and stays
+      an active member of that group; its own space_member row was never touched
+      so no Space cascade revisits it; no project-side job was ever enqueued; the
+      I2 scan is report-only. The owner, now outside the Space, keeps a proxy
+      reading a project group.
+    fix: |
+      The agents get the TWO-PHASE close plus a job each, exactly as the kick and
+      leave paths do, so P1's detach removes them from EVERY group of the project.
+      Direct-closing them would also have made an enqueued job useless:
+      removalCancelled retires any job whose member reads removing = 0.
+    test: |
+      TestSpaceRemovalTakesTheAgentOutOfEVERYProjectGroup (end to end, through the
+      real group side, with the all-member group as the control since the old code
+      DID handle that one) and TestSpaceCascadeBeginsATwoPhaseCloseForTheDepartingMembersAgents
+      (the mechanism). The e2e case was confirmed to fail on the unfixed code.
+  - id: members-add-ran-a-looser-agent-predicate-than-create
+    severity: high
+    brief_ref: S4 / D2 / D15(c)
+    what: |
+      create ran the full D2 rule; members/add decided on robot.creator_uid alone.
+      A self-hosted agent create refuses was accepted here, and -- the half that
+      bites -- a DISABLED or ORPHANED bot (user.robot = 1 with robot.status = 0 or
+      no robot row) read as "not an agent" and fell through to the HUMAN branch, so
+      an admin could seat it as an ordinary member.
+    why_it_matters: |
+      That seat is unreclaimable. queryOwnedAgentSeatsTx requires robot.status = 1,
+      so D13 never takes it when its owner leaves, and no cascade revisits an
+      active seat.
+    fix: |
+      queryAgentOwnerTx replaced by queryAgentClassTx, which reads the two facts
+      separately: `user`.robot decides WHICH BRANCH, the full eligibility rule
+      decides whether the own-agent branch applies. The round-1 ordering (ownership
+      first, then the permission gate, then the agent-specific refusal only for a
+      privileged caller) is preserved, so no oracle is reintroduced.
+    test: TestMembersAddAppliesTheSameAgentPredicateAsCreate
+  - id: transfer-route-paid-two-queries-against-a-budget-of-one
+    severity: medium
+    brief_ref: S3 / C1
+    what: |
+      transferGrouper used refuseIfAllMemberGroupByNo, which issues its own
+      QueryWithGroupNo, and the very next statement called getGroupInfo -- the same
+      query. Space-direct groups paid +1 and project groups +2, against a budget of
+      0 and 1 that the guard's own comment states as a hard requirement.
+    fix: |
+      The guard moved below getGroupInfo and takes the row it already read. The
+      by-number variant was DELETED rather than left available: with no entry point
+      that can read the group row itself, C1 holds by construction instead of by
+      every call site remembering. TestAllMemberGroupGuardTakesTheGroupRowFromItsCaller
+      pins that, and also pins the five call sites.
+  - id: rebuild-left-the-existing-roster-out-of-the-new-group
+    severity: medium
+    brief_ref: Q11
+    what: |
+      The rebuild seeded the new group with nil members and a comment saying
+      admitAllMemberGroup would fill the rest in one by one. Nothing did -- it runs
+      only for the uids of the triggering request. A project holding A and B,
+      rebuilt while adding C, came out as {owner, C}.
+    fix: |
+      The rebuild seeds the CURRENT active roster. The old comment's argument (a
+      batch admission is all-or-nothing) is true but pointed the wrong way: these
+      uids are the project's active members, so they pass I2 by definition, and the
+      only failure mode -- a removal landing between the roster read and the create
+      -- is self-healing, since the lease releases and the next write path retries.
+    test: TestRebuildBringsTheWHOLERosterIntoTheNewGroup
+  - id: lease-release-cleared-whoever-s-lease-was-there
+    severity: medium
+    brief_ref: Q1
+    what: |
+      releaseAllMemberGroupProvision keyed on the project alone, so a provisioning
+      attempt outliving allMemberGroupLease cleared, on its way out, the lease a
+      successor was actively holding -- and a third writer claimed immediately.
+    fix: |
+      The claim returns its deadline and the release is fenced on it, the way
+      completeRemovalJob fences on the lease owner. Writing that fence surfaced a
+      second defect the test caught rather than the reasoning: the deadline has to
+      be TRUNCATED to milliseconds, because the column is DATETIME(3) and an
+      equality fence against a nanosecond-precision Go time never matches -- a
+      fence that never matches looks exactly like no fence in the logs.
+    test: TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease
+  - id: assorted-non-blocking
+    severity: low
+    fixes: |
+      Q3: splitSeatCounts reads its own fallback total, so the happy path is one
+      aggregate instead of two -- and the create path stops deriving a fallback
+      from the REQUEST, which was wrong by one whenever the caller named
+      themselves in agent_uids (Q9's other half).
+      Q4: the list route counts TOTAL (index-only, no join) and HUMANS, deriving
+      agents as the difference -- halving the per-card `user` dives the two-join
+      version cost.
+      Q5: the group number is read once per batch instead of once per uid; the
+      admit-lookup metric moved to where that single read now fails, so hoisting
+      it did not eat a signal.
+      Q7: bot deletion attributes the seat closures to the OWNER who issued the
+      delete, not to the bot itself.
+      Q8: the blacklist refusal has tests, both halves -- refused on add, still
+      open on remove, since un-blacklisting moves WITH I4.
+      Q9: the create audit loop filters through withoutUID, so naming yourself in
+      agent_uids no longer logs a membership write that did not happen.
+      Q10: IsAllMemberGroup excludes a disbanded group, and the literal it compares
+      against is now one exported constant (pkg/project.GroupStatusDisband) that
+      both readers share, with TestGroupStatusDisbandMatchesPkgProject keeping it
+      in step with modules/group.
+      Q12: AllMemberGroupGuardFailures counts every fail-open. The choice is only
+      right if a fail-open is loud, and the shapes that matter (schema change,
+      collation drift) fail on EVERY call rather than once.
+      Q13: the admitter re-reads the group row INSIDE its transaction, so the
+      admission gate evaluates I2 against the transaction's own view of
+      project_id rather than a snapshot taken before it.
+      S2: the scan-B grace window is configurable
+      (OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE), defaulting to the old constant.
+
+# Raised in the review, deliberately not changed. Each has an answer, not a shrug.
+pr_855_review_not_changed:
+  - id: i4-scan-b-banned-space-exemption
+    brief_ref: S1
+    answer: |
+      Not added, and now with evidence rather than an argument.
+      TestI4ScanBStaysQuietWhenTheSpaceIsBanned bans the Space under a healthy
+      project and the gauge stays at zero, then breaks the invariant under the same
+      ban and the gauge reports 1. P1's I2 scan needs the exemption because it is
+      the SUBSET direction and a banned Space's group rows are expected to remain;
+      scan B is the SUPERSET direction and the cascade leaves both sides alone, so
+      there is nothing to suppress. The exemption would be a `space` lookup per
+      examined row that can never fire, and it would silence a real admitter
+      failure that happened to occur in a Space banned afterwards.
+    note: |
+      The review's stated impact -- "a banned Space will drive the gauge up with
+      rows nobody can act on" -- is what the first assertion checks. It does not.
+  - id: ensureAllMemberGroupOwner-holds-a-tx-while-reading-the-pool
+    brief_ref: Q6
+    answer: |
+      Left as the review itself suggests ("worth noting rather than doing here").
+      Fixing it properly needs *dbr.Tx variants of pkg/project's MemberRole and
+      PickActiveOwner, which changes a package modules/group, modules/space and
+      modules/project all depend on -- a change that wants its own review, not a
+      rider on this one. No lock-order violation today: both are non-locking reads
+      on octo_project_member.
+
+# Also fixed, found while fixing the above rather than reported.
+pr_855_found_while_fixing:
+  - id: two-i4-scans-had-no-behavioural-test
+    what: |
+      Both scans existed only behind source guards -- the bounds rules and the
+      collation drift probe -- so nothing had ever run either one and looked at
+      what it reported.
+    fix: |
+      reconcile_p2_scan_test.go: scan A's three unusable states plus the healthy
+      and disbanded-project cases, and scan B's gap, its grace-window exemption,
+      its removing = 1 exemption, and the banned-Space evidence above.
+  - id: space-cascade-agent-removals-were-unaudited
+    fix: "auditCascade with reason agent_follows_owner, in the post-commit loop that already invalidates their caches -- closedAgents does not leave the service, so the caller cannot do it."
+
+# PR #855 second formal pass (yujiawei on head 0b9e784), plus the review from
+# mochashanyao on 153a8a9 that arrived after the first round had been answered.
+pr_855_round_2_fixed:
+  - id: rebuild-inputs-validated-against-a-different-table-than-they-came-from
+    severity: blocking
+    where: modules/project/service_all_member_group.go ensureAllMemberGroup
+    what: |
+      The rebuild picked BOTH its inputs from octo_project_member and handed them
+      to CreateGroup, which validates against space_member: the creator through
+      CheckMembership (hard failure), the roster through the I2 gate whose Space
+      half is a conjunction refusing the whole batch on one miss.
+    why_that_was_wrong: |
+      The comment I wrote said "these are the project active members, so by
+      definition they all pass I2". That skips the Space half, and the half it
+      skips is the reachable AND TERMINAL one: an abandoned Space-removal cleanup
+      job leaves a uid with an active project seat and no Space seat, and the
+      module already has a gauge named for exactly that state whose help text
+      reads "nothing re-drives these; a non-zero value needs manual repair".
+    consequence: |
+      One such member refused the entire rebuild. Because both inputs are a
+      deterministic total order, it failed IDENTICALLY on every later add -- and
+      the rebuild is the only repair path this feature has, since scan A is
+      report-only by decision. The project could never get an all-member group,
+      and scan A would report it forever.
+    fix: |
+      Both inputs are filtered through pkg/space.ActiveMembers -- the same
+      function the admission gate Space half uses, so the two cannot disagree --
+      in one batched query. The owner pick returns an ordered CANDIDATE LIST and
+      falls through to the first one holding a Space seat. Dropped members are by
+      construction I1 violations that scan B then reports, which is where they
+      belong and strictly better than no group.
+    test: |
+      TestRebuildProducesAGroupMatchingTheAdmissibleRoster and
+      TestRebuildSkipsAnOwnerWhoLostTheirSpaceSeat -- end to end through the REAL
+      provisioner, asserting on group_member rows rather than on what the stand-in
+      was called with. Both confirmed to fail on the unfixed code.
+    note: |
+      The review named the coverage shape behind this: four blocking findings on
+      this PR have now come out of ensureAllMemberGroup / provisionAllMemberGroup,
+      and all four were invisible to tests that assert on the stand-in stub. The
+      first test above is written as an INVARIANT over the rebuild rather than as
+      a regression case, which is what that observation asks for.
+  - id: i4-scan-b-banned-space-exemption
+    severity: spec
+    brief_ref: S1
+    what: "I argued the exemption unnecessary and was half right, which is the same as wrong."
+    why_that_was_wrong: |
+      My argument was that no NEW gap can open during a ban, since lockSpaceSeatsTx
+      joins `space` on status = 1 and refuses every add and removal. True, and
+      beside the point: the exemption is not there to stop gaps appearing, it is
+      there to stop the gauge holding rows nobody can act on. A gap that PREDATES
+      the ban is still reported, and its only documented repair -- an admin
+      re-adding the member -- goes through that same refused path. My own test
+      asserted the wrong half: it checked that a gap opened AFTER the ban was
+      still reported, and called that "not merely mute".
+    fix: |
+      Exemption 4 added, in the violating flag (LEFT JOIN `space`), matching
+      reconcile_p1.go:178. TestI4ScanBExemptsABannedSpace now opens a real gap
+      BEFORE the ban, asserts it is reported, bans, asserts it stops, un-bans,
+      asserts it returns -- so the exemption is the ban and not a silence.
+  - id: index-with-no-query
+    brief_ref: Q2
+    what: |
+      idx_octo_project_all_member_group_no was justified as serving D7 reverse
+      lookups. The review enumerated every statement touching the column: all of
+      them also filter on project_id (served by the UNIQUE uk_octo_project_project_id)
+      or drive off p.status / p.id. Nothing looks the column up alone.
+    fix: "Dropped. It is not free -- a non-INSTANT online build at deploy time, and a B+ tree maintained on every octo_project write, for no reader."
+  - id: service-layer-guard-read-one-file
+    brief_ref: Q3
+    what: |
+      The guard asserted refuseIfAllMemberGroup is absent from ../group/service.go.
+      Of the primitives its own message names, only RemoveGroupMembers is there:
+      UpdateMemberRoleTx and UpdateStatusTx are in db.go, and admitOrRestoreMembersTx
+      -- the one the all-member admitter itself goes through -- is in admission.go.
+    note: |
+      The same diff ships learnings/pending/a-guard-that-names-its-subject-file-is-not-a-floor.md,
+      which states this rule verbatim. Writing the rule down did not stop me
+      breaking it in the same commit.
+    fix: "It globs the package, allow-listing api.go (where the refusals belong) and the guard definition itself, with a floor on the number of files scanned."
+  - id: losing-the-provisioning-race-dropped-a-batch-silently
+    brief_ref: Q4
+    what: |
+      ensureAllMemberGroup returns "" both when the rebuild FAILED and when it was
+      SKIPPED because another writer holds the lease. The empty string is threaded
+      to every admission in the batch, and the groupNo == "" arm counted nothing on
+      the reasoning that the rebuild path had already logged. It had not -- it was
+      never entered.
+    fix: "reasonAdmitRaceLost on the metric (per uid) plus one batch-level Warn in addMembers, rather than one log line per uid."
+  - id: rebuild-cost-decision
+    brief_ref: Q1
+    decision: |
+      The seed is NOT capped at MemberBatchMax. Capping turns the rebuild back into
+      the defect the previous round fixed -- a group that is incomplete and that
+      nothing backfills -- and the tail's only repair would again be per-member
+      re-adds. The cost is one-off rather than per-request: the blocking fix above
+      removes the state that made a rebuild fail permanently.
+      The sequential half IS fixed: CreateGroup batched its per-member
+      CheckMembership loop into one pkg/space.ActiveMembers call, which that
+      helper doc explicitly exists for and which benefits every caller. The
+      remaining per-member GenSeq is the create path shape for all callers and
+      changing it means changing version allocation -- not a rider on this change.
+  - id: assorted-nits
+    fixes: |
+      pkg/project.AllMemberGroupNo deleted: zero callers, and it kept answering the
+      pre-fix version of the question after IsAllMemberGroup gained the
+      disbanded-group and project_id checks.
+      admitToAllMemberGroup spaceID parameter renamed to _ with the reason (the
+      gate must judge by the group own space_id, re-read in the transaction).
+      The "leaks nothing" claim corrected in both places it appears: two of the
+      five call sites run the guard before reading the caller membership, so a
+      non-member CAN learn the group belongs to a project. Bounded, not nothing --
+      stated accurately because the next person to move the guard will cite it.
+      Scan B system-bot exemption moved from the WHERE into the violating flag,
+      matching the rule stated three lines above it.
+      len(roster) >= maxMembers relaxed to >, which was warning on a project that
+      is legitimately exactly full.
+      The 400-vs-403 divergence between the group and bot_api codes for one rule
+      is documented at the code, not unified: each is consistent inside its own
+      module convention, and unifying means changing one module wire contract.
+
+# From mochashanyao (review on 153a8a9, submitted after the first round had been
+# answered, so it was not seen at the time). Its P1 and four of its five P2s were
+# already fixed by the response to the first review; the rest are above.
+pr_855_second_reviewer:
+  already_fixed_by_round_1: |
+    P1 (rebuild leaves pre-existing members out) = Q11. P2s: unaudited agent seats
+    on the Space cascade, the blacklist guard having no test, the create handler
+    auditing uids the service dropped, and self-hosted agents accepted by
+    members/add but refused by create.
+  unique_items: |
+    The 400-vs-403 note (handled above), and four human-verify items. One of those
+    is new and is NOT resolved here: whether DISBAND specifically should fail
+    CLOSED rather than open. The fail-open argument is strongest for exit (a user
+    who cannot leave has no way round it) and weakest for disband (irreversible).
+    Recorded in open_verification rather than decided.
+
+# PR #855 fourth pass (yujiawei on head 1142ad5). Spec came back green; three new
+# blocking findings, two of which this project put there in the round before.
+pr_855_round_3_fixed:
+  - id: writeback-was-not-fenced-on-the-lease-it-claimed
+    severity: blocking
+    where: modules/project/db_all_member_group.go setAllMemberGroupNo
+    what: |
+      Round 2 fenced releaseAllMemberGroupProvision on the claimed deadline.
+      setAllMemberGroupNo never got the other half: its only guard was "the
+      pointer is still empty".
+    why_that_was_wrong: |
+      The comment argued exactly one ordering -- the successor writes back first,
+      so the late one finds a non-empty pointer and loses -- and that ordering is
+      self-consistent. The reverse was not considered: A claims, runs past its
+      lease, B claims and builds from the CURRENT roster, then A returns FIRST and
+      writes back. The pointer is still empty, so A wins with its older snapshot.
+    consequence: |
+      The project names the group built from the stale roster; everyone added in
+      the window is missing from it, and B group -- which has the complete roster
+      -- survives as an ordinary project group, so the Space shows two groups
+      named after the project. Lease expiry is not exotic here: the constant own
+      comment sizes 2 minutes against the IM channel call as "the only part that
+      can take minutes".
+    fix: "the claimed deadline is threaded into the writeback as an equality fence. Correct in both directions: an expired-but-UNCLAIMED lease still holds the claimant own deadline, so a late write with no successor still lands."
+    test: |
+      all_member_group_lease_test.go -- the lease PROTOCOL, not the rebuild
+      inputs. Two properties: exactly one group ever carries the pointer, and the
+      one that does is built from the later roster. Confirmed non-vacuous by
+      removing the fence and watching the stale write win.
+    note: |
+      The review asked for exactly this test and named why the previous round
+      invariant test did not catch it: that one exercises the rebuild INPUTS,
+      while what was unguarded is the protocol AROUND it -- which of two
+      concurrent attempts becomes authoritative.
+  - id: roster-truncation-became-silent
+    severity: blocking
+    where: modules/project/service_all_member_group.go / db_all_member_group.go
+    what: |
+      queryActiveMemberUIDsForRebuild was called with LIMIT = maxMembers while the
+      caller checked len(roster) > maxMembers, so the check was unreachable.
+    why_that_was_wrong: |
+      Round 2 relaxed >= to > in response to a nit (>= also fires on a project
+      legitimately at exactly max_members) and did not change the limit. The
+      correct answer to that nit is to fetch maxMembers + 1 and keep >. So the
+      round that was fixing a false-positive removed the only true signal, in a
+      commit whose own heading reads "the roster is NOT truncated, this is a
+      decision" -- while the code truncated anyway, at a bound updateProject can
+      lower below the current seat count with no check.
+    fix: "fetch maxMembers + 1, keep >, drop the probe row before seeding."
+    test: TestRebuildWarnsWhenTheRosterIsTruncated
+  - id: bot-deletion-continued-past-a-failed-seat-close
+    severity: blocking
+    where: modules/botfather/command.go onDeleteConfirm
+    what: |
+      CloseAllSpaceSeats returning an error was logged and the flow continued to
+      deleteRobot. The comment justified that with two claims, and the review
+      showed both are false.
+    why_those_claims_were_false: |
+      "I1 will report it" -- I1 looks for an active project seat whose SPACE seat
+      is gone. In this failure the Space seat is still ACTIVE (the UPDATE never
+      ran, or rolled back). No scan in this repository looks for an active
+      space_member row whose robot row is status = 0.
+      "Retrying the whole delete is idempotent" -- deleteRobot sets
+      robot.status = 0, and the bot selection query requires status = 1, so the
+      owner can never reach that bot again.
+    consequence: |
+      A bot the user deleted keeps an active Space seat in the failed Space,
+      therefore an active project seat, therefore keeps satisfying the I2 gate and
+      stays a reading member of that project groups -- permanently, invisible to
+      every scan, with no user-reachable repair. Exactly the end state D14 exists
+      to eliminate, and LESS observable than the raw UPDATE it replaced (that one,
+      when it succeeded, left a state I1 could see).
+    fix: "abort before deleteRobot and reply MsgDeleteFailedRetry. The robot row is still status = 1 at that point, so the retry the message promises actually works."
+  - id: scan-b-double-reported-scan-a-problem
+    brief_ref: Q2
+    what: |
+      Scan B base population required only that the pointer be non-empty. A
+      project pointing at a DISBANDED group is therefore in it -- and group_member
+      rows survive a disband (only group.status flips; the member cleanup is an
+      async event that can fail), so the join keeps finding them until that
+      cleanup lands and then finds none of them at once. Scan A already reports
+      that project as one row.
+    note: "The scan own doc comment claimed this exclusion. It only covered the empty-pointer case."
+    fix: "exemption 5, in the violating flag with scan A join shape, so the two agree on usable."
+    test: TestI4ScanBDoesNotDoubleReportScanAsProblem
+  - id: assorted
+    fixes: |
+      Q5: the owner-candidate cap was a self-chosen 16 with nothing bounding a
+      project to 16 owners; if the sixteen most senior were all I1 leaks the
+      rebuild failed forever -- a narrow version of the P1 fixed last round. Now
+      bounded by max_members, which is the meaningful bound (owners are a subset
+      of members).
+      Q6: bot_api guard copy read group.project_id itself, so a Space-direct group
+      paid one query where C1 budgets zero. project_id now rides along with the
+      status the handler already reads for its disband check.
+      Q7: reasonAdmitRaceLost renamed admit_skipped_no_group -- the arm cannot
+      tell a lost race from a failed provision, so a name that says "race" reads
+      as a concurrency signal while double-counting provisioning failures.
+      Q4: agent eligibility now includes the account itself
+      (u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2), matching the contact
+      directory that D2 says it matches. Read as a separate flag rather than
+      filtered in the WHERE, so a deactivated bot does not fall through to the
+      HUMAN branch -- which is the shape of the hole closed two rounds ago.
+      Nits: the D7 header said "four operations" while five are guarded; the brief
+      D7 paragraph now names blacklist and the bot_api copy, and records that
+      IsAllMemberGroup real signature is narrower than D5 wrote.
+      Two stale spec-record entries corrected: declared_deviations still said the
+      banned-Space exemption was not implemented, and open_verification still
+      asked the deploy team to budget for TWO indexes after one was dropped. The
+      second was a live instruction to whoever runs the migration.
+  - id: transfer-not-disband-is-the-fail-open-outlier
+    brief_ref: Q1
+    what: |
+      The open_verification entry asking whether the D7 guard should fail CLOSED
+      was aimed at DISBAND, following the third-round reviewer. The fourth round
+      showed that aim is backwards.
+    detail: |
+      The fail-open argument is that the worst case leaves a state a scan reports.
+      remove / exit / blacklist leave member-set gaps (scan B); disband leaves a
+      project pointing at a disbanded group (scan A, then the stale-pointer clear
+      and a rebuild). TRANSFER is the one where it does not hold: a group-side
+      owner transfer that slips through leaves the all-member group creator on
+      someone who need not be a project owner, and no scan checks that relation.
+      D6 own comment already describes the resulting state -- a group owner nobody
+      can change, since D7 then refuses them transfer, exit and disband.
+    status: "re-aimed in open_verification, still a product call rather than decided here."
+
+# PR #855 fifth pass. Two reviewers on the same head (yujiawei, and Jerry-Xin
+# joining), converging independently on the same two blocking items.
+pr_855_round_4_fixed:
+  - id: collate-placement-made-the-probe-index-unusable-on-user-traffic
+    severity: blocking
+    where: pkg/project/all_member_group.go IsAllMemberGroup, and modules/project/db_all_member_group.go queryAllMemberGroupNo
+    what: |
+      The repo rule is "put the explicit COLLATE on the driving side's values so
+      the driving table's indexes stay usable". That is true and it hides the
+      cost: an explicit COLLATE has coercibility 0, so the COMPARISON is in that
+      collation and the OTHER side must be converted per row -- its index cannot
+      serve it. `group.group_no` is 0900_ai_ci in production; group_groupNo, its
+      UNIQUE index, was unusable.
+    measured: |
+      Reproduced locally on MySQL 8.0.46, `group` at 0900_ai_ci / 5000 rows:
+        shipped join:  p const uk_octo_project_project_id 1 row
+                       g ALL   possible_keys=group_groupNo  key=NULL  rows=5000
+        split reads:   p const uk_octo_project_project_id 1 row
+                       g const group_groupNo               1 row
+    consequence: |
+      IsAllMemberGroup is the WHOLE of the D7 guard, reached from six user-facing
+      handlers (group disband / exit / member removal / owner transfer / blacklist,
+      and the bot API member removal). A full scan of `group` -- a core IM table --
+      on every group exit. In P0 and P1 this shape only touched background scans;
+      P2 is the first time it reached request traffic.
+    fix: |
+      Both predicates split into two single-table reads with NO cross-schema
+      comparison. Deliberately not "move the COLLATE to the legacy side": that is
+      correct today and silently wrong in the mirror direction the moment the
+      collation conversion lands. A comparison that crosses no schemas needs no
+      collation opinion.
+    not_fixed: |
+      The two paged reconcile scans cannot be split that way. Their comment
+      claiming a per-row index dive was corrected to state the measured plan
+      (`g ALL`, plus `Using temporary` defeating the ORDER BY / LIMIT paging), and
+      open_verification now carries that as the EXPLAIN item rather than an
+      assumption. They inherit P0/P1's pending conversion and are bounded by
+      ReconcileLimit and a 5-minute interval meanwhile.
+    note: "CI creates its database with general_ci on both sides, so every one of these plans is const there. P0's migration header says exactly this -- a green suite is structurally not evidence."
+  - id: the-one-query-optimisation-loosened-a-fail-closed-bot-guard
+    severity: blocking
+    where: modules/bot_api/send.go queryGroupStatusAndProject
+    what: |
+      Round 4's Q6 fix merged isGroupDisbanded's lookup with the D7 guard's
+      project_id read, replacing LoadOne with Load. A missing group row therefore
+      became (status 0, "", nil) -- "not disbanded" -- instead of dbr.ErrNotFound.
+    consequence: |
+      errBotSendPermGroupNotFound and the sendPermissionReasonNotFound metric,
+      whose job is to separate "a bot is probing channel ids that do not exist"
+      from "a query failed", became unreachable through the DB. On the OBO send
+      path the disband guard was the ONLY existence check (checkOBO returns early
+      with an enabled scope row). And modules/bot_api started answering
+      differently from modules/robot and modules/message on the same question,
+      while its own doc comment still claimed the not-found signal was preserved.
+    why_the_suite_was_green: |
+      Both "missing group" cases drive groupStatusQueryOverride -- the stub seam,
+      which the change did not touch. The changed branch had no test at all.
+    fix: "the not-found signal is wrapped and propagated; the D7 half short-circuits on projectID == \"\" independently. Two tests drive the REAL query with no stub."
+    self_assessment: "This was mine, introduced to save one query for a P2 latency nit, on a PR labelled security-sensitive. The reviewer's framing is the right one."
+  - id: admission-subscribed-the-parent-channel-but-not-its-threads
+    severity: blocking
+    where: modules/group/all_member_group.go admitToAllMemberGroup
+    what: |
+      Each thread is its own WuKongIM channel with its own subscriber list, and
+      send permission is checked against that list. Every other admission path in
+      the module pairs IMAddSubscriber with addUsersToGroupThreads -- memberAdd,
+      groupScanJoin, un-blacklist, Service.AddGroupMembers, event.go -- and removal
+      is symmetric. The all-member admitter had only the first half.
+    consequence: "a member added to a project could not post in the all-member group's threads and did not receive them: permanently (the admitter runs once per join) and invisibly (I4 scan B reads group_member rows, not subscriptions)."
+    fix: "addUsersToGroupThreads after the parent subscribe, held by a source guard on the pairing -- the effect itself is not assertable, since nothing here can read the broker's subscriber table back."
+  - id: two-fixes-shipped-without-anything-pinning-them
+    severity: blocking-adjacent
+    raised_as: "Jerry-Xin P2-5, by mutation testing"
+    what: |
+      Reverting round 4's botfather abort to log-and-continue left the entire
+      modules/botfather suite GREEN. Removing the +1 probe row from the roster
+      query left TestRebuildWarnsWhenTheRosterIsTruncated GREEN -- a test named
+      for the warning, asserting only the bound, which is identical either way.
+    why_it_matters: "both are fixes the previous two rounds BLOCKED on, one revert away from returning with nothing going red."
+    fix: |
+      A closeSeatsFn seam in botfather plus two cases (abort on failure with the
+      robot row still selectable; proceed on success). And the truncation is now a
+      COUNTER, not only a log line -- a signal that exists only in a log cannot be
+      asserted, which is how it got deleted silently once already.
+    both_verified: "by re-running the reviewer's mutations: each test goes red."
+  - id: comments-naming-detection-that-does-not-cover-the-residue
+    raised_as: "Jerry-Xin P2-2"
+    fixes: |
+      CloseAllSpaceSeats's partial-failure comment said "I1 will report it". I1's
+      domain is octo_project_member ("project seat alive, Space seat gone"); this
+      residue is the opposite and no scan looks for it. The comment now says so and
+      names the real backstop -- botfather aborting the deletion.
+      The provisioning !ok Warn named only one of its three cases and routed the
+      on-call reader to scan A for all of them; it now names all three (pointer
+      taken, lease taken with the pointer still empty, project disbanded -- the
+      last being I3's domain, not A's).
+  - id: spec-record-and-journal-drift
+    raised_as: "Jerry-Xin P2-1 / P2-3 / P2-4"
+    fixes: |
+      db.go's comment called octo_project_member a legacy table while the two lines
+      above it say it is pinned -- and the consequence is worse than a wrong word:
+      that pre-existing join raises 1267 under the production shape, so listMembers
+      (D16's roster surface) cannot execute at all until the conversion lands. Added
+      to open_verification as a gating item rather than left in a comment.
+      The brief said "four protected operations" in four more places after the D7
+      section was corrected to five, and still described D5 as "add an index" after
+      the second one was dropped. The journal still described scan B as not
+      exempting banned Spaces and counted end-to-end cases that have since grown.
+      All corrected; the journal also gained the two lessons this round produced.
+
+# octospec Verify phase. Each injected rule re-read and checked against the diff,
+# then the brief's Acceptance walked line by line.
+# PR #855 fifth pass, second half. The two blocking items were fixed in 07207f1;
+# this is the non-blocking remainder from the same two reviews, worked rather than
+# carried -- three of them had been restated across rounds, which is how an item
+# becomes invisible by having been mentioned.
+pr_855_round_5_fixed:
+  - id: the-owner-sync-could-not-converge-two-creators
+    severity: high
+    where: modules/group/all_member_group.go ensureAllMemberGroupOwner
+    what: |
+      The creator rows were read without ORDER BY and only creators[0] was
+      inspected. Two role=creator rows is the state the FOR UPDATE exists to
+      prevent, so it is reachable -- and if the row the engine happened to return
+      first was still an active project owner, the function returned at its first
+      check with both creators intact.
+    why: |
+      Nothing else converges it: D7 refuses transfer, exit and disband on an
+      all-member group, so no group-face path can clean up a second creator. The
+      unordered read had a second cost -- which row counted as "the sitting
+      creator" depended on the storage engine, so the outcome was untestable and
+      could differ on a replica.
+    fix: |
+      Ordered by (created_at, uid), the same total order PickActiveOwner uses; the
+      keeper is decided first and EVERY other creator row is demoted. The successor
+      being already one of the creator rows is its own branch: promoting a row that
+      is already a creator updates nothing, and the promote path treats that as a
+      bug and rolls back, so the naive convergence would have turned a repairable
+      state into a permanent error.
+    test: TestOwnerSyncConvergesAGroupWithTwoCreators, TestOwnerSyncKeepsTheOwnerWhoIsAlreadyACreator
+    mutation: "restoring the early return leaves the first test red."
+  - id: the-owner-sync-asked-the-project-on-a-pooled-connection
+    severity: medium
+    where: modules/group/all_member_group.go, pkg/project/{membership,all_member_group}.go
+    what: |
+      MemberRole and PickActiveOwner ran on ctx.DB() while the sync held FOR UPDATE
+      locks on the group's group_member rows -- a different snapshot from the one
+      its writes land in.
+    why: |
+      The role can change inside that window, and this sync only re-fires on a
+      project owner change, so a wrong answer is not retried until the next one.
+      Deferred for three rounds on the belief that it needed new *dbr.Tx variants
+      of two shared helpers.
+    fix: |
+      It did not. Widening both helpers to dbr.SessionRunner -- the repo's existing
+      idiom (modules/group/bot_ownership.go, modules/user/db_manager.go) -- takes
+      *dbr.Session and *dbr.Tx alike and changes no call site.
+    test: TestOwnerSyncAsksTheProjectInsideItsOwnTransaction
+  - id: the-last-index-served-no-query-either
+    severity: medium
+    where: modules/project/sql/20260907000002_project_all_member_group.sql
+    what: |
+      idx_octo_project_all_member_group (status, all_member_group_no) was justified
+      by scan A's predicate. The third round moved all_member_group_no out of that
+      WHERE and into the violating flag, so the justification stopped being true
+      two rounds before this one.
+    why: |
+      Measured, neither scan chooses it under either collation shape: scan A pages
+      by PRIMARY on p.id (a secondary index orders by all_member_group_no, not id),
+      and scan B is driven from octo_project_member. The cost is a non-INSTANT
+      online build plus a B+ tree on every octo_project write.
+    fix: |
+      Dropped, and the two ADD COLUMNs now say ALGORITHM=INSTANT so the file's own
+      INSTANT claim is enforced rather than hoped for. The migration needs no
+      deploy window at all now.
+  - id: the-drift-test-could-not-see-a-plan
+    severity: medium
+    where: modules/project/all_member_group_plan_test.go
+    what: |
+      TestP2StatementsSurviveCollationDrift proves the statements EXECUTE under the
+      production shape. That is the 1267 question. The fifth round's blocking item
+      was a PLAN question, and no test could see it.
+    fix: |
+      A plan guard on the same drifted fixture, EXPLAINing the split predicates
+      through constants the production code itself runs (a copy would pin the plan
+      of a statement nobody executes). The removed joined form is the control: it
+      MUST plan as a full scan of `group` under drift and must NOT after the
+      conversion -- which is simultaneously the evidence for the split and the
+      evidence that "move the COLLATE to the legacy side" is a fix with an expiry
+      date.
+    mutation: "putting a COLLATE back on the group-side read turns it red, naming the table."
+  - id: the-account-deletion-entry-point-skipped-two-aftercare-steps
+    severity: medium
+    where: modules/space/member_removal_all_spaces.go CloseAllSpaceSeats
+    what: |
+      It cleared the per-uid authorization cache and kicked the worker, but did not
+      invalidate notify's per-Space member cache and did not fire
+      SpaceMemberRemove -- both of which afterMembersRemoved does on kick, leave
+      and disband.
+    why: |
+      The event has zero listeners today, so nothing is broken now; that is exactly
+      why it would have stayed broken. This function's own doc calls it the only
+      correct entry point for "an account disappears entirely", and it was the one
+      removal shape that would never reach a listener.
+    fix: |
+      Both helpers were extracted to package-level functions (one implementation,
+      two entry points) and called from CloseAllSpaceSeats -- the event from a
+      single goroutine, as afterMembersRemoved does, because listeners run on the
+      caller's goroutine.
+    test: TestCloseAllSpaceSeatsDoesTheSameAftercareAsEveryOtherRemoval
+  - id: a-rename-could-resurrect-a-disbanded-group
+    severity: medium
+    where: modules/group/service.go UpdateGroupInfo, modules/group/db.go
+    what: |
+      UpdateGroupInfo read the group row on a pooled connection and wrote the whole
+      snapshot back through DB.UpdateTx -- status, forbidden, invite, notice and
+      creator included -- so anything committed inside that window was reverted.
+    why: |
+      Pre-existing, and the repo had already learned it twice (UpdateInviteTx and
+      UpdateStatusTx both carry the comment). What is new is D8: before P2 the
+      window opened when a person clicked rename; now every project rename drives
+      it automatically, with no human in the loop.
+    fix: "UpdateNameNoticeTx, a column-level write, used by UpdateGroupInfo. Fixes the HTTP rename path too."
+    test: TestUpdateGroupInfoWritesColumnsNotTheWholeRow
+  - id: the-create-path-half-of-account-usable-had-no-test
+    severity: low
+    where: modules/project/all_member_group_test.go
+    what: |
+      The deactivated / destroyed account cases were covered on members/add only.
+      The two entry points run DIFFERENT queries (queryAgentRowsTx vs
+      queryAgentClassTx), so "one of them is tested" was not coverage of the
+      expression.
+    fix: "Both cases added to the create-path refusal table, beside the four that were there."
+    test: TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent
+  - id: comments-that-claimed-what-the-code-does-not-do
+    severity: low
+    what: |
+      Four, each of which would have been cited by the next reader:
+      (1) member_removal_all_spaces.go said a seat granted after the snapshot
+      "会被 I1 对账扫描报出来" -- I1 is the opposite direction and no scan reports it;
+      (2) the same file told callers to log and continue on a partial failure,
+      which is the behaviour the fourth round REMOVED from its only caller;
+      (3) admitToAllMemberGroup and renameAllMemberGroup called group.creator "this
+      group's owner" -- it is the group's CREATOR, which no handover path in this
+      repo rewrites, so it goes stale the moment the original creator leaves;
+      (4) removeMemberOnce claimed a person, an unknown uid and a disabled bot all
+      read alike, which stopped being true when account_usable was added -- removal
+      deliberately does NOT ask it, so an owner can still reclaim the seat of an
+      agent whose account is gone.
+    fix: "All four corrected at the code, with the reason each was wrong."
+  - id: the-synchronous-rebuild-had-no-stated-budget
+    severity: low
+    where: modules/project/service.go addMembers
+    what: |
+      The latency trade was argued for project creation. D15 widened members/add to
+      canManageOwnAgents in the same PR, so an ordinary member adding their own
+      agent can now trigger it, and no budget was written down.
+    fix: |
+      The budget is stated where the call is made: it has to fit the HTTP request,
+      the 2-minute lease is a crash timeout and not an allowance, and if it stops
+      fitting the answer is to move the rebuild to the reconcile worker rather than
+      cap the roster (a capped rebuild is the defect the third round fixed).
+      open_verification carries the measurement.
+
+# PR #855 sixth pass. One reviewer (yujiawei) on 3db5f9c, two blocking findings,
+# BOTH against the fifth round's own fixes -- one a behavioural regression the fix
+# introduced, one a guard that passed with its subject deleted.
+pr_855_round_6_fixed:
+  - id: the-convergence-could-demote-the-only-valid-owner
+    severity: blocking
+    where: modules/group/all_member_group.go ensureAllMemberGroupOwner
+    what: |
+      The keeper was chosen before it was known whether the pool-picked successor
+      could be promoted, and was never reconsidered when the promotion fell
+      through. Reachable: creators = [S, B] where S is senior and no longer an
+      owner and B IS an active project owner; PickActiveOwner returns A, the
+      SENIOR owner, who is not in the group (the D12 gap scan B reports); the
+      promotion finds no live member row; the keeper stays S; and the new
+      convergence loop then demotes B.
+    why: |
+      Strictly worse than the state the convergence replaced. Before, this input
+      wrote nothing and left {S, B} -- unconverged, but with a valid owner still in
+      control. After, the group's only creator is a non-owner: D7 refuses transfer,
+      exit and disband so no group-face path repairs it, the sync only re-fires on
+      a project owner change, and NO scan asks whether a group's creator is a
+      project owner. Two independent external events are needed to escape it.
+    fix: |
+      The keeper is chosen from "creators who are still active project owners"
+      before falling back to creators[0], via firstActiveProjectOwner on the same
+      transaction. Skipped entirely when PickActiveOwner returned "" -- that answer
+      already means the project has no active owner at all, so no creator can be
+      one either.
+    test: TestOwnerSyncKeepsTheOwnerInTheGroupWhenTheSeniorOwnerIsMissing
+    mutation: "reverting to keeping creators[0] leaves it red."
+    note: |
+      Neither round-5 test could see this: one had the senior creator BE the owner,
+      the other had the picked owner already in creators. The arm that misbehaved
+      was the only one with no case.
+  - id: the-thread-guard-passed-with-its-subject-deleted
+    severity: blocking
+    where: modules/group/all_member_group_test.go
+    what: |
+      The guard matched the bare token addUsersToGroupThreads against the raw
+      function source. The doc comment two lines above the call names the function,
+      so deleting the CALL left the guard green -- the reviewer executed exactly
+      that mutation and reported ok.
+    why: |
+      The fifth round asked for this fix to be pinned and this test was the pin
+      offered. A guard whose subject also appears in the prose beside its subject
+      is not a guard, and the absence being pinned had already shipped once
+      undetected.
+    fix: |
+      Comments are stripped from the function body before searching, and both
+      assertions now match CALLS (ctx.IMAddSubscriber( / g.addUsersToGroupThreads()
+      rather than tokens. Over-stripping is the safe direction: removing text can
+      only make an assertion harder to satisfy.
+    mutation: "deleting the call now turns it red; verified with the reviewers exact mutation."
+  - id: the-last-joined-write-path-statement
+    severity: medium
+    where: modules/project/db_all_member_group.go clearStaleAllMemberGroupPointer
+    what: |
+      The one statement on a write path still shaped as a JOIN UPDATE with COLLATE
+      on the driving side, i.e. one full scan of `group` per call under the
+      production collation shape.
+    why: |
+      Exposure is small but not zero and not once-only: a project with no active
+      owner returns before provisioning, so every members/add on it pays the scan
+      and buys nothing.
+    fix: |
+      Three single-table statements -- read the pointer, check the group row, then
+      a clear fenced on the pointer value that was read. The fence is a guarantee
+      the joined form did not have: a concurrently written new pointer is not
+      cleared. Atomicity is not lost in any reachable way, because a group cannot
+      go from unusable back to usable (disband is terminal, project_id is immutable
+      by I3). The plan guard now covers this statement too.
+  - id: a-rename-could-still-land-on-a-disbanded-group
+    severity: medium
+    where: modules/group/db.go UpdateNameNoticeTx
+    what: |
+      The column-level write closed the expensive half (a rename could no longer
+      resurrect a disband) and left the other half: UpdateGroupInfo checks status on
+      a pooled read, and the write carried no status predicate, so a rename landing
+      after a concurrent disband still wrote the name, bumped the version and
+      pushed an update notification for a group that is gone.
+    why: "D8 drives this path machine-side on every project rename, so the window is no longer a human-click rarity."
+    fix: "AND status <> disband in the WHERE. Zero rows affected is the whole effect; no error, no change to the caller's idempotence."
+    test: "TestUpdateGroupInfoWritesColumnsNotTheWholeRow, now with both a disbanded case (nothing lands) and a live case (so the predicate cannot pass by refusing everything). The previous version of this test CODIFIED the residue -- it disbanded the group and expected the rename to succeed."
+  - id: the-plan-guard-could-not-see-a-re-inlined-query
+    severity: low
+    where: modules/project/all_member_group_plan_test.go
+    what: |
+      The plan guard EXPLAINs statement constants. A constant stays referenced by
+      the test itself, so re-inlining a joined query into IsAllMemberGroup while
+      leaving the constant declared would regress production with every plan
+      assertion still green.
+    fix: "TestTheSplitPredicatesAreWhatProductionRuns requires each constant to appear at least twice in its own file -- declared AND used."
+
+# PR #855 seventh pass. Jerry-Xin approved at 12:58Z and then dismissed his own
+# review when yujiawei's landed on the same head one blocking finding -- which he
+# then confirmed by executed mutation, recording the under-call as his. The
+# authoritative vote on 90bb457 is REQUEST_CHANGES.
+pr_855_round_7_fixed:
+  - id: the-production-use-guard-counted-occurrences
+    severity: blocking
+    where: modules/project/all_member_group_plan_test.go
+    what: |
+      The guard added last round required each statement constant to appear at least
+      twice in its file -- "declaration plus a use". Vacuous for both pkg/project
+      constants: they occur three times, because the exported test helper the plan
+      guard reads them through is itself a reference. Deleting the production use
+      still left two. Executed by the reviewer with the exact regression the guard
+      names -- a re-inlined joined query with COLLATE inside IsAllMemberGroup -- and
+      the guard stayed green.
+    why: |
+      The same threshold was soft on the module side for a different reason: two
+      production call sites each, so deleting one still left two. And CI could not
+      catch either, because the DB-backed drift suite asserts the statement
+      EXECUTES, which a joined query with an explicit COLLATE does -- that is the
+      whole reason the fifth round's regression was a plan regression and not a 1267.
+    fix: |
+      Counting was the wrong instrument. The guard now names, per constant, the
+      FUNCTION that must run it, slices that function's body, strips comments, and
+      asserts the constant appears inside it. No reference elsewhere in the file can
+      satisfy it, and every one of the five production call sites is pinned
+      individually.
+    mutation: "the reviewer's re-inlined join now turns it red, naming the function."
+  - id: the-rename-still-published-what-it-did-not-write
+    severity: medium
+    where: modules/group/db.go, modules/group/service.go
+    what: |
+      The status predicate added last round stopped the write; UpdateGroupInfo
+      ignored RowsAffected and still invalidated the push-name cache, sent two
+      GroupUpdate broadcasts and a channel refresh, then returned nil. On the race
+      it was meant to close, the database ended clean and the clients were told a
+      disbanded group had been renamed.
+    fix: "UpdateNameNoticeTx returns rows affected; 0 skips all three publish steps and returns nil (nothing happened is not a failure)."
+    test: "the behavioural case asserts affected == 0 / == 1, and a body-scoped source guard pins that the early return precedes all three publish calls -- the caller half cannot be reproduced without a hook between its pooled status read and its write."
+  - id: the-seat-count-had-the-blocking-shape-one-table-over
+    severity: medium
+    where: modules/project/db_agent.go countActiveSeatsByKind
+    what: |
+      octo_project_member driving, `user` probed, COLLATE on the driving side. Under
+      the production collation shape that is a full scan of `user` per call, and the
+      call runs on the project detail, create and update responses. The file header's
+      rule -- put the COLLATE on the driving side so the octo_project* indexes stay
+      usable -- describes the sibling statement and had been applied here, where
+      octo_project* IS the driving side.
+    fix: "Two single-table reads (seat uids by project_id, then those uids against `user`), no COLLATE anywhere. The header now states the condition the rule depends on."
+  - id: a-post-commit-subscribe-failure-pointed-on-call-at-a-blind-scan
+    severity: medium
+    where: modules/group/all_member_group.go, modules/project/service_all_member_group.go
+    what: |
+      When the admission transaction commits and the broker subscribe then fails, the
+      caller logged "人未进群，由 I4 扫描 B 报出" and counted admit_failed. Both halves
+      are wrong for that path: the member IS in group_member, so scan B -- which
+      compares seats against group_member rows -- reports nothing, and what actually
+      remains is a subscriber gap nothing in this repository can read back.
+    fix: |
+      pkg/project.ErrAdmittedButNotSubscribed (the shared leaf both modules may
+      import), wrapped by the group side and matched with errors.Is by the project
+      side, with its own reason label subscribe_failed_after_commit and a message
+      that says what is actually missing.
+  - id: one-doc-line-called-a-read-view-a-lock
+    severity: low
+    where: modules/group/all_member_group.go
+    what: |
+      The comment said the project-side questions go through tx because the answer
+      must come from the snapshot that will be written. MemberRole and PickActiveOwner
+      are non-locking reads: they join the transaction's read view but lock nothing,
+      so the role can still change before the commit.
+    fix: "Corrected in place, with why the trade is right (the no-escalation invariant, and FOR SHARE would add an unanalysed edge to the declared lock order) rather than deleting the paragraph."
+
+# PR #855 seventh pass, second half. Jerry-Xin re-posted his round-7 review as a
+# merged revision with a SECOND blocking finding the first version (and every
+# earlier round, mine included) had missed.
+pr_855_round_7b_fixed:
+  - id: the-rest-bot-deletion-never-went-through-d14
+    severity: blocking
+    where: modules/botfather/api_user.go deleteUserBot, modules/botfather/api.go
+    what: |
+      Bots have TWO deletion entry points. This PR routed the chat command through
+      modules/space.CloseAllSpaceSeats and left DELETE /v1/user/bots/:bot_id doing
+      the bare `UPDATE space_member SET status=0` that D14 exists to forbid --
+      zero diff bytes on that file between merge-base and head.
+    why: |
+      The bare update skips the whole chain: no cleanup job, so no P0 project-seat
+      cascade and no P1 group detach. The residue is a disabled bot still holding
+      an active octo_project_member row and an active group_member row, and it has
+      no witness -- I1's reconcile is default-off and gated on the collation
+      conversion, I4 scan B looks for a member MISSING from the group while this
+      ghost has both rows, and D13 cannot reclaim a seat whose robot row is
+      disabled. Retry is impossible too: deleteRobot has already flipped
+      robot.status, and the endpoint's own lookup requires status = 1.
+      In scope for this PR rather than pre-existing hygiene: D14 is this PR's own
+      deliverable, and the brief, the acceptance line and the PR description all
+      claimed it was done.
+    fix: |
+      The REST path closes seats through CloseAllSpaceSeats with the same
+      abort-on-failure semantics as the command path (the robot row is still
+      selectable at that point, so the retry it offers is real), behind the same
+      injectable closeSeatsFn seam.
+    test: TestRESTBotDeleteClosesSeatsThroughTheOutbox
+    mutation: "putting the bare UPDATE back turns it red."
+    note: |
+      Nobody ran the census -- "which entry points can delete a bot" -- through
+      seven rounds. The same parity discipline this change applied well elsewhere
+      (D7's guard placement across handlers, the admission-entry constant lists)
+      was never applied to the thing D14 is about.
+
+# PR #855 eighth pass (yujiawei on a00a721). Its P0 -- the REST bot deletion --
+# was already fixed in fc218b1, pushed before the review landed. The rest is here.
+pr_855_round_8_fixed:
+  - id: the-list-route-carried-the-collation-shape-at-n-fanout
+    severity: high
+    where: modules/project/db.go listVisibleInSpace
+    what: |
+      The member_count subquery joined `user` with a COLLATE on the driving side --
+      the third instance of the shape this PR was blocked on twice -- and the worst
+      placed of the three: correlated on p.project_id, so a page of 20 projects
+      paid up to twenty `user` probes that the production shape turns into scans,
+      on a route with no create gate in front of it. It was in neither the drift
+      suite nor the plan guard, and the comment above it argued for keeping the
+      join on an assumption ("each subquery dives into `user` once per member row")
+      that the shape invalidates.
+    fix: |
+      Seats stay in the statement (index-only). Humans are classified afterwards by
+      fillMemberCounts in two single-table reads for the whole page: the seat uids
+      of the listed projects, then which of those uids are bots. No COLLATE
+      anywhere. The exactness argument survives, and now for a reason true of the
+      code -- one roster snapshot, so humans + agents == len(seats) by arithmetic.
+  - id: the-agent-seat-join-was-argued-not-measured
+    severity: medium
+    where: modules/project/db_agent.go queryOwnedAgentSeatsTx
+    what: |
+      The last cross-schema join on a write path, run under FOR UPDATE by D13's
+      cascade, so its cost is lock-hold time. Its comment claimed the COLLATE
+      placement kept robot's primary key usable.
+    fix: |
+      Measured instead of argued (MySQL 8.0.46, drifted shape, 2000 robots over 200
+      creators): r ref idx_robot_creator_uid rows=3, then pm eq_ref PRIMARY rows=1.
+      No scan on either side -- but the reason is the literal creator_uid predicate,
+      not robot's primary key, which the COLLATE does make unusable. The comment now
+      says that, the statement is a constant, and its plan is asserted under both
+      collation shapes by TestAgentSeatJoinKeepsAnIndexUnderCollationDrift.
+      A first measurement said otherwise (r ref rows=2000, filtering per row) and
+      was an artifact of a probe where one user owned every robot; recorded because
+      the fixture, not the engine, was what changed the answer.
+  - id: a-rename-that-did-not-land-answered-success
+    severity: medium
+    where: modules/group/service.go
+    what: |
+      The 0-rows path returned nil, so the human rename handler answered 200 OK for
+      a group disbanded inside the window -- while updateAvatarCustom, one screen
+      away in the same file, returns not-found for the identical TOCTOU. Two
+      conventions for one situation, and the new one was the looser.
+    fix: |
+      One sentinel (errGroupGoneOrDisbanded, same message text so the two
+      strings.Contains callers in api.go keep working) returned by both the
+      status-check path and the 0-rows path. D8's rename sync swallows it with
+      errors.Is; the human handler reports it. The difference belongs to the
+      callers.
+  - id: two-comments-described-a-statement-that-no-longer-existed
+    severity: low
+    where: modules/project/db_agent.go
+    what: |
+      The round-7 split left countActiveSeatsByKind's comments describing the
+      conditional aggregate and the `user` LEFT JOIN it had replaced. The property
+      they defended still held, by a different mechanism.
+    fix: "Rewritten to the mechanism that actually holds it: one roster snapshot, so the two counts sum by arithmetic."
+  - id: the-plan-guard-matched-block-comments
+    severity: low
+    where: modules/project/all_member_group_plan_test.go
+    what: "stripSourceComments stripped // only, so a constant name inside a /* */ block would satisfy Contains."
+    fix: "Block comments stripped first. Narrow, but this guard's history is haystacks larger than their subject."
+  - id: the-drift-suite-covered-seven-statements-not-every-one
+    severity: low
+    what: |
+      The PR description claimed the drift suite covers EVERY P2 statement crossing
+      the schema boundary. It covered seven, and two crossing statements were absent
+      from it and from the plan guard.
+    fix: "queryOwnedAgentSeatsTx and listVisibleInSpace added to the drift suite; the former also to the plan guard. The PR description claim is corrected."
+
+# PR #855 ninth pass: Jerry-Xin APPROVED 5ec2764 with every round-7/8 blocker
+# verified by executed mutation. He left two advisories, both of the "the guard is
+# vacuous" family this change has been caught by four times. Closed here rather
+# than deferred, because a follow-up on a guard is exactly what did not happen the
+# last three times.
+pr_855_round_9_fixed:
+  - id: the-subscribe-failure-sentinel-had-nothing-pinning-it
+    severity: medium
+    where: modules/group/all_member_group.go, modules/project/{service_all_member_group,all_member_group_test}.go
+    what: |
+      ErrAdmittedButNotSubscribed and its reason label were referenced by no test.
+      Unwrapping the sentinel on the group side left every test in both modules
+      green, so the mislabelling the round-7 fix removed could come back silently:
+      a post-commit subscribe failure would again be logged as "the member is not in
+      the group, scan B will report it", and both halves of that are false for that
+      path.
+    fix: |
+      Both halves pinned. The caller half behaviourally, through the stub admitter
+      seam: an error wrapping the sentinel must increment
+      subscribe_failed_after_commit and must NOT increment admit_failed. The group
+      half by a body-scoped source guard, because reproducing it needs a broker that
+      accepts the group creation and then refuses the subscribe mid-transaction.
+    test: TestASubscribeFailureAfterCommitIsCountedAsItself, TestAdmissionMarksAPostCommitSubscribeFailureAsItself
+    mutation: "unwrapping the sentinel turns the group guard red; removing the errors.Is branch turns the project test red."
+  - id: the-rename-guard-pinned-a-token-not-a-position
+    severity: medium
+    where: modules/group/update_group_info_column_write_test.go
+    what: |
+      `return errGroupGoneOrDisbanded` appears twice in UpdateGroupInfo -- the
+      status-check refusal at the top and the affected == 0 block -- so a Contains
+      over the whole body was satisfied by the first. Deleting ONLY the second
+      return, keeping the if and the Warn, left the guard green while all three
+      publish calls ran: the database clean, every client told a disbanded group was
+      renamed, and the API reporting success.
+    fix: |
+      The assertion is a WINDOW: the return must appear between `if affected == 0`
+      and the earliest of the three publish calls. Position, not existence.
+    mutation: "the partial edit above now turns it red; a full revert was already caught."
+
+# Round 10 landed TWO independent reviews on head 221f383 within eight minutes:
+# yujiawei (2 blocking + 5 P2) and mochashanyao / Octo-Q (1 blocking + 1 P2).
+# They agree on the blocking one; everything else is disjoint.
+pr_855_round_10_fixed:
+  - id: a-third-bot-deletion-entry-point-was-outside-d14
+    severity: high
+    reported_by: "yujiawei P1-1 and mochashanyao P1 (independently, same finding)"
+    where: modules/robot/api_manager.go, modules/space/bot_deletion_census_test.go, modules/robot/api_manager_delete_seatclose_test.go
+    what: |
+      Manager.robotDelete (DELETE /v1/manager/robots/:robot_id, super-admin) removed
+      the bot from every group and flipped robot.status to 0 without touching
+      space_member and without writing a removal ticket. The residue is a DIFFERENT
+      shape from the bare UPDATE the previous two rounds fixed, and worse: the Space
+      seat stays active, so the project seat stays active, while the bot is already
+      out of the all-member group. That is exactly I4 scan B's violating state, it is
+      exempt from none of the five exemptions, and scan B is report-only. D13 cannot
+      reclaim the seat (it requires robot.status = 1) and an operator cannot repair
+      it by re-adding, because addOneMemberOnce refuses a disabled robot row.
+      The methodological error is mine and is the point: the round-7 census asked
+      "who WRITES space_member", which structurally cannot find a door that deletes
+      a bot WITHOUT writing it. The right question is "what deletes a bot".
+    fix: |
+      robotDelete routes through space.CloseAllSpaceSeats with
+      MemberRemoveReasonBotDeleted, behind the same injectable closeSeatsFn seam
+      botfather's two doors have, aborting the deletion on failure (robot.status
+      stays 1, so the admin can retry). The operator is the acting super-admin, not
+      the bot -- the attribution bug the command door already fixed once.
+    test: |
+      Two layers. Endpoint-level, matching the two doors that already had one:
+      TestManagerBotDeleteClosesSeatsThroughTheOutbox (a cleanup job per closed
+      seat), TestManagerBotDeleteAttributesTheRemovalToTheAdmin,
+      TestManagerBotDeleteAbortsWhenSeatsCannotBeClosed.
+      Set-level, which is what the review actually asked for:
+      TestEveryBotDeletionEntryPointRoutesThroughD14 in modules/space. It parses the
+      tree (go/ast, no comment text in the AST at all), finds every function that
+      turns a bot's robot row off, finds every function that calls one, and requires
+      each to call the D14 seam with the bot_deleted reason -- or to be recorded as
+      an exemption with a written reason.
+    found_by_the_census: |
+      A FOURTH call site nobody had named: botfather/command.go tryCreateBotCore
+      calls deleteRobot to compensate a half-failed CREATION. Correctly exempt (the
+      bot never got a Space seat), and recorded as such. It is also the argument for
+      why the set-level test was needed: an endpoint-level test could not have
+      surfaced it.
+    mutation: "deleting the closeSeatsFn call turns all three endpoint tests AND the census red."
+  - id: the-space-removal-path-never-converged-the-all-member-groups-owner
+    severity: high
+    reported_by: "yujiawei P1-2"
+    where: modules/space/member_removal.go, modules/project/{space_member_removal,service_all_member_group,db,api}.go
+    what: |
+      A project owner can lose their seat four ways: kicked, left, role changed, and
+      removed from the Space. The first three call syncAllMemberGroupOwner. The
+      fourth did not -- and on that path the group side still hands the group over,
+      picking the second-oldest non-bot GROUP member with no project-role filter. It
+      can land on an ordinary project member, whom D7 then forbids from
+      transferring, exiting, disbanding or blacklisting the group. Nobody can move
+      it and no scan reports it: I4 compares member SETS, never creator-versus-owner.
+    fix: |
+      A post-steps FINALIZER registry in modules/space, and modules/project
+      registers the idempotent owner sync into it.
+      Not a fifth step and not a call inside deactivateSeatForCascade: step order is
+      registration order, which is import order, declared nowhere -- and BOTH orders
+      leave the defect. Group step first: the departing owner's project seat is still
+      active, so PickActiveOwner can return the person on their way out, promoting
+      them fails (they are no longer a group member), and the non-owner stays.
+      Project step first: the group still has the departing owner as creator, so the
+      sync changes nothing and the handover installs the non-owner afterwards.
+      A finalizer runs only after every step SUCCEEDED, so its input is a settled
+      state rather than an ordering artifact. Its failure retries the job.
+    test: |
+      TestSpaceRemovalLeavesTheAllMemberGroupOwnedByAProjectOwner (e2e, real group
+      module) plus four registry-contract cases in modules/space:
+      TestFinalizerRunsAfterEveryStep (records the ORDER, which is what a fifth step
+      could not give), TestFinalizerDoesNotRunWhenAStepFailed,
+      TestFailedFinalizerRetriesTheJob, TestFinalizerPanicIsContained.
+    a-test-that-was-asserting-a-coin-flip: |
+      The first version of the e2e case passed with the fix removed.
+      group_member.created_at is second-granular, both adds land in the same second,
+      and querySecondOldestNonBotMemberTx orders by created_at with NO tie-break --
+      so the successor was whichever row the engine returned first, which happened to
+      be the right answer. Bob's group row is now backdated an hour, which makes the
+      seniority pick deterministic and the mutation red.
+    mutation: "unregistering the finalizer turns the e2e case red."
+  - id: both-i4-scans-shipped-on-by-default-with-a-measured-full-scan-plan
+    severity: medium
+    reported_by: "yujiawei P2-1 (the one point both reviewer legs agreed on)"
+    where: modules/project/{reconcile,reconcile_p2,review8_reconcile_gate_test}.go
+    what: |
+      The two I4 scans ran outside ReconcileEnabled on the argument that the gate is
+      for statements that cannot survive the collation drift, and these can. True,
+      and the wrong question: SURVIVING 1267 is not the same as being affordable.
+      Their own measured plans under the production shape are `g ALL key=NULL` plus
+      `Using temporary` for scan A and `Using temporary; Using filesort` for scan B,
+      and the temporary table takes the ORDER BY / LIMIT paging with it -- so
+      ReconcileLimit stops bounding the work. On by default is a five-minute full
+      scan of a core IM table on every pod for as long as the conversion is unscheduled.
+    fix: |
+      Both scans moved inside ReconcileEnabled, with the reason stated as cost rather
+      than failure so the next reader does not "fix" it back. Both are report-only, so
+      what waiting costs is the reporting -- and the gate's startup Warn now names all
+      five gated scans, which is what makes "we never turned it on" findable.
+    test: TestReconcileGateCoversExactlyTheGatedScans (renamed; the gated set is now five, and the reason differs per half)
+  - id: two-hooks-judged-group-attribution-from-a-stale-snapshot
+    severity: medium
+    reported_by: "yujiawei P2-3"
+    where: modules/group/{all_member_group,db,service}.go, modules/project/{all_member_group_registry,service_all_member_group}.go
+    what: |
+      admitToAllMemberGroup re-reads the group row in its own transaction so the
+      admission gate judges attribution from an authoritative snapshot (Q13). The
+      other two hooks did not: renameAllMemberGroup checked only status and then
+      updated by group_no, and ensureAllMemberGroupOwner read group_member by
+      group_no and never asked about attribution at all. The project side's
+      queryAllMemberGroupNo does verify both halves, but it is a separate unlocked
+      read -- a detach landing in that window lets a project rename, or change the
+      creator of, a group that is no longer its own.
+    fix: |
+      ensureAllMemberGroupOwner gets the same in-transaction re-read admission has.
+      The rename cannot: the transaction belongs to UpdateGroupInfo. It gets a FENCE
+      instead -- project_id in the UPDATE's own WHERE, threaded through
+      UpdateGroupInfoServiceReq.ExpectProjectID -- which is strictly stronger, since
+      read and write are one statement and there is no window to narrow. Zero rows
+      exits through the existing errGroupGoneOrDisbanded path, i.e. a quiet skip.
+      The rename hook's signature gained projectID to carry it.
+    test: TestOwnerSyncRefusesAGroupThatIsNoLongerTheProjects, TestOwnerSyncStillActsOnTheProjectsOwnGroup, TestRenameRefusesAGroupThatIsNoLongerTheProjects, TestRenameFenceIsWhatStopsTheWrite
+    mutation: "removing the re-read, the early return, or the fence each turns its own case red."
+  - id: the-list-routes-two-counts-do-not-share-a-read-view
+    severity: low
+    reported_by: "yujiawei P2-4"
+    where: modules/project/db.go
+    what: |
+      AgentCount's comment said the two counts come from one snapshot of the roster
+      so the difference cannot go negative, and fillMemberCounts' repeated it. They
+      are two statements with no enclosing transaction: SeatCount from the page
+      query's correlated subquery, MemberCount from a later statement. A concurrent
+      add between them makes MemberCount > SeatCount in normal operation -- so the
+      clamp is load-bearing, and the comment read as if it were decorative.
+    fix: |
+      Comments rewritten to say what the code does, including what the clamp does NOT
+      buy (member_count + agent_count == seat_count can be off by one, briefly).
+      Folding the classification back into the page statement was rejected on the
+      spot: it means re-adding the COLLATE'd join into `user` at one join per listed
+      project, which is exactly what round 8 removed.
+  - id: comment-drift-in-two-places
+    severity: low
+    reported_by: "yujiawei P2-5"
+    where: pkg/errcode/group.go, modules/project/reconcile_p2.go
+    fix: |
+      errcode's D7 code said it refuses "the four group operations" and omitted
+      blacklist, in the one place a client author reads to find out what the code
+      means; it now says five and names it. reconcile_p2 labelled the grace-window
+      predicate "exemption 3: a banned Space" -- wrong exemption AND wrong line; the
+      grace window is 3, the ban is 4, and both now sit on their own predicate.
+  - id: the-full-roster-rebuild-was-carried-as-unmeasured
+    severity: low
+    reported_by: "mochashanyao P2"
+    where: modules/project/all_member_group_e2e_test.go
+    what: |
+      ensureAllMemberGroup runs synchronously inside the HTTP request, and D15
+      widened the caller set from canManageMembers to canManageOwnAgents -- so an
+      ordinary member adding their own agent can trigger it. The worst case (a CAS
+      claim, a max_members+1 roster read, a batched Space read, CreateGroup inserting
+      ~500 rows with a Redis GenSeq each plus one blocking IM call, then a
+      write-back) was carried in open_verification as never measured.
+    fix: |
+      Measured instead of gated. TestRebuildAtAFullRosterStaysInsideAnHTTPBudget
+      seeds a 500-member roster, puts the project back into "provisioning never
+      succeeded", and times the request that pays for the rebuild end to end.
+      Local (MySQL 8.0.46 + Redis + WuKongIM v2.2.4-20260313, all on one box):
+      500 members admitted in 130ms. That is a floor, not a production number, but it
+      answers the question that was open -- the order of magnitude is milliseconds,
+      not seconds. The ceiling asserted is 60s, deliberately loose: a tight bound on
+      a shared runner is a flake generator, and what the assertion has to catch is
+      the difference between "fast" and "the client times out".
+    not_done: |
+      The alternative the review offered -- gate the synchronous rebuild to
+      canManageMembers callers -- was NOT taken. It trades a measured 130ms for a
+      project that stays without a group until someone with higher privilege happens
+      to write, and every admission in between is skipped with reasonAdmitSkippedNoGroup.
+
+# PR #855 merged as 566e625. The eleventh review APPROVED it and recorded three P2s plus a
+# nit and a coverage gap, explicitly as owned fast-follows. This section is that follow-up,
+# on a fresh branch off the merged main.
+pr_855_round_11_fixed:
+  - id: the-census-guard-did-not-have-the-property-its-commit-claimed
+    severity: medium
+    reported_by: "yujiawei P2-1 (executed, with two mutations)"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The round-10 commit message said "a fourth door added tomorrow fails this test the
+      moment it is written". Not true, in two spellings.
+      (a) The HARD delete was invisible: the matcher knew `UPDATE robot SET status=0` and
+      `.Update("robot")` and nothing else, so a `DeleteFrom("robot")` door passed. The
+      reviewer proved it by adding one. Worse, that spelling is already in the tree --
+      deleteCreatedBotArtifacts uses it (modules/botfather/db.go:239) and registers as a
+      primitive only via the raw UPDATE in its fail-closed fallback. It passed the
+      anti-vacuity list for the WRONG REASON, which is precisely why that list could not
+      expose the blind spot.
+      (b) The two halves can live in different functions: updateRobotInfo holds the
+      `.Update("robot")` with no literal, a caller holds `{"status": 0}` with no Update.
+      Neither half is a primitive and the caller is not a door.
+    fix: |
+      Hard delete recognised in both spellings (`DeleteFrom("robot")` and raw
+      `DELETE FROM robot`). The split spelling is resolved one hop: functions that write
+      the robot table with a caller-supplied field map are collected first, and a function
+      holding a literal `"status": 0` that calls one becomes a DOOR.
+      Not an exemption entry: recording updateRobotInfo as exempt would have said its
+      callers may skip D14, which is false.
+    a-fix-that-failed-its-own-mutation-first: |
+      The first attempt classified the split-spelling function as a PRIMITIVE. Primitives
+      are skipped by the "a primitive is not a door onto itself" rule, and nothing called
+      it, so nothing was asserted and the mutation stayed green. The classification is
+      load-bearing: in that shape the deletion site IS the function holding the literal,
+      because the Update it borrows lives in a generic helper that is not itself a
+      deletion. Caught only by running the mutation.
+    mutation: |
+      Both of the reviewer's probes now turn it red: a DeleteFrom("robot") door, and a
+      caller passing {"status": 0} to updateRobotInfo. Baseline still green, still finding
+      3 primitives and 4 doors.
+  - id: the-finalizers-retry-could-not-make-progress
+    severity: medium
+    reported_by: "yujiawei P2-3"
+    where: modules/project/space_member_removal.go, modules/project/metrics_all_member_group.go
+    what: |
+      convergeAllMemberGroupOwners returned errCascadeIncomplete on a spent page budget,
+      with a comment claiming parity with the cascade's retryable error. The claim is false
+      in exactly the half that makes retry useful: the cascade re-queries ACTIVE seats, so
+      the rows it closes leave its own result set and each retry starts smaller. This query
+      deliberately has no status filter (with one it returns the empty set and converges
+      nothing), so a retry re-reads from project_id > '' and walks the same first 5000 rows
+      forever -- until the job burns its attempt budget and is marked abandoned, dragging
+      every already-successful cleanup step through twenty pointless re-runs.
+      Reachable rather than theoretical: octo_project_member rows are never deleted
+      (rejoining is an UPDATE) and the per-Space quota counts only ACTIVE projects, so the
+      historical row count for one (space_id, uid) is unbounded.
+    fix: |
+      A spent budget no longer asks for a retry: it counts a new metric reason
+      counter of its own (project_all_member_group_owner_convergence_incomplete_total, NOT a
+      kind on the sync-failure counter -- see the entry below for why that was rejected), logs
+      the resume cursor, and returns nil. What is given up is
+      stated in the code: the projects past the budget are not converged this time, and
+      wait for their own next kick / leave / role change -- all three of which already call
+      the same sync. Persisting the cursor would need a column on
+      space_member_removal_cleanup, which belongs to modules/space; inverting that layering
+      for a project-side finalizer is its own task.
+    test: TestOwnerConvergenceDoesNotAskForARetryItCannotWin, plus TestOwnerConvergenceStillWalksEveryPageWithinBudget as the control
+    mutation: "putting errCascadeIncomplete back turns the first case red."
+  - id: the-attribution-re-read-narrowed-the-window-without-closing-it
+    severity: medium
+    reported_by: "yujiawei P2-2"
+    resolution: "documented, not closed -- the suggested fix introduces a deadlock"
+    where: modules/group/all_member_group.go
+    what: |
+      The round-10 fix re-read the group row in-transaction, but non-locking. That read is
+      the transaction's first, so it OPENS the read view: a detach committing after it is
+      invisible, the group_member locks taken next do not revalidate the group row, and the
+      sync goes on to promote or demote creators in a group that is now Space-direct.
+      The review is right about all of that, and right that the comment declining FOR SHARE
+      cited the wrong subject (that argument is about the octo_project_member role read).
+    what-i-did-and-why-not-the-suggested-fix: |
+      Took FOR SHARE, ran the suites, then this branch's own code review found the reason it
+      cannot stay: it introduces an ABBA deadlock that did not exist before.
+      P1's cascade, handOverProjectGroupIfCreator (project_cascade.go:282), locks
+      group_member FOR UPDATE first (queryGroupCreatorTx) and then, on the no-successor
+      path, takes an exclusive lock on the SAME group row (detachGroupFromProjectTx) --
+      group_member then group. The owner sync with FOR SHARE is group then group_member.
+      Both reach the same all-member group: the cascade's detach branch needs "no group
+      member is still in the project", which a one-person project satisfies exactly when its
+      owner leaves. Concurrent, that is ABBA and MySQL kills one side with 1213.
+      Reverted to the non-locking read, with the window, its consequence and its prerequisite
+      written into the code instead of waved at.
+    the-real-ordering-defect-is-one-file-over: |
+      The declared lock order is
+      space_member -> space -> project -> group -> group_member -> octo_project_member.
+      handOverProjectGroupIfCreator takes group_member before group, which INVERTS it. That
+      inversion is what makes the correct fix here unsafe. Straightening it is its own change
+      on a load-bearing P1 path and needs its own analysis and cases; recorded as a follow-up
+      rather than ridden along on a fast-follow.
+    what-the-remaining-window-costs: |
+      A detach has to commit inside the gap between this transaction's first read and its
+      group_member writes. The end state is a Space-direct group with a possibly-wrong
+      creator -- and being Space-direct it is no longer under D7, so an ordinary owner
+      transfer repairs it. Materially different from the unrepairable state round 10 fixed.
+  - id: the-one-new-statement-shipped-without-its-plan
+    severity: low
+    reported_by: "yujiawei, the nit"
+    where: modules/project/db.go
+    fix: |
+      queryProjectIDsForSpaceMemberPage now carries its measured plan, like every other new
+      statement in this change. MySQL 8.0.46, 10k rows over 200 uids x 50 Spaces, after
+      ANALYZE: `ref idx_octo_project_member_space_uid key_len=324 ref=const,const rows=50`,
+      `Using where; Using filesort`. The index seeks to the (space_id, uid) range, which is
+      the part that must be right; the filesort is expected, because the index is
+      (space_id, uid, status) and constraining status is exactly what this query must not
+      do. Bounded by the set: one row per project the member was ever in.
+  - id: the-gate-tests-name-outgrew-its-coverage
+    severity: low
+    reported_by: "yujiawei, the coverage note"
+    where: modules/project/review8_reconcile_gate_test.go
+    what: |
+      runReconcile now runs ten scans, five gated and five not. The list of ungated scans in
+      the test still named two, so i2, i3 and removing_stall were asserted nowhere -- an
+      edit that accidentally gated one would pass a test whose name claims it covers exactly
+      the gated set. i2 is the one that matters: a violation there is a person seeing a
+      project group they are not in. The file header also read "two of the five ... the
+      other five", which is seven against an actual ten.
+    fix: "all five ungated scans asserted; header arithmetic corrected."
+    mutation: "gating scanI2Violations now turns it red; before this it did not."
+  - id: the-census-still-skipped-a-handler-that-deletes-inline
+    severity: medium
+    reported_by: "self, /code-review on this branch"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Teaching the matcher the hard-delete spelling created a third instance of the same
+      bug it was fixing. A handler that runs `DeleteFrom("robot")` INLINE is classified a
+      primitive, and "a primitive is not a door onto itself" then excludes it from the door
+      set -- so step 3 never checks it for D14 routing. That rule silently assumes every
+      primitive is a db-layer helper with a handler above it, which is true of all three
+      today and false for an inline one.
+    fix: |
+      A primitive nothing calls is its own door. Stated as a rule rather than left to the
+      assumption, since this is now the third time the same assumption produced a hole.
+    mutation: "a handler with an inline DeleteFrom(\"robot\") and no seam now turns it red."
+  - id: the-budget-spent-signal-was-filed-as-a-failure
+    severity: low
+    reported_by: "self, /code-review on this branch"
+    where: modules/project/metrics_all_member_group.go
+    what: |
+      owner_budget_spent was added as a `kind` on all_member_group_sync_failures_total,
+      whose Help says it counts failed sync attempts. It is not a failure: the projects
+      reached were converged. Any alert summing that counter across kinds would page on a
+      normal event -- and telling that it was normal would require already knowing this kind
+      exists, which defeats the alert.
+    fix: |
+      its own counter, all_member_group_owner_convergence_incomplete_total.
+      Scope, added in round 3: this was caught in the working tree BEFORE the first commit on
+      this branch -- `git log -S owner_budget_spent --all -- modules/project` is empty, so no
+      commit anywhere ever carried that kind. Recording it is right; describing it as a defect
+      the PR repaired in shipped code is not, and the PR description said exactly that.
+  - id: one-metric-shipped-under-a-different-namespace-from-its-six-siblings
+    severity: low
+    reported_by: "self, while checking a merge-impact list"
+    where: pkg/project/all_member_group.go
+    what: |
+      AllMemberGroupGuardFailures registered under namespace `octo_project` -- named after
+      the table prefix rather than the module -- while the feature's other six metrics use
+      `project`, and every other module in the repo uses one namespace per module (`group`,
+      `dmwork`). It is the single metric an operator most needs, because D7 fails open and
+      this counter is the only thing separating a database hiccup from the guard having been
+      off since Tuesday. Under a different prefix it would not appear beside its siblings on
+      a dashboard, and a merge-impact list written from the sibling names had it wrong.
+    fix: |
+      Renamed to `project_all_member_group_guard_failures_total`. Done now because the
+      feature is off by default and no dashboard exists yet; later it is a breaking rename.
+
+# D16 的计数口径在 GA 前改回来了。不是 review 提的，是核实"是否 breaking"时查出来的。
+pr_855_member_count_realigned:
+  - id: one-server-two-meanings-of-member_count
+    severity: medium
+    reported_by: "self, while answering whether the D16 semantic change was breaking"
+    where: modules/project/{model,api,db}.go
+    what: |
+      D16 redefined Resp.member_count as "humans only" and added agent_count. Checking the
+      client blast radius turned up two facts that together change the question:
+        1. Not breaking -- but for a reason checkable from the tags, not the one first
+           recorded here. v1.18.0 (2026-09-07) DOES ship modules/project (42 files),
+           including Resp.member_count filled from countActiveMembers, i.e. the TOTAL.
+           What never shipped is the humans-only redefinition: `git tag --contains`
+           puts 566e625 on no release. So this restores the released meaning and retires
+           the unreleased one, and a v1.18.0 client sees no change at all.
+           The original wording ("has never been GA, nothing has shipped") was wrong and
+           was the weaker argument; PR #868's fifth review checked the tags.
+           group / thread / integration each have
+           their own member_count on their own endpoints; none was touched.
+        2. But modules/opanalytics already ships member_count (total),
+           human_member_count and agent_member_count on the wire, to the same client
+           teams. So the server now means two different things by one field name, and
+           `agent_count` is separately taken by the Space directory, where it means "how
+           many agents this OWNER has".
+      Nothing catches that: both spellings compile, both return an int, and a client author
+      who learned the opanalytics convention renders the wrong number in projects.
+    fix: |
+      member_count restored to EVERY active seat -- its pre-D16 meaning and opanalytics'
+      meaning -- with the split moved to human_member_count and agent_member_count, named
+      for the existing precedent rather than the shorter agent_count.
+      D16's original argument survives intact: a project with one person and two of their
+      agents should not render "3 人". That is a statement about what the client DISPLAYS,
+      and the display fix is for it to read human_member_count. Redefining member_count
+      bought the same outcome and charged one namespace collision for it.
+      toResp derives member_count as humans + agents rather than reading a third count:
+      both callers already produce the two halves from two statements, so a separately-read
+      total could disagree with them, and the identity a client renders
+      (member_count == human + agent) now holds by construction.
+      listRow.MemberCount renamed HumanCount for the same reason -- two structs one
+      function-argument apart holding a same-named field of opposite meaning is how the
+      wrong one gets passed.
+    test: |
+      TestListRouteSplitsTheRosterAndTheThreeCountsAddUp -- new, and it covers the path that
+      had none: the LIST route, where the two halves come from two statements. It asserts
+      the three fields on a mixed roster, that they add up, and that the detail route agrees
+      field-for-field. TestCreateProjectSeatsTheCreatorsAgents extended with the same three.
+    mutation: "making member_count humans-only again turns both cases red."
+    window: |
+      Done while the humans-only meaning is still unreleased, which is the only time it is
+      free -- see the tag check above; "before first GA" was the wrong way to say it, since
+      v1.18.0 already ships the field with its total meaning. After the humans-only meaning
+      reaches a tag, restoring member_count and renaming agent_count are two breaking
+      changes rather than one field rename against unreleased main.
+
+# PR #868 收到三份 review：两票 APPROVE，一票 CHANGES_REQUESTED（Octo-Q，1 个 P1）。
+# 门禁状态最终是 approved，但那条 P1 成立，连同 yujiawei 的 P2-1/P2-2 是同一类，一并修。
+pr_868_review_fixed:
+  - id: the-census-drew-its-line-on-spelling-and-called-it-semantics
+    severity: high
+    reported_by: "mochashanyao P1; yujiawei P2-1 found the same class from another angle"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The one-hop rule keyed on a literal `"status": 0` in the CALLER, so it could not see
+      either live endpoint that turns a bot off:
+        updateRobotStatus  PUT /robot/status/{id}/{status}  robot.Status = int(status)
+                           -> updateRobot -> UPDATE robot SET version=?, status=?
+        robotUpdate        PUT /robots/{id}                 fields["status"] = *req.Status
+                           -> updateRobotInfo
+      updateRobot's write is BYTE-IDENTICAL to deleteRobotSoft's, which this file classifies
+      as a deletion primitive whose doors must route through D14. The only difference is that
+      one spells the zero as a literal. And the first door's zero is the DEFAULT for a
+      malformed path parameter, so it is reachable by accident.
+      Worse than the miss: my step-0 comment justified it -- "correct, it is a reversible
+      disable, not a deletion". deleteRobotSoft is exactly as reversible. That was a semantic
+      story told about a syntactic behaviour, and it would have taught the next reader that
+      the gap was a decision.
+      yujiawei's angle: the `.Set("status", 0)` chain (182 uses in the tree) was unmatched too,
+      and such a function landed in the benign-helper set -- so the guard did not merely miss
+      the door, it filed it under harmless and then used it to accuse that door's callers.
+    fix: |
+      The rule is now effect-based. A function that writes the robot table's status column
+      with ANY value -- literal, variable, or a caller-supplied field map -- is STATUS-CAPABLE,
+      and every caller of one is a door candidate. Both dbr spellings of a literal zero
+      (SetMap entry and Set chain) now make a function a primitive.
+      What happens to the two doors is a DECISION recorded in d14ExemptDoors with its residue
+      spelled out, not an omission in a matcher: disable is not delete (reversible, releases no
+      username, rotates no token), and round 11 already ruled that whether a disable should
+      release the project seat is a PRODUCT question. Recording the exemption is the honest
+      move; routing them through D14 would be answering that question myself.
+    a-false-positive-the-widening-produced-and-what-it-taught: |
+      The first widening flagged bot_api's applyAgentReport, because it hands SetMap a map it
+      builds itself. "Not a literal" is not the same as "the caller's": a locally built map has
+      knowable columns (all agent_*, never status), a parameter does not. Narrowed to
+      `SetMap(p)` where p is one of the function's own parameters -- which also narrows what
+      used to be flagged, so callers of setDescription / updateBotCommands /
+      updateRobotIMTokenCache are no longer accused of being bot-deletion doors (yujiawei P2-6).
+    mutation: |
+      Five probes, each killing exactly one fixture: remove the Set-chain branch; remove the
+      dbr hard-delete branch; remove the raw-SQL hard-delete branch; remove the SetMap-param
+      branch; and widen SetMap back to "any non-literal" (the false-positive regression).
+  - id: the-matchers-that-close-the-blind-spots-were-themselves-unguarded
+    severity: medium
+    reported_by: "yujiawei P2-2 -- the one he said he would fix before merge"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The census asserts an OUTCOME over the tree. It says nothing about whether each matcher
+      branch can still SEE its shape. yujiawei verified by deletion: remove the hard-delete
+      branch, or step 0, or the uncalled-primitive rule, and the suite stays green -- because
+      nothing in the tree spells those shapes today. That is the same defect the PR was fixing
+      (round 11: the census passed for the wrong reason), moved one abstraction level up.
+    fix: |
+      TestCensusMatcherSeesEverySpellingItClaimsTo -- ten fixtures parsed from source strings,
+      one per matched shape plus three that must NOT match (status zero on another table, a
+      locally built map, a table whose name merely starts with robot). Source strings rather
+      than the repository, because a branch covering a shape the tree does not contain can only
+      be exercised that way. The scanner was split into censusFuncsIn so both drivers share one
+      classifier.
+    note: |
+      This is the exit criterion yujiawei proposes for the whole chain, and it is the right one:
+      guards that assert their own detection paths, not just their outcomes.
+  - id: four-comments-and-two-records-left-stale-by-this-work
+    severity: low
+    reported_by: "yujiawei P2-4/P2-5, mochashanyao P2 x2"
+    fix: |
+      - db_agent.go: the identity read "member_count + agent_count == seats", i.e. after #868
+        "seats + agents == seats", naming a field that no longer exists. Now stated as
+        human_member_count + agent_member_count == member_count. The eighth review had already
+        corrected this same comment once.
+      - roster_counts_test.go: justified itself on the list route being "the only path where the
+        two numbers come from TWO statements". PR-5 moved seat_count into fillMemberCounts, so
+        both come from one roster read -- which this PR's own db.go and api.go comments say. Two
+        comments in one PR stating opposite facts about one function. Re-argued on what is
+        actually true: the two routes compute their halves in DIFFERENT CODE and must agree.
+      - reconcile.go: said the ungated pair "touch only this module's own tables", the narrower
+        of the two reasons -- and giving the narrow one is how the gate test's header ended up
+        asserting a smaller set than the code had.
+      - context.yaml: recorded the budget-spent event as "a new metric reason
+        (owner_budget_spent)" while the code ships a dedicated counter, with the same block
+        recording that the kind was REJECTED. An operator writing an alert from it would have
+        queried a series that does not exist.
+      - project-p2-product-surfaces/brief.md: still recorded member_count as humans-only, and
+        that paragraph is explicitly earmarked as the source for the not-yet-written Swagger
+        contract -- so leaving it would have written the retired semantics into the contract at
+        the moment it was created.
+  - id: the-pr-description-claimed-coverage-that-was-not-committed
+    severity: low
+    reported_by: "both reviewers, independently"
+    what: |
+      The Testing section said the census guard "executes against both of the reviewer's own
+      probes and against an inline-deletion door". Those were throwaway mutations I ran, not
+      committed fixtures. Overstating coverage in the description of a PR whose subject is a
+      guard that passed for the wrong reason.
+    fix: "description corrected, and the fixtures now actually exist (entry above)."
+
+pr_868_round_3_fixed:
+  - id: the-exemptions-were-config-that-nothing-checked
+    severity: high
+    reported_by: "yujiawei (review 5149568590, the APPROVE); mochashanyao reproduced the same mutation independently"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 made the census EFFECT-based and recorded updateRobotStatus / robotUpdate in
+      d14ExemptDoors. Both reviewers then deleted the status-capable door loop and the whole
+      suite stayed green: the door set drops from 6 to 4 and those two endpoints simply leave
+      the census. Nothing noticed, because neither is reachable through a primitive, and the
+      known-door anti-vacuity list names only the three that are.
+      So the entire mechanism round 2 added was deletable while green, and the exemption
+      entries -- which read like assertions -- were config that nothing consumed. An exemption
+      nothing checks is indistinguishable from a matcher that was deleted.
+    fix: |
+      Every key in d14ExemptDoors must appear in the door set the census actually found; a
+      recorded exemption for a door the matcher can no longer see is now an error, with the
+      two readings (renamed/removed vs matcher regressed) named in the message. Plus the
+      matching anti-vacuity loop on statusCapableWriters for updateRobot / updateRobotInfo,
+      since those two are what make the endpoints visible in the first place.
+    mutation: |
+      deleting the status-capable door loop now reddens TWO cases -- the exemption-consumption
+      assertion in the census, and the assembly fixture below. Verified.
+  - id: the-classifier-was-fixtured-but-the-assembly-was-not
+    severity: high
+    reported_by: "yujiawei P?; mochashanyao, same round"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2's answer to "a branch with no example quietly stops working" was fixtures for
+      censusFuncsIn -- the CLASSIFIER. The door ASSEMBLY was still driven only by whatever the
+      repository happens to contain, and both branches there have the same property: delete the
+      uncalled-primitive rule and the door set is byte-identical, because all three real
+      primitives have callers today.
+      That is the third recurrence of one defect at a third level: the census (round 11), the
+      classifier branches (round 1), the assembly (round 2).
+    fix: |
+      assembleCensus extracted from the test body and driven by synthetic packages in
+      TestCensusDoorAssemblyIsPinned -- four cases: a caller of a status-capable writer is a
+      door; a primitive nothing calls is its own door; a primitive WITH a caller makes the
+      caller the door and not itself; a writer that never touches status leaves its callers
+      alone.
+    mutation: "deleting the uncalled-primitive rule now reddens the inline-handler case. Verified."
+  - id: the-Set-chain-branch-still-had-no-fixture-of-its-own
+    severity: medium
+    reported_by: "yujiawei, same round"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 added `cf.writesStatusColumn = true` on the `.Set("status", ...)` chain, but the
+      only chain fixture wrote a literal zero -- which setsStatusZero already covers. Deleting
+      the writesStatusColumn line left the fixture passing, so the status-capable half of that
+      branch was untested.
+    fix: 'a `.Set("status", v)` fixture with a VARIABLE, asserted wantStatusCapable.'
+    mutation: "deleting that line now reddens exactly that case. Verified."
+  - id: the-fixture-header-claimed-a-precision-it-did-not-have
+    severity: low
+    reported_by: "self, while mutation-verifying the three above"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The header said "deleting any single detection branch turns exactly one case below red".
+      Measured across all nine branches: true for eight, false for the ninth. The
+      `Update("robot")` table guard reddens five, because it is not a spelling but the
+      precondition every robot-table shape is built on.
+    fix: |
+      Header now states the measurement instead of the slogan, including the exception. The
+      property that matters -- no branch is deletable while green -- is stated separately and
+      is what was actually verified.
+  - id: the-description-listed-a-defect-that-never-shipped
+    severity: low
+    reported_by: "self, checking the description against git history"
+    where: PR #868 description; this file, the-budget-spent-signal-was-filed-as-a-failure
+    what: |
+      The Changes list said "`owner_budget_spent` was filed as a `kind` on the sync-FAILURE
+      counter ... It has its own counter", which reads as a defect this PR repaired in shipped
+      code. `git log -S owner_budget_spent --all -- modules/project` is empty: no commit ever
+      carried that kind. It existed only in this branch's working tree, and /code-review
+      caught it before the first commit.
+      Small, but it is the second description-overstatement in one PR, in a PR whose subject is
+      guards that claim more than they check.
+    fix: |
+      The bullet now says what is true -- the counter is new, and the kind it briefly was
+      never left this branch. Description and this file corrected together.
+
+pr_868_round_3_advisory_taken:
+  - id: the-justification-said-expensive-about-a-ten-line-reorder
+    severity: medium
+    reported_by: "yujiawei P2-1 (both of that review's advisory passes reached it independently)"
+    where: modules/group/all_member_group.go
+    what: |
+      The comment explaining why FOR SHARE was reverted said the window can only be closed
+      after the cascade's lock order is straightened, i.e. that closing it is a cross-module
+      change to a P1 path. The ABBA analysis behind the revert is right; the conclusion drawn
+      from it is not. Verified the reviewer's alternative against the code: the txGroup read is
+      used only for validation (nil / disbanded / reassigned), and nothing between it and the
+      creator lock depends on its result. Moving it AFTER the `group_member ... FOR UPDATE` and
+      making it locking gives this function the order group_member -> group -- the cascade's own
+      order, so no ABBA, and the two paths then serialize on group_member so the detach cannot
+      land in the window. Cost: one extra lock in the already-detached case, which early-returns.
+      A justification that says "expensive" about a ten-line local reorder tells the next reader
+      not to look. That is the same failure as the round-2 comment that called a matcher gap
+      correct on semantic grounds.
+    fix: |
+      The comment now says the window CAN be closed locally, describes the reorder, and gives
+      the real reason for not doing it here: it changes lock acquisition on a P1-adjacent path
+      and deserves its own concurrency test, which is scheduling, not difficulty. The cascade's
+      own inversion is named as a separate matter and explicitly NOT a precondition.
+    not_changed: "the reorder itself. The reviewer asked for the justification, not the fix."
+  - id: the-spent-budget-comment-described-the-disposition-not-the-residue
+    severity: medium
+    reported_by: "yujiawei P2-2 (one of its advisory passes rated this P1)"
+    where: modules/project/space_member_removal.go
+    what: |
+      The comment framed the give-up as deferral -- "those projects wait for their own next
+      membership change". What it left out is what the intermediate state IS. All three of the
+      reviewer's claims check out against the code:
+        - querySuccessorForProjectGroupTx (group/db.go) picks by seniority narrowed by I2, i.e.
+          any ACTIVE project member, not an active project OWNER. That mismatch is the reason
+          this finalizer exists at all.
+        - a human cannot repair it: owner transfer is one of the six D7-guarded handlers, and
+          the group is still project-bound, so IsAllMemberGroup is true and the guard applies.
+        - nothing reports it: the five ungated scans are ownerless / epoch / I2 / I3 /
+          removing_stall, none of which asserts D6 owner correctness.
+      So the new counter is not a nicety, it is the only signal this state exists.
+    fix: |
+      The residue is now named as a D6 violation, with the three points above and the reason it
+      is still P2 (reachability is 5000 rows -- 25 pages x 200 -- for one (space_id, uid), and the
+      same projects were never converged under the old code either: `after` resets per invocation,
+      so a retry re-walks all 25 pages and never advances past row 5000, so this is
+      not a regression). The cursor-persistence follow-up now carries a D6 owner-correctness
+      scan alongside it.
+  - id: the-flat-name-space-was-visible-but-unstated
+    severity: low
+    reported_by: "yujiawei P2-4"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      primitives, statusCapableWriters and the f.calls[name] lookup are keyed by bare function
+      name, repo-wide, while d14ExemptDoors is keyed "file:func" and says why. The asymmetry is
+      deliberate -- an exemption must not be inherited by a same-named function elsewhere -- but
+      only one half of it was written down.
+    fix: "stated in Known limits, with which direction each half fails in (loudly, both)."
+  - id: the-status-flags-are-per-function-not-per-statement
+    severity: low
+    reported_by: "yujiawei P2-5"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      writesStatusColumn / setsStatusZero are set from any `.Set` or key-value in the body,
+      independent of which table the surrounding statement targets. A function that updates
+      `robot` in one statement and writes `"status": 0` to another table in a second is
+      classified as a deletion primitive. Round 2 widened the numerator, so the surface grew.
+      Fail-closed: a false primitive is a false door and a loud failure.
+    fix: |
+      Pinned rather than narrowed -- a twelfth fixture asserting the current over-match, with
+      the reason in place, so the day someone scopes the flags to a statement this case tells
+      them the behaviour changed on purpose. Narrowing it means tracking dbr builder chains
+      through locals, which is a different tool.
+  - id: the-remeasured-header-changed-again
+    severity: low
+    reported_by: "self, after adding the twelfth fixture"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The header's measurement was re-run after the over-match fixture landed and the numbers
+      moved: seven of nine branches redden exactly one case, not eight. `Update("robot")`
+      reddens six (was five) and the key-value `"status": 0` branch now reddens two, both
+      because they are shapes several fixtures are built out of rather than spellings of their
+      own.
+    fix: "header re-measured and rewritten. The invariant claim -- none deletable while green -- is unchanged and still verified."
+
+pr_868_round_3_superseded_review_items:
+  - id: the-raw-sql-side-never-got-round-2s-widening
+    severity: medium
+    reported_by: "yujiawei P2-4 in the superseding review (5149568590); first-pass found it independently"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 2 taught the dbr side to see a status write with any value (`.Set("status", v)`,
+      `SetMap(param)`). The raw-SQL side was left matching only the literal zero, so
+      `UpdateBySql("UPDATE robot SET status=? ...")` was neither a primitive nor status-capable.
+      The reviewer enumerated every raw write to the table and confirmed no live miss today --
+      which is precisely the condition this file exists to stop depending on.
+    fix: |
+      rawRobotSetClause captures the SET clause and rawStatusAssignment looks for the status
+      column THERE. The capture is load-bearing, not cosmetic: two live statements write
+      bound_agent_ref with status=1 in their WHERE, and a regex matching `status =` anywhere in
+      the string would call both of them bot disables. Two fixtures: the bound status write
+      (status-capable) and the WHERE-only guard (no match).
+    mutation: |
+      deleting the branch reddens the bound-status fixture; widening the match from the capture
+      back to the whole string reddens the WHERE-only fixture. Both verified. Door and
+      status-capable sets on the tree are unchanged, matching the reviewer's enumeration.
+  - id: the-counter-help-read-as-a-guarantee
+    severity: low
+    reported_by: "yujiawei P2-3 in the superseding review"
+    where: modules/project/metrics_all_member_group.go
+    what: |
+      The Help said the unvisited projects "are picked up by their own next membership change".
+      That is a guarantee about an event that may never come, on a counter that -- per the same
+      review's own finding -- is the only signal the state exists at all.
+    fix: |
+      Help now names the residue (a possible D6 violation D7 blocks repair of and no scan
+      reports), states the convergence as conditional on one of that project's own members being
+      removed / leaving / changing role, says this counter is the only signal, and points at
+      resumeAfterProjectId on the accompanying warning as the manual resume point.
+  - id: the-branch-sweep-moved-again
+    severity: low
+    reported_by: "self, after adding the raw-SQL branch"
+    where: modules/space/bot_deletion_census_test.go
+    what: "ten branches now, not nine; eight redden exactly one case, not seven."
+    fix: |
+      Header re-measured a third time this round. Also states why the SET-clause capture is
+      mutated separately from the branch: deleting it and widening it are different failures,
+      and only the second one reaches the live WHERE-clause shape.
+
+verify:
+  rules_rechecked:
+    - id: space-isolation
+      verdict: complies
+      evidence: |
+        `go list -deps ./modules/project | grep -c modules/group` = 0. pkg/project
+        imports no modules/* and does not read `robot`. Agent eligibility is
+        decided inside the create transaction against space_member rows locked in
+        the same statement position as the creator's (lockSpaceSeatRowsTx), never
+        from the client's list. D13 matches agents on robot.creator_uid, the field
+        the group side already uses. The new bot_api guard sits AFTER that
+        handler's existing bot-ownership and group-admin checks.
+    - id: error-handling
+      verdict: complies
+      evidence: |
+        All four new codes are 4xx with Internal unset; every new response goes
+        through httperr. make i18n-extract-check, make i18n-lint, golangci-lint on
+        all six touched trees: clean. The bot_api refusal uses
+        ResponseErrorLWithStatus, matching the three 403 refusals already in that
+        same handler rather than diverging from D14.
+      note: |
+        The brief expected TestGroupNoLegacyResponseError / TestProjectNoLegacyResponseError
+        to be hard-coded file lists needing new entries. Both DISCOVER their files
+        from the directory, so the new files were already covered. Nothing to do,
+        recorded because the brief says otherwise.
+    - id: rate-limit
+      verdict: complies
+      evidence: |
+        No new route. The only Redis call added anywhere in the diff is
+        InvalidateMembershipCache in CloseAllSpaceSeats -- cache invalidation, not
+        a counter. The D4 lease is a CAS on a table column.
+    - id: trust-boundary
+      verdict: complies
+      evidence: |
+        agent_uids bounded by MemberBatchMax before the transaction. The six agent
+        ineligibility reasons still collapse to one code -- and the round-3 fix
+        narrowed what that code echoes to the ineligible subset, which is strictly
+        less than it echoed before.
+    - id: testing
+      verdict: complies-with-note
+      evidence: |
+        Seven pre-existing test files are touched and every edit is additive
+        registration into a hard-coded enumeration -- the shape the brief itself
+        requires ("否则两个守卫静默缩水"). No existing assertion was weakened or
+        removed. The two added in this phase are listed below.
+    - id: commit-style
+      verdict: complies
+
+  # Gaps the Verify pass found and closed.
+  fixed_in_verify:
+    - id: audit-guard-did-not-enumerate-the-agent-seat-write
+      where: modules/project/observability_test.go
+      what: |
+        The brief lists registering the create-with-agents path in
+        TestEveryWritePathEmitsAnAuditEntry as load-bearing. Round 3 added the
+        audit entries and covered them in a NEW case, which leaves the
+        enumeration guard passing on the paths it already knew about -- exactly
+        the silent shrink the brief names.
+      fix: "that case now creates its project with agent_uids and asserts the agent seat is audited."
+    - id: actor-seat-guard-stopped-at-the-requireSpaceSeatsTx-callers
+      where: modules/project/review4_actorseat_test.go
+      what: |
+        createProject takes its space_member locks directly (lockSpaceSeatRowTx
+        for the creator, lockSpaceSeatRowsTx for the agents) instead of through
+        requireSpaceSeatsTx, so a guard scoped to that function's callers could
+        not see the path the brief names as load-bearing.
+      fix: "a seventh leg drives createProject with agent_uids under a seatless actor; the guard's scope is now every write that takes a space_member lock."
+    - id: hook-ordering-was-asserted-nowhere
+      where: modules/project/all_member_group_test.go
+      what: |
+        The brief asks for a case pinning that the provisioner runs only after the
+        project transaction commits. Nothing checked it.
+      fix: |
+        The stand-in provisioner now reads octo_project on a POOLED connection --
+        visible only if the create transaction committed -- and stubAllMemberGroup
+        registers a cleanup that fails the case if it ever was not. Every stubbed
+        case carries the check rather than one dedicated case carrying it.
+    - id: d9-daily-quota-bypass-was-untested
+      where: modules/project/all_member_group_e2e_test.go
+      fix: |
+        TestAllMemberGroupDoesNotConsumeTheDailyGroupQuota sets
+        Group.SameDayCreateMaxCount to ZERO (so it cannot pass by the cap being
+        generous) and asserts the all-member group is still built. It holds
+        because the cap lives in the HTTP handler and the provisioner enters at
+        the service layer; a refactor pushing the cap down would break it, which
+        is the point.
+
+  # Delivered differently from the brief, on purpose.
+  declared_deviations:
+    # SUPERSEDED by pr_855_round_2_fixed / i4-scan-b-banned-space-exemption: the
+    # exemption IS implemented now. Kept rather than deleted so the reasoning that
+    # was wrong stays visible, but marked here because declared_deviations is what
+    # a merger reads to decide what was skipped on purpose.
+    - id: i4-scan-b-does-not-exempt-banned-spaces-SUPERSEDED
+      brief_line: "扫描 B 的豁免：... 被封禁 Space 的项目"
+      what_was_done: "the exemption was not implemented; the other two (grace window, system bots) are, plus removing = 1."
+      why: |
+        P1's I2 scan needs it because CheckMembershipForCleanup deliberately leaves
+        a banned Space's seats alone, so the group rows are EXPECTED to remain --
+        that is the ⊆ direction. Scan B is the ⊇ direction and the state it would
+        suppress cannot arise: in a banned Space the cascade leaves BOTH sides
+        alone, so seat and group row are either both present or both closing (and
+        `removing = 1` already exempts the latter). Every other path that could
+        strip a group row without touching the seat is now refused by D7. The
+        exemption would be a `space` lookup per examined row that can never fire.
+        A genuine admitter failure inside a banned Space stays reportable, which
+        is the behaviour worth having.
+    - id: p2-scan-bounds-guard-is-its-own-file
+      brief_line: "纳入 TestReconcileQueriesAreBounded / TestReconcilePageQueriesExamineBoundedRows"
+      what_was_done: "reconcile_p2_bounds_test.go re-applies both rules to reconcile_p2.go."
+      why: |
+        Those two guards read reconcile.go by name. P1 hit the same wall and
+        answered it the same way (reconcile_p1_bounds_test.go), so this follows the
+        precedent rather than widening the P0 guards and loosening them for
+        everyone. The P2 file declares its own two exemptions next to their
+        arguments.
+
+# Cannot be verified from here; must be checked before merge.
+pr_868_round_4_fixed:
+  - id: the-number-carrying-the-severity-call-was-twenty-times-too-big
+    severity: medium
+    reported_by: "mochashanyao P2-1 (Octo-Q); yujiawei flagged the same arithmetic independently"
+    where: modules/project/space_member_removal.go; this file
+    what: |
+      The comment justifying "P2, not blocking" for the residual D6 violation put the page budget
+      at 十万行 (100,000). cascadePageSize = 200 and cascadeMaxPages = 25, so it is 5000 -- as the
+      constants' own comment says at :40, and as the SAME comment block says twenty lines earlier
+      ("走同样的前 5000 行"). The error is in the direction that flatters the decision: it claimed
+      twenty times more safety margin than exists, for accepting an invariant violation that D7
+      blocks manual repair of and no scan reports.
+      A second sentence was wrong the other way: "the retry could not pass page one". `after`
+      resets per invocation, so a retry re-walks all 25 pages and simply never advances past row
+      5000.
+      I had also repeated the reviewer's own earlier 100k figure without checking it. Both of us
+      carried it for two rounds.
+    fix: |
+      Both corrected in code and in this file, with the arithmetic spelled out (25 x 200) so the
+      next reader can check it in one line rather than trusting it, and the retry restated as
+      re-walking the budget rather than stalling at page one.
+  - id: the-degrade-comment-was-wrong-on-count-shape-and-table
+    severity: medium
+    reported_by: "mochashanyao P2-2"
+    where: modules/project/api.go
+    what: |
+      toResp's comment said the (total, 0) fallback "fires only after two consecutive COUNT
+      failures over the same table". splitSeatCounts returns (total, 0) when countActiveSeatsByKind
+      FAILS and the countActiveMembers fallback SUCCEEDS -- one failure, not two; two failures
+      return (0, 0). And countActiveSeatsByKind is not a COUNT over one table: it is two SELECTs,
+      over octo_project_member and then user. Wrong on the failure count, the statement shape and
+      the table, in one sentence.
+      This is the same class as the db_agent.go comment this PR already corrected twice for
+      describing a statement that does not exist -- in the same file, in the same round.
+    fix: "restated to how the code actually branches, with both failure paths named."
+  - id: an-exemption-was-absorbing-an-unfiled-validation-defect
+    severity: medium
+    reported_by: "mochashanyao P2-3"
+    where: modules/space/bot_deletion_census_test.go; modules/robot/api_manager.go
+    what: |
+      The updateRobotStatus exemption closed by noting that this door's 0 is the default for a
+      malformed parameter. That sentence is not a product question -- it is an unvalidated write.
+      Verified: status := ParseInt64OrDefault(c.Param("status"), 0) then robot.Status = int(status),
+      with no check against the legal status set. PUT /robot/status/{id}/abc silently disables a
+      bot; /999 writes 999 into a state column.
+      The trap is specific to what this PR did: making d14ExemptDoors load-bearing means the census
+      now asserts this door is FOUND, so it will never surface it as a finding again. A recorded
+      exemption would have become permanent cover for a validation bug.
+    fix: |
+      The exemption text now separates the two explicitly -- the product decision is exempt, the
+      parameter validation is not -- and points here. NOT fixed in code: this PR touches no
+      modules/robot logic, and adding validation to a super-admin write is a behaviour change that
+      wants its own test and review rather than a ride on a fast-follow.
+    open: |
+      modules/robot/api_manager.go updateRobotStatus must validate `status` against the legal set
+      and refuse malformed input, instead of defaulting a parse failure to 0 (= disable). Same
+      check belongs on robotUpdate's optional status field.
+  - id: the-unreadable-shard-2-failure-was-identified-by-a-reviewer
+    severity: low
+    reported_by: "mochashanyao, P2 CI note"
+    where: CI, E2E Test (2/4) at 94f85c17
+    what: |
+      I could not read which package failed -- get_job_logs caps returned content at ~8KB of tail
+      and that tail was the WuKongIM teardown dump, the log archive and blob hosts are blocked by
+      this environment's egress policy, and rerun-failed-jobs returns 403. The reviewer could read
+      it: ~10 bot-settings cases dying at modules/robot/bot_setting_integration_test.go:60 with
+      "sql: database is closed" -- a module this PR does not touch.
+      Independently confirmed afterwards by the rebase onto c16f8c1, whose fresh full run passed
+      shard 2. Two shards on this branch needed a runner-level retry within the hour, which points
+      at the runner/service-container layer rather than at any package.
+    fix: |
+      Nothing in this PR. Recorded because the diagnosis cost a round, and because the mitigation
+      ci/run-e2e-shard.sh already carries (reprint the FAIL lines last) is defeated by the
+      service-container dump that follows the step -- the summary should also go to
+      $GITHUB_STEP_SUMMARY, which is served by a separate API. Proposed on the PR, not pushed.
+
+pr_868_round_5_fixed:
+  - id: the-raw-sql-matcher-missed-the-spelling-this-table-already-uses
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-1"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The three raw-SQL regexes were applied per *ast.BasicLit, so a statement split across
+      concatenated literals matched neither half: `"UPDATE robot SET " + "status=0 WHERE ..."`
+      leaves the first fragment with an empty SET clause and the second not beginning with
+      UPDATE. Concatenation is the LIVE style on this very table -- botfather/db.go's two CAS
+      writes are built that way -- so this is not a hypothetical spelling. A disable written
+      like it was invisible: not a primitive, not status-capable, its caller never a door, and
+      the census green while the deletion skipped D14.
+    fix: |
+      foldConcatenatedString flattens the `+` tree; matchRawSQL extracted so the folded and the
+      single-literal paths run the SAME three regexes (two hand-copied rule sets is how the
+      split-spelling hole got in on the dbr side in the first place).
+    mutation: "deleting the fold case reddens both concatenation fixtures. Verified."
+    regression_check: |
+      The live tree's classification is byte-identical after the change -- 3 primitives, 2
+      status-capable writers, the same 6 doors. In particular bindRobotCAS / unbindRobotCAS
+      still do NOT match: they carry status=1 in the WHERE, and the SET-clause capture excludes
+      it. That was the thing to check, since folding can only ADD matches.
+  - id: the-fold-first-aborted-on-non-literals-and-that-was-backwards
+    severity: medium
+    reported_by: "self, mutation-testing the fix above"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      The first draft returned "" for the whole expression when any fragment was not a literal,
+      on the reasoning that stitching around a gap invents adjacency. Mutation testing showed
+      the trade is backwards: aborting MISSES real disables (`"UPDATE robot SET status=0 " + v +
+      " WHERE x"` reports as nothing), while skipping's failure mode -- inventing `status=0` out
+      of `"... SET status" + x + "=0"` -- is a false primitive, i.e. a false door and a LOUD red.
+      This file takes loud over silent everywhere else, because a missed deletion is a bot
+      leaving with its Space seats open and nothing reporting it.
+      Worse, my first fixture for this did not pin it at all: it began `"UPDATE robot SET
+      status=" + ...`, and that first literal already matches on its own, so the case passed with
+      the fold and without it. The mutation is what exposed that -- a fixture written to
+      demonstrate a rule, which the rule's deletion left green. Same defect as the file's subject,
+      inside the fix for the file's subject.
+    fix: |
+      Non-literal fragments are skipped, not fatal. The fixture is rebuilt so NEITHER literal
+      matches alone: `"UPDATE robot SET " + placeholder(v) + " status=0 WHERE robot_id=?"`.
+      Kept the negative for the other direction: `"... SET " + col + "=0"` must not match, since
+      the fused text names no column.
+    mutation: "restoring the abort guard now reddens exactly that case. Verified."
+  - id: the-counter-was-called-the-only-signal-and-is-not
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-2"
+    where: modules/project/space_member_removal.go; modules/project/metrics_all_member_group.go
+    what: |
+      Both the comment and the metric Help said this counter is the ONLY signal that the
+      unvisited-projects state exists. When the budget is spent AND a sync failed, the function
+      returns at the firstErr branch above and never reaches the observe call -- while leaving
+      exactly the same residue. So the claim was stronger than the code on a path the code
+      itself takes.
+    fix: |
+      Narrowed rather than widened, and the reason recorded: the error path returns an error, so
+      the cleanup job retries up to removalCleanupMaxAttempts (20) -- observing there would emit
+      twenty points for one removal, against this counter's one-point-per-removal meaning -- and
+      it has not run the `remaining` probe, so it would also fire on the exact-multiple case that
+      is actually complete. That path has its own signal: the abandoned job and releaseCleanupJob's
+      error log. Comment and Help both now say which case each signal covers.
+  - id: the-never-been-GA-justification-is-contradicted-by-the-repos-own-tags
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2-5"
+    where: modules/project/model.go; the journal; this file; the PR description
+    what: |
+      The member_count realignment was justified as "the module has never been GA, so nothing
+      had shipped against either meaning". v1.18.0 (2026-09-07) ships 42 files under
+      modules/project INCLUDING Resp.member_count, filled from countActiveMembers -- the total.
+      Verified: `git ls-tree v1.18.0 -- modules/project | wc -l` = 42, and
+      `git tag --contains 566e625` (the humans-only redefinition) is empty.
+      The conclusion survives and the argument is stronger once corrected: this restores the
+      meaning that IS in a release tag and retires the one that never reached one, so a v1.18.0
+      client is unaffected. But the recorded reason was false, and it is the sentence a future
+      wire change will cite.
+    fix: "corrected in all four places, stated as a tag check rather than as a GA status."
+  - id: the-open-item-ledger-still-described-the-retired-meaning-as-current
+    severity: low
+    reported_by: "mochashanyao (Octo-Q) P2-4"
+    where: this file, open_verification
+    what: |
+      The first open_verification entry still listed three items including "the client blast
+      radius of member_count counting humans only (D16)" -- both the count (two remain) and the
+      description (that meaning is what this PR retires) wrong, so a reader following the ledger
+      would go verify semantics that no longer exist. The same sweep had correctly updated
+      project-p2-product-surfaces/brief.md and stopped one file short.
+    fix: "entry rewritten: D2 and D14 remain open, the member_count item is recorded as resolved here."
+  - id: the-mutation-harness-reported-nothing-ran-as-nothing-failed
+    severity: medium
+    reported_by: "self, re-running the branch sweep after the refactor"
+    where: the sweep procedure, not the tree
+    what: |
+      After extracting matchRawSQL the branch sweep was re-run to keep the header's claim true,
+      and it came back 0 red for ALL eleven branches. That reads as "every branch is deletable
+      while green" -- the worst possible result -- and it was wrong. TestMain was panicking on
+      stale migration state left by the previous package's run, so no test body executed, and a
+      harness that counts "--- FAIL" lines cannot tell "nothing failed" from "nothing ran".
+      Two ways this could have gone wrong and one did: had the numbers looked plausible instead
+      of uniformly zero, the false measurement would have been believed and written into the
+      header as fact.
+    fix: |
+      The sweep now drops and recreates the test database first, records a BASELINE run and its
+      subtest count, and marks any mutation whose subtest count differs -- or whose output
+      contains a panic or build error -- as INVALID rather than as a result. Re-run under that
+      procedure: eleven branches, none deletable while green.
+      Written into the test header too, because the next person to re-measure needs the
+      procedure, not just the numbers.
+  - id: carried-forward-not-fixed
+    severity: low
+    reported_by: "Jerry-Xin (P2 advisory); mochashanyao P2-3"
+    what: |
+      Two guard-completeness gaps are acknowledged and NOT fixed in this round, deliberately:
+        - An UNCALLED status-capable writer escapes the census. Uncalled primitives get their own
+          door; uncalled status-capable writers only become doors through callers. Probe-verified
+          by the reviewer: injecting one leaves the census green with the door set at 6. Zero live
+          instances.
+        - "Both fail loudly, not silently" in the Known limits header is only true of the first
+          half; the same-named-non-primitive exclusion (primitives[f.name] == nil) is silent. No
+          name collision exists today.
+      Both want the same shape of fix (extend the uncalled rule to status-capable writers with the
+      same exemption lookup; make the self-exclusion identity-based) plus one assembly fixture
+      each. That is a mechanism change to the assembly, and this round already changed the
+      classifier; doing both at once is how the last four rounds each produced the next round.
+
+pr_868_round_6_fixed:
+  - id: the-exemption-consumption-rule-was-only-built-on-one-of-the-two-maps
+    severity: medium
+    reported_by: "yujiawei P2 (maintainability), review 5153473178"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      Round 3 made d14ExemptDoors load-bearing: every key must appear in the door set the census
+      actually found. d14ExemptPrimitives never got the same rule -- its keys were only ever read
+      to SKIP a primitive, so a key naming a function that no longer exists exempts nothing while
+      still reading like a decision. That is the exact vacuity class this file exists to catch,
+      missing from the half of the mechanism built to catch it.
+      Masked today only by coincidence: the single key also appears in the hardcoded
+      known-primitives list, so a RENAME is caught -- but by the routing assertion firing on the
+      newly un-exempted primitive, not by anything checking the exemption itself.
+    fix: "the symmetric loop: every d14ExemptPrimitives key must be found as a primitive."
+    mutation: |
+      The first mutation I tried did NOT isolate it: renaming the key also un-exempts a real
+      primitive, so the D14-routing assertion fires and the test is red with or without the new
+      loop. The mutation that isolates it is a STALE key -- one naming no function at all, which
+      is the scenario the finding describes. With the loop: red, naming the key. Without: green.
+      Verified both ways. Worth recording because the first mutation looked like it confirmed the
+      fix and confirmed nothing.
+  - id: the-status-capable-predicate-was-hand-copied-into-the-fixture-test
+    severity: low
+    reported_by: "yujiawei nit, same review"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      assembleCensus and the fixture table each spelled out "updates robot AND not a primitive AND
+      (writes status OR takes a field map)". A change to the assembly's rule would have been
+      caught only by the assembly test, leaving the fixture table asserting a rule the census no
+      longer uses -- while presenting itself as the authoritative list of what the matcher sees.
+    fix: |
+      One method, isStatusCapableWriter, called from both. Same reason the raw-SQL matchers were
+      merged into matchRawSQL this round: two copies of a rule drift, and this file has now had
+      that happen twice.
+    mutation: |
+      Narrowing the shared predicate (dropping takesFieldMapParam) now reddens all three tests --
+      the census, the fixture table and the assembly. Before the extraction it would have reddened
+      the fixture table only by coincidence of the two copies agreeing.
+  - id: merged-main-rather-than-rebasing
+    severity: low
+    reported_by: "self"
+    what: |
+      main moved to c69995af (#827, #854) while round 5 was in review, and the branch went
+      mergeable_state=dirty. The conflict was ONE file, .octospec/log.md, where both sides had
+      appended entries; no code file overlapped between main's two commits and this branch.
+      Resolved by keeping both blocks, main's entry first. Verified by set-difference against both
+      parents that no line from either side was lost, rather than by reading the result -- the
+      check that would have caught the log.md truncation this branch already made once.
+
+pr_868_round_7_fixed:
+  - id: the-raw-sql-matchers-failed-open-on-four-spellings
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2, review 5154235498"
+    where: modules/space/bot_deletion_census_test.go
+    what: |
+      rawRobotDisable and rawRobotSetClause both required the literal shape `update robot set`,
+      so four spellings classified as NOTHING -- not a primitive, not status-capable, callers
+      never door candidates:
+        UPDATE robot r SET r.status=0            (table alias)
+        UPDATE robot AS r SET status=0           (AS form)
+        UPDATE robot SET `status`=0              (backticked column)
+        INSERT INTO robot ... ON DUPLICATE KEY UPDATE status=0
+      Reproduced by running the three regexes against each: all four produce nothing.
+      The severity is not the count of spellings. Every other gap in this file is argued as
+      fail-CLOSED -- an over-match is a false door and a loud red, never a missed deletion --
+      and the fixture table calls itself the authoritative list. These four were the opposite,
+      in a file whose header says so. A stated guarantee the code did not hold, which is this
+      PR's own subject.
+    fix: |
+      One shape for the whole raw side: strip backticks first (normalizeRawSQL), capture the
+      clause a statement ASSIGNS in (rawRobotAssignClause with an optional alias in either
+      spelling, plus rawRobotUpsertClause for the upsert), then apply two rules to that clause --
+      any status assignment is status-capable, a literal zero is a primitive.
+      Deriving the primitive from the SAME capture is the structural fix: the old version matched
+      the table twice, in two patterns, and only one of them ever learned anything.
+    mutation: |
+      Eleven deletable branches, all red. Four weakenings, all red: drop the alias tolerance
+      (2 cases), stop stripping backticks (1), match status anywhere in the statement instead of
+      inside the clause (3 -- all the WHERE-guard fixtures, the live shape), abort the fold on a
+      non-literal instead of skipping (1). Six new fixtures.
+    regression_check: |
+      Widening can only ADD matches, so the check was the live tree: classification byte-identical
+      -- 3 primitives, 2 status-capable writers, the same 6 doors. bindRobotCAS / unbindRobotCAS
+      still do not match, now verified with an alias fixture as well as without.
+  - id: the-ledger-and-the-journal-still-carried-the-GA-claim-this-PR-retracted
+    severity: medium
+    reported_by: "mochashanyao (Octo-Q) P2, same review"
+    where: brief.md:299 and :525; log.md
+    what: |
+      Round 5 corrected "the module has never been GA" in model.go, the journal and this file --
+      and stopped three files short. brief.md:299, brief.md:525 and log.md still recorded the
+      retracted argument as the resolution of a launch-gating checklist item, and brief.md is the
+      file project-p2-product-surfaces names as the source for the not-yet-written Swagger
+      contract. So the item that gates launch rested on a premise the same PR identifies as false,
+      in the document a future contract will be written from.
+      This is the same failure as round 5's own finding -- one sweep, one file short -- committed
+      by the same sweep that fixed it.
+    fix: |
+      All three restated in the tag-checkable form: v1.18.0 ships modules/project including
+      member_count as the total; `git tag --contains 566e625` is empty. Swept afterwards for any
+      remaining occurrence; the only hits left are the corrections quoting the old wording.
+  - id: the-mutation-harness-was-wrong-twice-more-in-the-other-direction
+    severity: low
+    reported_by: "self, running the round-7 sweep"
+    what: |
+      Round 5 taught the sweep to reject runs where nothing executed. This round it was wrong
+      twice the other way: its build-error detector matched testify's own "expected: true" output
+      and called every valid run INVALID; and a mutation applied by string replacement silently
+      did nothing when the pattern did not match, reporting a branch as UNPINNED when it had
+      never been removed. The second one is the dangerous shape -- it produced a plausible
+      "red=0" for the alias group, which is exactly the result that would have been believed.
+    fix: |
+      Detector anchored to real build/panic signals, and every mutation now asserts its pattern
+      matched before running. Both written into the test header, since the procedure is what the
+      next person re-measuring needs.
+  - id: still-carried-forward
+    severity: low
+    what: |
+      NOT fixed, and now recorded accurately in Known limits rather than claimed away:
+        - an UNCALLED status-capable writer escapes the census (uncalled primitives get their own
+          door; uncalled status-capable writers only become doors through callers). Zero live
+          instances, reviewer-probed.
+        - `primitives` is keyed by bare name and assigned last-write-wins, so two same-named
+          bot-disabling functions collapse silently. Keying by file:func would close it. Zero live
+          collisions.
+      Both change the ASSEMBLY. This round changed the classifier's raw-SQL half; doing both at
+      once is how each of the last five rounds produced the next. The header's "both fail loudly"
+      sentence, which was false about the second of these, is corrected.
+
+open_verification:
+  - "modules/robot/api_manager.go updateRobotStatus writes an unvalidated path segment into
+     robot.Status: ParseInt64OrDefault(param, 0) means a malformed segment silently DISABLES the
+     bot, and any integer is written through to the state column. robotUpdate's optional status
+     field wants the same check. Found by PR #868's fourth review while reading the D14 exemption
+     that records this endpoint; deliberately NOT fixed there, because that PR touches no
+     modules/robot logic. The exemption text points here so the census's load-bearing exemption
+     cannot be mistaken for a decision that this is fine."
+  - "TWO items remain from the brief's 'must check before merge' section: whether the
+     agent picker already excludes self-hosted agents (D2), and whether any caller
+     depends on the synchronicity of botfather's old raw space_member update (D14).
+     The third -- the client blast radius of member_count counting humans only -- is
+     RESOLVED by PR #868, which retired that meaning: member_count is every seat again
+     and the humans-only number moved to human_member_count. This entry used to list it
+     as open and described the retired semantics as current, so a reader following it
+     went off to verify a meaning that no longer exists (PR #868's fifth review)."
+  - "EXPLAIN for the two I4 scans on production-scale `group` / `group_member`,
+     under the PRODUCTION collation shape rather than CI's.
+     PR #855's fifth review measured the shape this item was written about and it
+     is worse than assumed: an explicit COLLATE has coercibility 0, so the
+     comparison lands in general_ci and the legacy side's index cannot serve it.
+     Measured on MySQL 8.0.46 with `group` at 0900_ai_ci / 5000 rows, the scan-A
+     join plans as `g ALL key=NULL` plus `Using temporary` on the driving side,
+     which defeats the ORDER BY / LIMIT paging as well as the per-row cost.
+     The two USER-FACING predicates were fixed rather than measured --
+     pkg/project.IsAllMemberGroup and queryAllMemberGroupNo are now two
+     single-table reads with no cross-schema comparison, verified const/const --
+     because a full scan of `group` on every group exit is not a background cost.
+     The paged scans cannot be split that way and inherit P0/P1's pending
+     conversion; they are what this item is now about.
+     Scan A drives from octo_project by id with a point lookup per row, and scan B
+     from octo_project with the (p.id, pm.uid) row-constructor cursor -- the same
+     shape P1 flagged as needing a real plan for queryI2Page, and for the same
+     reason the plan cannot be produced from CI.
+     Measured again while fixing the fifth round, on a purpose-built database in
+     the production shape (2000 projects x 10 members, 5000 groups): scan A is
+     `p range PRIMARY` + `g ALL key=NULL` (hash join); scan B is not driven from
+     octo_project at all -- `pm ref idx_octo_project_member_removing` then eq_ref
+     back into p -- with `gm ALL` and `g ALL`, and `Using temporary; Using
+     filesort` for the two-table keyset ORDER BY. Both scans stay bounded by
+     ReconcileLimit and the 5-minute interval rather than by an index, which is
+     what makes this an item to verify at production scale rather than a blocker.
+     CI can now see the CLASS of defect even though it cannot see the scale:
+     TestTheD7PredicateReachesItsRowByAnIndexUnderCollationDrift EXPLAINs the
+     split predicates against a deliberately drifted database, with the removed
+     joined form as a control that must plan as a full scan under drift and must
+     not after the conversion."
+  - "RESOLVED, by removal. This entry used to ask for the index build time at
+     production row counts. There is no index left to build: the last one
+     (idx_octo_project_all_member_group) was dropped in the fifth review round
+     after EXPLAIN showed neither scan chooses it under EITHER collation shape --
+     scan A pages by PRIMARY on p.id, and scan B is not even driven from
+     octo_project. The migration is now two ADD COLUMNs, both pinned
+     ALGORITHM=INSTANT so a silent downgrade to a rebuild fails loudly instead of
+     becoming an unplanned long statement. Nothing in this migration needs a
+     deploy window."
+  - "RESOLVED. A WuKongIM broker (the pinned v2.2.4-20260313, WK_TOKENAUTHON=false)
+     was installed alongside MySQL 8.0.46 and Redis, and every suite was re-run.
+     modules/project (including -race -shuffle=on), group, space, thread, message,
+     bot_api and integration are GREEN. Two failures remain and both are
+     pre-existing, verified against a stashed clean tree: botfather's
+     TestRegisterStoresAgentHosting and channel's TestGetStoryline_NotGroupMember.
+     modules/user has an order-dependent failure in its VerifyPasswordByUID family
+     that appears on the clean tree too and passes when that family is run alone;
+     nothing in this change touches modules/user."
+  - "That the all-member group's IM channel subscriber list equals its member set.
+     modules/group creates the channel inside CreateGroup and rolls the group back
+     if it fails, and the end-to-end cases exercise that path, but nothing in this
+     repository can READ a channel's subscribers back from WuKongIM -- there is no
+     such call anywhere in octo-server or octo-lib -- so the equality itself is not
+     assertable from a test. Same class as the EXPLAIN items above: check it
+     against a running broker before merge."
+  - "Whether the D7 guard should fail CLOSED on TRANSFER specifically, while
+     staying fail-open on the other four actions.
+     This entry first asked the question about DISBAND, following mochashanyao,
+     and the fourth review round showed that aim was backwards. The fail-open
+     argument is that the worst case leaves a state a scan reports: remove / exit
+     / blacklist leave member-set gaps (scan B), and disband leaves a project
+     pointing at a disbanded group (scan A, then clearStaleAllMemberGroupPointer
+     and a rebuild). Transfer is the one where it does not hold -- a group-side
+     owner transfer that slips through leaves the all-member group creator on
+     someone who need not be a project owner, and NO scan checks that relation.
+     D6 own comment names the resulting state: a group owner nobody can change,
+     because D7 then refuses them transfer, exit and disband. The only automatic
+     repair is the next project-side owner event.
+     Still not decided here: it is a product call about which failure a user is
+     walked into, and splitting the guard by action costs the property that all
+     five answer identically. But it should be asked about transfer."
+  - "The synchronous rebuild's latency at a full roster. ensureAllMemberGroup runs
+     inside the HTTP request on POST /v1/projects/:id/members/add, and D15 widened
+     that handler to canManageOwnAgents -- so an ORDINARY member adding their own
+     agent can trigger it. Worst case it reads up to max_members + 1 seats, calls
+     pkg/space.ActiveMembers once over them, then CreateGroup inserts up to
+     max_members member rows with one Redis GenSeq each plus one blocking IM call.
+     At the default cap of 500 that is a few hundred Redis round-trips.
+     MEASURED in round 10, after mochashanyao raised the same point as a P2:
+     TestRebuildAtAFullRosterStaysInsideAnHTTPBudget seeds a 500-member roster, puts
+     the project back into \"provisioning never succeeded\", and times the request that
+     pays for the rebuild end to end -- 500 members admitted in 130ms on MySQL
+     8.0.46 + Redis + WuKongIM v2.2.4-20260313, all on one box. That is a FLOOR, not
+     a production figure (no network between the three, an empty database, no
+     concurrent load), so what remains open is the same number against production
+     latencies; the order of magnitude it settles is milliseconds, not seconds.
+     Bounded meanwhile by the fact that it is reachable only for a project whose
+     provisioning already failed and by the lease, which serialises concurrent
+     triggers. If it does not fit the request budget the answer is to move the
+     rebuild onto the reconcile worker, NOT to cap the roster -- a capped rebuild is
+     the incomplete-group defect the third round fixed.
+     PR #855's fifth review Q3, measured after its tenth."
+  - "NOT a gate, resolved by splitting: countActiveSeatsByKind carried the same
+     shape as the fifth round's blocking finding one table over -- octo_project_member
+     driving, `user` probed, COLLATE on the driving side, so under the production
+     collation shape it was a full scan of `user` per call, on the project detail,
+     create and update responses. PR #855's seventh review found it and offered the
+     gate as an option; it is two single-table reads now instead (seat uids by
+     project_id, then those uids against `user`), so it crosses no schema and needs
+     no collation opinion. The file header's driving-side rule was corrected too --
+     it holds only when octo_project* is the PROBED side, and it had been applied to
+     a statement where octo_project* drives."
+  - "The pre-launch collation gate is a LIST, and it is this one: listMembers
+     (cannot execute at all -- see the next entry), and, now measured rather than
+     assumed, queryOwnedAgentSeatsTx (executes and keeps an index; the entry point
+     is the literal creator_uid predicate, NOT robot's primary key as its comment
+     used to claim -- measured r ref idx_robot_creator_uid rows=3, pm eq_ref
+     PRIMARY rows=1, and pinned by
+     TestAgentSeatJoinKeepsAnIndexUnderCollationDrift). countActiveSeatsByKind and
+     listVisibleInSpace were on this list in earlier rounds and are off it because
+     they were split into single-table reads; they cross no schema now. The two I4
+     scans keep the shape deliberately and are covered by their own item above.
+     Also on the list, and needing an operator rather than an engineer: check
+     `group`'s LIVE collation in production -- the whole gate assumes 0900_ai_ci
+     there, and if it is already general_ci no conversion window is needed at all.
+     PR #855's eighth review asked for the gate to name every statement rather
+     than one."
+  - "GATING: modules/project listMembers cannot execute under the production
+     collation shape at all -- its pre-existing `LEFT JOIN user u ON u.uid = pm.uid`
+     compares 0900_ai_ci (`user`) with pinned general_ci (octo_project_member) and
+     raises 1267. This is P0's join and rides the pending conversion, not this
+     change; it is listed here because it is D16's roster surface and becomes
+     user-visible the moment the feature switch flips. Either the conversion lands
+     or that join is pinned BEFORE project groups are enabled for real traffic.
+     PR #855's fifth review verified the 1267 by execution."

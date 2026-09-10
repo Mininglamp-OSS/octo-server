@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -64,7 +65,7 @@ func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 	if keys, err := rds.Keys("ratelimit:uid:*").Result(); err == nil && len(keys) > 0 {
 		_ = rds.Del(keys...).Err()
 	}
-	_ = rds.Del(etlRunLockKey).Err()
+	_ = rds.Del(etlRunLockKeyFor(ctx.GetConfig().DB.MySQLAddr)).Err()
 }
 
 func setSuperAdminToken(t *testing.T, ctx *config.Context) {
@@ -1473,6 +1474,50 @@ func TestOpanalyticsStaleGroupHidden(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, etl.RunIncremental())
 	assert.Equal(t, int64(0), channelsOf("s1"), "硬删除群不再出现在表二")
+}
+
+func TestOpanalyticsAIContainerHiddenFromGroupSurfaces(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	// Turn an already-materialized channel into an AI container. This pins the
+	// read-side authority check even when an older dimension row still exists.
+	_, err := ctx.DB().Update("group").Set("purpose", aiteam.GroupPurpose).
+		Where("group_no=?", "g1").Exec()
+	require.NoError(t, err)
+
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+	var overview overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview"+rng), &overview)
+	assert.Equal(t, int64(1), overview.GroupTotal)
+
+	var spaces struct {
+		List []spaceListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces"+rng), &spaces)
+	for _, item := range spaces.List {
+		if item.SpaceID == "s1" {
+			assert.Zero(t, item.GroupTotal)
+		}
+	}
+
+	var channels struct {
+		Count int64             `json:"count"`
+		List  []channelListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces/s1/channels"+rng), &channels)
+	assert.Zero(t, channels.Count)
+	assert.Empty(t, channels.List)
+
+	memberResp := opaGet(t, route, "/v1/manager/dashboard/channels/g1/members"+rng)
+	assert.Equal(t, "err.server.opanalytics.not_found", errorCode(t, memberResp))
+
+	groups, err := newETLDB(ctx).queryGroupsForDim()
+	require.NoError(t, err)
+	for _, item := range groups {
+		assert.NotEqual(t, "g1", item.GroupNo)
+	}
 }
 
 // TestOpanalyticsSpaceNameLikeEscape 验收 P2：表一 name 过滤把 % _ 当字面量(转义)而非通配符。

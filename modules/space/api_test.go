@@ -32,6 +32,13 @@ var (
 	testSpaceDB *DB
 )
 
+func spaceTestMySQLAddr() string {
+	if addr := os.Getenv("OCTO_TEST_MYSQL_ADDR"); addr != "" {
+		return addr
+	}
+	return "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+}
+
 // TestMain 确保 space 迁移所依赖的外部表存在，并创建共享测试服务器。
 //
 // OCTO_MASTER_KEY 必须在 NewTestServer 之前设置：space 包通过
@@ -44,16 +51,19 @@ func TestMain(m *testing.M) {
 		_ = os.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	}
 
-	db, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true")
+	db, err := sql.Open("mysql", spaceTestMySQLAddr())
 	if err != nil {
 		panic("连接测试数据库失败: " + err.Error())
 	}
 
 	// space 迁移脚本依赖 group 和 robot 表
 	depDDLs := []string{
-		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, purpose VARCHAR(32) NOT NULL DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		"CREATE TABLE IF NOT EXISTS group_member (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) DEFAULT '', uid VARCHAR(40) DEFAULT '', role INT DEFAULT 0, is_deleted SMALLINT DEFAULT 0, status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
-		"CREATE TABLE IF NOT EXISTS robot (id BIGINT AUTO_INCREMENT PRIMARY KEY, robot_id VARCHAR(40) NOT NULL DEFAULT '', token VARCHAR(200) DEFAULT '', status SMALLINT DEFAULT 1, creator_uid VARCHAR(40) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_robot_id(robot_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		// robot 与 user 同样显式重建：共享 test 库里遗留的旧版 robot 表缺少
+		// 通讯录依赖的 description / agent_hosting 列时，IF NOT EXISTS 不会补列。
+		"DROP TABLE IF EXISTS robot",
+		"CREATE TABLE robot (id BIGINT AUTO_INCREMENT PRIMARY KEY, robot_id VARCHAR(40) NOT NULL DEFAULT '', token VARCHAR(200) DEFAULT '', status SMALLINT NOT NULL DEFAULT 1, creator_uid VARCHAR(40) NOT NULL DEFAULT '', description VARCHAR(500) NOT NULL DEFAULT '', agent_hosting VARCHAR(64) NOT NULL DEFAULT '', agent_reported_hosting_at TIMESTAMP NULL DEFAULT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_robot_id(robot_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		// user 表显式重建（DROP + CREATE），不用 CREATE TABLE IF NOT EXISTS。
 		// 原因：复用同一个 test 库时，旧版本可能已建过缺少 username/phone 的 user 表，
 		// IF NOT EXISTS 不会补列，随后成员搜索 SQL 会因 Unknown column 失败。
@@ -65,7 +75,8 @@ func TestMain(m *testing.M) {
 		// 缺这一列会让搜索 SQL 报 Unknown column。本包不 import modules/user，拿不到它的迁移，
 		// 所以这张 fixture 必须手工跟随被查询到的列。
 		"DROP TABLE IF EXISTS `user`",
-		"CREATE TABLE `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', username VARCHAR(40) DEFAULT '', email VARCHAR(200) DEFAULT '', phone VARCHAR(20) DEFAULT '', phone_last4 VARCHAR(4) NOT NULL DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', username VARCHAR(40) DEFAULT '', email VARCHAR(200) DEFAULT '', phone VARCHAR(20) DEFAULT '', phone_last4 VARCHAR(4) NOT NULL DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT NOT NULL DEFAULT 0, status SMALLINT NOT NULL DEFAULT 1, is_destroy SMALLINT NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS friend (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', to_uid VARCHAR(40) NOT NULL DEFAULT '', is_deleted SMALLINT NOT NULL DEFAULT 0, UNIQUE KEY idx_friend_uid_to_uid(uid, to_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		// user_verification 是 queryMembers 的 name 兜底来源（issue #344）：
 		// u.name 为空时回退 real_name。列对齐 modules/user/sql/20260505000003_user_legacy01.sql。
 		"CREATE TABLE IF NOT EXISTS user_verification (user_id VARCHAR(40) NOT NULL, real_name VARCHAR(128) NOT NULL DEFAULT '', source VARCHAR(32) NOT NULL DEFAULT '', source_sub VARCHAR(128) NOT NULL DEFAULT '', emp_id VARCHAR(64) DEFAULT NULL, dept VARCHAR(255) DEFAULT NULL, email VARCHAR(255) DEFAULT NULL, mobile VARCHAR(32) DEFAULT NULL, verified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (user_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
@@ -774,6 +785,26 @@ func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
 		_, err := testCtx.DB().SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=?", groupNo, testutil.UID).Load(&count)
 		return err == nil && count == 1
 	}, time.Second, 10*time.Millisecond, "群成员记录应该只有一条（幂等）")
+}
+
+func TestJoinPresetGroupsSkipsAIContainer(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	const groupNo, spaceID, uid = "g-ai-preset", "sp-ai-preset", "u-ai-preset"
+
+	_, err = testCtx.DB().InsertInto("group").
+		Columns("group_no", "name", "creator", "status", "space_id", "purpose").
+		Values(groupNo, "private AI container", "owner", 1, spaceID, "ai_session_container").Exec()
+	assert.NoError(t, err)
+
+	f.joinPresetGroups(uid, spaceID, `["`+groupNo+`"]`)
+
+	var count int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, uid,
+	).Load(&count)
+	assert.NoError(t, err)
+	assert.Zero(t, count, "preset groups must not bypass the AI container membership invariant")
 }
 
 func TestJoinSpacePresetGroupDisbanded(t *testing.T) {
@@ -2824,7 +2855,8 @@ func TestResetApprovedApplyForRejoin_NoOpWhenMemberActive(t *testing.T) {
 	// 其余状态一律不受影响。成员必须先置回非活跃，否则 NOT EXISTS 子句单独就会让
 	// 每个 status 都返回 0 行，这个循环就变成了空转——删掉 SQL 里的 AND ja.status=1
 	// 它照样会绿（第一版正是如此，由推送前的对抗性审查发现）。
-	assert.NoError(t, f.db.removeMemberLocked(spaceId, uid, 99))
+	_, removeErr := f.db.removeMemberLocked(spaceId, uid, 99, testutil.UID, MemberRemoveReasonKicked)
+	assert.NoError(t, removeErr)
 	inactive, err := f.db.queryMember(spaceId, uid)
 	assert.NoError(t, err)
 	assert.Nil(t, inactive, "前提：成员此刻不活跃，status 谓词才是唯一变量")

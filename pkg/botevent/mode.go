@@ -102,6 +102,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
 	"go.uber.org/zap"
 )
 
@@ -210,7 +211,7 @@ const (
 	// activation writing the same bytes as a previously denied mirror is not noticed. That
 	// window cannot be zero without re-reading the authority per allocation, and it is only
 	// entered at all when a mirror claiming activation was already sitting in Redis against
-	// a legacy authority — which `botevent-seq -action activate` now refuses to flip on top
+	// a legacy authority — which `app cutover botevent activate` now refuses to flip on top
 	// of, so the precondition is checked at the one supervised step.
 	repairCooldown = time.Second
 
@@ -285,37 +286,39 @@ func AuthorityUnreadable() int64 { return authorityUnreadable.load() }
 
 // The expected-mode deployment guard, parsed once.
 //
-// Same shape as #627's internal/msgextraseq: unset means no assertion, and a
-// *malformed* value fails closed instead of silently disabling the guard. The
-// previous revision compared a free-form env string against ModeIncr, so
-// `OCTO_BOTEVENT_EXPECTED_MODE=inrc` was indistinguishable from unset — a typo
-// disarming the one guard that exists to stop a silent downgrade (review P1-4).
+// The three-state semantics (unset means no assertion; a *malformed* value fails
+// closed instead of silently disabling the guard) live in pkg/cutover, shared
+// with #627's internal/msgextraseq. The previous revision here compared a
+// free-form env string against ModeIncr, so `OCTO_BOTEVENT_EXPECTED_MODE=inrc`
+// was indistinguishable from unset — a typo disarming the one guard that exists
+// to stop a silent downgrade (review P1-4). The error wording stays in this
+// file: it explains this domain's consequences and is read mid-incident.
 //
-// Held behind an atomic pointer rather than three package vars because the test hook
+// Held behind an atomic pointer rather than package vars because the test hook
 // rewrites it while production code reads it. Both current call sites are
 // single-goroutine so `-race` was clean, but combining the hook with the concurrency
 // test would not be, and "clean today" is not a property worth relying on (review P2-3).
-type expectedModeGuard struct {
-	set       bool
-	incr      bool
-	malformed bool
-}
-
-var expectedMode atomic.Pointer[expectedModeGuard]
+var expectedMode atomic.Pointer[cutover.ExpectedMode]
 
 func init() { expectedMode.Store(parseExpectedMode(os.Getenv(ExpectedModeEnv))) }
 
-func parseExpectedMode(raw string) *expectedModeGuard {
-	switch strings.TrimSpace(raw) {
-	case "":
-		return &expectedModeGuard{}
-	case ModeLegacy:
-		return &expectedModeGuard{set: true}
-	case ModeIncr:
-		return &expectedModeGuard{set: true, incr: true}
-	default:
-		return &expectedModeGuard{set: true, malformed: true}
+// ExpectedModeSpellings is the authoritative set of values ExpectedModeEnv
+// accepts, and the mode each one asserts. Anything else is malformed and fails
+// closed.
+//
+// Exported so the operator command reports the guard using the same table the
+// allocator enforces it with, rather than a second hand-written copy that could
+// disagree with the running server about whether a value is valid.
+func ExpectedModeSpellings() map[string]int {
+	return map[string]int{
+		ModeLegacy: StateModeLegacy,
+		ModeIncr:   StateModeIncr,
 	}
+}
+
+func parseExpectedMode(raw string) *cutover.ExpectedMode {
+	g := cutover.ParseExpectedMode(raw, ExpectedModeSpellings())
+	return &g
 }
 
 // validateExpectedMode rejects a malformed deployment guard without needing to know
@@ -324,7 +327,7 @@ func parseExpectedMode(raw string) *expectedModeGuard {
 // must be both immediate and cheap.
 func validateExpectedMode() error {
 	g := expectedMode.Load()
-	if g == nil || !g.set || !g.malformed {
+	if g == nil || !g.IsMalformed() {
 		return nil
 	}
 	return fmt.Errorf("botevent: %s is set to an unrecognised value; refusing to allocate "+
@@ -335,18 +338,22 @@ func validateExpectedMode() error {
 // assertExpectedMode enforces the optional deployment guard against a resolved mode.
 func assertExpectedMode(activated bool) error {
 	g := expectedMode.Load()
-	if g == nil || !g.set {
+	if g == nil {
 		return nil
 	}
-	if g.malformed {
+	resolved := StateModeLegacy
+	if activated {
+		resolved = StateModeIncr
+	}
+	switch g.Check(resolved) {
+	case cutover.GuardMalformed:
 		return validateExpectedMode()
-	}
-	if g.incr && !activated {
-		return fmt.Errorf("botevent: %s=%s but the authority says the allocator is not activated; "+
-			"refusing to fall back to the legacy allocator, whose lower ids would land below "+
-			"live consumer cursors", ExpectedModeEnv, ModeIncr)
-	}
-	if !g.incr && activated {
+	case cutover.GuardMismatch:
+		if !activated {
+			return fmt.Errorf("botevent: %s=%s but the authority says the allocator is not activated; "+
+				"refusing to fall back to the legacy allocator, whose lower ids would land below "+
+				"live consumer cursors", ExpectedModeEnv, ModeIncr)
+		}
 		return fmt.Errorf("botevent: %s=%s but the authority says the allocator is activated; "+
 			"refusing to allocate from a mode this replica was not deployed for",
 			ExpectedModeEnv, ModeLegacy)

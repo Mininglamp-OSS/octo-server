@@ -1,6 +1,10 @@
 package user
 
 import (
+	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -47,6 +51,28 @@ func (f userListFilter) applyExcludes(stmt *dbr.SelectStmt) *dbr.SelectStmt {
 type managerDB struct {
 	session *dbr.Session
 	ctx     *config.Context
+}
+
+// ErrManagerEmailAlreadyInUse is returned when a manager email is already
+// attached to another user account.
+var ErrManagerEmailAlreadyInUse = errors.New("manager email already in use")
+
+// queryEmailOwner checks the existing login identity before a manager email
+// write. The check covers all user rows because the public email login and
+// password-recovery flows resolve accounts by email without a role filter.
+// The current deployment convention keeps one super-admin account, so the
+// write race is extremely unlikely. We intentionally keep this transaction
+// check as the scoped fix and do not add a schema-wide unique index here.
+func queryEmailOwner(runner dbr.SessionRunner, email, excludeUID string) (*Model, error) {
+	where := "email=? AND email<>''"
+	args := []interface{}{email}
+	if excludeUID != "" {
+		where += " AND uid<>?"
+		args = append(args, excludeUID)
+	}
+	var model *Model
+	_, err := runner.Select("uid").From("user").Where(where, args...).Limit(1).Load(&model)
+	return model, err
 }
 
 // newManagerDB
@@ -159,6 +185,61 @@ func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
 	return err
 }
 
+// updateManagerEmail updates only the role observed by the handler. The
+// affected-row check is intentional: a concurrent role change or a missing
+// target must never be reported as a successful second-factor repair.
+func (m *managerDB) updateManagerEmail(uid, role, email string) (bool, error) {
+	tx, err := m.session.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	owner, err := queryEmailOwner(tx, email, uid)
+	if err != nil {
+		return false, err
+	}
+	if owner != nil {
+		return false, ErrManagerEmailAlreadyInUse
+	}
+
+	result, err := tx.Update("user").Set("email", email).
+		Where("uid=? and role=?", uid, role).Exec()
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		// MySQL reports changed rows by default, so setting email to the
+		// already-stored value is a successful no-op. Re-read the target under
+		// the same transaction and row lock to distinguish that case from a
+		// missing target or a concurrent role change.
+		var current struct {
+			UID   string
+			Role  string
+			Email string
+		}
+		matched, err := tx.Select("uid", "role", "email").From("user").
+			Where("uid=?", uid).Suffix("FOR UPDATE").Load(&current)
+		if err != nil {
+			return false, err
+		}
+		if matched != 1 || current.Role != role ||
+			!strings.EqualFold(strings.TrimSpace(current.Email), strings.TrimSpace(email)) {
+			return false, fmt.Errorf("manager email update affected %d rows", rows)
+		}
+	} else if rows != 1 {
+		return false, fmt.Errorf("manager email update affected %d rows", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // updateUserRole changes role only if it still equals expectedRole. The
 // compare-and-set prevents a concurrent promotion to SuperAdmin from being
 // overwritten by the temporary dashboardReader grant/revoke path.
@@ -179,6 +260,7 @@ type managerLoginModel struct {
 	Username  string
 	UID       string
 	Name      string
+	Email     string
 	Password  string
 	Role      string
 	Language  string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值

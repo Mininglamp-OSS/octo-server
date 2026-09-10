@@ -103,7 +103,9 @@ docs-only `doc_id` and `request_id` top-level conveniences may be absent. For a
 standard approval result, `display.title` is optional but recommended; octo
 uses only that reviewed display field, removes all actions, renders the status,
 and sends a v1 requester outcome. It ignores callback-authored URLs, card JSON,
-reasons, and arbitrary display fields.
+reasons, and arbitrary display fields. The Docs specialized finalizer is the
+exception: it terminalizes approver cards in place and sends no second applicant
+terminal IM card.
 
 Docs uses the same callback transport contract but keeps its existing
 `DocsCard`/`OCTO_DOCS_NOTIFY_TOKEN` ingress and specialized deep-link/template
@@ -128,6 +130,7 @@ Example request body:
   "action_id": "approval-execute",
   "decision": "execute",
   "operator_uid": "user-b",
+  "operator_space_id": "space-2",
   "inputs": {},
   "data": {
     "owner": "tasks",
@@ -136,12 +139,36 @@ Example request body:
     "task_id": "task-1"
   },
   "message_id": "190001234567890",
-  "channel_id": "notification",
+  "channel_id": "user-b",
   "channel_type": 1,
   "space_id": "space-1",
   "acted_at": 1784073600
 }
 ```
+
+`space_id` is the card/resource origin Space. `operator_space_id` is the
+operator's current Space verified by octo-server at click time. They are
+separate assertions and may differ for a valid cross-Space decision. Consumers
+must authorize `operator_uid` in `operator_space_id` and against their own
+request ACL; they must not require membership in the card-origin `space_id`
+unless that is an independent consumer-domain rule.
+
+Routes using the `octo-card-v1` envelope receive the same operator Space as
+`actor.space_id`, alongside `actor.uid`; the flat field is not duplicated in
+that envelope.
+
+`channel_id` names the channel from the **card sender's** point of view, exactly
+as the sender addressed it when it sent the card. For a DM (`channel_type: 1`)
+that is the **peer user's UID** — not the sending bot's own UID, and not the
+value the clicking client submitted (the client names *its* peer, which is the
+bot). Group and community-topic ids name the channel itself, so both sides
+already agree on them.
+
+In the ordinary DM the clicker is the sender's peer, so `channel_id` and
+`operator_uid` carry the same value. Do not turn that into an equality check:
+they answer different questions — which conversation this is, and who acted —
+and they diverge whenever the sender is also the clicker. Match on
+`channel_id` alone, the way the card was addressed.
 
 `operator_uid` is an authenticated identity assertion from octo-server, not an
 authorization grant. The consumer must still verify that this user can decide
@@ -173,7 +200,14 @@ before verification changes the signature.
 ### Language-neutral test vector
 
 Use this fixed non-production vector to verify any implementation. The body is
-the single UTF-8 line shown below with no trailing newline.
+the single UTF-8 line shown below with no trailing newline. Its field values are
+arbitrary filler pinned to these exact bytes — do not "correct" them to match the
+example above, or the published digest and signature stop matching.
+
+This vector intentionally remains frozen without `operator_space_id`. It tests
+HMAC canonicalization over one exact historical body, not the latest request
+schema. Adding the field would change the body hash and signature without
+adding request-shape coverage.
 
 ```text
 secret:    0123456789abcdef0123456789abcdef
@@ -208,6 +242,7 @@ type DecisionRequest = {
   action_id: string;
   decision: string;
   operator_uid: string;
+  operator_space_id?: string;
   doc_id?: string;
   request_id?: string;
   inputs: Record<string, unknown>;
@@ -223,6 +258,9 @@ type DecisionResult = {
   disposition: "applied" | "replayed" | "forbidden" | "conflict" | "not_found";
   state: "pending" | "approved" | "denied" | "cancelled";
   requester_uid?: string;
+  decider_uid?: string;
+  decider_space_id?: string;
+  decided_at?: number;
   display?: Record<string, string>;
 };
 
@@ -270,7 +308,12 @@ function parseDecisionRequest(value: unknown): DecisionRequest {
   ) {
     throw new Error("invalid action data");
   }
-  for (const key of ["doc_id", "request_id", "space_id"]) {
+  for (const key of [
+    "doc_id",
+    "request_id",
+    "space_id",
+    "operator_space_id",
+  ]) {
     if (value[key] !== undefined && typeof value[key] !== "string") {
       throw new Error(`invalid ${key}`);
     }
@@ -390,6 +433,9 @@ type DecisionResult = {
   disposition: "applied" | "replayed" | "forbidden" | "conflict" | "not_found";
   state: "pending" | "approved" | "denied" | "cancelled";
   requester_uid?: string;
+  decider_uid?: string;
+  decider_space_id?: string;
+  decided_at?: number;
   display?: Record<string, string>;
 };
 ```
@@ -401,9 +447,21 @@ Applied action example:
   "disposition": "applied",
   "state": "approved",
   "requester_uid": "user-a",
+  "decider_uid": "user-b",
+  "decider_space_id": "space-2",
+  "decided_at": 1784073600,
   "display": { "title": "Execute task" }
 }
 ```
+
+For consumers such as Docs that persist a first-writer decision, these decider
+fields identify the stored winner, not necessarily the click currently being
+replayed. octo-server resolves actor and Space display names internally.
+`decider_space_id` is accepted for display only when that exact decider is an
+active member of that exact active Space. It is not checked against the
+card-origin Space because legitimate cross-Space decisions exist. The IDs come
+from the trusted decision consumer, but are not a general anti-forgery proof;
+callback-supplied display strings do not override their resolved display.
 
 An idempotent replay must return the exact stored result for the same
 `event_id`. If the original result was the applied action above, repeat that
@@ -442,14 +500,34 @@ states or the standard terminal wording cannot represent the result, the
 consumer needs a separately reviewed finalizer/template rather than inventing
 callback response fields.
 
-`requester_uid` is required whenever `state` is `approved` or `denied`, because
-octo-server must notify the applicant. It must be the consumer-authoritative
+`requester_uid` remains required by the shared typed response whenever `state`
+is `approved` or `denied`. Generic standard approval finalizers consume it to
+send a requester outcome; the Docs specialized finalizer ignores it and sends
+no second applicant terminal IM card. It must be the consumer-authoritative
 request initiator, not the operator or an unverified callback field. Responses
-are limited to 64 KiB and the current decoder rejects unknown top-level fields.
-`display` accepts at most 32 string fields; keys are non-empty and at most 64
-bytes, and values are at most 500 Unicode code points. The standard finalizer
+are limited to 64 KiB. The exact validation is:
+
+- unknown top-level fields, trailing JSON values, malformed types, and unknown
+  `disposition`/`state` enum values are rejected;
+- `requester_uid`, `decider_uid`, and `decider_space_id` have no leading or
+  trailing Unicode whitespace and are at most 128 **UTF-8 bytes** each (Go
+  `len(string)` semantics); empty values are otherwise allowed;
+- `decider_space_id` requires a non-empty `decider_uid`;
+- `decided_at` is an optional non-negative integer Unix timestamp in seconds
+  (`0` means absent/unknown);
+- `requester_uid` is non-empty when state is `approved` or `denied`;
+- `display` has at most 32 entries; keys are non-empty and at most 64 bytes, and
+  values are at most 500 Unicode code points.
+
+The standard finalizer
 currently consumes only `display.title`. Coordinate schema additions with an
 octo-server release.
+
+Because decoding is strict, deploy octo-server versions that accept these new
+response fields **before** deploying a Docs consumer that emits them. Old
+consumers may omit all three fields during a rolling upgrade. Reversing the
+order makes old servers classify a successful response as invalid, retry it,
+and eventually send it to the DLQ.
 
 For standard approval routes, the originating card must carry an authoritative
 `space_id`; terminal requester notification fails closed without it.
@@ -458,7 +536,7 @@ For standard approval routes, the originating card must carry an authoritative
 
 | Consumer response                             | octo-server behavior                               |
 | --------------------------------------------- | -------------------------------------------------- |
-| `2xx` + valid typed body                      | Finalize card; approved/denied also notify requester; then ACK |
+| `2xx` + valid typed body                      | Finalize card; generic standard approved/denied also notify requester; Docs does not; then ACK |
 | `408`, `429`, or `5xx`                        | Retry with bounded exponential backoff             |
 | Other `4xx`                                   | Permanent rejection; move to DLQ                   |
 | `3xx`                                         | Redirect rejected; move to DLQ                     |
@@ -478,5 +556,16 @@ Do not return HTTP 403/404 for normal domain outcomes; use the typed
 - an unknown `decision` is rejected without a domain transition;
 - concurrent decisions produce one domain winner;
 - operator removed from ACL before click returns `forbidden`;
-- terminal `approved`/`denied` always includes `requester_uid`;
+- flat callbacks carry `operator_space_id`; `octo-card-v1` callbacks carry the
+  same value as `actor.space_id`;
+- cross-Space authorization uses the verified operator Space and does not
+  incorrectly require membership in the card-origin Space;
+- terminal `approved`/`denied` always includes `requester_uid`; Docs accepts but does not consume it;
+- first-writer/replay results return the stored `decider_uid`,
+  `decider_space_id`, and `decided_at`, including when the current clicker differs;
+- decider IDs reject leading/trailing whitespace, 129-byte values, and a Space
+  without a UID; 128-byte values are accepted;
+- unknown result fields, negative/string `decided_at`, trailing JSON, and a body
+  larger than 64 KiB are rejected;
+- rollout rehearsal proves servers accept the fields before Docs emits them;
 - transient `5xx` can be retried safely.

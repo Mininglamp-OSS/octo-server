@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	redis "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,15 +31,19 @@ import (
 // resetSpaceInviteRateLimit.
 func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 	t.Helper()
-	rdsClient := redis.NewClient(&redis.Options{
-		Addr:     ctx.GetConfig().DB.RedisAddr,
-		Password: ctx.GetConfig().DB.RedisPass,
-	})
-	defer rdsClient.Close()
-	keys, err := rdsClient.Keys("ratelimit:uid:*").Result()
-	if err == nil && len(keys) > 0 {
-		_ = rdsClient.Del(keys...).Err()
+	clear := func() error {
+		rdsClient := redis.NewClient(&redis.Options{
+			Addr:     ctx.GetConfig().DB.RedisAddr,
+			Password: ctx.GetConfig().DB.RedisPass,
+		})
+		defer rdsClient.Close()
+		return rdsClient.Del("ratelimit:uid:" + testutil.UID).Err()
 	}
+	require.NoError(t, clear())
+	// A rate-limit test deliberately drains the shared process-wide bucket.
+	// Clear it on exit as well, so -shuffle cannot make the next test observe
+	// that test's exhausted state.
+	t.Cleanup(func() { require.NoError(t, clear()) })
 }
 
 // ---------- helpers ----------
@@ -186,6 +191,40 @@ func TestCategory_List(t *testing.T) {
 	// 默认分组 should have 1 group
 	uncatGroups := cats[2]["groups"].([]interface{})
 	assert.Equal(t, 1, len(uncatGroups))
+}
+
+func TestCategory_ExcludesAndRejectsAITeamContainer(t *testing.T) {
+	s, ctx := newCategoryTestServer()
+	f := New(ctx)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	spaceID := "space-category-ai"
+	groupNo := "group-category-ai"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	seedGroup(t, f, groupNo, spaceID)
+	_, err := f.db.session.UpdateBySql("UPDATE `group` SET purpose=? WHERE group_no=?", aiteampkg.GroupPurpose, groupNo).Exec()
+	require.NoError(t, err)
+
+	category := createCategory(t, s.GetRoute(), spaceID, "工作")
+	require.Equal(t, http.StatusOK, category.Code, category.Body.String())
+	categoryID := parseJSON(t, category)["category_id"].(string)
+
+	move := doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": categoryID,
+	})
+	require.Equal(t, http.StatusBadRequest, move.Code, move.Body.String())
+	var envelope errEnvelope
+	require.NoError(t, json.Unmarshal(move.Body.Bytes(), &envelope))
+	assert.Equal(t, "err.server.ai_team.container_protected", envelope.Error.Code)
+
+	list := doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/categories", nil)
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+	for _, category := range parseJSONArray(t, list) {
+		for _, rawGroup := range category["groups"].([]interface{}) {
+			group := rawGroup.(map[string]interface{})
+			assert.NotEqual(t, groupNo, group["group_no"], "AI container must not appear in category trees")
+		}
+	}
 }
 
 func TestCategory_Update(t *testing.T) {

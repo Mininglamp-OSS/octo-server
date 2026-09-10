@@ -3,12 +3,13 @@ package oidc
 import (
 	"encoding/base64"
 	"fmt"
-	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 )
 
 // providerIDRe 限定 provider ID 只能用 URL-safe 的小写字母+数字+'-'/'_'。
@@ -32,6 +33,18 @@ var providerIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // Config OIDC 模块完整配置
 type Config struct {
+	// ExchangeEnabled 是否挂载 /exchange 与 /exchange-jwt。
+	//
+	// 默认 **false**:main 上本模块只有 authorize/callback/logout 三条路由,
+	// 让这两个端点跟着 DM_OIDC_ENABLED 顺带挂上,等于给每个存量部署白加两个
+	// 未认证的会话签发端点,而且没法单独关掉。
+	//
+	// kind=oidc 下 /exchange 的语义是"出示 id_token 换完整会话",没有 nonce 绑定、
+	// 没有重放记录。id_token 是前端信道产物(浏览器历史/前端 JS/Referer 里出现是
+	// 它的正常用途),泄漏后的影响原本是"一个会过期作废的断言";挂上这个端点之后
+	// 它在 exp 之前等价于该用户的账号。所以必须是显式选择。
+	ExchangeEnabled bool
+
 	Enabled  bool
 	Provider ProviderConfig
 	// Bind 自助绑定子配置(P0)。Bind.Enabled 独立于 Config.Enabled,允许
@@ -45,6 +58,26 @@ type ProviderConfig struct {
 	// 未配置时分别默认 "oidc" / "SSO", 保证基础部署不强制运维填这两个字段。
 	ID   string
 	Name string
+
+	// Kind 上游协议种类,决定用哪个 AuthProvider 实现(OCTO_OIDC_PROVIDER_KIND)。
+	// 缺省 KindOIDC —— 存量部署没有这个 env,不能因为引入它而改变行为。
+	//
+	// 注意:业务分支一律读 ProviderCapabilities,不读 Kind。Kind 只用于选实现、
+	// 打 metric label 和启动期配置分叉校验。
+	Kind ProviderKind
+
+	// BaseURL 仅 KindOAuth2 使用:IdP 站点根,authorize / token / userinfo /
+	// 登出路径都拼在其后(OCTO_OIDC_PROVIDER_BASE_URL)。
+	// 留空时回落 Issuer 值 —— 这样接入新 kind 不需要新增必填 env(见 loadProvider
+	// 里 required 列表的镜像副本说明)。
+	BaseURL string
+
+	// AppID 仅 KindOAuth2 使用:单点登出的应用标识(OCTO_OIDC_PROVIDER_APP_ID)。
+	//
+	// 它**不是** ClientID —— IdP 侧是两个独立的注册值,由同一批管理员分别下发,
+	// 且可能每环境不同。申请凭据时只要了 client id/secret/redirect uri 的话,
+	// 登出功能会做不出来。
+	AppID string
 
 	Issuer       string
 	ClientID     string
@@ -101,6 +134,8 @@ type ProviderConfig struct {
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		Enabled: getBool("DM_OIDC_ENABLED", false),
+		// 默认 false —— 见 Config.ExchangeEnabled 的说明。
+		ExchangeEnabled: getBool("OCTO_OIDC_EXCHANGE_ENABLED", false),
 	}
 	if !cfg.Enabled {
 		return cfg, nil
@@ -123,8 +158,21 @@ func LoadConfig() (*Config, error) {
 // alias 仅为减小重命名 PR 对部署的冲击,不持久维护。
 func loadProvider() (ProviderConfig, error) {
 	p := ProviderConfig{
-		ID:           getStringWithAlias("DM_OIDC_PROVIDER_ID", "", "oidc"),
-		Name:         getStringWithAlias("DM_OIDC_PROVIDER_NAME", "", "SSO"),
+		ID:   getStringWithAlias("DM_OIDC_PROVIDER_ID", "", "oidc"),
+		Name: getStringWithAlias("DM_OIDC_PROVIDER_NAME", "", "SSO"),
+		// 缺省 oidc:存量部署无此 env,行为必须不变。
+		// Kind / BaseURL / AppID 走 oidcboot.EnvString(会 trim),不用 getString。
+		//
+		// Kind 是**决定用哪个实现**的字段,而 ValidateKind / UpstreamBaseURL 内部都归一化 ——
+		// 两边看到不同的值有两条后果,第二条尤其难查:
+		//   - 无 BASE_URL:校验按 oauth2 要求 base URL 而拒绝启动,镜像却报"已配置" → 锁死;
+		//   - 有 BASE_URL:LoadConfig **成功**,但下面 applyKindConstraints 的 switch 与
+		//     NewAuthProvider 的 switch 都拿未 trim 的值比,双双落 default → oauth2 的收窄
+		//     一条不生效,且对一个没有 Discovery 的 IdP 做标准 OIDC Discovery → 全端点 500。
+		//     配置看起来是好的,这是静默走错协议。
+		Kind:         ProviderKind(kindFromEnv()),
+		BaseURL:      oidcboot.EnvString("OCTO_OIDC_PROVIDER_BASE_URL", ""),
+		AppID:        oidcboot.EnvString("OCTO_OIDC_PROVIDER_APP_ID", ""),
 		Issuer:       getStringWithAlias("DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER", ""),
 		ClientID:     getStringWithAlias("DM_OIDC_PROVIDER_CLIENT_ID", "DM_OIDC_AEGIS_CLIENT_ID", ""),
 		ClientSecret: getStringWithAlias("DM_OIDC_PROVIDER_CLIENT_SECRET", "DM_OIDC_AEGIS_CLIENT_SECRET", ""),
@@ -213,34 +261,106 @@ func loadProvider() (ProviderConfig, error) {
 		return p, fmt.Errorf("DM_OIDC_RT_ENC_KEY must be 32 bytes after base64 decode, got %d", len(key))
 	}
 	p.RefreshTokenEncryptionKey = key
+
+	// kind 分叉放在最后:oauth2 分支的 BaseURL 回落依赖 Issuer 已校验非空。
+	if err := applyKindConstraints(&p); err != nil {
+		return p, err
+	}
 	return p, nil
 }
 
-// validateLogoutURL 启动期 fail-loud 校验 RP-Initiated Logout 相关 URL 为绝对 https。
+// applyKindConstraints 按 provider kind 收窄配置,并拒绝该 kind 下语义不成立的项。
 //
-// 空值视作"功能未开",直接放行(可选配置)。非空时必须是绝对地址且 https,拦
-// 相对地址 / javascript: / data: 等 —— 这两个值最终都会进浏览器顶层跳转,
-// EndSessionURL 还携带 id_token,误配会把 token 发去任意域或在导航时执行脚本。
-// 开发环境可用 OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 放宽到 http(与 bind 的同名机制对齐)。
+// 设计原则:对不适用的配置**启动期报错**而不是静默忽略。运维照抄另一个 kind 的
+// 配置是常态,静默忽略会让人以为某项已生效(例如登出),等到线上才发现没配上。
+//
+// 本函数不新增任何必填 env。required 列表在
+// modules/common/system_settings.go 的 isOIDCFullyConfigured() 有镜像副本
+// (为避开 common→oidc→user→common 的 import 循环),两处漂移会让
+// isOIDCFullyConfigured 误答 → anyThirdPartyLoginConfigured 误判 →
+// login.local_off 的兜底静默翻回 false → 全站恢复密码登录。
+func applyKindConstraints(p *ProviderConfig) error {
+	switch p.Kind {
+	case KindOIDC:
+		// 标准路线:配置形状不变。拒绝决定交给 oidcboot ——
+		// 它会挡住那些"配了但在这个 kind 下不会生效"的键。
+		return kindRefusal(p)
+
+	case KindOAuth2:
+		// BaseURL 回落 Issuer:该 kind 下 Issuer 的语义是"身份命名空间",
+		// 而多数部署里它同时就是站点根,所以可以兼作缺省值。
+		// 回落必须在校验之前 —— 规则看的是最终会被使用的值。
+		// 回落决策走 oidcboot.UpstreamBaseURL —— 单一定义。
+		//
+		// 这里曾经是 `p.BaseURL == ""`,拿**未 trim** 的值判断,而 modules/common
+		// 先 trim 再回落。空白值于是让本模块拒绝启动、镜像取到回落值报"已配置"。
+		// 归一化放进 ValidateKind 挡不住这一处 —— 这个决策跑在它**之前**。
+		p.BaseURL = oidcboot.UpstreamBaseURL(string(p.Kind), p.BaseURL, p.Issuer)
+		if err := kindRefusal(p); err != nil {
+			return err
+		}
+
+		// 以下是配置**收窄**(不是拒绝),留在本模块:
+
+		// 该 IdP 的 authorize 端点只认 scope=read。运维照抄 OIDC 的 scope 列表
+		// 会被上游直接拒,所以在这里收窄而不是原样透传。
+		p.Scopes = []string{"read"}
+
+		// 协议里没有 code_challenge 参数。抽象后由 ProviderCapabilities 消费。
+		p.RequirePKCE = false
+
+		// 该 IdP 返回 refresh_token,但文档从未给出刷新端点。留非零间隔只会让
+		// sync worker 空转,并让运维误以为"IdP 侧封号 → 我方踢线"在工作。
+		p.SyncInterval = 0
+		return nil
+
+	default:
+		return kindRefusal(p)
+	}
+}
+
+// kindRefusal 把"这份配置能不能起来"的判断委托给 pkg/oidcboot。
+//
+// 规则放在那个叶子包里而不是这里,是因为 modules/common 的
+// isOIDCFullyConfigured() 需要同一个答案,而它不能 import 本包(本包传递依赖
+// 它)。两边各写一份就是上一版的 bug:5 个新的致命条件只加在了这一侧,
+// 于是一个 KIND 拼写错误会让端点全部 404、同时 login.local_off 仍被采信,
+// SSO-only 部署因此没有任何可用登录方式。
+func kindRefusal(p *ProviderConfig) error {
+	return oidcboot.ValidateKind(oidcboot.KindInput{
+		Kind:                  string(p.Kind),
+		BaseURL:               p.BaseURL,
+		AppID:                 p.AppID,
+		EndSessionURL:         p.EndSessionURL,
+		PostLogoutRedirectURI: p.PostLogoutRedirectURI,
+		AutoLinkByEmail:       p.AutoLinkByEmail,
+		RequireEmailVerified:  p.RequireEmailVerified,
+		AllowInsecureUpstream: getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false),
+		AllowInsecureLogout:   getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false),
+		Issuer:                p.Issuer,
+	})
+}
+
+// validateLogoutURL 委派 pkg/oidcboot.ValidateLogoutURL —— 单一定义。
+//
+// 曾经这里是唯一一份,而 modules/common 的镜像没有它,尽管那份镜像的注释声称
+// 覆盖了每一条致命检查、只跳过非致命的。这两条**是**致命的:一个相对的
+// POST_LOGOUT_REDIRECT_URI 会让全部 OIDC 路由变 404,而镜像照答"已配置",
+// login.local_off 继续生效 —— 与 kind 那一类同一个锁死。
 func validateLogoutURL(envName, raw string) error {
-	if raw == "" {
-		return nil
+	return oidcboot.ValidateLogoutURL(envName, raw,
+		getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false))
+}
+
+// kindFromEnv 读 provider kind,空白视作未配置(回落默认 kind)。
+//
+// 单独一个函数是为了让"这个字段必须归一化"这件事有个可指的地方 —— 它决定分派,
+// 而分派与校验看到不同的值会静默走错协议。
+func kindFromEnv() string {
+	if v := oidcboot.EnvString("OCTO_OIDC_PROVIDER_KIND", ""); v != "" {
+		return v
 	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("oidc: invalid %s %q: %w", envName, raw, err)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("oidc: %s %q must be absolute (scheme://host/path)", envName, raw)
-	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	if u.Scheme == "http" && getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false) {
-		return nil
-	}
-	return fmt.Errorf("oidc: %s %q must use https scheme "+
-		"(set OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 to allow http for dev)", envName, raw)
+	return string(KindOIDC)
 }
 
 func getString(key, def string) string {
@@ -251,14 +371,18 @@ func getString(key, def string) string {
 }
 
 // getStringWithAlias 优先 primary,缺省回退 alias,再回退 def。alias="" 表示无 alias。
+// getStringWithAlias 委派 pkg/oidcboot.EnvString —— 单一定义。
+//
+// 曾经这里用**未 trim** 的值判断主键是否存在:`v != ""`。于是一个只含空白的
+// DM_OIDC_PROVIDER_ISSUER 被当成"已配置",legacy alias 根本不会被查;而
+// modules/common 那侧先 trim 再判,会回落到 alias。kind=oauth2 下 issuer 兼作
+// base URL,于是两侧得出相反结论 —— 模块拒绝启动(全端点 404)、镜像报"已配置"、
+// login.local_off 继续生效。与 BASE_URL、布尔值那两处同一个锁死,换了第三个字段。
+//
+// def 保留:调用方有需要默认值的键,而 EnvString 只回答"环境里有没有配"。
 func getStringWithAlias(primary, alias, def string) string {
-	if v, ok := os.LookupEnv(primary); ok && v != "" {
+	if v := oidcboot.EnvString(primary, alias); v != "" {
 		return v
-	}
-	if alias != "" {
-		if v, ok := os.LookupEnv(alias); ok && v != "" {
-			return v
-		}
 	}
 	return def
 }
@@ -275,22 +399,14 @@ func getBool(key string, def bool) bool {
 	return b
 }
 
-// 解析失败时 fall through 到 alias,避免迁移期 ops 把新 key 写错值反而吞掉
-// 老 key 上仍有效的配置。所有 alias 用尽后才返回 def。
+// getBoolWithAlias 委托 pkg/oidcboot.EnvBool —— 单一定义。
+//
+// 曾经这里和 modules/common 各有一份,后者的注释还写着 "matching
+// modules/oidc.getBoolWithAlias"。它们在"主键存在但解析失败"这一点上不一致,
+// 而那一个分歧足以让 SSO-only 部署整体失去登录入口(见 EnvBool 的说明)。
+// 一句声称同步的注释不是机制。
 func getBoolWithAlias(primary, alias string, def bool) bool {
-	if v, ok := os.LookupEnv(primary); ok && v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	if alias != "" {
-		if v, ok := os.LookupEnv(alias); ok && v != "" {
-			if b, err := strconv.ParseBool(v); err == nil {
-				return b
-			}
-		}
-	}
-	return def
+	return oidcboot.EnvBool(primary, alias, def)
 }
 
 func getIntWithAlias(primary, alias string, def int) int {

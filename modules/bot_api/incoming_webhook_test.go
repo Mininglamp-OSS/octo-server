@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -160,6 +161,49 @@ func TestBotWebhook_MemberCreateAndManageOwn(t *testing.T) {
 	// 删除自己创建的 OK。
 	w = doBot(handler, botReq(t, "DELETE", botWebhookBase()+"/"+whID, iwhBotToken, nil))
 	assert.Equalf(t, http.StatusOK, w.Code, "self delete body: %s", w.Body.String())
+}
+
+func TestBotWebhook_AllManagementRoutesRejectAIContainer(t *testing.T) {
+	handler, ctx := setupBotWebhookEnv(t)
+	_, err := ctx.DB().Update("group").Set("purpose", aiteam.GroupPurpose).
+		Where("group_no=?", iwhGroupNo).Exec()
+	require.NoError(t, err)
+
+	type routeCase struct {
+		method string
+		path   string
+		body   interface{}
+	}
+	tests := []routeCase{
+		{http.MethodPost, botWebhookBase(), map[string]interface{}{}},
+		{http.MethodGet, botWebhookBase(), nil},
+		{http.MethodPut, botWebhookBase() + "/missing", map[string]interface{}{"status": 0}},
+		{http.MethodDelete, botWebhookBase() + "/missing", nil},
+		{http.MethodPost, botWebhookBase() + "/missing/regenerate", nil},
+		{http.MethodGet, botWebhookBase() + "/missing/deliveries", nil},
+		{http.MethodPost, botWebhookBase() + "/missing/test", nil},
+	}
+	threadBase := fmt.Sprintf("/v1/bot/groups/%s/threads/100000000000099/incoming-webhooks", iwhGroupNo)
+	tests = append(tests, []routeCase{
+		{http.MethodPost, threadBase, map[string]interface{}{}},
+		{http.MethodGet, threadBase, nil},
+		{http.MethodPut, threadBase + "/missing", map[string]interface{}{"status": 0}},
+		{http.MethodDelete, threadBase + "/missing", nil},
+		{http.MethodPost, threadBase + "/missing/regenerate", nil},
+		{http.MethodGet, threadBase + "/missing/deliveries", nil},
+		{http.MethodPost, threadBase + "/missing/test", nil},
+	}...)
+	for _, tc := range tests {
+		w := doBot(handler, botReq(t, tc.method, tc.path, iwhBotToken, tc.body))
+		require.Equal(t, http.StatusForbidden, w.Code, "%s %s: %s", tc.method, tc.path, w.Body.String())
+		assert.Contains(t, w.Body.String(), "This AI session container cannot be changed through group APIs.")
+	}
+
+	var count int64
+	_, err = ctx.DB().Select("COUNT(*)").From("incoming_webhook").
+		Where("group_no=?", iwhGroupNo).Load(&count)
+	require.NoError(t, err)
+	assert.Zero(t, count)
 }
 
 // 成员 bot 不可动他人创建的（403）；非成员 bot 一切操作 403。

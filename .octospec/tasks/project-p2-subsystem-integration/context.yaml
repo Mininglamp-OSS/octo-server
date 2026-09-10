@@ -1,0 +1,421 @@
+# octospec Implement-phase record for the PR-5 slice of task
+# project-p2-subsystem-integration (the provisioning outbox).
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global tier
+# available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml).
+
+slice: PR-5 (provisioning outbox, octo-server half only)
+branch: feat/project-p2-provisioning-outbox
+base: main @ d5b091a6 (P0 #841 and P1 #846 both merged; rebased onto P1 on 2026-09-07)
+# Originally written against main @ c7abadeb, when P1 #846 was still open and this slice was
+# built and verified without it. That independence was real and is what let the two ship in
+# parallel — but it stopped being TRUE of the shipped tree the moment P1 merged and this
+# branch rebased onto it, and the record kept asserting it for three heads. It is now the
+# opposite: P1 made modules/group depend on modules/project, which closed an import cycle
+# through internal/cardactiondispatch and forced the pkg/octosign extraction. See the
+# octosign-leaf-extraction deviation.
+
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + internal/**/*.go match every file touched; brief tags
+      carry space / isolation / acl. Drives the central decision of this slice: the
+      container id is random and opaque rather than derived from project_id, because
+      listVisibleInSpace lets any active Space member read the project_id of every
+      space_listed project while fleet's workspace gate admits on octo Space
+      membership alone and then materializes the caller as a workspace member. A
+      derivable id completes that chain (brief P-3). Also drives: space_id is carried
+      on the outbox row so the ensure body names the Space explicitly rather than the
+      receiver inferring it, and no container id reaches any client response.
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by touches:wire-contract and by the fact that this slice creates
+      octo-server's FIRST egress to fleet or drive. Drives: one HMAC secret per target
+      (a leaked fleet secret must not provision drive containers), both registered in
+      main.go's cardactiondispatch ValidateNotifyTokenExclusions call — the only place
+      that also sees the dynamic route-scoped notify tokens; proxy cleared and
+      redirects refused so a deployment-level proxy setting or a compromised target
+      cannot redirect signed traffic; response body bounded; ensure URL validated at
+      process start (scheme allowlist, no userinfo, path required); the outbound client
+      confined to its own package so no request handler can reach a subsystem.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go. This slice registers NO new pkg/errcode code and that is
+      the finding, not an omission: the only new user-visible failure is a create that
+      fails because the outbox write failed, and a client can do nothing differently
+      about it than about any other storage failure — so it answers with the existing
+      ErrProjectStoreFailed (500, Internal=true, cause logged first). What it does get
+      is its own METRIC reason (write_rejected_total{reason="provisioning_enqueue"}),
+      because "creation is failing" and "creation is failing because this slice was
+      turned on" must be distinguishable. make i18n-extract-check and make i18n-lint
+      both pass unchanged.
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + internal/**/*.go. No new HTTP surface, so no middleware
+      to mount. The clause that DOES apply is the outbound direction, which the rule's
+      "never hand-roll" spirit covers from the other side: one bounded batch per tick
+      (OCTO_PROJECT_PROVISION_BATCH), one in-flight batch per process
+      (provisioningRunning), one claim per row under a DB lease, and a capped
+      exponential backoff — so an unhealthy target cannot be turned into a
+      self-inflicted flood.
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go. Drives: testutil.NewTestServer + CleanAllTables via the
+      package's existing setup(), targets enabled AFTER mountProject so the worker's
+      process-wide sync.Once is never consumed in tests, the post-create nudge replaced
+      with a no-op seam so no assertion races a goroutine, and every source guard
+      mutation-verified (see verification below).
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ** — English Conventional Commits.
+
+brief: .octospec/tasks/project-p2-subsystem-integration/brief.md
+plan: .octospec/tasks/project-p2-subsystem-integration/plan.md
+
+# Deviations from the brief's sketch. Each is a single-site decision and reversible.
+deviations:
+  - id: per-target-enablement
+    what: |
+      OCTO_PROJECT_PROVISION_TARGETS is a comma list, empty by default, and
+      createProjectOnce enqueues nothing for a target that is not on it. The claim
+      query also filters on the enabled set.
+    why: |
+      D2's "the backlog is real work sitting visible" reads as if rows should
+      accumulate before precondition P-2 lands. Narrowed: a backlog is informative
+      once an operator has ASKED for a target and noise before that. Unconditional
+      enqueueing would put two guaranteed-dead rows on every project on every
+      deployment and drive them to `abandoned` — the module's alert state — before
+      anyone requested the feature. A list rather than a boolean because fleet and
+      drive are on different teams' schedules (Q1 recommends fleet first). The claim
+      filter additionally makes turning a target OFF non-destructive: its pending rows
+      stop being picked up instead of burning their budget against a dead destination.
+  - id: container-id-prefix
+    what: container ids are "octows-" / "octods-" plus 16 crypto/rand bytes as hex.
+    why: |
+      D1 says random and opaque. A CONSTANT per-target prefix carries no information
+      about the project, so opacity is unchanged, and it earns its keep on the
+      subsystem side where an operator looking at a workspace.slug or a drive_space.id
+      can tell what created it. A source guard pins that both prefixes exist only
+      next to the single producer, so a second construction site cannot appear.
+  - id: outbound-name-is-a-label
+    what: |
+      the ensure body's `name` is the fixed string "octo-project" and `issue_prefix` is
+      omitted, rather than the project name and a prefix.
+    why: |
+      D3 makes the name authoritative in octo-server and never synced outbound, so a
+      copy on the other side can only drift. More importantly a project name is
+      user-supplied free text: sending it makes provisioning a content-egress path
+      with its own escaping and disclosure questions, which this slice does not open.
+      A target that needs the real name reads GET /v1/projects/:project_id, which is
+      what D3 already tells fleet to do for `context`. fleet applies its own
+      issue_prefix default; its help text already says changing the prefix only affects
+      new issues.
+  - id: disband-moves-abandoned-rows-too
+    what: |
+      markProvisioningDisbandPendingTx moves pending, ready AND abandoned rows to
+      disband_pending, and it lives inside disbandProjectTx rather than in the service
+      layer.
+    why: |
+      An abandoned row records "we never confirmed a container", but we may well have
+      created one and failed to record it, so it is exactly as reclaimable as a ready
+      row — and last_error survives the transition, so the failure history is still
+      readable. Leaving them behind would pin the abandoned gauge above zero forever
+      for a project that no longer exists, which trains the on-call to ignore the one
+      signal that needs a human. Putting it in the DAO makes it structural: that
+      function is the single choke point for every disband in the module.
+  - id: misconfigured-target-is-dropped-not-fatal
+    what: |
+      a target named in the list but with a bad URL, a short secret or a colliding
+      secret is DROPPED from the enabled set, with an Error log at construction and
+      project_provisioning_target_misconfigured{target}=1. main.go's token-exclusion
+      check still refuses to boot.
+    why: |
+      The asymmetry is deliberate. A credential collision is a process-wide security
+      invariant, so refusing to boot is right. A typo in a project provisioning URL is
+      not: taking down every IM feature for every tenant because one optional
+      collaboration integration was misconfigured is a worse outcome than that
+      integration being off. The failure is therefore loud in two channels that survive
+      a restart loop instead of one that does not.
+  - id: receiver-contract-is-specified-here
+    what: |
+      the client's package comment and brief D2 now state three MUST clauses for the
+      receiver (verify the signature, reject a stale timestamp, treat container_id as the
+      idempotency key), and document that `name` is a fixed label the receiver should not
+      display.
+    why: |
+      The original sketch specified how the request is SIGNED and nothing about what
+      verifying it requires, and the first two clauses have no enforcement on this side.
+      The gap that matters is freshness: the timestamp is inside the signed string so it
+      cannot be edited, but a captured request can still be REPLAYED, and because ensure
+      is idempotent a replay resurrects a container the subsystem had already reclaimed.
+      octosign.Verify checks only the MAC. Written down now because neither
+      subsystem has started its ensure endpoint — after they ship it is a cross-repo
+      rework.
+  - id: no-lease-heartbeat
+    what: |
+      the outbox has NO lease heartbeat, and OCTO_PROJECT_PROVISION_TIMEOUT is rejected at
+      config load unless it is at most a quarter of the lease (maxProvisionTimeoutFraction).
+    why: |
+      D2 item 1 and the migration header both claimed a heartbeat that no code ever
+      implemented — the same "the doc says it is done" class as H-1/H-2, caught by review.
+      The claim is withdrawn rather than implemented: a heartbeat is machinery for long
+      jobs and this job is a single bounded outbound call. Without the heartbeat the
+      timeout-vs-lease relationship is a CORRECTNESS constraint, so it is now enforced
+      instead of commented.
+  - id: permanent-failure-short-circuit
+    what: |
+      container_id_mismatch / invalid_request / encode_failed abandon the row on the FIRST
+      attempt instead of spending the budget; there is no exported Retryable predicate.
+    why: |
+      Retryable existed, was computed and never consumed, and encoded the wrong question
+      ("does this STATUS justify another try") — the worker deliberately retries 404 and
+      401, because a not-yet-deployed ensure endpoint and a rotated secret both become 200
+      after a deployment on the other side. The failures that must not be retried are
+      identifiable by CATEGORY, not by status, so the decision moved to the worker and the
+      dead abstraction was deleted.
+  - id: unnarrowed-gauge-over-counts
+    what: |
+      provisioning_unnarrowed_containers counts ready + pending + abandoned, and an
+      unconfigured target counts as not narrowed.
+    why: |
+      The first version counted `ready` only, arguing "a pending row has no container on
+      the other side yet" — not true under at-least-once delivery (a lost response leaves
+      a container behind a row that does not say so), and contradicting what this module
+      says elsewhere about abandoned rows. A security-surface gauge must over-count.
+      Zeroing for an unconfigured target made the documented rollback read 0 while every
+      container still existed.
+  - id: sweep-predicate-and-rolling-max
+    what: |
+      the exhausted-row sweep treats lease_until IS NULL as due (plus full-lease grace for
+      a held lease), re-checks ALL predicates in its UPDATE, and MaxAttempts is bounded to
+      [1, 50] at config load.
+    why: |
+      release NULLs the lease, so a retrying row rests at (pending, k, NULL); requiring
+      IS NOT NULL made it unsweepable while a lowered max made it unclaimable — a silent
+      zombie exactly where the code claims to prevent one. The UPDATE re-check closes a
+      rolling-restart race where replicas disagree about max. The bounds exist because an
+      unbounded int cast to uint32 made every claim predicate false.
+  - id: purge-drains-and-is-gated
+    what: |
+      the retention purge drains (loop until a short batch, bounded per tick) AND is gated
+      PER TARGET on OCTO_PROJECT_PROVISION_{FLEET,DRIVE}_RECLAIM_CONSUMER_LIVE, both
+      default off, with that set threaded into the DELETE as `target IN ?`. The sweep
+      appends to last_error rather than overwriting it. The row census is scheduled
+      independently of whether any target is enabled.
+    why: |
+      Three separate findings with one root: the retention path was built as if its
+      consumer already existed. A fixed DELETE per tick is not a slower purge but no purge
+      once churn exceeds it (#797's own argument, and #846 implements the drain). Deleting
+      a disband_pending row before the D9 endpoint ships makes the status answer
+      permanently `unknown`, which D9 makes indistinguishable from "outside your grant" —
+      so the container can never be reclaimed; that is the only irreversible operation in
+      this slice, so it must not run on an assumption. Overwriting last_error destroyed the
+      only durable failure evidence exactly on the pod-killed path where there is no log
+      line either. And scheduling the census inside startProvisioningWorker meant the
+      documented rollback took every gauge with it, including the backlog the runbook
+      promises is preserved.
+  - id: reclaim-gate-is-per-target
+    what: |
+      the reclaim gate is a per-target set (ProvisioningConfig.ReclaimTargets, resolved for
+      every KNOWN target rather than every enabled one) and it is threaded into the purge
+      DELETE as `target IN ?`; the retired process-global
+      OCTO_PROJECT_PROVISION_RECLAIM_CONSUMER_LIVE is refused at config load rather than
+      ignored. The exhausted-row sweep gained the same `target IN ?` filter the claim path
+      already had.
+    why: |
+      A live reclaim consumer is a per-subsystem deliverable — fleet and drive ship on
+      different teams' schedules, which is why every other per-subsystem fact here is
+      already per target. A process-global boolean guarding a DELETE with no target
+      predicate meant the FIRST subsystem to ship a consumer silently authorized deleting
+      the OTHER one's reclaim records, on the rollout order the runbook prescribes; those
+      containers reach exactly the end state the gate exists to prevent, irreversibly and
+      with no gauge for it. Read for every known target, not every enabled one, because a
+      target disabled after use still has containers its live consumer must finish
+      reclaiming: enablement governs what we create, this governs what we may forget. The
+      sweep filter is the same non-destructiveness the claim filter documents — without it,
+      narrowing TARGETS drove the disabled target's exhausted rows to terminal `abandoned`,
+      from which there is no automatic re-drive, so flipping the switch back would not
+      resume them.
+  - id: scan-indexes-lead-with-target
+    what: |
+      both scan indexes on octo_project_provisioning lead with `target`:
+      idx_..._pending (target, status, next_attempt_at, lease_until) and
+      idx_..._finished (target, status, finished_at).
+    why: |
+      Found by a flaky test, not by review. Every claim/sweep/purge statement filters
+      `target IN (...)`, but while the indexes led with `status`, each per-target scan
+      walked an index range containing the other target's rows, locked them, and only then
+      filtered them out at the server layer — and FOR UPDATE SKIP LOCKED makes the sibling
+      scan skip a row a peer transaction holds. Measured on MySQL 8.0.46: with two targets
+      due in the same tick, the loser claimed nothing and waited silently for the next 15s
+      tick. That is the mutual starvation the one-goroutine-per-target fan-out exists to
+      remove, so the fix belongs in the index. Also makes the (target, status) census a
+      covering-index read (EXPLAIN: Using index) rather than a whole-table scan, which was
+      a separate review finding.
+  - id: published-conformance-secrets-refused
+    what: |
+      ValidateTarget rejects the two secrets conformance.go publishes, next to the 32-byte
+      length floor.
+    why: |
+      Both published values are 33 bytes, so they cleared the floor: an operator copying one
+      into OCTO_PROJECT_PROVISION_*_SECRET to try the endpoint booted clean holding a
+      published HMAC key, and conformanceTamperedBody is literally the forgery that key
+      authorises — a valid signature over an attacker-chosen project_id. The MAC is the
+      load-bearing layer precisely because ValidateTarget declines to require TLS.
+  - id: last-error-carries-the-transport-reason
+    what: |
+      EnsureError gained a bounded Detail field, filled ONLY at the two transport-layer
+      construction sites from the transport error's inner error; Summary() returns the
+      container-id-free text minus the category; and the abandon path writes the detail
+      alongside the give-up reason instead of replacing it.
+    why: |
+      Category-plus-status was empty for the failure an operator meets first: a target that
+      is down wrote `last_error = "transport_failed: projectprovision: transport_failed"` —
+      the outcome label twice — while connection-refused vs DNS vs TLS vs deadline sat in the
+      unexported cause, reachable only through Unwrap, which nothing calls. That field is
+      what the runbook sends a human to read, the sweep was deliberately changed to append to
+      it because it is the only durable per-row evidence, and this package has no logger by
+      design, so an OOM-killed pod leaves nothing else. A separate Detail field rather than
+      folding cause into Error(), because cause at the encode_failed site is a json.Marshal
+      error over an EnsureRequest, which carries the container id — realistically impossible
+      to trigger, but "realistically" is not the bar for a value the package comment calls a
+      capability. Detail is drawn only from the transport error's inner error, which describes
+      the network and structurally cannot contain the request, so container-id-freedom stays a
+      property of construction rather than an argument about stdlib formatting. The abandon
+      change is the same argument as the sweep's append: finishProvisioningJob SETs
+      last_error, so writing the reason alone destroyed the detail on the one row with no
+      automatic re-drive.
+  - id: mechanical-doc-truth-guards
+    what: |
+      two source guards over the slice's own text: every repository path referenced in a
+      comment or task document must resolve in the tree, and every parenthesised column tuple
+      made entirely of octo_project_provisioning columns must be a prefix of a key the
+      migration actually declares.
+    why: |
+      Five consecutive review rounds produced the same class of finding — a comment or
+      document asserting behaviour the code does not have — and every instance was caught by a
+      human reading carefully. Two were minted by a mechanical import rename (two nonexistent
+      paths, in the file other repositories are told to copy the wire contract from), one by
+      an index change invalidating untouched prose. Those are references a grep can settle, so
+      review attention should not be spent on them. The class matters more than usual here
+      because the feature is inert: nothing exercises it, so its correctness reaches an
+      operator only through the runbook and reaches two other teams only through a contract
+      file. The TUPLE guard found a real live instance on its first run — a stale index
+      enumeration in brief.md that three reviewers and the author had missed. The PATH guard
+      found none: an earlier revision of this entry said "both", which was wrong. Its first
+      run produced a screenful of output, all false positives from an over-greedy regex that
+      was then fixed, and that was mistaken for a catch. Corrected after a reviewer replayed
+      both guards against the pre-fix tree. It matters because a false efficacy claim is
+      exactly what makes the next reader skip mutation-checking a guard — and the path guard
+      genuinely needed it: its first version could not see a two-segment package
+      misspelling, which is one of the two defects it is named for.
+  - id: conformance-vectors
+    what: |
+      internal/projectprovision ships four fixed request/verdict vectors (valid /
+      stale_timestamp / tampered_body / wrong_secret) plus the canonical string spelled out
+      byte by byte; passing them is a runbook precondition for enabling a target.
+    why: |
+      Go internal/ packages are not importable cross-repo, so pointing receivers at
+      octosign.CanonicalRequest asked two codebases to reimplement it from prose.
+      A wrong canonical string fails closed and is self-announcing; a lenient timestamp
+      check fails open and is silent — the vectors make the silent one checkable, and the
+      drift test keeps the table from rotting away from the implementation.
+
+  - id: provision-ensurer-interface
+    what: |
+      Project.provisionClient is typed on a local one-method interface declared in
+      provisioning_worker.go, not on *projectprovision.Client.
+    why: |
+      Without it api.go — the file carrying this module's request handlers — has to
+      import the outbound package just to name a field type, and the confinement guard
+      then needs an exception for its own type declaration. With it the rule is
+      unconditional: no handler file imports internal/projectprovision. It is also the
+      idiomatic direction (declare the interface where it is used).
+
+# Taken where the brief left a choice; each is reversible at one site.
+assumptions:
+  - "Retry budget: 12 attempts with backoff capped at 5 minutes, which is
+     2+4+8+16+32+64+128+256+300+300+300 = 1410s = ~23.5 MINUTES. An earlier revision of
+     this line and of the code comment said '~1 hour', which was simply wrong — the sum
+     was never taken. Deliberately not stretched to days either way: because a row only
+     exists for a target an operator turned on, exhaustion means 'a target I asked for is
+     not answering' — a real alert — and hiding that behind a week of retries would delay
+     the only signal there is. Tunable via OCTO_PROJECT_PROVISION_MAX_ATTEMPTS; re-do the
+     sum if you change it or the cap."
+  - "Lease is 2 minutes, ~10x one job's bounded cost (a single 10s-timeout call plus
+     two short statements). modules/space needs 10 minutes because its job walks every
+     group; this one does not."
+  - "Retention purges disband_pending only, after 90 days. ready rows are kept
+     indefinitely because they are what makes 'which projects were ever provisioned
+     into drive' answerable locally (D12); abandoned rows are the only durable record
+     that provisioning gave up. 90 days rather than modules/space's 14 because this is
+     a RECLAIM window: consumers learn about a disband by polling, so deleting the row
+     early drops local accounting for a container that still exists elsewhere."
+  - "The signature's event-id slot carries sha256(container_id), not the id. Replay-stable
+     and still bound to one resource, while keeping a capability out of a header —
+     bodies are almost never logged, headers routinely are. An earlier revision put the
+     raw id there and justified it with 'the body already carries it', which ignored that
+     asymmetry."
+  - "octo_project_provisioning carries a space_id column that D2 item 1's column sketch
+     does not list. Added because the ensure body needs octo_space_id, and reading it from
+     octo_project on every attempt would add a query per call. Worth knowing when diffing
+     the spec against the table."
+  - "A successful create nudges the worker in one goroutine so 'eager' means seconds
+     rather than up to a full interval. Bounded by the project creation rate, which the
+     per-day and per-Space quotas already cap — unlike modules/space's original per-uid
+     fan-out, which turned one large disband into thousands of goroutines."
+
+# Cannot be verified from here; must be checked before the feature is turned on.
+open_verification:
+  - "Brief precondition P-2 (a service identity on each subsystem) is NOT met. Until it
+     lands, turning a target on produces rows that retry and then go abandoned. This is
+     why the enablement list is empty by default: the code is merged inert."
+  - "Brief P-3 / R2 / R3 (authorization narrowed by Project before a container exists)
+     are NOT met. Nothing here discloses a container id, and
+     project_provisioning_unnarrowed_containers measures the surface protected by the
+     id's opacity alone. Do not disclose an id for a target whose
+     OCTO_PROJECT_PROVISION_*_NARROWED is false."
+  - "Abandoned rows have NO automatic re-drive. Once P-2 lands, existing abandoned rows
+     need a deliberate requeue (one UPDATE — see plan.md). Chosen over an automatic
+     requeue because an automatic one would erase the distinction between 'a target is
+     broken' and 'a target is fine'."
+  - "The collation gap recorded in P0's migration header still applies to the WHOLE
+     database and is unchanged by this slice: the new table pins
+     utf8mb4_general_ci like every other migration-created table, and it joins nothing,
+     so it adds no new 1267 exposure."
+  - "Whether the deployment can tolerate a rolling restart to flip
+     OCTO_PROJECT_PROVISION_TARGETS in both directions. It is an env var, so the
+     mitigation path is a deploy, not a config change (same as the two P0 switches)."
+
+# Found while implementing.
+defects_found:
+  - "None in existing code. Four defects were found in THIS slice's own first drafts, all
+     by mutation-testing the guards rather than by review: (1) the container-id guard
+     extracted its subject by cutting at the next `func `, which swallowed the
+     provisioningJob struct whose db tags are literally project_id and space_id — so it
+     reported a leak that did not exist; (2) the import guard matched
+     `\"internal/projectprovision\"` with a LEADING quote, which never matches the fully
+     qualified import path, so it passed on a file that did import it; (3) the migration
+     guard stripped `--` comments but not SQL string literals, so a column COMMENT
+     mentioning CURRENT_TIMESTAMP tripped it; (4) the purge fixture inserted three rows
+     with the same (project_id, target) and hit the unique key — which at least proved
+     the key works."

@@ -231,11 +231,11 @@ Alert from these bounded-label metrics:
 - `dmwork_card_action_dispatch_leased{owner}`
 - `dmwork_card_action_dispatch_ready_depth`
 - `dmwork_card_action_dispatch_dlq_depth`
-- `dmwork_card_action_dispatch_applicant_notify_failure_total{owner}`
+- `dmwork_card_action_dispatch_applicant_notify_failure_total{owner}` (generic standard routes; Docs emits none)
 
 Deployment-specific thresholds belong in the monitoring repository. At
 minimum, alert on sustained DLQ depth above zero and sustained `consumer_5xx`,
-`invalid_response`, or applicant notification failures.
+`invalid_response`, or generic requester-outcome notification failures.
 
 A `route_missing` at dispatch is treated as transient (a rolling deploy / restart
 that came up before `OCTO_CARD_ACTION_ROUTES` loaded the route): the event is
@@ -264,8 +264,9 @@ go run ./tools/card-action-dlq -config configs/tsdd.yaml -action replay -event-i
 
 Replay resets attempts and returns that one event to ready state. The consumer
 must remain idempotent: its domain decision may already have committed. Terminal
-card mutation is also idempotent (`card_seq=event_id`). Applicant notification
-is at-least-once, so replay may duplicate it at the documented crash boundary.
+card mutation is also idempotent (`card_seq=event_id`). Generic standard-route
+requester outcomes are at-least-once, so replay may duplicate one at the
+documented crash boundary. The Docs specialized route emits no requester outcome.
 Replay is non-destructive: an entry older than the CLI's resolved retention is
 refused (`event_id N was not present in the DLQ`) but left intact for the server to
 prune — it never deletes a server-retained entry. If a replay reports "not present"

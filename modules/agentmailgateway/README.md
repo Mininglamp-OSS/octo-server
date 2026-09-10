@@ -62,11 +62,19 @@ caller even though their gateway URLs are otherwise identical.
   it cannot end as a clean chunked success.
 - HTTP/1.x close-delimited responses are rejected before their status is
   committed because EOF cannot distinguish completion from truncation.
-  Unknown-length responses are also rejected for HTTP/1.0 and HTTP/2 downstream
-  clients, where this handler cannot reliably surface a mid-stream failure.
+  Unknown-length responses remain rejected for HTTP/1.0 downstream clients.
+- When the downstream hop reaching this handler uses HTTP/2, unknown-length
+  responses are fully validated before status commit and then forwarded with a
+  computed `Content-Length`. The gateway retains them in 256 KiB chunks to
+  avoid geometric whole-body reallocations. Each response reserves its full
+  64 MiB allowance from a process-wide 256 MiB budget until the buffered body
+  is written downstream, allowing at most four such responses concurrently.
+  A request that cannot obtain a reservation within five seconds receives the
+  localized `503 err.server.agent_mail_gateway.unavailable` response.
 - Request and response bodies each have a 64 MiB per-request limit. Four slots
-  bound concurrent large-body buffering. Bodies over 1 MiB additionally use a
-  256 MiB weighted budget until the upstream transport closes its request body.
+  bound concurrent large request-body buffering. Request bodies over 1 MiB
+  additionally use a 256 MiB weighted budget until the upstream transport
+  closes its request body.
   Closing that body drops the transport-visible reference to the buffered bytes
   before releasing the reservation, so a slow browser response cannot retain
   unrelated upload capacity. Smaller bodies bypass that large-body budget.

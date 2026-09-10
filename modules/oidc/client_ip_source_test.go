@@ -36,8 +36,8 @@ func TestSecuritySensitivePathsUseWKHTTPClientIP(t *testing.T) {
 		}
 		safeCalls += safe
 	}
-	if safeCalls != 4 {
-		t.Fatalf("OIDC production wkhttp.ClientIP calls = %d, want 4", safeCalls)
+	if safeCalls != 6 {
+		t.Fatalf("OIDC production wkhttp.ClientIP calls = %d, want 6", safeCalls)
 	}
 }
 

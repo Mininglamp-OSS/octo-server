@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -180,29 +181,72 @@ func classifyThreadError(err error) codes.Code {
 func (t *Thread) Route(r *wkhttp.WKHttp) {
 	threads := r.Group("/v1/groups/:group_no/threads", t.ctx.AuthMiddleware(r))
 	{
-		threads.POST("", t.createThread)
+		threads.POST("", t.protectAIContainerMutation, t.createThread)
 		threads.GET("", t.listThreads)
 		threads.GET("/:short_id", t.getThread)
-		threads.PUT("/:short_id", t.updateThread)
-		threads.PUT("/:short_id/setting", t.updateSetting)
+		threads.PUT("/:short_id", t.protectAIContainerMutation, t.updateThread)
+		threads.PUT("/:short_id/setting", t.protectAIContainerMutation, t.updateSetting)
 		threads.GET("/:short_id/members", t.listMembers)
-		threads.POST("/:short_id/join", t.joinThread)
-		threads.POST("/:short_id/leave", t.leaveThread)
-		threads.POST("/:short_id/archive", t.archiveThread)
-		threads.POST("/:short_id/unarchive", t.unarchiveThread)
-		threads.DELETE("/:short_id", t.deleteThread)
+		threads.POST("/:short_id/join", t.protectAIContainerMutation, t.joinThread)
+		threads.POST("/:short_id/leave", t.protectAIContainerMutation, t.leaveThread)
+		threads.POST("/:short_id/archive", t.protectAIContainerMutation, t.archiveThread)
+		threads.POST("/:short_id/unarchive", t.protectAIContainerMutation, t.unarchiveThread)
+		threads.DELETE("/:short_id", t.protectAIContainerMutation, t.deleteThread)
 		threads.GET("/:short_id/md", t.threadMdGet)
-		threads.PUT("/:short_id/md", t.threadMdUpdate)
-		threads.DELETE("/:short_id/md", t.threadMdDelete)
+		threads.PUT("/:short_id/md", t.protectAIContainerMutation, t.threadMdUpdate)
+		threads.DELETE("/:short_id/md", t.protectAIContainerMutation, t.threadMdDelete)
 	}
 
 	// 简化路由（不需要 group_no，通过 short_id 查询）
 	threadSimple := r.Group("/v1/threads", t.ctx.AuthMiddleware(r))
 	{
-		threadSimple.POST("/:short_id/join", t.joinThreadSimple)
-		threadSimple.POST("/:short_id/leave", t.leaveThreadSimple)
+		threadSimple.POST("/:short_id/join", t.protectAIContainerSimpleMutation, t.joinThreadSimple)
+		threadSimple.POST("/:short_id/leave", t.protectAIContainerSimpleMutation, t.leaveThreadSimple)
 		threadSimple.GET("/:short_id", t.getThreadSimple)
 	}
+}
+
+func (t *Thread) protectAIContainerMutation(c *wkhttp.Context) {
+	protected, err := aiteampkg.IsProtectedGroup(t.ctx.DB(), c.Param("group_no"))
+	if err != nil {
+		t.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", c.Param("group_no")))
+		httperr.ResponseErrorL(c, errcode.ErrThreadStoreFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
+func (t *Thread) protectAIContainerSimpleMutation(c *wkhttp.Context) {
+	model, err := t.db.QueryByShortID(c.Param("short_id"))
+	if err != nil {
+		t.Error("query thread for AI container protection failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrThreadStoreFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if model == nil {
+		c.Next()
+		return
+	}
+	protected, err := aiteampkg.IsProtectedGroup(t.ctx.DB(), model.GroupNo)
+	if err != nil {
+		t.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", model.GroupNo))
+		httperr.ResponseErrorL(c, errcode.ErrThreadStoreFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
 }
 
 // createThread 创建子区

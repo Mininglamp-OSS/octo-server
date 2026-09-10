@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -122,6 +123,27 @@ func TestResolveTargets_GroupAndThreadSameName(t *testing.T) {
 		assert.Equal(t, "g_rt_a", thread.GroupNo)
 		assert.Equal(t, "tp_a1", thread.ShortID)
 		assert.Equal(t, "研发", thread.ParentName)
+	}
+}
+
+func TestResolveTargets_ExcludesAIContainersAndTheirThreads(t *testing.T) {
+	handler, ctx := setupBotResolveTargets(t)
+
+	seedGroup(t, ctx, "g_rt_normal", "shared target", "space_1")
+	seedMember(t, ctx, "g_rt_normal", rtRobotID)
+	seedThread(t, ctx, "g_rt_normal", "tp_normal", "shared target", 1)
+
+	seedGroup(t, ctx, "g_rt_ai", "shared target", "space_1")
+	_, err := ctx.DB().Update("group").Set("purpose", aiteam.GroupPurpose).
+		Where("group_no=?", "g_rt_ai").Exec()
+	assert.NoError(t, err)
+	seedMember(t, ctx, "g_rt_ai", rtRobotID)
+	seedThread(t, ctx, "g_rt_ai", "tp_ai", "shared target", 1)
+
+	b := decodeResolveTargets(t, callResolveTargets(t, handler, rtBotToken, "name=shared+target"))
+	assert.Equal(t, 2, b.Total)
+	for _, candidate := range b.Candidates {
+		assert.Equal(t, "g_rt_normal", candidate.GroupNo)
 	}
 }
 

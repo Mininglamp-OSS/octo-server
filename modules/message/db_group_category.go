@@ -23,11 +23,11 @@ func newGroupCategoryDB(ctx *config.Context) *groupCategoryDB {
 // GroupCategorySetting 群组分类设置（来自 group_setting JOIN group_category）。
 //
 // PR #21 review (lml2468 blocker #3)：swagger 承诺 v2 SidebarItem.category_sort
-// 来自 group_category.sort，且 /category/sort 接口也只更新 group_category.sort
-// 并 bump follow_version。如果 sidebar 只读 group_setting.category_sort（类别
+// 来自 category 的顶层排序，且 /category/sort 接口会更新该排序并 bump
+// follow_version。如果 sidebar 只读 group_setting.category_sort（类别
 // 内排序），用户重排序类别后 sidebar 完全不变，与 contract 不符。本结构两个
 // sort 字段一起读出：
-//   - CategoryGroupSort  →  group_category.sort，category 之间的相对顺序
+//   - CategoryGroupSort  →  octo_sidebar_section.sort，category 之间的相对顺序
 //     （也就是 SidebarItem.CategorySort 暴露给客户端的值）；
 //   - IntraCategorySort  →  group_setting.category_sort，同类别内组之间的顺序
 //     （sidebar 排序时作为二级 key，不暴露给客户端，避免破坏现有 schema）。
@@ -51,7 +51,7 @@ type GroupCategorySetting struct {
 	// CategorySort 是 group_setting.category_sort —— 类别内排序（v1 兼容字段，
 	// v1 API_conversation 直接回显该值，故保留语义不变）。
 	CategorySort int `db:"category_sort"`
-	// CategoryGroupSort 是 group_category.sort —— 类别之间的排序权重，
+	// CategoryGroupSort 是 octo_sidebar_section.sort —— 类别之间的排序权重，
 	// 对应 swagger v2 sidebar 的 SidebarItem.category_sort 字段。
 	CategoryGroupSort int `db:"category_group_sort"`
 }
@@ -60,7 +60,7 @@ type GroupCategorySetting struct {
 //
 // 用 LEFT JOIN group_category：保留所有 gs 行（包括未分类的、指向已删 category
 // 的），让 sidebar 能在一次查询里同时拿到分类内排序（gs.category_sort）和分类
-// 之间排序（gc.sort）；JOIN miss 走 IFNULL 退回 0，无需第二次查询。
+// 之间排序（octo_sidebar_section.sort）；JOIN miss 走 IFNULL 退回 0，无需第二次查询。
 //
 // JOIN 谓词同时绑定 `gc.uid = gs.uid`（PR #21 Round-4 review I4 by yujiawei）：
 // 虽然 group_category.category_id 当前是全局唯一、且应只被 owner 的 group_setting
@@ -72,7 +72,7 @@ type GroupCategorySetting struct {
 // gs.category_id 是持久化字段，category 被软删后这里仍保留 stale 值（cleanup
 // 路径会清，但 TOCTOU race 可能产生 dangling — modules/category 的
 // MoveGroupToCategory_TOCTOU_DanglingReference 测试明确承认这种状态合法存在）。
-// 取 JOIN 后的 gc.category_id：JOIN miss（gc.status=2 或 gc 不存在）时为 NULL，
+// 取 JOIN 后的 gc.category_id：category 或其 active sidebar section 缺失时为 NULL，
 // 恰好让 GroupCategorySetting.CategoryID 反映 "live" 语义。下游 buildFollowItems
 // 和 sidebar 物化路径的 cs.CategoryID == nil → 跳过 都自动获得正确语义，
 // 不再让 dangling category 的群进入 follow tab 或被物化（issue #151 review
@@ -84,18 +84,20 @@ func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid
 	var results []*GroupCategorySetting
 	_, err := d.session.Select(
 		"gs.group_no",
-		"gc.category_id",
+		"CASE WHEN ss.id IS NULL THEN NULL ELSE gc.category_id END AS category_id",
 		"IFNULL(gs.category_sort, 0) AS category_sort",
-		"IFNULL(gc.sort, 0) AS category_group_sort",
+		"IFNULL(ss.sort, 0) AS category_group_sort",
 	).
 		From(dbr.I("group_setting").As("gs")).
 		LeftJoin(dbr.I("group_category").As("gc"), "gs.category_id = gc.category_id AND gs.uid = gc.uid AND gc.status != 2").
+		LeftJoin(dbr.I("octo_sidebar_section").As("ss"),
+			"ss.uid=gc.uid AND ss.space_id=gc.space_id AND ss.section_type=1 AND ss.ref_id=gc.category_id AND ss.status=1").
 		Where("gs.group_no IN ? AND gs.uid = ?", groupNos, uid).
 		Load(&results)
 	return results, err
 }
 
-// QueryCategorySortsByIDs 批量返回 group_category.sort（map[categoryID]sort）。
+// QueryCategorySortsByIDs 批量返回 octo_sidebar_section.sort（map[categoryID]sort）。
 //
 // Issue #41：DM 在 user_conversation_ext.dm_category_id 上引用 group_category.category_id；
 // sidebar follow tab 排序需要把对应 category 的 sort 值写到 SidebarItem.CategorySort，
@@ -115,9 +117,11 @@ func (d *groupCategoryDB) QueryCategorySortsByIDs(categoryIDs []string, uid stri
 		Sort       int    `db:"sort"`
 	}
 	var rows []*row
-	_, err := d.session.Select("category_id", "IFNULL(sort, 0) AS sort").
-		From("group_category").
-		Where("category_id IN ? AND uid = ? AND status != 2", categoryIDs, uid).
+	_, err := d.session.Select("gc.category_id", "ss.sort").
+		From(dbr.I("group_category").As("gc")).
+		Join(dbr.I("octo_sidebar_section").As("ss"),
+			"ss.uid=gc.uid AND ss.space_id=gc.space_id AND ss.section_type=1 AND ss.ref_id=gc.category_id AND ss.status=1").
+		Where("gc.category_id IN ? AND gc.uid = ? AND gc.status != 2", categoryIDs, uid).
 		Load(&rows)
 	if err != nil {
 		return nil, fmt.Errorf("query category sorts by ids: %w", err)

@@ -34,8 +34,8 @@ import (
 func TestFix_ConversationSync_SpaceizesDMRecents(t *testing.T) {
 	const (
 		dmChannel   = "dm-peer-recents"
-		spaceA      = "space-a-recents"      // non-default
-		spaceB      = "space-b-recents"      // non-default, holds the globally-latest msg
+		spaceA      = "space-a-recents"       // non-default
+		spaceB      = "space-b-recents"       // non-default, holds the globally-latest msg
 		spaceDefaul = "space-default-recents" // earliest membership → default Space
 	)
 

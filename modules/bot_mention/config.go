@@ -24,11 +24,22 @@ const (
 	internalTokenEnv           = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	internalTokenHeader        = "X-Internal-Token"
 	docCommentMentionEventType = "doc_comment_mention"
+
+	// docKindHTML 标记 doc_id 是 octo-doc 的 slug(HTML 文档),而不是 docs-backend 的 docId。
+	docKindHTML = "html"
 )
 
 type mentionRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	DocID          string `json:"doc_id"`
+	// DocKind 说明 DocID 是哪一类文档的标识,决定消费端该走哪套 API。
+	//
+	// 为什么必须显式传而不是让消费端自己判:HTML 文档的 DocID 是 octo-doc 的 slug,
+	// 而 docs-backend 的接口按 docId 寻址 —— 拿 slug 去查必然 404。而「404」和
+	// 「文档真的不存在」无法区分,靠试错回退会把后者误判成 HTML 再失败一次。
+	//
+	// 空 = 默认 docs-backend 文档(doc/sheet/board),与加这个字段之前的行为一致。
+	DocKind        string `json:"doc_kind,omitempty"`
 	CommentID      string `json:"comment_id"`
 	ParentID       string `json:"parent_id,omitempty"`
 	FromUID        string `json:"from_uid"`
@@ -41,6 +52,7 @@ type mentionRequest struct {
 type normalizedMention struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	DocID          string `json:"doc_id"`
+	DocKind        string `json:"doc_kind,omitempty"`
 	CommentID      string `json:"comment_id"`
 	ThreadID       string `json:"thread_id"`
 	ParentID       string `json:"parent_id,omitempty"`
@@ -71,6 +83,7 @@ func normalizeMentionRequest(req mentionRequest) (normalizedMention, error) {
 	normalized := normalizedMention{
 		IdempotencyKey: strings.TrimSpace(req.IdempotencyKey),
 		DocID:          strings.TrimSpace(req.DocID),
+		DocKind:        strings.ToLower(strings.TrimSpace(req.DocKind)),
 		CommentID:      strings.TrimSpace(req.CommentID),
 		ParentID:       strings.TrimSpace(req.ParentID),
 		FromUID:        strings.TrimSpace(req.FromUID),
@@ -78,6 +91,14 @@ func normalizeMentionRequest(req mentionRequest) (normalizedMention, error) {
 		Text:           req.Text,
 		URL:            strings.TrimSpace(req.URL),
 		SpaceID:        strings.TrimSpace(req.SpaceID),
+	}
+
+	// 白名单,未知值直接拒而不是当成空。
+	//
+	// 静默降级成「普通文档」的代价是消费端拿 slug 去打 docs-backend 的 docId 接口,
+	// 报出来的是一个看不出根因的 404;拒在入口,调用方拼错立刻知道。
+	if normalized.DocKind != "" && normalized.DocKind != docKindHTML {
+		return normalizedMention{}, &requestValidationError{field: "doc_kind"}
 	}
 
 	for _, field := range []struct {
@@ -131,6 +152,23 @@ func mentionClaimLogHash(claimKey string) string {
 	return hex.EncodeToString(sum[:6])
 }
 
+// resolveBotMentionInternalToken loads OCTO_DOCS_BOT_MENTION_TOKEN and refuses
+// to enable the capability when it is unset or collides with a sibling *fixed*
+// internal-token env, so one leaked value can never grant two capabilities.
+//
+// OCTO_MARKETPLACE_INTERNAL_TOKEN is the newest member of that set
+// (modules/space.MarketplaceInternalTokenEnv). modules/space rejects a value
+// shared with this module's token, so the branch below is the mirror-image
+// half: a deployment that sets one value for both fails BOTH capabilities
+// closed instead of picking an arbitrary winner. The other, pre-existing pairs
+// are left exactly as they were.
+//
+// The env names are duplicated as literals rather than imported from their
+// owning packages, matching modules/internal_resolve/config.go: no module
+// should take a production dependency on another just to learn a string.
+// config_test.go pins the spellings.
+//
+// Returned error messages are logger-safe (they never contain token values).
 func resolveBotMentionInternalToken(getenv func(string) string) (string, error) {
 	if getenv == nil {
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN lookup unavailable; bot mention capability disabled")
@@ -143,6 +181,8 @@ func resolveBotMentionInternalToken(getenv func(string) string) (string, error) 
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; bot mention capability disabled")
 	case token == getenv("OCTO_DOCS_NOTIFY_TOKEN"):
 		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; bot mention capability disabled")
+	case token == getenv("OCTO_MARKETPLACE_INTERNAL_TOKEN"):
+		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_MARKETPLACE_INTERNAL_TOKEN; bot mention capability disabled")
 	default:
 		return token, nil
 	}

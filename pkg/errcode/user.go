@@ -376,6 +376,15 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "This account is not eligible for analytics dashboard access.",
 	})
+	// ErrUserManagerRoleTargetIneligible is the role-agnostic counterpart used by
+	// fixed manager roles added after dashboardReader (marketAdmin, ...). The
+	// dashboard-specific code above is kept so that endpoint's message does not
+	// change for existing clients.
+	ErrUserManagerRoleTargetIneligible = register(codes.Code{
+		ID:             "err.server.user.manager_role_target_ineligible",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This account is not eligible for the requested management role.",
+	})
 	ErrUserManagerRoleChanged = register(codes.Code{
 		ID:             "err.server.user.manager_role_changed",
 		HTTPStatus:     http.StatusConflict,
@@ -571,6 +580,52 @@ var (
 		ID:             "err.server.user.email_rate_limited",
 		HTTPStatus:     http.StatusTooManyRequests,
 		DefaultMessage: "Verification codes are being sent too frequently, please try again in a minute.",
+	})
+
+	// Management-console email MFA. The two 503 codes are internal so SMTP
+	// details and settings-load failures never reach the client.
+	ErrUserManagerMFASettingsUnavailable = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_settings_unavailable",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "Management-console MFA settings are not ready.",
+		Internal:       true,
+	})
+	ErrUserManagerMFAMisconfigured = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_misconfigured",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "Management-console MFA is temporarily unavailable.",
+		Internal:       true,
+	})
+	ErrUserManagerMFAChallengeInvalid = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_challenge_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The management-console MFA challenge is invalid or expired.",
+	})
+	ErrUserManagerMFACodeInvalid = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_code_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The management-console verification code is invalid.",
+	})
+	ErrUserManagerMFARateLimited = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_rate_limited",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "The management-console verification code cannot be sent yet. Please try again later.",
+		SafeDetailKeys: []string{"retry_after"},
+	})
+	// ErrUserManagerMFAVerifyLocked fires when the operator has entered the
+	// wrong verification code three times and verification is locked for
+	// ten minutes. Distinct from the send cooldown (ErrUserManagerMFARateLimited)
+	// so the client can render a verification-specific countdown and message.
+	ErrUserManagerMFAVerifyLocked = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_verify_locked",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "Too many incorrect verification attempts. Verification is temporarily locked. Please try again later.",
+		SafeDetailKeys: []string{"retry_after"},
+	})
+	ErrUserManagerMFAEmailRequired = register(codes.Code{
+		ID:             "err.server.user.manager_email_mfa_enable_email_required",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The operator must have a valid email address before enabling management-console MFA.",
 	})
 
 	// Username / Web3 signature login (modules/user/api_usernamelogin.go) codes.

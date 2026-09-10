@@ -69,17 +69,19 @@ func pendingLabels(lang string, pf pendingFields) pendingLabelSet {
 // L1 契约里标为 server-filled 的文案(handoff data.schema.json 中同名字段并未 required)。
 func docsApprovalContentFromFields(pf pendingFields, labels pendingLabelSet) cardtmpl.DocsApprovalContent {
 	return cardtmpl.DocsApprovalContent{
-		Title:        pf.Document.Title,
-		Actor:        pf.Requester.Name,
-		ActorAvatar:  pf.Requester.AvatarURL,
-		Timestamp:    pf.RequestedAtDisplay,
-		Reason:       pf.RequestReason,
-		Variant:      Variant,
-		HeaderLabel:  labels.headerLabel,
-		StatusLabel:  labels.statusLabel,
-		BannerSuffix: labels.bannerSuffix,
-		RoleLabel:    labels.roleLabel,
-		ReasonLabel:  labels.reasonLabel,
+		Title:              pf.Document.Title,
+		Actor:              pf.Requester.Name,
+		ActorAvatar:        pf.Requester.AvatarURL,
+		Timestamp:          pf.RequestedAtDisplay,
+		Reason:             pf.RequestReason,
+		RequesterSpaceName: pf.Requester.SourceSpaceName,
+		RequestedBotNames:  pf.RequestedBotNames,
+		Variant:            Variant,
+		HeaderLabel:        labels.headerLabel,
+		StatusLabel:        labels.statusLabel,
+		BannerSuffix:       labels.bannerSuffix,
+		RoleLabel:          labels.roleLabel,
+		ReasonLabel:        labels.reasonLabel,
 		// Source 走 Registry.Render 的 Meta.Source 注入,不在 content 里带
 	}
 }

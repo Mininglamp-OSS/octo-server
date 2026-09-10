@@ -1,0 +1,38 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: >-
+      brief load-bearing tag `acl` + paths modules/**/*.go。本任务移除退群提示的
+      `visibles` 读白名单，必须论证不跨越隔离边界：消息只发往 group channel，
+      订阅者就是群成员本身，群成员资格即边界；且成员变更本已由
+      CMDGroupMemberUpdate 全群广播，全员可见不引入新信息面。
+  - id: trust-boundary
+    source: repo
+    why: >-
+      brief load-bearing tag `wire-contract`（paths 不匹配，按 touches 命中）。
+      退群提示内嵌用户可控的 showName（remark / 登录名）。helper 保持
+      content 为模板 `“{0}“退出群聊` + name 放 extra 结构化字段，
+      不做 fmt.Sprintf 插值，避免把不可信文本拼进渲染敏感串。
+  - id: error-handling
+    source: repo
+    why: >-
+      brief load-bearing tag `wire-contract` + paths modules/**/*.go。
+      本次不新增/修改 errcode；退群提示是系统消息 payload 而非错误信封，
+      发送失败沿用 best-effort 记日志（与 bot_cascade 一致），
+      调用点既有的 httperr.ResponseErrorL 不变。
+  - id: rate-limit
+    source: repo
+    why: >-
+      paths modules/**/*.go 命中。本次不新增/改动路由与中间件，
+      不引入任何手写 Redis 计数器；无实质约束。
+  - id: testing
+    source: repo
+    why: >-
+      brief load-bearing tag `test` + paths **/*_test.go。新增/调整
+      modules/group 下的测试，沿用 testutil + 既有 groupIMStub 形状。
+  - id: commit-style
+    source: repo
+    why: >-
+      brief tag `commit`（paths ** 命中）。Implement 阶段不提交，
+      约束在 Finish 阶段生效。
+brief: .octospec/tasks/group-exit-notice-visibility/brief.md

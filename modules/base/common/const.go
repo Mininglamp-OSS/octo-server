@@ -18,6 +18,10 @@ const (
 	// CodeTypeOIDCBind OIDC 自助绑定 OTP。单独 keyspace 避免与
 	// register/login/forget-pwd 等流程的 SMS 计数器串扰。
 	CodeTypeOIDCBind
+	// CodeTypeManagerLogin 管理控制台登录 MFA OTP。必须使用独立的
+	// 验证码、限流、失败计数和发送状态 key，避免公开用户验证码流程影响
+	// 管理端登录。
+	CodeTypeManagerLogin
 )
 
 const (

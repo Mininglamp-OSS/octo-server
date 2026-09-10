@@ -83,6 +83,14 @@ func mgmtForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookForbidden, nil, nil)
 }
 
+// mgmtContainerProtected keeps every user- and Bot-facing management route
+// from reading or mutating server-managed AI session containers. Callers reach
+// this only after membership validation, so the response does not become a
+// group-purpose oracle for arbitrary authenticated users.
+func mgmtContainerProtected(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAITeamContainerProtected, nil, nil)
+}
+
 // mgmtFeatureDisabled returns 403 when the feature is globally disabled
 // (system_setting incomingwebhook.enabled=0). Gates every management write
 // (create/update/delete/regenerate); list (read) stays open.

@@ -1,11 +1,96 @@
 package message
 
 import (
+	"database/sql"
+	"os"
 	"testing"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+const sidebarOrderTestDBName = "octo_message_sidebar_order_test"
+
+func newSidebarOrderTestContext(t *testing.T) *config.Context {
+	t.Helper()
+	addr := os.Getenv("OCTO_TEST_MYSQL_ADDR")
+	if addr == "" {
+		addr = "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+	}
+	parsed, err := mysqldriver.ParseDSN(addr)
+	require.NoError(t, err, "parse MySQL DSN")
+	parsed.DBName = ""
+	bootstrap, err := sql.Open("mysql", parsed.FormatDSN())
+	require.NoError(t, err, "open MySQL bootstrap connection")
+	t.Cleanup(func() { require.NoError(t, bootstrap.Close()) })
+	_, err = bootstrap.Exec("DROP DATABASE IF EXISTS `" + sidebarOrderTestDBName + "`")
+	require.NoError(t, err, "drop isolated sidebar-order database")
+	_, err = bootstrap.Exec("CREATE DATABASE `" + sidebarOrderTestDBName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	require.NoError(t, err, "create isolated sidebar-order database")
+
+	parsed.DBName = sidebarOrderTestDBName
+	cfg := config.New()
+	cfg.Test = true
+	cfg.DB.Migration = false
+	cfg.DB.MySQLAddr = parsed.FormatDSN()
+	ctx := config.NewContext(cfg)
+	t.Cleanup(func() { require.NoError(t, ctx.DB().Close()) })
+
+	for _, statement := range []string{
+		"CREATE TABLE group_category (category_id VARCHAR(40) NOT NULL, space_id VARCHAR(40) NOT NULL, uid VARCHAR(40) NOT NULL, name VARCHAR(100) NOT NULL, sort INT NOT NULL, status SMALLINT NOT NULL, is_default SMALLINT NULL, PRIMARY KEY (category_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE group_setting (group_no VARCHAR(40) NOT NULL, uid VARCHAR(40) NOT NULL, category_id VARCHAR(40) NULL, category_sort INT NOT NULL DEFAULT 0, PRIMARY KEY (group_no, uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE octo_sidebar_section (id BIGINT NOT NULL AUTO_INCREMENT, uid VARCHAR(40) NOT NULL, space_id VARCHAR(40) NOT NULL, section_type SMALLINT NOT NULL, ref_id VARCHAR(40) NOT NULL, sort INT NOT NULL, status SMALLINT NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_sidebar_section (uid, space_id, section_type, ref_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+	} {
+		_, err = ctx.DB().Exec(statement)
+		require.NoError(t, err, "create isolated sidebar-order table")
+	}
+	return ctx
+}
+
+// TestCategorySortsUseSidebarSectionOrder keeps the follow-sidebar's legacy
+// group/DM payload on the same source of truth as the new unified sections
+// endpoint. The two values intentionally disagree so a fallback to
+// group_category.sort cannot accidentally satisfy this test.
+func TestCategorySortsUseSidebarSectionOrder(t *testing.T) {
+	ctx := newSidebarOrderTestContext(t)
+
+	const (
+		uid        = "sidebar-order-uid"
+		spaceID    = "sidebar-order-space"
+		categoryID = "sidebar-order-category"
+		groupNo    = "sidebar-order-group"
+	)
+	now := time.Now().UTC()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO group_category (category_id, space_id, uid, name, sort, status, is_default) VALUES (?, ?, ?, ?, ?, 1, NULL)",
+		categoryID, spaceID, uid, "category", 99,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO octo_sidebar_section (uid, space_id, section_type, ref_id, sort, status, created_at, updated_at) VALUES (?, ?, 1, ?, ?, 1, ?, ?)",
+		uid, spaceID, categoryID, 7, now, now,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_setting (uid, group_no, category_id, category_sort) VALUES (?, ?, ?, ?)",
+		uid, groupNo, categoryID, 3,
+	).Exec()
+	require.NoError(t, err)
+
+	db := newGroupCategoryDB(ctx)
+	settings, err := db.QueryCategorySettingsByGroupNos([]string{groupNo}, uid)
+	require.NoError(t, err)
+	require.Len(t, settings, 1)
+	assert.Equal(t, 7, settings[0].CategoryGroupSort)
+
+	sorts, err := db.QueryCategorySortsByIDs([]string{categoryID}, uid)
+	require.NoError(t, err)
+	assert.Equal(t, 7, sorts[categoryID])
+}
 
 // TestQueryCategorySettingsByGroupNos_WithCategory 测试查询有分类的群组
 func TestQueryCategorySettingsByGroupNos_WithCategory(t *testing.T) {

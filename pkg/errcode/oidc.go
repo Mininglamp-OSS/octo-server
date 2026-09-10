@@ -144,4 +144,27 @@ var (
 		HTTPStatus:     http.StatusUnprocessableEntity,
 		DefaultMessage: "The identity provider did not supply the account details required to create an account.",
 	})
+
+	// ---- token exchange (400 / 401) -----------------------------------------
+	//
+	// ErrOIDCExchangeRequestInvalid is the catch-all for malformed exchange
+	// input: BindJSON failure, missing/blank access_token. Like the bind
+	// request-invalid code, this is a client-shape problem the caller can fix.
+	ErrOIDCExchangeRequestInvalid = register(codes.Code{
+		ID:             "err.server.oidc.exchange_request_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid request.",
+	})
+	// ErrOIDCExchangeTokenRejected is the single anti-enumeration response for
+	// any failure to establish identity from the supplied access_token (IdP
+	// rejected it, transport failure, envelope validation failed, etc.).
+	//
+	// Anti-enumeration: the surface reason is logged via zap only, never
+	// surfaced. Callers cannot distinguish "token expired" from "unknown user"
+	// from "IdP down" from the response. HTTP 401 = "please retry SSO".
+	ErrOIDCExchangeTokenRejected = register(codes.Code{
+		ID:             "err.server.oidc.exchange_token_rejected",
+		HTTPStatus:     http.StatusUnauthorized,
+		DefaultMessage: "The SSO token was rejected. Please sign in again.",
+	})
 )

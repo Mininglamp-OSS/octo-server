@@ -345,14 +345,18 @@ func (m *Manager) forceDisband(c *wkhttp.Context) {
 		c.ResponseOK()
 		return
 	}
-	if err = m.managerDB.forceDisbandSpace(spaceId); err != nil {
+	operator := c.GetLoginUID()
+	removed, err := m.managerDB.forceDisbandSpace(spaceId, operator)
+	if err != nil {
 		m.Error("强制解散空间失败", zap.Error(err), zap.String("spaceId", spaceId))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	m.Info("管理员强制解散空间", zap.String("spaceId", spaceId), zap.String("operator", c.GetLoginUID()))
+	m.Info("管理员强制解散空间", zap.String("spaceId", spaceId), zap.String("operator", operator),
+		zap.Int("removedMembers", len(removed)))
 	// 刷新 ParseChannelID 缓存，避免已解散的 spaceId 继续被前缀路由认为有效
 	go m.space.loadKnownSpaceIDs()
+	m.space.afterMembersRemoved(spaceId, removed, operator, MemberRemoveReasonSpaceDisbanded)
 	c.ResponseOK()
 }
 
@@ -700,7 +704,9 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 		respondSpaceBatchTooLarge(c, managerMaxBatchUIDs)
 		return
 	}
-	if err := m.managerDB.removeMembersForce(spaceId, uids); err != nil {
+	operator := c.GetLoginUID()
+	removed, err := m.managerDB.removeMembersForce(spaceId, uids, operator)
+	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
 			return
@@ -709,7 +715,10 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	m.Info("管理员移除空间成员", zap.String("spaceId", spaceId), zap.String("operator", c.GetLoginUID()), zap.Strings("uids", uids))
+	m.Info("管理员移除空间成员", zap.String("spaceId", spaceId), zap.String("operator", operator), zap.Strings("uids", uids))
+	// 管理端此前完全没有做缓存失效，被移除的人还能带着 space_id 正常访问最长 60s，
+	// 且 notify 仍把他当成员投递。与用户侧走同一条收尾路径。
+	m.space.afterMembersRemoved(spaceId, removed, operator, MemberRemoveReasonForceRemoved)
 	c.ResponseOK()
 }
 

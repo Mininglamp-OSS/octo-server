@@ -9,14 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -311,7 +311,11 @@ func NewTestServer1(args ...string) (*server.Server, *config.Context) {
 	cfg.Test = true
 	// cfg.TracingOn = true
 	// cfg.TracerAddr = "49.235.106.135:6831"
-	cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true"
+	if addr := os.Getenv("OCTO_TEST_MYSQL_ADDR"); addr != "" {
+		cfg.DB.MySQLAddr = addr
+	} else {
+		cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+	}
 	cfg.DB.Migration = false
 	ctx := config.NewContext(cfg)
 	// ctx.Event = event.New(ctx)

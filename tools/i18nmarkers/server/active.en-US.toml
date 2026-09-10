@@ -24,6 +24,30 @@ other = "Authentication is required."
 ["err.server.agent_mail_gateway.unavailable"]
 other = "Agent Mail is temporarily unavailable."
 
+["err.server.ai_team.container_protected"]
+other = "This AI session container cannot be changed through group APIs."
+
+["err.server.ai_team.disabled"]
+other = "The AI team feature has been disabled by the administrator."
+
+["err.server.ai_team.forbidden"]
+other = "You do not have permission to use this AI in the current space."
+
+["err.server.ai_team.idempotency_conflict"]
+other = "The idempotency key was already used for a different request."
+
+["err.server.ai_team.im_unavailable"]
+other = "The AI session is not ready. Please retry."
+
+["err.server.ai_team.not_found"]
+other = "AI team resource not found."
+
+["err.server.ai_team.request_invalid"]
+other = "Invalid AI team request."
+
+["err.server.ai_team.store_failed"]
+other = "Failed to save AI team data."
+
 ["err.server.app_bot.id_conflict"]
 other = "The bot id is already in use."
 
@@ -53,6 +77,9 @@ other = "The token was rotated by another request; please retry."
 
 ["err.server.bot.occupied"]
 other = "Bot is already occupied by another agent."
+
+["err.server.bot_api.all_member_group_protected"]
+other = "This is a project's all-member group; manage its members from the project instead."
 
 ["err.server.bot_api.app_bot_dm_only"]
 other = "App bots can only operate on direct message channels."
@@ -103,7 +130,7 @@ other = "The content exceeds the maximum allowed size."
 other = "The user has not started a conversation with this bot."
 
 ["err.server.bot_api.file_too_large"]
-other = "The file exceeds the maximum allowed size."
+other = "The file exceeds the maximum allowed size of {{.max_size}}."
 
 ["err.server.bot_api.file_type_unsupported"]
 other = "Unsupported file type."
@@ -222,6 +249,18 @@ other = "Invalid request."
 ["err.server.bot_provision.space_forbidden"]
 other = "You are not a member of this space."
 
+["err.server.bot_task.forbidden"]
+other = "This source cannot deliver tasks to the requested bot."
+
+["err.server.bot_task.idempotency_conflict"]
+other = "This idempotency key was already used with a different task."
+
+["err.server.bot_task.in_progress"]
+other = "A task with this idempotency key is still being accepted."
+
+["err.server.bot_task.store_failed"]
+other = "Failed to accept the bot task."
+
 ["err.server.botfather.already_friends"]
 other = "You are already friends."
 
@@ -324,6 +363,9 @@ other = "Category not found."
 ["err.server.category.permission_denied"]
 other = "You do not have permission to operate on this category."
 
+["err.server.category.project_group_cannot_categorize"]
+other = "A Project group cannot be placed in a manual category."
+
 ["err.server.category.query_failed"]
 other = "Failed to query category data."
 
@@ -345,11 +387,35 @@ other = "The group and the category are not in the same space."
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
+["err.server.common.file_extension_not_allowlistable"]
+other = "This file extension is on the built-in blocklist and cannot be allowed."
+
+["err.server.common.file_upload_size_ordering"]
+other = "The global file upload size cap must not be smaller than the sticker upload cap."
+
+["err.server.common.manager_mfa_smtp_invalid"]
+other = "The SMTP configuration required by management-console MFA is invalid."
+
+["err.server.common.oidc_initial_space_invalid"]
+other = "The configured OIDC initial Space does not exist or is not active."
+
 ["err.server.common.space_welcome_config_invalid"]
 other = "Invalid space welcome configuration."
 
 ["err.server.common.thread_archive_window_ordering"]
 other = "Thread auto-archive window must not be shorter than the recent-tab thread window."
+
+["err.server.file.extension_list_too_large"]
+other = "The extension list is too large (max {{.max_entries}} entries, {{.max_length}} chars each)."
+
+["err.server.file.extension_list_too_long"]
+other = "The extension list is too long (max {{.max_bytes}} bytes)."
+
+["err.server.file.upload_too_large"]
+other = "The file exceeds the maximum allowed size of {{.max_size}}."
+
+["err.server.group.all_member_group_protected"]
+other = "This is a project's all-member group; manage its members from the project instead."
 
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
@@ -359,6 +425,9 @@ other = "The authorization code is invalid or has expired."
 
 ["err.server.group.auth_code_user_mismatch"]
 other = "The authorization code does not match the current user."
+
+["err.server.group.bot_cannot_be_owner"]
+other = "Group ownership cannot be transferred to a bot."
 
 ["err.server.group.bot_not_in_space"]
 other = "This bot does not belong to your space."
@@ -443,6 +512,12 @@ other = "You are not a member of this group."
 
 ["err.server.group.notify_failed"]
 other = "Failed to send group notification."
+
+["err.server.group.project_member_required"]
+other = "Only members of this project can be added to the group."
+
+["err.server.group.project_unavailable"]
+other = "This project is unavailable."
 
 ["err.server.group.qrcode_member_only"]
 other = "Only group members can generate a QR code."
@@ -708,6 +783,12 @@ other = "The binding session has expired or is invalid. Please start over."
 ["err.server.oidc.bind_verify_required"]
 other = "Please complete verification before confirming."
 
+["err.server.oidc.exchange_request_invalid"]
+other = "Invalid request."
+
+["err.server.oidc.exchange_token_rejected"]
+other = "The SSO token was rejected. Please sign in again."
+
 ["err.server.opanalytics.etl_already_running"]
 other = "Analytics ETL is already running."
 
@@ -725,6 +806,93 @@ other = "Failed to query analytics data."
 
 ["err.server.opanalytics.request_invalid"]
 other = "Invalid analytics request."
+
+["err.server.project.actor_not_space_member"]
+other = "You are no longer an active member of this space."
+
+["err.server.project.agent_not_eligible"]
+other = "One or more selected AI agents cannot join this project."
+
+["err.server.project.batch_too_large"]
+other = "Too many members in a single request."
+
+["err.server.project.collaboration_role_disabled"]
+other = "Project collaboration-role changes are disabled."
+
+["err.server.project.collaboration_role_duplicated"]
+other = "A collaboration role with this name already exists in the project."
+
+["err.server.project.collaboration_role_invalid"]
+other = "The collaboration role is invalid."
+
+["err.server.project.collaboration_role_name_invalid"]
+other = "The collaboration role name is invalid."
+
+["err.server.project.collaboration_role_target_invalid"]
+other = "The collaboration role target is invalid."
+
+["err.server.project.disabled"]
+other = "The project feature has been disabled by the administrator."
+
+["err.server.project.field_too_long"]
+other = "The field exceeds the maximum allowed length."
+
+["err.server.project.last_owner_must_transfer"]
+other = "Transfer ownership before leaving or being demoted."
+
+["err.server.project.member_not_found"]
+other = "Project member not found."
+
+["err.server.project.member_not_space_member"]
+other = "The target user is not an active member of this space."
+
+["err.server.project.name_duplicated"]
+other = "A project with this name already exists in this space."
+
+["err.server.project.name_invalid"]
+other = "Project name is required and must not exceed the maximum length."
+
+["err.server.project.not_found"]
+other = "Project not found."
+
+["err.server.project.not_member"]
+other = "You are not a member of this project."
+
+["err.server.project.permission_denied"]
+other = "You do not have permission to perform this operation."
+
+["err.server.project.query_failed"]
+other = "Failed to query project data."
+
+["err.server.project.quota_collaboration_roles"]
+other = "This project has reached its collaboration role limit."
+
+["err.server.project.quota_daily_create"]
+other = "You have created too many projects today."
+
+["err.server.project.quota_member_collaboration_roles"]
+other = "This member has reached the collaboration role limit."
+
+["err.server.project.quota_members"]
+other = "This project has reached its member limit."
+
+["err.server.project.quota_per_creator"]
+other = "You have reached your project limit in this space."
+
+["err.server.project.quota_per_space"]
+other = "This space has reached its project limit."
+
+["err.server.project.quota_pinned"]
+other = "You have pinned the maximum number of projects."
+
+["err.server.project.request_invalid"]
+other = "Invalid request."
+
+["err.server.project.role_invalid"]
+other = "Invalid project member role."
+
+["err.server.project.store_failed"]
+other = "Failed to store project data."
 
 ["err.server.qrcode.group_not_found"]
 other = "Group not found."
@@ -787,7 +955,7 @@ other = "Unsupported message type."
 other = "Only the bot creator can perform this operation."
 
 ["err.server.robot.file_too_large"]
-other = "The file exceeds the maximum allowed size."
+other = "The file exceeds the maximum allowed size of {{.max_size}}."
 
 ["err.server.robot.file_type_unsupported"]
 other = "Unsupported file type."
@@ -1134,11 +1302,35 @@ other = "Too many failed login attempts, account temporarily locked. Please try 
 ["err.server.user.login_pwd_update_failed"]
 other = "Failed to update login password."
 
+["err.server.user.manager_email_mfa_enable_email_required"]
+other = "The operator must have a valid email address before enabling management-console MFA."
+
+["err.server.user.manager_mfa_challenge_invalid"]
+other = "The management-console MFA challenge is invalid or expired."
+
+["err.server.user.manager_mfa_code_invalid"]
+other = "The management-console verification code is invalid."
+
+["err.server.user.manager_mfa_misconfigured"]
+other = "Management-console MFA is temporarily unavailable."
+
+["err.server.user.manager_mfa_rate_limited"]
+other = "The management-console verification code cannot be sent yet. Please try again later."
+
+["err.server.user.manager_mfa_settings_unavailable"]
+other = "Management-console MFA settings are not ready."
+
+["err.server.user.manager_mfa_verify_locked"]
+other = "Too many incorrect verification attempts. Verification is temporarily locked. Please try again later."
+
 ["err.server.user.manager_permission_required"]
 other = "This account does not have management permission."
 
 ["err.server.user.manager_role_changed"]
 other = "The target account role has changed; refresh and try again."
+
+["err.server.user.manager_role_target_ineligible"]
+other = "This account is not eligible for the requested management role."
 
 ["err.server.user.new_password_same_as_old"]
 other = "The new password must be different from the current one."

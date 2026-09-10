@@ -468,10 +468,11 @@ func buildSearchAfterFromHit(hit *elastic.SearchHit, isRelevance bool) ([]any, b
 // carry the Tika-extracted file body (payload.file.content, avg 30–100 KB per
 // doc) and its extraction metadata (payload.file.contentMeta); both participate
 // in the multi_match relevance score via the inverted index but never surface
-// on the wire — Q1 C keeps FileHit without a contentSnippet field, and Q4 D
-// keeps pickSnippet from promoting content into the snippet slot. Highlight
-// fragments are drawn from the inverted index rather than _source, so this
-// exclude does not affect highlight functionality.
+// on the wire as the full field. Highlight fragments (name_highlight,
+// content_snippet) are drawn from the inverted index rather than _source, so
+// this exclude does not affect highlight functionality — the file-tab and (as
+// of V6) the chat-tab _search_all path both return a single 120-char
+// content_snippet fragment while the 30-100 KB body stays off the wire.
 func fileContentSourceExcludes() *elastic.FetchSourceContext {
 	return elastic.NewFetchSourceContext(true).Exclude(
 		"payload.file.content",

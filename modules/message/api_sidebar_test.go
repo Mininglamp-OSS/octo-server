@@ -149,7 +149,7 @@ func TestBuildFollowItems_GroupFollowed(t *testing.T) {
 	}
 	unfollowedGroups := map[string]struct{}{} // empty: not unfollowed
 
-	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "g1", items[0].TargetID)
 	assert.Equal(t, "cat1", *items[0].CategoryID)
@@ -166,7 +166,7 @@ func TestBuildFollowItems_GroupUnfollowed_Excluded(t *testing.T) {
 	}
 	unfollowedGroups := map[string]struct{}{"g1": {}}
 
-	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -178,7 +178,7 @@ func TestBuildFollowItems_GroupWithoutCategory_Excluded(t *testing.T) {
 	categorySetting := map[string]*GroupCategorySetting{} // no entry
 	unfollowedGroups := map[string]struct{}{}
 
-	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -191,7 +191,7 @@ func TestBuildFollowItems_DMFollowed(t *testing.T) {
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 5},
 	}
 
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "peer1", items[0].TargetID)
 	assert.Equal(t, 5, items[0].FollowSort)
@@ -203,7 +203,7 @@ func TestBuildFollowItems_DMNotFollowed_Excluded(t *testing.T) {
 	}
 	followedDMs := map[string]*convext.Model{} // no entry for peer2
 
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -221,7 +221,7 @@ func TestBuildFollowItems_ThreadAsIMEntry_IncludedWhenParentFollowed(t *testing.
 		threadChannelID: {TargetID: threadChannelID, FollowSort: 2},
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, threadChannelID, items[0].TargetID)
 	assert.Equal(t, int(common.ChannelTypeCommunityTopic), items[0].TargetType)
@@ -238,7 +238,7 @@ func TestBuildFollowItems_ThreadWithoutExtRow_Excluded(t *testing.T) {
 	}
 	threadExtMap := map[string]*convext.Model{} // no ext for this thread
 
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -250,7 +250,7 @@ func TestBuildRecentItems_GroupWithinWindow_Included(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "g1", items[0].TargetID)
 }
@@ -259,7 +259,7 @@ func TestBuildRecentItems_GroupOutsideWindow_Excluded(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -268,7 +268,7 @@ func TestBuildRecentItems_DMAlwaysIncluded(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), now3DaysAgo()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "peer1", items[0].TargetID)
 }
@@ -277,7 +277,7 @@ func TestBuildRecentItems_ThreadWithinWindow_Included(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1____th1", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "g1____th1", items[0].TargetID)
 }
@@ -286,7 +286,7 @@ func TestBuildRecentItems_ThreadOutsideWindow_Excluded(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1____th1", common.ChannelTypeCommunityTopic.Uint8(), now3DaysAgo()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -298,7 +298,7 @@ func TestBuildRecentItems_PinnedFirst(t *testing.T) {
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
 		makeIMConv("g2", common.ChannelTypeGroup.Uint8(), nowRecent()-10),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), pinnedSet, nil, nil, "")
+	items := buildRecentItems(convs, legacyRecentCutoffs(), pinnedSet, nil, nil, nil, "")
 	require.Len(t, items, 2)
 
 	// buildRecentItems sets IsPinned flag; sorting is done separately
@@ -338,7 +338,7 @@ func TestBuildRecentItems_GroupCutoffZero_AllGroupsKept(t *testing.T) {
 		makeIMConv("g-old", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 		makeIMConv("g-new", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	assert.Len(t, items, 2, "group 窗口关闭时，超期群也保留")
 }
 
@@ -351,7 +351,7 @@ func TestBuildRecentItems_PerTypeWindowsIndependent(t *testing.T) {
 		makeIMConv("g1____t-old", common.ChannelTypeCommunityTopic.Uint8(), now3DaysAgo()), // dropped (thread window on)
 		makeIMConv("g1____t-new", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),   // kept
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	ids := map[string]bool{}
 	for _, it := range items {
 		ids[it.TargetID] = true
@@ -370,7 +370,7 @@ func TestBuildRecentItems_PersonWindowFiltersDMs(t *testing.T) {
 		makeIMConv("dm-old", common.ChannelTypePerson.Uint8(), now3DaysAgo()),
 		makeIMConv("dm-new", common.ChannelTypePerson.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "person 窗口=3天时，超期 DM 被剔除")
 	assert.Equal(t, "dm-new", items[0].TargetID)
 }
@@ -391,7 +391,7 @@ func TestBuildRecentItems_UnknownChannelType_KeptUnconditionally(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("x-ancient", unknownChannelType, time.Now().Add(-10000*time.Hour).Unix()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "未知频道类型不应被时间窗口过滤（cutoffFor 默认 0=不过滤）")
 	assert.Equal(t, "x-ancient", items[0].TargetID)
 }
@@ -403,7 +403,7 @@ func TestBuildRecentItems_PersonCutoffZero_AllDMsKept(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("dm-ancient", common.ChannelTypePerson.Uint8(), time.Now().Add(-1000*time.Hour).Unix()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "person 默认 0 → DM 永远保留")
 }
 
@@ -466,7 +466,7 @@ func TestMergeThreadEntries_AddsNewEntry(t *testing.T) {
 	}
 
 	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, threadExtRows, lastMsgAtMap, cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, lastMsgAtMap, cat, unfollowed, nil, nil, nil, "", nil, nil)
 	require.Len(t, result, 2)
 	ids := []string{result[0].TargetID, result[1].TargetID}
 	assert.Contains(t, ids, th2ChannelID)
@@ -481,14 +481,14 @@ func TestMergeThreadEntries_NoDuplicateIfAlreadyPresent(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 	// nil map is fine here: presentIDs short-circuits before the alive check.
-	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, nil, "", nil, nil)
 	assert.Len(t, result, 1) // no duplicate
 }
 
 func TestMergeThreadEntries_EmptyExt(t *testing.T) {
 	existing := []*SidebarItem{}
 	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, nil, nil, cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, nil, nil, cat, unfollowed, nil, nil, nil, "", nil, nil)
 	assert.Len(t, result, 0)
 }
 
@@ -501,7 +501,7 @@ func TestMergeThreadEntries_SkipWhenThreadDeleted(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 	// lastMsgAtMap 为空（thread 已被删除，cleanup 还没清理 ext 行）
-	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, nil, "", nil, nil)
 	assert.Len(t, result, 0,
 		"thread 已删除时 ext 行必须被 skip，避免 ghost 条目出现在 follow tab")
 }
@@ -515,7 +515,7 @@ func TestMergeThreadEntries_AliveThreadEmitsTimestamp(t *testing.T) {
 		{TargetID: "g1____alive", FollowSort: 3},
 	}
 	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____alive", &now), cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____alive", &now), cat, unfollowed, nil, nil, nil, "", nil, nil)
 	require.Len(t, result, 1)
 	assert.Equal(t, now.Unix(), result[0].Timestamp,
 		"alive thread 的 timestamp 必须从 lastMsgAtMap 正确读取")
@@ -531,7 +531,7 @@ func TestMergeThreadEntries_AliveThreadNilLastMsgAt(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 	// 键存在但值为 nil = thread 活跃但还没消息
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____fresh", nil), cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____fresh", nil), cat, unfollowed, nil, nil, nil, "", nil, nil)
 	require.Len(t, result, 1, "活跃 thread 即便 last_message_at=NULL 也必须 emit")
 	assert.Equal(t, int64(0), result[0].Timestamp)
 }
@@ -547,7 +547,7 @@ func TestMergeThreadEntries_SkipWhenParentUnfollowed(t *testing.T) {
 	cat, _ := followedG1()
 	unfollowed := map[string]struct{}{"g1": {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____th-orphan", nil), cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____th-orphan", nil), cat, unfollowed, nil, nil, nil, "", nil, nil)
 	assert.Len(t, result, 0,
 		"thread whose parent group is unfollowed must NOT be merged into follow tab")
 }
@@ -561,7 +561,7 @@ func TestMergeThreadEntries_SkipWhenParentHasNoCategory(t *testing.T) {
 	}
 	cat, unfollowed := followedG1() // only g1 is in the follow set, g-noCat is not
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g-noCat____th-orphan", nil), cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g-noCat____th-orphan", nil), cat, unfollowed, nil, nil, nil, "", nil, nil)
 	assert.Len(t, result, 0,
 		"thread whose parent group lacks a category (not in follow set) must NOT be merged")
 }
@@ -578,7 +578,7 @@ func TestMergeThreadEntries_SelfCreated_UncategorizedParent_Rendered(t *testing.
 	cat, unfollowed := followedG1() // g-noCat 不在 follow set
 	selfCreated := map[string]struct{}{cid: {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, activeStatus(cid))
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, activeStatus(cid))
 	require.Len(t, result, 1, "创建者自建子区即使父群未分类也必须渲染（issue #557）")
 	assert.Equal(t, cid, result[0].TargetID)
 	assert.True(t, result[0].IsFollowed)
@@ -597,7 +597,7 @@ func TestMergeThreadEntries_SelfCreated_UnfollowedParent_Rendered(t *testing.T) 
 	unfollowed := map[string]struct{}{"g1": {}} // 父群显式取关
 	selfCreated := map[string]struct{}{cid: {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, activeStatus(cid))
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, activeStatus(cid))
 	require.Len(t, result, 1, "父群被取关也不应隐藏创建者自建子区（issue #557）")
 	assert.Equal(t, cid, result[0].TargetID)
 	// 父群 g1 有分类：自建子区仍继承父群分类（豁免只跳过丢弃前置，不改分类归属）。
@@ -616,7 +616,7 @@ func TestMergeThreadEntries_NonSelfCreated_UncategorizedParent_Dropped(t *testin
 	// selfCreated 不含 cid（该子区非本人创建）
 	selfCreated := map[string]struct{}{"g-noCat____someone-elses": {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, nil)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, nil)
 	assert.Len(t, result, 0,
 		"非创建者子区不被豁免：父群未分类必须丢弃（防误放）")
 }
@@ -630,7 +630,7 @@ func TestMergeThreadEntries_SelfCreated_DeletedThread_StillDropped(t *testing.T)
 	selfCreated := map[string]struct{}{cid: {}}
 
 	// lastMsgAtMap 为空 → thread 已删除 / 不存在
-	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, "", selfCreated, nil)
+	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, nil, "", selfCreated, nil)
 	assert.Len(t, result, 0,
 		"创建者豁免不改活跃性判定：已删除子区仍必须丢弃")
 }
@@ -647,7 +647,7 @@ func TestMergeThreadEntries_SelfCreated_Archived_UncategorizedParent_Dropped(t *
 	selfCreated := map[string]struct{}{cid: {}}
 
 	// thread 仍 alive（archived != deleted），但 status=archived。
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, archivedStatus(cid))
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, archivedStatus(cid))
 	assert.Len(t, result, 0,
 		"归档自建子区不再享受 #557 豁免：父群未分类必须丢弃（XIN-1135 块B）")
 }
@@ -662,7 +662,7 @@ func TestMergeThreadEntries_SelfCreated_Archived_UnfollowedParent_Dropped(t *tes
 	unfollowed := map[string]struct{}{"g1": {}} // 父群显式取关
 	selfCreated := map[string]struct{}{cid: {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, archivedStatus(cid))
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, archivedStatus(cid))
 	assert.Len(t, result, 0,
 		"归档自建子区在父群被取关时也被丢弃（XIN-1135 块B）")
 }
@@ -677,7 +677,7 @@ func TestMergeThreadEntries_SelfCreated_ActiveFresh_UncategorizedParent_Rendered
 	selfCreated := map[string]struct{}{cid: {}}
 
 	// active 且刚创建（last_message_at=NULL → ts=0）：#557 场景「创建者看得到自建 active 子区」。
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, activeStatus(cid))
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, activeStatus(cid))
 	require.Len(t, result, 1, "新建 active 自建子区必须 emit（固化 #557，XIN-1135 守卫只拦 archived）")
 	assert.Equal(t, cid, result[0].TargetID)
 	assert.True(t, result[0].IsFollowed)
@@ -696,7 +696,7 @@ func TestMergeThreadEntries_SelfCreated_StatusMissing_NotExempted(t *testing.T) 
 	selfCreated := map[string]struct{}{cid: {}}
 
 	// alive 但 statusMap 为空 → threadStatusMap[cid]==0 != active → 不豁免 → drop。
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated, map[string]int{})
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, nil, "", selfCreated, map[string]int{})
 	assert.Len(t, result, 0,
 		"status 缺失时自建豁免不生效（默认非 active），回落 parent-follow 谓词丢弃")
 }
@@ -710,7 +710,7 @@ func TestMergeThreadEntries_SkipMalformedChannelID(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 
-	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, "", nil, nil)
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, nil, "", nil, nil)
 	assert.Len(t, result, 0,
 		"malformed thread channel id (no separator) must be skipped")
 }
@@ -894,7 +894,7 @@ func TestBuildFollowItems_ThreadInheritsParentCategorySort(t *testing.T) {
 	threadExtMap := map[string]*convext.Model{
 		threadID: {TargetID: threadID, FollowSort: 1},
 	}
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 2)
 
 	var groupItem, threadItem *SidebarItem
@@ -950,7 +950,7 @@ func TestBuildFollowItems_CategoryGroupSort_Propagates(t *testing.T) {
 			CategoryGroupSort: 42, // group_category.sort       —— 客户端可见 category_sort
 		},
 	}
-	items := buildFollowItems(convs, categorySetting, nil, nil, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, 42, items[0].CategorySort, "客户端可见的 category_sort 必须取自 group_category.sort")
 	assert.Equal(t, 7, items[0].intraCategorySort, "intraCategorySort 必须取自 group_setting.category_sort")
@@ -986,12 +986,12 @@ func TestSortRecentItems_MultiplePinned_ByTimestampDesc(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildFollowItems_EmptyConversations(t *testing.T) {
-	items := buildFollowItems(nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
 func TestBuildRecentItems_EmptyConversations(t *testing.T) {
-	items := buildRecentItems(nil, legacyRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(nil, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -1021,7 +1021,7 @@ func TestBuildFollowItems_MixedTypes(t *testing.T) {
 		"g1____th1": {TargetID: "g1____th1", FollowSort: 1},
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, followedDMs, threadExtMap, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, followedDMs, threadExtMap, nil, nil, nil, nil, nil, "")
 	// g1 + peer1 + g1____th1 = 3; peer2 (not followed) and g2 (no category) excluded
 	assert.Len(t, items, 3)
 	ids := make(map[string]bool)
@@ -1085,7 +1085,7 @@ func TestBuildFollowItems_DMFollowed_WithDMCategory(t *testing.T) {
 	followedDMs := map[string]*convext.Model{
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 3, DMCategoryID: &catID},
 	}
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	require.NotNil(t, items[0].CategoryID)
 	assert.Equal(t, catID, *items[0].CategoryID, "DMCategoryID 直接透传 UUID，不再 fmt.Sprintf 转字符串")
@@ -1107,7 +1107,7 @@ func TestBuildFollowItems_GroupHonorsFollowSort(t *testing.T) {
 	groupExts := map[string]*convext.Model{
 		"g1": {TargetID: "g1", FollowSort: 7},
 	}
-	items := buildFollowItems(convs, categorySetting, nil, nil, nil, groupExts, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil, groupExts, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, 7, items[0].FollowSort, "group FollowSort 必须取自 user_conversation_ext.follow_sort")
 }
@@ -1120,7 +1120,7 @@ func TestBuildFollowItems_GroupMissingExtFallsBackToZero(t *testing.T) {
 	categorySetting := map[string]*GroupCategorySetting{
 		"g-noext": {GroupNo: "g-noext", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
 	}
-	items := buildFollowItems(convs, categorySetting, nil, nil, nil, map[string]*convext.Model{}, nil, nil, nil, "")
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil, map[string]*convext.Model{}, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, 0, items[0].FollowSort)
 }
@@ -1137,7 +1137,7 @@ func TestBuildFollowItems_DMLoadsCategorySort(t *testing.T) {
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 4, DMCategoryID: &catID},
 	}
 	dmCategorySorts := map[string]int{catID: 42}
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, dmCategorySorts, nil, nil, "")
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, dmCategorySorts, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, 42, items[0].CategorySort, "DM 的 CategorySort 必须取自 group_category.sort")
 	require.NotNil(t, items[0].CategoryID)
@@ -1152,7 +1152,7 @@ func TestBuildFollowItems_DMNoCategory_NoCategorySort(t *testing.T) {
 	followedDMs := map[string]*convext.Model{
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 4},
 	}
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, "")
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, 0, items[0].CategorySort)
 	assert.Nil(t, items[0].CategoryID)

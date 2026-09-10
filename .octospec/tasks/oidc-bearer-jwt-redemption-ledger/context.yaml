@@ -1,0 +1,42 @@
+# 本任务实际注入并遵循的规则(.octospec/rules/_index.yaml 解析结果)。
+slug: oidc-bearer-jwt-redemption-ledger
+rules_injected:
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    matched_by: "paths(modules/**/*.go) + touches(error-response, wire-contract)"
+    how_followed: >
+      台账拒绝走 httperr.ResponseErrorLWithStatus + 既有的
+      errcode.ErrOIDCExchangeTokenRejected,不新增错误码、不新增 i18n 条目 ——
+      新增一个"兑换被拒"的专用码等于告诉客户端"这张 token 曾经有效",违反本端点
+      的反枚举约定。make i18n-extract-check / i18n-lint 均通过。
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    matched_by: "paths(modules/**/*.go)"
+    how_followed: >
+      未新增任何请求频率限流;/exchange-jwt 仍只挂 routeAt 里既有的
+      StrictIPRateLimitMiddleware。兑换台账是按**凭据身份**(token 摘要)的重放
+      判定,不是按请求频率的计数器,属于该规则 "Exception (intentional)" 一列
+      (与 sms_rate_limit / OIDC bind attempt cap 同类)。
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    matched_by: "paths(modules/**/*.go) + touches(auth)"
+    how_followed: >
+      /exchange-jwt 仍是显式豁免 AuthMiddleware 的未认证端点(它本身就是签发会话的
+      入口,原因在 api_exchange_jwt.go 顶部注释)。本次改动只收紧准入,不放松;
+      建号后的初始 Space 加入逻辑未改动。
+  - id: testing
+    tier: repo
+    load_bearing: false
+    matched_by: "paths(**/*_test.go)"
+    how_followed: >
+      新增 redemption_ledger_test.go:纯逻辑用例 + 一个走真 Redis 的判定表
+      (testutil.NewTestServer,与 bind_store_redis_test.go 同模式,每个子用例用
+      独立摘要并先 DEL,避免同 binary 重跑串扰)。
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    matched_by: "paths(**)"
+    how_followed: "Conventional Commits,英文提交信息。"

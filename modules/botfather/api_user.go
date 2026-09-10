@@ -334,16 +334,23 @@ func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 			s := bot.BoundAt.Time.Format(botBoundAtFormat)
 			boundAt = &s
 		}
+		var agentReportedHostingAt *string
+		if bot.AgentReportedHostingAt.Valid {
+			s := bot.AgentReportedHostingAt.Time.Format(botBoundAtFormat)
+			agentReportedHostingAt = &s
+		}
 		list = append(list, &UserBotResp{
-			RobotID:       bot.RobotID,
-			Username:      bot.Username,
-			Name:          name,
-			Description:   bot.Description,
-			BoundAgentRef: bot.BoundAgentRef,
-			BoundAt:       boundAt,
-			AgentPlatform: bot.AgentPlatform,
-			AgentVersion:  bot.AgentVersion,
-			PluginVersion: bot.PluginVersion,
+			RobotID:                bot.RobotID,
+			Username:               bot.Username,
+			Name:                   name,
+			Description:            bot.Description,
+			BoundAgentRef:          bot.BoundAgentRef,
+			BoundAt:                boundAt,
+			AgentPlatform:          bot.AgentPlatform,
+			AgentVersion:           bot.AgentVersion,
+			PluginVersion:          bot.PluginVersion,
+			AgentHosting:           bot.AgentHosting,
+			AgentReportedHostingAt: agentReportedHostingAt,
 		})
 	}
 	c.Response(list)
@@ -455,6 +462,15 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 		}
 	}
 
+	// Account lifecycle cleanup must happen while the Bot still exists. The
+	// shared group entry point includes hidden AI containers and is the only
+	// place allowed to opt into protected membership removal.
+	if err := bf.groupService.RemoveUserFromGroupsForLifecycleCleanup(botID); err != nil {
+		bf.Error("清理Bot群成员失败", zap.String("botID", botID), zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
+		return
+	}
+
 	// Clean up IM connection: invalidate token to kick existing WS sessions
 	newIMToken := util.GenerUUID()
 	_, imErr := bf.ctx.UpdateIMToken(config.UpdateIMTokenReq{
@@ -508,12 +524,27 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 		}
 	}
 
-	// Remove from Spaces
-	_, spErr := bf.ctx.DB().UpdateBySql(
-		"UPDATE space_member SET status=0 WHERE uid=? AND status=1", botID,
-	).Exec()
-	if spErr != nil {
-		bf.Error("移除Bot的Space成员记录失败", zap.Error(spErr))
+	// Space 席位走**移除工单**，不是裸 UPDATE。D14。
+	//
+	// 这是 Bot 的第二个删除入口。PR #855 把聊天命令那条改成了工单，这一条没动，
+	// 于是同一个 D14 在两个端点上答案不同——第七轮 review 的 1b 把它查了出来，
+	// 而每一轮（包括我自己的每一轮）都漏了它：没有人对"哪些入口能删 Bot"做过普查。
+	//
+	// 裸 UPDATE 会跳过整条级联链：P0 关项目席位、P1 从项目群移除、会话面清理。
+	// 留下的终态是一个已停用的 Bot 仍持有活跃项目席位与群成员行，而且**没有任何
+	// 扫描看得见**：I1 的对账默认关闭且要等排序规则转换，I4 扫描 B 找的是"有席位、
+	// 不在群里"而这个幽灵两样都有，D13 也永远回收不了它（要求 robot.status=1）。
+	//
+	// 失败就**中止删除**，与命令路径同一条规则：此刻 robot 行还是 status=1，
+	// 用户可以重试；往下走一步（deleteRobot）之后就再也选不到这个 bot 了。
+	if closed, closeErr := bf.closeSeatsFn(
+		bf.ctx, botID, uid, space.MemberRemoveReasonBotDeleted,
+	); closeErr != nil {
+		bf.Error("关闭Bot的Space席位失败，中止删除（robot 行保持可选，用户可重试）",
+			zap.String("botId", botID), zap.Strings("closedSpaces", closed),
+			zap.Error(closeErr))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
+		return
 	}
 
 	// Soft-delete robot record

@@ -17,6 +17,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 	"go.uber.org/zap"
 )
 
@@ -72,13 +74,24 @@ func EnsureSystemSettings(ctx *config.Context) *SystemSettings {
 // drift: an admin-side change becomes visible on every server within one TTL.
 const defaultReloadTTL = 60 * time.Second
 
+// ManagerEmailMFAState is deliberately tri-state. A nil snapshot means the
+// database settings have never loaded successfully and must not be treated as
+// the safe-looking "off" default by a manager login gate.
+type ManagerEmailMFAState uint8
+
+const (
+	ManagerEmailMFAUnavailable ManagerEmailMFAState = iota
+	ManagerEmailMFAOff
+	ManagerEmailMFAOn
+)
+
 // SystemSettings is the read path for admin-tunable global config.
 //
 // Lookup model:
 //   - Snapshot is an immutable map[string]string ("category.key" → value),
-//     swapped atomically by Load / Reload. Readers go through atomic.Pointer
-//     and never take a lock; SMTP send (high-frequency) does not block on
-//     admin writes.
+//     swapped atomically by Load / Reload. Generic readers go through the
+//     atomic.Pointer; the MFA readiness gate additionally takes a small
+//     publication lock so its snapshot and probe result stay paired.
 //   - Empty DB value means "not configured" and falls back to the matching
 //     yaml field on *config.Config.
 //   - Encrypted values are decrypted at snapshot-build time and cached in
@@ -86,15 +99,33 @@ const defaultReloadTTL = 60 * time.Second
 //     the cipher. Decryption failure logs an error and skips the entry, so
 //     the getter falls back to yaml rather than serving a corrupt value.
 type SystemSettings struct {
-	ctx       *config.Context
-	db        *systemSettingDB
-	snapshot  atomic.Pointer[map[string]string]
-	reloadTTL time.Duration
-	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
+	ctx      *config.Context
+	db       *systemSettingDB
+	snapshot atomic.Pointer[map[string]string]
+	// managerMFAProbe* records the last real SMTP preflight for the effective
+	// manager-console MFA configuration.  A syntactically valid configuration
+	// is not enough for the login gate: startup may have observed a real SMTP
+	// failure and must keep management login fail-closed until a later probe
+	// succeeds.  The pair is reset only when one of the relevant snapshot
+	// values changes, so the 60s ordinary settings reload does not create a
+	// needless login outage on every tick.
+	managerMFAProbeMu    sync.Mutex
+	managerMFAProbeKnown bool
+	managerMFAProbeReady bool
+	// managerMFAProbeGeneration changes whenever the effective MFA/SMTP
+	// snapshot changes. Async probes carry this generation so a result from an
+	// older snapshot cannot publish readiness for newer settings.
+	managerMFAProbeGeneration uint64
+	managerMFAProbeInFlight   atomic.Bool
+	reloadTTL                 time.Duration
+	// clampWarned 去重 clamp getter 的越界 Warn(review R6)。这些 getter 坐在读热
+	// 路径上（file.max_size_kb 每次 currentPolicy() 都读，包括每个未认证的
+	// appconfig 请求），不去重的话一个配错的键就能让匿名调用者按请求数刷日志。
+	// key 形如
 	// "sticker.upload_max_size_kb=99999>5120",同一 (key, 越界值) 在进程周期
 	// 内只 log 一次;admin 改到别的越界值会重新 log 一条。避免读侧热路径
 	// 刷屏,同时保留 operator 可观测性。
-	stickerClampWarned sync.Map
+	clampWarned sync.Map
 	log.Log
 }
 
@@ -112,12 +143,20 @@ func NewSystemSettings(ctx *config.Context, db *systemSettingDB) *SystemSettings
 }
 
 // Load reads every row from system_setting and atomically replaces the
-// snapshot. Used at startup and by Reload (which is just an alias for
-// "load now" with logging semantics).
+// snapshot. It is the no-probe load used during startup and by write paths
+// that already validated the prospective configuration synchronously.
 func (s *SystemSettings) Load() error {
+	_, err := s.loadWithGeneration(false)
+	return err
+}
+
+// loadWithGeneration replaces the snapshot and returns the generation that
+// was published with it. The manager-settings write path uses that generation
+// to bind its prospective SMTP probe to the loaded snapshot.
+func (s *SystemSettings) loadWithGeneration(reprobe bool) (uint64, error) {
 	rows, err := s.db.listAll()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	next := make(map[string]string, len(rows))
 	for _, row := range rows {
@@ -138,19 +177,57 @@ func (s *SystemSettings) Load() error {
 		}
 		next[schemaKey(row.Category, row.KeyName)] = row.Value
 	}
+	s.managerMFAProbeMu.Lock()
+	previous := s.snapshot.Load()
+	changed := previous == nil || managerMFASettingsChanged(previous, &next)
+	if changed {
+		s.managerMFAProbeGeneration++
+		s.managerMFAProbeKnown = false
+		s.managerMFAProbeReady = false
+	}
+	// Clear readiness before publishing a changed snapshot. This keeps the
+	// login gate fail-closed during the small publication window instead of
+	// allowing a probe for the previous settings to authorize the new ones.
 	s.snapshot.Store(&next)
-	return nil
+	generation := s.managerMFAProbeGeneration
+	s.managerMFAProbeMu.Unlock()
+	if reprobe && previous != nil && changed && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
+		s.scheduleManagerEmailMFAPreflight()
+	}
+	return generation, nil
 }
 
-// Reload is the admin-write hook: after the manager API upserts new values
-// it calls this so the change is visible on this instance immediately
-// (other instances pick it up within reloadTTL).
+func managerMFASettingsChanged(previous, next *map[string]string) bool {
+	if previous == nil || next == nil {
+		return true
+	}
+	for _, key := range []string{
+		"login.manager_email_mfa_on",
+		"support.email",
+		"support.email_smtp",
+		"support.email_pwd",
+	} {
+		if (*previous)[key] != (*next)[key] {
+			return true
+		}
+	}
+	return false
+}
+
+// Reload refreshes the snapshot and, when manager MFA/SMTP values changed,
+// schedules one generation-bound SMTP preflight. This covers direct DB
+// changes followed by Reload as well as instances that observe a peer change
+// through the automatic reload loop. The manager settings write path uses
+// Load instead because it already probes the merged prospective values before
+// committing the transaction.
 func (s *SystemSettings) Reload() error {
-	return s.Load()
+	_, err := s.loadWithGeneration(true)
+	return err
 }
 
 // StartAutoReload kicks off a goroutine that re-loads the snapshot every
-// reloadTTL until ctx is canceled. Intended to be called once at startup
+// reloadTTL until ctx is canceled. 当前系统每 60 秒会执行一次自动 reload，
+// 发现配置变化后更新本地快照。Intended to be called once at startup
 // (with a long-lived context). Errors are logged but do not stop the loop.
 //
 // Production callers pass context.Background() — the goroutine therefore
@@ -161,15 +238,19 @@ func (s *SystemSettings) Reload() error {
 // context.Background() it is unreachable but kept so the function stays
 // correct under either invocation.
 func (s *SystemSettings) StartAutoReload(ctx context.Context) {
+	s.startAutoReload(ctx, s.reloadTTL)
+}
+
+func (s *SystemSettings) startAutoReload(ctx context.Context, ttl time.Duration) {
 	go func() {
-		ticker := time.NewTicker(s.reloadTTL)
+		ticker := time.NewTicker(ttl)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := s.Load(); err != nil {
+				if _, err := s.loadWithGeneration(true); err != nil {
 					s.Error("auto-reload system_setting failed", zap.Error(err))
 				}
 			}
@@ -464,13 +545,23 @@ func isOIDCFullyConfigured() bool {
 		{"DM_OIDC_PROVIDER_REDIRECT_URI", "DM_OIDC_AEGIS_REDIRECT_URI"},
 	}
 	for _, r := range required {
-		if os.Getenv(r.primary) == "" && os.Getenv(r.alias) == "" {
+		// oidcboot.EnvString, not os.Getenv: the module's loader resolves the same pairs
+		// through it, and it trims. Comparing untrimmed here meant a whitespace-only
+		// required value passed this loop while the module refused to boot on it —
+		// the same lockout as the BASE_URL, boolean and issuer cases.
+		if oidcboot.EnvString(r.primary, r.alias) == "" {
 			return false
 		}
 	}
 	// Provider ID: empty falls back to "oidc" (matches loadProvider default),
 	// non-empty must satisfy the same regex or LoadConfig fails fatally.
-	providerID := os.Getenv("DM_OIDC_PROVIDER_ID")
+	// EnvString(会 trim),与 loadProvider 同一个读取器。
+	//
+	// 这里原本是裸 os.Getenv,而模块侧已 trim:DM_OIDC_PROVIDER_ID="   " 会让模块
+	// 回落 "oidc" 正常启动,而这里不过正则、报"未配置" → anyThirdPartyLoginConfigured
+	// 为假 → local_off 不被采信 → **在一个刻意关掉密码登录的部署上把它又打开了**。
+	// 方向与锁死相反,但同样是安全回退;三行之上的 required 循环正是为此迁过来的。
+	providerID := oidcboot.EnvString("DM_OIDC_PROVIDER_ID", "")
 	if providerID == "" {
 		providerID = "oidc"
 	}
@@ -489,7 +580,74 @@ func isOIDCFullyConfigured() bool {
 	if err != nil || len(key) != 32 {
 		return false
 	}
+	// Provider-kind refusals live in pkg/oidcboot so this function and
+	// modules/oidc.LoadConfig cannot disagree.
+	//
+	// They must not disagree because the failure is asymmetric and severe: when
+	// LoadConfig refuses, modules/oidc registers 404 handlers for every endpoint,
+	// so SSO does not work. If this function still answered "configured",
+	// anyThirdPartyLoginConfigured would stay true, login.local_off=1 would be
+	// honoured, and password login would remain off too — leaving an SSO-only
+	// deployment with no working login path and no recovery short of a redeploy.
+	//
+	// This used to be a hand-maintained mirror, and it drifted the moment new
+	// fatal conditions were added on the oidc side. The shared table
+	// oidcboot.RefusedScenarios pins both sides' tests to the same list.
+	if err := oidcboot.ValidateKind(oidcboot.KindInput{
+		Kind:    os.Getenv("OCTO_OIDC_PROVIDER_KIND"),
+		BaseURL: oidcUpstreamBaseURLFromEnv(),
+		AppID:   os.Getenv("OCTO_OIDC_PROVIDER_APP_ID"),
+
+		EndSessionURL:         os.Getenv("OCTO_OIDC_PROVIDER_END_SESSION_URL"),
+		PostLogoutRedirectURI: os.Getenv("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI"),
+		// Both logout URLs are boot-fatal in the module; omitting them here is what let
+		// a relative post-logout redirect 404 every OIDC route while this side still
+		// answered "configured".
+		AllowInsecureLogout: oidcEnvBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "", false),
+		Issuer:              oidcIssuerFromEnv(),
+
+		AutoLinkByEmail:      oidcEnvBool("DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL", "DM_OIDC_AEGIS_AUTO_LINK_BY_EMAIL", true),
+		RequireEmailVerified: oidcEnvBool("DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED", "DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED", true),
+
+		AllowInsecureUpstream: oidcEnvBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", "", false),
+	}); err != nil {
+		return false
+	}
 	return true
+}
+
+// oidcUpstreamBaseURLFromEnv mirrors the base-URL fallback in
+// modules/oidc.applyKindConstraints: the plain-OAuth2 kind falls back to the
+// issuer when no explicit base URL is set.
+//
+// The fallback has to be applied here too, because the refusal rules are about
+// the value that will actually be used, not the raw variable.
+func oidcUpstreamBaseURLFromEnv() string {
+	// Delegates the fallback decision to the single definition. This used to be a second
+	// implementation differing from the module's in exactly one way -- it trimmed first --
+	// and that was enough to produce a total login lockout: the module refused to boot on a
+	// whitespace-only value while this side took the fallback and reported "configured".
+	return oidcboot.UpstreamBaseURL(
+		os.Getenv("OCTO_OIDC_PROVIDER_KIND"),
+		os.Getenv("OCTO_OIDC_PROVIDER_BASE_URL"),
+		oidcIssuerFromEnv(),
+	)
+}
+
+// oidcIssuerFromEnv reads the issuer with its legacy alias, matching the module's loader.
+func oidcIssuerFromEnv() string {
+	return oidcboot.EnvString("DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER")
+}
+
+// oidcEnvBool delegates to pkg/oidcboot.EnvBool — the single definition shared
+// with modules/oidc's config loader.
+//
+// This used to be a local copy carrying a comment that claimed it matched the
+// other one. It did not: on a present-but-unparseable primary, the other fell
+// through to the legacy alias while this returned the default. See EnvBool for
+// why that single disagreement can leave a deployment with no login path at all.
+func oidcEnvBool(primary, alias string, def bool) bool {
+	return oidcboot.EnvBool(primary, alias, def)
 }
 
 // LogLocalLoginOffSafetyOverrideIfActive emits a single error-level log entry
@@ -586,6 +744,24 @@ func parseSpaceDisableUserCreateEnv(v string) bool {
 		return true
 	}
 	return false
+}
+
+// OIDCInitialSpaceID returns the space_id that an account created through the
+// OIDC module is automatically joined to, or "" when the feature is off.
+//
+// DB-only, no env fallback: unlike the register/login toggles this key has never
+// had a yaml or env source, and adding one would give an operator two places to
+// look when SSO users land outside every Space. The admin console
+// (POST /v1/manager/common/system_setting) is the single source of truth, and
+// its write path validates that the Space exists and is active.
+//
+// The value is trimmed here rather than at the call sites: a space_id pasted out
+// of the admin console routinely carries trailing whitespace, and an untrimmed
+// value would silently miss on every lookup while reading as configured in the
+// GET response. Empty (missing row, or a row explicitly blanked to turn the
+// feature off) means the caller must not join anything.
+func (s *SystemSettings) OIDCInitialSpaceID() string {
+	return strings.TrimSpace(s.getString("space", "oidc_initial_space_id", ""))
 }
 
 // ----- sidebar recent-tab activity filter (issue #289) -----
@@ -767,6 +943,195 @@ func (s *SystemSettings) SupportEmailSmtp() string {
 // this getter returns the yaml fallback.
 func (s *SystemSettings) SupportEmailPwd() string {
 	return s.getEncrypted("support", "email_pwd", s.ctx.GetConfig().Support.EmailPwd)
+}
+
+// managerEmailMFASMTPSettings reads the effective SMTP values from one
+// immutable snapshot. Reading the three values together is important when a
+// caller is about to publish MFA readiness: separate getter calls could span
+// two snapshot generations during a concurrent reload.
+func (s *SystemSettings) managerEmailMFASMTPSettings() smtpSettingsSnapshot {
+	defaults := smtpSettingsSnapshot{
+		from:     s.ctx.GetConfig().Support.Email,
+		address:  s.ctx.GetConfig().Support.EmailSmtp,
+		password: s.ctx.GetConfig().Support.EmailPwd,
+	}
+	snapshot := s.snapshot.Load()
+	if snapshot == nil {
+		return defaults
+	}
+	values := *snapshot
+	effective := func(key, fallback string) string {
+		value, ok := values[schemaKey("support", key)]
+		if !ok || value == "" {
+			return fallback
+		}
+		return value
+	}
+	return smtpSettingsSnapshot{
+		from:     effective("email", defaults.from),
+		address:  effective("email_smtp", defaults.address),
+		password: effective("email_pwd", defaults.password),
+	}
+}
+
+// ManagerEmailMFAState returns the security state used only by management
+// console login. A successfully loaded snapshot with no row means the
+// feature's documented default-off state; an uninitialized snapshot is
+// unavailable and therefore fail-closed.
+func (s *SystemSettings) ManagerEmailMFAState() ManagerEmailMFAState {
+	if s.snapshot.Load() == nil {
+		return ManagerEmailMFAUnavailable
+	}
+	v, configured := s.lookup("login", "manager_email_mfa_on")
+	if !configured {
+		return ManagerEmailMFAOff
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true":
+		return ManagerEmailMFAOn
+	case "0", "false", "":
+		return ManagerEmailMFAOff
+	default:
+		return ManagerEmailMFAUnavailable
+	}
+}
+
+// ManagerEmailMFAOn is the convenient boolean view for schema/appconfig
+// rendering. Security-sensitive handlers must use ManagerEmailMFAState so an
+// unavailable snapshot cannot collapse into false.
+func (s *SystemSettings) ManagerEmailMFAOn() bool {
+	return s.ManagerEmailMFAState() == ManagerEmailMFAOn
+}
+
+// ValidateManagerEmailMFASMTP checks the effective SMTP values without doing
+// network I/O. Callers that are about to enable the policy must follow it with
+// PreflightManagerEmailMFA so the actual delivery path is exercised too.
+func (s *SystemSettings) ValidateManagerEmailMFASMTP() error {
+	return commonbase.ValidateSMTPConfiguration(
+		s.SupportEmailSmtp(), s.SupportEmail(), s.SupportEmailPwd(),
+	)
+}
+
+// PreflightManagerEmailMFA sends a real probe through the same SMTP path used
+// for OTP mail. It never changes the policy value and never panics; startup
+// callers log the returned error and leave the login gate fail-closed.
+func (s *SystemSettings) PreflightManagerEmailMFA(ctx context.Context) error {
+	generation := s.ManagerEmailMFAProbeGeneration()
+	err := s.preflightManagerEmailMFA(ctx)
+	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		s.publishManagerEmailMFAPreflight(generation, false, false)
+		return err
+	}
+	if !s.publishManagerEmailMFAPreflight(generation, true, err == nil) {
+		s.Warn("丢弃过期的管理端 MFA SMTP 预检结果")
+	}
+	return err
+}
+
+func (s *SystemSettings) preflightManagerEmailMFA(ctx context.Context) error {
+	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		return nil
+	}
+	if err := s.ValidateManagerEmailMFASMTP(); err != nil {
+		return err
+	}
+	return commonbase.NewEmailService(s.ctx, s).PreflightSMTP(ctx)
+}
+
+// scheduleManagerEmailMFAPreflight re-probes a peer after its auto-reload
+// observes a changed MFA/SMTP snapshot. It runs at most one probe at a time;
+// a later snapshot change causes a follow-up probe after the current one
+// finishes. This is deliberately event-driven, not periodic, so the 60-second
+// settings poll does not send an email on every tick.
+func (s *SystemSettings) scheduleManagerEmailMFAPreflight() {
+	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		return
+	}
+	generation := s.ManagerEmailMFAProbeGeneration()
+	if !s.managerMFAProbeInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer func() {
+			s.managerMFAProbeInFlight.Store(false)
+			if generation != s.ManagerEmailMFAProbeGeneration() && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
+				s.scheduleManagerEmailMFAPreflight()
+			}
+		}()
+
+		probeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err := s.preflightManagerEmailMFA(probeCtx)
+		if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+			return
+		}
+		if !s.publishManagerEmailMFAPreflight(generation, true, err == nil) {
+			return
+		}
+		if err != nil {
+			s.Warn("manager-console MFA SMTP auto-reload preflight failed; management login remains fail-closed", zap.Error(err))
+		}
+	}()
+}
+
+// ManagerEmailMFAProbeGeneration returns the generation of the effective
+// MFA/SMTP snapshot. Callers that perform a probe outside this type must pass
+// the captured value back to RecordManagerEmailMFAPreflight.
+func (s *SystemSettings) ManagerEmailMFAProbeGeneration() uint64 {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	return s.managerMFAProbeGeneration
+}
+
+func (s *SystemSettings) publishManagerEmailMFAPreflight(generation uint64, known, ready bool) bool {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	if generation != s.managerMFAProbeGeneration {
+		return false
+	}
+	s.managerMFAProbeKnown = known
+	s.managerMFAProbeReady = ready
+	return true
+}
+
+// RecordManagerEmailMFAPreflight lets a system-setting write path publish the
+// result of a probe performed against the prospective (not-yet-reloaded)
+// SMTP values. It refuses to publish a result captured for an older snapshot.
+// It is intentionally tiny: callers still own the actual probe and this
+// method never changes the MFA policy or snapshot.
+func (s *SystemSettings) RecordManagerEmailMFAPreflight(generation uint64, ok bool) bool {
+	return s.publishManagerEmailMFAPreflight(generation, true, ok)
+}
+
+// RecordManagerEmailMFAPreflightIfMatches publishes a successful write-path
+// preflight only when the loaded snapshot still contains the exact SMTP values
+// that were probed. The generation check rejects a newer snapshot; the value
+// comparison also rejects a same-request reload that picked up a concurrent
+// partial SMTP update whose final combination was never probed.
+func (s *SystemSettings) RecordManagerEmailMFAPreflightIfMatches(generation uint64, probed smtpSettingsSnapshot) bool {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	if generation != s.managerMFAProbeGeneration || s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		return false
+	}
+	if s.managerEmailMFASMTPSettings() != probed {
+		return false
+	}
+	s.managerMFAProbeKnown = true
+	s.managerMFAProbeReady = true
+	return true
+}
+
+// ManagerEmailMFAReady is the login gate's fail-closed view.  It requires an
+// enabled policy, a complete effective configuration, and a successful real
+// SMTP preflight for that exact snapshot.
+func (s *SystemSettings) ManagerEmailMFAReady() bool {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	return s.ManagerEmailMFAState() == ManagerEmailMFAOn &&
+		s.managerMFAProbeKnown &&
+		s.managerMFAProbeReady &&
+		s.ValidateManagerEmailMFASMTP() == nil
 }
 
 // ----- incomingwebhook settings (总开关 + 核心阈值) -----
@@ -1336,6 +1701,83 @@ func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
 
+// ProjectEnabled reports whether the Project collaboration module is on.
+//
+// Unlike DocsEnabled and its siblings this is NOT a presentation-only toggle: it
+// is the SAME switch modules/project enforces its write paths with
+// (requireWriteEnabled). One source of truth is the point. Two switches — an env
+// var for the server and a system_setting for the client — can disagree, and the
+// disagreement is the worst possible shape: the client shows the Project entry
+// and every write behind it returns 403.
+//
+// Resolution order is DB → env → false, the same chain SpaceDisableUserCreate
+// uses:
+//
+//   - a system_setting row wins, so an operator can flip the feature from the
+//     admin console with no restart (60s multi-instance convergence);
+//   - with no row, the historical OCTO_PROJECT_CREATE_ENABLED still decides, so
+//     an existing deployment keeps behaving exactly as it does today;
+//   - default false — fail-closed, as P0 shipped it.
+//
+// What it does NOT do is relax invariant I2. Turning it off stops NEW projects
+// and new project groups from being created; every existing project group keeps
+// enforcing membership. That asymmetry is deliberate — the design brief is
+// explicit that a rollback may stop production of project groups but must never
+// loosen the constraint on the ones that exist.
+func (s *SystemSettings) ProjectEnabled() bool {
+	if v, ok := s.ProjectEnabledOverride(); ok {
+		return v
+	}
+	return parseProjectEnabledEnv(os.Getenv(envProjectCreateEnabled))
+}
+
+// ProjectEnabledOverride reports the system_setting value and whether a row
+// exists at all.
+//
+// The distinction matters to modules/project, which resolved the env half once
+// at construction and must keep doing so: with no row, the value it already
+// holds decides, and this method's found=false says exactly that. Folding the
+// two into a single bool would make "no row" indistinguishable from "row says
+// false", which is how a feature that is ON via env silently turns OFF the first
+// time someone opens the admin console.
+func (s *SystemSettings) ProjectEnabledOverride() (value bool, found bool) {
+	if _, ok := s.lookup("project", "enabled"); !ok {
+		return false, false
+	}
+	return s.getBool("project", "enabled", false), true
+}
+
+// envProjectCreateEnabled is the env var P0 shipped (modules/project/config.go).
+// The name is kept rather than introduced fresh so an existing deployment's
+// configmap keeps working untouched.
+const envProjectCreateEnabled = "OCTO_PROJECT_CREATE_ENABLED"
+
+// parseProjectEnabledEnv mirrors modules/project/config.go's envBool: 1/true/
+// yes/on, case-insensitive, surrounding space tolerated, anything else false.
+// Mirrored rather than lifted into a shared package for the same reason
+// parseSpaceDisableUserCreateEnv is — one helper does not justify a new package
+// — but the two MUST be changed together, or the same switch means different
+// things at its two exits.
+func parseProjectEnabledEnv(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// MailEnabled reports whether clients should surface the Agent Mail module.
+// This is a presentation toggle only: Agent Mail authorization and access
+// control remain enforced by octo-server and octo-mail. Default false so the
+// entry is exposed only after an operator enables system_setting mail.enabled.
+func (s *SystemSettings) MailEnabled() bool {
+	return s.getBool("mail", "enabled", false)
+}
+
 // DocsSearchEnabled reports whether clients should surface cloud-doc full-text
 // search. Decoupled from DocsEnabled: the search endpoint is provided
 // independently by octo-docs-backend and may land later than the docs module
@@ -1356,6 +1798,20 @@ func (s *SystemSettings) DocsSearchEnabled() bool {
 // Value source: system_setting drive.enabled (DB, hot-reloaded).
 func (s *SystemSettings) DriveEnabled() bool {
 	return s.getBool("drive", "enabled", false)
+}
+
+// DriveSearchEnabled reports whether clients should surface the "网盘" tab in
+// the global-search modal. Decoupled from DriveEnabled: the search endpoint is
+// provided independently by octo-drive-search and may land later than the
+// drive module itself, or roll out independently under its own gray-release
+// timeline. Display policy only — it neither grants nor enforces any
+// server-side authorization, which lives in octo-drive-search (VisibleSpaces
+// + VisibleDocs + baseFilters permission down-push). Default false so the tab
+// stays hidden until search is deployed, the index is populated, and the
+// admin flips drive.search_enabled for a controlled rollout. Value source:
+// system_setting drive.search_enabled (DB, hot-reloaded).
+func (s *SystemSettings) DriveSearchEnabled() bool {
+	return s.getBool("drive", "search_enabled", false)
 }
 
 // DmloopEnabled reports whether the Loop(回路)module entry should be shown to
@@ -1442,50 +1898,121 @@ const (
 // 若 modules/file 侧改动允许扩展名，此列表也需同步。
 var stickerUploadRasterAllowlist = []string{".gif", ".png", ".jpg", ".jpeg", ".webp"}
 
-// stickerClampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
+// clampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
 // non-numeric (which surface as fallback default from getInt) is served as
 // default; values above hardCap are clamped to hardCap; everything else is
 // returned verbatim. Shared by every KB/px/ms/count sticker upload setting so
 // the clamp policy is single-sourced.
 //
+// clampIntUpper 是所有「有服务端硬上限」的 int getter 的共用读侧钳位。
 // key is the fully qualified setting name (e.g. "sticker.upload_max_size_kb");
 // when v exceeds hardCap this method emits a per-(key, v) one-shot Warn so a
 // bad admin edit is operator-observable without spamming the read hot path
 // (review R6). Admin fixes → new越界 value or in-range value → new Warn or
 // silence, matching human-friendly signal semantics.
-func (s *SystemSettings) stickerClampIntUpper(key string, v, fallback, hardCap int) int {
+func (s *SystemSettings) clampIntUpper(key string, v, fallback, hardCap int) int {
 	if v <= 0 {
-		return fallback
+		// 回落值同样要过上界。hardCap 曾经全是编译期常量、且恒高于对应的代码
+		// 默认值，这一分支直接 return fallback 是安全的；file.max_size_kb 的
+		// 天花板变成部署可配（OCTO_FILE_MAX_SIZE_KB_HARD_CAP，可低于 100MB）
+		// 之后就不成立了 —— 一个直改库写入的 ≤0 值会拿到 102400，高出部署
+		// 自己声明的天花板 200 倍，等于天花板形同虚设。
+		return min(fallback, hardCap)
 	}
 	if v > hardCap {
-		dedupKey := fmt.Sprintf("%s=%d>%d", key, v, hardCap)
-		if _, loaded := s.stickerClampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
-			s.Warn("system_setting sticker knob exceeds hard cap; clamped",
-				zap.String("key", key),
-				zap.Int("configured", v),
-				zap.Int("hard_cap", hardCap))
-		}
+		s.warnClampOnce(fmt.Sprintf("%s=%d>%d", key, v, hardCap),
+			"system_setting knob exceeds hard cap; clamped",
+			zap.String("key", key),
+			zap.Int("configured", v),
+			zap.Int("hard_cap", hardCap))
 		return hardCap
 	}
 	return v
 }
 
-// StickerUploadMaxSizeKB returns the per-file upload cap in KB. Read-side
-// clamped to [1, stickerUploadMaxSizeKBHardCap]; out-of-range falls back to
-// the historical 1024 KB default.
-func (s *SystemSettings) StickerUploadMaxSizeKB() int {
-	return s.stickerClampIntUpper("sticker.upload_max_size_kb",
+// warnClampOnce 按 dedupKey 去重地打一条钳位告警。钳位 getter 坐在读热路径上
+// （file.max_size_kb 每次 currentPolicy() 都读，包括每个未认证的 appconfig
+// 请求），不去重的话一个配错的键就能让匿名调用者按请求数刷日志。
+func (s *SystemSettings) warnClampOnce(dedupKey, msg string, fields ...zap.Field) {
+	if _, loaded := s.clampWarned.LoadOrStore(dedupKey, struct{}{}); loaded {
+		return
+	}
+	s.Warn(msg, fields...)
+}
+
+// getIntOK 与 getInt 同义，额外报告这个键**是否真的被配置过**。
+//
+// 钳位 getter 需要这个区分：把代码默认值喂进 clampIntUpper，会在天花板低于
+// 默认值时报出 configured=102400 —— 而表里一行都没有。那是在诬告一次没有
+// 发生过的变更，并且每个 pod 启动后都会打一条。
+//
+// 键存在但解析不了时返回 (0, true)：确实配置过，只是非法，交给钳位器的 ≤0
+// 分支回落，取值与 getInt 逐字节一致。
+func (s *SystemSettings) getIntOK(category, key string) (int, bool) {
+	raw, ok := s.lookup(category, key)
+	if !ok {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, true
+	}
+	return parsed, true
+}
+
+// stickerUploadMaxSizeKBOwnBound 返回只受**贴纸自身产品硬上限**约束的贴纸
+// 上限，不含全局上限那道收敛。
+//
+// 写侧守卫要的是这个值：它代表「运营想配成多大」。若拿收敛后的
+// StickerUploadMaxSizeKB()去比，两侧会被 min() 拉平，D6 守卫永远不触发。
+func (s *SystemSettings) stickerUploadMaxSizeKBOwnBound() int {
+	return s.clampIntUpper("sticker.upload_max_size_kb",
 		s.getInt("sticker", "upload_max_size_kb", defaultStickerUploadMaxSizeKB),
 		defaultStickerUploadMaxSizeKB,
 		stickerUploadMaxSizeKBHardCap,
 	)
 }
 
+// StickerUploadMaxSizeKB returns the per-file sticker upload cap in KB.
+//
+// 两道上界，缺一不可：
+//
+//	贴纸自身的产品硬上限   stickerUploadMaxSizeKBHardCap（5120，编译期常量）
+//	当前生效的全局单文件上限 FileMaxSizeKB()（部署天花板 + 管理台值）
+//
+// 第二道是必须的，因为上传校验里**全局大小门在贴纸门之前**
+// （modules/file/api.go），所以真正生效的贴纸上限本来就是 min(两者)。
+// 不在这里收敛，这个事实就只有闸门知道：appconfig 会向客户端广播一个服务端
+// 并不接受的值（客户端按它预校验、白传一次、拿到「文件过大」而不是贴纸文案），
+// 管理台 effective_value 也会显示一个「写着但不生效」的数字 —— 正是本任务在
+// extra_allowed_extensions 上明确拒绝的失败形态。
+//
+// 天花板还是编译期常量 524288 时这一道是不可达的（贴纸最高 5120，clamp 永远
+// 落不到它之下）；OCTO_FILE_MAX_SIZE_KB_HARD_CAP 让天花板可以低于贴纸上限，
+// 这条路径才打开。写侧的 D6 守卫按定义只在**发生写入**时运行，因此看不见
+// 「空表 + 低天花板」这一格：读侧收敛是唯一能覆盖它的地方。
+func (s *SystemSettings) StickerUploadMaxSizeKB() int {
+	own := s.stickerUploadMaxSizeKBOwnBound()
+	fileCap := s.FileMaxSizeKB()
+	if own <= fileCap {
+		return own
+	}
+	// 收敛是静默的（贴纸照常能传，只是更小），但运维需要知道部署天花板正在
+	// 压着一个产品配置 —— 这就是 review 要求的「大声检测」，按 (贴纸值, 全局
+	// 值) 去重，每个进程每种组合一条。
+	s.warnClampOnce(fmt.Sprintf("sticker.upload_max_size_kb=%d>file=%d", own, fileCap),
+		"sticker upload cap exceeds the effective file upload cap; converged to the file cap",
+		zap.String("key", "sticker.upload_max_size_kb"),
+		zap.Int("sticker_max_size_kb", own),
+		zap.Int("file_max_size_kb", fileCap))
+	return fileCap
+}
+
 // StickerUploadMaxDimension returns the decoded-pixel single-edge cap. Read-side
 // clamped to [1, stickerUploadMaxDimensionHardCap]; out-of-range falls back to
 // the historical 512-px default.
 func (s *SystemSettings) StickerUploadMaxDimension() int {
-	return s.stickerClampIntUpper("sticker.upload_max_dimension",
+	return s.clampIntUpper("sticker.upload_max_dimension",
 		s.getInt("sticker", "upload_max_dimension", defaultStickerUploadMaxDimension),
 		defaultStickerUploadMaxDimension,
 		stickerUploadMaxDimensionHardCap,
@@ -1550,7 +2077,7 @@ func (s *SystemSettings) StickerCompressEnabled() bool {
 // Read-side clamped to [1, stickerCompressTargetKBHardCap]; out-of-range falls
 // back to the 1024 KB default.
 func (s *SystemSettings) StickerCompressTargetKB() int {
-	return s.stickerClampIntUpper("sticker.compress_target_kb",
+	return s.clampIntUpper("sticker.compress_target_kb",
 		s.getInt("sticker", "compress_target_kb", defaultStickerCompressTargetKB),
 		defaultStickerCompressTargetKB,
 		stickerCompressTargetKBHardCap,
@@ -1561,7 +2088,7 @@ func (s *SystemSettings) StickerCompressTargetKB() int {
 // sticker compressions. Read-side clamped to [1, stickerCompressMaxConcurrencyHardCap];
 // out-of-range falls back to 4.
 func (s *SystemSettings) StickerCompressMaxConcurrency() int {
-	return s.stickerClampIntUpper("sticker.compress_max_concurrency",
+	return s.clampIntUpper("sticker.compress_max_concurrency",
 		s.getInt("sticker", "compress_max_concurrency", defaultStickerCompressMaxConcurrency),
 		defaultStickerCompressMaxConcurrency,
 		stickerCompressMaxConcurrencyHardCap,
@@ -1572,7 +2099,7 @@ func (s *SystemSettings) StickerCompressMaxConcurrency() int {
 // Read-side clamped to [1, stickerCompressTimeoutMsHardCap]; out-of-range falls
 // back to 2000ms.
 func (s *SystemSettings) StickerCompressTimeoutMs() int {
-	return s.stickerClampIntUpper("sticker.compress_timeout_ms",
+	return s.clampIntUpper("sticker.compress_timeout_ms",
 		s.getInt("sticker", "compress_timeout_ms", defaultStickerCompressTimeoutMs),
 		defaultStickerCompressTimeoutMs,
 		stickerCompressTimeoutMsHardCap,
@@ -1593,7 +2120,7 @@ func (s *SystemSettings) StickerCompressTimeoutMs() int {
 // effectiveGateDim) and this value only decides how far they are shrunk before
 // store.
 func (s *SystemSettings) StickerCompressMaxDimension() int {
-	return s.stickerClampIntUpper("sticker.compress_max_dimension",
+	return s.clampIntUpper("sticker.compress_max_dimension",
 		s.getInt("sticker", "compress_max_dimension", defaultStickerCompressMaxDimension),
 		defaultStickerCompressMaxDimension,
 		stickerUploadMaxDimensionHardCap,

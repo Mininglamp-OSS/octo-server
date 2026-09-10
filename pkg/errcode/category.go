@@ -49,6 +49,14 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "The group and the category are not in the same space.",
 	})
+	// ErrCategoryProjectGroupCannotCategorize preserves the invariant that a
+	// Project group appears only in its Project section, never in a manual
+	// category. It is a state conflict, not a permission decision.
+	ErrCategoryProjectGroupCannotCategorize = register(codes.Code{
+		ID:             "err.server.category.project_group_cannot_categorize",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "A Project group cannot be placed in a manual category.",
+	})
 
 	// ---- permission / authorization (403) ------------------------------------
 

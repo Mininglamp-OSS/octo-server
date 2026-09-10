@@ -172,6 +172,9 @@ type BotAPI struct {
 	// returns the error without logging identifiers; the permission observer owns
 	// the single desensitized terminal log.
 	spaceMemberQueryOverride func(uid, spaceID string) (bool, error)
+	// principalStoreOverride makes the exact-Space principal lookup testable
+	// without weakening its production DB-backed authorization query.
+	principalStoreOverride spacePrincipalStore
 	// groupMemberCountOverride lets focused permission tests distinguish an
 	// empty active membership from a query failure without a live MySQL session.
 	groupMemberCountOverride func(groupNo, robotID string) (int, error)
@@ -382,6 +385,18 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	//
 	// 顺序是载荷性的：authBot → requireBotIdentity → 限流。限流中间件在拿不到身份时
 	// 旁路放行（OutcomeNoKey），顺序颠倒会让它静默失效。
+	// Always-on per-IP strict bucket for POST /v1/bot/users/batch. The /v1/bot
+	// group's per-bot business limiter is default-off (see ratelimit.go
+	// envBatchUsersIP* comment), so this dedicated bucket is the endpoint's real
+	// default-config rate bound — mirroring the bot_register / bot_heartbeat
+	// always-on IP buckets. Mounted on the route itself (below), after the group's
+	// auth/identity, since it keys on IP and only needs to bound this one route.
+	batchUsersIPRPS, batchUsersIPBurst := ipLimitParams(
+		envBatchUsersIPRPS, defaultBatchUsersIPRPS, envBatchUsersIPBurst, defaultBatchUsersIPBurst)
+	batchUsersIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
+		"bot_users_batch", batchUsersIPRPS, batchUsersIPBurst)
+
 	botAPI := r.Group("/v1/bot",
 		ba.authBot(),
 		ba.requireBotIdentity(),
@@ -400,26 +415,32 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/messages/sync", ba.syncMessages)
 		botAPI.GET("/groups", ba.getGroups)
 		botAPI.GET("/resolve/targets", ba.botResolveTargets)
+		// 批量解析用户最小身份信息（无 PII），供大群转发授权等场景一次拉取，替代逐个
+		// 单查打满限流；复用本组的 bot 鉴权 / 身份断言。速率由自带的 always-on per-IP
+		// 桶（batchUsersIPLimit）兜底——本组的 per-bot business 桶默认关闭，不能作为该
+		// 端点的速率上界，故这道桶才是默认配置下真正的 bound（见 batch_users.go 注释）。
+		botAPI.POST("/users/batch", batchUsersIPLimit, ba.batchUsers)
 		botAPI.GET("/groups/:group_no", ba.getGroupInfo)
 		botAPI.GET("/groups/:group_no/members", ba.getGroupMembers)
 		botAPI.GET("/groups/:group_no/mention_pref", ba.getMentionPref) // 群级免@偏好读（octo-server#237）
 		botAPI.GET("/groups/:group_no/md", ba.getGroupMd)
-		botAPI.PUT("/groups/:group_no/md", ba.updateGroupMd)
+		botAPI.PUT("/groups/:group_no/md", ba.protectAIContainerMutation, ba.updateGroupMd)
 		botAPI.GET("/space/members", ba.botSpaceMembers)
+		botAPI.GET("/space/principals/:uid", ba.botSpacePrincipal)
 		botAPI.POST("/createGroup", ba.botGroupCreate)
 		botAPI.PUT("/groups/:group_no/info", ba.botGroupUpdate)
 		botAPI.POST("/groups/:group_no/members/add", ba.botGroupMemberAdd)
 		botAPI.POST("/groups/:group_no/members/remove", ba.botGroupMemberRemove)
 		// Thread API
-		botAPI.POST("/groups/:group_no/threads", ba.botCreateThread)
+		botAPI.POST("/groups/:group_no/threads", ba.protectAIContainerMutation, ba.botCreateThread)
 		botAPI.GET("/groups/:group_no/threads", ba.botListThreads)
 		botAPI.GET("/groups/:group_no/threads/:short_id", ba.botGetThread)
-		botAPI.DELETE("/groups/:group_no/threads/:short_id", ba.botDeleteThread)
+		botAPI.DELETE("/groups/:group_no/threads/:short_id", ba.protectAIContainerMutation, ba.botDeleteThread)
 		botAPI.GET("/groups/:group_no/threads/:short_id/members", ba.botListThreadMembers)
-		botAPI.POST("/groups/:group_no/threads/:short_id/join", ba.botJoinThread)
-		botAPI.POST("/groups/:group_no/threads/:short_id/leave", ba.botLeaveThread)
+		botAPI.POST("/groups/:group_no/threads/:short_id/join", ba.protectAIContainerMutation, ba.botJoinThread)
+		botAPI.POST("/groups/:group_no/threads/:short_id/leave", ba.protectAIContainerMutation, ba.botLeaveThread)
 		botAPI.GET("/groups/:group_no/threads/:short_id/md", ba.botGetThreadMd)
-		botAPI.PUT("/groups/:group_no/threads/:short_id/md", ba.botUpdateThreadMd)
+		botAPI.PUT("/groups/:group_no/threads/:short_id/md", ba.protectAIContainerMutation, ba.botUpdateThreadMd)
 		botAPI.POST("/setCommands", ba.setCommands)
 		// File API
 		botAPI.POST("/file/upload", ba.botUploadFile)

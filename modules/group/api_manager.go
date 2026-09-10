@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
@@ -46,14 +47,34 @@ func NewManager(ctx *config.Context) *Manager {
 func (m *Manager) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{
-		auth.GET("/group/list", m.list)                              // 群列表
-		auth.GET("/group/disablelist", m.disablelist)                // 封禁群列表
-		auth.PUT("/group/liftban/:groupNo/:status", m.leftbangroup)  // 封禁或解禁某个群
-		auth.PUT("/groups/:group_no/forbidden/:on", m.forbidden)     // 群全员禁言
-		auth.GET("/groups/:group_no/members", m.members)             // 群成员
-		auth.GET("/groups/:group_no/members/blacklist", m.blacklist) // 群黑名单成员
-		auth.DELETE("/groups/:group_no/members", m.removeMember)     // 移除群成员
+		auth.GET("/group/list", m.list)                                                           // 群列表
+		auth.GET("/group/disablelist", m.disablelist)                                             // 封禁群列表
+		auth.PUT("/group/liftban/:groupNo/:status", m.protectAIContainerMutation, m.leftbangroup) // 封禁或解禁某个群
+		auth.PUT("/groups/:group_no/forbidden/:on", m.protectAIContainerMutation, m.forbidden)    // 群全员禁言
+		auth.GET("/groups/:group_no/members", m.members)                                          // 群成员
+		auth.GET("/groups/:group_no/members/blacklist", m.blacklist)                              // 群黑名单成员
+		auth.DELETE("/groups/:group_no/members", m.protectAIContainerMutation, m.removeMember)    // 移除群成员
 	}
+}
+
+func (m *Manager) protectAIContainerMutation(c *wkhttp.Context) {
+	groupNo := c.Param("group_no")
+	if groupNo == "" {
+		groupNo = c.Param("groupNo")
+	}
+	protected, err := aiteampkg.IsProtectedGroup(m.ctx.DB(), groupNo)
+	if err != nil {
+		m.Error("query AI container purpose failed", zap.Error(err), zap.String("group_no", groupNo))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		c.Abort()
+		return
+	}
+	if protected {
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
 }
 
 // 查询群列表

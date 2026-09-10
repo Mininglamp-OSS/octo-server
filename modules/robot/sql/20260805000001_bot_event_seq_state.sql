@@ -15,7 +15,7 @@
 -- FOR UPDATE 的 CAS flip + floor 校验），但**不复用它的 FOR SHARE drain barrier**：
 -- 那个 barrier 要求每个写入方在业务事务内持锁到 commit，而 robotEvent 的写入是
 -- INCR + ZADD 纯 Redis，没有 commit 可持。本方案的 flip 前提是运维先确认无旧副本，
--- 详见 tools/botevent-seq。
+-- 详见 docs/botevent-cutover-runbook.md 与 `app cutover botevent`。
 CREATE TABLE IF NOT EXISTS `octo_bot_event_seq_state` (
   `singleton_id`  TINYINT UNSIGNED NOT NULL COMMENT '恒为1的单例键',
   `mode`          TINYINT          NOT NULL DEFAULT 0 COMMENT '0=legacy(GenSeq) 1=incr(Redis计数器)',
@@ -39,7 +39,7 @@ ON DUPLICATE KEY UPDATE `singleton_id` = `singleton_id`;
 -- 一旦 mode=1，这张表就是唯一不随 Redis RDB 回滚的激活凭据：drop 掉它之后，
 -- ReadState 返回 ErrStateMissing、按设计被读方当作 legacy，于是任何一次镜像丢失都会让
 -- 分配器发出低于计数器已发号的 GenSeq id，落在活跃游标下方 —— #697 的镜像，由回滚本身
--- 造成。这个 flip 在别处（tools/botevent-seq、pkg/botevent/seq.go）都写明不可逆，Down
+-- 造成。这个 flip 在别处（`app cutover botevent`、pkg/botevent/seq.go）都写明不可逆，Down
 -- 也必须一致。
 --
 -- 手法：向单例表插入 singleton_id=2，只在 mode=1 时选出行。CHECK (singleton_id = 1)

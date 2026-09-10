@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -107,12 +109,19 @@ type IService interface {
 	ActiveMemberGroupNos(uid string) ([]string, error)
 	// GetGroupsWithMemberUID 获取某个用户的所有群
 	GetGroupsWithMemberUID(uid string) ([]*InfoResp, error)
+	// GetGroupsWithMemberUIDForLifecycleCleanup returns every active membership,
+	// including server-managed containers hidden from product-facing lists.
+	GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*InfoResp, error)
+	// RemoveUserFromGroupsForLifecycleCleanup removes a deprovisioned account
+	// from every active group, including hidden server-managed containers.
+	// Product-facing deletion routes must use this single entry point so a new
+	// account lifecycle path cannot accidentally strand protected membership.
+	RemoveUserFromGroupsForLifecycleCleanup(uid string) error
 	// 获取指定群的群成员的最大数据版本
 	GetGroupMemberMaxVersion(groupNo string) (int64, error)
 	// 获取用户所有超级群信息
 	GetUserSupers(uid string) ([]*InfoResp, error)
 	// 新增群成员
-	AddMember(model *AddMemberReq) error
 	// 获取指定一批群的指定成员信息
 	GetMembersWithUIDAndGroupIds(uid string, groupNos []string) ([]*MemberResp, error)
 	// 查询一批群的管理员及群主
@@ -230,6 +239,71 @@ func (s *Service) AddGroup(model *AddGroupReq) error {
 
 func (s *Service) GetGroupsWithMemberUID(uid string) ([]*InfoResp, error) {
 	groups, err := s.db.queryGroupsWithMemberUID(uid)
+	return groupModelsToInfo(groups, err)
+}
+
+func (s *Service) GetGroupsWithMemberUIDForLifecycleCleanup(uid string) ([]*InfoResp, error) {
+	groups, err := s.db.queryAllGroupsWithMemberUID(uid)
+	return groupModelsToInfo(groups, err)
+}
+
+// RemoveUserFromGroupsForLifecycleCleanup is the authoritative account-teardown
+// path for group membership. It deliberately sees AI containers that ordinary
+// product lists hide, and only enables protected removal for rows whose persisted
+// purpose proves they are lifecycle-managed containers. Creator memberships are
+// reported and skipped: RemoveGroupMembers intentionally cannot remove a creator,
+// and that outcome must not turn otherwise-convergent account teardown into a 500.
+func (s *Service) RemoveUserFromGroupsForLifecycleCleanup(uid string) error {
+	groups, err := s.GetGroupsWithMemberUIDForLifecycleCleanup(uid)
+	if err != nil {
+		return fmt.Errorf("query lifecycle groups for %s: %w", uid, err)
+	}
+
+	var cleanupErrs []error
+	for _, group := range groups {
+		// Disbanded groups retain member rows by existing lifecycle semantics.
+		if group.Status == GroupStatusDisband {
+			continue
+		}
+		if group.Creator == uid {
+			s.Warn("生命周期清理跳过群主成员",
+				zap.String("uid", uid), zap.String("group_no", group.GroupNo))
+			continue
+		}
+		result, removeErr := s.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+			GroupNo:              group.GroupNo,
+			Members:              []string{uid},
+			OperatorUID:          uid,
+			SuppressRemoveNotice: true,
+			AllowProtected:       group.Purpose == aiteampkg.GroupPurpose,
+		})
+		if removeErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: %w", uid, group.GroupNo, removeErr))
+			continue
+		}
+		if result == nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove %s from group %s: empty cleanup result", uid, group.GroupNo))
+			continue
+		}
+		removed := false
+		for _, removedUID := range result.RemovedUIDs {
+			if removedUID == uid {
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			// A concurrent ownership transfer may promote the target after the
+			// lifecycle lookup. RemoveGroupMembers deliberately skips creators;
+			// preserve that non-fatal contract and leave an operator-visible trace.
+			s.Warn("生命周期清理未移除成员（可能已成为群主）",
+				zap.String("uid", uid), zap.String("group_no", group.GroupNo))
+		}
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func groupModelsToInfo(groups []*Model, err error) ([]*InfoResp, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -375,13 +449,6 @@ func (s *Service) GetUserSupers(uid string) ([]*InfoResp, error) {
 	return infoResps, nil
 }
 
-func (s *Service) AddMember(model *AddMemberReq) error {
-	err := s.db.InsertMember(&MemberModel{
-		GroupNo: model.GroupNo,
-		UID:     model.MemberUID,
-	})
-	return err
-}
 func (s *Service) GetGroupMemberMaxVersion(groupNo string) (int64, error) {
 	version, err := s.db.queryGroupMemberMaxVersion(groupNo)
 	return version, err
@@ -723,15 +790,10 @@ type AddGroupReq struct {
 	Name    string
 }
 
-// AddMemberReq 添加群成员
-type AddMemberReq struct {
-	GroupNo   string
-	MemberUID string
-}
-
 // InfoResp 群信息
 type InfoResp struct {
 	GroupNo             string    `json:"group_no"`               // 群编号
+	Purpose             string    `json:"purpose,omitempty"`      // 服务端管理用途
 	GroupType           GroupType `json:"group_type"`             // 群类型
 	Name                string    `json:"name"`                   // 群名称
 	Notice              string    `json:"notice"`                 // 群公告
@@ -743,16 +805,25 @@ type InfoResp struct {
 	AllowViewHistoryMsg int       `json:"allow_view_history_msg"` // 是否允许新成员查看历史记录
 	CreatedAt           string    `json:"created_at"`
 	UpdatedAt           string    `json:"updated_at"`
-	Version             int64     `json:"version"`           // 群数据版本
-	SpaceID             string    `json:"space_id"`          // Space ID
-	IsExternalGroup     int       `json:"is_external_group"` // 是否外部群
-	AllowExternal       int       `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
-	AllowNoMention      int       `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
+	Version             int64     `json:"version"`  // 群数据版本
+	SpaceID             string    `json:"space_id"` // Space ID
+	// ProjectID 群所属项目；空串 = 直属 Space。与 GroupResp.ProjectID 同一列、
+	// 同一含义（P2 开始下发）。加在这里是因为 InfoResp 是模块间的批量读形状：
+	// sidebar 靠 GetGroups 一次拿回整页会话的群信息，没有它就只能为 project_id
+	// 再发一轮查询，而那是热读路径上的一次额外往返。
+	//
+	// 数据本来就在手里——QueryWithGroupNos 取的是整行，Model.ProjectID 一直都在，
+	// 只是没有被映射出来。
+	ProjectID       string `json:"project_id"`        // 所属项目 ID（空串=直属 Space）
+	IsExternalGroup int    `json:"is_external_group"` // 是否外部群
+	AllowExternal   int    `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention  int    `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
 }
 
 func toInfoResp(m *Model) *InfoResp {
 	return &InfoResp{
 		GroupNo:             m.GroupNo,
+		Purpose:             m.Purpose,
 		GroupType:           GroupType(m.GroupType),
 		Name:                m.Name,
 		Notice:              m.Notice,
@@ -766,6 +837,7 @@ func toInfoResp(m *Model) *InfoResp {
 		UpdatedAt:           m.UpdatedAt.String(),
 		Version:             m.Version,
 		SpaceID:             m.SpaceID,
+		ProjectID:           m.ProjectID,
 		IsExternalGroup:     m.IsExternalGroup,
 		AllowExternal:       m.AllowExternal,
 		AllowNoMention:      m.AllowNoMention,
@@ -841,6 +913,7 @@ func toSettingResp(m *Setting) *SettingResp {
 
 type GroupResp struct {
 	GroupNo                  string    `json:"group_no"`                    // 群编号
+	Purpose                  string    `json:"purpose,omitempty"`           // 服务端管理用途
 	GroupType                GroupType `json:"group_type"`                  // 群类型
 	Category                 string    `json:"category"`                    // 群分类
 	Name                     string    `json:"name"`                        // 群名称
@@ -878,17 +951,27 @@ type GroupResp struct {
 	CanEditGroupMd           bool      `json:"can_edit_group_md"`           // 是否可编辑GROUP.md
 	CanManageBotAdmin        bool      `json:"can_manage_bot_admin"`        // 是否可管理Bot管理员
 	SpaceID                  string    `json:"space_id"`                    // Space ID
-	IsExternalGroup          int       `json:"is_external_group"`           // 是否外部群 0.否 1.是
-	AllowExternal            int       `json:"allow_external"`              // 是否允许外部成员 1.允许(默认) 0.禁止
-	AllowNoMention           int       `json:"allow_no_mention"`            // 群级是否允许免@生效 1.允许(默认) 0.禁止
-	CreatedAt                string    `json:"created_at"`
-	UpdatedAt                string    `json:"updated_at"`
-	Version                  int64     `json:"version"` // 群数据版本
+	// ProjectID 群所属项目；空串 = 直属 Space。P2 开始下发。
+	//
+	// 客户端要靠它把项目群归到项目名下展示，也要靠它知道这个群的成员是由项目
+	// 决定的（全员群还会被 D7 的四道保护挡住若干操作，客户端最好别把那些按钮
+	// 画出来）。P1 建立了这一列并让 I2 依赖它，但刻意没有下发——那是留给 P2 的
+	// 第一项透出工作。
+	//
+	// 只加字段、不改任何既有字段：老客户端读不到它，行为与今天完全一致。
+	ProjectID       string `json:"project_id"`        // 所属项目 ID（空串=直属 Space）
+	IsExternalGroup int    `json:"is_external_group"` // 是否外部群 0.否 1.是
+	AllowExternal   int    `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention  int    `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+	Version         int64  `json:"version"` // 群数据版本
 }
 
 func (g *GroupResp) from(model *DetailModel) *GroupResp {
 	resp := &GroupResp{
 		GroupNo:                  model.GroupNo,
+		Purpose:                  model.Purpose,
 		GroupType:                GroupType(model.GroupType),
 		Category:                 model.Category,
 		Name:                     model.Name,
@@ -917,6 +1000,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
 		SpaceID:                  model.SpaceID,
+		ProjectID:                model.ProjectID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
 		AllowNoMention:           model.AllowNoMention,
@@ -935,6 +1019,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 func (g *GroupResp) fromModel(model *Model) *GroupResp {
 	resp := &GroupResp{
 		GroupNo:                  model.GroupNo,
+		Purpose:                  model.Purpose,
 		GroupType:                GroupType(model.GroupType),
 		Category:                 model.Category,
 		Name:                     model.Name,
@@ -950,6 +1035,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
 		SpaceID:                  model.SpaceID,
+		ProjectID:                model.ProjectID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
 		AllowNoMention:           model.AllowNoMention,
@@ -1004,14 +1090,17 @@ func GetGroupMdMaxSize() int {
 
 // CreateGroupServiceReq 创建群请求
 type CreateGroupServiceReq struct {
-	Creator     string   // 创建者 UID
-	Members     []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
-	Name        string   // 群名称（可为空，Service 会自动生成）
-	SpaceID     string   // Space ID（可为空）
-	BotUID      string   // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
-	CategoryID  string   // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText  string   // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor *int     // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
+	Creator string   // 创建者 UID
+	Members []string // 成员 UID 列表（不含创建者，Service 内部会自动加入）
+	Name    string   // 群名称（可为空，Service 会自动生成）
+	SpaceID string   // Space ID（可为空）
+	// ProjectID 群的项目归属（可为空=直属 Space）。非空时群成员受 I2 约束，
+	// 包括创建者自己——他不是该项目成员的话，建群会在准入闸门处被拒。
+	ProjectID   string // 所属项目 ID（可为空）
+	BotUID      string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
+	CategoryID  string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
+	AvatarText  string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
 // CreateGroupServiceResp 创建群响应
@@ -1041,9 +1130,48 @@ type RemoveGroupMembersServiceReq struct {
 	Members      []string // 待移除成员 UID 列表
 	OperatorUID  string   // 操作者 UID
 	OperatorName string   // 操作者名称
+	// SuppressRemoveNotice 抑制「被 X 移出群聊」系统消息，由调用方自行发更贴切的文案。
+	// 用于成员**自愿**离开却要走同一套移除流程的场景（如退出 Space 触发的级联退群）：
+	// 那里 Operator 就是本人，默认文案会渲染成「X 被 X 移出群聊」。
+	// 其余清理（IM 退订、CMD、子区/置顶/会话扩展、bot 连带移除本身）不受影响。
+	//
+	// **它不管 bot 连带移除的那条 Tip** —— 那是另一条群可见的持久化系统消息，
+	// 用下面两个字段单独控制。早先只有这一个开关时，主动退出和解散两种被抑制的
+	// 场景都仍然会发出「X 被移出群聊，其机器人 Y 已一并移除」，把这个开关要挡的
+	// 措辞又写进了群历史。
+	SuppressRemoveNotice bool
+
+	// BotCascadeTipAction 覆盖 bot 连带移除 Tip 里的动作词。
+	// 空串沿用默认的「被移出」，所以既有调用方行为不变；自愿离开的场景传「退出了」。
+	BotCascadeTipAction string
+
+	// BotOwnerSelfRemoval 标记「bot 所有者自助把自己名下的 bot 移出群聊」
+	// （octo-web#1511）。置位时抑制默认的「你被 X 移除群聊」——那是被移除者视角的
+	// 措辞，目标是 bot 时读起来是错的——改发一条 owner 视角的 Tip
+	// （sendBotOwnerRemovedTip）。
+	//
+	// 为什么不复用 SuppressRemoveNotice + 调用方自己发消息：那需要调用方同时设对
+	// 两个开关才不出错，而 handler 手上没有成员名字（QueryMembersWithUids 返回的
+	// MemberModel 无 Name 字段），本函数则已经为 removedVos 查好了名字。
+	// 收敛成一个语义化开关，调用方无法只设一半。
+	BotOwnerSelfRemoval bool
+
+	// SuppressBotCascadeTip 完全不发 bot 连带移除 Tip。
+	// 只在「通告本身已无意义」时用（Space 解散：群还在，但每个成员每个群各发一条，
+	// N×M 条堆给最后一个人看）。普通移除和自愿退出都**应该**发——群成员看见 bot
+	// 凭空消失，有权知道原因，这与「谁移出了谁」是两件事。
+	SuppressBotCascadeTip bool
+
+	// AllowProtected is reserved for authoritative lifecycle cleanup (Space
+	// removal/disband). User and Bot API callers must leave it false.
+	AllowProtected bool
 }
 
-// RemoveGroupMembersServiceResp 移除群成员响应
+// RemoveGroupMembersServiceResp 移除群成员响应。
+//
+// Removed 是**实际**移除数量，可能小于请求的成员数：群主会被静默跳过，
+// 且锁内重读发现目标刚被提升为群主时也会跳过。调用方若依赖「这个人一定被移除」，
+// 必须检查 Removed 而不是只看 error —— 两种跳过都返回 nil error。
 type RemoveGroupMembersServiceResp struct {
 	Removed     int      // 实际移除数量
 	RemovedUIDs []string // 实际移除的 UID 列表
@@ -1056,6 +1184,9 @@ type UpdateGroupInfoServiceReq struct {
 	OperatorName string  // 操作者名称
 	Name         *string // 新群名（nil 表示不更新）
 	Notice       *string // 新公告（nil 表示不更新）
+	// ExpectProjectID 可选的归属栅栏：非空时，只有当这个群仍属于该项目才写。
+	// 只有 D8 的全员群改名会设置它；人手改名留空。见 UpdateNameNoticeTx。
+	ExpectProjectID string
 }
 
 // UpdateGroupAvatarCustomServiceReq 更新自定义群头像文字/颜色（二次弹窗保存）。
@@ -1080,9 +1211,19 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	if req.Creator == "" {
 		return nil, errors.New("creator is required")
 	}
-	if len(req.Members) == 0 {
-		return nil, errors.New("members is required")
-	}
+	// Members MAY be empty — a group of just its creator is a legitimate group.
+	//
+	// This used to be rejected here, and the rejection has to go for P2: a project
+	// created with no agents picked needs an all-member group whose only initial
+	// member is the project owner. Refusing that would make "create a project"
+	// silently produce a project with no group in the most common case there is.
+	//
+	// The HTTP handler's own check is UNCHANGED (groupReq.Check still requires at
+	// least one member), so a user creating a group by hand still cannot create an
+	// empty one. What is relaxed is the SERVICE contract, for callers that are not
+	// a person filling in a form. The distinction matters: the handler rule is a
+	// product rule about a form, this one was a guard against an empty insert, and
+	// the insert below is not empty — the creator is always added.
 
 	var skippedMembers []string
 	// 跨 Space 外部成员标识：key=uid, value=source_space_id（uid 的默认 Space）
@@ -1115,13 +1256,19 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		// 行为与 scanjoin / AddGroupMembers 路径对齐，保证 YUJ-53 消息头来源 tag 在
 		// 建群初始成员路径也能被正确渲染。建群暂不做 allow_external 门禁，默认允许（与
 		// 新群 allow_external=1 一致）；若未来需要拒绝，应由 API 层提前校验。
+		//
+		// 一条批量查询，不是逐个 CheckMembership。ActiveMembers 的谓词与
+		// CheckMembership 逐字节相同，它的文档写明存在的理由就是"别让一个拿着很多
+		// uid 的调用方发 N 次往返"。P2 的补建把整份项目名册当作建群初始成员，于是
+		// 这个循环第一次真的会拿到几百个 uid——PR #855 第二轮 review 的 Q1 量到的
+		// 就是这里。
+		spaceActive, err := spacepkg.ActiveMembers(s.ctx.DB(), req.SpaceID, req.Members)
+		if err != nil {
+			s.Error("check member space membership failed", zap.Error(err))
+			return nil, errors.New("failed to check space membership")
+		}
 		for _, uid := range req.Members {
-			ok, err := spacepkg.CheckMembership(s.ctx.DB(), req.SpaceID, uid)
-			if err != nil {
-				s.Error("check member space membership failed", zap.Error(err), zap.String("uid", uid))
-				return nil, errors.New("failed to check space membership")
-			}
-			if ok {
+			if spaceActive[uid] {
 				continue
 			}
 			externalMap[uid] = true
@@ -1202,6 +1349,12 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
 	// group_member 的 is_external_* 标记在同一事务内一致（与 ADD / DELETE
 	// 路径对称，bot-only 外部不会 flip 群标记）。
+	// 建群时的项目归属。空串=直属 Space。handler 已校验过它属于同一个 Space
+	// 且项目处于活跃状态；「创建者本人是不是该项目成员」由下面的准入闸门在事务
+	// 内判定，那才是不会过期的判定点。
+	newGroupProjectID := req.ProjectID
+	initialAdmissions := make([]MemberAdmission, 0, len(memberUsers))
+
 	isExternalGroup := 0
 	for _, memberUser := range memberUsers {
 		if memberUser.UID == req.Creator {
@@ -1224,6 +1377,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Version:             version,
 		AllowViewHistoryMsg: int(common.GroupAllowViewHistoryMsgEnabled),
 		SpaceID:             req.SpaceID,
+		ProjectID:           req.ProjectID,
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
 		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,
@@ -1264,27 +1418,32 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			isExt = 1
 			srcSpaceID = sourceSpaceMap[memberUser.UID]
 		}
-		err = s.db.InsertMemberTx(&MemberModel{
-			GroupNo:       groupNo,
+		initialAdmissions = append(initialAdmissions, MemberAdmission{
 			UID:           memberUser.UID,
-			Role:          role,
 			Version:       memberVersion,
+			Role:          role,
 			InviteUID:     req.Creator,
 			Robot:         memberUser.Robot,
-			Status:        int(common.GroupMemberStatusNormal),
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}, tx)
-		if err != nil {
-			s.Error("insert member failed", zap.Error(err), zap.String("uid", memberUser.UID))
-			return nil, errors.New("failed to insert group member")
-		}
+		})
 		realMemberUIDs = append(realMemberUIDs, memberUser.UID)
 		memberVos = append(memberVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
 	}
 	if len(realMemberUIDs) == 0 {
 		return nil, errors.New("no valid member to add")
+	}
+	// 收口到唯一准入口（A3）。newGroupProjectID 来自建群请求的 project_id：
+	// handler 已经校验过它存在、活跃、属于同一个 Space，且调用方在这个 Space 里；
+	// 「调用方是不是这个项目的成员」故意不在那里查，而是由下面这道闸门在**建群
+	// 事务内、持锁状态下**判定——放在 handler 里查是一次会过期的读。
+	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID,
+		initialAdmissions, AdmissionEntryCreateGroup); err != nil {
+		s.Error("insert members failed", zap.Error(err), zap.String("groupNo", groupNo))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("failed to insert group member")
 	}
 
 	// Bot 加入群
@@ -1294,16 +1453,16 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			s.Error("generate bot member version failed", zap.Error(err))
 			return nil, err
 		}
-		err = s.db.InsertMemberTx(&MemberModel{
-			GroupNo:   groupNo,
+		// 收口到唯一准入口（A4）。Bot 走的是与人相同的闸门：只有 pkg/space 白名单
+		// 里的系统 bot 才对项目成员资格豁免，普通 bot 需要显式的项目席位，否则
+		// 「邀请一个 bot」就成了往项目群里塞监听者的旁路。
+		err = s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID, []MemberAdmission{{
 			UID:       req.BotUID,
-			Role:      MemberRoleCommon,
 			Version:   botMemberVersion,
+			Role:      MemberRoleCommon,
 			InviteUID: req.Creator,
 			Robot:     1,
-			Status:    int(common.GroupMemberStatusNormal),
-			Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
-		}, tx)
+		}}, AdmissionEntryCreateGroupBot)
 		if err != nil {
 			s.Error("insert bot member failed", zap.Error(err))
 			// Bot 加入失败不阻断建群
@@ -1397,6 +1556,11 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	}
 	if len(req.Members) == 0 {
 		return nil, errors.New("members is required")
+	}
+	if protected, err := aiteampkg.IsProtectedGroup(s.ctx.DB(), req.GroupNo); err != nil {
+		return nil, err
+	} else if protected {
+		return nil, aiteampkg.ErrContainerProtected
 	}
 
 	// 链路耗时定位（邀请成员入群慢排查）：startedAt 覆盖整条 AddGroupMembers，
@@ -1520,6 +1684,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 
 	var addedUIDs []string
 	var addedVos []*config.UserBaseVo
+	admissions := make([]MemberAdmission, 0, len(memberUsers))
 	hasNewExternal := false
 	for _, memberUser := range memberUsers {
 		if memberUser.IsDestroy == user.IsDestroyDone {
@@ -1543,31 +1708,15 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			srcSpaceID = sourceSpaceMap[memberUser.UID]
 		}
 
-		// 检查是否之前被删除过（需要恢复）
-		insStart := time.Now()
-		existDelete, _ := s.db.ExistMemberDelete(memberUser.UID, req.GroupNo)
-		newMember := &MemberModel{
-			GroupNo:       req.GroupNo,
+		admissions = append(admissions, MemberAdmission{
 			UID:           memberUser.UID,
-			Role:          MemberRoleCommon,
 			Version:       memberVersion,
-			Status:        int(common.GroupMemberStatusNormal),
+			Role:          MemberRoleCommon,
 			InviteUID:     req.OperatorUID,
 			Robot:         memberUser.Robot,
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}
-		if existDelete {
-			err = s.db.recoverMemberTx(newMember, tx)
-		} else {
-			err = s.db.InsertMemberTx(newMember, tx)
-		}
-		insertMs += time.Since(insStart).Milliseconds()
-		if err != nil {
-			s.Error("add group member failed", zap.Error(err), zap.String("uid", memberUser.UID))
-			continue
-		}
+		})
 		addedUIDs = append(addedUIDs, memberUser.UID)
 		addedVos = append(addedVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
 		// is_external_group 语义只反映人类外部成员：bot 即便 is_external=1
@@ -1578,6 +1727,18 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			hasNewExternal = true
 		}
 	}
+
+	// 收口到唯一准入口（I2 / D3）。原先是每个 uid 一次 ExistMemberDelete 会话查询
+	// 加一次 insert/recover，且单个失败时 continue；现在整批一条 upsert，失败即整批
+	// 回滚。原子失败优于部分成功：部分成功会让下面的成员添加事件通告一批人，其中
+	// 有些并没有真的写进去。
+	insStart := time.Now()
+	if err := s.db.admitOrRestoreMembersTx(tx, req.GroupNo, groupModel.SpaceID, groupModel.ProjectID,
+		admissions, AdmissionEntryAddMembers); err != nil {
+		s.Error("add group members failed", zap.Error(err), zap.String("groupNo", req.GroupNo))
+		return nil, err
+	}
+	insertMs += time.Since(insStart).Milliseconds()
 
 	// 首次出现外部成员时，在事务内将群标记为外部群，确保成员/群标记一致提交
 	markedExternal := false
@@ -1711,6 +1872,13 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	if len(req.Members) == 0 {
 		return nil, errors.New("members is required")
 	}
+	if !req.AllowProtected {
+		if protected, err := aiteampkg.IsProtectedGroup(s.ctx.DB(), req.GroupNo); err != nil {
+			return nil, err
+		} else if protected {
+			return nil, aiteampkg.ErrContainerProtected
+		}
+	}
 
 	// 群存在性检查
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
@@ -1736,6 +1904,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// #354 产品决策：bot 永远跟随其主人，无角色例外——manager 不再豁免，
 	// 被踢的管理员连同其拉入的 bot 一并带走（API 层 memberRemove 已限制
 	// 只有群主能踢管理员；creator 仍不可被踢）。
+	//
+	// 唯一例外是 bot 所有者自助移除（req.BotOwnerSelfRemoval，octo-web#1511）：
+	// 那条路径下级联额外排除被授予群角色的 bot，避免普通成员借级联越权移除一个
+	// 管理员 bot。它**不影响**本注释描述的踢人 / 退群 / 拉黑三条路径 —— 那三条
+	// 传 false，#354 原样保持。判据见 QueryBotsInvitedByUIDTx 的 requireCommonRole。
 	var removableMembers []*MemberModel
 	for _, m := range targetMembers {
 		if m.IsDeleted == 1 || m.Role == MemberRoleCreator {
@@ -1764,9 +1937,55 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		LeaverName string
 		Bots       []*user.Model
 	}
+	// 按 uid 排序后再进锁循环：本函数在**同一个事务**里逐个 FOR UPDATE 锁成员行
+	// （LockRemovableMemberTx），持锁顺序由调用方传进来的名单顺序决定。
+	//
+	// 排序**只**让本函数的多次并发调用之间锁序一致（RGM ↔ RGM），
+	// **并没有关掉整类 ABBA**：handOverGroupCreator 也锁 group_member 行，
+	// 但它是「先锁离开者，再锁继任者扫描命中的行」，而那次扫描是
+	// `ORDER BY created_at LIMIT 1 FOR UPDATE`、group_member 上没有服务该排序的索引，
+	// 于是按存储序锁行，不是 uid 序。所以「同群上并发跑一次批量移除和一次群主交接」
+	// 这一对**仍然可能死锁**：T1 持 A 等 B，T2 扫描先锁到 B 再等 A。
+	// 后果有界（MySQL 回滚一方；清理工单重试收敛，管理端批量踢人得到可重试的 500），
+	// 但别把这次排序读成「这类问题已解决」。
+	//
+	// 真正关掉它需要让 handOverGroupCreator 也按 uid 序取那两把锁，并给
+	// (group_no, created_at) 补索引让继任者扫描不再锁全群 —— 都记在 follow-up。
+	//
+	// P1 起这个 follow-up 多了第二个调用方：handOverProjectGroupIfCreator
+	// （modules/group/project_cascade.go）形状完全一样——先锁创建者行，再锁
+	// 继任者扫描命中的行，而那次扫描同样没有服务其 ORDER BY 的索引。
+	// 后果同样有界（工单退避重试），但 follow-up 现在要覆盖两处，不是一处。
+	//
+	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
+	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。
+	sort.Slice(removableMembers, func(i, j int) bool {
+		return removableMembers[i].UID < removableMembers[j].UID
+	})
 	var cascadedPerLeaver []cascadedLeaver
 	alreadyCascadedBotUIDs := make(map[string]struct{})
 	for _, m := range removableMembers {
+		// 事务内、行锁下重读角色再删。
+		//
+		// 上面那次 creator 过滤读的是事务外的快照，两者之间目标可能刚好被提升为
+		// 群主（群主转让接口，或另一条清理工单的交接），而 DeleteMemberTx 的
+		// WHERE 只有 group_no + uid、没有角色守卫 —— 于是新群主被直接删掉，
+		// 群里还剩着人却没有群主，且没有任何东西会重新选主。
+		// 锁内确认仍非 creator 才删；已经变成 creator 的跳过，让调用方按
+		// Removed 计数发现并重试（见 RemoveGroupMembersServiceResp）。
+		// 自助路径（bot 所有者）在事务外只放行普通角色目标，锁内必须用同一口径：
+		// 否则窗口内 Common→Manager 的提升会通过重查、行真的被删，且 removedUIDs
+		// 里有它，连调用方的集合比对都发现不了。其余路径沿用「只排除 Creator」。
+		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
+		if err != nil {
+			s.Error("re-read member role failed", zap.Error(err), zap.String("uid", m.UID))
+			return nil, errors.New("failed to re-read member role")
+		}
+		if !stillRemovable {
+			s.Warn("成员在锁外读取后变成群主或已离群，跳过删除",
+				zap.String("groupNo", req.GroupNo), zap.String("uid", m.UID))
+			continue
+		}
 		memberVersion, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
 		if err != nil {
 			s.Error("generate member version failed", zap.Error(err))
@@ -1794,7 +2013,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		if m.Role == MemberRoleCreator {
 			continue
 		}
-		cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, req.GroupNo, m.UID, tx)
+		cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
 		if cerr != nil {
 			s.Error("cascade remove bots failed", zap.Error(cerr), zap.String("uid", m.UID))
 			return nil, errors.New("failed to cascade-remove invited bots")
@@ -1855,14 +2074,23 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		}
 
 		// 发送被踢消息
-		removeReq := &config.MsgGroupMemberRemoveReq{
-			Operator:     req.OperatorUID,
-			OperatorName: req.OperatorName,
-			GroupNo:      req.GroupNo,
-			Members:      removedVos,
-		}
-		if err := s.ctx.SendGroupMemberBeRemove(removeReq); err != nil {
-			s.Error("send group member remove notification failed", zap.Error(err))
+		switch {
+		case req.BotOwnerSelfRemoval:
+			// bot 所有者自助移除：换成 owner 视角的 Tip。仍然要发——群成员看见 bot
+			// 凭空消失有权知道原因（与 bot 级联 Tip 同一条透明度约定）。
+			if err := sendBotOwnerRemovedTip(s.ctx, req.GroupNo, req.OperatorName, removedVos); err != nil {
+				s.Error("send bot owner removed tip failed", zap.Error(err))
+			}
+		case !req.SuppressRemoveNotice:
+			removeReq := &config.MsgGroupMemberRemoveReq{
+				Operator:     req.OperatorUID,
+				OperatorName: req.OperatorName,
+				GroupNo:      req.GroupNo,
+				Members:      removedVos,
+			}
+			if err := s.ctx.SendGroupMemberBeRemove(removeReq); err != nil {
+				s.Error("send group member remove notification failed", zap.Error(err))
+			}
 		}
 
 		// 发送群成员更新 CMD
@@ -1877,9 +2105,19 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 
 		// D-2 · 级联透明度：bot 被连带移除时发系统 Tip，避免"神秘消失"。
 		// 每个 leaver 单独发一条；若 leaver 没有 bot 则跳过。
-		for _, cl := range cascadedPerLeaver {
-			if err := sendBotCascadeRemovedTip(s.ctx, req.GroupNo, cl.LeaverName, "被移出", cl.Bots); err != nil {
-				s.Error("send bot cascade removed tip failed", zap.Error(err), zap.String("leaver", cl.LeaverName))
+		//
+		// 动作词跟着**离开方式**走，不能硬编码：这条 Tip 是 NoPersist=0 的群可见消息，
+		// 把一个自愿退出的人写成「被移出」会永久留在群历史里。空串沿用「被移出」，
+		// 既有调用方（管理端踢人、bot API）行为不变。
+		if !req.SuppressBotCascadeTip {
+			cascadeAction := req.BotCascadeTipAction
+			if cascadeAction == "" {
+				cascadeAction = "被移出"
+			}
+			for _, cl := range cascadedPerLeaver {
+				if err := sendBotCascadeRemovedTip(s.ctx, req.GroupNo, cl.LeaverName, cascadeAction, cl.Bots); err != nil {
+					s.Error("send bot cascade removed tip failed", zap.Error(err), zap.String("leaver", cl.LeaverName))
+				}
 			}
 		}
 
@@ -1899,6 +2137,12 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 }
 
 // UpdateGroupInfo 更新群信息
+// errGroupGoneOrDisbanded 是"这个群已经不在了"的统一答案。
+//
+// 消息文本与之前的字面量逐字相同，因为 api.go 有两处 strings.Contains 依赖它；
+// 收成哨兵是为了让调用方能用 errors.Is 分辨，而不是继续比字符串。
+var errGroupGoneOrDisbanded = errors.New("group not found or disbanded")
+
 func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	if req.GroupNo == "" {
 		return errors.New("group_no is required")
@@ -1914,7 +2158,7 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 		return errors.New("failed to query group")
 	}
 	if groupModel == nil || groupModel.Status == GroupStatusDisband {
-		return errors.New("group not found or disbanded")
+		return errGroupGoneOrDisbanded
 	}
 
 	// 生成新版本号
@@ -1948,7 +2192,11 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	err = s.db.UpdateTx(groupModel, tx)
+	// 列级写：只动本次真正要改的列 + version。整行回写会把无锁读之后、这次提交
+	// 之前别人改掉的 status / forbidden / invite 用旧快照盖回去——其中 status 那一
+	// 项意味着一次改名可以撤销一次解散。见 UpdateNameNoticeTx 上的说明。
+	affected, err := s.db.UpdateNameNoticeTx(
+		req.GroupNo, req.Name, req.Notice, groupModel.Version, req.ExpectProjectID, tx)
 	if err != nil {
 		s.Error("update group failed", zap.Error(err))
 		return errors.New("failed to update group")
@@ -1957,6 +2205,28 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	if err := tx.Commit(); err != nil {
 		s.Error("commit transaction failed", zap.Error(err))
 		return errors.New("failed to commit transaction")
+	}
+
+	// 0 行 = 上面那条谓词把写挡住了，也就是 status 检查（无锁读）之后、这次写之前
+	// 群被解散了。数据库这时是干净的，但下面三步不是数据库：失效推送缓存、给群里
+	// 发 GroupUpdate、通知客户端刷频道。照发就等于给一个已经不存在的群推一条改名，
+	// 而接口还报成功。返回 nil 而不是错误——什么都没发生不是失败，调用方（D8 的
+	// 项目改名同步）该做的也只是安静地跳过。PR #855 第七轮 review 的 P2-1。
+	if affected == 0 {
+		// 0 行 = 状态检查（无锁读）之后、这次写之前群被解散了。
+		//
+		// 返回与"读的时候就已经解散"完全相同的错误，而不是 nil：这是同一件事，
+		// 只是发现得晚了一点。上一版返回 nil，于是人点"改群名"会拿到 200 OK，
+		// 而同一个文件里 updateAvatarCustom 对**同一个** TOCTOU 明确返回
+		// "group not found or disbanded"，理由就写在它旁边——不要对一行已经死掉的
+		// 数据报成功。一个文件里两套约定，新的那套更松。第八轮 review。
+		//
+		// D8 的项目改名同步不需要这个错误：它由 renameAllMemberGroup 吞掉
+		// （errors.Is），保持"安静跳过"。人工入口与机器入口的处置不同，而这个
+		// 差别属于调用方，不属于这里。
+		s.Warn("群信息更新未落库（群已解散），跳过全部通知",
+			zap.String("group_no", req.GroupNo))
+		return errGroupGoneOrDisbanded
 	}
 
 	// 发布群更新事件（name 和 notice 分开发送）
@@ -2030,6 +2300,12 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 		return errors.New("group not found or disbanded")
 	}
 
+	if avatarVisibleChange(groupModel, req) {
+		if err := sendGroupAvatarChangedMessage(s.ctx, req.GroupNo, req.OperatorUID, req.OperatorName); err != nil {
+			s.Error("send group avatar changed message failed", zap.String("group_no", req.GroupNo), zap.Error(err))
+		}
+	}
+
 	// 通知客户端刷新频道信息 → 重新拉取头像。
 	s.ctx.SendChannelUpdateToGroup(req.GroupNo)
 	if req.ClearUploadedAvatar {
@@ -2046,6 +2322,37 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	}
 
 	return nil
+}
+
+func avatarVisibleChange(before *Model, req *UpdateGroupAvatarCustomServiceReq) bool {
+	if before == nil {
+		return false
+	}
+	uploadedBefore := before.IsUploadAvatar == 1
+	uploadedAfter := uploadedBefore && !req.ClearUploadedAvatar
+	if uploadedBefore != uploadedAfter {
+		return true
+	}
+	if uploadedAfter {
+		return false
+	}
+
+	textAfter := before.AvatarText
+	if req.AvatarText != nil {
+		textAfter = *req.AvatarText
+	}
+	colorAfter := before.AvatarColor
+	if req.SetAvatarColor {
+		colorAfter = req.AvatarColor
+	}
+	return textAfter != before.AvatarText || !avatarColorEqual(colorAfter, before.AvatarColor)
+}
+
+func avatarColorEqual(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // ---------- Service internal helpers (thread sync, no thread package import) ----------
