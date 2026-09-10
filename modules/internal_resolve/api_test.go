@@ -13,8 +13,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
-	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 // testInternalToken is 32 bytes so it clears the minInternalTokenBytes floor
@@ -410,46 +410,70 @@ func TestResolveDriveInternalTokenRejectsShortValue(t *testing.T) {
 }
 
 func TestResolveDriveInternalTokenRejectsSiblingCollision(t *testing.T) {
-	// Use a 32-byte shared value so the length gate passes and we exercise
-	// the collision cases individually.
+	// Enumerate the shared registry rather than a hand-written sibling list,
+	// and branch on internaltoken.Yields rather than on the precedence index.
+	//
+	// The guard is directional and not uniform: the drive token yields to every
+	// env registered BEFORE it, AND to any env marked Mutual regardless of
+	// order (OCTO_MARKETPLACE_INTERNAL_TOKEN is one — #827 made that pair
+	// symmetric on purpose). Asking the registry which way a pair falls is what
+	// keeps this test correct through an appended Spec and through a Spec being
+	// marked Mutual; hard-coding either shape passes only by accident of the
+	// current ordering, and the cheapest way out of a red assertion is to
+	// delete it.
+	//
+	// Use a 32-byte shared value so the length gate passes and we exercise the
+	// collision path.
 	sharedSecret := strings.Repeat("s", minInternalTokenBytes)
-	cases := []struct {
-		name    string
-		sibling string
-	}{
-		{"notify", notifyInternalTokenEnv},
-		{"docs-notify", docsNotifyInternalToken},
-		{"bot-mention", botMentionInternalToken},
-		{"marketplace", marketplaceInternalToken},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			getenv := func(k string) string {
-				if k == DriveInternalTokenEnv || k == tc.sibling {
-					return sharedSecret
-				}
-				return ""
+	yielding, outranking := 0, 0
+	for _, sibling := range internaltoken.Envs() {
+		if sibling == DriveInternalTokenEnv {
+			continue
+		}
+		getenv := func(k string) string {
+			if k == DriveInternalTokenEnv || k == sibling {
+				return sharedSecret
 			}
-			_, err := resolveDriveInternalToken(getenv)
-			if err == nil {
-				t.Fatalf("expected error when %s == %s", DriveInternalTokenEnv, tc.sibling)
+			return ""
+		}
+		if internaltoken.Yields(DriveInternalTokenEnv, sibling) {
+			yielding++
+			t.Run("yields_to_"+sibling, func(t *testing.T) {
+				token, err := resolveDriveInternalToken(getenv)
+				if err == nil {
+					t.Fatalf("expected a refusal when %s == %s", DriveInternalTokenEnv, sibling)
+				}
+				if token != "" {
+					t.Fatalf("token = %q on collision; must be empty so the auth middleware fails closed", token)
+				}
+				if !strings.Contains(err.Error(), sibling) {
+					t.Fatalf("reason %q must name the colliding env", err.Error())
+				}
+				if strings.Contains(err.Error(), sharedSecret) {
+					t.Fatalf("reason leaked the token value: %q", err.Error())
+				}
+			})
+			continue
+		}
+		outranking++
+		t.Run("outranks_"+sibling, func(t *testing.T) {
+			// A junior, non-Mutual env is the side that gets disabled, so this
+			// endpoint keeps serving. Asserted from this module so a registry
+			// reorder — or a Spec newly marked Mutual — surfaces as a behaviour
+			// change here too.
+			token, err := resolveDriveInternalToken(getenv)
+			if err != nil {
+				t.Fatalf("unexpected refusal when the junior env %s duplicates this token: %v", sibling, err)
+			}
+			if token != sharedSecret {
+				t.Fatalf("token = %q, want the configured value", token)
 			}
 		})
 	}
-}
-
-// TestMarketplaceInternalTokenLiteralMatchesSpaceConstant pins the duplicated
-// env-name literal in config.go to the exported constant that owns it. The
-// literal exists so this module has no production dependency on modules/space;
-// the cost is that a rename over there would silently turn our collision check
-// into a comparison against an env nobody sets. This test converts that silent
-// failure into a build-time-visible one.
-func TestMarketplaceInternalTokenLiteralMatchesSpaceConstant(t *testing.T) {
-	if marketplaceInternalToken != space.MarketplaceInternalTokenEnv {
-		t.Fatalf("marketplaceInternalToken = %q, want %q (modules/space renamed the env; "+
-			"update config.go or the intra-set collision check silently stops working)",
-			marketplaceInternalToken, space.MarketplaceInternalTokenEnv)
+	if yielding == 0 {
+		t.Fatal("registry exposed no env this token yields to; the cross-capability guard would be vacuous")
 	}
+	_ = outranking
 }
 
 func TestResolveDriveInternalTokenAcceptsUnique(t *testing.T) {

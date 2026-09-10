@@ -59,6 +59,80 @@ change-log convention (§7). Newest first.
   [journal](journal/shared/project-collaboration-roles.md); reusable pagination guidance
   is staged in [learnings/pending](learnings/pending/project-collaboration-roles.md).
 
+## 2026-09-08 — internal-token-registry (PR #853 review round 2)
+
+- **Fixed (blocking, P1)** — `modules/internal_resolve/api_test.go` still
+  asserted the *symmetric* guard the registry stopped implementing when the
+  design moved to precedence. It passed only because `OCTO_DRIVE_INTERNAL_TOKEN`
+  is registered last; appending one `Spec` — the operation the package doc calls
+  "the whole change" — turned it red. Rewritten into the `yields_to_` /
+  `outranks_` two-branch shape the other two modules already used, which also
+  adds the previously-unasserted "drive keeps serving when a junior duplicates
+  its value" half.
+- **Fixed (P2)** — `Collisions` is now derived from `Resolve` instead of
+  re-deriving the comparison. It had drifted in two directions: it ignored the
+  length floor (undoing `Resolve`'s deliberate "don't name a sibling for a value
+  that is too short anyway"), and in a three-way collision it named an
+  already-disabled env as `serving_env`. The boot line no longer asserts a cause
+  it cannot verify; `SeniorServing` carries the claim as a field.
+- **Fixed (P2)** — `DefaultMinBytes` doc now records that the two sites it feeds
+  have different blast radii: a fixed env below the floor degrades
+  module-locally, a dynamic route credential below it **panics** boot. Raising
+  the constant is a rollout decision, not a one-line bump.
+- **Fixed (docs)** — five prose sites claimed the guard compares against "every
+  OTHER" / "ANY other" registered env. It compares against every env registered
+  *before* it. Corrected in `internal_resolve/config.go` ×2,
+  `bot_mention/config.go`, `notify/api.go`, `main_wiring_test.go`, and in the
+  brief's Acceptance section, which had claimed "no test edit" while the tree
+  required one.
+- **Learned** — *a design change has to sweep the prose and the tests that
+  asserted the old design, not just the code.* The symmetric→precedence switch
+  updated the implementation and two of three module tests. The third test plus
+  five comments kept asserting symmetry, and the one that was executable passed
+  by positional accident. Both reviewers found it independently; neither the
+  suite nor `golangci-lint` could.
+- **Learned** — *derive a report from the decision it reports on.* A parallel
+  re-implementation of "which envs collide" drifted from `Resolve` in two ways at
+  once; deriving it made both unrepresentable.
+
+## 2026-09-07 — internal-token-registry (extract pkg/internaltoken)
+
+- **Done** — one registry now owns the four fixed internal-token envs, the
+  `X-Internal-Token` header name and the shared 32-byte floor.
+  `Resolve(env, getenv)` enforces the floor and compares against every env
+  registered *before* it, so every unordered pair is checked exactly once and
+  appending a Spec needs no edit anywhere else. `modules/notify`,
+  `modules/bot_mention` and `modules/internal_resolve` collapse to one call each;
+  `main.go` feeds `ValidateNotifyTokenExclusions` from `internaltoken.Values`
+  and logs each colliding pair by ENV name before the card-dispatch installers,
+  so a malformed `OCTO_CARD_ACTION_ROUTES` cannot swallow the diagnostic.
+  `internal/cardactiondispatch` drops its two hardcoded `32` literals.
+- **Learned (the load-bearing one)** — the first cut made `Resolve` symmetric
+  ("one secret opens two doors, neither stays open"). It was strictly more
+  coverage and strictly worse: `NOTIFY_INTERNAL_TOKEN == OCTO_DOCS_NOTIFY_TOKEN`
+  had been disabling docs only and leaving the legacy ingress serving; symmetric
+  resolution 401s the whole `/v1/internal` notify group on the next rolling
+  deploy. Registration order as a *precedence* order keeps complete coverage AND
+  the pre-existing survivor. The ladder the four modules had built by accident
+  was the right semantics — what was wrong was that it lived in four places.
+- **Learned** — length floors are a rollout decision, not a refactor decision.
+  Three of four envs ship without the 32-byte bar and `pilote2e` proves short
+  values are in use; the waivers are explicit `MinBytes: 0` entries pinned by a
+  test rather than a silent uniform raise.
+- **Learned** — `Values`/`Collisions` panic on a nil `getenv`: returning an empty
+  slice would turn the one gate that *aborts* startup into a no-op.
+- **Gotcha (environment, not code)** — running the suite locally needs the two
+  things CI sets and a naive `go test ./...` does not: `OCTO_MASTER_KEY` and
+  `SET GLOBAL max_connections = 1000`. Skipping them produced 5 failures that
+  looked like regressions and were not. `ci/run-unit-tests.sh` +
+  `ci/run-e2e-shard.sh` already do the per-package DB drop/recreate (each package
+  registers only its own module set's migrations, so a shared ledger aborts with
+  `unknown migration in database`) and fall back to local binaries when
+  `MYSQL_CID`/`REDIS_CID` are unset — use them instead of hand-rolling a runner.
+- **Verified** — 102 packages, 0 failures via both CI lanes. `pilote2e`'s 3
+  failures (`cardtmpl ... default catalog not wired`) reproduce identically on
+  the parent commit.
+
 ## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
 
 - **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的

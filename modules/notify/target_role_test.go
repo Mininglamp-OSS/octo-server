@@ -22,6 +22,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -780,7 +781,7 @@ const tokenB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 // modules/space runs the mirror-image comparison, so a shared value fails BOTH
 // capabilities closed rather than picking an arbitrary winner.
 func TestResolveInternalTokens_MarketplaceCollisionDisablesNotifyTokens(t *testing.T) {
-	foreign := marketplaceInternalTokenEnvForExclusion
+	foreign := internaltoken.MarketplaceInternalTokenEnv
 
 	t.Run("legacy vs "+foreign, func(t *testing.T) {
 		getenv := func(k string) string {
@@ -846,10 +847,14 @@ func TestResolveInternalTokens_PreExistingForeignEnvsAreNotExcluded(t *testing.T
 }
 
 // The marketplace env spelling must track modules/space's exported constant.
-// The literal is duplicated on purpose (no production import); this pins it.
+// It no longer needs a duplicated literal to track: both names now resolve to
+// the single entry in pkg/internaltoken, so this pins that they still do.
 func TestForeignTokenEnvSpellingsMatchOwningPackages(t *testing.T) {
-	assert.Equal(t, space.MarketplaceInternalTokenEnv, marketplaceInternalTokenEnvForExclusion,
-		"modules/space renamed its token env; update the literal in modules/notify/config.go")
+	assert.Equal(t, space.MarketplaceInternalTokenEnv, internaltoken.MarketplaceInternalTokenEnv,
+		"modules/space no longer sources its token env from pkg/internaltoken; the "+
+			"spelling can drift again")
+	assert.True(t, internaltoken.Registered(internaltoken.MarketplaceInternalTokenEnv),
+		"the marketplace env must stay registered, or its Mutual collision rule stops applying")
 }
 
 // The pre-existing intra-module tie-break is preserved verbatim: legacy wins,

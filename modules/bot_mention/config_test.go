@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 func TestFeatureGate(t *testing.T) {
@@ -141,6 +143,63 @@ func TestResolveBotMentionInternalTokenLeavesPreExistingPairsAlone(t *testing.T)
 	}
 	if token != shared {
 		t.Fatalf("token = %q, want the configured value", token)
+	}
+}
+
+// TestResolveBotMentionInternalTokenCoversEverySibling pins what the shared
+// registry buys this module: the mention token is compared against every env
+// it yields to — its seniors, plus any env marked Mutual regardless of
+// registration order — not just the two the original hand-rolled switch
+// happened to list. Enumerating internaltoken.Envs() and branching on
+// internaltoken.Yields means an appended Spec, or an existing one newly marked
+// Mutual, is covered with no edit to this file.
+func TestResolveBotMentionInternalTokenCoversEverySibling(t *testing.T) {
+	const shared = "shared-internal-token-value-0000"
+	yielding := 0
+	for _, sibling := range internaltoken.Envs() {
+		if sibling == internalTokenEnv {
+			continue
+		}
+		getenv := func(key string) string {
+			if key == internalTokenEnv || key == sibling {
+				return shared
+			}
+			return ""
+		}
+		// Ask the registry which side yields rather than restating the rule:
+		// this token yields to its seniors AND to any Mutual env whatever the
+		// order. Both shapes are live today.
+		if internaltoken.Yields(internalTokenEnv, sibling) {
+			yielding++
+			t.Run("yields_to_"+sibling, func(t *testing.T) {
+				token, err := resolveBotMentionInternalToken(getenv)
+				if err == nil {
+					t.Fatalf("expected a refusal when %s == %s", internalTokenEnv, sibling)
+				}
+				if token != "" {
+					t.Fatalf("token = %q on collision; must be empty so the ingress fails closed", token)
+				}
+				if !strings.Contains(err.Error(), sibling) {
+					t.Fatalf("reason %q must name the colliding env", err.Error())
+				}
+				if strings.Contains(err.Error(), shared) {
+					t.Fatalf("reason leaked the token value: %q", err.Error())
+				}
+			})
+			continue
+		}
+		t.Run("outranks_"+sibling, func(t *testing.T) {
+			token, err := resolveBotMentionInternalToken(getenv)
+			if err != nil {
+				t.Fatalf("unexpected refusal when the junior env %s duplicates this token: %v", sibling, err)
+			}
+			if token != shared {
+				t.Fatalf("token = %q, want the configured value", token)
+			}
+		})
+	}
+	if yielding == 0 {
+		t.Fatal("registry exposed no env this token yields to; the guard would be vacuous")
 	}
 }
 

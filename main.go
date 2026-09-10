@@ -30,7 +30,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
-	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
@@ -48,6 +47,7 @@ import (
 	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	ratelimitpkg "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -385,6 +385,20 @@ func runAPI(ctx *config.Context) {
 			return ratelimitpkg.Params{}
 		}
 	})
+	// Report fixed internal-token env collisions before anything that can abort
+	// boot on unrelated config.
+	//
+	// pkg/internaltoken already disables the junior capability on its own
+	// (module-locally, without failing boot — main_carddispatch_test.go pins
+	// that contract). What a module cannot do is show the whole picture: an
+	// operator reading "docs capability disabled" as a standalone line has to
+	// work out which other env it collided with, and that the other one is
+	// still serving. This runs ahead of installCardDispatch /
+	// installCardActionDispatch precisely so that a malformed
+	// OCTO_CARD_ACTION_ROUTES cannot swallow the diagnostic: the two problems
+	// are independent, and an operator fixing the route config should not have
+	// to redeploy again to discover a capability was silently off.
+	reportFixedInternalTokenCollisions(os.Getenv)
 	// Install the one process registry before register.GetModules constructs
 	// module instances. The foundation rollout deliberately has no production
 	// producer registrations; later enablement injects only a bound Sender into
@@ -665,6 +679,27 @@ func (r *cardActionDispatchRuntime) Stop() {
 	}
 }
 
+// reportFixedInternalTokenCollisions logs one line per capability that
+// pkg/internaltoken disabled over a duplicated value, naming the env that
+// duplicated and the earlier env it duplicated. Env names only — never a value.
+//
+// The message does not claim the other env is still serving; the
+// duplicates_env_serving field says so, because a senior can be dark for its
+// own reason (a value below its floor) and an operator who rotates the wrong
+// secret on the strength of a "still serving" line leaves an ingress off.
+//
+// Log-only by design: a fixed-vs-fixed collision degrades module-locally and
+// must not fail boot (main_carddispatch_test.go). Promoting it to a boot
+// failure is a separate rollout decision.
+func reportFixedInternalTokenCollisions(getenv func(string) string) {
+	for _, collision := range internaltoken.Collisions(getenv) {
+		log.Error("fixed internal-token env disabled: its value duplicates an earlier env — give each capability its own secret",
+			zap.String("disabled_env", collision.Junior),
+			zap.String("duplicates_env", collision.Senior),
+			zap.Bool("duplicates_env_serving", collision.SeniorServing))
+	}
+}
+
 func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime, error) {
 	specs, err := cardactiondispatch.LoadRouteSpecs(os.Getenv("OCTO_CARD_ACTION_ROUTES"))
 	if err != nil {
@@ -681,55 +716,48 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 	if err != nil {
 		return nil, err
 	}
-	if err := registry.ValidateNotifyTokenExclusions(
-		os.Getenv("NOTIFY_INTERNAL_TOKEN"),
-		os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"),
-		os.Getenv("OCTO_DOCS_BOT_MENTION_TOKEN"),
-		// Cross-capability exclusion for OCTO_DRIVE_INTERNAL_TOKEN vs the
-		// dynamic route-scoped notify tokens / callback secrets loaded from
-		// OCTO_CARD_ACTION_ROUTES MUST happen here — modules/internal_resolve
-		// only sees the four fixed internal-token envs and cannot detect a
-		// collision with route-level credentials. Without this argument, an
-		// operator who accidentally sets the drive token equal to a route's
-		// notify_token_env value would pass all three local checks (drive
-		// module, registry construction, and this call), and a single leaked
-		// value would then authorize BOTH resolve-bot-owner AND route notify
-		// — breaking the "one credential / one capability" invariant.
-		//
-		// modules/internal_resolve/main_wiring_test.go asserts this argument
-		// stays present so a future refactor cannot delete it silently.
-		os.Getenv(internal_resolve.DriveInternalTokenEnv),
-		// Same reasoning for the marketplace internal token: it authorizes
-		// reading any uid's role in any Space, so if it ever equalled a route's
-		// notify_token_env value one leaked credential would grant both the
-		// Space role lookup AND route notify. Registered by qualified constant,
-		// not a literal, so main_wiring_test.go can assert it stays present.
+	// Cross-capability exclusion between the credentials this process holds and
+	// the *dynamic* route-scoped notify tokens / callback secrets loaded from
+	// OCTO_CARD_ACTION_ROUTES MUST happen here — the owning modules only see
+	// their own credentials and cannot detect a collision with route-level ones.
+	// Unlike a fixed-vs-fixed collision, this one FAILS startup: a route
+	// credential that also unlocks a fixed capability breaks the "one credential
+	// / one capability" invariant in a way no module-local degradation can
+	// contain.
+	//
+	// The fixed internal-token envs are sourced from internaltoken.Values rather
+	// than hand-written, so a capability registered there joins this check
+	// automatically instead of waiting for someone to remember to extend the
+	// argument list. modules/internal_resolve/main_wiring_test.go and
+	// modules/space/main_wiring_test.go assert that wiring stays.
+	//
+	// Two credential families are still passed explicitly, because they are NOT
+	// in that registry:
+	//
+	//   - the project provisioning secrets, which gate fleet/drive container
+	//     provisioning rather than an X-Internal-Token ingress, and which
+	//     modules/project checks on its own;
+	//   - modules/space's marketplace token, until the follow-up on PR #853
+	//     moves it into the registry.
+	//
+	// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions
+	// (modules/project/provisioning_guard_test.go) and modules/space's wiring
+	// guard assert their arguments stay present so a refactor cannot drop them.
+	//
+	// NOT covered here, stated because the absence is otherwise invisible:
+	// modules/bot_task's per-source bearer tokens live inside the
+	// OCTO_BOT_TASK_SOURCES JSON registry rather than in a single env, so no
+	// os.Getenv can reach them and they cannot be passed to this call. They are
+	// deduped only WITHIN that registry, which means a value shared between a
+	// bot_task source and any credential named here is detected by nothing.
+	// Closing it needs that module to expose its configured token values — a
+	// change there, not here.
+	if err := registry.ValidateNotifyTokenExclusions(append(
+		internaltoken.Values(os.Getenv),
 		os.Getenv(space.MarketplaceInternalTokenEnv),
-		// The two project provisioning secrets, for the same reason and with the same
-		// limitation: modules/project can check them against each other and against the
-		// four FIXED internal-token envs, but it cannot see the dynamic route-scoped
-		// notify tokens / callback secrets. Without these two arguments an operator who
-		// set a provisioning secret equal to a route's notify_token_env would pass every
-		// local check, and one leaked value would then authorize BOTH provisioning a
-		// container into fleet/drive AND minting that route's card action.
-		//
-		// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions in
-		// modules/project/provisioning_guard_test.go asserts both arguments stay present
-		// so a refactor cannot drop them silently. (This pointer exists so a future
-		// refactorer can find the guard — an earlier version named a file that does not
-		// exist, which defeats the only purpose the comment has.)
 		os.Getenv(project.ProvisionFleetSecretEnv),
 		os.Getenv(project.ProvisionDriveSecretEnv),
-		// NOT covered here, stated because the absence is otherwise invisible:
-		// modules/bot_task's per-source bearer tokens live inside the
-		// OCTO_BOT_TASK_SOURCES JSON registry rather than in a single env, so no
-		// os.Getenv can reach them and they cannot be passed to this call. They are
-		// deduped only WITHIN that registry, which means a value shared between a
-		// bot_task source and any credential named here is detected by nothing.
-		// Closing it needs that module to expose its configured token values — a
-		// change there, not here. Recorded at the call site because this is where a
-		// reader counts the arguments and concludes the set is complete.
-	); err != nil {
+	)...); err != nil {
 		return nil, err
 	}
 	// OCTO_CARD_MESSAGE_ENABLED is the deployment-level master gate (rollout /

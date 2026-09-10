@@ -6,12 +6,19 @@ package internal_resolve_test
 // that boot_config_test.go's collision cases would still pass even if the
 // production argument in main.go's ValidateNotifyTokenExclusions call were
 // deleted — because those tests build their own argument list. This test
-// closes that loop by asserting the production source itself passes the
-// drive token to the exclusions call.
+// closes that loop by asserting the production source itself feeds the drive
+// token into the exclusions call.
 //
-// It is a source-level grep rather than a runtime assertion because the
-// exclusion call happens inside installCardDispatch, which requires a real
-// config/DB/redis rig to invoke. A file grep is coarser but gives us
+// The call no longer takes a hand-written argument list: main.go passes
+// internaltoken.Values(os.Getenv), so the wiring is now two claims instead of
+// one — main.go sources its arguments from the shared registry, AND the
+// registry contains the drive token. Both are checked below; together they are
+// strictly stronger than grepping for a single literal argument, because they
+// also hold for every capability registered after this one.
+//
+// The main.go half stays a source-level grep rather than a runtime assertion
+// because the exclusion call happens inside installCardActionDispatch, which
+// takes a real route config to reach. A file grep is coarser but gives us
 // tamper-detection with zero extra fixtures.
 
 import (
@@ -20,6 +27,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 // TestMainWiresDriveTokenIntoValidateNotifyTokenExclusions guards the exact
@@ -70,19 +80,53 @@ func TestMainWiresDriveTokenIntoValidateNotifyTokenExclusions(t *testing.T) {
 		t.Fatalf("main.go: could not find balanced closing paren for ValidateNotifyTokenExclusions call")
 	}
 
-	// The critical argument: the drive token env value. Grep for the fully
-	// qualified reference to the exported constant so a future refactor that
-	// unqualifies the import or copy-pastes a stale literal cannot silently
-	// pass.
-	wantRef := "internal_resolve.DriveInternalTokenEnv"
-	if !strings.Contains(args, wantRef) {
-		t.Fatalf("main.go: registry.ValidateNotifyTokenExclusions(...) no longer includes %s\n"+
+	// Claim 1: the argument list comes from the shared registry, fed by the real
+	// process environment. Both halves matter — `internaltoken.Values(` alone
+	// would still pass for a stub lookup that yields nothing, which would make
+	// the whole gate a no-op. (pkg/internaltoken's Values panics on a nil
+	// getenv for the same reason; this catches the non-nil stubs it cannot.)
+	const wantSource = "internaltoken.Values(os.Getenv)"
+	if !strings.Contains(strings.Join(strings.Fields(args), ""), strings.ReplaceAll(wantSource, " ", "")) {
+		t.Fatalf("main.go: registry.ValidateNotifyTokenExclusions(...) no longer sources its arguments from %s\n"+
 			"Args block:\n%s\n\n"+
-			"P1 from PR #711 review requires the drive token to be checked against "+
-			"the dynamic per-route notify tokens / callback secrets loaded from "+
-			"OCTO_CARD_ACTION_ROUTES. Removing this argument reopens the "+
-			"one-credential-two-capabilities hazard.",
-			wantRef, args)
+			"P1 from PR #711 review requires the fixed internal-token envs to be checked "+
+			"against the dynamic per-route notify tokens / callback secrets loaded from "+
+			"OCTO_CARD_ACTION_ROUTES. A hand-written list reopens the "+
+			"one-credential-two-capabilities hazard the moment someone forgets an entry.",
+			wantSource, args)
+	}
+
+	// Claim 2: the drive token is actually in that registry. Without this, claim 1
+	// could hold over an empty or drive-less registry and the P1 would be back.
+	if !internaltoken.Registered(internal_resolve.DriveInternalTokenEnv) {
+		t.Fatalf("%s is not in pkg/internaltoken's registry; main.go's exclusion gate "+
+			"therefore never sees it, reopening the one-credential-two-capabilities hazard",
+			internal_resolve.DriveInternalTokenEnv)
+	}
+}
+
+// TestDriveTokenIsRegisteredWithSiblings pins the precondition this module used
+// to hand-roll for itself: the drive token is in the shared registry alongside
+// the other fixed internal-token envs, so Resolve compares it against its
+// seniors and any capability added later yields to it. Enumerating the registry
+// means an appended env needs no edit here.
+//
+// This asserts membership, not the comparison itself — that is
+// TestResolveDriveInternalTokenRejectsSiblingCollision's job, and it branches on
+// the precedence index because the guard is directional.
+func TestDriveTokenIsRegisteredWithSiblings(t *testing.T) {
+	envs := internaltoken.Envs()
+	if len(envs) < 2 {
+		t.Fatalf("registry holds %d envs; the cross-capability guard would be vacuous", len(envs))
+	}
+	found := false
+	for _, env := range envs {
+		if env == internal_resolve.DriveInternalTokenEnv {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%s missing from internaltoken.Envs() = %v", internal_resolve.DriveInternalTokenEnv, envs)
 	}
 }
 

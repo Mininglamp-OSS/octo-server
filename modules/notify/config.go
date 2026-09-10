@@ -1,5 +1,11 @@
 package notify
 
+import (
+	"errors"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
+)
+
 // Internal-token resolution for modules/notify.
 //
 // # What this file adds, and what it deliberately leaves alone
@@ -10,23 +16,23 @@ package notify
 // process env — the same shape modules/internal_resolve, modules/bot_mention
 // and modules/space already use.
 //
-// The one NEW rule is the exclusion against OCTO_MARKETPLACE_INTERNAL_TOKEN,
-// the single fixed internal-token env this change introduces
-// (modules/space.MarketplaceInternalTokenEnv). modules/space refuses to enable
-// the Space role lookup on a value shared with either notify credential; this
-// is the mirror-image half, so a deployment that sets one value for both fails
-// BOTH capabilities closed instead of picking an arbitrary winner and leaving
-// the leaked value serving here.
+// Both rules now come from pkg/internaltoken rather than from branches here:
 //
-// Scope note: the exclusion set is deliberately NOT extended to the other
-// pre-existing fixed internal-token envs (OCTO_DOCS_BOT_MENTION_TOKEN,
-// OCTO_DRIVE_INTERNAL_TOKEN). Those pairs predate this change; switching a
-// currently-serving deployment's notify path off is not something a marketplace
-// feature gets to do as a side effect.
+//   - the intra-module tie-break (OCTO_DOCS_NOTIFY_TOKEN yields to
+//     NOTIFY_INTERNAL_TOKEN) is the registry's precedence rule, in the same
+//     direction this file used to hand-roll it;
+//   - the exclusion against OCTO_MARKETPLACE_INTERNAL_TOKEN is that Spec's
+//     Mutual flag, which disables BOTH sides — the mirror-image behaviour #827
+//     introduced, expressed once instead of in four modules.
 //
-// Comparison is byte-exact on the raw env values, matching modules/space,
-// modules/bot_mention and modules/internal_resolve. No normalization is applied
-// anywhere in this file: the tokens returned here are what
+// The pre-existing pairs against OCTO_DOCS_BOT_MENTION_TOKEN and
+// OCTO_DRIVE_INTERNAL_TOKEN keep behaving exactly as they did: both are
+// registered after these two envs and are not Mutual, so they are the side that
+// yields. Switching a currently-serving deployment's notify path off is still
+// not something this file does.
+//
+// Comparison is byte-exact on the raw env values, in pkg/internaltoken as it
+// was here. No normalization is applied anywhere: the tokens returned here are what
 // internalAuthMiddleware compares against the request header, and
 // NOTIFY_INTERNAL_TOKEN / OCTO_DOCS_NOTIFY_TOKEN are pre-existing production
 // credentials whose accepted bytes must not change. Trimming on one side only
@@ -39,31 +45,11 @@ package notify
 // §5.1 describes it as such.
 
 const (
-	notifyInternalTokenEnv     = "NOTIFY_INTERNAL_TOKEN"
-	docsNotifyInternalTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
-
-	// marketplaceInternalTokenEnvForExclusion is
-	// modules/space.MarketplaceInternalTokenEnv. Duplicated as a literal rather
-	// than imported, matching modules/internal_resolve/config.go and
-	// modules/bot_mention/config.go: no module should take a production
-	// dependency on another just to learn a string. The spelling is pinned
-	// against the owning package by a test.
-	marketplaceInternalTokenEnvForExclusion = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
+	// The two notify credentials, sourced from the shared registry so their
+	// spellings cannot drift from the entry the collision check compares.
+	notifyInternalTokenEnv     = internaltoken.NotifyInternalTokenEnv
+	docsNotifyInternalTokenEnv = internaltoken.DocsNotifyTokenEnv
 )
-
-// collidesWithForeignFixedToken reports the foreign env name a non-empty token
-// collides with, or "" when it is clean. An empty token never "collides":
-// unset already means the capability is disabled, and reporting a collision
-// between two unset envs would produce a confusing boot error.
-func collidesWithForeignFixedToken(token string, getenv func(string) string) string {
-	if token == "" || getenv == nil {
-		return ""
-	}
-	if getenv(marketplaceInternalTokenEnvForExclusion) == token {
-		return marketplaceInternalTokenEnvForExclusion
-	}
-	return ""
-}
 
 // resolveInternalTokens loads NOTIFY_INTERNAL_TOKEN and OCTO_DOCS_NOTIFY_TOKEN
 // and returns them alongside human-readable, logger-safe diagnostics (never
@@ -77,35 +63,31 @@ func resolveInternalTokens(getenv func(string) string) (token, docsToken string,
 	if getenv == nil {
 		return "", "", nil, []string{"internal token lookup unavailable; notify internal API disabled"}
 	}
-	token = getenv(notifyInternalTokenEnv)
-	docsToken = getenv(docsNotifyInternalTokenEnv)
 
-	if token == "" {
-		warnings = append(warnings,
-			notifyInternalTokenEnv+" not set — internal API will reject all requests")
-	}
-	if docsToken == "" {
-		warnings = append(warnings,
-			docsNotifyInternalTokenEnv+" not set — docs notification requests will be rejected")
+	// resolve runs one env through the shared registry, which enforces the
+	// length floor and compares the value against every env registered BEFORE
+	// it. For NOTIFY_INTERNAL_TOKEN (registered first) that is nothing; for
+	// OCTO_DOCS_NOTIFY_TOKEN it is the legacy token — i.e. exactly the
+	// intra-module tie-break this function used to run by hand, in the same
+	// direction. An unset env is a normal deployment shape and reports as a
+	// warning; a collision or an undersized value is an operator mistake that
+	// silently turns an ingress off, and reports as a boot error.
+	resolve := func(env string) string {
+		value, err := internaltoken.Resolve(env, getenv)
+		if err == nil {
+			return value
+		}
+		var resolveErr *internaltoken.Error
+		if errors.As(err, &resolveErr) && resolveErr.Reason == internaltoken.ReasonUnset {
+			warnings = append(warnings, err.Error())
+			return ""
+		}
+		bootErrors = append(bootErrors, err.Error())
+		return ""
 	}
 
-	// Pre-existing intra-module tie-break, unchanged. Runs first so the docs
-	// token is already cleared before the foreign check looks at it.
-	if token != "" && docsToken == token {
-		bootErrors = append(bootErrors, docsNotifyInternalTokenEnv+" must differ from "+
-			notifyInternalTokenEnv+"; docs capability disabled")
-		docsToken = ""
-	}
+	token = resolve(notifyInternalTokenEnv)
+	docsToken = resolve(docsNotifyInternalTokenEnv)
 
-	if env := collidesWithForeignFixedToken(token, getenv); env != "" {
-		bootErrors = append(bootErrors, notifyInternalTokenEnv+" must differ from "+env+
-			"; legacy notify capability disabled")
-		token = ""
-	}
-	if env := collidesWithForeignFixedToken(docsToken, getenv); env != "" {
-		bootErrors = append(bootErrors, docsNotifyInternalTokenEnv+" must differ from "+env+
-			"; docs notify capability disabled")
-		docsToken = ""
-	}
 	return token, docsToken, warnings, bootErrors
 }

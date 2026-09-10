@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 )
 
 type ResolutionKind string
@@ -298,16 +300,16 @@ func validateRouteSpec(spec RouteSpec, getenv func(string) string) error {
 	if !secretEnvPattern.MatchString(spec.SecretEnv) {
 		return errors.New("invalid secret_env")
 	}
-	if len(getenv(spec.SecretEnv)) < 32 {
-		return errors.New("callback secret must contain at least 32 bytes")
+	if len(getenv(spec.SecretEnv)) < internaltoken.DefaultMinBytes {
+		return fmt.Errorf("callback secret must contain at least %d bytes", internaltoken.DefaultMinBytes)
 	}
 	if spec.NotifyTokenEnv != "" {
 		if !secretEnvPattern.MatchString(spec.NotifyTokenEnv) {
 			return errors.New("invalid notify_token_env")
 		}
 		notifyToken := getenv(spec.NotifyTokenEnv)
-		if len(notifyToken) < 32 {
-			return errors.New("notify token must contain at least 32 bytes")
+		if len(notifyToken) < internaltoken.DefaultMinBytes {
+			return fmt.Errorf("notify token must contain at least %d bytes", internaltoken.DefaultMinBytes)
 		}
 		if spec.NotifyTokenEnv == spec.SecretEnv || notifyToken == getenv(spec.SecretEnv) {
 			return errors.New("notify token must differ from callback secret")

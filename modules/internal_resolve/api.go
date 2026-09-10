@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
@@ -67,7 +68,16 @@ func New(ctx *config.Context) *Module {
 	logger := log.NewTLog("InternalResolve")
 	token, tokenErr := resolveDriveInternalToken(os.Getenv)
 	if tokenErr != nil {
-		logger.Error(tokenErr.Error())
+		// An unset env is a normal deployment shape (a deployment without the
+		// drive integration); a collision or an undersized value is an operator
+		// mistake that silently turns this endpoint off. Splitting the levels
+		// keeps ERROR meaning "someone needs to look at this".
+		var resolveErr *internaltoken.Error
+		if errors.As(tokenErr, &resolveErr) && resolveErr.Reason == internaltoken.ReasonUnset {
+			logger.Warn(tokenErr.Error())
+		} else {
+			logger.Error(tokenErr.Error())
+		}
 	}
 	return &Module{
 		ctx:           ctx,
@@ -156,9 +166,11 @@ func (m *Module) Route(r *wkhttp.WKHttp) {
 	)
 }
 
-// internalAuthMiddleware fails closed when the token is unset (matches
-// modules/notify/api.go:207-232) and uses constant-time comparison to defeat
-// timing side-channels (same guarantee as modules/bot_mention/api.go:79).
+// internalAuthMiddleware fails closed when the token is unset (matching
+// notify.internalAuthMiddleware and bot_mention's equivalent) and uses
+// constant-time comparison to defeat timing side-channels. Referenced by name
+// rather than by line number so the cross-reference survives edits to those
+// files.
 func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		token := c.GetHeader(internalTokenHeader)

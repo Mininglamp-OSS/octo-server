@@ -108,9 +108,16 @@ a network zone, or a public boundary.
 `notify_token_env` is optional for callback-only routes whose initial card is
 produced elsewhere. When present, it dynamically installs an `octo/v2`,
 DM-only producer bound to the route owner and the shared `notification` sender.
-The token must differ from the callback secret, `NOTIFY_INTERNAL_TOKEN`, every
-other owner token, and `OCTO_DOCS_NOTIFY_TOKEN`. The producer only sends cards
-while `OCTO_CARD_MESSAGE_ENABLED` is `true`.
+The token must differ from the callback secret, from every other owner token,
+and from **every fixed internal-token env** — the registry in
+`pkg/internaltoken` is the authoritative list, so this doc does not repeat it
+(today: `NOTIFY_INTERNAL_TOKEN`, `OCTO_DOCS_NOTIFY_TOKEN`,
+`OCTO_DOCS_BOT_MENTION_TOKEN`, `OCTO_DRIVE_INTERNAL_TOKEN`). Reusing one of
+those values is not a warning: startup aborts with `cardactiondispatch: action
+notify token conflicts with an existing notify token`, because a route
+credential that also unlocks a fixed capability breaks the "one credential /
+one capability" invariant. The producer only sends cards while
+`OCTO_CARD_MESSAGE_ENABLED` is `true`.
 
 `OCTO_CARD_MESSAGE_ENABLED` is the deployment-level master gate. With it off
 (unset or `false`) octo-server still starts with routes left in the config: the

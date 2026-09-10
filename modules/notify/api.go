@@ -27,12 +27,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/internaltoken"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
 // InternalTokenHeader is the header key for internal service authentication.
-const InternalTokenHeader = "X-Internal-Token"
+// Owned by pkg/internaltoken alongside the env names, so the credential family
+// has one spelling; re-exported here because callers outside this module
+// already reference notify.InternalTokenHeader.
+const InternalTokenHeader = internaltoken.Header
 
 const notifyCapabilityContextKey = "octo.notify.capability"
 
