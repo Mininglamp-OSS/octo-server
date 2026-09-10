@@ -65,7 +65,7 @@ func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 	if keys, err := rds.Keys("ratelimit:uid:*").Result(); err == nil && len(keys) > 0 {
 		_ = rds.Del(keys...).Err()
 	}
-	_ = rds.Del(etlRunLockKey).Err()
+	_ = rds.Del(etlRunLockKeyFor(ctx.GetConfig().DB.MySQLAddr)).Err()
 }
 
 func setSuperAdminToken(t *testing.T, ctx *config.Context) {
