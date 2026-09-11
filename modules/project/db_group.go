@@ -101,6 +101,18 @@ const sqlListMyProjectGroupsByProjectIDs = "SELECT g.project_id, " + projectGrou
 	"WHERE g.space_id = ? AND g.project_id IN ?" + projectGroupActiveMembershipPredicate +
 	"ORDER BY g.project_id ASC, g.id ASC"
 
+const sqlListProjectGroupRelationsByProjectIDs = "SELECT g.project_id, g.group_no, g.name, g.project_linked_by, " +
+	"IFNULL(s.pinned, 0) AS pinned " +
+	"FROM `group` g LEFT JOIN `octo_project_group_user_setting` s ON " +
+	"s.space_id = g.space_id COLLATE utf8mb4_general_ci " +
+	"AND s.project_id = g.project_id COLLATE utf8mb4_general_ci " +
+	"AND s.group_no = g.group_no COLLATE utf8mb4_general_ci " +
+	"AND s.uid = ? " +
+	"WHERE g.space_id = ? AND g.project_id IN ? AND g.status <> ? " +
+	"ORDER BY g.project_id ASC, IFNULL(s.pinned, 0) DESC, " +
+	"CASE WHEN s.pinned = 1 THEN s.pinned_at END DESC, " +
+	"g.id ASC, g.group_no ASC"
+
 // listMyProjectGroups returns the LIVE groups of one project that uid is an
 // active member of, oldest first.
 //
@@ -113,9 +125,9 @@ const sqlListMyProjectGroupsByProjectIDs = "SELECT g.project_id, " + projectGrou
 // granularity. There is no self-join path into a group either, so the wider list
 // would not even be actionable.
 //
-// The relation endpoint has its own Project-wide projection below. This legacy
-// helper remains deliberately native-membership-scoped for category/sidebar
-// surfaces that render actual chat rooms.
+// The relation endpoint and unified sidebar use the Project-wide relation
+// projection below. This legacy helper remains native-membership-scoped for
+// callers that render actual chat rooms.
 //
 // # Disbanded groups are excluded, and that filter is load-bearing
 //
@@ -221,10 +233,10 @@ func (d *DB) countActiveGroupMembers(groupNos []string) (map[string]int, error) 
 	return counts, nil
 }
 
-// listMyProjectGroupResponses owns the complete response construction used by
-// both the HTTP endpoint and the sidebar. Keeping the mapper beside the
-// membership-scoped query prevents the two surfaces from drifting on fields,
-// visibility, or member counts.
+// listMyProjectGroupResponses owns the complete response construction for the
+// legacy native-membership-scoped projection. Keeping the mapper beside the
+// membership-scoped query prevents those callers from drifting on fields or
+// member counts; the relation-only endpoint and sidebar use ProjectGroupRelation.
 func (d *DB) listMyProjectGroupResponses(spaceID, projectID, uid string, offset, limit int) ([]*GroupResp, error) {
 	rows, err := d.listMyProjectGroups(spaceID, projectID, uid, offset, limit)
 	if err != nil {
@@ -257,10 +269,10 @@ func projectGroupResponse(row *projectGroupRow, memberCount int) *GroupResp {
 	}
 }
 
-// listMyProjectGroupResponsesByProjectIDs returns the same membership-scoped
-// projection as listMyProjectGroupResponses for multiple Projects. It executes
-// one group query and one grouped member-count query regardless of Project
-// count, then applies the endpoint's per-Project page limit in memory.
+// listMyProjectGroupResponsesByProjectIDs returns the same legacy
+// membership-scoped projection as listMyProjectGroupResponses for multiple
+// Projects. It executes one group query and one grouped member-count query
+// regardless of Project count, then applies the per-Project page limit in memory.
 func (d *DB) listMyProjectGroupResponsesByProjectIDs(spaceID, uid string, projectIDs []string, limit int) (map[string][]*GroupResp, error) {
 	result := make(map[string][]*GroupResp, len(projectIDs))
 	for _, projectID := range projectIDs {
@@ -304,8 +316,9 @@ func (d *DB) listMyProjectGroupResponsesByProjectIDs(spaceID, uid string, projec
 }
 
 // ListMyProjectGroups is the in-process legacy native-membership-scoped
-// projection used by category/sidebar chat-room surfaces. It is intentionally
-// not the relation-only GET /v1/projects/:project_id/groups endpoint.
+// projection for callers that render actual chat-room surfaces. It is
+// intentionally not the relation-only GET /v1/projects/:project_id/groups
+// endpoint or the unified sidebar projection.
 //
 // It follows the legacy default page, including its 50-row bound.
 func ListMyProjectGroups(ctx *config.Context, spaceID, projectID, uid string) ([]*GroupResp, error) {
@@ -316,9 +329,9 @@ func ListMyProjectGroups(ctx *config.Context, spaceID, projectID, uid string) ([
 	return db.listMyProjectGroupResponses(spaceID, projectID, uid, 0, projectDefaultPageLimit)
 }
 
-// ListMyProjectGroupsByProjectIDs is the batched legacy sidebar equivalent of
-// ListMyProjectGroups. Each Project keeps the default 50-row bound while the
-// database cost remains two queries for the whole request.
+// ListMyProjectGroupsByProjectIDs is the batched legacy native-membership
+// projection. The unified sidebar uses ListProjectGroupRelationsByProjectIDs
+// instead, while this helper remains available for legacy GroupResp callers.
 func ListMyProjectGroupsByProjectIDs(ctx *config.Context, spaceID, uid string, projectIDs []string) (map[string][]*GroupResp, error) {
 	if ctx == nil {
 		return map[string][]*GroupResp{}, nil
@@ -344,6 +357,16 @@ type projectGroupRelationRow struct {
 	ProjectID     string  `db:"project_id"`
 	ProjectLinked *string `db:"project_linked_by"`
 	Pinned        bool    `db:"pinned"`
+}
+
+func projectGroupRelationFromRow(row *projectGroupRelationRow) ProjectGroupRelation {
+	return ProjectGroupRelation{
+		GroupNo:   row.GroupNo,
+		Name:      row.Name,
+		ProjectID: row.ProjectID,
+		LinkedBy:  normalizedProjectLinkedBy(row.ProjectLinked),
+		Pinned:    row.Pinned,
+	}
 }
 
 // projectGroupLike escapes LIKE metacharacters while keeping the query's
@@ -422,19 +445,121 @@ func (d *DB) listProjectGroupRelations(
 		if row == nil {
 			continue
 		}
-		linkedBy := normalizedProjectLinkedBy(row.ProjectLinked)
-		result = append(result, ProjectGroupRelation{
-			GroupNo:   row.GroupNo,
-			Name:      row.Name,
-			ProjectID: row.ProjectID,
-			LinkedBy:  linkedBy,
-			Pinned:    row.Pinned,
-		})
+		result = append(result, projectGroupRelationFromRow(row))
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, 0, fmt.Errorf("%w: commit Project group list: %v", ErrGroupProjectDependency, err)
 	}
 	return result, total, nil
+}
+
+// listProjectGroupRelationsByProjectIDs returns the relation-only projection used
+// by the sidebar for every requested Project. Only Projects where the caller has
+// an active seat receive groups; a visible Space-listed Project pinned without a
+// Project seat remains an empty entry.
+//
+// The authorization predicates are evaluated once for the caller and the active
+// Project set, while each Project keeps the relation endpoint's default page
+// bound and pinned-first ordering.
+func (d *DB) listProjectGroupRelationsByProjectIDs(
+	ctx context.Context, spaceID, actorUID string, projectIDs []string, limit int,
+) (map[string][]ProjectGroupRelation, error) {
+	result := make(map[string][]ProjectGroupRelation, len(projectIDs))
+	for _, projectID := range projectIDs {
+		result[projectID] = make([]ProjectGroupRelation, 0)
+	}
+	if d == nil || d.session == nil {
+		return nil, fmt.Errorf("project: group relation database unavailable")
+	}
+	spaceID = strings.TrimSpace(spaceID)
+	actorUID = strings.TrimSpace(actorUID)
+	if spaceID == "" || actorUID == "" || len(projectIDs) == 0 {
+		return result, nil
+	}
+	if limit <= 0 {
+		limit = projectDefaultPageLimit
+	}
+
+	tx, err := d.session.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: begin sidebar Project group list: %v", ErrGroupProjectDependency, err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	activeSeat, err := queryGroupProjectSpaceSeatTx(tx, spaceID, actorUID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: check Space seat: %v", ErrGroupProjectDependency, err)
+	}
+	if !activeSeat {
+		return result, nil
+	}
+	activeUser, err := queryGroupProjectUserEligibleTx(tx, actorUID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: check user: %v", ErrGroupProjectDependency, err)
+	}
+	if !activeUser {
+		return result, nil
+	}
+
+	var activeProjectIDs []string
+	_, err = tx.SelectBySql(
+		"SELECT p.project_id FROM `octo_project` p "+
+			"INNER JOIN `octo_project_member` pm ON pm.project_id = p.project_id "+
+			"AND pm.space_id = p.space_id "+
+			"WHERE p.space_id = ? AND p.status = ? AND pm.uid = ? "+
+			"AND pm.status = ? AND pm.removing = 0 AND p.project_id IN ? "+
+			"ORDER BY p.project_id ASC",
+		spaceID, StatusNormal, actorUID, MemberStatusActive, projectIDs,
+	).Load(&activeProjectIDs)
+	if err != nil {
+		return nil, fmt.Errorf("%w: list sidebar Project memberships: %v", ErrGroupProjectDependency, err)
+	}
+	if len(activeProjectIDs) == 0 {
+		return result, nil
+	}
+
+	query := sqlListProjectGroupRelationsByProjectIDs
+	var rows []*projectGroupRelationRow
+	if _, err := tx.SelectBySql(query, actorUID, spaceID, activeProjectIDs, groupStatusDisband).Load(&rows); err != nil {
+		return nil, fmt.Errorf("%w: list sidebar Project groups: %v", ErrGroupProjectDependency, err)
+	}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		groups, ok := result[row.ProjectID]
+		if !ok || len(groups) >= limit {
+			continue
+		}
+		groups = append(groups, projectGroupRelationFromRow(row))
+		result[row.ProjectID] = groups
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("%w: commit sidebar Project group list: %v", ErrGroupProjectDependency, err)
+	}
+	return result, nil
+}
+
+// ListProjectGroupRelationsByProjectIDs is the batched relation-only projection
+// used by the category sidebar. A requested Project without an active seat for
+// uid receives an empty slice, matching the sidebar's pinned Space-listed view.
+func ListProjectGroupRelationsByProjectIDs(
+	ctx *config.Context, spaceID, uid string, projectIDs []string,
+) (map[string][]ProjectGroupRelation, error) {
+	result := make(map[string][]ProjectGroupRelation, len(projectIDs))
+	for _, projectID := range projectIDs {
+		result[projectID] = make([]ProjectGroupRelation, 0)
+	}
+	if ctx == nil {
+		return result, nil
+	}
+	db := NewDB(ctx)
+	return db.listProjectGroupRelationsByProjectIDs(
+		context.Background(), spaceID, uid, projectIDs, projectDefaultPageLimit,
+	)
 }
 
 func normalizedProjectLinkedBy(value *string) *string {

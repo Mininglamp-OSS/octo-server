@@ -147,7 +147,7 @@ func (c *Category) sidebarSections(uid, spaceID string) ([]sidebarSectionResp, e
 	for _, section := range projects {
 		projectIDs = append(projectIDs, section.ProjectID)
 	}
-	groupsByProject, err := projectmod.ListMyProjectGroupsByProjectIDs(c.ctx, spaceID, uid, projectIDs)
+	groupsByProject, err := projectmod.ListProjectGroupRelationsByProjectIDs(c.ctx, spaceID, uid, projectIDs)
 	if err != nil {
 		return nil, fmt.Errorf("list project groups for sidebar sections: %w", err)
 	}

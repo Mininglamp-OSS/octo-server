@@ -65,11 +65,9 @@ interface ProjectPayload {
 interface ProjectGroup {
   group_no: string;
   name: string;
-  is_named: number;            // 0 | 1
-  avatar_text: string;
-  avatar_color: number | null;
-  is_upload_avatar: number;    // 0 | 1
-  member_count: number;
+  project_id: string;
+  linked_by: string | null;
+  pinned: boolean;
 }
 
 interface SidebarSectionSortItem {
@@ -84,8 +82,8 @@ interface SidebarSectionSortItem {
 - `id` 必须等于对应对象中的 `category_id` 或 `project_id`。
 - 客户端应直接采用响应数组顺序。`sort` 用于表达服务端顺序，但不应假设其永久连续或唯一。
 - `groups` 始终是数组；没有数据时为 `[]`，不是 `null`。
-- Project 的 `groups` 与 `GET /v1/projects/{project_id}/groups` 默认第一页口径一致，
-  最多返回 50 条。需要更多群时继续调用原 Project groups 分页接口。
+- 对当前 Project 成员，Project 的 `groups` 与 `GET /v1/projects/{project_id}/groups` 默认第一页口径一致：
+  返回当前 Project 的全部存活关联群，不按调用者是否有原生 `group_member` 席位过滤，最多返回 50 条。需要更多群时继续调用原 Project groups 分页接口。
 - `groups[0]` 不保证是全员群。如 UI 要固定全员群在首位，请比较
   `group_no === all_member_group_no` 后由客户端排序。
 
@@ -132,11 +130,9 @@ HTTP `200`，响应体为数组，不额外包裹 `data`：
         {
           "group_no": "group-all-001",
           "name": "全员群",
-          "is_named": 0,
-          "avatar_text": "",
-          "avatar_color": null,
-          "is_upload_avatar": 0,
-          "member_count": 12
+          "project_id": "project-001",
+          "linked_by": null,
+          "pinned": false
         }
       ]
     }

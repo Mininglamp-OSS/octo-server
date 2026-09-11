@@ -7,7 +7,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The group list's execution plan, asserted rather than reasoned about.
+// The legacy native-membership group list's execution plan is asserted rather
+// than reasoned about.
 //
 // PR #861's review rounds asked for this twice and I deferred it twice, on the
 // grounds that `group` is empty in CI so the assertion would be weak. That reason
@@ -17,11 +18,11 @@ import (
 // accessTypeOf, all_member_group_plan_test.go), landed for a different predicate.
 //
 // The property is worth a guard for the same reason that predicate's was: the
-// statement is a user-facing paginated GET, and the failure mode is silent. A later
-// edit that drops `g.space_id` — the LEADING column of group_space_project, which
-// db_group.go's comment calls the Space isolation boundary rather than decoration —
-// degrades the request from an index range to a scan of a core IM table with
-// nothing red anywhere.
+// statement is a user-facing chat-room projection, and the failure mode is silent.
+// A later edit that drops `g.space_id` — the LEADING column of group_space_project,
+// which db_group.go's comment calls the Space isolation boundary rather than
+// decoration — degrades the request from an index range to a scan of a core IM
+// table with nothing red anywhere.
 func TestTheProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
 	setup(t)
 	p := New(testCtx)
@@ -60,17 +61,25 @@ func TestTheProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
 func TestTheBatchProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
 	setup(t)
 	p := New(testCtx)
-	rows := explainRows(t, p.db.session, sqlListMyProjectGroupsByProjectIDs,
-		"plan_probe_space", []string{"plan_probe_project_a", "plan_probe_project_b"},
-		groupStatusDisband, "plan_probe_uid", 1)
+	rows := explainRows(t, p.db.session, sqlListProjectGroupRelationsByProjectIDs,
+		"plan_probe_uid", "plan_probe_space",
+		[]string{"plan_probe_project_a", "plan_probe_project_b"}, groupStatusDisband)
 
-	require.NotEmpty(t, rows)
+	var groupRows int
 	for _, row := range rows {
+		if derefOr(row.Table, "") != "g" {
+			continue
+		}
+		groupRows++
 		assert.NotEqual(t, "ALL", derefOr(row.Type, ""),
-			"the batched sidebar Project-group list must not scan table %q", derefOr(row.Table, ""))
+			"the batched Sidebar Project relation list must not scan table %q", derefOr(row.Table, ""))
 		assert.NotEmpty(t, derefOr(row.Key, ""),
-			"the batched sidebar Project-group list must use an index for table %q", derefOr(row.Table, ""))
+			"the batched Sidebar Project relation list must use an index for table %q", derefOr(row.Table, ""))
 	}
+	require.Equal(t, 1, groupRows, "EXPLAIN must include the related group table")
+	assert.Equal(t, "group_space_project", indexChosenFor(t, rows, "g"),
+		"the relation list must use the Space+Project group index")
+
 }
 
 // TestThePinQuotaCountReachesItsRowsByAnIndex covers the other statement this PR

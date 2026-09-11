@@ -10,6 +10,9 @@
 - 新增 Project 成员单查 `GET /v1/projects/:project_id/members/:uid`：沿用 `MemberResp` 列表投影和 Project 角色，按 `project_id + uid` 直接有界读取；同一 RR 只读事务复核调用者组织/Project 成员资格，未知或已移除目标返回既有 not-found，目标账号/Space 状态不额外改变成员列表语义，响应仅是 Project 关系事实而非 Drive 授权决定；Drive 可用原始用户 session `token` 携带路径 selector 获取关系事实。
 - `GET /v1/group/my` 的 `role=owner|admin|owner,admin` 筛选与 `space_id` 组合收口，先校验 active Space 并排除解散群、非活跃成员、外部管理脏角色及已撤权 Space；无 `role` 保持旧查询，仅补齐群角色回填。
 - PR887 review fixes：置顶配额与 membership-only 可见性对齐，移除/closing 的历史 pin 不再耗尽用户在该 Space 的槽位；达到上限后仍可置顶新的可见 Project。
+- 统一 Sidebar 的 Project 内容与 `GET /v1/projects/:project_id/groups` 的
+  `ProjectGroupRelation` 投影：返回 Project 的存活关联群，不再按调用者的原生
+  `group_member` 席位过滤，同时保留 Project 成员授权、置顶排序和默认 50 条上限。
 - Project-backed 建群将非成员、禁用目标和跨 Space 等预期拒绝返回本地化 D14 4xx envelope（legacy wire status 仍为 400），`POST /v1/group/create` 同时接入共享 UID 限流；原生群管理门和 active 角色冲突的整批原子拒绝补齐回归覆盖。
 
 ## [v1.1.2] - 2026-03-05

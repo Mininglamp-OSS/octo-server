@@ -23,7 +23,7 @@ source: self
 > | | |
 > |---|---|
 > | **Confirmed** (requester, 2026-09-09) | The prototype mapping (Background §1); Project-group ↔ manual-category **mutual exclusion** (D3); category stays a per-user private view, never shared/admin-managed; Project creation, admission, and #861 pin each add the Project to the caller's 关注; explicit unpin removes it even while the caller remains a Project member; every Sidebar-facing `project_id` in this task is paired with `project_name` |
-> | **Implemented in this task** | D1 (new ordering table), D2 (reuse the shipped project-groups query), D3 (mutual exclusion), D4 (auto-provision on create+admit+pin and hide on unpin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
+> | **Implemented in this task** | D1 (new ordering table), D2 (reuse the final Project-group relation projection), D3 (mutual exclusion), D4 (auto-provision on create+admit+pin and hide on unpin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
 > | **Deferred / unchanged** | D6 (`SidebarItem.ProjectID *string`) remains gated on Q2; D7 (全员群 pinning) remains a client concern |
 > | **Open** | Q2–Q4 |
 >
@@ -35,10 +35,12 @@ The 关注 (Follow) tab's top-level list becomes **one user-orderable sequence
 whose entries are of two kinds**: the caller's manually-created categories,
 and eligible Projects. Both are draggable against each other in one order. An
 eligible Project is one the caller actively belongs to, or a Space-listed
-Project they explicitly pinned under #861; only its group contents are
-determined by the caller's Project membership — automatic, never user-curated
-— and a group that belongs to a Project can never also be filed into one of the
-caller's own categories.
+Project they explicitly pinned under #861; an eligible Project's group contents
+are authorized by the caller's active Project membership — automatic, never
+user-curated. Once authorized, the contents are the Project's live associated
+groups, regardless of whether the caller has a native `group_member` seat; a
+group that belongs to a Project can never also be filed into one of the caller's
+own categories.
 Creating or joining a Project auto-adds its entry to the caller's list, the
 way a default category is auto-provisioned today. A successful #861 pin does
 the same: a Space member may pin a Space-listed Project without receiving a
@@ -92,9 +94,10 @@ Confirmed against the 2026-09-09 prototype screenshot by the requester:
   = 直属 Space, never `NULL`. Index `group_space_project (space_id, project_id)`
   at `:78`.
 - `GET /v1/projects/:project_id/groups` (`project-p2-product-surfaces` D1-D3,
-  `modules/project/api_group.go:41`) already answers "which groups in this
-  Project am I in": membership-scoped, disbanded-excluded, blacklist-aware,
-  narrow field set.
+  `modules/project/api_group.go:41`) answers which live groups are associated
+  with this Project: Project-relation-scoped, disbanded-excluded, pinned-first,
+  and independent of the caller's native `group_member` seat. Its narrow
+  `ProjectGroupRelation` field set is the shared Sidebar contract.
 - `POST /v1/sidebar/sync` (`modules/message/api_sidebar.go:189-196`, `tab` ∈
   {`follow`,`recent`}) is the endpoint behind the screenshot. Its `SidebarItem`
   (`:107-152`) carries `CategoryID *string` and `ProjectID string` as two
@@ -119,9 +122,10 @@ what makes it a peer and not a filter.
   「Project is explicitly not a read boundary — Space remains the only
   security boundary」. The unified list is gated by the same
   `spacepkg.CheckMembership` `category.list` already performs
-  (`modules/category/api.go:133-142`); a Project entry's *contents* inherit
-  `listMyProjectGroups`'s own predicate, which the shipped code documents as
-  「the predicate IS the gate」 (`modules/project/db_group.go:96-104`).
+  (`modules/category/api.go:133-142`); a Project entry's *contents* use the
+  Project-owned relation-only batch reader. It requires an active Project seat
+  (and active account/Space), but does not require native `group_member`
+  membership for each related group.
   Nothing here turns Project into a read boundary.
 - **`migration` — the ordering table is authoritative for BOTH entry kinds.**
   See D1. The backfill must seed a row per existing category (carrying its
@@ -248,24 +252,29 @@ matching `octo_project_user_setting`'s rule in
    rejection the *default* — a Project's `ref_id` is simply never a valid
    `category_id`.
 
-**D2 — A Project entry's group list preserves the shipped
-`listMyProjectGroups` semantics through a Project-owned batch reader. Not
-re-implemented in category, not proxied over HTTP. RECOMMENDED.**
+**D2 — A Project entry's group list reuses the final Project relation semantics
+through a Project-owned batch reader. Not re-implemented in category, not
+proxied over HTTP. RECOMMENDED.**
 
-`modules/project/db_group.go:148` already encodes four decisions this task
-would otherwise have to re-derive and could get subtly wrong: membership-scoped
-rather than project-wide (`project-p2-product-surfaces` D1), disbanded groups
-excluded, the strict active-member predicate that **hides a group which
-blacklisted the caller** (`db_group.go:120-136`, pinned by
-`TestListProjectGroupsHidesAGroupThatBlacklistedMe`), and an index-driven plan
-pinned by `TestTheProjectGroupListReachesItsRowsByAnIndex`. A second copy of
-that predicate is a copy that will drift — the exact failure mode
-`project-p2-product-surfaces` documents for `GroupResp`'s two mappers. The
-unified sidebar therefore calls `ListMyProjectGroupsByProjectIDs` once for all
-visible Projects. The Project module performs one membership-scoped group query
-and one grouped member-count query, partitions in memory, and preserves the
-same 50-row limit per Project. Sort validation uses section metadata only and
+`modules/project/db_group.go` owns the relation-only projection used by
+`GET /v1/projects/:project_id/groups` and the unified Sidebar. It returns the
+Project's live associated groups rather than filtering by the caller's native
+`group_member` seat, excludes disbanded groups, carries only
+`ProjectGroupRelation` fields, and preserves the endpoint's pinned-first order
+and 50-row default page. Active Space and Project membership still authorize
+the read; a Space-listed Project that is merely pinned therefore has
+`groups: []`.
+
+The unified Sidebar calls `ListProjectGroupRelationsByProjectIDs` once for all
+visible Projects. The Project module batches the relation read, partitions
+rows in memory, and applies the per-Project page limit. It does not duplicate
+the endpoint's relation predicate in category, and it does not load native chat
+member counts or avatar fields. Sort validation uses section metadata only and
 never renders Project contents.
+
+The legacy `ListMyProjectGroupsByProjectIDs`/`GroupResp` reader remains for
+surfaces that explicitly need native chat-room membership and its richer
+projection; it is not the Sidebar's source.
 
 Sub-question to settle in implementation, not a product call: **which module
 owns the unified-list handler.** `modules/category` is the natural home (it
@@ -472,11 +481,12 @@ golangci-lint run ./...
   Projects with 3 categories gets 5 entries, correctly typed.
 - Every Project entry carries both `project_id` and the current `project_name`.
 - `TestSidebarSectionProjectContentMatchesProjectGroupsEndpoint` — a Project
-  entry's groups are identical to `GET /v1/projects/:project_id/groups` for the
-  same caller (pins D2's "same query, not a second copy").
-- `TestListMyProjectGroupResponsesByProjectIDsUsesTwoQueries` — multiple
-  Projects cost one group query plus one member-count query, with the per-Project
-  response cap applied before counts are loaded.
+  entry's relation groups are identical to `GET /v1/projects/:project_id/groups`
+  for the same caller, including a related group outside the caller's native
+  roster (pins D2's Project-wide relation semantics).
+- `TestListMyProjectGroupResponsesByProjectIDsUsesTwoQueries` — the legacy
+  native-membership reader still keeps its one group query plus one
+  member-count query and per-Project response cap for its remaining callers.
 - `TestSidebarSortValidationDoesNotRenderProjectContents` — sorting validates
   only visible section metadata and cannot invoke the full Project-group render.
 - `TestSidebarSectionsOrderInterleavesTypesAndOldCategoriesKeepRelativeOrder`

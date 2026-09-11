@@ -365,7 +365,10 @@ type collaborationRoleCatalogResp struct {
 	Roles                  []CollaborationRoleResp `json:"roles"`
 }
 
-// GroupResp is one row of the project group list.
+// GroupResp is one row of the legacy native-membership-scoped project group
+// projection used by chat-room surfaces. The relation-only GET
+// /v1/projects/:project_id/groups endpoint and the unified sidebar use
+// ProjectGroupRelation instead.
 //
 // Deliberately NARROW, and not a copy of modules/group's GroupResp. That struct
 // is forty-odd fields of per-user group state, and it is served by the routes a
@@ -374,8 +377,8 @@ type collaborationRoleCatalogResp struct {
 // and the two would drift the first time either changed — while this module,
 // which cannot import modules/group, would have no compiler to notice.
 //
-// So this answers one question — which groups in this project am I in — with the
-// fields the tree renders, and the client fetches everything else where it
+// So this answers one question — which native chat groups in this project am I
+// in — with the fields the tree renders, and the client fetches everything else where it
 // already does. The avatar fields travel together because they are one decision
 // on the client: avatar_text/avatar_color override, is_upload_avatar wins over
 // both, and is_named decides the fallback when none is set. Shipping a subset
@@ -389,12 +392,12 @@ type GroupResp struct {
 	// icon. NOT "the user chose this name" — that was the column's original
 	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
 	//
-	// On THIS endpoint the value is therefore always 0: modules/group hardcodes
-	// IsNamed: 0 at BOTH create sites in modules/group/service.go, and 1 exists only where
-	// the #500 migration backfilled it, which no project group can be. It is
-	// shipped anyway so the avatar fallback chain is evaluated by the same code
-	// on every surface rather than special-cased here — a client that hardcodes
-	// the fallback for this list is the drift the field exists to prevent.
+	// For Project-owned legacy GroupResp callers the value is therefore always 0:
+	// modules/group hardcodes IsNamed: 0 at BOTH create sites in modules/group/service.go,
+	// and 1 exists only where the #500 migration backfilled it, which no project
+	// group can be. It is shipped anyway so the avatar fallback chain is evaluated
+	// by the same code on every surface rather than special-cased here — a client
+	// that hardcodes the fallback for this list is the drift the field exists to prevent.
 	IsNamed int `json:"is_named"`
 	// AvatarText is the custom avatar text; "" falls back per IsNamed.
 	AvatarText string `json:"avatar_text"`

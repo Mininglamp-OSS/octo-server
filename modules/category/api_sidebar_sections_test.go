@@ -307,6 +307,14 @@ func TestSidebarSectionProjectContentMatchesProjectGroupsEndpoint(t *testing.T) 
 		_, err := ctx.DB().UpdateBySql("UPDATE `group` SET project_id=? WHERE group_no=?", projectID, groupNo).Exec()
 		require.NoError(t, err)
 	}
+	// Keep one related group outside the caller's native roster. The Project
+	// relation list is Project-wide, so this catches an accidental return to the
+	// legacy ListMyProjectGroups membership filter.
+	_, err := ctx.DB().DeleteBySql(
+		"DELETE FROM group_member WHERE group_no=? AND uid=?",
+		"sidebar-project-content-group-0", testutil.UID,
+	).Exec()
+	require.NoError(t, err)
 
 	w := doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/sidebar-sections", nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
