@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,7 +26,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/tokenlifecycle"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
-	"github.com/Mininglamp-OSS/octo-server/modules/base/outbox"
 	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
@@ -37,7 +35,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	workspacemod "github.com/Mininglamp-OSS/octo-server/modules/workspace"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
@@ -112,90 +109,6 @@ func loadConfigFromFile(cfgFile string) *viper.Viper {
 
 func validateTokenExpireConfig(vp *viper.Viper) (time.Duration, error) {
 	return tokenlifecycle.ValidateTokenExpire(vp)
-}
-
-const (
-	// Workspace 内部凭据沿用既有 internal API 的 32 字节最低长度。
-	workspaceInternalTokenMinBytes = 32
-
-	// 这些固定凭据必须互斥，避免一次泄露同时打开多个内部能力。
-	workspaceNotifyInternalTokenEnv     = "NOTIFY_INTERNAL_TOKEN"
-	workspaceDocsNotifyInternalTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
-	workspaceBotMentionInternalTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
-)
-
-// loadWorkspaceInternalTokenForStartup 复制 Workspace 包的启动期校验，
-// 因为校验函数保持包内可见，组合根不能直接调用。返回错误时只包含环境变量名，
-// 这样启动日志可以说明禁用原因而不会把凭据值写入日志。
-func loadWorkspaceInternalTokenForStartup(getenv func(string) string, env string) (string, error) {
-	if getenv == nil {
-		return "", fmt.Errorf("%s lookup unavailable; Workspace internal API disabled", env)
-	}
-	token := getenv(env)
-	if token == "" {
-		return "", nil
-	}
-	if len(token) < workspaceInternalTokenMinBytes {
-		return "", fmt.Errorf("%s must be at least %d bytes; Workspace internal API disabled", env, workspaceInternalTokenMinBytes)
-	}
-
-	for _, sibling := range []string{
-		workspacemod.LoopInternalTokenEnv,
-		workspacemod.DriveInternalTokenEnv,
-		workspaceNotifyInternalTokenEnv,
-		workspaceDocsNotifyInternalTokenEnv,
-		workspaceBotMentionInternalTokenEnv,
-	} {
-		if sibling == env {
-			continue
-		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(getenv(sibling))) == 1 {
-			return "", fmt.Errorf("%s must differ from %s; Workspace internal API disabled", env, sibling)
-		}
-	}
-	return token, nil
-}
-
-// loadLoopInternalToken 与 Workspace 包保持同名语义，供启动接线复用。
-func loadLoopInternalToken(getenv func(string) string) (string, error) {
-	return loadWorkspaceInternalTokenForStartup(getenv, workspacemod.LoopInternalTokenEnv)
-}
-
-// loadDriveInternalToken 与 Workspace 包保持同名语义，供启动接线复用。
-func loadDriveInternalToken(getenv func(string) string) (string, error) {
-	return loadWorkspaceInternalTokenForStartup(getenv, workspacemod.DriveInternalTokenEnv)
-}
-
-// validateWorkspaceInternalTokens 在启动期一次性决定两项能力是否可用。
-// 凭据错误只禁用对应能力而不让 API 进程 panic，避免一个可选的内部消费者
-// 配置错误拖垮面向用户的服务；空凭据则以 Warn 明确提示未启用。
-func validateWorkspaceInternalTokens() (loopEnabled, driveEnabled bool) {
-	loopToken, err := loadLoopInternalToken(os.Getenv)
-	switch {
-	case err != nil:
-		log.Error("Workspace loop internal capability disabled by startup token validation", zap.Error(err))
-	case loopToken == "":
-		log.Warn("Workspace loop internal capability is not enabled: token is not configured",
-			zap.String("env", workspacemod.LoopInternalTokenEnv))
-	default:
-		log.Info("Workspace loop internal capability enabled",
-			zap.String("env", workspacemod.LoopInternalTokenEnv))
-		loopEnabled = true
-	}
-
-	driveToken, err := loadDriveInternalToken(os.Getenv)
-	switch {
-	case err != nil:
-		log.Error("Workspace driver internal capability disabled by startup token validation", zap.Error(err))
-	case driveToken == "":
-		log.Warn("Workspace driver internal capability is not enabled: token is not configured",
-			zap.String("env", workspacemod.DriveInternalTokenEnv))
-	default:
-		log.Info("Workspace driver internal capability enabled",
-			zap.String("env", workspacemod.DriveInternalTokenEnv))
-		driveEnabled = true
-	}
-	return loopEnabled, driveEnabled
 }
 
 func main() {
@@ -598,32 +511,6 @@ func runAPI(ctx *config.Context) {
 		cardActionRuntime.Stop()
 		panic(fmt.Errorf("start card action callback dispatcher: %w", err))
 	}
-	// 模块迁移完成后初始化通用发件箱；它复用 ctx 的数据库会话和统一插桩的
-	// Redis 客户端，避免为事件投递再创建一套连接配置与连接池。
-	outbox.Init(ctx)
-
-	// 启动期校验两个 Workspace 内部凭据。凭据错误只关闭对应的可选能力，
-	// 不让一个下游服务配置问题触发 panic，从而保持面向用户的 API 继续启动。
-	loopEnabled, driveEnabled := validateWorkspaceInternalTokens()
-
-	// 由 Workspace 模块统一登记 loop 与 driver 目标，复用模块内相同的
-	// 凭据校验闭包，避免组合根维护第二套目标清单。
-	workspacemod.RegisterEventTargets()
-	log.Info("Workspace event outbox targets registered",
-		zap.Bool("loop_enabled", loopEnabled),
-		zap.Bool("driver_enabled", driveEnabled))
-	// 两个目标都未启用时仍允许 API 启动，但明确告警，便于运维区分
-	// “没有下游订阅”与“发件箱 worker 未启动”；此时零行展开是设计行为。
-	if !loopEnabled && !driveEnabled {
-		log.Warn("Workspace event outbox has no enabled targets; workspace events will not be delivered")
-	}
-
-	// 发件箱 worker 立即启动并先执行一轮扫描；扫描间隔只接受规格约定的
-	// 3/5/10 分钟值，日志记录解析后的结果，便于运维确认实际配置。
-	scanInterval := outbox.ScanIntervalFromEnv()
-	log.Info("event outbox worker starting", zap.Duration("scan_interval", scanInterval))
-	go outbox.RunWorker(context.Background(), scanInterval)
-
 	//开始定时处理事件
 	cn := cron.New()
 	//定时发布事件 每59秒执行一次
@@ -842,11 +729,6 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// Closing it needs that module to expose its configured token values — a
 		// change there, not here. Recorded at the call site because this is where a
 		// reader counts the arguments and concludes the set is complete.
-		// Workspace internal 读取凭据同理纳入全局互斥:loop token 若与
-		// 任一动态路由 notify token 相等,单凭据将同时授予 workspace 只读
-		// 与卡片回调两个能力。模块内的 sibling 检查只覆盖固定 env 集合,
-		// 与动态路由密钥的互斥只能在这一个看得全的地方做。
-		os.Getenv(workspacemod.LoopInternalTokenEnv),
 	); err != nil {
 		return nil, err
 	}

@@ -1,18 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
-### 新功能
-- Workspace 元数据与成员 API — 支持组织限定的列表/详情、创建、部分更新、成员管理、Owner 转让和成员自助退出。
-- Group↔Workspace 关联与查询 API — 支持群关联的绑定、换绑、解绑、单群查询、Workspace 反查，以及 `GET /v1/group/my` 的组织和群角色筛选；关联不改变原生群成员或下游 ACL。
-- Workspace 群创建快照 — `POST /v1/group/create` 可在同一事务中将 active eligible Workspace 成员与创建者、显式成员按原生群规则去重合并，保留有效显式外部成员策略；快照只写入一次，后续 Workspace 变化不自动同步，并保留 IM 失败补偿语义。
-### 修复
-- Workspace 生命周期边界 — 本体资源级 `DELETE` 未注册。
-- Workspace 与 Group 关联读取使用一致的只读快照；建群使用候选预读、当前读复核和有界候选扩展重试，写入按实际授权行缩小锁范围并适配受限连接池。
-- Workspace 名称和 Group 关联群名的 `%`、`_`、`!` 关键词按字面匹配，不受 MySQL SQL 模式差异影响；`GET /v1/group/my` 的成员计数失败继续采用 best-effort，不掩盖主查询或权限错误。
-- Space 成员移除会通过持久化清理链停用其非 Owner Workspace 身份，重新加入 Space 不会自动恢复原 Workspace 权限；普通建群继续批量判定 Space 席位并过滤不存在或已注销账号。
-- Workspace 事件对所有已注册下游持久化投递意图，凭据恢复后继续投递；Redis Stream 不再按固定长度淘汰未确认事件。
-
 ## [v1.1.2] - 2026-03-05
 
 ### 新功能

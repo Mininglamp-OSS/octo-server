@@ -81,5 +81,4 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/workspace"
 )

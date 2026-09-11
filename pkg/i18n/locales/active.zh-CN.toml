@@ -569,36 +569,6 @@ other = "保存群数据失败。"
 ["err.server.group.notify_failed"]
 other = "发送群通知失败。"
 
-["err.server.workspace.request_invalid"]
-other = "Workspace 请求参数无效。"
-
-["err.server.workspace.space_required"]
-other = "请提供有效的组织 Space。"
-
-["err.server.workspace.forbidden"]
-other = "你没有权限访问此 Workspace。"
-
-["err.server.workspace.not_found"]
-other = "Workspace 不存在。"
-
-["err.server.workspace.owner_protected"]
-other = "请先转让 Workspace 所有者身份，再退出或移除。"
-
-["err.server.workspace.workspace_role_invalid"]
-other = "Workspace 角色无效。"
-
-["err.server.workspace.candidate_ineligible"]
-other = "所选成员无法加入此 Workspace。"
-
-["err.server.workspace.dependency_unavailable"]
-other = "Workspace 依赖服务暂不可用。"
-
-["err.server.workspace.internal"]
-other = "Workspace 服务内部错误。"
-
-["err.server.group.workspace_conflict"]
-other = "群与 Workspace 的关联与当前状态冲突。"
-
 ["err.server.message.request_invalid"]
 other = "请求参数有误。"
 
