@@ -3,12 +3,14 @@ package user
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -21,11 +23,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/stretchr/testify/require"
 )
-
-var tokenHTTPTestDatabases struct {
-	sync.Mutex
-	names []string
-}
 
 func TestTokenDeadlineOverHTTP(t *testing.T) {
 	server, ctx, _, _ := newTokenHTTPTestServer(t)
@@ -329,16 +326,22 @@ func testNicknameUpdatePreservesFiniteTokenDeadlineOverHTTP(t *testing.T, server
 func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *User, *Manager) {
 	t.Helper()
 	databaseName := "octo_user_token_ttl_" + util.GenerUUID()[:12]
-	bootstrapConfig := config.New()
-	bootstrapConfig.Test = true
-	bootstrapConfig.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/information_schema?charset=utf8mb4&parseTime=true"
-	bootstrap := config.NewContext(bootstrapConfig)
-	_, err := bootstrap.DB().Exec("CREATE DATABASE `" + databaseName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	bootstrap, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1:3306)/information_schema?charset=utf8mb4&parseTime=true")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bootstrap.Close()) })
+	createCtx, cancelCreate := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err = bootstrap.ExecContext(createCtx, "CREATE DATABASE `"+databaseName+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	cancelCreate()
 	require.NoError(t, err, "create isolated token TTL test database")
-	require.NoError(t, bootstrap.DB().DB.Close())
-	tokenHTTPTestDatabases.Lock()
-	tokenHTTPTestDatabases.names = append(tokenHTTPTestDatabases.names, databaseName)
-	tokenHTTPTestDatabases.Unlock()
+	// Register DROP first so LIFO cleanup stops the rollout and closes the
+	// fixture's clients before removing its database. TestMain cleanup used to
+	// run unbounded DROP statements after PASS, exhausting CI's package timeout.
+	t.Cleanup(func() {
+		dropCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := bootstrap.ExecContext(dropCtx, "DROP DATABASE IF EXISTS `"+databaseName+"`")
+		require.NoError(t, err, "drop isolated token TTL test database %s", databaseName)
+	})
 
 	cfg := config.New()
 	cfg.Test = true
@@ -346,6 +349,7 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 	cfg.Cache.TokenCachePrefix = "token-http:" + util.GenerUUID() + ":"
 	cfg.Cache.UIDTokenCachePrefix = "token-http-uid:" + util.GenerUUID() + ":"
 	ctx := config.NewContext(cfg)
+	t.Cleanup(func() { require.NoError(t, ctx.DB().DB.Close()) })
 
 	// module.Setup must run the complete migration set, but octo-lib caches its
 	// module instances behind a process-wide sync.Once. Under CI's shuffled
@@ -370,6 +374,7 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 	server.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(server.GetRoute())
 	store, client := auth.SessionStoreAndClientForContext(ctx)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	stopRollout, err := testsession.StartRollout(ctx, "token-http-test")
 	require.NoError(t, err)
 	t.Cleanup(stopRollout)
@@ -392,26 +397,4 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 		}
 	})
 	return server, ctx, userAPI, managerAPI
-}
-
-func cleanupTokenHTTPTestDatabases() error {
-	tokenHTTPTestDatabases.Lock()
-	names := append([]string(nil), tokenHTTPTestDatabases.names...)
-	tokenHTTPTestDatabases.names = nil
-	tokenHTTPTestDatabases.Unlock()
-	if len(names) == 0 {
-		return nil
-	}
-
-	cfg := config.New()
-	cfg.Test = true
-	cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/information_schema?charset=utf8mb4&parseTime=true"
-	bootstrap := config.NewContext(cfg)
-	defer bootstrap.DB().DB.Close()
-	for _, name := range names {
-		if _, err := bootstrap.DB().Exec("DROP DATABASE IF EXISTS `" + name + "`"); err != nil {
-			return fmt.Errorf("drop isolated token TTL database %s: %w", name, err)
-		}
-	}
-	return nil
 }
