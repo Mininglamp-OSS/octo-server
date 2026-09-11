@@ -222,13 +222,30 @@ var spaceMemberWriterBaseline = map[string]struct {
 	},
 	"modules/botfather/mint_obo.go": {
 		writes: 1,
-		why: "INSERT IGNORE of a bot's Space seat. On its own this needs no bump: an " +
-			"INSERT creates a seat that did not exist, so no surviving project seat is " +
-			"reopened by it. It becomes reachable ONLY in combination with the bot-" +
-			"deletion gap below (deletion leaves the project seat active forever, so a " +
-			"re-minted Space seat reopens the answer over it with nothing bumping) — " +
-			"i.e. it is a consequence of that gap, closed when that gap is, and tracked " +
-			"with it rather than separately.",
+		why: "INSERT IGNORE of a bot's Space seat. TWO axes, and this entry used to answer " +
+			"only the first. " +
+			"EPOCH axis: needs no bump on its own. An INSERT creates a seat that did not " +
+			"exist, so no surviving project seat is reopened by it. It becomes reachable " +
+			"only in combination with the bot-deletion gap (deletion leaves the project " +
+			"seat active forever, so a re-minted Space seat reopens the answer over it " +
+			"with nothing bumping) — a consequence of that gap, closed when it is. " +
+			"IDENTITY axis: KNOWN GAP, and NOT closed by this branch. The space_id stored " +
+			"here is req.SpaceID off a JSON body (modules/bot_provision/bot_api.go), and " +
+			"MintBotOBO never loads the `space` row, so the seat can be written with bytes " +
+			"the row does not hold. The gate in front of it (bot_provision.assertSpaceMember) " +
+			"joins space_member/space/user — all utf8mb4_0900_ai_ci in production — so a " +
+			"fullwidth-drifted id passes it. That seat's close then resolves the DRIFTED " +
+			"bytes faithfully and the epoch enumeration finds nothing under general_ci: the " +
+			"round-12/13 stale-grant shape, reachable end to end. " +
+			"Not fixed here because the fix belongs in modules/bot_provision (MintBotOBO has " +
+			"to load the `space` row, which it should be doing for liveness anyway) and this " +
+			"branch does not modify that module. The peer-facing half is held inert by the " +
+			"two-env enablement gate; the half that is live — an orphaned octo_project_member " +
+			"row the cascade can never reach — exists on main unchanged by this branch. " +
+			"Recorded here rather than left implied, because a baseline that answers one axis " +
+			"while reading as if it answered both is the failure this file has twice recorded " +
+			"as worse than a missing entry. Closing it is a precondition on setting " +
+			"OCTO_MEMBERSHIP_INTERNAL_TOKEN — see docs/project-member-epoch-rollout.md.",
 	},
 }
 

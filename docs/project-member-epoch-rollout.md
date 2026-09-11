@@ -104,6 +104,16 @@ B 的同一条语句是**当前读**，会阻塞在上一段说的那批整表�
 `pkg/db/mysql.go` 对任何迁移错误都 `panic`，所以结果是 **B 启动 panic 并进入
 CrashLoopBackOff**，不是幂等跳过。
 
+**并发启动还有第二种失败形态，和 1205 是两回事。** 两个 pod 都把这条迁移算进
+「待执行」计划，A 提交后 B 走到写 `gorp_migrations` 那一步撞主键重复，`sql-migrate`
+返回错误，同样被 `pkg/db/mysql.go` 的 `panic` 接住。区别在于 B 这次**根本没跑**那条
+UPDATE——数据是对的，pod 却起不来。它在重启后自愈（届时账本已有记录，计划为空），
+所以症状是「第一次滚动时有 pod CrashLoop 一两次然后好了」，很容易被读成偶发。
+
+这两种形态都不是本 PR 引入的，是本仓 **启动即迁移** 设计的固有属性——没有任何地方取
+advisory lock，任何新迁移都同样暴露。`octo_project` 建于 2026-09-04，基数小，所以这次
+的实际风险低；写在这里是因为运维看到 CrashLoop 时需要知道该不该回滚（不该）。
+
 `kubectl rollout restart`、节点 drain、`maxSurge > 1` 都会并发起 pod。首次升级请
 **串行放量**（先让一个 pod 完成迁移再放其余），或在该窗口把副本数临时降到 1。
 
@@ -123,6 +133,9 @@ CrashLoopBackOff**，不是幂等跳过。
    `SELECT COUNT(*) FROM octo_project WHERE status = 1 AND member_epoch = 0;`
    期望 0。不为 0 说明有实例还在按旧逻辑写入（见第 2 节）。
 5. 恢复副本数 / 正常滚动。
+
+这五步是**要执行并留痕的发布门禁**，不是一段建议性文字：第 1 步和第 3 步是上一节两种
+失败形态唯一的防线，而它们都以 CrashLoop 的形式出现，事后很难和别的原因区分。
 
 第 2 步之后再起并发 pod 就是安全的：谓词不再匹配任何行，语句是空操作。
 
@@ -342,6 +355,24 @@ OCTO_MEMBERSHIP_INTERNAL_PEER_MAX_CACHE_AGE_SECONDS=<1..300>
 
 写「数值」而不是一个 yes/no 确认位，是因为数值才是契约本身。提案 §3.1 的
 `max_age_seconds` 上线后，应答里那个字段的取值就来自这里，不会有第二个来源漂移。
+
+### 开 token 之前还必须关掉的一件事（不在本分支范围内）
+
+`modules/botfather/mint_obo.go` 把 `req.SpaceID`（HTTP body 直取，
+`modules/bot_provision/bot_api.go`）直接 INSERT 进 `space_member`，全程不读 `space` 行。
+它前面的 `assertSpaceMember` JOIN 的是 `space_member`/`space`/`user`，生产上都是
+`utf8mb4_0900_ai_ci`，所以一个全角漂移的 space_id 能通过这道门、把带漂移字节的席位写进去。
+之后关席位时 `ResolveSeatTx` 忠实读回漂移字节，epoch 枚举在 `general_ci` 下查不到任何
+项目席位——这就是第 12/13 轮那条陈旧授权链路，端到端可达。
+
+它没有在本分支修，因为修的地方在 `modules/bot_provision`（`MintBotOBO` 得去读 `space` 行，
+它本来也该做存活校验），而本分支不改那个模块。两位 reviewer 都判为「立 issue + 作为开 token
+的前置条件」，理由是：**面向对端的那一半被上面的两个 env 门禁挡死了**，而**现在就活着的那一半**
+（一条级联永远够不到的孤儿 `octo_project_member` 行）在 main 上本来就存在，跟本分支无关。
+
+写在这里是因为它属于「开 token 之前」而不是「合这个 PR 之前」。同类但可达性低得多的
+`atomicJoinInitialSpace` 已在本分支修掉（配置来源、权威行在手），见
+`modules/space/disband_space_id_spelling_test.go`。
 
 ### 这个门禁不保证什么
 

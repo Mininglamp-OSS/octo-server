@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -169,7 +170,7 @@ func TestAccountLivenessSurvivesCollationDrift(t *testing.T) {
 				"VALUES ('cp1','clive','cs1',0,1,NOW(3),NOW(3),0), " +
 				"       ('cp1','cbanned','cs1',0,1,NOW(3),NOW(3),0)")
 
-			_, roles, e := projectpkg.ProjectMemberships(sess, "cs1", "cp1",
+			_, roles, e := projectpkg.ProjectMemberships(context.Background(), sess, "cs1", "cp1",
 				[]string{"clive", "cbanned"})
 			if e != nil {
 				return e

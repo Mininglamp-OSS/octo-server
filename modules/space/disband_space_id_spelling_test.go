@@ -105,3 +105,48 @@ func TestDisbandDoorsStoreTheSpaceRowsSpellingInTheRemovalOutbox(t *testing.T) {
 		})
 	}
 }
+
+// TestInitialSpaceJoinStoresTheSpaceRowsSpelling covers the last `space_member`
+// writer in this module that had the authoritative row in hand and dropped the
+// column.
+//
+// Lower reachability than the disband doors — the id comes from configuration
+// rather than a request, so drifting it takes operator error rather than a crafted
+// call — which is why it survived three rounds of this class being fixed elsewhere.
+// It is pinned anyway: the seat it writes is the one the epoch enumeration has to
+// reach, and "nobody would type that" is a property of today's deployment rather
+// than of the code.
+//
+// Driven at the DB layer rather than through a route because the only caller reads
+// the id from config, so there is no request whose spelling a test could drift.
+func TestInitialSpaceJoinStoresTheSpaceRowsSpelling(t *testing.T) {
+	_, _, err := setup(t)
+	require.NoError(t, err)
+
+	const stored = "initialJoinSid"
+	seedSpace(t, stored, "initial-join", "ij-owner", SpaceStatusNormal)
+
+	drifted := strings.ToUpper(stored)
+	require.NotEqual(t, stored, drifted,
+		"the fixture must differ from its drifted form or this case proves nothing")
+
+	sp, outcome, err := testSpaceDB.atomicJoinInitialSpace(drifted, "ij-newcomer")
+	require.NoError(t, err)
+	require.Equal(t, InitialSpaceJoined, outcome,
+		"the drifted spelling must still resolve the Space — this lookup has always "+
+			"matched under the row's collation and narrowing it would be a behaviour "+
+			"change, not a fix")
+	require.NotNil(t, sp)
+
+	var got []string
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT space_id FROM space_member WHERE uid = ?", "ij-newcomer").Load(&got)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, stored, got[0],
+		"the initial-space join must store the space_id the `space` ROW holds. It has "+
+			"that row in hand — it loaded it two statements earlier to check max_users "+
+			"and liveness — and a seat stored under the caller's spelling is unreachable "+
+			"from the project-side epoch enumeration, which compares under a stricter "+
+			"collation.")
+}

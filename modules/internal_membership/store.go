@@ -1,6 +1,8 @@
 package internal_membership
 
 import (
+	"context"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 )
@@ -23,7 +25,13 @@ type membershipStore interface {
 	// Memberships returns the project's member_epoch and the role of each uid
 	// holding an active seat. Epoch 0 with an empty map means the project is
 	// not an active project of spaceID.
-	Memberships(spaceID, projectID string, uids []string) (int64, map[string]int, error)
+	//
+	// Takes a context and Epochs does not, which is a real asymmetry rather than
+	// an oversight: this one answers from a single transaction, so it HOLDS a
+	// pooled connection from the first read to the last and the wait to acquire
+	// that connection needs a deadline. Epochs issues two autocommit reads that
+	// borrow and return a connection each.
+	Memberships(ctx context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error)
 }
 
 // dbStore is the production implementation, delegating to pkg/project.
@@ -39,6 +47,6 @@ func (s dbStore) Epochs(spaceID string, projectIDs []string) (map[string]int64, 
 	return projectpkg.ProjectEpochsInSpace(s.ctx.DB(), spaceID, projectIDs)
 }
 
-func (s dbStore) Memberships(spaceID, projectID string, uids []string) (int64, map[string]int, error) {
-	return projectpkg.ProjectMemberships(s.ctx.DB(), spaceID, projectID, uids)
+func (s dbStore) Memberships(ctx context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
+	return projectpkg.ProjectMemberships(ctx, s.ctx.DB(), spaceID, projectID, uids)
 }

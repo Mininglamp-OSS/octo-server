@@ -160,6 +160,14 @@ func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSp
 	if sp.SpaceId == "" || sp.Status != SpaceStatusNormal {
 		return nil, InitialSpaceInactive, nil
 	}
+	// 从这里起改用行里的拼写。
+	//
+	// 第 4 步会把 space_id 写进 space_member，而下游的 epoch 枚举拿它去查
+	// octo_project_member（utf8mb4_general_ci，比 space/space_member 的
+	// 0900_ai_ci 严），所以存进去的必须是 `space` 行自己的字节，不能是调用方传的。
+	// 这里 id 来自配置而不是请求，可达性比 #852 修掉的那几处低，但形状是同一个：
+	// **权威行已经在手里，却把列丢了**。见 seatref.go 的 SpaceRef。
+	spaceId = sp.SpaceId
 
 	// 3) 容量。与 atomicAddMemberIfNotFull 同语义:max_users=0 表示不限,此时这条
 	//    COUNT 给不出任何判断,跳过它连带省掉一把覆盖全空间成员的锁。

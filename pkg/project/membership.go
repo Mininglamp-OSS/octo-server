@@ -27,6 +27,7 @@ import (
 	"sort"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/user"
@@ -750,7 +751,10 @@ func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs 
 // axis is a time bound on the consumer's side; it is out of scope for this branch
 // and specified in docs/project-membership-cache-bound-proposal.md, and the reason
 // OCTO_MEMBERSHIP_INTERNAL_TOKEN stays unset until the peer implements it.
-func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
+func ProjectMemberships(ctx context.Context, session *dbr.Session, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	roles := make(map[string]int, len(uids))
 	if spaceID == "" || projectID == "" {
 		return 0, roles, nil
@@ -813,7 +817,20 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	// first read belongs to the NEXT answer. The peer learns about it from the epoch
 	// channel, whose IsActiveSpace fold turns the project absent and breaks agreement
 	// — which is a bound, and the torn denial had none.
-	tx, err := session.BeginTx(context.Background(), &sql.TxOptions{
+	// The CALLER's context, not context.Background(), and that matters more since
+	// round 16 than it did before it.
+	//
+	// Before the snapshot fix these four reads borrowed and returned a pooled
+	// connection each. Now one transaction holds a connection across all four round
+	// trips, and sql.DB.BeginTx is where the wait for that connection happens. With
+	// Background() nothing bounds it: a retrying peer at the configured burst can park
+	// hundreds of goroutines waiting on a pool octo-lib defaults to 100 connections,
+	// and every other module in the process queues behind them. The 15s read deadline
+	// on the route bounds the SOCKET, not the pool, so it offers nothing here.
+	//
+	// Passing the request's context also means a peer that hangs up frees its
+	// connection immediately rather than at the end of four queries.
+	tx, err := session.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,
 		ReadOnly:  true,
 	})
@@ -823,6 +840,20 @@ func ProjectMemberships(session *dbr.Session, spaceID, projectID string, uids []
 	// Rollback rather than commit: nothing here writes, and rolling back releases the
 	// read view just as commit would.
 	defer tx.RollbackUnlessCommitted()
+
+	// Bound every statement on this transaction, including the three issued from
+	// pkg/project, pkg/space and pkg/user through the SessionRunner they are handed.
+	//
+	// dbr applies runner.GetTimeout() around each query, and Tx inherits the session's
+	// — which is unset process-wide, i.e. no deadline at all. Setting it here is the
+	// one place that reaches all four reads without giving three packages a context
+	// parameter they otherwise have no use for. A blocked read holds the connection AND
+	// the read view, so an unbounded one is the expensive half of the same hazard.
+	//
+	// The value is per-STATEMENT, not for the whole transaction; the caller's context
+	// bounds the whole. Four point reads on indexed predicates, so this is an outlier
+	// cutoff rather than a budget.
+	tx.Timeout = membershipReadTimeout
 
 	// Step 1 — epoch + existence, in that order. See the doc comment.
 	epochs, err := ProjectEpochsInSpace(tx, spaceID, []string{projectID})
@@ -995,6 +1026,15 @@ func SetMembershipTearHookForTest(fn func()) (restore func(), err error) {
 	membershipTearHook.Store(&fn)
 	return func() { membershipTearHook.Store(nil) }, nil
 }
+
+// membershipReadTimeout caps ONE statement inside ProjectMemberships' transaction.
+//
+// Not a budget for the request: each of the four reads is a point lookup on an
+// indexed predicate and returns in single-digit milliseconds on a healthy engine.
+// It is the cutoff past which a read has stopped being slow and started being stuck,
+// and holding a pooled connection plus a read view while stuck is what makes an
+// authorization endpoint able to starve the rest of the process.
+const membershipReadTimeout = 5 * time.Second
 
 // dedupeNonEmpty drops empty and repeated ids while preserving first-seen order.
 //

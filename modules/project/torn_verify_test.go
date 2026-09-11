@@ -46,6 +46,7 @@ package project
 // the point the old code tore, from a SEPARATE connection so the commit is real.
 
 import (
+	"context"
 	"testing"
 
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
@@ -91,7 +92,7 @@ func TestVerifyNeverStampsADenialWithALiveEpoch(t *testing.T) {
 	require.NoError(t, err)
 	defer restore()
 
-	epoch, roles, err := projectpkg.ProjectMemberships(
+	epoch, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"tornOwner"})
 	require.NoError(t, err)
 	require.True(t, banned, "the hook must have run, or this case proves nothing")
@@ -160,7 +161,7 @@ func TestVerifyStepsShareOneSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	defer restore()
 
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"snapOwner"})
 	require.NoError(t, err)
 	require.True(t, closed, "the hook must have run, or this case proves nothing")
@@ -173,7 +174,7 @@ func TestVerifyStepsShareOneSnapshot(t *testing.T) {
 	// And a call that STARTS after the seat is closed must deny. The project and the
 	// Space are both still active here, so step 1's fold cannot produce this answer:
 	// only the space-half conjunction can.
-	_, roles, err = projectpkg.ProjectMemberships(
+	_, roles, err = projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"snapOwner"})
 	require.NoError(t, err)
 	assert.NotContains(t, roles, projectpkg.FoldID("snapOwner"),
@@ -257,7 +258,7 @@ func TestProjectMembershipsPinsItsOwnIsolationLevel(t *testing.T) {
 	require.NoError(t, err)
 	defer restore()
 
-	epoch, roles, err := projectpkg.ProjectMemberships(
+	epoch, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		session, spaceA, created.ProjectID, []string{"isoOwner"})
 	require.NoError(t, err)
 	require.True(t, banned, "the hook must have run, or this case proves nothing")

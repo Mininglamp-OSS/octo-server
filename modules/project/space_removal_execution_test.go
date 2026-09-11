@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -446,7 +447,7 @@ func TestVerifyAnswersFoldedUIDs(t *testing.T) {
 
 	// Case variance is folded on both sides: the caller's spelling matches, and the
 	// answer is keyed by the fold so the handler can find it.
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"FOLDMEMBER"})
 	require.NoError(t, err)
 	assert.Contains(t, roles, projectpkg.FoldID("FOLDMEMBER"),
@@ -460,7 +461,7 @@ func TestVerifyAnswersFoldedUIDs(t *testing.T) {
 			"utf8mb4_general_ci does not, which made the fold LOOSER than the collation "+
 			"and served a uid the database never matched as a member with a role")
 
-	_, roles, err = projectpkg.ProjectMemberships(
+	_, roles, err = projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"foldmember", "fold" + kelvin + "ember"})
 	require.NoError(t, err)
 	assert.Len(t, roles, 1,
@@ -493,7 +494,7 @@ func TestProjectMembershipsFoldsTheProjectID(t *testing.T) {
 	require.NotEqual(t, created.ProjectID, upper, "the fixture id must contain letters to "+
 		"vary the case of; a hex id without a-f would make this vacuous")
 
-	epoch, roles, err := projectpkg.ProjectMemberships(testCtx.DB(), spaceA, upper,
+	epoch, roles, err := projectpkg.ProjectMemberships(context.Background(), testCtx.DB(), spaceA, upper,
 		[]string{"pidMember"})
 	require.NoError(t, err)
 	assert.NotZero(t, epoch, "a re-cased project_id matches in SQL under general_ci, so the "+

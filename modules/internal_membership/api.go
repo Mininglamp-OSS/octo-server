@@ -231,10 +231,23 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 // agrees with its own cached 0 and the grant never expires. Reproduced against
 // the engine; see TestRolloutSentinelIsRefusedRatherThanServed.
 //
-// So the window now costs availability (500, retry, repaired within one scan
-// rotation) rather than a permanent grant. It also means the rollback runbook no
-// longer DEPENDS on the reconcile loop being enabled: with the loop off the
-// endpoint refuses instead of quietly handing out the collision.
+// So the window now costs availability rather than a permanent grant: 500, the
+// peer retries, and the retry succeeds because logLookupFailure repairs the named
+// row OUT OF BAND on the way out (see it, ~300 lines below). The practical bound
+// is ONE request.
+//
+// An earlier version of this sentence said "repaired within one scan rotation",
+// which is the recovery model this file corrects everywhere else and is wrong:
+// scanEpochSanity walks a bounded page budget per tick behind a PERSISTED cursor,
+// a sentinel row written by a not-yet-upgraded pod carries the highest id, and
+// reaching it takes hours on a large octo_project — during which the per-BATCH
+// refusal fails every request whose batch of 50 contains that id, not only the
+// ones naming it. The scan is the backstop for rows nobody happens to query; it
+// is not the bound.
+//
+// It also means the rollback runbook no longer DEPENDS on the reconcile loop
+// being enabled: with the loop off the endpoint refuses instead of quietly
+// handing out the collision.
 type epochsResponse struct {
 	Projects map[string]int64 `json:"projects"`
 }
@@ -498,7 +511,10 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 		uids = append(uids, uid)
 	}
 
-	epoch, roles, err := m.store.Memberships(spaceID, projectID, uids)
+	// The request's context, so a peer that hangs up or a proxy that times out
+	// releases the pooled connection this call holds instead of it being held to the
+	// end of four round trips. See membershipStore.Memberships.
+	epoch, roles, err := m.store.Memberships(c.Request.Context(), spaceID, projectID, uids)
 	if err != nil {
 		m.logLookupFailure("verify project memberships", err, spaceID, len(uids),
 			zap.String("project_id", projectID))

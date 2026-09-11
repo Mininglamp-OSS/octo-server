@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -66,7 +67,7 @@ func TestVerifyDeniesAGloballyBannedAccount(t *testing.T) {
 	require.True(t, admitted)
 
 	// Baseline: a live account is a member.
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"livOwner", "livBanned"})
 	require.NoError(t, err)
 	require.Contains(t, roles, projectpkg.FoldID("livBanned"))
@@ -89,7 +90,7 @@ func TestVerifyDeniesAGloballyBannedAccount(t *testing.T) {
 		"the ban must not have touched space_member — otherwise the Space conjunction "+
 			"would already deny this uid and the account gate is untested")
 
-	_, roles, err = projectpkg.ProjectMemberships(
+	_, roles, err = projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"livOwner", "livBanned"})
 	require.NoError(t, err)
 	assert.NotContains(t, roles, projectpkg.FoldID("livBanned"),
@@ -129,7 +130,7 @@ func TestVerifyDeniesADestroyedAccountButKeepsCoolingOff(t *testing.T) {
 	// Cooling-off: a destroy REQUEST inside its reversible window.
 	setUserLiveness(t, "destCooling", 1, 1)
 
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"destGone", "destCooling"})
 	require.NoError(t, err)
 	assert.NotContains(t, roles, projectpkg.FoldID("destGone"),
@@ -410,7 +411,7 @@ func TestAdmissionPathsFoldTheLivenessLookup(t *testing.T) {
 	assert.True(t, admitted)
 
 	// The seat really exists, keyed however the database stored it.
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"FOLDTARGET"})
 	require.NoError(t, err)
 	assert.Contains(t, roles, projectpkg.FoldID("FOLDTARGET"))

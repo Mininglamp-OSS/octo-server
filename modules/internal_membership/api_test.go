@@ -2,6 +2,7 @@ package internal_membership
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,7 +70,7 @@ func (s *stubStore) Epochs(spaceID string, projectIDs []string) (map[string]int6
 	return out, nil
 }
 
-func (s *stubStore) Memberships(spaceID, projectID string, uids []string) (int64, map[string]int, error) {
+func (s *stubStore) Memberships(_ context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	s.memberCalls++
 	s.lastSpaceID = spaceID
 	s.lastProject = projectID

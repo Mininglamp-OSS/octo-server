@@ -1470,7 +1470,15 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 		// registered category hook opens its own transaction, so calling it before
 		// commit would both lengthen the project lock and create an entry for a
 		// member write that may still roll back.
-		p.provisionSidebarSection(projectID, spaceID, uid)
+		//
+		// row.SpaceID for the same reason admitMemberTx uses it eleven lines above,
+		// and not the request's spaceID this arrived from #878 carrying. The hook
+		// writes a row keyed on the pair, so a caller's spelling makes an entry the
+		// project-side reader cannot reach. The effect here is cosmetic — Follow
+		// sidebar ordering, best effort — which is exactly why it would have sat
+		// there: this branch spent three rounds on the same shape in places where it
+		// was not cosmetic, and the value to take is not a judgement call.
+		p.provisionSidebarSection(projectID, row.SpaceID, uid)
 	}
 	return changed, nil
 }

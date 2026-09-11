@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -54,7 +55,7 @@ func TestProjectMembershipsDeniesAUserRemovedFromTheSpace(t *testing.T) {
 	// projectpkg.FoldID (see FoldID): the SQL matched these uids under a
 	// case-INSENSITIVE collation, so an exact-match Go key would drop a member whose
 	// rows are spelled differently from the request.
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"conjOwner", "conjMember"})
 	require.NoError(t, err)
 	require.Contains(t, roles, projectpkg.FoldID("conjOwner"))
@@ -67,7 +68,7 @@ func TestProjectMembershipsDeniesAUserRemovedFromTheSpace(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, seat, "the project seat must still exist — that IS the window")
 
-	_, roles, err = projectpkg.ProjectMemberships(
+	_, roles, err = projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"conjOwner", "conjMember"})
 	require.NoError(t, err)
 	assert.NotContains(t, roles, projectpkg.FoldID("conjMember"),
@@ -95,7 +96,7 @@ func TestProjectMembershipsDeniesEveryoneInAnInactiveSpace(t *testing.T) {
 		"UPDATE `space` SET status = 2 WHERE space_id = ?", spaceA).Exec()
 	require.NoError(t, err)
 
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"conjBanOwner"})
 	require.NoError(t, err)
 	assert.Empty(t, roles,
@@ -131,7 +132,7 @@ func TestProjectMembershipsAndEpochsFoldTheAbsentCases(t *testing.T) {
 			assert.NotContains(t, epochs, tc.projectID,
 				"absent from the map is what the caller turns into epoch 0")
 
-			epoch, roles, err := projectpkg.ProjectMemberships(
+			epoch, roles, err := projectpkg.ProjectMemberships(context.Background(),
 				testCtx.DB(), tc.spaceID, tc.projectID, []string{"conjFold"})
 			require.NoError(t, err)
 			assert.Zero(t, epoch)
@@ -145,7 +146,7 @@ func TestProjectMembershipsAndEpochsFoldTheAbsentCases(t *testing.T) {
 	epochs, err := projectpkg.ProjectEpochsInSpace(testCtx.DB(), spaceA, []string{created.ProjectID})
 	require.NoError(t, err)
 	assert.NotContains(t, epochs, created.ProjectID)
-	epoch, roles, err := projectpkg.ProjectMemberships(
+	epoch, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"conjFold"})
 	require.NoError(t, err)
 	assert.Zero(t, epoch)
@@ -173,9 +174,15 @@ func TestProjectMembershipsAndEpochsFoldTheAbsentCases(t *testing.T) {
 // undo it after step 3 — its predicate needs status = 1, and the row is
 // disbanded forever.
 //
-// The fix refuses the sentinel at step 2 instead. That costs availability for
-// the length of one scan rotation, which is the direction this module trades in
-// everywhere else.
+// The fix refuses the sentinel at step 2 instead. That costs availability rather
+// than a grant, which is the direction this module trades in everywhere else.
+//
+// How much availability: one request. The endpoint repairs the named row out of
+// band while answering the 500, so the peer's retry succeeds. NOT "one scan
+// rotation" — that was this comment's earlier claim and it is wrong; the scan is
+// a backstop whose persisted cursor takes hours to reach a freshly written row on
+// a large table, and the refusal is per-batch. See
+// pkg/project.SentinelAnomalyError.
 func TestRolloutSentinelIsRefusedRatherThanServed(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -191,7 +198,7 @@ func TestRolloutSentinelIsRefusedRatherThanServed(t *testing.T) {
 	require.Equal(t, StatusNormal, row.Status, "and the project must still be ACTIVE — that is the point")
 
 	// Step 2 must not produce a servable answer at all.
-	_, _, err = projectpkg.ProjectMemberships(
+	_, _, err = projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"sentinelOwner"})
 	require.Error(t, err, "an ACTIVE project on the reserved sentinel must not be served")
 	assert.True(t, errors.Is(err, projectpkg.ErrLiveProjectOnAbsentSentinel),
@@ -254,7 +261,7 @@ func TestSpaceBanMovesTheEpochChannelToo(t *testing.T) {
 	cached := epochs[created.ProjectID]
 	require.NotZero(t, cached, "baseline: an active project in an active Space has a real epoch")
 
-	_, roles, err := projectpkg.ProjectMemberships(
+	_, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
 	require.NoError(t, err)
 	require.Contains(t, roles, projectpkg.FoldID("banOwner"),
@@ -268,7 +275,7 @@ func TestSpaceBanMovesTheEpochChannelToo(t *testing.T) {
 	require.Equal(t, StatusNormal, row.Status, "a ban must not touch the project row — that is the point")
 	require.EqualValues(t, cached, row.MemberEpoch, "and it must not bump the epoch either")
 
-	_, banRoles, err := projectpkg.ProjectMemberships(
+	_, banRoles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
 	require.NoError(t, err)
 	require.Empty(t, banRoles, "a banned Space must fail the authorization gate")
@@ -291,7 +298,7 @@ func TestSpaceBanMovesTheEpochChannelToo(t *testing.T) {
 		"a denial cached during the ban (under 0) must stop matching, or every member of "+
 			"every project in this Space stays denied after the unban")
 
-	_, backRoles, err := projectpkg.ProjectMemberships(
+	_, backRoles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"banOwner"})
 	require.NoError(t, err)
 	assert.Contains(t, backRoles, projectpkg.FoldID("banOwner"),
@@ -325,7 +332,7 @@ func TestDisbandedSpaceProjectsReadAsAbsent(t *testing.T) {
 	assert.NotContains(t, epochs, created.ProjectID,
 		"a project whose Space is disbanded must read as absent, i.e. epoch 0")
 
-	epoch, roles, err := projectpkg.ProjectMemberships(
+	epoch, roles, err := projectpkg.ProjectMemberships(context.Background(),
 		testCtx.DB(), spaceA, created.ProjectID, []string{"goneSpaceOwner"})
 	require.NoError(t, err)
 	assert.Zero(t, epoch)
