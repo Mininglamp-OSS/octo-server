@@ -273,7 +273,25 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 		mustExpectationsMet(t, mock)
 	})
 
-	t.Run("all tables present, gorp empty of thread-* — INSERT all 6", func(t *testing.T) {
+	// sqlmock.Rows are single-use iterators; each subtest below builds its
+	// own fresh set rather than sharing one across t.Run closures (a
+	// shared Rows would be drained by the first subtest that reads it and
+	// return no rows to every subsequent one).
+	newAllThreadCols := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"COLUMN_NAME"}).
+			AddRow("message_count").AddRow("last_message_at").AddRow("last_message_content").
+			AddRow("last_message_sender_uid").AddRow("thread_md").AddRow("thread_md_version").
+			AddRow("thread_md_updated_at").AddRow("thread_md_updated_by")
+	}
+	newAllThreadTables := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"TABLE_NAME"}).
+			AddRow("thread").AddRow("thread_member").AddRow("thread_setting")
+	}
+	newAllThreadIdx := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1)
+	}
+
+	t.Run("all tables present, gorp empty of thread-* — probes effects, INSERT all 6", func(t *testing.T) {
 		db, mock := openMock(t)
 		defer db.Close()
 		mock.ExpectQuery(probeQuery).
@@ -284,6 +302,17 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("some_other_migration.sql"))
+		// All six IDs are missing from the ledger, so the reconciler probes
+		// the schema to confirm each one's effect before inserting.
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")).
+			WithArgs("thread").WillReturnRows(newAllThreadCols())
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?, ?, ?)")).
+			WithArgs("thread", "thread_member", "thread_setting").WillReturnRows(newAllThreadTables())
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?")).
+			WithArgs("thread", "idx_status_last_msg_id").WillReturnRows(newAllThreadIdx())
 		mock.ExpectBegin()
 		stmt := mock.ExpectPrepare(regexp.QuoteMeta(
 			"INSERT IGNORE INTO gorp_migrations (id, applied_at) VALUES (?, NOW())"))
@@ -297,13 +326,60 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 		mustExpectationsMet(t, mock)
 	})
 
-	t.Run("partial state — any thread-* present means sql-migrate owns it, no-op", func(t *testing.T) {
-		// Regression test for the silent-corruption bug: if even one
-		// thread-* row is already in gorp_migrations, sql-migrate is
-		// actively tracking the module. Any *missing* thread-* row is a
-		// genuine unapplied migration (e.g. a future ADD INDEX) and the
-		// shim must NOT pre-seed it — doing so would mark a real DDL as
-		// applied without ever running it.
+	t.Run("partial ledger — missing ID's effect already applied — seeds just that ID", func(t *testing.T) {
+		// Regression test for #831: MySQL DDL auto-commits per statement and
+		// is not covered by sql-migrate's surrounding transaction, so a
+		// mid-migration failure (or two pods racing the same migration
+		// during a rolling deploy) can leave a migration's schema effect
+		// applied while its gorp_migrations row never got written. The old
+		// all-or-nothing "anyPresent" gate saw the other five IDs recorded
+		// and bailed entirely, leaving 20260410000003 pending forever and
+		// making sql-migrate replay its ADD COLUMNs against a table that
+		// already had them (MySQL Error 1060, permanent CrashLoopBackOff).
+		// The fix probes the missing ID's actual columns and seeds it since
+		// they're all already present.
+		db, mock := openMock(t)
+		defer db.Close()
+		mock.ExpectQuery(probeQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).
+				AddRow("thread").AddRow("thread_member").AddRow("thread_setting"))
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gorp_migrations'")).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
+		// Five of six thread-* rows are recorded; 20260410000003 (index 2)
+		// is the missing one, but its four columns are already on `thread`.
+		rows := sqlmock.NewRows([]string{"id"})
+		for i, id := range threadModuleSnapshotMigrationIDs {
+			if i == 2 {
+				continue
+			}
+			rows.AddRow(id)
+		}
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).WillReturnRows(rows)
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")).
+			WithArgs("thread").WillReturnRows(newAllThreadCols())
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?, ?, ?)")).
+			WithArgs("thread", "thread_member", "thread_setting").WillReturnRows(newAllThreadTables())
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?")).
+			WithArgs("thread", "idx_status_last_msg_id").WillReturnRows(newAllThreadIdx())
+		mock.ExpectBegin()
+		stmt := mock.ExpectPrepare(regexp.QuoteMeta(
+			"INSERT IGNORE INTO gorp_migrations (id, applied_at) VALUES (?, NOW())"))
+		stmt.ExpectExec().WithArgs(threadModuleSnapshotMigrationIDs[2]).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+
+	t.Run("partial ledger — missing ID's effect NOT applied — stays pending for sql-migrate", func(t *testing.T) {
+		// The other half of the #831 fix: if the missing ID's effect is
+		// genuinely absent (e.g. a real future ADD INDEX that hasn't run
+		// yet), the shim must not seed it — sql-migrate has to apply it.
 		db, mock := openMock(t)
 		defer db.Close()
 		mock.ExpectQuery(probeQuery).
@@ -313,14 +389,25 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gorp_migrations'")).
 			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
 		// Only the first five thread-* rows are recorded; the sixth
-		// (a hypothetical ADD INDEX in a later release) is genuinely
-		// pending and must be left for sql-migrate to apply.
+		// (idx_status_last_msg_id) is genuinely pending — no such index
+		// exists yet.
 		rows := sqlmock.NewRows([]string{"id"})
 		for _, id := range threadModuleSnapshotMigrationIDs[:5] {
 			rows.AddRow(id)
 		}
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).WillReturnRows(rows)
-		// No transaction — the shim must hand control back to sql-migrate.
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")).
+			WithArgs("thread").WillReturnRows(newAllThreadCols())
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?, ?, ?)")).
+			WithArgs("thread", "thread_member", "thread_setting").WillReturnRows(newAllThreadTables())
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?")).
+			WithArgs("thread", "idx_status_last_msg_id").
+			WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
+		// No transaction — the effect isn't confirmed, so the shim hands
+		// control back to sql-migrate rather than seeding the row.
 		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
 			t.Fatalf("expected nil for partial state, got %v", err)
 		}
