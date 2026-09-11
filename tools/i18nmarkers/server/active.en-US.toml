@@ -543,6 +543,9 @@ other = "The target user does not exist or has been deactivated."
 ["err.server.group.view_forbidden"]
 other = "You do not have permission to view this."
 
+["err.server.group.workspace_conflict"]
+other = "The group and Workspace association conflicts with the current state."
+
 ["err.server.incomingwebhook.mgmt_creator_left"]
 other = "The webhook's creator has left the group, so it cannot be enabled. It can be re-enabled after the creator rejoins, or deleted and recreated by someone in the group."
 
@@ -1502,3 +1505,30 @@ other = "Invalid request."
 
 ["err.server.workplace.store_failed"]
 other = "Failed to update workplace data."
+
+["err.server.workspace.candidate_ineligible"]
+other = "The selected member cannot be added to this Workspace."
+
+["err.server.workspace.dependency_unavailable"]
+other = "A required Workspace dependency is unavailable."
+
+["err.server.workspace.forbidden"]
+other = "You do not have permission to access this Workspace."
+
+["err.server.workspace.internal"]
+other = "Workspace service failed."
+
+["err.server.workspace.not_found"]
+other = "Workspace not found."
+
+["err.server.workspace.owner_protected"]
+other = "The Workspace owner must transfer ownership before leaving or being removed."
+
+["err.server.workspace.request_invalid"]
+other = "Invalid Workspace request."
+
+["err.server.workspace.space_required"]
+other = "A valid organization Space is required."
+
+["err.server.workspace.workspace_role_invalid"]
+other = "The Workspace role is invalid."
