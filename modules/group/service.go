@@ -1,7 +1,6 @@
 package group
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,11 +13,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	workspace "github.com/Mininglamp-OSS/octo-server/modules/workspace"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
@@ -139,10 +136,6 @@ type IService interface {
 	IsBotAdmin(groupNo string, uid string) (bool, error)
 	// GetBotMemberUIDs returns UIDs of robot members in the group
 	GetBotMemberUIDs(groupNo string) ([]string, error)
-	// Relation reads own their RR transaction and authorization checks in the
-	// Service; HTTP handlers only parse input and render the result.
-	ReadGroupWorkspace(ctx context.Context, groupNo string, scope workspace.Scope) (GroupWorkspace, error)
-	ListWorkspaceGroups(ctx context.Context, workspaceID, keyword string, page workspace.Page, scope workspace.Scope) (workspace.Pagination[GroupWorkspace], error)
 
 	// CreateGroup 创建群（统一入口，Web 和 Bot 共用）
 	CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceResp, error)
@@ -1104,19 +1097,10 @@ type CreateGroupServiceReq struct {
 	// ProjectID 群的项目归属（可为空=直属 Space）。非空时群成员受 I2 约束，
 	// 包括创建者自己——他不是该项目成员的话，建群会在准入闸门处被拒。
 	ProjectID   string // 所属项目 ID（可为空）
-	WorkspaceID string // Workspace ID（可为空；非空时快照成员并建立关联）
-	// expectedSpaceID is the optional X-Space-ID assertion supplied by the HTTP layer.
-	// It is deliberately private so non-HTTP callers retain the existing request API.
-	expectedSpaceID string
-	// preparedAppConfig is read once by the HTTP layer and reused by the
-	// Workspace creation path; the loaded bit distinguishes a valid nil result
-	// from a direct Service caller that still needs to read configuration.
-	preparedAppConfig       *common2.AppConfigResp
-	preparedAppConfigLoaded bool
-	BotUID                  string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
-	CategoryID              string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText              string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
-	AvatarColor             *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
+	BotUID      string // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
+	CategoryID  string // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
+	AvatarText  string // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
+	AvatarColor *int   // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
 // CreateGroupServiceResp 创建群响应
@@ -1224,22 +1208,275 @@ type UpdateGroupAvatarCustomServiceReq struct {
 
 // CreateGroup 创建群（统一入口，Web 和 Bot 共用）
 func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceResp, error) {
-	state, err := s.createGroupBeforeIM(req)
-	if err != nil {
-		return nil, err
+	if req.Creator == "" {
+		return nil, errors.New("creator is required")
+	}
+	// Members MAY be empty — a group of just its creator is a legitimate group.
+	//
+	// This used to be rejected here, and the rejection has to go for P2: a project
+	// created with no agents picked needs an all-member group whose only initial
+	// member is the project owner. Refusing that would make "create a project"
+	// silently produce a project with no group in the most common case there is.
+	//
+	// The HTTP handler's own check is UNCHANGED (groupReq.Check still requires at
+	// least one member), so a user creating a group by hand still cannot create an
+	// empty one. What is relaxed is the SERVICE contract, for callers that are not
+	// a person filling in a form. The distinction matters: the handler rule is a
+	// product rule about a form, this one was a guard against an empty insert, and
+	// the insert below is not empty — the creator is always added.
+
+	var skippedMembers []string
+	// 跨 Space 外部成员标识：key=uid, value=source_space_id（uid 的默认 Space）
+	// 只有 req.SpaceID 非空时才会被填充——群归属 Space 时，非 Space 成员被视为外部成员。
+	externalMap := make(map[string]bool)
+	sourceSpaceMap := make(map[string]string)
+
+	// Space 校验
+	if req.SpaceID != "" {
+		// 校验 Bot 是否属于目标 Space
+		if req.BotUID != "" {
+			botOk, err := spacepkg.CheckMembership(s.ctx.DB(), req.SpaceID, req.BotUID)
+			if err != nil {
+				s.Error("check bot space membership failed", zap.Error(err))
+				return nil, errors.New("failed to check space membership")
+			}
+			if !botOk {
+				return nil, errors.New("bot is not a member of this space")
+			}
+		}
+		creatorOk, err := spacepkg.CheckMembership(s.ctx.DB(), req.SpaceID, req.Creator)
+		if err != nil {
+			s.Error("check creator space membership failed", zap.Error(err))
+			return nil, errors.New("failed to check space membership")
+		}
+		if !creatorOk {
+			return nil, errors.New("creator is not a member of this space")
+		}
+		// 初始成员：不在群 Space 的成员视为外部成员并标记 is_external / source_space_id，
+		// 行为与 scanjoin / AddGroupMembers 路径对齐，保证 YUJ-53 消息头来源 tag 在
+		// 建群初始成员路径也能被正确渲染。建群暂不做 allow_external 门禁，默认允许（与
+		// 新群 allow_external=1 一致）；若未来需要拒绝，应由 API 层提前校验。
+		//
+		// 一条批量查询，不是逐个 CheckMembership。ActiveMembers 的谓词与
+		// CheckMembership 逐字节相同，它的文档写明存在的理由就是"别让一个拿着很多
+		// uid 的调用方发 N 次往返"。P2 的补建把整份项目名册当作建群初始成员，于是
+		// 这个循环第一次真的会拿到几百个 uid——PR #855 第二轮 review 的 Q1 量到的
+		// 就是这里。
+		spaceActive, err := spacepkg.ActiveMembers(s.ctx.DB(), req.SpaceID, req.Members)
+		if err != nil {
+			s.Error("check member space membership failed", zap.Error(err))
+			return nil, errors.New("failed to check space membership")
+		}
+		for _, uid := range req.Members {
+			if spaceActive[uid] {
+				continue
+			}
+			externalMap[uid] = true
+			// source_space_id 可能为空（用户未属于任何 Space，如无 Space 的 bot），
+			// 与 Service.AddGroupMembers 语义保持一致——仍以外部成员入群，
+			// source_space_name 在下发时若为空则 UI 不渲染来源 tag。
+			sourceSpaceMap[uid] = spacemod.GetUserDefaultSpaceID(s.ctx, uid)
+		}
 	}
 
-	// Keep the post-commit side effects separate from the database protocol:
-	// BotAdmin, category settings, IM creation, compensation, and notification
-	// must not be repeated when Workspace snapshot preparation retries.
-	req = &state.req
-	groupNo := state.groupNo
-	groupName := state.groupName
-	version := state.version
-	creatorUser := state.creatorUser
-	realMemberUIDs := state.realMemberUIDs
-	memberVos := state.memberVos
-	skippedMembers := state.skippedMembers
+	// 查询创建者用户信息
+	creatorUser, err := s.userDB.QueryByUID(req.Creator)
+	if err != nil {
+		s.Error("query creator info failed", zap.Error(err))
+		return nil, errors.New("failed to query creator info")
+	}
+	if creatorUser == nil {
+		return nil, errors.New("creator user not found")
+	}
+
+	// 成员去重，加入创建者，过滤空值
+	allUIDs := make([]string, 0, len(req.Members)+1)
+	allUIDs = append(allUIDs, req.Creator)
+	seen := map[string]bool{req.Creator: true}
+	for _, uid := range req.Members {
+		uid = strings.TrimSpace(uid)
+		if uid != "" && !seen[uid] {
+			seen[uid] = true
+			allUIDs = append(allUIDs, uid)
+		}
+	}
+
+	// 查询成员用户信息
+	memberUsers, err := s.userDB.QueryByUIDs(allUIDs)
+	if err != nil {
+		s.Error("query member info failed", zap.Error(err))
+		return nil, errors.New("failed to query member info")
+	}
+	if len(memberUsers) == 0 {
+		return nil, errors.New("no valid member found")
+	}
+
+	// 群名生成。建群传了 name = 用户显式起名；没传 = 用成员名拼接的自动默认名。
+	// 注(产品 2026-06-29 改版)：新建群一律 is_named=0 → 默认头像双人图标，群名不作为头像
+	// 文字；用户在「修改头像」填了 avatar_text 才渲染文字。is_named=1 不再由建群产生——它
+	// 仅由 #500 迁移回填给「改版前的存量老群」，使这些老群保留其原有的群名文字头像
+	// （grandfather，避免存量群一夜全变小人）。
+	groupName := strings.TrimSpace(req.Name)
+	if groupName == "" {
+		names := make([]string, 0, len(memberUsers))
+		for _, u := range memberUsers {
+			names = append(names, u.Name)
+		}
+		groupName = strings.Join(names, "、")
+	}
+	nameRunes := []rune(groupName)
+	if len(nameRunes) > MaxGroupNameLen {
+		groupName = string(nameRunes[:MaxGroupNameLen])
+	}
+
+	// 生成群编号和版本号
+	groupNo := util.GenerUUID()
+	version, err := s.ctx.GenSeq(common.GroupSeqKey)
+	if err != nil {
+		s.Error("generate group version failed", zap.Error(err))
+		return nil, errors.New("failed to generate group version")
+	}
+
+	// 开启事务
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		s.Error("begin transaction failed", zap.Error(err))
+		return nil, errors.New("failed to begin transaction")
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 插入群记录
+	// 如果初始成员中存在人类外部成员，同步把群标记为外部群，保持 group 与
+	// group_member 的 is_external_* 标记在同一事务内一致（与 ADD / DELETE
+	// 路径对称，bot-only 外部不会 flip 群标记）。
+	// 建群时的项目归属。空串=直属 Space。handler 已校验过它属于同一个 Space
+	// 且项目处于活跃状态；「创建者本人是不是该项目成员」由下面的准入闸门在事务
+	// 内判定，那才是不会过期的判定点。
+	newGroupProjectID := req.ProjectID
+	initialAdmissions := make([]MemberAdmission, 0, len(memberUsers))
+
+	isExternalGroup := 0
+	for _, memberUser := range memberUsers {
+		if memberUser.UID == req.Creator {
+			continue
+		}
+		if req.BotUID != "" && memberUser.UID == req.BotUID {
+			continue
+		}
+		if externalMap[memberUser.UID] && memberUser.Robot == 0 {
+			isExternalGroup = 1
+			break
+		}
+	}
+	err = s.db.InsertTx(&Model{
+		GroupNo:             groupNo,
+		Name:                groupName,
+		IsNamed:             0, // 新群默认 0 → 双人图标；is_named=1 仅存量老群（#500 迁移回填）
+		Creator:             req.Creator,
+		Status:              GroupStatusNormal,
+		Version:             version,
+		AllowViewHistoryMsg: int(common.GroupAllowViewHistoryMsgEnabled),
+		SpaceID:             req.SpaceID,
+		ProjectID:           req.ProjectID,
+		AllowExternal:       1, // 向后兼容：默认允许外部成员
+		AllowNoMention:      1, // 向后兼容：默认允许群级免@
+		IsExternalGroup:     isExternalGroup,
+		AvatarText:          req.AvatarText,  // 空=按 is_named 回退（老群渲染群名/新群双人图标）
+		AvatarColor:         req.AvatarColor, // nil=渲染时按 group_no 派生
+	}, tx)
+	if err != nil {
+		s.Error("insert group record failed", zap.Error(err))
+		return nil, errors.New("failed to insert group record")
+	}
+
+	// 插入成员
+	realMemberUIDs := make([]string, 0, len(memberUsers))
+	memberVos := make([]*config.UserBaseVo, 0, len(memberUsers))
+	for _, memberUser := range memberUsers {
+		if memberUser.IsDestroy == user.IsDestroyDone {
+			continue
+		}
+		// Bot UID 单独处理（下面添加）
+		if req.BotUID != "" && memberUser.UID == req.BotUID {
+			continue
+		}
+		memberVersion, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
+		if err != nil {
+			s.Error("generate member version failed", zap.Error(err))
+			return nil, err
+		}
+		role := MemberRoleCommon
+		if memberUser.UID == req.Creator {
+			role = MemberRoleCreator
+		}
+		// 跨 Space 外部成员：写入 is_external=1 和 source_space_id，保证
+		// 消息头 from_is_external / from_source_space_name 在建群初始成员
+		// 路径也能正确下发（YUJ-53 UI 来源 tag 渲染依赖）。
+		isExt := 0
+		srcSpaceID := ""
+		if externalMap[memberUser.UID] {
+			isExt = 1
+			srcSpaceID = sourceSpaceMap[memberUser.UID]
+		}
+		initialAdmissions = append(initialAdmissions, MemberAdmission{
+			UID:           memberUser.UID,
+			Version:       memberVersion,
+			Role:          role,
+			InviteUID:     req.Creator,
+			Robot:         memberUser.Robot,
+			IsExternal:    isExt,
+			SourceSpaceID: srcSpaceID,
+		})
+		realMemberUIDs = append(realMemberUIDs, memberUser.UID)
+		memberVos = append(memberVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
+	}
+	if len(realMemberUIDs) == 0 {
+		return nil, errors.New("no valid member to add")
+	}
+	// 收口到唯一准入口（A3）。newGroupProjectID 来自建群请求的 project_id：
+	// handler 已经校验过它存在、活跃、属于同一个 Space，且调用方在这个 Space 里；
+	// 「调用方是不是这个项目的成员」故意不在那里查，而是由下面这道闸门在**建群
+	// 事务内、持锁状态下**判定——放在 handler 里查是一次会过期的读。
+	if err := s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID,
+		initialAdmissions, AdmissionEntryCreateGroup); err != nil {
+		s.Error("insert members failed", zap.Error(err), zap.String("groupNo", groupNo))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("failed to insert group member")
+	}
+
+	// Bot 加入群
+	if req.BotUID != "" {
+		botMemberVersion, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
+		if err != nil {
+			s.Error("generate bot member version failed", zap.Error(err))
+			return nil, err
+		}
+		// 收口到唯一准入口（A4）。Bot 走的是与人相同的闸门：只有 pkg/space 白名单
+		// 里的系统 bot 才对项目成员资格豁免，普通 bot 需要显式的项目席位，否则
+		// 「邀请一个 bot」就成了往项目群里塞监听者的旁路。
+		err = s.db.admitOrRestoreMembersTx(tx, groupNo, req.SpaceID, newGroupProjectID, []MemberAdmission{{
+			UID:       req.BotUID,
+			Version:   botMemberVersion,
+			Role:      MemberRoleCommon,
+			InviteUID: req.Creator,
+			Robot:     1,
+		}}, AdmissionEntryCreateGroupBot)
+		if err != nil {
+			s.Error("insert bot member failed", zap.Error(err))
+			// Bot 加入失败不阻断建群
+		} else {
+			realMemberUIDs = append(realMemberUIDs, req.BotUID)
+			memberVos = append(memberVos, &config.UserBaseVo{UID: req.BotUID, Name: req.BotUID})
+		}
+	}
+
+	// 提交事务
+	if err := tx.Commit(); err != nil {
+		s.Error("commit transaction failed", zap.Error(err))
+		return nil, errors.New("failed to commit transaction")
+	}
 
 	// 事务提交后设置 Bot 为 bot_admin
 	if req.BotUID != "" {
@@ -1284,10 +1521,14 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	})
 	if err != nil {
 		s.Error("create IM channel failed, performing compensating rollback", zap.Error(err), zap.String("groupNo", groupNo))
-		cleanupErr := s.compensateCreateGroup(groupNo)
-		if cleanupErr != nil {
-			s.Error("compensating group cleanup failed", zap.Error(cleanupErr), zap.String("groupNo", groupNo))
-			return nil, fmt.Errorf("failed to create IM channel: %v; compensating cleanup failed: %w", err, cleanupErr)
+		// Compensating delete: remove group_member and group records that were
+		// already committed. Use s.ctx.DB() (not tx) because the transaction
+		// has already been committed.
+		if _, delErr := s.ctx.DB().DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); delErr != nil {
+			s.Error("compensating delete group_member failed", zap.Error(delErr), zap.String("groupNo", groupNo))
+		}
+		if _, delErr := s.ctx.DB().DeleteFrom("group").Where("group_no=?", groupNo).Exec(); delErr != nil {
+			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
 		}
 		return nil, errors.New("failed to create IM channel, group has been rolled back")
 	}
@@ -1306,38 +1547,6 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Name:           groupName,
 		SkippedMembers: skippedMembers,
 	}, nil
-}
-
-// compensateCreateGroup removes all local rows committed before an IM channel
-// creation failure. The cleanup is one transaction so a failed delete cannot
-// leave a relation or a partial member set while the caller is told rollback
-// succeeded.
-func (s *Service) compensateCreateGroup(groupNo string) error {
-	tx, err := s.ctx.DB().Begin()
-	if err != nil {
-		return fmt.Errorf("begin compensating cleanup transaction: %w", err)
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	// Match the lock order used by group writes: serialize on the parent row
-	// before touching child rows.
-	var lockedGroupNo string
-	if err = tx.SelectBySql("SELECT group_no FROM `group` WHERE group_no=? FOR UPDATE", groupNo).LoadOne(&lockedGroupNo); err != nil {
-		return fmt.Errorf("lock group for compensating cleanup: %w", err)
-	}
-	if _, err = tx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); err != nil {
-		return fmt.Errorf("delete group members: %w", err)
-	}
-	if _, err = tx.DeleteFrom("group_setting").Where("group_no=?", groupNo).Exec(); err != nil {
-		return fmt.Errorf("delete group settings: %w", err)
-	}
-	if _, err = tx.DeleteFrom("group").Where("group_no=?", groupNo).Exec(); err != nil {
-		return fmt.Errorf("delete group: %w", err)
-	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit compensating cleanup: %w", err)
-	}
-	return nil
 }
 
 // AddGroupMembers 添加群成员

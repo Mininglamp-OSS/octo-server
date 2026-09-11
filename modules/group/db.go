@@ -916,8 +916,6 @@ type Model struct {
 	Category                 string     // 群分类
 	SpaceID                  string     // Space ID
 	ProjectID                string     // 所属项目ID；空串=直属 Space。非空即受不变量 I2 约束（见 admission.go）
-	WorkspaceID              *string    // 关联的 Workspace ID；NULL 表示未关联
-	WorkspaceLinkedBy        *string    // 当前 Workspace 关联操作者；NULL 表示未关联
 	IsExternalGroup          int        // 外部群 0.否 1.是（自动维护）
 	AllowExternal            int        // 是否允许外部成员加入 1.允许(默认) 0.禁止
 	AllowNoMention           int        // 群级是否允许免@生效 1.允许(默认) 0.禁止（bot 在本群必须被@）
