@@ -479,12 +479,15 @@ func TestWorkerReachesReadyAndConvergesOnReplay(t *testing.T) {
 // state would send the wrong super_admin_uid.
 func TestDriveWorkerSendsCurrentProjectOwnerAndNoContainerID(t *testing.T) {
 	var (
+		mu       sync.Mutex
 		gotPath  string
 		gotToken string
 		gotBody  map[string]json.RawMessage
 		calls    int
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		gotPath = r.URL.Path
 		gotToken = r.Header.Get(projectprovision.HeaderInternalToken)
 		if signature := r.Header.Get(projectprovision.HeaderSignature); signature != "" {
@@ -537,7 +540,9 @@ func TestDriveWorkerSendsCurrentProjectOwnerAndNoContainerID(t *testing.T) {
 	require.Len(t, rows, 1)
 	require.Equal(t, provisionStatusPending, rows[0].Status)
 	assert.Contains(t, rows[0].LastError, "transport_failed")
+	mu.Lock()
 	assert.Equal(t, 1, calls)
+	mu.Unlock()
 
 	// Transfer ownership after the failed attempt. The retry must re-read the
 	// active Project owner rather than replaying creator=owner1.
@@ -554,6 +559,8 @@ func TestDriveWorkerSendsCurrentProjectOwnerAndNoContainerID(t *testing.T) {
 	p.processProvisioningJobs()
 	rows = readProvisioningRows(t, created.ProjectID)
 	require.Equal(t, provisionStatusReady, rows[0].Status, "last_error=%q", rows[0].LastError)
+	mu.Lock()
+	defer mu.Unlock()
 	assert.Equal(t, 2, calls)
 	assert.Equal(t, "/v1/internal/drive/spaces", gotPath)
 	assert.Equal(t, provTestDriveToken, gotToken)
