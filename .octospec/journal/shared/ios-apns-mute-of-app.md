@@ -89,9 +89,69 @@ Two mutations confirmed the tests are not vacuous: removing the `Silence()` call
 in `push` reddens the connection-point test, and writing `sound: ""` instead of
 omitting reddens the payload tests.
 
+Coverage spans four levels: the payload bytes (stub APNs gateway), the
+resolver (stubbed lookup), the SQL (`DesktopOnlineUIDs` against real MySQL), and
+the assembly (`pushTo` through PushPool to a capturing pusher). The SQL and
+assembly levels exist because the stub levels demonstrably could not catch the
+Error 1064 defect described above.
+
 Gates: `go build ./...`, `go vet`, `gofmt`, `golangci-lint` (0 issues),
 `make i18n-extract-check`, `make i18n-lint`, full `modules/webhook` and
 `modules/user` suites against local MySQL + Redis + WuKongIM.
+
+## Review round (code-review findings)
+
+A review pass raised ten findings; six were real and are fixed here.
+
+**The online lookup was an N+1, and the code comment claimed it was not.**
+The first version queried per muted recipient (PC, then Web). The defense —
+"almost nobody enables mute" — contradicted this change's own premise: the
+server never clears `mute_of_app`, so the muted population only grows. Replaced
+with `user.IService.DesktopOnlineUIDs`, one `uid IN (...) AND device_flag IN
+(PC, Web) AND online=1` for the whole batch, still skipped entirely when no
+recipient is muted. A test pins one query for a 1000-recipient batch.
+
+**A redundant dependency.** `user.IService` already exposed `GetDeviceOnline`
+and is already an interface. The first version added a `deviceOnlineChecker`
+interface, an `onlineService` field and a second `OnlineService` instance. All
+three are gone; the batch method was added to the interface the struct already
+holds.
+
+**Error logging was per recipient.** A single DB blip during a broadcast would
+emit one Error line per muted user. Now one line per batch carrying the count,
+matching `filterPausedUIDs`.
+
+**The RTC test covered dead code.** `PayloadInfo.IsVideoCall` is never assigned
+in production, so the payload-layer RTC branch is unreachable and a test that
+set the field by hand proved nothing. The real guarantee is `if !isVideoCall` in
+`pushTo`, driven by the payload `cmd`. The test now drives `pushTo`; deleting
+that line turns it red.
+
+**Redis leaked between tests.** Device-token hashes were written and never
+deleted, and `CleanAllTables` is SQL-only — a fact this repo's own testing rule
+warns about.
+
+### The finding that mattered most
+
+The review also flagged that `pushTo`'s assembly — the only place the feature is
+actually switched on in production — had no coverage: three layers each unit
+tested, nothing covering the wiring between them. Writing that test immediately
+failed, and the cause was in the code written to fix the N+1 finding:
+
+```go
+[]uint8{config.PC.Uint8(), config.Web.Uint8()}   // []uint8 IS []byte
+```
+
+dbr binds `[]byte` as a blob rather than expanding an `IN` list, so the `?` was
+never expanded and MySQL returned Error 1064 on every call. The fail-open path
+then swallowed it and every muted user got an audible push — **the original bug,
+reproduced exactly, by the code meant to fix it**. Stub-based unit tests stayed
+green throughout, because the stub never touched SQL.
+
+Two defenses were added: a DB-level test for `DesktopOnlineUIDs` against real
+MySQL (device-flag matrix: PC / Web / APP-only / offline / multi-device), and
+the `pushTo` end-to-end tests. Mutation-verified — reverting to `[]uint8`
+reddens the DB test, deleting the RTC exemption reddens the pushTo test.
 
 ## Known gaps left open
 

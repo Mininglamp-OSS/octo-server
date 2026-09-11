@@ -46,10 +46,7 @@ type Webhook struct {
 	groupService        group.IService
 	userService         user.IService
 	notificationService *notification.Service
-	// onlineService 用于判定「手机静音」是否仍然生效（需要该用户确有 PC/Web
-	// 在线会话），详见 resolveEffectiveAppMute。
-	onlineService deviceOnlineChecker
-	secretKey     string // Webhook HMAC-SHA256 签名密钥
+	secretKey           string // Webhook HMAC-SHA256 签名密钥
 	wkhook.UnimplementedWebhookServiceServer
 	grpcServer *grpc.Server
 }
@@ -137,7 +134,6 @@ func New(ctx *config.Context) *Webhook {
 		groupService:        group.NewService(ctx),
 		userService:         user.NewService(ctx),
 		notificationService: notification.New(ctx),
-		onlineService:       user.NewOnlineService(ctx),
 		secretKey:           os.Getenv("TS_WEBHOOK_SECRET_KEY"),
 	}
 }
@@ -612,12 +608,12 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 	}
 
 	// 解析每个接收者的「手机静音」是否生效（仅影响推送声音，不影响是否推送）。
-	// 与账号级通知暂停同样放在批量阶段，避免在 PushPool 扇出后产生 N+1 查询。
+	// 与账号级通知暂停同样放在批量阶段，整批一次查询，不在 PushPool 扇出后逐个往返。
 	// RTC 来电穿透静音，与下方 allowPush 对 isVideoCall 的豁免保持一致。
 	var mutedUIDs map[string]bool
 	if !isVideoCall {
-		mutedUIDs = resolveEffectiveAppMute(users, w.onlineService, func(uid string, err error) {
-			w.Error("查询PC/Web在线状态失败，按有声推送", zap.Error(err), zap.String("uid", uid))
+		mutedUIDs = resolveEffectiveAppMute(users, w.userService.DesktopOnlineUIDs, func(mutedCount int, err error) {
+			w.Error("查询PC/Web在线状态失败，按有声推送", zap.Error(err), zap.Int("mutedCount", mutedCount))
 		})
 	}
 

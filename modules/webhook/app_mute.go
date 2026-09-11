@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 )
 
@@ -17,14 +16,17 @@ import (
 // 接口，所以静音对安卓仍是 no-op。
 type silenceable interface {
 	// Silence 让该负载以「无声」形态下发：只去掉声音，横幅与角标照常。
+	//
+	// 契约：调用方在 GetPayload 返回之后、Push 之前调用，因此 GetPayload 的每个
+	// 实现必须返回**全新实例**，不得复用或缓存跨接收者的 Payload —— 否则一个
+	// 接收者的静音会泄漏给同批次的其他人。现有六个实现均为每次新建。
 	Silence()
 }
 
-// deviceOnlineChecker 抽象设备在线查询，便于在测试中注入。
-// 生产实现是 user.OnlineService。
-type deviceOnlineChecker interface {
-	DeviceOnline(uid string, device config.DeviceFlag) (bool, error)
-}
+// desktopOnlineLookup 批量查询「这批 uid 里谁有 PC/Web 在线会话」。
+// 生产实现是 user.IService.DesktopOnlineUIDs；独立成函数类型只为测试注入，
+// 不额外往 Webhook 上挂依赖。
+type desktopOnlineLookup func(uids []string) (map[string]bool, error)
 
 // resolveEffectiveAppMute 计算每个接收者的「手机静音」(user.mute_of_app) 是否
 // **真正生效**，返回 uid -> 是否静音。
@@ -38,49 +40,55 @@ type deviceOnlineChecker interface {
 //	可靠：Web 断开的那一刻 App 可能已被杀死或在后台。所以在线校验必须由服务端
 //	在推送时做。
 //
-// 性能：只有 mute_of_app == 1 的接收者才会触发在线查询。绝大多数用户未开静音，
-// 因此批量阶段通常是 0 次查询，不会在 PushPool 扇出前产生 N+1
-// （与 api.go 中账号级通知暂停的批量查询同一考量）。
+// 在线信号自身的时效边界（已知且可接受）：
+//
+//	user_online 也可能滞后 —— 若 IM 的下线回调丢失，纠正要等 onlineStatusCheck
+//	（每 5 分钟一轮，单轮最多 1000 行，见 modules/user/api_online.go）。也就是说
+//	静音有可能在用户关掉 Web 之后多持续若干分钟。这仍然可接受，因为两种陈旧的
+//	**量级不同**：mute_of_app 的残留是无界的（永不清除），user_online 的滞后是
+//	有界的（分钟级且有定时纠正）。把无界降成有界正是本判定的目的；若日后要进一步
+//	收紧，方向是改用 last_online 新鲜度而非 online 标志位。
+//
+// 性能：整批只做一次查询，且仅在存在 mute_of_app == 1 的接收者时才发起 ——
+// 无人开启静音的批次为 0 次查询。
 //
 // 失败姿态：查询出错按**有声**处理（fail-open）。一条听不到的通知等同于丢消息，
 // 与 filterPausedUIDs 对通知偏好的 fail-open 取向一致。
-func resolveEffectiveAppMute(users []*user.Resp, checker deviceOnlineChecker, logger func(uid string, err error)) map[string]bool {
-	if len(users) == 0 || checker == nil {
+func resolveEffectiveAppMute(users []*user.Resp, lookup desktopOnlineLookup, onErr func(mutedCount int, err error)) map[string]bool {
+	if len(users) == 0 || lookup == nil {
 		return nil
 	}
-	var muted map[string]bool
+
+	// 先挑出声明了静音的接收者；没有就完全不查库。
+	var candidates []string
 	for _, u := range users {
-		if u == nil || u.MuteOfApp != 1 {
-			continue // 未开启静音：不查在线，直接有声
+		if u != nil && u.MuteOfApp == 1 {
+			candidates = append(candidates, u.UID)
 		}
-		online, err := hasDesktopSession(u.UID, checker)
-		if err != nil {
-			if logger != nil {
-				logger(u.UID, err)
-			}
-			continue // fail-open：查不出在线状态就照常发声
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	desktopOnline, err := lookup(candidates)
+	if err != nil {
+		// fail-open：查不出在线状态就整批照常发声。整批记一条日志，
+		// 避免一次 DB 抖动在广播场景刷出成百上千条重复错误。
+		if onErr != nil {
+			onErr(len(candidates), err)
 		}
-		if !online {
+		return nil
+	}
+
+	var muted map[string]bool
+	for _, uid := range candidates {
+		if !desktopOnline[uid] {
 			continue // 静音已失效（PC/Web 均不在线），照常发声
 		}
 		if muted == nil {
-			muted = make(map[string]bool, 1)
+			muted = make(map[string]bool, len(candidates))
 		}
-		muted[u.UID] = true
+		muted[uid] = true
 	}
 	return muted
-}
-
-// hasDesktopSession 判断该用户是否存在 PC 或 Web 在线会话。
-// 与 modules/user/api_online.go 下发「PC 在线」面板的判定口径保持一致：
-// 先看 PC，未命中再看 Web。
-func hasDesktopSession(uid string, checker deviceOnlineChecker) (bool, error) {
-	pcOnline, err := checker.DeviceOnline(uid, config.PC)
-	if err != nil {
-		return false, err
-	}
-	if pcOnline {
-		return true, nil
-	}
-	return checker.DeviceOnline(uid, config.Web)
 }

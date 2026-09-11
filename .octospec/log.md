@@ -16,9 +16,18 @@ change-log convention (§7). Newest first.
   后永久静音」。在线查询失败按有声处理（fail-open）。
 - 新增 `silenceable` 可选接口，只有 `IOSPayload` 实现；其余五个厂商负载未改动、
   线上行为不变。安卓侧（HMS `sound`/MI `sound_uri`）同类缺口按决定另行处理。
-- 记录见 [journal](journal/shared/ios-apns-mute-of-app.md)；「客户端只清本地的设置
-  在服务端已是陈旧值」这条经验暂存在
-  [learnings/pending](learnings/pending/a-setting-the-client-clears-locally-is-stale-on-the-server.md)。
+- **Review 轮**：在线判定改为整批单次查询（原实现是逐静音用户往返，而注释却声称
+  避免了 N+1 —— 依据是「极少人开静音」，恰好与本次修复的前提「mute_of_app 永不
+  清除」矛盾）；复用已有的 `user.IService`，删掉多加的 `deviceOnlineChecker` 接口
+  与第二个 OnlineService 实例；fail-open 错误日志由每用户一条改为每批一条带计数。
+- **Review 暴露的真 bug**：补 `pushTo` 装配层测试后当场失败 —— 批量查询里
+  `device_flag in ?` 传了 `[]uint8`，而 `[]uint8` 就是 `[]byte`，dbr 按 blob 绑定
+  导致 `?` 不展开、每次调用都 Error 1064；fail-open 又把它咽了下去，于是静音全部
+  失效 —— **原 bug 被「修复代码」原样复现**。stub 单测全程绿灯。已补 `DesktopOnlineUIDs`
+  的真实 MySQL 测试（PC/Web/仅APP/离线/多端矩阵）与 `pushTo` 端到端测试，并做变异验证。
+- 记录见 [journal](journal/shared/ios-apns-mute-of-app.md)；两条经验暂存在
+  [learnings/pending](learnings/pending/)：「客户端只清本地的设置在服务端已是陈旧值」、
+  「fail-open 会把自身实现的 bug 伪装成功能没生效」。
 
 ## 2026-09-09 — space-directory-octo-hosted-only
 

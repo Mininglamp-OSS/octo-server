@@ -116,23 +116,6 @@ func TestIOSPayload_SilentChangesNothingButSound(t *testing.T) {
 	}
 }
 
-// RTC 来电穿透静音：与 allowPush 对 isVideoCall 的豁免保持一致。
-func TestIOSPayload_RTCAlwaysAudible(t *testing.T) {
-	info := newTestPayloadInfo()
-	info.IsVideoCall = true
-	info.FromUID = "u_888"
-	info.Operation = "invoke"
-
-	p := NewIOSPayload(info)
-	if s, ok := p.(silenceable); ok {
-		s.Silence() // 即便被标记静音
-	}
-	_, decoded := captureAPNsPayload(t, p)
-	if got := apsOf(t, decoded)["sound"]; got != "default" {
-		t.Fatalf("RTC 推送应始终有声，实际 sound=%v", got)
-	}
-}
-
 func jsonEqual(a, b interface{}) bool {
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)
@@ -141,18 +124,21 @@ func jsonEqual(a, b interface{}) bool {
 
 // --- resolveEffectiveAppMute ---
 
-type stubOnlineChecker struct {
-	online map[config.DeviceFlag]bool
-	err    error
-	calls  int
+// stubLookup 记录批量在线查询的调用情况。
+type stubLookup struct {
+	online    map[string]bool
+	err       error
+	calls     int
+	lastBatch []string
 }
 
-func (s *stubOnlineChecker) DeviceOnline(uid string, device config.DeviceFlag) (bool, error) {
+func (s *stubLookup) fn(uids []string) (map[string]bool, error) {
 	s.calls++
+	s.lastBatch = append([]string(nil), uids...)
 	if s.err != nil {
-		return false, s.err
+		return nil, s.err
 	}
-	return s.online[device], nil
+	return s.online, nil
 }
 
 func mutedUser(uid string) *user.Resp  { return &user.Resp{UID: uid, MuteOfApp: 1} }
@@ -162,57 +148,53 @@ func TestResolveEffectiveAppMute(t *testing.T) {
 	tests := []struct {
 		name      string
 		users     []*user.Resp
-		checker   *stubOnlineChecker
+		lookup    *stubLookup
 		wantMuted []string
 		wantCalls int
+		wantBatch []string
 	}{
 		{
-			name:      "未开启静音：不查在线，直接有声",
+			name:      "未开启静音：完全不查库",
 			users:     []*user.Resp{normalUser("u1"), normalUser("u2")},
-			checker:   &stubOnlineChecker{},
+			lookup:    &stubLookup{},
 			wantMuted: nil,
-			wantCalls: 0, // 关键：避免为未静音用户产生 N+1 查询
+			wantCalls: 0,
 		},
 		{
-			name:      "静音 + PC 在线：生效",
+			name:      "静音 + 桌面端在线：生效",
 			users:     []*user.Resp{mutedUser("u1")},
-			checker:   &stubOnlineChecker{online: map[config.DeviceFlag]bool{config.PC: true}},
+			lookup:    &stubLookup{online: map[string]bool{"u1": true}},
 			wantMuted: []string{"u1"},
-			wantCalls: 1, // 命中 PC 后不再查 Web
-		},
-		{
-			name:      "静音 + 仅 Web 在线：生效",
-			users:     []*user.Resp{mutedUser("u1")},
-			checker:   &stubOnlineChecker{online: map[config.DeviceFlag]bool{config.Web: true}},
-			wantMuted: []string{"u1"},
-			wantCalls: 2,
+			wantCalls: 1,
 		},
 		{
 			// 回归核心：Web 退出后 DB 里残留 mute_of_app=1，绝不能变成永久静音。
-			name:      "静音但 PC/Web 均不在线：残留值失效，照常有声",
+			name:      "静音但桌面端不在线：残留值失效，照常有声",
 			users:     []*user.Resp{mutedUser("u1")},
-			checker:   &stubOnlineChecker{online: map[config.DeviceFlag]bool{}},
-			wantMuted: nil,
-			wantCalls: 2,
-		},
-		{
-			name:      "在线查询失败：fail-open 有声",
-			users:     []*user.Resp{mutedUser("u1")},
-			checker:   &stubOnlineChecker{err: errors.New("db down")},
+			lookup:    &stubLookup{online: map[string]bool{}},
 			wantMuted: nil,
 			wantCalls: 1,
 		},
 		{
-			name:      "混合批次：只为静音用户查询",
-			users:     []*user.Resp{normalUser("u1"), mutedUser("u2"), normalUser("u3")},
-			checker:   &stubOnlineChecker{online: map[config.DeviceFlag]bool{config.PC: true}},
+			name:      "查询失败：整批 fail-open 有声",
+			users:     []*user.Resp{mutedUser("u1"), mutedUser("u2")},
+			lookup:    &stubLookup{err: errors.New("db down")},
+			wantMuted: nil,
+			wantCalls: 1,
+		},
+		{
+			// 无论多少接收者，都只查一次，且只把静音候选人放进查询。
+			name:      "混合批次：单次查询，且只带静音候选",
+			users:     []*user.Resp{normalUser("u1"), mutedUser("u2"), normalUser("u3"), mutedUser("u4")},
+			lookup:    &stubLookup{online: map[string]bool{"u2": true}},
 			wantMuted: []string{"u2"},
 			wantCalls: 1,
+			wantBatch: []string{"u2", "u4"},
 		},
 		{
 			name:      "含 nil 用户不 panic",
 			users:     []*user.Resp{nil, mutedUser("u1")},
-			checker:   &stubOnlineChecker{online: map[config.DeviceFlag]bool{config.PC: true}},
+			lookup:    &stubLookup{online: map[string]bool{"u1": true}},
 			wantMuted: []string{"u1"},
 			wantCalls: 1,
 		},
@@ -220,42 +202,49 @@ func TestResolveEffectiveAppMute(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resolveEffectiveAppMute(tt.users, tt.checker, nil)
-			if len(got) != len(tt.wantMuted) {
-				t.Fatalf("静音用户数不符: 期望 %v, 实际 %v", tt.wantMuted, got)
-			}
+			got := resolveEffectiveAppMute(tt.users, tt.lookup.fn, nil)
+			assert.Equal(t, len(tt.wantMuted), len(got), "静音用户数不符")
 			for _, uid := range tt.wantMuted {
-				if !got[uid] {
-					t.Errorf("期望 %s 静音生效，实际未生效", uid)
-				}
+				assert.True(t, got[uid], "期望 %s 静音生效", uid)
 			}
-			if tt.checker.calls != tt.wantCalls {
-				t.Errorf("在线查询次数不符: 期望 %d, 实际 %d", tt.wantCalls, tt.checker.calls)
+			assert.Equal(t, tt.wantCalls, tt.lookup.calls, "在线查询次数不符")
+			if tt.wantBatch != nil {
+				assert.Equal(t, tt.wantBatch, tt.lookup.lastBatch, "查询批次内容不符")
 			}
 		})
 	}
 }
 
-// checker 缺失时不得 panic，且按有声处理。
-func TestResolveEffectiveAppMute_NilChecker(t *testing.T) {
-	if got := resolveEffectiveAppMute([]*user.Resp{mutedUser("u1")}, nil, nil); len(got) != 0 {
-		t.Fatalf("checker 为 nil 时应无人静音，实际 %v", got)
+// 一千个静音接收者也只能产生一次查询 —— 这是 N+1 的回归闸门。
+func TestResolveEffectiveAppMute_SingleQueryForLargeBatch(t *testing.T) {
+	users := make([]*user.Resp, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		users = append(users, mutedUser(fmt.Sprintf("u%d", i)))
 	}
+	lookup := &stubLookup{online: map[string]bool{}}
+	resolveEffectiveAppMute(users, lookup.fn, nil)
+	assert.Equal(t, 1, lookup.calls, "整批必须只查一次，不得逐用户往返")
+	assert.Len(t, lookup.lastBatch, 1000, "一次查询应覆盖全部静音候选")
 }
 
-// 查询失败必须可观测：logger 被调用且带上 uid 与原始错误。
-func TestResolveEffectiveAppMute_LogsLookupFailure(t *testing.T) {
+// lookup 缺失时不得 panic，且按有声处理。
+func TestResolveEffectiveAppMute_NilLookup(t *testing.T) {
+	assert.Empty(t, resolveEffectiveAppMute([]*user.Resp{mutedUser("u1")}, nil, nil))
+}
+
+// 查询失败必须可观测，且整批只记一条（避免广播时刷屏）。
+func TestResolveEffectiveAppMute_LogsOncePerBatch(t *testing.T) {
 	wantErr := errors.New("db down")
-	var gotUID string
+	var calls, gotCount int
 	var gotErr error
-	resolveEffectiveAppMute(
-		[]*user.Resp{mutedUser("u1")},
-		&stubOnlineChecker{err: wantErr},
-		func(uid string, err error) { gotUID, gotErr = uid, err },
-	)
-	if gotUID != "u1" || !errors.Is(gotErr, wantErr) {
-		t.Fatalf("期望记录 uid=u1 与原始错误，实际 uid=%q err=%v", gotUID, gotErr)
-	}
+	users := []*user.Resp{mutedUser("u1"), mutedUser("u2"), mutedUser("u3")}
+	resolveEffectiveAppMute(users, (&stubLookup{err: wantErr}).fn, func(n int, err error) {
+		calls++
+		gotCount, gotErr = n, err
+	})
+	assert.Equal(t, 1, calls, "整批只能记一条错误日志")
+	assert.Equal(t, 3, gotCount, "日志应带上受影响的静音人数")
+	assert.ErrorIs(t, gotErr, wantErr)
 }
 
 // --- push() 的静音传递（端到端连接点）---
@@ -297,6 +286,9 @@ func TestPush_AppliesSilenceToPayload(t *testing.T) {
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 
 	const uid = "u_mute_apply"
+	// CleanAllTables 只清 MySQL，不清 Redis —— 设备令牌必须显式删除，
+	// 否则会残留给后续（或乱序执行的）用例，导致不可复现的失败。
+	defer func() { _ = ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", common.UserDeviceTokenPrefix, uid)) }()
 	err := ctx.GetRedisConn().Hmset(fmt.Sprintf("%s%s", common.UserDeviceTokenPrefix, uid),
 		"device_token", "tok_1",
 		"device_type", string(common.DeviceTypeIOS),
@@ -327,6 +319,7 @@ func TestPush_UnsupportedVendorStillPushes(t *testing.T) {
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 
 	const uid = "u_mute_plain"
+	defer func() { _ = ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", common.UserDeviceTokenPrefix, uid)) }()
 	err := ctx.GetRedisConn().Hmset(fmt.Sprintf("%s%s", common.UserDeviceTokenPrefix, uid),
 		"device_token", "tok_2",
 		"device_type", string(common.DeviceTypeHMS),

@@ -89,6 +89,10 @@ type IService interface {
 
 	// 获取设备在线状态
 	GetDeviceOnline(uid string, deviceFlag config.DeviceFlag) (*config.OnlinestatusResp, error)
+
+	// DesktopOnlineUIDs 批量返回这批 uid 中存在 PC 或 Web 在线会话的那些。
+	// 单条查询覆盖整批；调用方据此判断「仅在桌面端登录时生效」的设置是否成立。
+	DesktopOnlineUIDs(uids []string) (map[string]bool, error)
 	// 查询在线用户总数量
 	GetOnlineCount() (int64, error)
 	// 存在黑明单
@@ -1288,6 +1292,22 @@ func (s *Service) GetDeviceOnline(uid string, deviceFlag config.DeviceFlag) (*co
 		LastOffline: onlineM.LastOffline,
 		Online:      onlineM.Online,
 	}, nil
+}
+
+// DesktopOnlineUIDs 批量返回这批 uid 中存在 PC 或 Web 在线会话的那些。
+func (s *Service) DesktopOnlineUIDs(uids []string) (map[string]bool, error) {
+	onlineUIDs, err := s.onlineDB.queryDesktopOnlineUIDs(uids)
+	if err != nil {
+		return nil, err
+	}
+	if len(onlineUIDs) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]bool, len(onlineUIDs))
+	for _, uid := range onlineUIDs {
+		result[uid] = true
+	}
+	return result, nil
 }
 
 // 查询在线总数量

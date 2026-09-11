@@ -128,6 +128,23 @@ func (o *onlineDB) queryOnlineDevice(uid string, deviceFlag config.DeviceFlag) (
 	return onlineStatusModel, err
 }
 
+// queryDesktopOnlineUIDs 批量查询这批 uid 中，哪些存在 PC 或 Web 的在线会话。
+// 单条 IN 查询覆盖整批，避免调用方逐用户往返（见 webhook.resolveEffectiveAppMute）。
+func (o *onlineDB) queryDesktopOnlineUIDs(uids []string) ([]string, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	// 注意：device_flag 列表必须用 []int 而不是 []uint8 —— []uint8 就是 []byte，
+	// dbr 会把它当成 blob 字面量而非 IN 列表，生成的 SQL 里 `?` 不被展开，直接
+	// 报 Error 1064。
+	var onlineUIDs []string
+	_, err := o.session.Select("distinct uid").From("user_online").
+		Where("uid in ? and device_flag in ? and `online`=1",
+			uids, []int{int(config.PC.Uint8()), int(config.Web.Uint8())}).
+		Load(&onlineUIDs)
+	return onlineUIDs, err
+}
+
 func (o *onlineDB) exist(uid string, deviceFlag uint8, online int) (bool, error) {
 	var cn int
 	_, err := o.session.Select("count(*)").From("user_online").Where("uid=? and device_flag=? and `online`=?", uid, deviceFlag, online).Load(&cn)
