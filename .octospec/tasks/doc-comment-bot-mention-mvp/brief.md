@@ -111,11 +111,21 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
   直接入队。
 - 灰度配置采用环境变量，启动时读取：
   - `OCTO_DOCS_BOT_MENTION_ENABLED`，默认 `false`；
+  - `OCTO_DOCS_BOT_MENTION_PPT_ENABLED`，默认 `false`，仅控制新的 PPT 评论任务；
   - `OCTO_DOCS_BOT_MENTION_SPACE_ALLOWLIST`；
   - `OCTO_DOCS_BOT_MENTION_DOC_ALLOWLIST`。
   开关为 true 后，doc 或非空 space 命中任一 allowlist 才放行；两份 allowlist 都为空时
   仍 fail-closed。doc allowlist 的 `*` 表示所有文档；space allowlist 的 `*` 表示任意**非空**
-  space，不能让空 `space_id` 命中。配置变更通过重启生效。
+  space，不能让空 `space_id` 命中。PPT 还必须显式开启独立开关；未配置、空白或无效布尔值
+  均视为关闭，即使总开关和通配 allowlist 已开启也拒绝新的 PPT 事件。普通文档及 HTML
+  不受 PPT 开关影响；独立开关不能绕过总开关、allowlist 或原有权限检查。
+  总开关关闭、PPT 开关关闭或 allowlist 未命中时，对应的新请求返回 `accepted:false, reason:"disabled"`，
+  不落幂等终态、不入队；已接受请求优先重放原 event_id，即使之后关闭总开关或 PPT 开关也不重复入队；关开关不会取消已接受的任务。
+  PPT 的部署顺序是协议前置条件：先发布并升级会接收事件的全部 PPT-aware 插件及配套 CLI，
+  再部署支持 PPT 的 Server，最后部署会产生 `doc_kind=ppt` 的 Docs API 并开放前端入口。
+  前端入口开关不是服务端安全门禁；未确认消费者升级完毕时，保持 PPT 独立开关关闭。
+  消费端验证后才能开启 `OCTO_DOCS_BOT_MENTION_PPT_ENABLED=true`。开关只控制评论任务，
+  不控制 PPT 创建、编辑、协作或导出；配置变更通过重启 Server 生效。
 
 ### openclaw-channel-octo
 
@@ -124,13 +134,17 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 - `inbound-queue.ts` 的队列键必须随会话键覆写，禁止合成 DM 形状后落入用户 DM 队列。
 - 服务端下发规范化 `thread_id = parent_id != "" ? parent_id : comment_id`；插件不得自行
   产生另一套规则。
-- session/queue key 使用同一个 canonical key：
-  `octo:doctask:{account_id}:{bot_uid}:{space_or_global}:{doc_id}:{thread_id}`。
-  每段须做无歧义编码或哈希，避免分隔符注入；同评论串串行、跨评论串可并行，但仍受
-  插件既有的 per-account 总并发上限约束，不得按 thread 无界创建执行 goroutine。
+- session/queue 共用规范化任务 scope，与插件 `src/doc-mention.ts` 保持一致：
+  - 普通文档及 HTML：`doctask:{escaped_doc_id}:{escaped_thread_id}`；
+  - PPT：`doctask:ppt:{escaped_doc_id}:{escaped_thread_id}`。
+  两个 ID 段先将反斜杠转义为双反斜杠，再将冒号转义为 `\:`。
+  会话键为 `agent:{agent_id}:octo:{normalized_account_id}:{scope}`，
+  队列键为 `{normalized_account_id}:{scope}`；由插件的 account 路由隔离 Bot，
+  `space_id` 不额外拼入任务 scope，文档/Space 授权仍由生产端和消费端检查。
+  同队列键串行；不同 key 不代表轮询器保证跨线程并行派发（当前轮询会等待 handler）。
 - 插件持久去重使用 `idempotency_key`，而不是仅用可能因崩溃重投而变化的 `event_id`；
   去重状态必须覆盖进程重启，TTL 不短于 `Robot.MessageExpire`。
-- ClawHub 发版与存量 bot 升级必须纳入发布计划；旧插件不识别新事件时不能开启服务端灰度。
+- ClawHub 发版与存量 bot 升级必须纳入发布计划；旧插件不识别 PPT 时不能部署/开放向已启用共享灰度投递 PPT 事件的生产端。
 
 ## Ingress contract
 
@@ -140,6 +154,7 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 {
   "idempotency_key": "stable-id-for-this-comment-mention",
   "doc_id": "doc-id",
+  "doc_kind": "ppt",
   "comment_id": "comment-id",
   "parent_id": "optional-root-comment-id",
   "from_uid": "human-user-id",
@@ -152,6 +167,9 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 
 字段规则：
 
+- 上述请求及下方事件示例为 PPT 变体；普通文档省略 `doc_kind`，HTML 使用 `html`。
+- `doc_kind` 可选，trim 并转小写后只接受空字符串、`html`、`ppt`；未知值返回
+  400 且 `field=doc_kind`。`html_ppt` 是存储类型，不能作为 wire kind。
 - 整个 request body 最大 32 KiB。
 - `idempotency_key`、`doc_id`、`comment_id`、`from_uid`、`bot_uid` 必填，trim 后
   1–256 bytes；`parent_id`、`space_id` 非空时不超过 256 bytes。
@@ -190,6 +208,7 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
   "event_data": {
     "idempotency_key": "stable-id-for-this-comment-mention",
     "doc_id": "doc-id",
+    "doc_kind": "ppt",
     "comment_id": "comment-id",
     "thread_id": "root-comment-id",
     "parent_id": "optional-root-comment-id",
@@ -205,6 +224,13 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 
 可选字段为空时省略；`enqueued_at` 由 octo-server 生成。上述字段只许向后兼容地增补，
 不得改名或改变语义。
+
+`doc_kind` is optional: absent/empty preserves legacy Docs routing, `html`
+selects the HTML service, and `ppt` selects the dedicated Docs backend PPT API.
+PPT uses canonical `doc_meta.doc_id`; `html_ppt` is a storage type, not a wire
+alias. Consumers must isolate PPT session/queue scopes from legacy scopes and
+must not fall back to another service on an unknown kind. See
+`../ppt-comment-mention/brief.md` for the PPT rollout and identity contract.
 
 ## Failure handling
 
@@ -224,12 +250,14 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 - octo-server 至少提供低基数指标：
   - `dmwork_doc_bot_mention_ingress_total{result}`，result 包含 accepted/replay/disabled/
     invalid/not_found/unauthorized/conflict/error；
+  - `dmwork_doc_bot_mention_ingress_by_kind_total{result,doc_kind}`，保持既有指标标签不变，
+    新指标的 doc_kind 仅为 legacy/html/ppt/unknown；未认证或请求校验失败归入 unknown；
   - `dmwork_doc_bot_mention_enqueue_total{result}`；
   - ingress/enqueue latency。
 - 插件至少提供 poll、claim、dispatch、retry、terminal、ack 指标，并能从
   `event_id + idempotency_key hash + bot_uid` 关联一次执行；不得把 doc/comment/user ID 放进
   metrics label。
-- 结构化日志记录 `event_id`、bot uid、结果和 idempotency key 的不可逆短 hash；不记录
+- 结构化日志记录 `event_id`、bot uid、规范化 `doc_kind`、结果和 idempotency key 的不可逆短 hash；不记录
   token、完整 text 或 URL。
 
 ## Out of scope

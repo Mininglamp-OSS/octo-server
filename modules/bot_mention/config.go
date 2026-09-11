@@ -19,6 +19,7 @@ const (
 	maxURLBytes         = 2048
 
 	featureEnabledEnv          = "OCTO_DOCS_BOT_MENTION_ENABLED"
+	pptEnabledEnv              = "OCTO_DOCS_BOT_MENTION_PPT_ENABLED"
 	spaceAllowlistEnv          = "OCTO_DOCS_BOT_MENTION_SPACE_ALLOWLIST"
 	documentAllowlistEnv       = "OCTO_DOCS_BOT_MENTION_DOC_ALLOWLIST"
 	internalTokenEnv           = "OCTO_DOCS_BOT_MENTION_TOKEN"
@@ -27,6 +28,9 @@ const (
 
 	// docKindHTML 标记 doc_id 是 octo-doc 的 slug(HTML 文档),而不是 docs-backend 的 docId。
 	docKindHTML = "html"
+	// PPT uses the canonical docs-backend doc_meta.doc_id, not a Bento deck ID
+	// or an HTML slug. html_ppt is the stored document type, not a wire alias.
+	docKindPPT = "ppt"
 )
 
 type mentionRequest struct {
@@ -39,14 +43,14 @@ type mentionRequest struct {
 	// 「文档真的不存在」无法区分,靠试错回退会把后者误判成 HTML 再失败一次。
 	//
 	// 空 = 默认 docs-backend 文档(doc/sheet/board),与加这个字段之前的行为一致。
-	DocKind        string `json:"doc_kind,omitempty"`
-	CommentID      string `json:"comment_id"`
-	ParentID       string `json:"parent_id,omitempty"`
-	FromUID        string `json:"from_uid"`
-	BotUID         string `json:"bot_uid"`
-	Text           string `json:"text"`
-	URL            string `json:"url,omitempty"`
-	SpaceID        string `json:"space_id,omitempty"`
+	DocKind   string `json:"doc_kind,omitempty"`
+	CommentID string `json:"comment_id"`
+	ParentID  string `json:"parent_id,omitempty"`
+	FromUID   string `json:"from_uid"`
+	BotUID    string `json:"bot_uid"`
+	Text      string `json:"text"`
+	URL       string `json:"url,omitempty"`
+	SpaceID   string `json:"space_id,omitempty"`
 }
 
 type normalizedMention struct {
@@ -97,7 +101,7 @@ func normalizeMentionRequest(req mentionRequest) (normalizedMention, error) {
 	//
 	// 静默降级成「普通文档」的代价是消费端拿 slug 去打 docs-backend 的 docId 接口,
 	// 报出来的是一个看不出根因的 404;拒在入口,调用方拼错立刻知道。
-	if normalized.DocKind != "" && normalized.DocKind != docKindHTML {
+	if normalized.DocKind != "" && normalized.DocKind != docKindHTML && normalized.DocKind != docKindPPT {
 		return normalizedMention{}, &requestValidationError{field: "doc_kind"}
 	}
 
@@ -189,9 +193,10 @@ func resolveBotMentionInternalToken(getenv func(string) string) (string, error) 
 }
 
 type featureGate struct {
-	enabled bool
-	spaces  map[string]struct{}
-	docs    map[string]struct{}
+	enabled    bool
+	pptEnabled bool
+	spaces     map[string]struct{}
+	docs       map[string]struct{}
 }
 
 func newFeatureGate(enabled bool, spaceAllowlist, documentAllowlist string) featureGate {
@@ -207,7 +212,19 @@ func featureGateFromEnv() featureGate {
 	if err != nil {
 		enabled = false
 	}
-	return newFeatureGate(enabled, os.Getenv(spaceAllowlistEnv), os.Getenv(documentAllowlistEnv))
+	gate := newFeatureGate(enabled, os.Getenv(spaceAllowlistEnv), os.Getenv(documentAllowlistEnv))
+	// ParseBool returns false for missing or invalid values: PPT requires opt-in.
+	gate.pptEnabled, _ = strconv.ParseBool(strings.TrimSpace(os.Getenv(pptEnabledEnv)))
+	return gate
+}
+
+// AllowsKind applies the PPT opt-in after request kind normalization. The shared
+// switch and allowlists are still required; legacy and HTML behavior is unchanged.
+func (g featureGate) AllowsKind(kind, docID, spaceID string) bool {
+	if kind == docKindPPT && !g.pptEnabled {
+		return false
+	}
+	return g.Allows(docID, spaceID)
 }
 
 func parseAllowlist(raw string) map[string]struct{} {

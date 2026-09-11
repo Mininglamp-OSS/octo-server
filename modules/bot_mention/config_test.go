@@ -329,3 +329,26 @@ func TestRequestValidationError(t *testing.T) {
 		t.Fatalf("invalidField(non-validation) = %q", got)
 	}
 }
+
+func TestPPTMentionRouting(t *testing.T) {
+	for _, tc := range []struct{ parent, thread string }{{"", "13"}, {"root-1", "root-1"}} {
+		req := mentionRequest{IdempotencyKey: "ppt-key", DocID: "deck", DocKind: " PPT ", CommentID: "13", ParentID: tc.parent, FromUID: "human", BotUID: "bot", Text: "change this"}
+		got, err := normalizeMentionRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.DocKind != docKindPPT {
+			t.Fatalf("kind=%q", got.DocKind)
+		}
+		data := mentionEventData(got, 100)
+		if data["doc_kind"] != "ppt" || data["thread_id"] != tc.thread {
+			t.Fatalf("bad routing: %v", data)
+		}
+		fingerprint := mentionFingerprint(got)
+		legacy := got
+		legacy.DocKind = ""
+		if fingerprint == mentionFingerprint(legacy) {
+			t.Fatal("PPT collided with legacy namespace")
+		}
+	}
+}

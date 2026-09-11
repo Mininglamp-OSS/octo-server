@@ -173,9 +173,10 @@ func (s *stubRobotService) counts() (exists, enqueues int) {
 }
 
 type fakeMetricRecorder struct {
-	mu       sync.Mutex
-	ingress  []string
-	enqueues []string
+	mu           sync.Mutex
+	ingress      []string
+	ingressKinds []string
+	enqueues     []string
 }
 
 type capturedLogEntry struct {
@@ -221,9 +222,10 @@ func (l *capturedLog) snapshot() []capturedLogEntry {
 	return append([]capturedLogEntry(nil), l.entries...)
 }
 
-func (m *fakeMetricRecorder) ObserveIngress(result string, _ time.Duration) {
+func (m *fakeMetricRecorder) ObserveIngress(result, kind string, _ time.Duration) {
 	m.mu.Lock()
 	m.ingress = append(m.ingress, result)
+	m.ingressKinds = append(m.ingressKinds, kind)
 	m.mu.Unlock()
 }
 
@@ -366,6 +368,48 @@ func decodeMentionError(t *testing.T, w *httptest.ResponseRecorder) mentionError
 		t.Fatalf("decode error %s: %v", w.Body.String(), err)
 	}
 	return response
+}
+
+func TestBotMentionPPTWireRouting(t *testing.T) {
+	claims := newClaimStore(newMemoryClaimBackend(), 7*24*time.Hour, deterministicTokens("ppt-lease"))
+	robots := &stubRobotService{exists: true, eventID: 4242}
+	gate := newFeatureGate(true, "space-1", "")
+	gate.pptEnabled = true
+	metrics := &fakeMetricRecorder{}
+	logger := &capturedLog{}
+	module := newTestBotMention(robots, claims, gate, metrics)
+	module.Log = logger
+	router := newMentionRouter(module)
+	body := []byte(`{"idempotency_key":"ppt-wire","doc_kind":" PPT ","doc_id":"d_ppt","comment_id":"13","parent_id":"12","from_uid":"human-1","bot_uid":"bot-1","text":"update title","space_id":"space-1"}`)
+	for _, replay := range []bool{false, true} {
+		response := doMentionRequest(t, router, "internal-secret", body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		got := decodeMentionResponse(t, response)
+		if !got.Accepted || got.Replay != replay {
+			t.Fatalf("response=%+v, replay=%v", got, replay)
+		}
+	}
+	metrics.mu.Lock()
+	kinds := append([]string(nil), metrics.ingressKinds...)
+	metrics.mu.Unlock()
+	if len(kinds) != 2 || kinds[0] != "ppt" || kinds[1] != "ppt" {
+		t.Fatalf("accepted/replayed PPT metric kinds=%v", kinds)
+	}
+	entries := logger.snapshot()
+	if len(entries) != 2 {
+		t.Fatalf("PPT outcome logs=%v; want accepted and replay", entries)
+	}
+	for i, result := range []string{"accepted", "replay"} {
+		if entries[i].fields["result"] != result || entries[i].fields["doc_kind"] != "ppt" {
+			t.Fatalf("PPT %s log=%v", result, entries[i].fields)
+		}
+	}
+	_, enqueues := robots.counts()
+	if enqueues != 1 || robots.eventType != "doc_comment_mention" || robots.eventData["doc_kind"] != "ppt" || robots.eventData["doc_id"] != "d_ppt" || robots.eventData["thread_id"] != "12" {
+		t.Fatalf("enqueues=%d type=%s data=%v", enqueues, robots.eventType, robots.eventData)
+	}
 }
 
 func TestBotMentionAcceptedAndReplay(t *testing.T) {
@@ -835,5 +879,98 @@ func TestBotMentionRecoversAmbiguousAtomicCommitAsReplay(t *testing.T) {
 	}
 	if notifications != 1 {
 		t.Fatalf("doorbell notifications = %d, want 1 after ambiguous commit recovery", notifications)
+	}
+}
+
+func TestBotMentionPPTEnvironmentGate(t *testing.T) {
+	for _, tt := range []struct {
+		name, global, ppt, spaces, docs string
+		allow, allowPPT                 bool
+	}{
+		{name: "unset global", ppt: "true", docs: "*"},
+		{name: "disabled global", global: "false", ppt: "true", docs: "*"},
+		{name: "invalid global", global: "bad", ppt: "true", docs: "*"},
+		{name: "unset PPT with existing wildcard", global: "true", docs: "*", allow: true},
+		{name: "disabled PPT leaves other kinds enabled", global: "true", ppt: "false", docs: "*", allow: true},
+		{name: "invalid PPT fails closed", global: "true", ppt: "bad", docs: "*", allow: true},
+		{name: "blank PPT fails closed", global: "true", ppt: "  ", docs: "*", allow: true},
+		{name: "empty allowlists", global: "true", ppt: "true"},
+		{name: "missed allowlists", global: "true", ppt: "true", spaces: "other", docs: "other"},
+		{name: "space allowlist", global: "true", ppt: "true", spaces: "space-1", allow: true, allowPPT: true},
+		{name: "doc allowlist", global: "true", ppt: "true", docs: "d_ppt", allow: true, allowPPT: true},
+		{name: "explicit PPT opt in with wildcard", global: "true", ppt: "true", docs: "*", allow: true, allowPPT: true},
+		{name: "normalized boolean", global: "true", ppt: " TRUE ", docs: "*", allow: true, allowPPT: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(featureEnabledEnv, tt.global)
+			t.Setenv("OCTO_DOCS_BOT_MENTION_PPT_ENABLED", tt.ppt)
+			t.Setenv(spaceAllowlistEnv, tt.spaces)
+			t.Setenv(documentAllowlistEnv, tt.docs)
+			for _, kind := range []string{"", "html", "ppt", " PPT ", "html_ppt", "pptx"} {
+				t.Run("kind="+kind, func(t *testing.T) {
+					claims := newClaimStore(newMemoryClaimBackend(), time.Hour, deterministicTokens("ppt-gate"))
+					robots := &stubRobotService{exists: true, eventID: 4242}
+					router := newMentionRouter(newTestBotMention(robots, claims, featureGateFromEnv(), &fakeMetricRecorder{}))
+					body := []byte(fmt.Sprintf(`{"idempotency_key":"ppt-gate","doc_kind":%q,"doc_id":"d_ppt","comment_id":"13","from_uid":"human-1","bot_uid":"bot-1","text":"update title","space_id":"space-1"}`, kind))
+					response := doMentionRequest(t, router, "internal-secret", body)
+					if kind == "html_ppt" || kind == "pptx" {
+						if response.Code != http.StatusBadRequest {
+							t.Fatalf("unsupported kind status=%d body=%s", response.Code, response.Body.String())
+						}
+					} else {
+						want := tt.allow
+						if kind == "ppt" || kind == " PPT " {
+							want = tt.allowPPT
+						}
+						got := decodeMentionResponse(t, response)
+						if response.Code != http.StatusOK || got.Accepted != want || got.Replay || (!want && got.Reason != "disabled") {
+							t.Fatalf("status=%d response=%+v wantAccepted=%v", response.Code, got, want)
+						}
+						if want {
+							return
+						}
+					}
+					if lookups, enqueues := robots.counts(); lookups != 0 || enqueues != 0 {
+						t.Fatalf("blocked request looked up bot %d times and enqueued %d events", lookups, enqueues)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestBotMentionPPTGateTransitionPreservesIdempotency(t *testing.T) {
+	for _, switchName := range []string{featureEnabledEnv, "OCTO_DOCS_BOT_MENTION_PPT_ENABLED"} {
+		t.Run(switchName, func(t *testing.T) {
+			t.Setenv(featureEnabledEnv, "true")
+			t.Setenv("OCTO_DOCS_BOT_MENTION_PPT_ENABLED", "true")
+			t.Setenv(spaceAllowlistEnv, "space-1")
+			t.Setenv(documentAllowlistEnv, "")
+			claims := newClaimStore(newMemoryClaimBackend(), time.Hour, deterministicTokens("ppt-transition"))
+			robots := &stubRobotService{exists: true, eventID: 4242}
+			body := []byte(`{"idempotency_key":"ppt-transition","doc_kind":"ppt","doc_id":"d_ppt","comment_id":"13","from_uid":"human-1","bot_uid":"bot-1","text":"update title","space_id":"space-1"}`)
+			for _, tt := range []struct{ enabled, accepted, replay bool }{
+				{false, false, false}, {true, true, false}, {false, true, true},
+			} {
+				t.Setenv(switchName, fmt.Sprint(tt.enabled))
+				// A new instance loads updated env, sharing the existing claim store.
+				router := newMentionRouter(newTestBotMention(robots, claims, featureGateFromEnv(), &fakeMetricRecorder{}))
+				response := doMentionRequest(t, router, "internal-secret", body)
+				got := decodeMentionResponse(t, response)
+				if response.Code != http.StatusOK || got.Accepted != tt.accepted || got.Replay != tt.replay || (tt.accepted && got.EventID != 4242) {
+					t.Fatalf("gate=%v status=%d response=%+v", tt.enabled, response.Code, got)
+				}
+				if !tt.enabled {
+					fresh := []byte(strings.ReplaceAll(string(body), `"ppt-transition"`, `"ppt-new"`))
+					got := decodeMentionResponse(t, doMentionRequest(t, router, "internal-secret", fresh))
+					if got.Accepted || got.Replay || got.Reason != "disabled" {
+						t.Fatalf("new request while disabled: %+v", got)
+					}
+				}
+			}
+			if lookups, enqueues := robots.counts(); lookups != 1 || enqueues != 1 {
+				t.Fatalf("lookups=%d enqueues=%d; want one accepted event across gate changes", lookups, enqueues)
+			}
+		})
 	}
 }

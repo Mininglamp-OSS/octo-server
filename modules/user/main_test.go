@@ -44,9 +44,5 @@ func TestMain(m *testing.M) {
 	}
 	code := m.Run()
 	stopRollout()
-	if err := cleanupTokenHTTPTestDatabases(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		code = 1
-	}
 	os.Exit(code)
 }
