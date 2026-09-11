@@ -1357,6 +1357,12 @@ type Resp struct {
 	CreatedAt       int64 // 注册时间 10位时间戳
 	IsDestroy       int   // 是否注销
 	Robot           int   // 机器人0.否1.是
+	// MuteOfApp 是 user.mute_of_app 的忠实映射：用户在「PC 在线」面板开启的
+	// 「手机静音」。语义上它只在该用户确有 PC/Web 会话时才成立（见列注释
+	// 「当pc登录后有效」）——本字段不自带这层判断，读取方必须自行叠加在线校验，
+	// 否则会把 Web 退出后残留的 1 当成"永久静音"。离线推送侧的判断收口在
+	// modules/webhook.resolveEffectiveAppMute。
+	MuteOfApp int
 }
 
 func newResp(m *Model) *Resp {
@@ -1374,6 +1380,7 @@ func newResp(m *Model) *Resp {
 		IsDestroy:       m.IsDestroy,
 		CreatedAt:       time.Time(m.CreatedAt).Unix(),
 		Robot:           m.Robot,
+		MuteOfApp:       m.MuteOfApp,
 	}
 }
 

@@ -46,7 +46,10 @@ type Webhook struct {
 	groupService        group.IService
 	userService         user.IService
 	notificationService *notification.Service
-	secretKey           string // Webhook HMAC-SHA256 签名密钥
+	// onlineService 用于判定「手机静音」是否仍然生效（需要该用户确有 PC/Web
+	// 在线会话），详见 resolveEffectiveAppMute。
+	onlineService deviceOnlineChecker
+	secretKey     string // Webhook HMAC-SHA256 签名密钥
 	wkhook.UnimplementedWebhookServiceServer
 	grpcServer *grpc.Server
 }
@@ -134,6 +137,7 @@ func New(ctx *config.Context) *Webhook {
 		groupService:        group.NewService(ctx),
 		userService:         user.NewService(ctx),
 		notificationService: notification.New(ctx),
+		onlineService:       user.NewOnlineService(ctx),
 		secretKey:           os.Getenv("TS_WEBHOOK_SECRET_KEY"),
 	}
 }
@@ -606,6 +610,17 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 		w.Error("查询推送用户信息错误", zap.Error(err))
 		return nil
 	}
+
+	// 解析每个接收者的「手机静音」是否生效（仅影响推送声音，不影响是否推送）。
+	// 与账号级通知暂停同样放在批量阶段，避免在 PushPool 扇出后产生 N+1 查询。
+	// RTC 来电穿透静音，与下方 allowPush 对 isVideoCall 的豁免保持一致。
+	var mutedUIDs map[string]bool
+	if !isVideoCall {
+		mutedUIDs = resolveEffectiveAppMute(users, w.onlineService, func(uid string, err error) {
+			w.Error("查询PC/Web在线状态失败，按有声推送", zap.Error(err), zap.String("uid", uid))
+		})
+	}
+
 	fromUID := ""
 	if !isVideoCall { // 音视频消息不检查设置，直接推送
 		// 查询免打扰
@@ -674,6 +689,7 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 			Data: map[string]interface{}{
 				"toUser": toUser,
 				"msg":    msgResp,
+				"silent": mutedUIDs[toUID],
 			},
 			JobFunc: func(id int64, data interface{}) {
 				dataMap, ok := data.(map[string]interface{})
@@ -691,7 +707,9 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 					w.Error("推送任务缺少有效的msg")
 					return
 				}
-				result, err := w.push(toUser, msgResp)
+				// 缺失即视为不静音（有声），与整体 fail-open 姿态一致。
+				silent, _ := dataMap["silent"].(bool)
+				result, err := w.push(toUser, msgResp, silent)
 				if err != nil {
 					w.Debug("推送失败！", zap.String("uid", toUser.UID), zap.String("deviceType", result.deviceType), zap.String("deviceToken", maskToken(result.deviceToken)), zap.Error(err))
 				} else {
@@ -762,7 +780,7 @@ func (w *Webhook) allowPush(users []*user.Resp, userSettings []*user.SettingResp
 	return isPush
 }
 
-func (w *Webhook) push(toUser *user.Resp, msgResp msgOfflineNotify) (pushResp, error) {
+func (w *Webhook) push(toUser *user.Resp, msgResp msgOfflineNotify, silent bool) (pushResp, error) {
 
 	toUID := toUser.UID
 	var deviceMap map[string]string
@@ -799,6 +817,15 @@ func (w *Webhook) push(toUser *user.Resp, msgResp msgOfflineNotify) (pushResp, e
 			deviceType:  deviceType,
 			deviceToken: deviceToken,
 		}, err
+	}
+	// 「手机静音」生效：只对支持静音的负载生效（当前为 APNs）。其余厂商负载未实现
+	// silenceable，行为与改动前完全一致。
+	if silent {
+		if s, ok := payload.(silenceable); ok {
+			s.Silence()
+		} else {
+			w.Debug("该厂商推送暂不支持静音，按有声下发", zap.String("deviceType", deviceType), zap.String("uid", toUID))
+		}
 	}
 	err = pusher.Push(deviceToken, payload)
 	if err != nil {

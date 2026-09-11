@@ -4,6 +4,22 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-11 — ios-apns-mute-of-app
+
+- 「手机静音」(`user.mute_of_app`) 现在对 iOS 离线推送生效：静音时 APNs 负载
+  **整键省略** `aps.sound`（不是写空串 —— 部分 iOS 版本会把空串当成「找不到音频
+  文件」而回落默认音）。其余字段与横幅、角标保持不变。
+- 根因是两层：`push_iosapns.go` 的 `sound` 写死 `"default"`，且 `user.Resp` 根本
+  没有 `MuteOfApp` 字段 —— 推送链路在类型上就读不到这个设置。
+- 静音生效附加 **PC/Web 在线闸门**。iOS 在 PC/Web 下线时只清本地、不回写服务端，
+  DB 里 `mute_of_app` 会长期残留 `1`；无条件采信会把「静音不生效」变成「关掉 Web
+  后永久静音」。在线查询失败按有声处理（fail-open）。
+- 新增 `silenceable` 可选接口，只有 `IOSPayload` 实现；其余五个厂商负载未改动、
+  线上行为不变。安卓侧（HMS `sound`/MI `sound_uri`）同类缺口按决定另行处理。
+- 记录见 [journal](journal/shared/ios-apns-mute-of-app.md)；「客户端只清本地的设置
+  在服务端已是陈旧值」这条经验暂存在
+  [learnings/pending](learnings/pending/a-setting-the-client-clears-locally-is-stale-on-the-server.md)。
+
 ## 2026-09-09 — space-directory-octo-hosted-only
 
 - Tightened `GET /v1/space/directory` so `agents` / `agent_count` /

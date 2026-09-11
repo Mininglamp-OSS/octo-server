@@ -1,0 +1,47 @@
+injected:
+  - id: trust-boundary
+    source: repo
+    reason: >-
+      modules/webhook is an outbound push adapter and this change alters the APNs
+      wire payload. Adapter parity is explicitly acknowledged: the sibling HMS/MI
+      sound fields carry the same defect and are deliberately deferred (owner
+      decision, recorded in the brief's Out of scope and in the journal). Parity
+      is not violated in the security sense the rule guards — mute is a user
+      preference, not an escaping defense, so the deferred vendors are a feature
+      gap rather than an injection surface.
+  - id: space-isolation
+    source: repo
+    reason: >-
+      The new lookups are keyed strictly by the recipient's own uid (user row +
+      that user's own device online status); no Space-scoped query, join or
+      filter is introduced or altered. The existing offline-push space_id
+      resolution is left untouched.
+  - id: error-handling
+    source: repo
+    reason: >-
+      This path is a background push worker, not an HTTP handler; it adds no
+      user-facing error response. The rule is honored by introducing no raw
+      c.JSON / c.ResponseError and by keeping lookup failures on the existing
+      zap logging + fail-open posture.
+  - id: rate-limit
+    source: repo
+    reason: >-
+      No request-frequency limiting is added. The online lookup is bounded by
+      running only for recipients whose mute_of_app is already 1, keeping the
+      batch stage free of an N+1 fan-out.
+  - id: testing
+    source: repo
+    reason: >-
+      A wire-contract change needs byte-level regression coverage; the stub-APNs
+      capture harness used to reproduce the bug is inverted into tests.
+  - id: commit-style
+    source: repo
+    reason: English Conventional Commits for the resulting commit and PR.
+brief: .octospec/tasks/ios-apns-mute-of-app/brief.md
+scope:
+  vendors_fixed: [apns-ios]
+  vendors_deferred: [hms, mi]
+  mute_semantics: sound-only
+  effective_mute_requires: live-pc-or-web-session
+  on_lookup_error: fail-open-audible
+  rtc_pushes: always-audible

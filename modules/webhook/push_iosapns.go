@@ -22,6 +22,9 @@ type IOSPayload struct {
 	channelID   string
 	channelType uint8
 	messageSeq  uint32
+	// silent 表示该接收者的「手机静音」已生效（判定见 resolveEffectiveAppMute）。
+	// 仅作用于普通消息推送的声音，不影响横幅/角标，也不影响 RTC 来电。
+	silent bool
 }
 
 // NewIOSPayload NewIOSPayload
@@ -52,6 +55,11 @@ func (p *IOSPayload) applyRouting(data map[string]interface{}) {
 	}
 	// channel_id 存在时 message_seq 一起下发，避免客户端拿不到定位序号。
 	data["message_seq"] = p.messageSeq
+}
+
+// Silence 实现 silenceable：让本次 APNs 负载以无声形态下发。
+func (p *IOSPayload) Silence() {
+	p.silent = true
 }
 
 // IOSPush IOSPush
@@ -169,15 +177,21 @@ func (p *IOSPush) Push(deviceToken string, payload Payload) error {
 		iosPayload.applyRouting(data)
 		notification.Payload = []byte(util.ToJson(data))
 	} else {
-		data := map[string]interface{}{
-			"aps": map[string]interface{}{
-				"alert": map[string]interface{}{
-					"title": payload.GetTitle(),
-					"body":  payload.GetContent(),
-				},
-				"badge": payload.GetBadge(),
-				"sound": "default",
+		aps := map[string]interface{}{
+			"alert": map[string]interface{}{
+				"title": payload.GetTitle(),
+				"body":  payload.GetContent(),
 			},
+			"badge": payload.GetBadge(),
+		}
+		// 静音生效时**整键省略** sound，而不是写空字符串 —— 部分 iOS 版本会把
+		// 空串当成「找不到该音频文件」从而回落默认音效，等于没静音。
+		// 其余字段（alert/badge/路由字段）保持不变：静音只去声音，横幅与角标照常。
+		if !iosPayload.silent {
+			aps["sound"] = "default"
+		}
+		data := map[string]interface{}{
+			"aps": aps,
 		}
 		iosPayload.applyRouting(data)
 		notification.Payload = []byte(util.ToJson(data))
