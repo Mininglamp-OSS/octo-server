@@ -34,9 +34,9 @@ func injectOrphanSeat(t *testing.T, projectID, spaceID, uid string) {
 	now := time.Now().UTC()
 	_, err := testCtx.DB().InsertBySql(
 		"INSERT INTO octo_project_member "+
-			"(project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		projectID, uid, spaceID, RoleCommon, MemberStatusActive, "owner1", now, now,
+			"(project_id, uid, space_id, role, status, invite_uid, created_at, joined_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		projectID, uid, spaceID, RoleCommon, MemberStatusActive, "owner1", now, now, now,
 	).Exec()
 	require.NoError(t, err)
 }

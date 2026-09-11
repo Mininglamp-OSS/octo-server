@@ -11,7 +11,7 @@ const projectReadModelColumns = "p.id, p.project_id, p.space_id, p.name, p.descr
 	"p.discoverability, p.max_members, p.member_epoch, p.collaboration_role_epoch, p.status, " +
 	"p.all_member_group_no, p.created_at, p.updated_at"
 const projectReadMemberColumns = "pm.project_id, pm.uid, pm.space_id, pm.role, pm.status, pm.removing, " +
-	"pm.invite_uid, pm.created_at, pm.updated_at"
+	"pm.invite_uid, pm.created_at, pm.joined_at, pm.updated_at"
 
 const projectReadMemberJoin = "FROM `octo_project_member` pm INNER JOIN `octo_project` p " +
 	"ON p.project_id = pm.project_id AND p.space_id = pm.space_id"

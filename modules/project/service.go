@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -430,6 +431,7 @@ func (p *Project) createProjectTxWithSeatRefs(
 		Role:      RoleOwner,
 		InviteUID: in.Creator,
 		CreatedAt: now,
+		JoinedAt:  now,
 		UpdatedAt: now,
 	}); err != nil {
 		return nil, err
@@ -485,6 +487,7 @@ func (p *Project) createProjectTxWithSeatRefs(
 				Role:      RoleCommon,
 				InviteUID: in.Creator,
 				CreatedAt: now,
+				JoinedAt:  now,
 				UpdatedAt: now,
 			}); err != nil {
 				return nil, err
@@ -839,15 +842,109 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, input []member
 	return changed, err
 }
 
+// validateMemberAddAgentsTx applies the same agent facts used by project
+// creation together with the Space directory's visible-agent predicate.
+//
+// Owner/Admin is the capability gate for members/add; this helper is only
+// reached after that gate. It deliberately groups targets by their real
+// creator instead of passing actorUID as the owner, so a privileged operator
+// may add another person's eligible directory bot without restoring the old
+// ordinary-member exception.
+func (p *Project) validateMemberAddAgentsTx(
+	tx *dbr.Tx,
+	spaceID string,
+	targetUIDs []string,
+	creatorUIDs []string,
+	held map[string]bool,
+) error {
+	targetRows, err := p.db.queryAgentRowsTx(tx, targetUIDs)
+	if err != nil {
+		return err
+	}
+	botUIDs := make([]string, 0, len(targetUIDs))
+	byCreator := make(map[string][]string)
+	for _, uid := range targetUIDs {
+		row, found := targetRows[uid]
+		if (!found || row.Robot != 1) && !spacepkg.IsSystemBot(uid) {
+			continue
+		}
+		botUIDs = append(botUIDs, uid)
+		creator := ""
+		if found {
+			creator = row.CreatorUID
+		}
+		byCreator[creator] = append(byCreator[creator], uid)
+	}
+	if len(botUIDs) == 0 {
+		return nil
+	}
+
+	directoryUIDs, err := p.db.queryDirectoryAgentUIDsTx(tx, spaceID, botUIDs)
+	if err != nil {
+		return err
+	}
+	creatorRows, err := p.db.queryAgentRowsTx(tx, creatorUIDs)
+	if err != nil {
+		return err
+	}
+	verdicts := make(map[string]agentEligibility, len(botUIDs))
+	for creator, uids := range byCreator {
+		group, gerr := p.classifyAgentsTx(tx, creator, uids, held)
+		if gerr != nil {
+			return gerr
+		}
+		for uid, verdict := range group {
+			verdicts[uid] = verdict
+		}
+	}
+
+	bad := make([]string, 0)
+	for _, uid := range botUIDs {
+		row := targetRows[uid]
+		verdict, classified := verdicts[uid]
+		creator, creatorOK := creatorRows[row.CreatorUID]
+		eligibleCreator := row.CreatorUID != "" &&
+			creatorOK &&
+			creator.Robot == 0 &&
+			creator.AccountUsable &&
+			held[row.CreatorUID]
+		if !classified || !verdict.OK || !directoryUIDs[uid] || !eligibleCreator {
+			bad = append(bad, uid)
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	p.Warn("添加项目成员：目标分身不符合组织通讯录资格",
+		zap.String("spaceId", spaceID),
+		zap.Strings("ineligible", bad),
+		zap.Any("reasons", ineligibleAgentReasons(botUIDs, verdicts)))
+	return &agentNotEligibleError{UIDs: bad}
+}
+
 func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []memberAdd) ([]string, error) {
 	now := time.Now().UTC()
 	targetUIDs := make([]string, 0, len(members))
 	for _, item := range members {
 		targetUIDs = append(targetUIDs, item.UID)
 	}
-	seatUIDs := make([]string, 0, len(targetUIDs)+1)
+	preparedAgents, err := p.db.queryAgentRows(targetUIDs)
+	if err != nil {
+		return nil, err
+	}
+	creatorUIDs := make([]string, 0, len(targetUIDs))
+	seenCreators := make(map[string]bool, len(targetUIDs))
+	for _, row := range preparedAgents {
+		if row.Robot != 1 || row.CreatorUID == "" || seenCreators[row.CreatorUID] {
+			continue
+		}
+		seenCreators[row.CreatorUID] = true
+		creatorUIDs = append(creatorUIDs, row.CreatorUID)
+	}
+	seatUIDs := make([]string, 0, len(targetUIDs)+len(creatorUIDs)+1)
 	seatUIDs = append(seatUIDs, actorUID)
 	seatUIDs = append(seatUIDs, targetUIDs...)
+	seatUIDs = append(seatUIDs, creatorUIDs...)
 	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, seatUIDs)
 	if err != nil {
 		return nil, err
@@ -858,7 +955,8 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if _, err := p.lockSeatsTx(tx, spaceID, actorUID, targetUIDs, nil, seatRefs); err != nil {
+	held, err := p.lockSeatsTx(tx, spaceID, actorUID, targetUIDs, creatorUIDs, seatRefs)
+	if err != nil {
 		return nil, err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -874,6 +972,9 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	}
 	if !canManageMembers(actorRole) {
 		return nil, errPermissionDenied
+	}
+	if err := p.validateMemberAddAgentsTx(tx, spaceID, targetUIDs, creatorUIDs, held); err != nil {
+		return nil, err
 	}
 
 	toAdmit := make([]memberAdd, 0, len(members))
@@ -914,6 +1015,7 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 			Role:      item.Role,
 			InviteUID: actorUID,
 			CreatedAt: now,
+			JoinedAt:  now,
 			UpdatedAt: now,
 		})
 		if aerr != nil {
@@ -1273,6 +1375,16 @@ func (p *Project) transferProjectOwnerOnce(projectID, spaceID, actorUID, success
 	}
 	if target.Role == RoleOwner {
 		return errMemberRoleConflict
+	}
+	targetClass, err := p.db.queryAgentClassTx(tx, successorUID)
+	if err != nil {
+		return err
+	}
+	if targetClass.IsBot || spacepkg.IsSystemBot(successorUID) {
+		// Project ownership is a human-only role. Keep the target hidden behind
+		// the existing member-not-found envelope rather than exposing robot
+		// classification through this authorization endpoint.
+		return errMemberNotFound
 	}
 	if _, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now); err != nil {
 		return err

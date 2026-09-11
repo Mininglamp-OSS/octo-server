@@ -108,6 +108,13 @@ func exposeProjectPaginationHeader() gin.HandlerFunc {
 			totalHeader  = "X-Total-Count"
 		)
 		h := c.Writer.Header()
+		if h.Get("Access-Control-Allow-Origin") == "" {
+			// SecureCORSOverrideMiddleware deliberately strips CORS headers for
+			// same-origin or disallowed requests. Do not reintroduce an expose
+			// header after that decision.
+			c.Next()
+			return
+		}
 		values := h.Values(exposeHeader)
 		for _, line := range values {
 			for _, token := range strings.Split(line, ",") {

@@ -54,6 +54,10 @@ func derefOr(s *string, fallback string) string {
 // a distinguishable alternative to using the index.
 func seedPlanProbeRows(t *testing.T, sess *dbr.Session, projectID, spaceID, groupNo string) {
 	t.Helper()
+	paddingPrefix := projectID
+	if len(paddingPrefix) > 8 {
+		paddingPrefix = paddingPrefix[len(paddingPrefix)-8:]
+	}
 	_, err := sess.InsertBySql(
 		"INSERT INTO `octo_project` (project_id, space_id, name, creator, status, "+
 			"all_member_group_no, created_at, updated_at) "+
@@ -67,11 +71,11 @@ func seedPlanProbeRows(t *testing.T, sess *dbr.Session, projectID, spaceID, grou
 		groupNo, spaceID, projectID).Exec()
 	require.NoError(t, err)
 
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		_, err = sess.InsertBySql(
 			"INSERT INTO `group` (group_no, name, creator, status, space_id, project_id) "+
 				"VALUES (?, 'padding', 'u_owner', 1, ?, '')",
-			fmt.Sprintf("plan_pad_%03d", i), spaceID).Exec()
+			fmt.Sprintf("plan_pad_%s_%03d", paddingPrefix, i), spaceID).Exec()
 		require.NoError(t, err)
 	}
 	// ANALYZE so the optimizer plans against the rows just written rather than

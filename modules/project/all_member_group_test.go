@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -140,7 +141,7 @@ func memberRow(t *testing.T, projectID, uid string) *MemberModel {
 	t.Helper()
 	var rows []*MemberModel
 	_, err := testCtx.DB().SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ?", projectID, uid,
 	).Load(&rows)
 	require.NoError(t, err)
@@ -178,6 +179,12 @@ func TestCreateProjectSeatsTheCreatorsAgents(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	resp := decodeResp(t, w)
 
+	ownerRow := memberRow(t, resp.ProjectID, "u_owner")
+	require.NotNil(t, ownerRow, "creator should hold the Owner seat")
+	require.False(t, ownerRow.JoinedAt.IsZero())
+	assert.Equal(t, ownerRow.CreatedAt, ownerRow.JoinedAt,
+		"the initial Owner admission starts both timestamps together")
+
 	// Both agents hold an active seat, written in the SAME transaction as the
 	// project — so if the project exists, they do.
 	for _, uid := range []string{"bot_mine_1", "bot_mine_2"} {
@@ -187,6 +194,9 @@ func TestCreateProjectSeatsTheCreatorsAgents(t *testing.T) {
 		require.Equal(t, 0, row.Removing)
 		require.Equal(t, RoleCommon, row.Role)
 		require.Equal(t, "u_owner", row.InviteUID)
+		require.False(t, row.JoinedAt.IsZero(), "agent %s joined_at must be populated", uid)
+		require.Equal(t, ownerRow.JoinedAt, row.JoinedAt,
+			"all initial seats must use the create transaction's admission time")
 	}
 
 	// D11 — the epoch stays at 0. Agents are part of the roster coming into

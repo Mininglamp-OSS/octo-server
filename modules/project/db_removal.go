@@ -63,8 +63,12 @@ type RemovalJob struct {
 	CreatedAt   time.Time `db:"created_at"`
 }
 
-// beginMemberRemovalTx sets removing = 1 on an active seat and reports whether a
-// row actually changed.
+// beginMemberRemovalTx sets removing = 1 on an active non-Owner seat and reports
+// whether a row actually changed.
+//
+// The Owner predicate is a final defense for every cascade caller, including
+// agent riders and Space-seat cleanup. Endpoint-level Owner checks are not
+// sufficient because those callers can arrive through independent transactions.
 //
 // The `status = active AND removing = 0` predicate is what makes the whole
 // removal path idempotent: a second request for a uid already being removed
@@ -74,8 +78,8 @@ type RemovalJob struct {
 func (d *DB) beginMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.Time) (bool, error) {
 	res, err := tx.UpdateBySql(
 		"UPDATE `octo_project_member` SET removing = 1, updated_at = ? "+
-			"WHERE project_id = ? AND uid = ? AND status = ? AND removing = 0",
-		now, projectID, uid, MemberStatusActive,
+			"WHERE project_id = ? AND uid = ? AND status = ? AND removing = 0 AND role <> ?",
+		now, projectID, uid, MemberStatusActive, RoleOwner,
 	).Exec()
 	if err != nil {
 		return false, fmt.Errorf("project: begin member removal: %w", err)
@@ -125,7 +129,7 @@ func (d *DB) finishMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.T
 func (d *DB) lockMemberForCascadeTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? FOR UPDATE",
 		projectID, uid,
 	).Load(&rows)

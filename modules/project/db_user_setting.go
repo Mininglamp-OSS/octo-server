@@ -99,8 +99,8 @@ func (d *DB) queryProjectPinned(projectID, uid string) (bool, error) {
 
 // sqlCountPinnedInSpace is the statement countPinnedInSpaceTx runs.
 //
-// Named for the same reason as sqlListMyProjectGroups: the plan guard EXPLAINs the
-// string production executes, not a copy that can drift into passing forever.
+// A named constant lets the plan guard EXPLAIN the string production executes,
+// rather than a copy that can drift into passing forever.
 //
 // The INNER JOIN carries the same membership visibility rule as
 // projectReadListPredicate: the Project is normal in this Space, and the caller's

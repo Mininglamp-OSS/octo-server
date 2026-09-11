@@ -1048,13 +1048,13 @@ func parseGroupMyRoles(raw string) (roles []int, hasRole, valid bool) {
 	return roles, true, true
 }
 
-func (g *Group) groupMyExternalMap(loginUID string) map[string]string {
+func (g *Group) groupMyExternalMap(loginUID string) (map[string]string, error) {
 	externalMap, err := g.db.QueryExternalGroupNosForUser(loginUID)
 	if err != nil {
 		g.Warn("查询外部群来源Space失败", zap.Error(err), zap.String("uid", loginUID))
-		return nil
+		return nil, err
 	}
-	return externalMap
+	return externalMap, nil
 }
 
 func (g *Group) respondGroupMyModels(c *wkhttp.Context, loginUID string, models []*Model, includeMemberCount, rewriteExternalSpace bool) {
@@ -1072,7 +1072,12 @@ func (g *Group) respondGroupMyModels(c *wkhttp.Context, loginUID string, models 
 	}
 	var externalMap map[string]string
 	if rewriteExternalSpace {
-		externalMap = g.groupMyExternalMap(loginUID)
+		externalMap, err = g.groupMyExternalMap(loginUID)
+		if err != nil {
+			g.Error("查询外部群来源Space失败", zap.Error(err), zap.String("uid", loginUID))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
 	}
 	memberCounts := make(map[string]int64, len(groupNos))
 	if includeMemberCount && len(groupNos) > 0 {

@@ -358,12 +358,12 @@ func (p *Project) queryOwnerlessProjectPage(cursor int64, limit int) ([]*orphanR
 	var rows []*orphanRow
 	_, err := p.db.session.SelectBySql(
 		"SELECT p.id, p.project_id, p.space_id, "+
-			// Active AND no seat holding RoleOwner. Both predicates are flags rather than WHERE
-			// terms: projects are never deleted, so filtering on status would bound rows
-			// returned instead of rows examined as disbanded projects accumulate.
+			// Active AND no seat holding an effective RoleOwner. A closing Owner
+			// (removing = 1) is already excluded from authorization reads and
+			// therefore must not mask the ownerless signal.
 			"(p.status = ? AND NOT EXISTS (SELECT 1 FROM `octo_project_member` pm "+
 			"             WHERE pm.project_id = p.project_id AND pm.status = ? "+
-			"               AND pm.role = ?)) AS violating "+
+			"               AND pm.removing = 0 AND pm.role = ?)) AS violating "+
 			"FROM `octo_project` p "+
 			"WHERE p.id > ? "+
 			"ORDER BY p.id LIMIT ?",

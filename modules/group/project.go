@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	"github.com/gocraft/dbr/v2"
 )
 
 var (
@@ -100,12 +101,13 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 	}
 	before, err := g.db.queryGroupProjectRelation(groupNo)
 	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: query relation: %v", errProjectRelationDependency, err)
+		return GroupProjectRelation{}, fmt.Errorf("%w: query relation: %w", errProjectRelationDependency, err)
 	}
 	if before == nil || before.Status == GroupStatusDisband {
 		return GroupProjectRelation{}, errProjectRelationNotFound
 	}
-	if strings.TrimSpace(before.SpaceID) == "" {
+	spaceID := strings.TrimSpace(before.SpaceID)
+	if spaceID == "" {
 		return GroupProjectRelation{}, errProjectRelationInvalid
 	}
 	if err := validateGroupProjectRelation(before); err != nil {
@@ -113,67 +115,92 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 	}
 	initialSource := strings.TrimSpace(before.ProjectID)
 
-	tx, err := g.ctx.DB().Begin()
-	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: begin relation bind: %v", errProjectRelationDependency, err)
-	}
-	defer tx.RollbackUnlessCommitted()
+	var pendingTx *dbr.Tx
+	var pendingRow *groupProjectRelationRow
+	err = projectmod.RetryGroupProjectLockConflict(func() error {
+		seatRefs, prepErr := projectmod.PrepareGroupProjectSpaceSeatRefs(
+			g.ctx.DB(), spaceID, []string{actorUID},
+		)
+		if prepErr != nil {
+			return mapProjectAccessError(prepErr)
+		}
+		tx, beginErr := g.ctx.DB().Begin()
+		if beginErr != nil {
+			return fmt.Errorf("%w: begin relation bind: %w", errProjectRelationDependency, beginErr)
+		}
+		accesses, lockErr := projectmod.LockGroupProjectAccessesTx(
+			tx, actorUID, projectRelationAccessIDs(initialSource, targetID), spaceID, seatRefs,
+		)
+		if lockErr != nil {
+			_ = tx.Rollback()
+			return mapProjectAccessError(lockErr)
+		}
+		locked, lockErr := g.db.lockGroupProjectRelationTx(tx, groupNo)
+		if lockErr != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("%w: lock relation: %w", errProjectRelationDependency, lockErr)
+		}
+		if locked == nil || locked.Status == GroupStatusDisband {
+			_ = tx.Rollback()
+			return errProjectRelationNotFound
+		}
+		if lockErr := validateGroupProjectRelation(locked); lockErr != nil {
+			_ = tx.Rollback()
+			return lockErr
+		}
+		if locked.SpaceID != spaceID {
+			_ = tx.Rollback()
+			return errProjectRelationConflict
+		}
+		currentSource := strings.TrimSpace(locked.ProjectID)
+		if !changedProjectSourceAllowed(initialSource, currentSource, targetID) {
+			_ = tx.Rollback()
+			return errProjectRelationConflict
+		}
+		if targetAccess, ok := accesses[targetID]; !ok || targetAccess.SpaceID != locked.SpaceID {
+			_ = tx.Rollback()
+			return errProjectRelationConflict
+		}
+		if currentSource != "" {
+			if sourceAccess, ok := accesses[currentSource]; !ok || sourceAccess.SpaceID != locked.SpaceID {
+				_ = tx.Rollback()
+				return errProjectRelationConflict
+			}
+		}
+		manager, lockErr := g.db.lockGroupManagerTx(tx, groupNo, actorUID)
+		if lockErr != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("%w: lock native manager: %w", errProjectRelationDependency, lockErr)
+		}
+		if !manager {
+			_ = tx.Rollback()
+			return errProjectRelationForbidden
+		}
 
-	accesses, err := projectmod.LockGroupProjectAccessesTx(
-		tx, actorUID, projectRelationAccessIDs(initialSource, targetID), before.SpaceID,
-	)
+		if currentSource != targetID {
+			if updateErr := g.db.updateGroupProjectRelationTx(tx, groupNo, targetID, actorUID); updateErr != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("%w: update relation: %w", errProjectRelationDependency, updateErr)
+			}
+			linkedBy := actorUID
+			locked.ProjectID = targetID
+			locked.ProjectLinkedBy = &linkedBy
+		}
+		pendingTx = tx
+		pendingRow = locked
+		return nil
+	})
 	if err != nil {
-		return GroupProjectRelation{}, mapProjectAccessError(err)
-	}
-	locked, err := g.db.lockGroupProjectRelationTx(tx, groupNo)
-	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: lock relation: %v", errProjectRelationDependency, err)
-	}
-	if locked == nil || locked.Status == GroupStatusDisband {
-		return GroupProjectRelation{}, errProjectRelationNotFound
-	}
-	if err := validateGroupProjectRelation(locked); err != nil {
 		return GroupProjectRelation{}, err
 	}
-	if locked.SpaceID != before.SpaceID {
-		return GroupProjectRelation{}, errProjectRelationConflict
+	if pendingTx == nil || pendingRow == nil {
+		return GroupProjectRelation{}, fmt.Errorf("%w: relation bind produced no transaction", errProjectRelationDependency)
 	}
-	currentSource := strings.TrimSpace(locked.ProjectID)
-	if !changedProjectSourceAllowed(initialSource, currentSource, targetID) {
-		return GroupProjectRelation{}, errProjectRelationConflict
+	defer pendingTx.RollbackUnlessCommitted()
+	if err := pendingTx.Commit(); err != nil {
+		return GroupProjectRelation{}, fmt.Errorf("%w: commit relation bind: %w", errProjectRelationDependency, err)
 	}
-	if targetAccess, ok := accesses[targetID]; !ok || targetAccess.SpaceID != locked.SpaceID {
-		return GroupProjectRelation{}, errProjectRelationConflict
-	}
-	if currentSource != "" {
-		if sourceAccess, ok := accesses[currentSource]; !ok || sourceAccess.SpaceID != locked.SpaceID {
-			return GroupProjectRelation{}, errProjectRelationConflict
-		}
-	}
-	manager, err := g.db.lockGroupManagerTx(tx, groupNo, actorUID)
-	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: lock native manager: %v", errProjectRelationDependency, err)
-	}
-	if !manager {
-		return GroupProjectRelation{}, errProjectRelationForbidden
-	}
-
-	if currentSource == targetID {
-		if err := tx.Commit(); err != nil {
-			return GroupProjectRelation{}, fmt.Errorf("%w: commit idempotent bind: %v", errProjectRelationDependency, err)
-		}
-		return groupProjectRelationFromRow(locked), nil
-	}
-	if err := g.db.updateGroupProjectRelationTx(tx, groupNo, targetID, actorUID); err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: update relation: %v", errProjectRelationDependency, err)
-	}
-	linkedBy := actorUID
-	locked.ProjectID = targetID
-	locked.ProjectLinkedBy = &linkedBy
-	if err := tx.Commit(); err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: commit relation bind: %v", errProjectRelationDependency, err)
-	}
-	return groupProjectRelationFromRow(locked), nil
+	return groupProjectRelationFromRow(pendingRow), nil
 }
 
 func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelation, error) {
@@ -184,12 +211,13 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 	}
 	before, err := g.db.queryGroupProjectRelation(groupNo)
 	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: query relation: %v", errProjectRelationDependency, err)
+		return GroupProjectRelation{}, fmt.Errorf("%w: query relation: %w", errProjectRelationDependency, err)
 	}
 	if before == nil || before.Status == GroupStatusDisband {
 		return GroupProjectRelation{}, errProjectRelationNotFound
 	}
-	if strings.TrimSpace(before.SpaceID) == "" {
+	spaceID := strings.TrimSpace(before.SpaceID)
+	if spaceID == "" {
 		return GroupProjectRelation{}, errProjectRelationInvalid
 	}
 	if err := validateGroupProjectRelation(before); err != nil {
@@ -197,66 +225,93 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 	}
 	initialSource := strings.TrimSpace(before.ProjectID)
 
-	tx, err := g.ctx.DB().Begin()
+	var pendingTx *dbr.Tx
+	var pendingRow *groupProjectRelationRow
+	err = projectmod.RetryGroupProjectLockConflict(func() error {
+		seatRefs, prepErr := projectmod.PrepareGroupProjectSpaceSeatRefs(
+			g.ctx.DB(), spaceID, []string{actorUID},
+		)
+		if prepErr != nil {
+			return mapProjectAccessError(prepErr)
+		}
+		tx, beginErr := g.ctx.DB().Begin()
+		if beginErr != nil {
+			return fmt.Errorf("%w: begin relation unbind: %w", errProjectRelationDependency, beginErr)
+		}
+		if initialSource != "" {
+			if _, lockErr := projectmod.LockGroupProjectAccessTx(
+				tx, actorUID, initialSource, spaceID, seatRefs,
+			); lockErr != nil {
+				_ = tx.Rollback()
+				return mapProjectAccessError(lockErr)
+			}
+		} else {
+			active, lockErr := projectmod.LockGroupProjectSpaceAccessTx(
+				tx, actorUID, spaceID, seatRefs,
+			)
+			if lockErr != nil {
+				_ = tx.Rollback()
+				return mapProjectAccessError(lockErr)
+			}
+			if !active {
+				_ = tx.Rollback()
+				return errProjectRelationForbidden
+			}
+		}
+		locked, lockErr := g.db.lockGroupProjectRelationTx(tx, groupNo)
+		if lockErr != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("%w: lock relation: %w", errProjectRelationDependency, lockErr)
+		}
+		if locked == nil || locked.Status == GroupStatusDisband {
+			_ = tx.Rollback()
+			return errProjectRelationNotFound
+		}
+		if lockErr := validateGroupProjectRelation(locked); lockErr != nil {
+			_ = tx.Rollback()
+			return lockErr
+		}
+		if locked.SpaceID != spaceID {
+			_ = tx.Rollback()
+			return errProjectRelationConflict
+		}
+		currentSource := strings.TrimSpace(locked.ProjectID)
+		if !changedProjectSourceAllowed(initialSource, currentSource, "") {
+			_ = tx.Rollback()
+			return errProjectRelationConflict
+		}
+		manager, lockErr := g.db.lockGroupManagerTx(tx, groupNo, actorUID)
+		if lockErr != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("%w: lock native manager: %w", errProjectRelationDependency, lockErr)
+		}
+		if !manager {
+			_ = tx.Rollback()
+			return errProjectRelationForbidden
+		}
+		if currentSource != "" {
+			if updateErr := g.db.updateGroupProjectRelationTx(tx, groupNo, "", ""); updateErr != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("%w: clear relation: %w", errProjectRelationDependency, updateErr)
+			}
+			locked.ProjectID = ""
+			locked.ProjectLinkedBy = nil
+		}
+		pendingTx = tx
+		pendingRow = locked
+		return nil
+	})
 	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: begin relation unbind: %v", errProjectRelationDependency, err)
-	}
-	defer tx.RollbackUnlessCommitted()
-	if initialSource != "" {
-		if _, err := projectmod.LockGroupProjectAccessTx(tx, actorUID, initialSource, before.SpaceID); err != nil {
-			return GroupProjectRelation{}, mapProjectAccessError(err)
-		}
-	} else {
-		active, err := g.db.lockGroupSpaceMemberTx(tx, before.SpaceID, actorUID)
-		if err != nil {
-			return GroupProjectRelation{}, fmt.Errorf("%w: lock group Space member: %v", errProjectRelationDependency, err)
-		}
-		if !active {
-			return GroupProjectRelation{}, errProjectRelationForbidden
-		}
-		eligible, err := g.db.lockGroupUserEligibleTx(tx, actorUID)
-		if err != nil {
-			return GroupProjectRelation{}, fmt.Errorf("%w: lock user: %v", errProjectRelationDependency, err)
-		}
-		if !eligible {
-			return GroupProjectRelation{}, errProjectRelationForbidden
-		}
-	}
-	locked, err := g.db.lockGroupProjectRelationTx(tx, groupNo)
-	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: lock relation: %v", errProjectRelationDependency, err)
-	}
-	if locked == nil || locked.Status == GroupStatusDisband {
-		return GroupProjectRelation{}, errProjectRelationNotFound
-	}
-	if err := validateGroupProjectRelation(locked); err != nil {
 		return GroupProjectRelation{}, err
 	}
-	if locked.SpaceID != before.SpaceID {
-		return GroupProjectRelation{}, errProjectRelationConflict
+	if pendingTx == nil || pendingRow == nil {
+		return GroupProjectRelation{}, fmt.Errorf("%w: relation unbind produced no transaction", errProjectRelationDependency)
 	}
-	currentSource := strings.TrimSpace(locked.ProjectID)
-	if !changedProjectSourceAllowed(initialSource, currentSource, "") {
-		return GroupProjectRelation{}, errProjectRelationConflict
+	defer pendingTx.RollbackUnlessCommitted()
+	if err := pendingTx.Commit(); err != nil {
+		return GroupProjectRelation{}, fmt.Errorf("%w: commit relation unbind: %w", errProjectRelationDependency, err)
 	}
-	manager, err := g.db.lockGroupManagerTx(tx, groupNo, actorUID)
-	if err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: lock native manager: %v", errProjectRelationDependency, err)
-	}
-	if !manager {
-		return GroupProjectRelation{}, errProjectRelationForbidden
-	}
-	if currentSource != "" {
-		if err := g.db.updateGroupProjectRelationTx(tx, groupNo, "", ""); err != nil {
-			return GroupProjectRelation{}, fmt.Errorf("%w: clear relation: %v", errProjectRelationDependency, err)
-		}
-		locked.ProjectID = ""
-		locked.ProjectLinkedBy = nil
-	}
-	if err := tx.Commit(); err != nil {
-		return GroupProjectRelation{}, fmt.Errorf("%w: commit relation unbind: %v", errProjectRelationDependency, err)
-	}
-	return groupProjectRelationFromRow(locked), nil
+	return groupProjectRelationFromRow(pendingRow), nil
 }
 
 func mapProjectAccessError(err error) error {
@@ -270,8 +325,8 @@ func mapProjectAccessError(err error) error {
 	case errors.Is(err, projectmod.ErrGroupProjectSpaceConflict):
 		return errProjectRelationConflict
 	case errors.Is(err, projectmod.ErrGroupProjectDependency):
-		return fmt.Errorf("%w: %v", errProjectRelationDependency, err)
+		return fmt.Errorf("%w: %w", errProjectRelationDependency, err)
 	default:
-		return fmt.Errorf("%w: %v", errProjectRelationDependency, err)
+		return fmt.Errorf("%w: %w", errProjectRelationDependency, err)
 	}
 }

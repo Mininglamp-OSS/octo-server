@@ -35,9 +35,9 @@ func seedProjectForGroupTest(t *testing.T, tctx *config.Context, projectID, spac
 func seedProjectSeat(t *testing.T, tctx *config.Context, projectID, spaceID, uid string, role int) {
 	t.Helper()
 	_, err := tctx.DB().InsertBySql(
-		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, 1, 0, ?, NOW(3), NOW(3)) "+
-			"ON DUPLICATE KEY UPDATE role=VALUES(role), status=1, removing=0",
+		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, 1, 0, ?, NOW(3), NOW(3), NOW(3)) "+
+			"ON DUPLICATE KEY UPDATE role=VALUES(role), joined_at=IF(status=0 OR removing=1, VALUES(joined_at), joined_at), status=1, removing=0",
 		projectID, uid, spaceID, role, uid,
 	).Exec()
 	require.NoError(t, err)

@@ -223,7 +223,7 @@ func TestMemberEpochBumpIsInTheSameTransaction(t *testing.T) {
 	require.NotNil(t, row)
 	changed, err := p.db.admitMemberTx(tx, &MemberModel{
 		ProjectID: created.ProjectID, UID: "rollback1", SpaceID: spaceA,
-		Role: RoleCommon, InviteUID: "owner1", CreatedAt: now, UpdatedAt: now,
+		Role: RoleCommon, InviteUID: "owner1", CreatedAt: now, JoinedAt: now, UpdatedAt: now,
 	})
 	require.NoError(t, err)
 	require.True(t, changed)
@@ -686,4 +686,109 @@ func TestReactivationWhileRemovalIsPendingCountsAgainstMemberQuota(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, 2, active,
 		"closing seats that would be reactivated count toward the cap")
+}
+
+// TestMemberJoinedAtTracksMembershipRounds pins the distinction between the
+// first-ever row timestamp and the current membership round timestamp.
+//
+// A new seat starts both clocks together. Role changes and idempotent admission
+// do not start a new round. A removed or closing seat rejoining does, while its
+// created_at remains the first-ever timestamp.
+func TestMemberJoinedAtTracksMembershipRounds(t *testing.T) {
+	srv, p := setup(t)
+	ownerToken, _, created := projectWithMembers(t, srv, "round-member")
+
+	member, err := p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	require.NotNil(t, member)
+	require.False(t, member.CreatedAt.IsZero())
+	require.False(t, member.JoinedAt.IsZero())
+	assert.Equal(t, member.CreatedAt, member.JoinedAt,
+		"a first admission starts created_at and joined_at together")
+	firstCreatedAt := member.CreatedAt
+	firstJoinedAt := member.JoinedAt
+
+	// A role adjustment is not a new membership round.
+	w := doJSON(t, srv, http.MethodPut,
+		"/v1/projects/"+created.ProjectID+"/members/round-member/role",
+		ownerToken, map[string]any{"role": RoleAdmin})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	member, err = p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	assert.Equal(t, firstJoinedAt, member.JoinedAt,
+		"changing role must not change the membership-round timestamp")
+
+	// Re-adding an already-active member is idempotent, including its timestamp.
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
+		addMemberWithRolePayload("round-member", RoleAdmin))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	member, err = p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	assert.Equal(t, firstJoinedAt, member.JoinedAt,
+		"idempotent admission must not change the membership-round timestamp")
+
+	// A completed removal followed by admission starts a fresh membership round.
+	// Backdate the old round so DATETIME(3) precision cannot make two fast writes
+	// appear equal.
+	backdatedJoinedAt := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE octo_project_member SET joined_at = ? WHERE project_id = ? AND uid = ?",
+		backdatedJoinedAt, created.ProjectID, "round-member").Exec()
+	require.NoError(t, err)
+	firstJoinedAt = backdatedJoinedAt
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{"round-member"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	drainRemovalCascade(t, p)
+	removed, err := p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	require.NotNil(t, removed)
+	assert.Equal(t, MemberStatusRemoved, removed.Status)
+	assert.Equal(t, backdatedJoinedAt, removed.JoinedAt,
+		"removing a member must not overwrite the previous membership-round timestamp")
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
+		addMembersPayload("round-member"))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	member, err = p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	assert.Equal(t, firstCreatedAt, member.CreatedAt,
+		"rejoining must preserve the first-ever row timestamp")
+	assert.True(t, member.JoinedAt.After(firstJoinedAt),
+		"rejoining after removal must refresh joined_at: old=%s new=%s",
+		firstJoinedAt, member.JoinedAt)
+
+	// A re-admission that cancels an in-flight removal is also a new round.
+	createdBeforePending := member.CreatedAt
+	backdatedPendingJoinedAt := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err = testCtx.DB().UpdateBySql(
+		"UPDATE octo_project_member SET joined_at = ? WHERE project_id = ? AND uid = ?",
+		backdatedPendingJoinedAt, created.ProjectID, "round-member").Exec()
+	require.NoError(t, err)
+	joinedBeforePending := backdatedPendingJoinedAt
+
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{"round-member"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	pending, err := p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, MemberStatusActive, pending.Status)
+	assert.Equal(t, backdatedPendingJoinedAt, pending.JoinedAt,
+		"a closing seat still belongs to its previous membership round until re-admission")
+	require.Equal(t, 1, pending.Removing)
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
+		addMembersPayload("round-member"))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	member, err = p.db.queryMember(created.ProjectID, "round-member")
+	require.NoError(t, err)
+	assert.Equal(t, createdBeforePending, member.CreatedAt)
+	assert.True(t, member.JoinedAt.After(joinedBeforePending),
+		"rejoining a closing seat must refresh joined_at: old=%s new=%s",
+		joinedBeforePending, member.JoinedAt)
+	assert.Zero(t, member.Removing)
 }

@@ -578,7 +578,7 @@ func (d *DB) checkSpaceSeatForCleanupTx(tx *dbr.Tx, spaceID, uid string) (bool, 
 func (d *DB) queryMember(projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := d.session.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? LIMIT 1",
 		projectID, uid,
 	).Load(&rows)
@@ -598,7 +598,7 @@ func (d *DB) queryMember(projectID, uid string) (*MemberModel, error) {
 func (d *DB) queryMemberTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? FOR UPDATE",
 		projectID, uid,
 	).Load(&rows)
@@ -623,6 +623,9 @@ func (d *DB) queryMemberTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, err
 //
 // The role is only reset when a seat is inactive or closing, never on a row that
 // is already active: re-adding an active admin must not silently demote them.
+// `joined_at` follows the same old-state predicate: a first admission receives
+// the caller's current time, re-admission refreshes the current round, and an
+// active idempotent add leaves the existing round untouched.
 //
 // ⚠️ ASSIGNMENT ORDER IS LOAD-BEARING. MySQL evaluates ON DUPLICATE KEY UPDATE
 // assignments left to right, and a column read on the right-hand side sees the value
@@ -635,12 +638,13 @@ func (d *DB) queryMemberTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, err
 func (d *DB) admitMemberTx(tx *dbr.Tx, m *MemberModel) (bool, error) {
 	res, err := tx.InsertBySql(
 		"INSERT INTO octo_project_member "+
-			"(project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?) "+
+			"(project_id, uid, space_id, role, status, invite_uid, created_at, joined_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE "+
 			// -- reads of the OLD status/removing must all precede `status = 1` --
 			"  role = IF(status = 0 OR removing = 1, VALUES(role), role), "+
 			"  invite_uid = IF(status = 0 OR removing = 1, VALUES(invite_uid), invite_uid), "+
+			"  joined_at = IF(status = 0 OR removing = 1, VALUES(joined_at), joined_at), "+
 			"  updated_at = IF(status = 0 OR removing = 1, VALUES(updated_at), updated_at), "+
 			// -- from here on `status` reads as 1 --
 			"  space_id = VALUES(space_id), "+
@@ -655,7 +659,7 @@ func (d *DB) admitMemberTx(tx *dbr.Tx, m *MemberModel) (bool, error) {
 			"  removing = 0, "+
 			"  status = 1",
 		m.ProjectID, m.UID, m.SpaceID, m.Role, MemberStatusActive, m.InviteUID,
-		m.CreatedAt, m.UpdatedAt,
+		m.CreatedAt, m.JoinedAt, m.UpdatedAt,
 	).Exec()
 	if err != nil {
 		return false, fmt.Errorf("project: admit member: %w", err)

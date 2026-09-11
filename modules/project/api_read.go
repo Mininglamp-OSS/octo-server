@@ -104,6 +104,7 @@ func projectMemberReadResponse(member *projectReadMemberRow) *MemberResp {
 		OwnerUID:           member.OwnerUID,
 		CollaborationRoles: roles,
 		CreatedAt:          formatTime(member.CreatedAt),
+		JoinedAt:           formatTime(member.JoinedAt),
 	}
 }
 

@@ -542,6 +542,7 @@ var projectMigrationFiles = []string{
 	"sql/20260909000001_project_collaboration_role.sql",
 	"sql/20260910000001_project_read_default.sql",
 	"sql/20260911000001_project_group_user_setting.sql",
+	"sql/20260911000002_project_member_joined_at.sql",
 }
 
 // applyProjectMigration executes one section of every migration file this module

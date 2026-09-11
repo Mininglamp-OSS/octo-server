@@ -89,16 +89,16 @@ func TestCascadeSkipsPreservedOwnersBeforePageBoundary(t *testing.T) {
 		require.NoError(t, err)
 		_, err = testCtx.DB().InsertBySql(
 			"INSERT INTO octo_project_member "+
-				"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
-				"VALUES (?, ?, ?, ?, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+				"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+				"VALUES (?, ?, ?, ?, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
 			project.id, "cascade-owner", spaceA, project.role, project.inviteBy,
 		).Exec()
 		require.NoError(t, err)
 		if project.role == RoleCommon {
 			_, err = testCtx.DB().InsertBySql(
 				"INSERT INTO octo_project_member "+
-					"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
-					"VALUES (?, ?, ?, ?, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+					"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+					"VALUES (?, ?, ?, ?, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
 				project.id, "cascade-other", spaceA, RoleOwner, "cascade-other",
 			).Exec()
 			require.NoError(t, err)

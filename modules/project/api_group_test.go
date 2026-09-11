@@ -58,9 +58,9 @@ func disbandGroupRow(t *testing.T, groupNo string) {
 	require.NoError(t, err)
 }
 
-func decodeGroupList(t *testing.T, w *httptest.ResponseRecorder) []*GroupResp {
+func decodeGroupList(t *testing.T, w *httptest.ResponseRecorder) []ProjectGroupRelation {
 	t.Helper()
-	var resp []*GroupResp
+	var resp []ProjectGroupRelation
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp), "body: %s", w.Body.String())
 	return resp
 }
@@ -72,7 +72,7 @@ func decodeProjectGroupRelations(t *testing.T, w *httptest.ResponseRecorder) []P
 	return resp
 }
 
-func groupNosOf(list []*GroupResp) []string {
+func groupNosOf(list []ProjectGroupRelation) []string {
 	out := make([]string, 0, len(list))
 	for _, g := range list {
 		out = append(out, g.GroupNo)
@@ -281,16 +281,21 @@ func TestListProjectGroupsDoesNotExposeNativeMemberCounts(t *testing.T) {
 	list := decodeGroupList(t, w)
 	require.Len(t, list, 2)
 	assert.Contains(t, groupNosOf(list), allMember.groupNo)
-	var relation *GroupResp
-	for _, item := range list {
-		if item.GroupNo == groupNo {
-			relation = item
+	var relation *ProjectGroupRelation
+	for index := range list {
+		if list[index].GroupNo == groupNo {
+			relation = &list[index]
 			break
 		}
 	}
 	require.NotNil(t, relation)
 	assert.Equal(t, groupNo, relation.GroupNo)
-	assert.Equal(t, 0, relation.MemberCount,
+	encoded, err := json.Marshal(relation)
+	require.NoError(t, err)
+	var relationJSON map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &relationJSON))
+	_, hasMemberCount := relationJSON["member_count"]
+	assert.False(t, hasMemberCount,
 		"relation DTOs must not smuggle native chat member counts into the Project surface")
 }
 

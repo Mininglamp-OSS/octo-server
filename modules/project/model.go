@@ -130,6 +130,10 @@ type MemberModel struct {
 	Removing  int       `db:"removing"`
 	InviteUID string    `db:"invite_uid"`
 	CreatedAt time.Time `db:"created_at"`
+	// JoinedAt is the start of the current active membership round. It is
+	// initialized with CreatedAt for a first admission and refreshed on
+	// re-admission after removal or while a removal is in flight.
+	JoinedAt  time.Time `db:"joined_at"`
 	UpdatedAt time.Time `db:"updated_at"`
 }
 
@@ -334,6 +338,7 @@ type MemberResp struct {
 	OwnerUID           string                  `json:"owner_uid"`
 	CollaborationRoles []CollaborationRoleResp `json:"collaboration_roles"`
 	CreatedAt          string                  `json:"created_at"`
+	JoinedAt           string                  `json:"joined_at"`
 }
 
 const (
@@ -363,59 +368,6 @@ type CollaborationRoleResp struct {
 type collaborationRoleCatalogResp struct {
 	CollaborationRoleEpoch int64                   `json:"collaboration_role_epoch"`
 	Roles                  []CollaborationRoleResp `json:"roles"`
-}
-
-// GroupResp is one row of the legacy native-membership-scoped project group
-// projection used by chat-room surfaces. The relation-only GET
-// /v1/projects/:project_id/groups endpoint and the unified sidebar use
-// ProjectGroupRelation instead.
-//
-// Deliberately NARROW, and not a copy of modules/group's GroupResp. That struct
-// is forty-odd fields of per-user group state, and it is served by the routes a
-// client already calls for exactly that (GET /v1/group/my, GET /v1/groups/:group_no).
-// Restating it here would create a second wire contract for one piece of state,
-// and the two would drift the first time either changed — while this module,
-// which cannot import modules/group, would have no compiler to notice.
-//
-// So this answers one question — which native chat groups in this project am I
-// in — with the fields the tree renders, and the client fetches everything else where it
-// already does. The avatar fields travel together because they are one decision
-// on the client: avatar_text/avatar_color override, is_upload_avatar wins over
-// both, and is_named decides the fallback when none is set. Shipping a subset
-// would make the list render group avatars differently from every other surface.
-type GroupResp struct {
-	GroupNo string `json:"group_no"`
-	Name    string `json:"name"`
-	// IsNamed is 1 for a group created BEFORE the 2026-06-29 avatar revamp and 0
-	// for one created after: legacy groups render the group name's first two
-	// characters into the default avatar, new ones fall back to the two-person
-	// icon. NOT "the user chose this name" — that was the column's original
-	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
-	//
-	// For Project-owned legacy GroupResp callers the value is therefore always 0:
-	// modules/group hardcodes IsNamed: 0 at BOTH create sites in modules/group/service.go,
-	// and 1 exists only where the #500 migration backfilled it, which no project
-	// group can be. It is shipped anyway so the avatar fallback chain is evaluated
-	// by the same code on every surface rather than special-cased here — a client
-	// that hardcodes the fallback for this list is the drift the field exists to prevent.
-	IsNamed int `json:"is_named"`
-	// AvatarText is the custom avatar text; "" falls back per IsNamed.
-	AvatarText string `json:"avatar_text"`
-	// AvatarColor is the custom palette index; null derives it from group_no.
-	// A pointer because the column is nullable and null is NOT index 0.
-	AvatarColor    *int `json:"avatar_color"`
-	IsUploadAvatar int  `json:"is_upload_avatar"`
-	// MemberCount counts active members (is_deleted = 0 AND status = 1),
-	// everyone in the group — the same meaning the project's own member_count
-	// carries, and the same one modules/opanalytics uses.
-	//
-	// This comment used to warn that the two were different populations, because
-	// #855 had narrowed the project's member_count to humans. That narrowing was
-	// reverted before GA precisely to remove the hazard this line described: one
-	// name, one meaning, with the human/agent split in its own two fields. The
-	// populations are still different — a group's roster is not a project's — but
-	// the QUESTION the name asks is now the same everywhere.
-	MemberCount int `json:"member_count"`
 }
 
 const respTimeFormat = "2006-01-02 15:04:05"

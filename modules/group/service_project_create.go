@@ -71,20 +71,41 @@ func (s *Service) CreateProjectGroup(req *CreateGroupServiceReq) (*CreateGroupSe
 			return nil, err
 		}
 
-		tx, err := s.ctx.DB().Begin()
-		if err != nil {
-			return nil, errors.New("failed to begin Project group transaction")
-		}
-		state, retry, txErr := s.insertProjectGroupTx(
-			tx, req, creator, projectID, spaceID, groupNo, version, candidates,
-			memberVersions, botUID, botMemberVersion,
-		)
+		var pendingTx *dbr.Tx
+		var state *projectGroupCreateState
+		snapshotExpanded := false
+		txErr := projectmod.RetryGroupProjectLockConflict(func() error {
+			seatRefs, prepErr := projectmod.PrepareGroupProjectSpaceSeatRefs(
+				s.ctx.DB(), spaceID, candidates,
+			)
+			if prepErr != nil {
+				return prepErr
+			}
+			tx, beginErr := s.ctx.DB().Begin()
+			if beginErr != nil {
+				return fmt.Errorf("failed to begin Project group transaction: %w", beginErr)
+			}
+			nextState, retrySnapshot, insertErr := s.insertProjectGroupTx(
+				tx, req, creator, projectID, spaceID, groupNo, version, candidates,
+				seatRefs, memberVersions, botUID, botMemberVersion,
+			)
+			if insertErr != nil {
+				_ = tx.Rollback()
+				return insertErr
+			}
+			if retrySnapshot {
+				_ = tx.Rollback()
+				snapshotExpanded = true
+				return nil
+			}
+			pendingTx = tx
+			state = nextState
+			return nil
+		})
 		if txErr != nil {
-			_ = tx.Rollback()
 			return nil, txErr
 		}
-		if retry {
-			_ = tx.Rollback()
+		if snapshotExpanded {
 			fresh, freshSpace, freshErr := projectmod.ListActiveProjectMemberUIDs(s.ctx.DB(), projectID)
 			if freshErr != nil {
 				return nil, freshErr
@@ -95,7 +116,14 @@ func (s *Service) CreateProjectGroup(req *CreateGroupServiceReq) (*CreateGroupSe
 			candidates = projectGroupUniqueUIDs(append(append([]string{}, fresh...), requestedMembers...))
 			continue
 		}
-		if err := tx.Commit(); err != nil {
+		if pendingTx == nil || state == nil {
+			return nil, errors.New("Project group transaction produced no state")
+		}
+		// Commit is intentionally outside the retry callback. A commit result
+		// may be uncertain, so this operation must not rerun the create or its
+		// post-commit IM side effect.
+		defer pendingTx.RollbackUnlessCommitted()
+		if commitErr := pendingTx.Commit(); commitErr != nil {
 			return nil, errors.New("failed to commit Project group transaction")
 		}
 		state.botAdminVersion = botAdminVersion
@@ -121,12 +149,13 @@ func (s *Service) insertProjectGroupTx(
 	creator, projectID, spaceID, groupNo string,
 	version int64,
 	prepared []string,
+	seatRefs map[string]int64,
 	memberVersions map[string]int64,
 	botUID string,
 	botMemberVersion int64,
 ) (*projectGroupCreateState, bool, error) {
 	access, expanded, err := projectmod.LockGroupProjectCreateAccessTx(
-		tx, creator, projectID, spaceID, prepared,
+		tx, creator, projectID, spaceID, prepared, seatRefs,
 	)
 	if err != nil {
 		return nil, false, err
@@ -153,14 +182,14 @@ func (s *Service) insertProjectGroupTx(
 	}
 	lockedUsers, err := queryProjectGroupUsersTx(tx, members)
 	if err != nil {
-		return nil, false, errors.New("failed to read Project group members")
+		return nil, false, fmt.Errorf("failed to read Project group members: %w", err)
 	}
 	if err := validateProjectGroupUsers(lockedUsers, members); err != nil {
 		return nil, false, err
 	}
 	defaultSpaces, err := queryProjectGroupDefaultSpacesTx(tx, members)
 	if err != nil {
-		return nil, false, errors.New("failed to read Project group member Spaces")
+		return nil, false, fmt.Errorf("failed to read Project group member Spaces: %w", err)
 	}
 	spaceMemberUIDs := make(map[string]struct{}, len(access.SpaceMemberUIDs))
 	for _, uid := range access.SpaceMemberUIDs {
@@ -206,7 +235,7 @@ func (s *Service) insertProjectGroupTx(
 		AvatarText:          req.AvatarText,
 		AvatarColor:         req.AvatarColor,
 	}, tx); err != nil {
-		return nil, false, errors.New("failed to insert Project group record")
+		return nil, false, fmt.Errorf("failed to insert Project group record: %w", err)
 	}
 
 	admissions := make([]MemberAdmission, 0, len(members)+1)
@@ -244,6 +273,9 @@ func (s *Service) insertProjectGroupTx(
 			InviteUID: creator, Robot: 1,
 		}})
 		if err != nil {
+			if projectmod.IsGroupProjectLockConflict(err) {
+				return nil, false, err
+			}
 			// Preserve CreateGroup's existing best-effort bot policy: a bot
 			// admission failure does not discard an otherwise valid group.
 			s.Warn("Project group bot admission failed", zap.Error(err), zap.String("botUID", botUID))

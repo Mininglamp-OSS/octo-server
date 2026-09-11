@@ -51,6 +51,9 @@ func TestGetProjectMemberMatchesRosterAndFindsLaterPage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &direct), "body: %s", w.Body.String())
 	assert.Equal(t, laterPage[0], direct,
 		"single-member projection must be the same as the roster projection")
+	assert.NotEmpty(t, direct.JoinedAt,
+		"member list/direct projections must expose the current membership-round timestamp")
+	assert.Equal(t, laterPage[0].JoinedAt, direct.JoinedAt)
 	assert.Equal(t, RoleAdmin, direct.Role)
 	require.Len(t, direct.CollaborationRoles, 1)
 	assert.Equal(t, frontend.RoleID, direct.CollaborationRoles[0].RoleID)

@@ -277,6 +277,7 @@ func (p *Project) projectMiddleware() wkhttp.HandlerFunc {
 		if c.Request.Method == "GET" &&
 			(c.FullPath() == "/v1/projects/:project_id" ||
 				c.FullPath() == "/v1/projects/:project_id/members" ||
+				c.FullPath() == "/v1/projects/:project_id/member-candidates" ||
 				c.FullPath() == "/v1/projects/:project_id/members/:uid") {
 			// Space-seat and Project-seat checks in one RR snapshot. Do not
 			// reject from this pre-resolver's potentially stale view.

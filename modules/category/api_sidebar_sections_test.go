@@ -63,8 +63,8 @@ func TestSidebarSectionsListsJoinedProjectsAndOwnCategories(t *testing.T) {
 		).Exec()
 		require.NoError(t, err)
 		_, err = ctx.DB().InsertBySql(
-			"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?, ?)",
-			projectID, testutil.UID, spaceID, testutil.UID, now, now,
+			"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, joined_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?)",
+			projectID, testutil.UID, spaceID, testutil.UID, now, now, now,
 		).Exec()
 		require.NoError(t, err)
 	}
@@ -90,7 +90,7 @@ func TestSidebarSectionsListsJoinedProjectsAndOwnCategories(t *testing.T) {
 	}
 }
 
-func TestPinnedSpaceListedProjectBackfillsAndRendersSidebarSection(t *testing.T) {
+func TestPinnedSpaceListedProjectIsNotVisibleWithoutMembership(t *testing.T) {
 	s, ctx := newCategoryTestServer()
 	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
 	resetUIDRateLimit(t, ctx)
@@ -108,9 +108,9 @@ func TestPinnedSpaceListedProjectBackfillsAndRendersSidebarSection(t *testing.T)
 		projectID, spaceID, projectName, "another-project-member", now, now,
 	).Exec()
 	require.NoError(t, err)
-	// This user can see a Space-listed Project but has no Project seat. #861
-	// permits the pin; the sidebar must materialize the matching entry and keep
-	// its group list empty rather than pretending this user joined its groups.
+	// A historical pre-membership-only deployment could leave this preference
+	// behind. It must not make a non-member Project visible or create an ordering
+	// row, and it must not grant Project or group access.
 	_, err = ctx.DB().InsertBySql(
 		"INSERT INTO octo_project_user_setting (project_id, uid, pinned, pinned_at, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?)",
 		projectID, testutil.UID, now, now, now,
@@ -119,25 +119,16 @@ func TestPinnedSpaceListedProjectBackfillsAndRendersSidebarSection(t *testing.T)
 
 	w := doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/sidebar-sections", nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	var found map[string]any
 	for _, section := range parseJSONArray(t, w) {
-		if section["type"] == sidebarSectionAPITypeProject && section["id"] == projectID {
-			found = section
-			break
-		}
+		require.NotEqual(t, projectID, section["id"],
+			"a historical non-member pin must not make a Project visible")
 	}
-	require.NotNil(t, found, "a pinned Space-listed Project must enter Follow even without a Project seat")
-	project, ok := found["project"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, projectID, project["project_id"])
-	require.Equal(t, projectName, project["project_name"])
-	require.Empty(t, project["groups"], "only Project membership grants groups")
 
-	var sections int
+	var sectionCount int
 	require.NoError(t, ctx.DB().Select("COUNT(*)").From("octo_sidebar_section").
 		Where("uid=? AND space_id=? AND section_type=? AND ref_id=? AND status=1", testutil.UID, spaceID, sidebarSectionTypeProject, projectID).
-		LoadOne(&sections))
-	require.Equal(t, 1, sections, "the list backstop must repair a missed pin hook")
+		LoadOne(&sectionCount))
+	require.Equal(t, 0, sectionCount, "the read backstop must not materialize a non-member Project pin")
 }
 
 func TestSidebarSectionsIsUIDRateLimited(t *testing.T) {
@@ -308,8 +299,8 @@ func TestSidebarSectionProjectContentMatchesProjectGroupsEndpoint(t *testing.T) 
 		require.NoError(t, err)
 	}
 	// Keep one related group outside the caller's native roster. The Project
-	// relation list is Project-wide, so this catches an accidental return to the
-	// legacy ListMyProjectGroups membership filter.
+	// relation list is Project-wide metadata, so this catches an accidental
+	// reintroduction of native membership filtering.
 	_, err := ctx.DB().DeleteBySql(
 		"DELETE FROM group_member WHERE group_no=? AND uid=?",
 		"sidebar-project-content-group-0", testutil.UID,
@@ -411,8 +402,8 @@ func TestSidebarSectionMigrationBackfillsOrderProjectsAndProjectGroupCleanup(t *
 		).Exec()
 		require.NoError(t, err)
 		_, err = ctx.DB().InsertBySql(
-			"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?, ?)",
-			projectID, uid, spaceID, uid, now, now,
+			"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, joined_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?)",
+			projectID, uid, spaceID, uid, now, now, now,
 		).Exec()
 		require.NoError(t, err)
 	}
@@ -492,8 +483,8 @@ func seedSidebarProjectMembership(t *testing.T, ctx *config.Context, spaceID, pr
 	).Exec()
 	require.NoError(t, err)
 	_, err = ctx.DB().InsertBySql(
-		"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?, ?)",
-		projectID, testutil.UID, spaceID, testutil.UID, now, now,
+		"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, joined_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?)",
+		projectID, testutil.UID, spaceID, testutil.UID, now, now, now,
 	).Exec()
 	require.NoError(t, err)
 	return projectID

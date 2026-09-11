@@ -52,8 +52,8 @@ func EnsureDefaultCategory(ctx *config.Context, uid, spaceID string) error {
 
 // EnsureProjectSidebarSection is the best-effort hook registered into
 // modules/project. It only creates a personal ordering entry; the sidebar read
-// predicate remains the authority for visibility (an active Project seat, or a
-// pinned Space-listed Project).
+// predicate remains the authority for visibility and requires an active Project
+// seat. A pin hook must not be used to widen that authorization boundary.
 func EnsureProjectSidebarSection(ctx *config.Context, uid, spaceID, projectID string) error {
 	if ctx == nil || uid == "" || spaceID == "" || projectID == "" {
 		return nil

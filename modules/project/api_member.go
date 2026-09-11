@@ -79,6 +79,14 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 		case errors.Is(err, errPermissionDenied):
 			observeRejected(entryMemberAdd, reasonPermissionDenied)
 			httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
+		case errors.Is(err, errAgentNotEligible):
+			observeRejected(entryMemberAdd, reasonAgentNotEligible)
+			var ineligible *agentNotEligibleError
+			if errors.As(err, &ineligible) {
+				respondProjectAgentNotEligible(c, ineligible.UIDs)
+			} else {
+				respondProjectAgentNotEligible(c, nil)
+			}
 		case errors.Is(err, errMemberRoleConflict):
 			httperr.ResponseErrorL(c, errcode.ErrProjectMemberRoleConflict, nil, nil)
 		case errors.Is(err, errQuotaMembers):

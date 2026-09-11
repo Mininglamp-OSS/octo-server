@@ -175,9 +175,9 @@ func (c *Category) sidebarSections(uid, spaceID string) ([]sidebarSectionResp, e
 		case sidebarSectionTypeProject:
 			project, ok := projectByID[row.RefID]
 			if !ok {
-				// A departed/disbanded Project, or a Project whose non-member pin is
-				// no longer Space-listed, is omitted even if an old ordering row
-				// remains. The Project visibility predicate is the read gate.
+				// A departed, disbanded, or non-member Project is omitted even if
+				// an old ordering or pin row remains. The visibility query is the
+				// read gate and never grants Project access.
 				continue
 			}
 			result = append(result, sidebarSectionResp{

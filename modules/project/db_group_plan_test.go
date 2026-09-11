@@ -1,85 +1,80 @@
 package project
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// The legacy native-membership group list's execution plan is asserted rather
-// than reasoned about.
+// The batched relation-only group list's execution plan is asserted against
+// representative rows rather than an empty test table.
 //
-// PR #861's review rounds asked for this twice and I deferred it twice, on the
-// grounds that `group` is empty in CI so the assertion would be weak. That reason
-// does not hold and the review said so: EXPLAIN resolves the chosen index from
-// schema metadata, not from row counts, so an empty table still proves which index
-// MySQL picked. What made it cheap in the end is #855's plan rig (explainRows /
-// accessTypeOf, all_member_group_plan_test.go), landed for a different predicate.
+// The query serves the unified Sidebar and must keep its group-space predicate
+// indexable while applying the per-Project window bound in SQL. EXPLAIN resolves
+// the chosen index from schema metadata; the fixture below supplies both matching
+// rows and unrelated padding so MySQL cannot answer from an empty-table shortcut.
 //
-// The property is worth a guard for the same reason that predicate's was: the
-// statement is a user-facing chat-room projection, and the failure mode is silent.
-// A later edit that drops `g.space_id` — the LEADING column of group_space_project,
-// which db_group.go's comment calls the Space isolation boundary rather than
-// decoration — degrades the request from an index range to a scan of a core IM
-// table with nothing red anywhere.
-func TestTheProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
-	setup(t)
-	p := New(testCtx)
-	sess := p.db.session
-
-	const (
-		probeSpace   = "plan_probe_space"
-		probeProject = "plan_probe_project"
-		probeUID     = "plan_probe_uid"
-	)
-
-	// The production constant, not a copy of it: a copy passes forever once the two
-	// drift, which is what makes a stale plan assertion worse than none.
-	rows := explainRows(t, sess, sqlListMyProjectGroups,
-		probeSpace, probeProject, groupStatusDisband, probeUID, 1, 10, 0)
-
-	require.NotEmpty(t, rows, "EXPLAIN returned no rows; the assertions below would be vacuous")
-	for _, row := range rows {
-		table := derefOr(row.Table, "")
-		assert.NotEqual(t, "ALL", derefOr(row.Type, ""),
-			"the project group list must reach %q by an index: a full scan here is a scan "+
-				"of a core IM table on every render of the project 群聊 tab", table)
-		assert.NotEmpty(t, derefOr(row.Key, ""),
-			"the project group list must have chosen an index for %q", table)
-	}
-
-	// Naming the index, not just "some index". group_space_project is
-	// (space_id, project_id), and the whole reason space_id is in the predicate
-	// rather than inferred from project_id is that it is the leading column —
-	// without it the index cannot serve the query at all.
-	assert.Equal(t, "group_space_project", indexChosenFor(t, rows, "g"),
-		"dropping g.space_id from the predicate would still return the right rows and "+
-			"would silently lose this index; that is what this assertion exists to catch")
-}
+// The property is worth a guard because the failure mode is silent: a later edit
+// that drops `g.space_id` or the setting lookup can turn a bounded relation
+// projection into a scan of a core IM table without changing the response shape.
 
 func TestTheBatchProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
 	setup(t)
 	p := New(testCtx)
+	seedPlanProbeRows(t, p.db.session, "plan_probe_project_a", "plan_probe_space", "plan_probe_group_a")
+	seedPlanProbeRows(t, p.db.session, "plan_probe_project_b", "plan_probe_space", "plan_probe_group_b")
+	for i := range 200 {
+		_, err := p.db.session.InsertBySql(
+			"INSERT INTO `octo_project_group_user_setting` "+
+				"(space_id, project_id, group_no, uid, pinned, pinned_at, created_at, updated_at) "+
+				"VALUES (?, ?, ?, ?, 1, NOW(3), NOW(3), NOW(3))",
+			fmt.Sprintf("plan_setting_space_%03d", i),
+			fmt.Sprintf("plan_setting_project_%03d", i),
+			fmt.Sprintf("plan_setting_group_%03d", i),
+			"plan_probe_uid",
+		).Exec()
+		require.NoError(t, err)
+	}
+	var analyzed []struct {
+		Table string `db:"Table"`
+	}
+	_, err := p.db.session.SelectBySql("ANALYZE TABLE `octo_project_group_user_setting`").Load(&analyzed)
+	require.NoError(t, err)
 	rows := explainRows(t, p.db.session, sqlListProjectGroupRelationsByProjectIDs,
 		"plan_probe_uid", "plan_probe_space",
-		[]string{"plan_probe_project_a", "plan_probe_project_b"}, groupStatusDisband)
+		[]string{"plan_probe_project_a", "plan_probe_project_b"}, groupStatusDisband,
+		projectDefaultPageLimit)
 
-	var groupRows int
+	require.Contains(t, sqlListProjectGroupRelationsByProjectIDs,
+		"ROW_NUMBER() OVER (PARTITION BY g.project_id",
+		"the batched Sidebar Project relation list must bound each Project in SQL")
+	require.Contains(t, sqlListProjectGroupRelationsByProjectIDs, "project_row_num <= ?",
+		"the per-Project bound must be applied before rows reach Go")
+
+	var groupRows, settingRows int
 	for _, row := range rows {
-		if derefOr(row.Table, "") != "g" {
-			continue
+		table := derefOr(row.Table, "")
+		switch table {
+		case "g":
+			groupRows++
+			assert.NotEqual(t, "ALL", derefOr(row.Type, ""),
+				"the batched Sidebar Project relation list must not scan table %q", table)
+			assert.NotEmpty(t, derefOr(row.Key, ""),
+				"the batched Sidebar Project relation list must use an index for table %q", table)
+		case "s":
+			settingRows++
+			assert.NotEqual(t, "ALL", derefOr(row.Type, ""),
+				"the batched Sidebar Project relation list must not scan table %q", table)
+			assert.NotEmpty(t, derefOr(row.Key, ""),
+				"the batched Sidebar Project relation list must use an index for table %q", table)
 		}
-		groupRows++
-		assert.NotEqual(t, "ALL", derefOr(row.Type, ""),
-			"the batched Sidebar Project relation list must not scan table %q", derefOr(row.Table, ""))
-		assert.NotEmpty(t, derefOr(row.Key, ""),
-			"the batched Sidebar Project relation list must use an index for table %q", derefOr(row.Table, ""))
 	}
 	require.Equal(t, 1, groupRows, "EXPLAIN must include the related group table")
+	require.Equal(t, 1, settingRows, "EXPLAIN must include the pin-setting table")
 	assert.Equal(t, "group_space_project", indexChosenFor(t, rows, "g"),
 		"the relation list must use the Space+Project group index")
-
 }
 
 // TestThePinQuotaCountReachesItsRowsByAnIndex covers the other statement this PR

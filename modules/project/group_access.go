@@ -20,6 +20,47 @@ var (
 	ErrGroupProjectDependency    = errors.New("project: group access dependency unavailable")
 )
 
+// PrepareGroupProjectSpaceSeatRefs resolves the requested Space-member
+// identities before a write transaction begins. The returned primary keys are
+// advisory only: every locking helper revalidates the id/Space/UID/status
+// tuple under the transaction lock.
+func PrepareGroupProjectSpaceSeatRefs(session *dbr.Session, spaceID string, uids []string) (map[string]int64, error) {
+	if session == nil {
+		return nil, ErrGroupProjectInvalid
+	}
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return nil, ErrGroupProjectInvalid
+	}
+	refs, err := (&DB{session: session}).resolveSpaceSeatIDs(spaceID, uniqueGroupProjectUIDs(uids))
+	if err != nil {
+		return nil, fmt.Errorf("%w: prepare Space seats: %w", ErrGroupProjectDependency, err)
+	}
+	result := make(map[string]int64, len(refs))
+	for uid, id := range refs {
+		result[uid] = id
+	}
+	return result, nil
+}
+
+// RetryGroupProjectLockConflict reuses the Project module's bounded retry
+// policy for group-facing write transactions. The callback must own one whole
+// transaction attempt and must not include post-commit side effects.
+func RetryGroupProjectLockConflict(fn func() error) error {
+	if fn == nil {
+		return ErrGroupProjectInvalid
+	}
+	return retryOnLockConflict(fn)
+}
+
+// IsGroupProjectLockConflict reports whether an error is one of the transient
+// InnoDB lock conflicts covered by RetryGroupProjectLockConflict. It lets a
+// best-effort sub-operation refuse to swallow a deadlock that already rolled
+// back its containing transaction.
+func IsGroupProjectLockConflict(err error) bool {
+	return isRetryableTxErr(err)
+}
+
 // GroupProjectAccess is the current, transactionally revalidated Project
 // membership view consumed by group relation and Project-backed group create
 // paths. MemberUIDs is populated only by LockGroupProjectCreateAccessTx.
@@ -42,10 +83,11 @@ type GroupProjectAccess struct {
 // Project seat in deterministic ID order.
 //
 // prepared is used only by Project-backed group creation. Relation operations
-// pass no candidates, so the actor is the sole candidate. The helper never
-// starts, commits, or rolls back tx.
-func LockGroupProjectAccessesTx(tx *dbr.Tx, actorUID string, projectIDs []string, expectedSpaceID string) (map[string]GroupProjectAccess, error) {
-	accesses, _, _, err := lockGroupProjectAccessesWithStateTx(tx, actorUID, projectIDs, expectedSpaceID, nil)
+// pass no candidates, so the actor is the sole candidate. seatRefs must have
+// been prepared before the caller began its write transaction. The helper
+// never starts, commits, or rolls back tx.
+func LockGroupProjectAccessesTx(tx *dbr.Tx, actorUID string, projectIDs []string, expectedSpaceID string, seatRefs map[string]int64) (map[string]GroupProjectAccess, error) {
+	accesses, _, _, err := lockGroupProjectAccessesWithStateTx(tx, actorUID, projectIDs, expectedSpaceID, nil, seatRefs)
 	return accesses, err
 }
 
@@ -55,6 +97,7 @@ func lockGroupProjectAccessesWithStateTx(
 	projectIDs []string,
 	expectedSpaceID string,
 	prepared []string,
+	seatRefs map[string]int64,
 ) (map[string]GroupProjectAccess, map[string]bool, map[string]bool, error) {
 	if tx == nil {
 		return nil, nil, nil, fmt.Errorf("%w: nil transaction", ErrGroupProjectInvalid)
@@ -64,22 +107,25 @@ func lockGroupProjectAccessesWithStateTx(
 	if actorUID == "" {
 		return nil, nil, nil, ErrGroupProjectForbidden
 	}
+	if expectedSpaceID == "" || seatRefs == nil {
+		return nil, nil, nil, ErrGroupProjectInvalid
+	}
 	ids := uniqueGroupProjectIDs(projectIDs)
 	if len(ids) == 0 {
 		return map[string]GroupProjectAccess{}, map[string]bool{}, map[string]bool{}, ErrGroupProjectInvalid
 	}
 
 	locations := make(map[string]*groupProjectLocation, len(ids))
-	spaceSet := make(map[string]struct{}, len(ids))
+	spaceSet := make(map[string]struct{})
 	for _, projectID := range ids {
 		location, err := readGroupProjectLocationTx(tx, projectID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("%w: read Project %s: %v", ErrGroupProjectDependency, projectID, err)
+			return nil, nil, nil, fmt.Errorf("%w: read Project %s: %w", ErrGroupProjectDependency, projectID, err)
 		}
 		if location == nil || location.Status != StatusNormal || location.SpaceID == "" {
 			return nil, nil, nil, ErrGroupProjectNotFound
 		}
-		if expectedSpaceID != "" && location.SpaceID != expectedSpaceID {
+		if location.SpaceID != expectedSpaceID {
 			return nil, nil, nil, ErrGroupProjectSpaceConflict
 		}
 		locations[projectID] = location
@@ -98,17 +144,17 @@ func lockGroupProjectAccessesWithStateTx(
 			seatKeys = append(seatKeys, groupProjectSeatKey{SpaceID: spaceID, UID: uid})
 		}
 	}
-	seats, err := lockGroupProjectSpaceSeatsTx(tx, seatKeys)
+	seats, err := lockGroupProjectSpaceSeatsTx(tx, seatKeys, seatRefs)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("%w: lock Space seats: %v", ErrGroupProjectDependency, err)
+		return nil, nil, nil, fmt.Errorf("%w: lock Space seats: %w", ErrGroupProjectDependency, err)
 	}
 	spaces, err := lockGroupProjectSpacesTx(tx, spaceIDs)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("%w: lock Spaces: %v", ErrGroupProjectDependency, err)
+		return nil, nil, nil, fmt.Errorf("%w: lock Spaces: %w", ErrGroupProjectDependency, err)
 	}
 	eligibleUsers, err := lockGroupProjectUsersTx(tx, candidateUIDs)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("%w: lock users: %v", ErrGroupProjectDependency, err)
+		return nil, nil, nil, fmt.Errorf("%w: lock users: %w", ErrGroupProjectDependency, err)
 	}
 	if !eligibleUsers[actorUID] {
 		return nil, nil, nil, ErrGroupProjectForbidden
@@ -123,18 +169,18 @@ func lockGroupProjectAccessesWithStateTx(
 	for _, projectID := range ids {
 		locked, err := lockGroupProjectLocationTx(tx, projectID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("%w: lock Project %s: %v", ErrGroupProjectDependency, projectID, err)
+			return nil, nil, nil, fmt.Errorf("%w: lock Project %s: %w", ErrGroupProjectDependency, projectID, err)
 		}
 		if locked == nil || locked.Status != StatusNormal || locked.SpaceID == "" {
 			return nil, nil, nil, ErrGroupProjectNotFound
 		}
 		location := locations[projectID]
-		if locked.SpaceID != location.SpaceID || (expectedSpaceID != "" && locked.SpaceID != expectedSpaceID) {
+		if locked.SpaceID != location.SpaceID || locked.SpaceID != expectedSpaceID {
 			return nil, nil, nil, ErrGroupProjectSpaceConflict
 		}
-		role, active, err := lockGroupProjectMemberTx(tx, projectID, actorUID)
+		role, active, err := lockGroupProjectMemberTx(tx, projectID, locked.SpaceID, actorUID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("%w: lock Project member: %v", ErrGroupProjectDependency, err)
+			return nil, nil, nil, fmt.Errorf("%w: lock Project member: %w", ErrGroupProjectDependency, err)
 		}
 		if !active {
 			return nil, nil, nil, ErrGroupProjectForbidden
@@ -151,21 +197,51 @@ func lockGroupProjectAccessesWithStateTx(
 
 // LockGroupProjectAccessTx is the single-target convenience form used by
 // callers that already know they have no source Project to lock.
-func LockGroupProjectAccessTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceID string) (GroupProjectAccess, error) {
-	accesses, err := LockGroupProjectAccessesTx(tx, actorUID, []string{projectID}, expectedSpaceID)
+func LockGroupProjectAccessTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceID string, seatRefs map[string]int64) (GroupProjectAccess, error) {
+	accesses, err := LockGroupProjectAccessesTx(tx, actorUID, []string{projectID}, expectedSpaceID, seatRefs)
 	if err != nil {
 		return GroupProjectAccess{}, err
 	}
 	return accesses[strings.TrimSpace(projectID)], nil
 }
 
+// LockGroupProjectSpaceAccessTx locks an actor's native Space access in the
+// same seat -> Space -> user order used by Project-backed writes. It is used
+// for an unbound relation, where there is no Project row to lock.
+func LockGroupProjectSpaceAccessTx(tx *dbr.Tx, actorUID, expectedSpaceID string, seatRefs map[string]int64) (bool, error) {
+	if tx == nil {
+		return false, fmt.Errorf("%w: nil transaction", ErrGroupProjectInvalid)
+	}
+	actorUID = strings.TrimSpace(actorUID)
+	expectedSpaceID = strings.TrimSpace(expectedSpaceID)
+	if actorUID == "" {
+		return false, ErrGroupProjectForbidden
+	}
+	if expectedSpaceID == "" || seatRefs == nil {
+		return false, ErrGroupProjectInvalid
+	}
+	seats, err := lockGroupProjectSpaceSeatsTx(tx, []groupProjectSeatKey{{SpaceID: expectedSpaceID, UID: actorUID}}, seatRefs)
+	if err != nil {
+		return false, fmt.Errorf("%w: lock Space seat: %w", ErrGroupProjectDependency, err)
+	}
+	spaces, err := lockGroupProjectSpacesTx(tx, []string{expectedSpaceID})
+	if err != nil {
+		return false, fmt.Errorf("%w: lock Space: %w", ErrGroupProjectDependency, err)
+	}
+	users, err := lockGroupProjectUsersTx(tx, []string{actorUID})
+	if err != nil {
+		return false, fmt.Errorf("%w: lock user: %w", ErrGroupProjectDependency, err)
+	}
+	return seats[expectedSpaceID+"\x00"+actorUID] && spaces[expectedSpaceID] && users[actorUID], nil
+}
+
 // LockGroupProjectCreateAccessTx obtains actor authorization and the current
 // effective Project-member snapshot under one transaction. prepared is the
 // advisory candidate set from the preparation phase; expanded reports whether
 // a new Project member appeared after that phase and requires retrying.
-func LockGroupProjectCreateAccessTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceID string, prepared []string) (access GroupProjectAccess, expanded bool, err error) {
+func LockGroupProjectCreateAccessTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceID string, prepared []string, seatRefs map[string]int64) (access GroupProjectAccess, expanded bool, err error) {
 	accesses, seats, eligibleUsers, err := lockGroupProjectAccessesWithStateTx(
-		tx, actorUID, []string{projectID}, expectedSpaceID, prepared,
+		tx, actorUID, []string{projectID}, expectedSpaceID, prepared, seatRefs,
 	)
 	if err != nil {
 		return GroupProjectAccess{}, false, err
@@ -184,9 +260,9 @@ func LockGroupProjectCreateAccessTx(tx *dbr.Tx, actorUID, projectID, expectedSpa
 	}
 	sort.Strings(access.EligibleUIDs)
 	sort.Strings(access.SpaceMemberUIDs)
-	members, err := lockGroupProjectMemberUIDsTx(tx, access.ProjectID)
+	members, err := lockGroupProjectMemberUIDsTx(tx, access.ProjectID, access.SpaceID)
 	if err != nil {
-		return GroupProjectAccess{}, false, fmt.Errorf("%w: snapshot Project members: %v", ErrGroupProjectDependency, err)
+		return GroupProjectAccess{}, false, fmt.Errorf("%w: snapshot Project members: %w", ErrGroupProjectDependency, err)
 	}
 	preparedSet := make(map[string]struct{}, len(prepared)+1)
 	preparedSet[strings.TrimSpace(actorUID)] = struct{}{}
@@ -217,7 +293,7 @@ func ListActiveProjectMemberUIDs(ctxDB *dbr.Session, projectID string) ([]string
 	}
 	location, err := readGroupProjectLocationSession(ctxDB, strings.TrimSpace(projectID))
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: read Project: %v", ErrGroupProjectDependency, err)
+		return nil, "", fmt.Errorf("%w: read Project: %w", ErrGroupProjectDependency, err)
 	}
 	if location == nil || location.Status != StatusNormal || location.SpaceID == "" {
 		return nil, "", ErrGroupProjectNotFound
@@ -228,7 +304,7 @@ func ListActiveProjectMemberUIDs(ctxDB *dbr.Session, projectID string) ([]string
 		projectID, MemberStatusActive,
 	).Load(&uids)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: list Project members: %v", ErrGroupProjectDependency, err)
+		return nil, "", fmt.Errorf("%w: list Project members: %w", ErrGroupProjectDependency, err)
 	}
 	return uids, location.SpaceID, nil
 }
@@ -254,12 +330,12 @@ func AuthorizeGroupProjectReadTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceI
 	}
 	_, err := tx.SelectBySql(
 		"SELECT p.project_id, p.space_id, pm.role FROM `octo_project` p "+
-			"INNER JOIN `octo_project_member` pm ON pm.project_id = p.project_id "+
+			"INNER JOIN `octo_project_member` pm ON pm.project_id = p.project_id AND pm.space_id = p.space_id "+
 			"WHERE p.project_id = ? AND p.status = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0",
 		projectID, StatusNormal, actorUID, MemberStatusActive,
 	).Load(&rows)
 	if err != nil {
-		return GroupProjectAccess{}, fmt.Errorf("%w: read Project member: %v", ErrGroupProjectDependency, err)
+		return GroupProjectAccess{}, fmt.Errorf("%w: read Project member: %w", ErrGroupProjectDependency, err)
 	}
 	if len(rows) == 0 {
 		return GroupProjectAccess{}, ErrGroupProjectNotFound
@@ -273,14 +349,14 @@ func AuthorizeGroupProjectReadTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceI
 	}
 	activeSeat, err := queryGroupProjectSpaceSeatTx(tx, row.SpaceID, actorUID)
 	if err != nil {
-		return GroupProjectAccess{}, fmt.Errorf("%w: check Space seat: %v", ErrGroupProjectDependency, err)
+		return GroupProjectAccess{}, fmt.Errorf("%w: check Space seat: %w", ErrGroupProjectDependency, err)
 	}
 	if !activeSeat {
 		return GroupProjectAccess{}, ErrGroupProjectForbidden
 	}
 	activeUser, err := queryGroupProjectUserEligibleTx(tx, actorUID)
 	if err != nil {
-		return GroupProjectAccess{}, fmt.Errorf("%w: check user: %v", ErrGroupProjectDependency, err)
+		return GroupProjectAccess{}, fmt.Errorf("%w: check user: %w", ErrGroupProjectDependency, err)
 	}
 	if !activeUser {
 		return GroupProjectAccess{}, ErrGroupProjectForbidden
@@ -339,15 +415,15 @@ func lockGroupProjectLocationTx(tx *dbr.Tx, projectID string) (*groupProjectLoca
 	return rows[0], nil
 }
 
-func lockGroupProjectMemberTx(tx *dbr.Tx, projectID, uid string) (int, bool, error) {
+func lockGroupProjectMemberTx(tx *dbr.Tx, projectID, spaceID, uid string) (int, bool, error) {
 	var rows []struct {
 		Role     int `db:"role"`
 		Status   int `db:"status"`
 		Removing int `db:"removing"`
 	}
 	_, err := tx.SelectBySql(
-		"SELECT role, status, removing FROM `octo_project_member` WHERE project_id = ? AND uid = ? LIMIT 1 FOR UPDATE",
-		projectID, uid,
+		"SELECT role, status, removing FROM `octo_project_member` WHERE project_id = ? AND space_id = ? AND uid = ? LIMIT 1 FOR UPDATE",
+		projectID, spaceID, uid,
 	).Load(&rows)
 	if err != nil {
 		return 0, false, err
@@ -358,11 +434,11 @@ func lockGroupProjectMemberTx(tx *dbr.Tx, projectID, uid string) (int, bool, err
 	return rows[0].Role, rows[0].Status == MemberStatusActive && rows[0].Removing == 0, nil
 }
 
-func lockGroupProjectMemberUIDsTx(tx *dbr.Tx, projectID string) ([]string, error) {
+func lockGroupProjectMemberUIDsTx(tx *dbr.Tx, projectID, spaceID string) ([]string, error) {
 	var uids []string
 	_, err := tx.SelectBySql(
-		"SELECT uid FROM `octo_project_member` WHERE project_id = ? AND status = ? AND removing = 0 ORDER BY uid FOR SHARE",
-		projectID, MemberStatusActive,
+		"SELECT uid FROM `octo_project_member` WHERE project_id = ? AND space_id = ? AND status = ? AND removing = 0 ORDER BY uid FOR SHARE",
+		projectID, spaceID, MemberStatusActive,
 	).Load(&uids)
 	return uids, err
 }
@@ -419,32 +495,72 @@ func groupProjectPlaceholders(count int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
 
-func lockGroupProjectSpaceSeatsTx(tx *dbr.Tx, keys []groupProjectSeatKey) (map[string]bool, error) {
-	held := make(map[string]bool)
+type groupProjectSeatTarget struct {
+	id      int64
+	spaceID string
+	uid     string
+}
+
+func lockGroupProjectSeatTargets(keys []groupProjectSeatKey, refs map[string]int64) []groupProjectSeatTarget {
 	keys = uniqueGroupProjectSeatKeys(keys)
-	if len(keys) == 0 {
+	targets := make([]groupProjectSeatTarget, 0, len(keys))
+	seen := make(map[int64]struct{}, len(keys))
+	for _, key := range keys {
+		id, ok := refs[key.UID]
+		if !ok || id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		targets = append(targets, groupProjectSeatTarget{id: id, spaceID: key.SpaceID, uid: key.UID})
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].id < targets[j].id
+	})
+	return targets
+}
+
+// lockGroupProjectSpaceSeatsTx probes the prepared clustered primary keys in
+// ascending id order. The UID is used only after the lock as an identity
+// recheck; a UID-index lookup must never be used to infer lock order.
+func lockGroupProjectSpaceSeatsTx(tx *dbr.Tx, keys []groupProjectSeatKey, refs map[string]int64) (map[string]bool, error) {
+	held := make(map[string]bool)
+	if refs == nil {
+		return nil, fmt.Errorf("%w: nil prepared Space seats", ErrGroupProjectInvalid)
+	}
+	targets := lockGroupProjectSeatTargets(keys, refs)
+	if len(targets) == 0 {
 		return held, nil
 	}
-	tuples := make([]string, 0, len(keys))
-	args := make([]interface{}, 0, len(keys)*2)
-	for _, key := range keys {
-		tuples = append(tuples, "(?, ?)")
-		args = append(args, key.SpaceID, key.UID)
+	args := make([]interface{}, len(targets))
+	for i, target := range targets {
+		args[i] = target.id
 	}
 	var rows []struct {
+		ID      int64  `db:"id"`
 		SpaceID string `db:"space_id"`
 		UID     string `db:"uid"`
 	}
 	_, err := tx.SelectBySql(
-		"SELECT space_id, uid FROM `space_member` WHERE status = 1 AND (space_id, uid) IN ("+
-			strings.Join(tuples, ", ")+") ORDER BY space_id, uid FOR SHARE",
+		"SELECT sm.id, sm.space_id, sm.uid FROM `space_member` sm FORCE INDEX (PRIMARY) "+
+			"WHERE sm.id IN ("+groupProjectPlaceholders(len(targets))+") AND sm.status = 1 "+
+			"ORDER BY sm.id ASC FOR SHARE",
 		args...,
 	).Load(&rows)
 	if err != nil {
 		return nil, err
 	}
+	expected := make(map[int64]groupProjectSeatKey, len(targets))
+	for _, target := range targets {
+		expected[target.id] = groupProjectSeatKey{SpaceID: target.spaceID, UID: target.uid}
+	}
 	for _, row := range rows {
-		held[row.SpaceID+"\x00"+row.UID] = true
+		key, ok := expected[row.ID]
+		if ok && key.SpaceID == row.SpaceID && key.UID == row.UID {
+			held[row.SpaceID+"\x00"+row.UID] = true
+		}
 	}
 	return held, nil
 }

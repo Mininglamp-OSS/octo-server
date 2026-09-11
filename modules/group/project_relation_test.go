@@ -306,3 +306,33 @@ func assertGroupProjectRelationRow(t *testing.T, ctx *config.Context, groupNo, w
 	require.NotNil(t, row.ProjectUID)
 	assert.Equal(t, wantLinkedBy, *row.ProjectUID)
 }
+
+func TestProjectRelationReadRejectsCrossSpaceProjectMember(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	g := New(ctx)
+	projectID := "project-cross-space-" + util.GenerUUID()[:8]
+	projectSpaceID := "space-project-" + util.GenerUUID()[:8]
+	memberSpaceID := "space-member-" + util.GenerUUID()[:8]
+	groupNo := "group-cross-space-" + util.GenerUUID()[:8]
+	actorUID := "cross-space-actor-" + util.GenerUUID()[:8]
+
+	seedSpaceSeat(t, ctx, projectSpaceID, actorUID)
+	seedSpaceSeat(t, ctx, memberSpaceID, actorUID)
+	seedProject(t, ctx, projectID, projectSpaceID)
+	seedProjectMember(t, ctx, projectID, memberSpaceID, actorUID, 0)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, status, is_destroy, robot) VALUES (?, ?, 1, 0, 0)",
+		actorUID, "Cross-space actor",
+	).Exec()
+	require.NoError(t, err)
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "Cross-space relation", Creator: actorUID,
+		Status: GroupStatusNormal, Version: 1, SpaceID: projectSpaceID,
+		ProjectID: projectID,
+	}))
+
+	_, err = g.readGroupProject(context.Background(), groupNo, actorUID)
+	require.ErrorIs(t, err, errProjectRelationNotFound,
+		"Project membership from another Space must not authorize relation reads")
+}

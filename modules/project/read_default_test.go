@@ -85,7 +85,7 @@ func TestProjectReadRosterUsesRepeatableReadSnapshotContract(t *testing.T) {
 		t.Fatalf("createProject: %v", err)
 	}
 	if _, err := testCtx.DB().InsertBySql(
-		"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+		"INSERT INTO octo_project_member (project_id, uid, space_id, role, status, invite_uid, created_at, joined_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
 		project.ProjectID, member, spaceA, RoleCommon, owner,
 	).Exec(); err != nil {
 		t.Fatalf("insert project member: %v", err)

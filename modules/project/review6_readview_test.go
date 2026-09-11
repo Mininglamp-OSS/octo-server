@@ -150,8 +150,8 @@ func TestConcurrentAddsCannotExceedTheMemberQuota(t *testing.T) {
 	now := time.Now().UTC()
 	_, err = txW.InsertBySql(
 		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, invite_uid, "+
-			"created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		pid, "q1", spaceA, RoleCommon, MemberStatusActive, "owner1", now, now).Exec()
+			"created_at, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		pid, "q1", spaceA, RoleCommon, MemberStatusActive, "owner1", now, now, now).Exec()
 	require.NoError(t, err)
 
 	type outcome struct {
@@ -199,8 +199,8 @@ func TestDisbandInvalidatesConcurrentlyAdmittedMembers(t *testing.T) {
 	now := time.Now().UTC()
 	_, err := txW.InsertBySql(
 		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, invite_uid, "+
-			"created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		pid, "late1", spaceA, RoleCommon, MemberStatusActive, "owner1", now, now).Exec()
+			"created_at, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		pid, "late1", spaceA, RoleCommon, MemberStatusActive, "owner1", now, now, now).Exec()
 	require.NoError(t, err)
 
 	type outcome struct {

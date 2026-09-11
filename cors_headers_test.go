@@ -35,3 +35,23 @@ func TestProjectPaginationHeaderIsExposedForAllowedOrigin(t *testing.T) {
 	require.Contains(t, w.Header().Get("Access-Control-Expose-Headers"), "Vary")
 	require.Contains(t, w.Header().Get("Access-Control-Expose-Headers"), "X-Total-Count")
 }
+
+func TestProjectPaginationHeaderIsNotExposedWhenCorsIsDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	route := gin.New()
+	route.Use(libwkhttp.SecureCORSOverrideMiddleware(nil))
+	route.Use(exposeProjectPaginationHeader())
+	route.GET("/projects", func(c *gin.Context) {
+		c.Header("X-Total-Count", "3")
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/projects", nil)
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, w.Header().Get("Access-Control-Allow-Origin"))
+	require.Empty(t, w.Header().Get("Access-Control-Expose-Headers"),
+		"the pagination middleware must not restore a CORS header after CORS is disabled")
+}

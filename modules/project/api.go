@@ -186,6 +186,7 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		projectScoped.PUT("/:project_id/groups/:group_no/setting", p.updateProjectGroupSettingHandler)
 		projectScoped.PUT("/:project_id/setting", p.updateSettingHandler)
 		projectScoped.GET("/:project_id/members", p.listMembersReadHandler)
+		projectScoped.GET("/:project_id/member-candidates", p.listMemberCandidatesHandler)
 		projectScoped.GET("/:project_id/members/:uid", p.getMemberReadHandler)
 		projectScoped.POST("/:project_id/members/add", p.addMembersHandler)
 		projectScoped.POST("/:project_id/members/remove", p.removeMembersHandler)
