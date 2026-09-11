@@ -199,10 +199,10 @@ var (
 	// only), so like i1_abandoned_cleanup_leak this is a standing figure needing a human, not
 	// a transient that clears.
 	//
-	// It exists because the state was reachable and invisible: the concurrency route is now
-	// closed (see countActiveOwnersTx), and the remaining route — a sole owner removed from
-	// the Space — is a filed product decision. This gauge is what lets that decision be made
-	// from data rather than a guess.
+	// It exists because legacy or manual writes can still leave this state and
+	// normal Space-removal now deliberately preserves Owner rows. The gauge lets
+	// operators distinguish that historical/inconsistent state from a healthy
+	// project instead of inferring it from a request failure.
 	ownerlessProjects = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricNamespace,
 		Name:      "ownerless_total",

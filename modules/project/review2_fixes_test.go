@@ -25,9 +25,9 @@ func TestCreateChecksCreatorSpaceSeatInsideTransaction(t *testing.T) {
 
 	// Warm the middleware's positive membership cache, then remove the seat in the database
 	// only. This is exactly the state the old code acted on: the middleware passed from cache
-	// and createProject never re-checked, leaving a permanent owner seat with no Space seat on
-	// a project nobody could clean up (the cascade closes seats; an ownerless project cannot be
-	// disbanded).
+	// and createProject never re-checked, leaving a stale owner seat with no valid Space gate.
+	// The cascade preserves the Owner identity by contract, so this write must be rejected
+	// before such a row can ever be created.
 	w := doJSON(t, srv, http.MethodGet, "/v1/space/"+spaceA+"/projects", token, nil)
 	require.Equal(t, http.StatusOK, w.Code)
 	removeSpaceMember(t, spaceA, "gone1")

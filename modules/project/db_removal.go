@@ -129,7 +129,8 @@ func (d *DB) finishMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.T
 func (d *DB) lockMemberForCascadeTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, "+
+			"COALESCE(joined_at, created_at) AS joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? FOR UPDATE",
 		projectID, uid,
 	).Load(&rows)
@@ -226,13 +227,10 @@ func (d *DB) claimRemovalJobs(owner string, limit int, now time.Time, lease time
 	// The claim reads the FULL row, not just the id, so there is no second
 	// SELECT after the UPDATE.
 	//
-	// That is not a micro-optimization. A plain SELECT later in this transaction
-	// would be a CONSISTENT read, and modules/project has a source guard —
-	// TestNoWriteAuthorisingAggregateIsANonLockingRead — forbidding exactly that
-	// shape after P0 shipped it and it cost a project with zero owners and a
-	// bypassable member cap. Reading everything under the same FOR UPDATE SKIP
-	// LOCKED removes the question instead of arguing about whether this
-	// particular instance happens to be safe.
+	// A plain SELECT later in this transaction would be a CONSISTENT read and
+	// could miss a row committed after the transaction's read view opened. The
+	// full row is therefore selected under the same FOR UPDATE SKIP LOCKED
+	// boundary used by the UPDATE below.
 	//
 	// SKIP LOCKED is what lets several pods poll the same queue without
 	// contending: a row another worker already claimed is skipped, not waited on.

@@ -74,15 +74,16 @@ func TestAddDoesNotDeadlockWhenSeatRowsAreLockedAgainstTheDisbandScanOrder(t *te
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		// addOneMemberOnce, NOT addOneMember: the latter is wrapped in retryOnLockConflict, and
-		// the retry would MASK the defect this test exists to catch. When InnoDB picks the add
-		// as its victim, attempt 2 runs after txD has already released its locks and succeeds,
-		// so the wrapper returns nil and the assertion below passes — the reproducer would only
-		// still fail on the runs where InnoDB happened to victimise the scan side, i.e. a coin
-		// flip (PR #841 round 4, P2-3a). Driving the unwrapped implementation makes the
-		// observation deterministic whichever side InnoDB chooses.
-		ok, aErr := p.addOneMemberOnce(created.ProjectID, spaceA, "rl_actor", "rl_target")
-		done <- outcome{admitted: ok, err: aErr}
+		// addMembersOnce is the current batch implementation, deliberately called
+		// without addMembers' retry wrapper so a deadlock cannot be hidden by retry.
+		// When InnoDB picks the add as its victim, retryOnLockConflict would mask
+		// the defect this test exists to catch; driving the batch transaction directly
+		// keeps the observation deterministic whichever side InnoDB chooses.
+		changed, aErr := p.addMembersOnce(
+			created.ProjectID, spaceA, "rl_actor",
+			[]memberAdd{{UID: "rl_target", Role: RoleCommon}},
+		)
+		done <- outcome{admitted: len(changed) > 0, err: aErr}
 	}()
 	time.Sleep(700 * time.Millisecond)
 

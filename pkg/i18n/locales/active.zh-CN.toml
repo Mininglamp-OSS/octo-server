@@ -530,6 +530,9 @@ other = "授权码与当前登录用户不匹配。"
 ["err.server.group.qrcode_member_only"]
 other = "只有群成员才能生成二维码。"
 
+["err.server.group.all_member_group_protected"]
+other = "这是项目的全员群，请从项目中管理其成员。"
+
 ["err.server.group.not_found"]
 other = "群不存在。"
 
@@ -1151,6 +1154,9 @@ other = "群主和管理员不能通过机器人 API 移除。"
 ["err.server.bot_api.not_space_member"]
 other = "不是该空间成员。"
 
+["err.server.bot_api.all_member_group_protected"]
+other = "这是项目的全员群，请从项目中管理其成员。"
+
 ["err.server.bot_api.app_bot_unsupported"]
 other = "应用机器人不支持该操作。"
 
@@ -1482,6 +1488,8 @@ other = "你没有权限执行此操作。"
 
 ["err.server.project.not_member"]
 other = "你不是该项目的成员。"
+["err.server.project.member_not_found"]
+other = "项目成员不存在或已被移除。"
 
 ["err.server.project.disabled"]
 other = "项目功能已被管理员关闭。"

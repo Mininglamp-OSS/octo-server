@@ -153,3 +153,27 @@ func TestBotGroupMemberRemove_AIContainerForbidden(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "AI session container")
 	assert.True(t, rmGuardIsActiveMember(t, handler, rmGuardCommon))
 }
+
+func TestBotGroupMemberRemove_DedicatedAllMemberGroupForbidden(t *testing.T) {
+	handler, ctx := setupRemoveGuardEnv(t)
+	const projectID = "p_rm_guard_dedicated"
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO octo_project "+
+			"(project_id, space_id, name, creator, status, all_member_group_no, created_at, updated_at) "+
+			"VALUES (?, '', ?, ?, 1, ?, NOW(3), NOW(3))",
+		projectID, projectID, rmGuardCreator, rmGuardGroupNo,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().Update("group").Set("project_id", projectID).
+		Where("group_no=?", rmGuardGroupNo).Exec()
+	require.NoError(t, err)
+
+	w := doBot(handler, botReq(t, "POST",
+		"/v1/bot/groups/"+rmGuardGroupNo+"/members/remove", rmGuardBotToken,
+		map[string]interface{}{"members": []string{rmGuardCommon}}))
+	assert.Equalf(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "all-member group")
+	assert.True(t, rmGuardIsActiveMember(t, handler, rmGuardCommon),
+		"Bot API removal of a dedicated member must be rejected without mutation")
+}

@@ -48,8 +48,8 @@ func init() {
 		// modules/project 不能 import 本模块。
 		api.registerProjectCascadeSteps()
 
-		// P2：全员群的两个钩子（实际建群 provision 与项目改名 rename），同样反向
-		// 注册进 modules/project。成员/群主同步不在此处注册，原生群成员创建后保持独立。
+		// P2：全员群的四个钩子（建群、Project 准入、群主同步、项目改名），同样
+		// 反向注册进 modules/project。普通 Project 关联群和预设群不进入这些钩子。
 		api.registerAllMemberGroupHooks()
 		return register.Module{
 			Name: "group",

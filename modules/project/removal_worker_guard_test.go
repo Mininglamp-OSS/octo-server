@@ -18,11 +18,8 @@ import (
 )
 
 // withNoRemovalSteps empties the reverse-registration registry for the duration
-// of one case and restores it afterwards.
-//
-// The registry is package state, which is exactly why this test can reach it:
-// modules/group registers its detach step into this package at construction, so
-// there is no way to build a "no steps registered" world other than to make one.
+// of one case and restores it afterwards. The project worker owns this registry
+// even when no optional project-side cleanup callback is installed.
 func withNoRemovalSteps(t *testing.T) {
 	t.Helper()
 	cascadeMu.Lock()
@@ -59,7 +56,7 @@ func TestAnEmptyStepRegistryClosesTheProjectSeat(t *testing.T) {
 }
 
 // TestAFullyRegisteredCascadeDoesCloseTheSeat is the control. Without it,
-// breaking the worker outright would satisfy the case above.
+// breaking the worker outright would satisfy the empty-registry case above.
 func TestAFullyRegisteredCascadeDoesCloseTheSeat(t *testing.T) {
 	p, job := claimedJob(t, "worker-a")
 

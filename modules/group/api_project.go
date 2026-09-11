@@ -6,6 +6,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -17,8 +18,8 @@ import (
 func (g *Group) routeProject(r *wkhttp.WKHttp) {
 	routes := r.Group("/v1/groups", g.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, g.ctx))
 	routes.GET("/:group_no/project", g.groupProjectGet)
-	routes.PUT("/:group_no/project", g.groupProjectPut)
-	routes.DELETE("/:group_no/project", g.groupProjectDelete)
+	routes.PUT("/:group_no/project", g.protectAIContainerMutation, g.groupProjectPut)
+	routes.DELETE("/:group_no/project", g.protectAIContainerMutation, g.groupProjectDelete)
 }
 
 func (g *Group) groupProjectGet(c *wkhttp.Context) {
@@ -74,6 +75,8 @@ func (g *Group) groupProjectDelete(c *wkhttp.Context) {
 
 func respondGroupProjectError(c *wkhttp.Context, err error) {
 	switch {
+	case errors.Is(err, aiteampkg.ErrContainerProtected):
+		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
 	case errors.Is(err, errProjectRelationInvalid):
 		httperr.ResponseErrorL(c, errcode.ErrGroupRequestInvalid, nil, nil)
 	case errors.Is(err, errProjectRelationNotFound):

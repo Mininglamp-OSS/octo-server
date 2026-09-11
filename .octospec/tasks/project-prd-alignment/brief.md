@@ -15,7 +15,7 @@ source: self
 
 `docs/specs/2026-09-10-project-prd-alignment-design.md` is authoritative over the Project implementation. This task covers core Project service, HTTP models/handlers, shared route wiring, core DB access, error contracts, name migration, and Space-removal cascade behavior. Read behavior and group relation implementations are integrated through their exact contracts; no default-Project initializer or mapping is retained.
 
-The implementation does not add Internal APIs, outbox/Redis event queues, ACL synchronization, or resource-side permission copies. Resource authorization remains a realtime query of current Project/group relationships.
+除下文明确的 Drive provisioning boundary 外，本实现不添加其他 Internal API、outbox/Redis 事件队列、ACL 同步或资源侧权限副本。资源授权仍由当前 Project/群关系实时查询决定。
 
 Group relations are entry metadata only: association/listing never grants chat read, send, or subarea access; resource authorization continues to use the current independent relationship checks.
 
@@ -42,6 +42,12 @@ Group relations are entry metadata only: association/listing never grants chat r
   client migration before deployment; this repository does not claim that rollout
   is complete.
 
+## Project–Drive provisioning boundary（2026-09-11）
+
+- 经授权的 Drive provisioning 以 `project_id` 作为唯一管理与幂等依据；Project 侧不要求返回 Drive ID。
+- 远端支持后由 `POST /v1/internal/drive/spaces` 接收 `X-Internal-Token` 和 `name`（使用完整 Project 名称、最多 30 个 Unicode 字符）、`octo_space_id`、当前 Owner `super_admin_uid`、`project_id`。只有同一 `project_id` 的完全相同重复请求可按幂等成功处理；其他 `409`、`401`、`500` 按重试/失败策略处理。
+- `OCTO_DRIVE_INTERNAL_TOKEN` 必须与 Fleet HMAC 凭据分离；功能关闭时不得向远端出站。远端接口及其 30 字符名称支持是启用/部署前提，远端尚未提供时不得宣称已部署。
+
 ## 2026-09-11 关联群个人置顶与纯读收口
 
 - 新增 `PUT /v1/projects/:project_id/groups/:group_no/setting`，要求显式布尔 `pinned`；写事务重新校验有效 Space、Project 成员和当前群关联。Project 成员即使不是原生群成员也可置顶，偏好不授予聊天读取、发送或子区权限。
@@ -65,6 +71,12 @@ Group relations are entry metadata only: association/listing never grants chat r
   pin rows; relation `groups[]` keeps metadata-only semantics without native
   `group_member`/blacklist filtering and is SQL-capped at 50 rows per Project. The
   client field-shape cutover remains coordinated work and is not claimed deployed.
+
+- P2：AI session container（`purpose=ai_session_container`）在 Group 关系 PUT/DELETE 路由和 service 层均拒绝；关系真实变更同步推进 `group.version`，而重复绑定/解绑不制造版本噪音。Project 关系读列表、分页计数及 Sidebar 批量读取同样排除历史绑定的 AI 容器，普通群关系不受影响。Project 关系与原生群模型保持独立，预设群可与 Project 关系并存，不新增警告或限制。
+- 置顶写入错误保持 `%w` 链；`pinned=1,pinned_at=NULL` 的历史行在重复置顶时修复时间戳，正常重复置顶仍保持原时间。`GET /v1/group/my` 角色列表的成员计数查询失败直接返回 `query_failed`，不再以成功的 0 掩盖数据库错误。已删除无引用的关系辅助函数。
+- 移除 `project_i2_violations_total`、`group_admission_rejected_total` 及全员群 guard failure 计数器后的运维影响：旧面板/告警应删除或允许序列缺失，缺失这些指标本身不是服务故障。
+- Bot/IM 提示、订阅和其他提交后通知按 best-effort 处理；已提交的数据库事实是权威，通知失败只记录并由既有补偿/重试路径处理，不应让客户端重复已成功的核心写入。
+- Migration 采用 `joined_at` rolling expand：仅新增可空 `DATETIME(3)`，不做回填、不改为 `NOT NULL`；旧二进制可省略该列，读取以 `COALESCE(joined_at,created_at)` 统一，新增/重新加入写真实 UTC 时间，后续收缩迁移不在本版本。Cascade 保留 active human Owner 及其角色；仅在有 active non-Owner agent rider 时处理 rider，并对 rider 只执行一次 member_epoch/清理队列过渡，Owner-only 行不进入分页。
 
 ## Non-goals
 

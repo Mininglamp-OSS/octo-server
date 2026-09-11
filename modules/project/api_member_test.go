@@ -688,6 +688,64 @@ func TestReactivationWhileRemovalIsPendingCountsAgainstMemberQuota(t *testing.T)
 		"closing seats that would be reactivated count toward the cap")
 }
 
+// TestLegacyMemberWriterCanInsertAndRejoinWithNullableJoinedAt exercises the
+// expand half of the rolling contract against the real MySQL table. An old
+// binary omits joined_at from its explicit INSERT list; the new reader must
+// expose created_at while the row is still legacy-shaped, and a later
+// re-admission through the new writer must persist a real joined_at value.
+func TestLegacyMemberWriterCanInsertAndRejoinWithNullableJoinedAt(t *testing.T) {
+	srv, p := setup(t)
+	ownerToken, _, created := projectWithMembers(t, srv)
+	legacyUID := "legacy-writer"
+	legacyCreatedAt := time.Date(2022, 2, 3, 4, 5, 6, 7000000, time.UTC)
+	seedUser(t, legacyUID)
+	seedSpaceMember(t, spaceA, legacyUID, 0, 1)
+
+	// This is the merge-base writer shape: removing has a schema default, and
+	// joined_at does not exist in the INSERT column list.
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO octo_project_member "+
+			"(project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		created.ProjectID, legacyUID, spaceA, RoleCommon, MemberStatusActive,
+		"owner1", legacyCreatedAt, legacyCreatedAt,
+	).Exec()
+	require.NoError(t, err, "an old binary must still insert while joined_at is nullable")
+
+	w := doJSON(t, srv, http.MethodGet,
+		"/v1/projects/"+created.ProjectID+"/members/"+legacyUID, ownerToken, nil)
+	require.Equal(t, http.StatusOK, w.Code, "legacy row must be readable: %s", w.Body.String())
+	var legacyResp MemberResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &legacyResp))
+	assert.Equal(t, formatTime(legacyCreatedAt), legacyResp.JoinedAt,
+		"new readers must fall back to created_at for a legacy NULL joined_at")
+
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{legacyUID}})
+	require.Equal(t, http.StatusOK, w.Code, "remove legacy row: %s", w.Body.String())
+	drainRemovalCascade(t, p)
+
+	w = doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
+		addMembersPayload(legacyUID))
+	require.Equal(t, http.StatusOK, w.Code, "re-admit legacy row: %s", w.Body.String())
+
+	var stored struct {
+		CreatedAt time.Time `db:"created_at"`
+		JoinedAt  time.Time `db:"joined_at"`
+	}
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT created_at, joined_at FROM octo_project_member WHERE project_id = ? AND uid = ?",
+		created.ProjectID, legacyUID,
+	).Load(&stored)
+	require.NoError(t, err)
+	assert.Equal(t, legacyCreatedAt, stored.CreatedAt,
+		"re-admission must preserve the first-ever created_at")
+	assert.True(t, stored.JoinedAt.After(legacyCreatedAt),
+		"the new writer must replace the legacy NULL with the current round timestamp")
+}
+
 // TestMemberJoinedAtTracksMembershipRounds pins the distinction between the
 // first-ever row timestamp and the current membership round timestamp.
 //

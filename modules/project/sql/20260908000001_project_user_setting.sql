@@ -6,9 +6,10 @@
 --
 -- 两条理由，都不是风格问题：
 --
---   1. 置顶偏好独立于 Project 成员事实。当前 Project 读写按有效成员授权；
---      历史偏好可在重新加入后恢复，但无成员席位的偏好不构成 Sidebar 或
---      Project 访问依据。
+--   1. 置顶不是成员事实。Space 管理员能看见 space_listed 项目而不必加入它
+--      （见 listVisibleInSpace 的 discoverability 分支），他同样可以置顶。把
+--      pinned 放进成员行，等于让「能置顶」隐含「是成员」，而这两件事在读路径上
+--      本来就是分开的。
 --   2. octo_project_member 的每一次写都在 member_epoch 递增路径上。那个纪元是
 --      fleet / drive 判断「成员是否变过」的依据，只允许 +1，且由
 --      TestMemberEpochOnlyEverIncrements 钉住。置顶不是成员变更，绝不能推动它；

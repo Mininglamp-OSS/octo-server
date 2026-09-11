@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,7 +46,7 @@ func TestTheBatchProjectGroupListReachesItsRowsByAnIndex(t *testing.T) {
 	rows := explainRows(t, p.db.session, sqlListProjectGroupRelationsByProjectIDs,
 		"plan_probe_uid", "plan_probe_space",
 		[]string{"plan_probe_project_a", "plan_probe_project_b"}, groupStatusDisband,
-		projectDefaultPageLimit)
+		aiteam.GroupPurpose, projectDefaultPageLimit)
 
 	require.Contains(t, sqlListProjectGroupRelationsByProjectIDs,
 		"ROW_NUMBER() OVER (PARTITION BY g.project_id",

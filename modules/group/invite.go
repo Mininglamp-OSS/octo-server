@@ -38,9 +38,12 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 		return
 	}
 
-	_, err := g.getGroupInfo(groupNo)
+	groupModel, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
+		return
+	}
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionInvite) {
 		return
 	}
 
@@ -283,10 +286,14 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 		respondGroupRequestInvalid(c, "group_no")
 		return
 	}
-	_, err = g.getGroupInfo(groupNo)
+	groupModel, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		tx.Rollback()
 		respondGroupInfoError(c, err)
+		return
+	}
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionInvite) {
+		tx.Rollback()
 		return
 	}
 	/**

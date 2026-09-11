@@ -44,6 +44,28 @@ func TestPresetGroupAdmissionAdmitsAProjectMember(t *testing.T) {
 		"the gate must not have become a blanket refusal")
 }
 
+func TestPresetGroupAdmissionSkipsDedicatedAllMemberGroup(t *testing.T) {
+	_, ctx := newTestServer(t)
+	f := New(ctx)
+
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	projectID := util.GenerUUID()
+	groupNo := util.GenerUUID()
+	seedSpaceSeat(t, ctx, spaceID, "a10_preset_outsider")
+	seedProject(t, ctx, projectID, spaceID)
+	seedGroupRow(t, ctx, groupNo, spaceID, projectID)
+	_, err := ctx.DB().Update("octo_project").
+		Set("all_member_group_no", groupNo).
+		Where("project_id=?", projectID).Exec()
+	require.NoError(t, err)
+
+	require.NoError(t, f.admitToPresetGroup(
+		ctx, spaceID, groupNo, "a10_preset_outsider",
+	))
+	require.False(t, activeMemberExists(t, ctx, groupNo, "a10_preset_outsider"),
+		"preset admission must not bypass the dedicated Project group projection")
+}
+
 // TestPresetGroupAdmissionAdmitsIntoASpaceDirectGroup covers the same native
 // policy for a Space-direct group.
 func TestPresetGroupAdmissionAdmitsIntoASpaceDirectGroup(t *testing.T) {

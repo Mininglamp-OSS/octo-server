@@ -6,9 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -33,18 +34,36 @@ func changedProjectSourceAllowed(initialSource, currentSource, targetID string) 
 	// replacement was not included in the authorization lock set.
 	return currentSource == "" || currentSource == targetID
 }
-
-func projectGroupLike(keyword string) string {
-	escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(keyword)
-	return "%" + escaped + "%"
+func ensureProjectRelationMutationAllowed(row *groupProjectRelationRow) error {
+	if row != nil && strings.TrimSpace(row.Purpose) == aiteampkg.GroupPurpose {
+		return aiteampkg.ErrContainerProtected
+	}
+	return nil
 }
 
-func validateProjectRelationKeyword(keyword string) (string, error) {
-	keyword = strings.TrimSpace(keyword)
-	if utf8.RuneCountInString(keyword) > 30 {
-		return "", errProjectRelationInvalid
+// ensureDedicatedRelationMutationAllowed refuses relation writes that would
+// change a group named by any active Project's all_member_group_no pointer.
+// A no-op bind to the same Project is safe; every actual rebind or unbind is
+// rejected so the pointer cannot silently outlive a user mutation.
+func ensureDedicatedRelationMutationAllowed(
+	session dbr.SessionRunner, groupNo, currentProjectID, targetProjectID string,
+) error {
+	if groupNo == "" || currentProjectID == targetProjectID {
+		return nil
 	}
-	return keyword, nil
+	var projects []string
+	if _, err := session.SelectBySql(
+		"SELECT project_id FROM `octo_project` "+
+			"WHERE status = 1 AND all_member_group_no = ? LIMIT 1",
+		groupNo,
+	).Load(&projects); err != nil {
+		return fmt.Errorf("%w: check dedicated-group relation: %w",
+			errProjectRelationDependency, err)
+	}
+	if len(projects) > 0 {
+		return errProjectRelationConflict
+	}
+	return nil
 }
 
 func (g *Group) readGroupProject(ctx context.Context, groupNo, actorUID string) (GroupProjectRelation, error) {
@@ -106,6 +125,9 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 	if before == nil || before.Status == GroupStatusDisband {
 		return GroupProjectRelation{}, errProjectRelationNotFound
 	}
+	if err := ensureProjectRelationMutationAllowed(before); err != nil {
+		return GroupProjectRelation{}, err
+	}
 	spaceID := strings.TrimSpace(before.SpaceID)
 	if spaceID == "" {
 		return GroupProjectRelation{}, errProjectRelationInvalid
@@ -114,6 +136,11 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 		return GroupProjectRelation{}, err
 	}
 	initialSource := strings.TrimSpace(before.ProjectID)
+	if err := ensureDedicatedRelationMutationAllowed(
+		g.ctx.DB(), groupNo, initialSource, targetID,
+	); err != nil {
+		return GroupProjectRelation{}, err
+	}
 
 	var pendingTx *dbr.Tx
 	var pendingRow *groupProjectRelationRow
@@ -144,6 +171,10 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 			_ = tx.Rollback()
 			return errProjectRelationNotFound
 		}
+		if err := ensureProjectRelationMutationAllowed(locked); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		if lockErr := validateGroupProjectRelation(locked); lockErr != nil {
 			_ = tx.Rollback()
 			return lockErr
@@ -156,6 +187,12 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 		if !changedProjectSourceAllowed(initialSource, currentSource, targetID) {
 			_ = tx.Rollback()
 			return errProjectRelationConflict
+		}
+		if err := ensureDedicatedRelationMutationAllowed(
+			tx, groupNo, currentSource, targetID,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
 		}
 		if targetAccess, ok := accesses[targetID]; !ok || targetAccess.SpaceID != locked.SpaceID {
 			_ = tx.Rollback()
@@ -178,7 +215,12 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 		}
 
 		if currentSource != targetID {
-			if updateErr := g.db.updateGroupProjectRelationTx(tx, groupNo, targetID, actorUID); updateErr != nil {
+			version, versionErr := g.ctx.GenSeq(common.GroupSeqKey)
+			if versionErr != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("%w: generate relation version: %w", errProjectRelationDependency, versionErr)
+			}
+			if updateErr := g.db.updateGroupProjectRelationTx(tx, groupNo, targetID, actorUID, version); updateErr != nil {
 				_ = tx.Rollback()
 				return fmt.Errorf("%w: update relation: %w", errProjectRelationDependency, updateErr)
 			}
@@ -216,6 +258,9 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 	if before == nil || before.Status == GroupStatusDisband {
 		return GroupProjectRelation{}, errProjectRelationNotFound
 	}
+	if err := ensureProjectRelationMutationAllowed(before); err != nil {
+		return GroupProjectRelation{}, err
+	}
 	spaceID := strings.TrimSpace(before.SpaceID)
 	if spaceID == "" {
 		return GroupProjectRelation{}, errProjectRelationInvalid
@@ -224,6 +269,11 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 		return GroupProjectRelation{}, err
 	}
 	initialSource := strings.TrimSpace(before.ProjectID)
+	if err := ensureDedicatedRelationMutationAllowed(
+		g.ctx.DB(), groupNo, initialSource, "",
+	); err != nil {
+		return GroupProjectRelation{}, err
+	}
 
 	var pendingTx *dbr.Tx
 	var pendingRow *groupProjectRelationRow
@@ -267,6 +317,10 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 			_ = tx.Rollback()
 			return errProjectRelationNotFound
 		}
+		if err := ensureProjectRelationMutationAllowed(locked); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		if lockErr := validateGroupProjectRelation(locked); lockErr != nil {
 			_ = tx.Rollback()
 			return lockErr
@@ -280,6 +334,12 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 			_ = tx.Rollback()
 			return errProjectRelationConflict
 		}
+		if err := ensureDedicatedRelationMutationAllowed(
+			tx, groupNo, currentSource, "",
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		manager, lockErr := g.db.lockGroupManagerTx(tx, groupNo, actorUID)
 		if lockErr != nil {
 			_ = tx.Rollback()
@@ -290,7 +350,12 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 			return errProjectRelationForbidden
 		}
 		if currentSource != "" {
-			if updateErr := g.db.updateGroupProjectRelationTx(tx, groupNo, "", ""); updateErr != nil {
+			version, versionErr := g.ctx.GenSeq(common.GroupSeqKey)
+			if versionErr != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("%w: generate relation version: %w", errProjectRelationDependency, versionErr)
+			}
+			if updateErr := g.db.updateGroupProjectRelationTx(tx, groupNo, "", "", version); updateErr != nil {
 				_ = tx.Rollback()
 				return fmt.Errorf("%w: clear relation: %w", errProjectRelationDependency, updateErr)
 			}

@@ -1,31 +1,35 @@
 package project
 
 import (
+	"errors"
+	"strings"
 	"time"
 
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
-// 全员群的服务层：建、改名（D4 / D8）。
+// 全员群的服务层：建、准入、群主同步、改名（D4 / D8）。
 //
 // 本文件里的每一个函数都在**项目事务提交之后**被调用，都是 best-effort，都不会让
 // 调用方的业务操作失败。理由见 all_member_group_registry.go 顶部；兜底见每个函数
 // 自己的注释。
 
-// provisionAllMemberGroup 尝试为一个项目建出全员群，并把 group_no 写回项目行。
+// provisionAllMemberGroup attempts to create the all-member group for a project
+// and persist its group_no. The runtime trigger is the post-commit project
+// creation hook; the lease still makes any repeated invocation idempotent.
 //
-// 幂等，且可以从任意多个写路径并发调用——互斥由 claimAllMemberGroupProvision 的
-// CAS 租约承担，不是由调用方的编排承担。这一点是有意的：补建的触发点是"任何一次
-// 写路径发现全员群还不存在"，而那些写路径彼此之间没有任何协调。
-//
-// 全部失败模式都收敛到同一个结果：项目还活着，all_member_group_no 还是空串，
-// 下一个写路径会再试一次，I4 扫描 A 把它报出来。没有任何一条会让调用方失败。
+// Every failure leaves the Project alive with all_member_group_no empty. Scan A
+// reports that missing artifact for explicit operational repair; this best-effort
+// hook never turns a successful Project write into an error.
 func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name string, members []string) {
 	provision := allMemberGroupProvisioner()
 	if provision == nil {
-		// 只包含 modules/project 而不含 modules/group 的二进制会走到这里。
-		// 不回退项目、不 panic：项目本身是完整的，缺的是它的群。
-		p.Error("全员群创建器未注册，跳过建群（项目已创建，可由后续写路径补建）",
+		// A binary containing only modules/project has no group-side provisioner.
+		// Do not roll back or panic: the Project is complete; scan A reports the
+		// missing all-member group for explicit repair.
+		p.Error("全员群创建器未注册，跳过建群（项目已创建，I4 扫描 A 将报告）",
 			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
 		observeAllMemberGroupProvisionFailure(reasonProvisionerMissing)
 		return
@@ -51,11 +55,12 @@ func (p *Project) provisionAllMemberGroup(projectID, spaceID, creator, name stri
 		Members:   members,
 	})
 	if err != nil || groupNo == "" {
-		p.Error("创建全员群失败（项目已创建，all_member_group_no 留空，由后续写路径补建）",
+		p.Error("创建全员群失败（项目已创建，I4 扫描 A 将报告）",
 			zap.Error(err), zap.String("projectId", projectID), zap.String("spaceId", spaceID))
 		observeAllMemberGroupProvisionFailure(reasonProvisionCallFailed)
-		// 主动放弃租约，让下一次写路径立刻能重试，而不是干等满一个租约周期。
-		// 围栏在本次认领的 deadline 上：一次超时的尝试不得清掉后继者的租约。
+		// Release the lease so an explicit repair can run without waiting for its
+		// full duration. The fence still prevents this attempt from clearing a
+		// successor's lease.
 		if relErr := p.db.releaseAllMemberGroupProvision(projectID, lease); relErr != nil {
 			p.Warn("释放全员群建群租约失败（租约到期后仍会自动释放）",
 				zap.Error(relErr), zap.String("projectId", projectID))
@@ -120,4 +125,170 @@ func (p *Project) syncAllMemberGroupName(projectID, name string) {
 			zap.String("groupNo", groupNo))
 		observeAllMemberGroupSyncFailure(reasonSyncName)
 	}
+}
+
+// ensureAllMemberGroup returns the active Project's dedicated group, repairing
+// a missing or stale pointer through the same post-commit lease protocol used
+// by initial creation. The rebuild seed is a bounded snapshot of the current
+// active Project roster, filtered to people who still hold a Space seat so the
+// native CreateGroup admission gate cannot reject the whole rebuild.
+func (p *Project) ensureAllMemberGroup(projectID, spaceID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return ""
+	}
+	groupNo, err := p.db.queryAllMemberGroupNo(projectID)
+	if err != nil {
+		p.Warn("查询全员群失败，跳过补建",
+			zap.String("projectId", projectID), zap.Error(err))
+		return ""
+	}
+	if groupNo != "" {
+		return groupNo
+	}
+
+	cleared, err := p.db.clearStaleAllMemberGroupPointer(projectID)
+	if err != nil {
+		p.Warn("清理失效的全员群指针失败，跳过补建",
+			zap.String("projectId", projectID), zap.Error(err))
+		return ""
+	}
+	if cleared {
+		p.Warn("全员群指针已失效，已清空并准备补建",
+			zap.String("projectId", projectID), zap.String("spaceId", spaceID))
+	}
+
+	model, err := p.db.queryByProjectID(projectID)
+	if err != nil || model == nil || model.Status != StatusNormal {
+		return ""
+	}
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		spaceID = model.SpaceID
+	}
+	if spaceID == "" {
+		return ""
+	}
+	maxMembers := p.cfg.effectiveMaxMembers(model.MaxMembers)
+	if maxMembers <= 0 {
+		return ""
+	}
+
+	ownerCandidates, err := p.db.queryActiveOwnerCandidatesForProvision(projectID, maxMembers)
+	if err != nil {
+		p.Warn("查询项目 owner 失败，跳过补建",
+			zap.String("projectId", projectID), zap.Error(err))
+		return ""
+	}
+	roster, err := p.db.queryActiveMemberUIDsForRebuild(projectID, maxMembers+1)
+	if err != nil {
+		p.Warn("读取项目名册失败，跳过补建",
+			zap.String("projectId", projectID), zap.Error(err))
+		return ""
+	}
+	if len(roster) > maxMembers {
+		roster = roster[:maxMembers]
+		p.Warn("补建全员群：项目活跃成员超过 max_members，名册被截断",
+			zap.String("projectId", projectID), zap.Int("maxMembers", maxMembers))
+	}
+	probe := make([]string, 0, len(ownerCandidates)+len(roster))
+	probe = append(probe, ownerCandidates...)
+	probe = append(probe, roster...)
+	spaceActive, err := spacepkg.ActiveMembers(p.db.session, spaceID, probe)
+	if err != nil {
+		p.Warn("校验补建成员的 Space 席位失败，跳过补建",
+			zap.String("projectId", projectID), zap.Error(err))
+		return ""
+	}
+	owner := ""
+	for _, candidate := range ownerCandidates {
+		if spaceActive[candidate] {
+			owner = candidate
+			break
+		}
+	}
+	if owner == "" {
+		// An active Project without a usable human Space owner is a valid
+		// intermediate state during Space cleanup. Do not create a group whose
+		// creator cannot pass native group admission.
+		return ""
+	}
+	members := make([]string, 0, len(roster))
+	for _, uid := range roster {
+		if uid == owner || spaceActive[uid] || spacepkg.IsSystemBot(uid) {
+			if uid != owner {
+				members = append(members, uid)
+			}
+		}
+	}
+	p.provisionAllMemberGroup(projectID, spaceID, owner, model.Name, members)
+	groupNo, err = p.db.queryAllMemberGroupNo(projectID)
+	if err != nil {
+		p.Warn("补建全员群后读取指针失败",
+			zap.String("projectId", projectID), zap.Error(err))
+		return ""
+	}
+	return groupNo
+}
+
+// admitAllMemberGroup performs one idempotent, pointer-scoped admission. The
+// Project transaction has already committed, so failures are best-effort and
+// are retried by a later Project write or explicit reconciliation.
+func (p *Project) admitAllMemberGroup(spaceID, groupNo, uid string) {
+	admit := allMemberGroupAdmitter()
+	if admit == nil || strings.TrimSpace(spaceID) == "" ||
+		strings.TrimSpace(groupNo) == "" || strings.TrimSpace(uid) == "" {
+		return
+	}
+	if err := admit(p.ctx, spaceID, groupNo, uid); err != nil {
+		if errors.Is(err, projectpkg.ErrAdmittedButNotSubscribed) {
+			p.Error("全员群订阅失败（成员已入群，后续写路径会重试）",
+				zap.String("projectId", ""), zap.String("groupNo", groupNo),
+				zap.String("uid", uid), zap.Error(err))
+			return
+		}
+		p.Warn("同步成员到全员群失败（后续加回/修复会重试）",
+			zap.String("groupNo", groupNo),
+			zap.String("uid", uid),
+			zap.Error(err))
+	}
+}
+
+// syncAllMemberGroupOwner converges the dedicated native group owner to the
+// active human Project owner. It is intentionally pointer-only and retryable.
+func (p *Project) syncAllMemberGroupOwner(projectID string) {
+	transfer := allMemberGroupOwnerTransfer()
+	if transfer == nil || strings.TrimSpace(projectID) == "" {
+		return
+	}
+	groupNo, err := p.db.queryAllMemberGroupNo(projectID)
+	if err != nil || groupNo == "" {
+		if err != nil {
+			p.Warn("读取全员群指针以同步群主失败",
+				zap.String("projectId", projectID), zap.Error(err))
+		}
+		return
+	}
+	if err := transfer(p.ctx, projectID, groupNo); err != nil {
+		p.Warn("同步全员群群主失败（后续项目变更会重试）",
+			zap.String("projectId", projectID),
+			zap.String("groupNo", groupNo),
+			zap.Error(err))
+	}
+}
+
+// syncAllMemberGroupMembers ensures the dedicated group exists after a
+// successful Project membership commit, then replays every requested uid.
+func (p *Project) syncAllMemberGroupMembers(projectID, spaceID string, uids []string) {
+	if len(uids) == 0 {
+		return
+	}
+	groupNo := p.ensureAllMemberGroup(projectID, spaceID)
+	if groupNo == "" {
+		return
+	}
+	for _, uid := range uids {
+		p.admitAllMemberGroup(spaceID, groupNo, uid)
+	}
+	p.syncAllMemberGroupOwner(projectID)
 }

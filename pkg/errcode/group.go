@@ -47,6 +47,15 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "This project is unavailable.",
 	})
+	// ErrGroupAllMemberGroupProtected blocks manual mutations that would break
+	// the Project's dedicated all-member-group projection. System lifecycle
+	// cleanup and owner synchronization bypass this handler-only guard.
+	ErrGroupAllMemberGroupProtected = register(codes.Code{
+		ID:             "err.server.group.all_member_group_protected",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
+		SafeDetailKeys: []string{"action"},
+	})
 	ErrGroupCategorySpaceMismatch = register(codes.Code{
 		ID:             "err.server.group.category_space_mismatch",
 		HTTPStatus:     http.StatusBadRequest,

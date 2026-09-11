@@ -103,11 +103,10 @@ type Model struct {
 	// none yet. "" is the sentinel and the column is NOT NULL, so every
 	// predicate in the feature is written `= ''` / `!= ''` (see D5).
 	//
-	// Empty is a REACHABLE state, not an error: the group is provisioned after
-	// the create transaction commits (the hook opens its own transaction in
-	// modules/group), so a provisioning failure leaves the project alive with no
-	// group. D4 makes that recoverable rather than terminal — the next write path
-	// on this project retries under a lease, and reconcile scan A reports it.
+	// Empty is a reachable state, not an error: provisioning runs after the
+	// create transaction commits (the hook opens its own modules/group
+	// transaction), so a failure leaves the Project alive without a group.
+	// Reconcile scan A reports that missing artifact for operational repair.
 	AllMemberGroupNo string    `db:"all_member_group_no"`
 	CreatedAt        time.Time `db:"created_at"`
 	UpdatedAt        time.Time `db:"updated_at"`
@@ -130,9 +129,10 @@ type MemberModel struct {
 	Removing  int       `db:"removing"`
 	InviteUID string    `db:"invite_uid"`
 	CreatedAt time.Time `db:"created_at"`
-	// JoinedAt is the start of the current active membership round. It is
-	// initialized with CreatedAt for a first admission and refreshed on
-	// re-admission after removal or while a removal is in flight.
+	// JoinedAt is the start of the current active membership round. During the
+	// rolling expand window legacy writers may leave it NULL; every read projection
+	// uses COALESCE(joined_at, created_at) before scanning this time.Time field.
+	// New admissions initialize it with CreatedAt and re-admissions refresh it.
 	JoinedAt  time.Time `db:"joined_at"`
 	UpdatedAt time.Time `db:"updated_at"`
 }

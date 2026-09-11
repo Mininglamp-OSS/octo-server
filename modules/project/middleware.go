@@ -150,9 +150,8 @@ func (p *Project) cachedProjectRole(projectID, uid string) (int, error) {
 		return roleNonMember, err
 	}
 	// D4 — a seat with removing = 1 is NOT a member for any authorization
-	// purpose, even though its status is still active. This is the middleware
-	// half of that rule; pkg/project's predicates carry the other half, and the
-	// two must agree or "who is a member" depends on which door you came in.
+	// purpose, even though its status is still active. This middleware read and
+	// each transactional authorization path enforce the same rule.
 	if member != nil && member.Status == MemberStatusActive && member.Removing == 0 {
 		role = member.Role
 	}

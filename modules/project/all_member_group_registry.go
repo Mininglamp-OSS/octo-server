@@ -6,7 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 )
 
-// 全员群的两个反向注册点（建群、改名）。
+// 全员群的四个反向注册点（建群、准入、群主同步、改名）。
 //
 // # 为什么又是反向注册
 //
@@ -25,10 +25,10 @@ import (
 //
 // modules/project/service.go 的 runDisbandSteps 上写着同一段理由，P1 就是这么定的。
 //
-// 代价被显式接受并各自有兜底：
+// The accepted failure mode is explicit:
 //
 //   - provisioner 失败 → 项目已创建、all_member_group_no 为空串。初次建群失败不会回滚
-//     Project；后续显式创建或补偿路径可再次尝试。
+//     Project；I4 扫描 A 会报告缺失产物，供运维处理。
 //   - rename 同步失败 → 群名与项目不一致。只记日志加指标。
 //
 // # 契约
@@ -57,7 +57,16 @@ type AllMemberGroupSeed struct {
 // 「分身的项目席位写进去了吗」这件事由不变量本身回答，而不是由调用顺序回答。
 type AllMemberGroupProvisioner func(ctx *config.Context, seed AllMemberGroupSeed) (string, error)
 
-// AllMemberGroupRename 把全员群名改成 name（D8）。best-effort。
+// AllMemberGroupAdmitter ensures uid is present in the Project's dedicated
+// all-member group. The group side must validate the Project pointer before
+// writing; ordinary Project-associated groups never use this hook.
+type AllMemberGroupAdmitter func(ctx *config.Context, spaceID, groupNo, uid string) error
+
+// AllMemberGroupOwnerTransfer synchronizes the dedicated group's human owner
+// with the Project owner. It is idempotent and pointer-scoped.
+type AllMemberGroupOwnerTransfer func(ctx *config.Context, projectID, groupNo string) error
+
+// AllMemberGroupRename把全员群名改成 name（D8）。best-effort。
 //
 // projectID 传的是**发起这次改名的项目**，群侧用它给写加一道归属栅栏：
 // 项目侧解析 group_no 的那次读是无锁的，两次之间 P1 的 detach 可以把群变回
@@ -68,6 +77,8 @@ type AllMemberGroupRename func(ctx *config.Context, projectID, groupNo, name str
 var (
 	allMemberGroupMu       sync.RWMutex
 	allMemberGroupProvish  AllMemberGroupProvisioner
+	allMemberGroupAdmitFn  AllMemberGroupAdmitter
+	allMemberGroupOwnerFn  AllMemberGroupOwnerTransfer
 	allMemberGroupRenameFn AllMemberGroupRename
 )
 
@@ -77,6 +88,20 @@ func RegisterAllMemberGroupProvisioner(fn AllMemberGroupProvisioner) {
 	allMemberGroupMu.Lock()
 	defer allMemberGroupMu.Unlock()
 	allMemberGroupProvish = fn
+}
+
+// RegisterAllMemberGroupAdmitter 由 modules/group 在构造时调用。
+func RegisterAllMemberGroupAdmitter(fn AllMemberGroupAdmitter) {
+	allMemberGroupMu.Lock()
+	defer allMemberGroupMu.Unlock()
+	allMemberGroupAdmitFn = fn
+}
+
+// RegisterAllMemberGroupOwnerTransfer 由 modules/group 在构造时调用。
+func RegisterAllMemberGroupOwnerTransfer(fn AllMemberGroupOwnerTransfer) {
+	allMemberGroupMu.Lock()
+	defer allMemberGroupMu.Unlock()
+	allMemberGroupOwnerFn = fn
 }
 
 // RegisterAllMemberGroupRename 由 modules/group 在构造时调用。
@@ -92,26 +117,43 @@ func allMemberGroupProvisioner() AllMemberGroupProvisioner {
 	return allMemberGroupProvish
 }
 
+func allMemberGroupAdmitter() AllMemberGroupAdmitter {
+	allMemberGroupMu.RLock()
+	defer allMemberGroupMu.RUnlock()
+	return allMemberGroupAdmitFn
+}
+
+func allMemberGroupOwnerTransfer() AllMemberGroupOwnerTransfer {
+	allMemberGroupMu.RLock()
+	defer allMemberGroupMu.RUnlock()
+	return allMemberGroupOwnerFn
+}
+
 func allMemberGroupRename() AllMemberGroupRename {
 	allMemberGroupMu.RLock()
 	defer allMemberGroupMu.RUnlock()
 	return allMemberGroupRenameFn
 }
 
-// AllMemberGroupHooksRegisteredForTest reports whether the two remaining hooks are wired.
+// AllMemberGroupHooksRegisteredForTest reports whether all four hooks are wired.
 //
 // Exported for modules/group's construction test. A missing provisioner means every project is
-// created without its initial group; a missing rename hook leaves metadata inconsistent. The
-// group module can assert construction without exposing its implementation.
+// created without its initial group; a missing admission/owner hook leaves the dedicated
+// projection stale; a missing rename hook leaves metadata inconsistent.
 func AllMemberGroupHooksRegisteredForTest() bool {
 	allMemberGroupMu.RLock()
 	defer allMemberGroupMu.RUnlock()
-	return allMemberGroupProvish != nil && allMemberGroupRenameFn != nil
+	return allMemberGroupProvish != nil &&
+		allMemberGroupAdmitFn != nil &&
+		allMemberGroupOwnerFn != nil &&
+		allMemberGroupRenameFn != nil
 }
 
-// AllMemberGroupHooksSnapshot holds the two registered hooks so a test can put them back.
+// AllMemberGroupHooksSnapshot holds the registered hooks so a test can put them back.
 type AllMemberGroupHooksSnapshot struct {
 	provision AllMemberGroupProvisioner
+	admit     AllMemberGroupAdmitter
+	owner     AllMemberGroupOwnerTransfer
 	rename    AllMemberGroupRename
 }
 
@@ -131,6 +173,8 @@ func SnapshotAllMemberGroupHooksForTest() AllMemberGroupHooksSnapshot {
 	defer allMemberGroupMu.RUnlock()
 	return AllMemberGroupHooksSnapshot{
 		provision: allMemberGroupProvish,
+		admit:     allMemberGroupAdmitFn,
+		owner:     allMemberGroupOwnerFn,
 		rename:    allMemberGroupRenameFn,
 	}
 }
@@ -140,5 +184,7 @@ func RestoreAllMemberGroupHooksForTest(s AllMemberGroupHooksSnapshot) {
 	allMemberGroupMu.Lock()
 	defer allMemberGroupMu.Unlock()
 	allMemberGroupProvish = s.provision
+	allMemberGroupAdmitFn = s.admit
+	allMemberGroupOwnerFn = s.owner
 	allMemberGroupRenameFn = s.rename
 }

@@ -61,6 +61,14 @@ type provisionEnsurer interface {
 	Ensure(ctx context.Context, target projectprovision.Target, req projectprovision.EnsureRequest) (projectprovision.EnsureResponse, error)
 }
 
+// driveProvisioner is the additional method used by the Drive target. Keeping
+// it separate preserves the Fleet Ensure seam and makes it impossible for the
+// Drive request to be represented by EnsureRequest (which contains
+// container_id).
+type driveProvisioner interface {
+	CreateDriveSpace(ctx context.Context, target projectprovision.Target, req projectprovision.DriveRequest) (projectprovision.DriveSpaceResponse, error)
+}
+
 // permanentProvisioningOutcomes are the failure categories that another attempt cannot
 // repair, so a row carrying one goes straight to `abandoned` instead of consuming its
 // whole retry budget.
@@ -359,7 +367,7 @@ func (p *Project) runProvisioningBatchForTarget(target string, limit int, maxAtt
 	}
 }
 
-// runProvisioningJob performs one ensure call and records the outcome.
+// runProvisioningJob performs one target call and records the outcome.
 //
 // The panic recovery is at THIS level, not only around the batch. A panic caught
 // one level up would skip the release, leaving the row claimed with no last_error
@@ -386,25 +394,57 @@ func (p *Project) runProvisioningJob(job *provisioningJob, owner string) {
 		return
 	}
 
-	req := projectprovision.EnsureRequest{
-		ContainerID: job.ContainerID,
-		ProjectID:   job.ProjectID,
-		OctoSpaceID: job.SpaceID,
-		Name:        provisioningContainerName,
-	}
-	// issue_prefix is fleet's per-workspace field and octo-server stores none of it
-	// (D4). Sending it empty at creation lets fleet apply its own default; 任务前缀
-	// is then edited in fleet, and fleet's own help text agrees that changing it only
-	// affects new issues.
-
+	var (
+		err             error
+		outcomeOverride string
+	)
 	started := time.Now()
-	// context.Background(), not a request context: nothing here is on a request
-	// path, and the call is bounded by the client's own per-target timeout.
-	_, err := p.provisionClient.Ensure(context.Background(), target.Target, req)
+	if target.Target.Auth == projectprovision.AuthInternalToken {
+		// Drive's body is built from the current Project state on every attempt.
+		// In particular, creator is not a durable Owner identity after transfer,
+		// and the outbox row's ContainerID is a Fleet-only opaque delivery key.
+		current, lookupErr := p.db.queryProvisioningProject(job.ProjectID)
+		switch {
+		case lookupErr != nil:
+			err = lookupErr
+			outcomeOverride = "project_state_unavailable"
+		case current == nil:
+			err = errProvisioningProjectNotReady
+			outcomeOverride = "project_not_ready"
+		case current.SpaceID != job.SpaceID:
+			err = errProvisioningProjectMismatch
+			outcomeOverride = "invalid_request"
+		default:
+			drive, ok := p.provisionClient.(driveProvisioner)
+			if !ok {
+				err = errProvisioningDriveClientUnavailable
+				outcomeOverride = "project_state_unavailable"
+				break
+			}
+			_, err = drive.CreateDriveSpace(context.Background(), target.Target, projectprovision.DriveRequest{
+				Name:          current.Name,
+				OctoSpaceID:   current.SpaceID,
+				SuperAdminUID: current.OwnerUID,
+				ProjectID:     current.ProjectID,
+			})
+		}
+	} else {
+		// Fleet's existing protocol remains keyed by the row's opaque
+		// ContainerID and uses its stable low-information display label.
+		_, err = p.provisionClient.Ensure(context.Background(), target.Target, projectprovision.EnsureRequest{
+			ContainerID: job.ContainerID,
+			ProjectID:   job.ProjectID,
+			OctoSpaceID: job.SpaceID,
+			Name:        provisioningContainerName,
+		})
+	}
 	provisioningDuration.WithLabelValues(job.Target).Observe(time.Since(started).Seconds())
 
 	if err != nil {
 		outcome := projectprovision.Category(err)
+		if outcome == "" {
+			outcome = outcomeOverride
+		}
 		if outcome == "" {
 			outcome = "unclassified"
 		}
@@ -412,51 +452,21 @@ func (p *Project) runProvisioningJob(job *provisioningJob, owner string) {
 		return
 	}
 	observeProvisioningAttempt(job.Target, "ready")
-	// Note what is NOT recorded: the container id returned by the target. It equals
-	// what we sent (the client refuses the response otherwise), and the row already
-	// holds it, so there is nothing to write back — which is the point of generating
-	// the id at enqueue time (D1). fleet's `slug` is likewise dropped: fleet
-	// addresses workspaces BY slug and our container_id IS that slug, so storing a
-	// second copy would only create something to drift.
+	// The Fleet response is intentionally not persisted: its container_id must
+	// equal the row key, while Drive's remote id is never part of the local
+	// contract. ProjectID remains the only Drive mapping key.
 	p.finishProvisioning(job, owner, provisionStatusReady, "")
 }
 
-// provisioningContainerName is the display name sent to the target.
-//
-// Deliberately NOT the project name, and the divergence from brief D2's sketched
-// body is worth stating rather than leaving as a silent simplification.
-//
-// Three reasons. The name is authoritative in octo-server and never synced outbound
-// (D3), so a copy on the other side can only drift. Reading octo_project here would
-// add a query to every attempt for a field the target treats as a label. And a
-// project name is user-supplied free text: sending it turns provisioning into a
-// content-egress path with its own escaping and disclosure questions, which this
-// slice does not want to open — a target that needs the real name reads it from
-// GET /v1/projects/:project_id, which is what D3 already tells fleet to do for
-// `context`.
-//
-// So the value carries no user content: a stable, low-information label. If the
-// product later wants the real name on the subsystem side, that is a deliberate
-// change with an owner, not a default.
+// provisioningContainerName is the low-information label sent on Fleet's
+// ensure protocol. Drive receives the current full Project name through its
+// separate internal-create request, so this constant never reaches Drive.
 const provisioningContainerName = "octo-project"
 
-// releaseOrAbandon schedules the retry, or writes the terminal abandoned state when
-// the budget is gone.
-//
-// It is also the ONE place a failed attempt is counted, and that placement is the fix
-// for a metric that was wrong in two directions at once. Counting at the call site
-// meant the panic and target-disabled paths — which reach here but not the ensure
-// call — recorded nothing at all, so a job that panicked on every attempt was
-// invisible in provisioning_attempts_total until it abandoned. And the abandon branch
-// then added a SECOND increment labelled "abandoned", so the last failing attempt of
-// any job was counted twice under two different outcomes and
-// sum by(outcome)(provisioning_attempts_total) did not equal the number of attempts.
-//
-// Now: exactly one increment per attempt, labelled with the real reason — including
-// the attempt that exhausts the budget, whose reason is the interesting part. "How
-// many rows have given up" is a different question and is already answered by the
-// provisioning_rows{status="abandoned"} gauge, so it does not need a counter label
-// competing with the outcomes.
+// releaseOrAbandon schedules the retry, or writes the terminal abandoned state
+// when the budget is gone. It is the only place a failed attempt is counted,
+// including failures that occur before an outbound call (such as a missing
+// current Drive owner).
 func (p *Project) releaseOrAbandon(job *provisioningJob, owner, outcome string, cause error) {
 	now := time.Now().UTC()
 	observeProvisioningAttempt(job.Target, outcome)

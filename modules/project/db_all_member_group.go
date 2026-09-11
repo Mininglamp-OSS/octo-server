@@ -190,6 +190,9 @@ const (
 		"WHERE project_id = ? AND status = ? AND all_member_group_no <> ''"
 	sqlProjectAllMemberGroupRow = "SELECT 1 FROM `group` " +
 		"WHERE group_no = ? AND status <> ? AND project_id = ?"
+	sqlProjectClearStaleAllMemberGroup = "UPDATE `octo_project` " +
+		"SET all_member_group_no = '', all_member_group_lease_until = NULL " +
+		"WHERE project_id = ? AND status = ? AND all_member_group_no = ?"
 )
 
 // queryAllMemberGroupNo reads the active Project's currently associated native
@@ -222,4 +225,86 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 		return "", nil
 	}
 	return pointers[0], nil
+}
+
+// clearStaleAllMemberGroupPointer clears a non-empty pointer whose native group
+// is gone, disbanded, or no longer attributed to this Project. The pointer value
+// is part of the UPDATE predicate so a concurrent successful provision cannot be
+// cleared by a stale repair.
+func (d *DB) clearStaleAllMemberGroupPointer(projectID string) (bool, error) {
+	if projectID == "" {
+		return false, nil
+	}
+	var pointers []string
+	if _, err := d.session.SelectBySql(
+		sqlProjectAllMemberGroupPointer, projectID, StatusNormal,
+	).Load(&pointers); err != nil {
+		return false, fmt.Errorf("project: read all-member group pointer before clear: %w", err)
+	}
+	if len(pointers) == 0 || pointers[0] == "" {
+		return false, nil
+	}
+	var alive []int
+	if _, err := d.session.SelectBySql(
+		sqlProjectAllMemberGroupRow, pointers[0], groupStatusDisband, projectID,
+	).Load(&alive); err != nil {
+		return false, fmt.Errorf("project: check all-member group before clear: %w", err)
+	}
+	if len(alive) > 0 {
+		return false, nil
+	}
+	result, err := d.session.UpdateBySql(
+		sqlProjectClearStaleAllMemberGroup, projectID, StatusNormal, pointers[0],
+	).Exec()
+	if err != nil {
+		return false, fmt.Errorf("project: clear stale all-member group pointer: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("project: read stale all-member group clear result: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// queryActiveOwnerCandidatesForProvision returns human Project-owner
+// candidates in seniority order. The caller filters against the current Space
+// roster before choosing one, because a Project seat can outlive a Space seat
+// while its removal cleanup is pending.
+func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string, limit int) ([]string, error) {
+	if projectID == "" || limit <= 0 {
+		return nil, nil
+	}
+	var uids []string
+	_, err := d.session.SelectBySql(
+		"SELECT pm.uid FROM `octo_project_member` pm "+
+			"LEFT JOIN `user` u ON u.uid = pm.uid "+
+			"WHERE pm.project_id = ? AND pm.role = 2 AND pm.status = 1 "+
+			"AND pm.removing = 0 AND COALESCE(u.robot, 0) = 0 "+
+			"AND COALESCE(u.is_destroy, 0) <> 2 "+
+			"ORDER BY COALESCE(pm.joined_at, pm.created_at) ASC, pm.created_at ASC, pm.uid ASC LIMIT ?",
+		projectID, limit,
+	).Load(&uids)
+	if err != nil {
+		return nil, fmt.Errorf("project: query active owner candidates: %w", err)
+	}
+	return uids, nil
+}
+
+// queryActiveMemberUIDsForRebuild returns the bounded active Project roster
+// used as the initial native membership snapshot for a rebuilt dedicated group.
+func (d *DB) queryActiveMemberUIDsForRebuild(projectID string, limit int) ([]string, error) {
+	if projectID == "" || limit <= 0 {
+		return nil, nil
+	}
+	var uids []string
+	_, err := d.session.SelectBySql(
+		"SELECT uid FROM `octo_project_member` "+
+			"WHERE project_id = ? AND status = 1 AND removing = 0 "+
+			"ORDER BY COALESCE(joined_at, created_at) ASC, created_at ASC, uid ASC LIMIT ?",
+		projectID, limit,
+	).Load(&uids)
+	if err != nil {
+		return nil, fmt.Errorf("project: query active member uids for rebuild: %w", err)
+	}
+	return uids, nil
 }

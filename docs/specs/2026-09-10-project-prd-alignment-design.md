@@ -21,9 +21,9 @@
 
 ### 不包含
 
-- Internal API、outbox、Redis 事件队列。
+- 除下文明确的 Drive provisioning boundary 外，不包含其他 Internal API、outbox、Redis 事件队列。
 - 资源侧授权引擎、权限同步和撤销通知。资源侧实时查询关系判权，关联变化自然改变授权依据。
-- Loop 任务、自动化及标签型项目、网盘、在线文档、能力招募和客户端界面实现。
+- Drive 资源内容、文件权限、ACL 和资源侧授权不在本设计范围；Project→Drive provisioning boundary 见下文，Drive ID 不作为 Project 响应事实。
 - 扩展 Project 删除、归档产品能力。既有生命周期执行链是否与目标发生冲突，应在实施时按本文件权限不变量核对；不借本次添加新的生命周期机制。
 
 ## 核心决策
@@ -36,8 +36,10 @@
 | 管理员 | 可以管理非 Owner 成员，包括其他管理员；最高授予管理员 |
 | 组织与 Project | 组织身份是访问前提，不自动授予 Project 管理权限 |
 | Project 创建方式 | Project 必须显式创建；列表是纯读，不因首次进入或读取自动创建默认 Project |
-| 群关联 | 原生群管理权限与 Project 成员资格独立校验 |
+| 群关联 | 原生群管理权限与 Project 成员资格独立校验；仅 `all_member_group_no` 指向的群是 Project 专属全员群 |
+| 全员群 | 专属群实时投影有效 Project 成员和真人 Owner；普通 Project 关联群保持原生快照 |
 | 资源判权 | 消费当前关系，不增加异步授权同步体系 |
+| Project 与 Drive | 以 `project_id` 管理 provisioning；不要求 Project 响应返回 Drive ID |
 
 ## 基础信息与列表
 
@@ -68,7 +70,7 @@
 - 重复添加相同角色的有效成员视为无变化；重复添加不能作为隐式角色修改，角色不同则返回明确冲突。无效目标使整批失败。
 - 任一资格失败、已有角色冲突或请求内同 UID 的角色冲突都回滚整个批次；请求内同 UID 同角色重复项去重，不产生部分成功。
 - 已移除成员重新加入时应用本次指定角色，并重新校验当前组织资格。现有清理流程不得在重新加入后继续删除其新资格。
-- 成员记录同时保留首次记录时间 `created_at` 和当前加入轮次时间 `joined_at`；首次创建（含初始 Owner/Agent）两者相同。新添加、退出后重新加入以及移除流程中的重新加入写当前 UTC 时间到 `joined_at`，有效成员幂等添加和角色调整不改变它；成员列表与单人读取统一返回与 `created_at` 相同格式的 `joined_at`。历史记录无法还原真实轮次，迁移以 `created_at` 初始化并在完成回填后设为非空。
+- 成员记录同时保留首次记录时间 `created_at` 和当前加入轮次时间 `joined_at`；首次创建（含初始 Owner/Agent）两者相同。新添加、退出后重新加入以及移除流程中的重新加入写当前 UTC 时间到 `joined_at`，有效成员幂等添加和角色调整不改变它；成员列表与单人读取统一返回与 `created_at` 相同格式的 `joined_at`。历史记录无法还原真实轮次，本版本迁移仅以 rolling expand 新增可空 `DATETIME(3)`，不回填、不改为 `NOT NULL`；所有读取统一使用 `COALESCE(joined_at,created_at)`，旧二进制可省略该列，后续收缩迁移不在本版本。
 - 用户有效性、组织资格、Project 资格均在写事务中重新校验。账号停用不改变其他有效成员的角色。
 - 组织级强制撤权立即使其组织身份不满足访问条件，同时保留唯一 Owner 的身份记录，不删除或降级该记录。其他有效成员保持原权限；组织身份恢复前，该 Owner 无法执行操作。本次不提供管理员越权转让或自动选任机制。
 
@@ -84,12 +86,21 @@
 - 解除关联后，该群不再出现在 Project 关联列表，原生群成员关系保持不变。
 - 群内容访问、子区访问及资源派生权限由相应资源的判权路径负责；关系接口不替代这些判权路径。
 - 资源侧以当前有效关联和成员资格实时判断 Project 派生权限；解除关联后该授权依据消失。原生群成员资格属于独立权限来源，不与派生权限混为一体。本规格只约定关系事实，不实施资源侧判断逻辑。
+- 预设群组的原生群成员模型与 Project 关系是两个独立维度；预设群可以同时保留自身成员并关联 Project，既不自动同步成员，也不因并存关系增加警告或限制。
+
+### Project 专属全员群
+
+- 只有 `octo_project.all_member_group_no` 指向且仍关联该 Project 的原生群属于专属全员群；普通 `group.project_id` 关联群、预设群和历史快照群均不进入本节同步。
+- 专属全员群的有效原生成员集合跟随 Project 当前有效席位（`status=active` 且 `removing=0`）收敛；Project 添加、重新加入、Space 成员恢复后补入，Project 移除、退出或 Space 撤权时先从专属群移除再清理 Project 席位。重试必须幂等，并以 Project 行锁和成员锁防止旧清理任务删除新资格。
+- 专属全员群的群主由当前有效真人 Project Owner 投影；机器人/Agent 不得成为群主。Owner 转让、Owner 失效和重试收敛时，旧 creator 降为普通成员，目标真人 Owner 升为群主；没有已入群的合格 Owner 时不凭空提升其他成员。
+- 专属群的群面 disband、退出、移除成员、手动转让群主、blacklist-add，以及手动 add/invite/scan-join（含 Bot API add/remove）均返回 `all_member_group_protected`，必须改走 Project 成员/Owner 入口；blacklist-remove 允许。Project/Space/BotFather 的系统级级联和同步钩子使用服务层原语，不受 HTTP 守卫阻断。
+- 专属群判定以 Project 指针为权威，并同时校验群的 `project_id` 与有效状态；普通关联群不得因 `project_id` 字段而获得上述保护或同步。
 
 ### 从 Project 创建群
 
 - Project 有效成员可以发起；创建时自动关联当前 Project。
-- 复用原开发设计中已明确的建群成员快照：将创建事务确认的有效 Project 成员作为初始群成员一次性写入。后续成员变化不自动同步原生群成员表。
-- 该快照仅初始化原生群成员，不是后续 Project 成员或关联的权威来源，也不替代资源侧实时关系查询。
+- 普通 Project 发起群复用原开发设计中已明确的建群成员快照：将创建事务确认的有效 Project 成员作为初始群成员一次性写入，后续成员变化不自动同步原生群成员表。专属全员群只通过 `all_member_group_no` 指针进入上一节的实时投影语义。
+- 快照仅初始化普通关联群的原生成员，不是后续 Project 成员或关联的权威来源，也不替代资源侧实时关系查询。
 - 群、关联字段和初始成员在同一业务事务内写入；实际 IM 创建位于提交后，使用现有补偿机制。
 - 所需序列及配置在持锁前准备；事务内重新验证当前资格。候选成员扩展导致不能安全复核时，释放锁重新准备，有界失败不留下部分本地数据。
 
@@ -139,6 +150,12 @@
 - 单查沿用 `readProjectAccessTx`，在同一 `REPEATABLE READ` 只读事务中校验调用者的有效账号、Project 所属 Space 当前组织成员资格及当前 Project 成员资格，再用 `project_id + target uid` 的有界 point query 读取目标；不得读取分页列表后在内存筛选。目标有效性与成员列表一致，仅要求 Project 正常且目标席位 `status=active`、`removing=0`；不额外把目标 `user`/Space 席位状态当作此关系事实的过滤条件。目标未知、已移除或 `removing=1` 均返回既有 not-found 语义；数据库错误必须返回 query_failed，不能降级成 not-found。该响应只表示目标的 Project 成员事实，不是目标账号或 Drive 资源授权决定，Drive 必须继续自行校验目标资格和 ACL。
 - Drive 关系判权需要用户态成员事实时，保留同一用户原始 session `token`（首选 `token` header，兼容 `Authorization: Bearer <session>`）调用 `GET /v1/projects/{project_id}/members/{uid}`；`project_id` 和目标 `uid` 是路径 selector，不要求 `X-Space-ID`，不接受 `X-Internal-Token`、客户端自报 UID 或角色。Drive 仍负责自己的映射、ACL 和撤权窗口，Project `role` 不替代 Drive 权限；没有用户 session 的后台任务不能借此用户路由。
 
+### Project→Drive provisioning boundary（2026-09-11）
+
+- 经授权的 provisioning 以 `project_id` 作为唯一管理与幂等依据；Project 创建/响应不要求返回 Drive ID。
+- 远端支持后调用 `POST /v1/internal/drive/spaces`，使用 `X-Internal-Token`，请求包含完整 Project `name`（最多 30 个 Unicode 字符）、`octo_space_id`、当前 Owner `super_admin_uid` 和 `project_id`。只有同一 `project_id` 的完全相同重复请求可按幂等成功处理；其他 `409`、`401`、`500` 按重试/失败策略处理。
+- `OCTO_DRIVE_INTERNAL_TOKEN` 与 Fleet HMAC 凭据分离；功能关闭时不得向远端出站。远端接口及 30 字符名称支持是启用/部署前提，远端尚未提供时不得宣称已部署。
+
 ### `GET /v1/group/my` 角色筛选收口（2026-09-11）
 
 - 成功响应继续是直接 `GroupResp[]`，不分页、不包 `data`；无参数返回当前用户保存的群，仅 `space_id` 返回该 Space 下当前用户已加入的群。
@@ -147,7 +164,7 @@
 
 ## 迁移与发布
 
-- 现有 Project ID、Owner、成员和群数据保留。新增迁移负责名称约束变更及关联人等必要存储，不复制未上线模块的数据。
+- 现有 Project ID、Owner、成员和群数据保留。新增迁移负责名称约束、关联人及成员轮次时间等必要存储；`joined_at` 采用仅扩展的可空列迁移，不在本版本回填或收缩为非空。
 - 旧接口中能够创建多个 Owner、直接退出 Owner 或绕过目标权限的入口必须一起调整；不能只修新入口。
 - 用户角色和添加批次语义是同端点的不兼容行为变更，采用协调切换：发布前完成所有受影响调用方适配与联合验收，切换期间暂停相关写入口，排空旧服务实例后统一启用新契约。无法协调时阻止该契约上线，不静默混用两种批次语义。实施交付列出实际受影响调用方；不能以本仓库测试替代外部客户端验收。
 - 存量群缺失关联人时返回空值，不推测或伪造历史操作者；管理权限仍取实时资格，后续实际换绑时记录操作者。
@@ -202,6 +219,11 @@
   限制 50 条；旧 native GroupResp 读路径移除，CORS 暴露仅在允许跨域响应时追加。
   客户端字段切换仍需协调，未在本规格中声称已部署。
 
+- P2 review 收口：AI session container（`purpose=ai_session_container`）在 Group 关系 PUT/DELETE 路由和 service 层均拒绝；实际关系变更同步推进 `group.version`，重复绑定/解绑不制造版本噪音。Project 关系读列表、分页计数及 Sidebar 批量投影同样排除历史绑定的 AI 容器，普通群关系不受影响。预设群与 Project 关系保持独立并允许并存；无引用的关系辅助函数已删除。
+- 置顶 upsert 保留 `%w` 错误链，并修复 `pinned=1,pinned_at=NULL` 的历史行；`GET /v1/group/my` 角色列表的成员计数查询失败直接返回 query_failed，不降级为成功的 0。
+- 运维注意：`project_i2_violations_total`、`group_admission_rejected_total` 及全员群 guard failure 计数器已移除，旧面板/告警应删除或允许序列缺失，缺失这些指标本身不是服务故障。Bot/IM 提示、订阅和其他提交后通知按 best-effort 处理，数据库提交事实权威，通知失败只记录并由既有补偿/重试路径处理。
+- Migration 采用 rolling expand：仅新增可空 `joined_at DATETIME(3)`，旧二进制仍可省略列，读侧 `COALESCE(joined_at,created_at)`，新写入使用真实 UTC 时间；后续收缩迁移不在本版本。Cascade 保留 active human Owner 及其角色；仅有 active non-Owner agent rider 时处理 rider，并使 member_epoch/清理队列过渡幂等，Owner-only 行不进入分页。
+
 ## 未决事项
 
-无产品决策待确认。外部客户端的契约切换和资源侧实时判权验收由对应维护者负责，不属于本设计阶段已验证的事实。
+无产品决策待确认。外部客户端契约切换、Drive 远端接口/30 字符支持的部署前提和资源侧实时判权验收由对应维护者负责，不属于本设计阶段已验证的外部部署事实。

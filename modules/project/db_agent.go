@@ -185,10 +185,9 @@ const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
 	//   pm eq_ref PRIMARY             rows=1   ← 比较落在 general_ci，而 pm 自己
 	//                                            就是 general_ci，主键可用
 	//
-	// 救它的不是 robot 的主键，是下面那条 creator_uid 字面量谓词给了优化器一个
-	// 有选择性的入口。所以这条语句不必等排序规则转换，但它的代价随"一个主人
-	// 名下的分身数"增长，而不是随项目席位数增长。计划由
-	// TestAgentSeatJoinKeepsAnIndexUnderCollationDrift 钉住。
+	// The selective entry point is creator_uid, so the work scales with the
+	// departing person's riders rather than with every project seat. Keep that
+	// property when changing the projection or predicates.
 	"INNER JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci " +
 	"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 AND pm.role <> ? " +
 	// creator_uid 比的是一个**字面量**，不是另一张表的列。字面量是可强制
@@ -198,19 +197,12 @@ const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
 	// 稳定顺序：级联会逐个开事务处理，固定顺序让并发的两次移除以同样的
 	// 顺序碰这些行，少一种死锁形状。
 	"ORDER BY pm.uid " +
-	// **加锁读，且只锁 pm。**
-	//
-	// 这次读直接授权紧随其后的写（把这些席位置为 removing=1）。非加锁读
-	// answers from the snapshot：本事务的读视图在第一条语句就打开了，于是
-	// 一个在那之后提交的新分身席位对这次读不可见，它会被漏掉——人走了、
-	// 他的分身席位还活着，正是 D13 要防的那个终局，而且没有任何东西会回来
-	// 补上。TestNoWriteAuthorisingAggregateIsANonLockingRead 钉住这条规则，
-	// 并且是它先发现了这里的漏洞。
-	//
-	// FOR UPDATE OF pm 而不是裸 FOR UPDATE：不锁 `robot`。robot 不在本模块
-	// 声明的锁序里（space_member → space → project → group → group_member →
-	// octo_project_member），锁它等于凭空加一条没人分析过的边。
-	// lockSpaceSeatsTx 用 FOR SHARE OF sm 是同一个手法。
+	// This read authorizes the immediately following beginMemberRemovalTx writes,
+	// so it must see rows committed after the transaction's read view opens.
+	// Lock only the project-member rows: `robot` is outside this module's lock
+	// order (space_member → space → project → group → group_member →
+	// octo_project_member), and lockSpaceSeatsTx uses the same scoped-lock
+	// pattern for its own table.
 	"FOR UPDATE OF pm"
 
 // queryOwnedAgentSeatsTx 读出 ownerUID 名下、当前在这个项目里有活跃席位且自身不是
@@ -327,9 +319,9 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 // 不是，所以两个数按算术相加就等于 len(uids)。性质没变，理由变了（第八轮 review：
 // 注释还在描述已经不存在的那条语句）。
 //
-// 只有会话版，没有事务版。它服务的是**响应渲染**，不授权任何写入；一个事务内的
-// 版本会被 TestNoWriteAuthorisingAggregateIsANonLockingRead 要求成为加锁读，
-// 而为一个纯展示用的计数在成员表上取锁是没有理由的。
+// This read serves response rendering only and is intentionally non-locking.
+// Write authorization paths use their own transactional locking reads rather
+// than reusing this display aggregate.
 //
 // 没有 user 行的成员仍然计为人：他不会出现在 bot 那一批里。这与 listMembers 的
 // LEFT JOIN 是同一个口径——名册和计数不能各说各话。

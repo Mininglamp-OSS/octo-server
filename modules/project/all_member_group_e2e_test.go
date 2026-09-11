@@ -71,6 +71,206 @@ func createProjectE2E(t *testing.T, srv *server.Server, spaceID, token string, b
 	return resp
 }
 
+// writeProjectE2E drives one authenticated JSON write through the real Project route.
+func writeProjectE2E(
+	t *testing.T,
+	srv *server.Server,
+	method, path, token string,
+	body map[string]any,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	require.NoError(t, err)
+	req, err := http.NewRequest(method, path, bytes.NewReader(payload))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("token", token)
+	w := httptest.NewRecorder()
+	srv.GetRoute().ServeHTTP(w, req)
+	return w
+}
+
+func projectSeatStateE2E(ctx *config.Context, projectID, uid string) (status, removing int, ok bool) {
+	var rows []struct {
+		Status   int `db:"status"`
+		Removing int `db:"removing"`
+	}
+	_, err := ctx.DB().SelectBySql(
+		"SELECT status, removing FROM octo_project_member WHERE project_id = ? AND uid = ?",
+		projectID, uid,
+	).Load(&rows)
+	if err != nil || len(rows) == 0 {
+		return 0, 0, false
+	}
+	return rows[0].Status, rows[0].Removing, true
+}
+
+func activeGroupMemberE2E(ctx *config.Context, groupNo, uid string) bool {
+	var uids []string
+	_, err := ctx.DB().SelectBySql(
+		"SELECT uid FROM group_member WHERE group_no = ? AND uid = ? "+
+			"AND is_deleted = 0 AND status = 1",
+		groupNo, uid,
+	).Load(&uids)
+	return err == nil && len(uids) == 1
+}
+func activeGroupMemberRoleE2E(ctx *config.Context, groupNo, uid string) (role int, ok bool) {
+	var roles []int
+	_, err := ctx.DB().SelectBySql(
+		"SELECT role FROM group_member WHERE group_no = ? AND uid = ? "+
+			"AND is_deleted = 0 AND status = 1",
+		groupNo, uid,
+	).Load(&roles)
+	if err != nil || len(roles) == 0 {
+		return 0, false
+	}
+	return roles[0], true
+}
+
+func latestRemovalJobStatusE2E(ctx *config.Context, projectID, uid string) (int, bool) {
+	var statuses []int
+	_, err := ctx.DB().SelectBySql(
+		"SELECT status FROM octo_project_member_removal_cleanup "+
+			"WHERE project_id = ? AND uid = ? ORDER BY id DESC LIMIT 1",
+		projectID, uid,
+	).Load(&statuses)
+	if err != nil || len(statuses) == 0 {
+		return 0, false
+	}
+	return statuses[0], true
+}
+
+// TestProjectLifecycleKeepsDedicatedAndOrdinaryGroupsSeparate covers the live
+// projection contract through Project's real HTTP writes and Group's real
+// provision/admission/removal hooks. A second Project-associated group is
+// deliberately seeded with the same project_id: it must remain a native
+// snapshot while only the pointer-linked all-member group follows the roster.
+func TestProjectLifecycleKeepsDedicatedAndOrdinaryGroupsSeparate(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID = "e2e_lifecycle_space"
+		owner   = "e2e_lifecycle_owner"
+		targetA = "e2e_lifecycle_target_a"
+		targetB = "e2e_lifecycle_target_b"
+	)
+	exec(t, ctx, "INSERT INTO `space` (space_id, name, creator, status) VALUES (?, ?, ?, 1)",
+		spaceID, spaceID, owner)
+	for _, uid := range []string{owner, targetA, targetB} {
+		role := 0
+		if uid == owner {
+			role = 2
+		}
+		exec(t, ctx, "INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, ?, 1)",
+			spaceID, uid, role)
+		exec(t, ctx, "INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)",
+			uid, uid, uid)
+	}
+
+	ownerToken := seedToken(t, ctx, owner)
+	targetAToken := seedToken(t, ctx, targetA)
+	resp := createProjectE2E(t, srv, spaceID, ownerToken, map[string]any{
+		"name": "生命周期投影",
+	})
+	projectID, _ := resp["project_id"].(string)
+	dedicatedNo, _ := resp["all_member_group_no"].(string)
+	require.NotEmpty(t, projectID)
+	require.NotEmpty(t, dedicatedNo)
+
+	// This group shares the Project relation but is not the Project's
+	// all_member_group_no pointer. It is intentionally independent.
+	ordinaryNo := "e2e_lifecycle_ordinary"
+	exec(t, ctx,
+		"INSERT INTO `group` (group_no, name, creator, status, version, space_id, project_id) "+
+			"VALUES (?, ?, ?, 1, 1, ?, ?)",
+		ordinaryNo, ordinaryNo, owner, spaceID, projectID)
+	for _, uid := range []string{owner, targetA, targetB} {
+		role := 0
+		if uid == owner {
+			role = 1
+		}
+		exec(t, ctx,
+			"INSERT INTO group_member (group_no, uid, role, is_deleted, status, version) "+
+				"VALUES (?, ?, ?, 0, 1, 1)",
+			ordinaryNo, uid, role)
+	}
+
+	w := writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"members": []map[string]any{
+			{"uid": targetA, "role": 0},
+			{"uid": targetB, "role": 0},
+		}})
+	require.Equal(t, http.StatusOK, w.Code, "add body: %s", w.Body.String())
+	assert.ElementsMatch(t, []string{owner, targetA, targetB},
+		liveGroupMembers(t, ctx, dedicatedNo),
+		"Project admission updates only the pointer-linked dedicated group")
+	assert.ElementsMatch(t, []string{owner, targetA, targetB},
+		liveGroupMembers(t, ctx, ordinaryNo),
+		"the ordinary associated group keeps its native snapshot")
+
+	w = writeProjectE2E(t, srv, http.MethodPut,
+		"/v1/projects/"+projectID+"/owner", ownerToken,
+		map[string]any{"uid": targetA})
+	require.Equal(t, http.StatusOK, w.Code, "transfer body: %s", w.Body.String())
+	require.Eventually(t, func() bool {
+		role, ok := activeGroupMemberRoleE2E(ctx, dedicatedNo, targetA)
+		return ok && role == 1
+	}, 20*time.Second, 200*time.Millisecond,
+		"the dedicated group's native owner role must follow the human Project owner")
+
+	// Transfer back so owner can exercise the removal endpoint. The second
+	// transfer also proves that owner synchronization is not one-way.
+	w = writeProjectE2E(t, srv, http.MethodPut,
+		"/v1/projects/"+projectID+"/owner", targetAToken,
+		map[string]any{"uid": owner})
+	require.Equal(t, http.StatusOK, w.Code, "transfer-back body: %s", w.Body.String())
+	require.Eventually(t, func() bool {
+		role, ok := activeGroupMemberRoleE2E(ctx, dedicatedNo, owner)
+		return ok && role == 1
+	}, 20*time.Second, 200*time.Millisecond,
+		"the dedicated group's native owner role must follow the transfer back")
+
+	// A completed removal must leave the ordinary associated group's native
+	// member untouched.
+	w = writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/projects/"+projectID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{targetB}})
+	require.Equal(t, http.StatusOK, w.Code, "remove body: %s", w.Body.String())
+	require.Eventually(t, func() bool {
+		status, removing, ok := projectSeatStateE2E(ctx, projectID, targetB)
+		return ok && status == 0 && removing == 0 &&
+			!activeGroupMemberE2E(ctx, dedicatedNo, targetB)
+	}, 40*time.Second, 200*time.Millisecond,
+		"the two-phase removal must close the Project seat and dedicated membership")
+	assert.False(t, activeGroupMemberE2E(ctx, dedicatedNo, targetB))
+	assert.True(t, activeGroupMemberE2E(ctx, ordinaryNo, targetB),
+		"removing a Project member must not mutate an ordinary associated group")
+	jobStatus, ok := latestRemovalJobStatusE2E(ctx, projectID, targetB)
+	require.True(t, ok)
+	assert.Equal(t, 1, jobStatus, "the completed removal outbox row must be terminal done")
+
+	// Remove and immediately re-add targetA. The admission transaction clears
+	// removing and retires the pending job before the worker's next poll; the
+	// dedicated projection must therefore retain the rejoined member.
+	w = writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/projects/"+projectID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{targetA}})
+	require.Equal(t, http.StatusOK, w.Code, "remove-for-rejoin body: %s", w.Body.String())
+	w = writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/projects/"+projectID+"/members/add", ownerToken,
+		map[string]any{"members": []map[string]any{{"uid": targetA, "role": 0}}})
+	require.Equal(t, http.StatusOK, w.Code, "rejoin body: %s", w.Body.String())
+	require.Eventually(t, func() bool {
+		status, removing, seatOK := projectSeatStateE2E(ctx, projectID, targetA)
+		return seatOK && status == 1 && removing == 0 &&
+			activeGroupMemberE2E(ctx, dedicatedNo, targetA)
+	}, 20*time.Second, 200*time.Millisecond,
+		"rejoin must cancel the fence and preserve the dedicated projection")
+	assert.True(t, activeGroupMemberE2E(ctx, ordinaryNo, targetA),
+		"rejoin must leave ordinary associated membership untouched")
+}
+
 // liveGroupMembers returns the group's active member uids.
 func liveGroupMembers(t *testing.T, ctx *config.Context, groupNo string) []string {
 	t.Helper()

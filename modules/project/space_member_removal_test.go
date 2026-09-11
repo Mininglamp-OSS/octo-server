@@ -194,3 +194,56 @@ func TestCascadeStepIsRegisteredUnderItsName(t *testing.T) {
 	assert.False(t, probeRan, "runCascade calls the step directly, so the probe proves "+
 		"registration is accepted rather than that the worker dispatched it")
 }
+
+// TestSpaceRemovalPreservesOwnerAndClosesAgentRiders exercises the production
+// all-Space removal entry point rather than a direct project-seat update. The
+// human Owner row is deliberately retained, while a non-Owner bot seated by
+// that Owner must still be removed from the Project.
+func TestSpaceRemovalPreservesOwnerAndClosesAgentRiders(t *testing.T) {
+	srv, p := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "cascade-owner")
+	seedSpaceMember(t, spaceA, "cascade-owner", 0, 1)
+	seedAgent(t, spaceA, "cascade-owner-bot", "cascade-owner", "octo_hosted")
+
+	w := doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", ownerToken,
+		map[string]any{
+			"name":       "owner rider cascade",
+			"agent_uids": []string{"cascade-owner-bot"},
+		})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	created := decodeResp(t, w)
+	epochBefore := epochOf(t, created.ProjectID)
+
+	closed, err := spacemod.CloseAllSpaceSeats(
+		testCtx, "cascade-owner", "cascade-operator", spacemod.MemberRemoveReasonForceRemoved)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{spaceA}, closed)
+
+	// CloseAllSpaceSeats is the real Space-side entry point. Its asynchronous
+	// worker may already have run the project step; the direct call is idempotent
+	// and makes this test deterministic about the project-side contract.
+	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-operator",
+		spacemod.MemberRemoveReasonForceRemoved))
+	p.runRemovalCascade()
+	require.Equal(t, epochBefore+1, epochOf(t, created.ProjectID),
+		"closing the Owner's rider seats bumps the project epoch once")
+
+	// A second pass has neither an active rider nor a human seat to close. It
+	// must not move the epoch again.
+	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-operator",
+		spacemod.MemberRemoveReasonForceRemoved))
+	p.runRemovalCascade()
+	require.Equal(t, epochBefore+1, epochOf(t, created.ProjectID))
+
+	owner := memberRow(t, created.ProjectID, "cascade-owner")
+	require.NotNil(t, owner)
+	assert.Equal(t, MemberStatusActive, owner.Status)
+	assert.Zero(t, owner.Removing)
+	assert.Equal(t, RoleOwner, owner.Role)
+
+	bot := memberRow(t, created.ProjectID, "cascade-owner-bot")
+	require.NotNil(t, bot)
+	assert.Equal(t, MemberStatusRemoved, bot.Status)
+	assert.Zero(t, bot.Removing)
+}

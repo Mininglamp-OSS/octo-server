@@ -774,19 +774,11 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 
 // runDisbandSteps executes every registered disband step, logging failures.
 //
-// byCascade is false for every caller at HEAD, and that is a correction to the
-// task brief rather than an omission. The brief states that P0's round-2 review
-// made the Space cascade "disband the project when there is no successor", with
-// a project_cascade_ownerless_disbands_total metric. Measured at e6a46cf: no
-// such metric exists, disbandProject has exactly ONE caller (the handler seam in
-// New), and space_member_removal.go says in as many words that leaving an
-// ownerless project is "the whole P0 treatment: make it visible, decide it with
-// product". So there is no cascade branch to reach.
-//
-// The ByCascade field is kept anyway because the distinction is real the day
-// that branch exists — a project ending because a worker decided so is worth
-// telling apart from one a human disbanded — and adding the field later would
-// mean changing a registered step's signature across modules.
+// The current Space-removal cascade preserves Project Owner rows and only
+// closes their non-Owner agent riders, so no cascade caller reaches this path
+// today. ByCascade remains in the registered payload for the future worker
+// branch: a project ending because automation decided so must stay distinct
+// from a human disband, without changing the cross-module callback signature.
 func (p *Project) runDisbandSteps(disband ProjectDisband) {
 	for _, step := range snapshotDisbandSteps() {
 		if err := step.fn(p.ctx, disband); err != nil {
@@ -839,6 +831,13 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, input []member
 		changed, e = p.addMembersOnce(projectID, spaceID, actorUID, members)
 		return e
 	})
+	if err == nil {
+		uids := make([]string, 0, len(members))
+		for _, item := range members {
+			uids = append(uids, item.UID)
+		}
+		p.syncAllMemberGroupMembers(projectID, spaceID, uids)
+	}
 	return changed, err
 }
 
@@ -1046,21 +1045,20 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 // addOneMember remains a narrow seam for create/legacy callers; it uses the
 // same atomic role-aware implementation as members/add.
 func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, error) {
-	var changed []string
+	var changed bool
 	err := retryOnLockConflict(func() error {
-		var e error
-		changed, e = p.addMembersOnce(projectID, spaceID, actorUID, []memberAdd{{UID: uid, Role: RoleCommon}})
-		return e
+		var err error
+		var changedUIDs []string
+		changedUIDs, err = p.addMembersOnce(projectID, spaceID, actorUID,
+			[]memberAdd{{UID: uid, Role: RoleCommon}})
+		changed = len(changedUIDs) > 0
+		return err
 	})
 	if err != nil {
 		return false, err
 	}
-	return len(changed) > 0, nil
-}
-
-func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bool, error) {
-	changed, err := p.addMembersOnce(projectID, spaceID, actorUID, []memberAdd{{UID: uid, Role: RoleCommon}})
-	return len(changed) > 0, err
+	p.syncAllMemberGroupMembers(projectID, spaceID, []string{uid})
+	return changed, nil
 }
 
 // removeMember runs removeMemberOnce through the bounded lock-conflict retry; see retryOnLockConflict.
@@ -1071,6 +1069,9 @@ func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (
 		removed, e = p.removeMemberOnce(projectID, spaceID, actorUID, targetUID)
 		return e
 	})
+	if err == nil {
+		p.syncAllMemberGroupOwner(projectID)
+	}
 	return removed, err
 }
 
@@ -1193,9 +1194,13 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 
 // leaveProject runs leaveProjectOnce through the bounded lock-conflict retry.
 func (p *Project) leaveProject(projectID, spaceID, uid string) error {
-	return retryOnLockConflict(func() error {
+	err := retryOnLockConflict(func() error {
 		return p.leaveProjectOnce(projectID, spaceID, uid)
 	})
+	if err == nil {
+		p.syncAllMemberGroupOwner(projectID)
+	}
+	return err
 }
 
 // leaveProject closes the caller's own seat.
@@ -1266,6 +1271,9 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 		changed, e = p.changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID, role)
 		return e
 	})
+	if err == nil {
+		p.syncAllMemberGroupOwner(projectID)
+	}
 	return changed, err
 }
 
@@ -1329,11 +1337,15 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 // transferProjectOwner atomically assigns Owner to a current project member and
 // demotes the former Owner to Admin.
 func (p *Project) transferProjectOwner(projectID, spaceID, actorUID, successorUID string) error {
-	return retryOnLockConflict(func() error {
+	err := retryOnLockConflict(func() error {
 		return p.transferProjectOwnerOnce(projectID, spaceID, actorUID, successorUID)
 	})
-}
+	if err == nil {
+		p.syncAllMemberGroupOwner(projectID)
+	}
+	return err
 
+}
 func (p *Project) transferProjectOwnerOnce(projectID, spaceID, actorUID, successorUID string) error {
 	if strings.TrimSpace(successorUID) == "" || successorUID == actorUID {
 		return errMemberNotFound

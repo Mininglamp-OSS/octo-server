@@ -141,7 +141,8 @@ func memberRow(t *testing.T, projectID, uid string) *MemberModel {
 	t.Helper()
 	var rows []*MemberModel
 	_, err := testCtx.DB().SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, "+
+			"COALESCE(joined_at, created_at) AS joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ?", projectID, uid,
 	).Load(&rows)
 	require.NoError(t, err)

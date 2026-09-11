@@ -23,6 +23,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var errGroupMemberNotInGroup = errors.New("none of the members are in this group")
+
 // IService 群相关
 type IService interface {
 	// 获取群总数
@@ -1162,6 +1164,13 @@ type RemoveGroupMembersServiceReq struct {
 	// AllowProtected is reserved for authoritative lifecycle cleanup (Space
 	// removal/disband). User and Bot API callers must leave it false.
 	AllowProtected bool
+
+	// ProjectRemoval/ProjectID mark authoritative Project-seat cleanup. The
+	// removal transaction locks the Project before the native group and member
+	// rows, then rechecks the seat so a concurrent re-admission cannot be
+	// removed after it commits.
+	ProjectRemoval bool
+	ProjectID      string
 }
 
 // RemoveGroupMembersServiceResp 移除群成员响应。
@@ -1883,7 +1892,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		return nil, errors.New("failed to query member info")
 	}
 	if len(targetMembers) == 0 {
-		return nil, errors.New("none of the members are in this group")
+		return nil, errGroupMemberNotInGroup
 	}
 
 	// 过滤：跳过群主、已删除的成员。
@@ -1897,7 +1906,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// 传 false，#354 原样保持。判据见 QueryBotsInvitedByUIDTx 的 requireCommonRole。
 	var removableMembers []*MemberModel
 	for _, m := range targetMembers {
-		if m.IsDeleted == 1 || m.Role == MemberRoleCreator {
+		if m.IsDeleted == 1 || (m.Role == MemberRoleCreator && !req.ProjectRemoval) {
 			continue
 		}
 		removableMembers = append(removableMembers, m)
@@ -1913,6 +1922,72 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		return nil, errors.New("failed to begin transaction")
 	}
 	defer tx.RollbackUnlessCommitted()
+	if req.ProjectRemoval {
+		projectID := strings.TrimSpace(req.ProjectID)
+		if projectID == "" {
+			return nil, errors.New("project removal requires project_id")
+		}
+		var projects []struct {
+			ProjectID string `db:"project_id"`
+			GroupNo   string `db:"group_no"`
+		}
+		if _, err := tx.SelectBySql(
+			"SELECT project_id, all_member_group_no AS group_no "+
+				"FROM `octo_project` WHERE project_id = ? AND status = 1 "+
+				"AND all_member_group_no = ? LIMIT 1 FOR UPDATE",
+			projectID, req.GroupNo,
+		).Load(&projects); err != nil {
+			return nil, fmt.Errorf("lock Project for dedicated-group removal: %w", err)
+		}
+		if len(projects) == 0 {
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("commit stale dedicated-group removal: %w", err)
+			}
+			return &RemoveGroupMembersServiceResp{Removed: 0}, nil
+		}
+		// Lock every target Project seat before the group row. This matches the
+		// shared lifecycle order (Project → Project member → group →
+		// group_member): re-admission cannot commit between this decision and
+		// the native group-member delete.
+		var projectMembers []struct {
+			UID      string `db:"uid"`
+			Status   int    `db:"status"`
+			Removing int    `db:"removing"`
+		}
+		if _, err := tx.SelectBySql(
+			"SELECT uid, status, removing FROM `octo_project_member` "+
+				"WHERE project_id = ? AND uid IN ? FOR UPDATE",
+			projectID, req.Members,
+		).Load(&projectMembers); err != nil {
+			return nil, fmt.Errorf("lock Project membership for group removal: %w", err)
+		}
+		for _, member := range projectMembers {
+			if member.Status == 1 && member.Removing == 0 {
+				if err := tx.Commit(); err != nil {
+					return nil, fmt.Errorf("commit cancelled dedicated-group removal: %w", err)
+				}
+				return &RemoveGroupMembersServiceResp{Removed: 0}, nil
+			}
+		}
+		var groups []struct {
+			ProjectID string `db:"project_id"`
+			Status    int    `db:"status"`
+		}
+		if _, err := tx.SelectBySql(
+			"SELECT project_id, status FROM `group` "+
+				"WHERE group_no = ? LIMIT 1 FOR UPDATE",
+			req.GroupNo,
+		).Load(&groups); err != nil {
+			return nil, fmt.Errorf("lock dedicated group for removal: %w", err)
+		}
+		if len(groups) == 0 || groups[0].Status == GroupStatusDisband ||
+			groups[0].ProjectID != projectID {
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("commit detached dedicated-group removal: %w", err)
+			}
+			return &RemoveGroupMembersServiceResp{Removed: 0}, nil
+		}
+	}
 
 	var removedUIDs []string
 	var removedVos []*config.UserBaseVo
@@ -1958,7 +2033,12 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		// 自助路径（bot 所有者）在事务外只放行普通角色目标，锁内必须用同一口径：
 		// 否则窗口内 Common→Manager 的提升会通过重查、行真的被删，且 removedUIDs
 		// 里有它，连调用方的集合比对都发现不了。其余路径沿用「只排除 Creator」。
-		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
+		var stillRemovable bool
+		if req.ProjectRemoval {
+			stillRemovable, err = s.db.LockProjectRemovalMemberTx(req.GroupNo, m.UID, tx)
+		} else {
+			stillRemovable, err = s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
+		}
 		if err != nil {
 			s.Error("re-read member role failed", zap.Error(err), zap.String("uid", m.UID))
 			return nil, errors.New("failed to re-read member role")
@@ -2045,6 +2125,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	}
 
 	// IM 操作（事务提交之后）
+	var imRemoveErr error
 	if len(removedUIDs) > 0 {
 		// 移除 IM 订阅
 		if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
@@ -2053,6 +2134,13 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 			Subscribers: removedUIDs,
 		}); err != nil {
 			s.Error("remove IM subscriber failed", zap.Error(err))
+			if req.ProjectRemoval {
+				// Project removal is an outbox step. Return the transport
+				// failure after all post-commit cleanup below has run so the
+				// callback retries the broker operation without changing the
+				// user-facing best-effort semantics of native removals.
+				imRemoveErr = err
+			}
 		}
 
 		// 发送被踢消息
@@ -2112,10 +2200,14 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		}
 	}
 
-	return &RemoveGroupMembersServiceResp{
+	resp := &RemoveGroupMembersServiceResp{
 		Removed:     len(removedUIDs),
 		RemovedUIDs: removedUIDs,
-	}, nil
+	}
+	if imRemoveErr != nil {
+		return resp, fmt.Errorf("remove project-member IM subscriber: %w", imRemoveErr)
+	}
+	return resp, nil
 }
 
 // UpdateGroupInfo 更新群信息

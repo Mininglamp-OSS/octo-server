@@ -30,6 +30,7 @@ func TestTranslate_PrefersRequestedLang(t *testing.T) {
 		{"en-US", "err.shared.auth.required", "en-US", "Please log in to continue."},
 		{"rate.limited zh", "err.shared.rate.limited", "zh-CN", "请求过于频繁，请稍后再试。"},
 		{"rate.limited en", "err.shared.rate.limited", "en-US", "Too many requests, please try again later."},
+		{"project member not found zh", "err.server.project.member_not_found", "zh-CN", "项目成员不存在或已被移除。"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

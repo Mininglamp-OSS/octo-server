@@ -45,7 +45,7 @@ func (g *Group) registerPresetGroupAdmitter() {
 // operator would put a name on an action that person did not take, and the
 // alternatives (empty, or a system uid) are worse: empty loses the fact that
 // this was self-service, and a system uid claims a bot did it.
-func (g *Group) admitToPresetGroup(ctx *config.Context, _ string, groupNo, uid string) error {
+func (g *Group) admitToPresetGroup(ctx *config.Context, spaceID, groupNo, uid string) error {
 	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {
 		return fmt.Errorf("group: preset admission GenSeq: %w", err)
@@ -69,6 +69,23 @@ func (g *Group) admitToPresetGroup(ctx *config.Context, _ string, groupNo, uid s
 	}
 	if count != 1 {
 		return fmt.Errorf("group: preset admission: group %s not found", groupNo)
+	}
+	var dedicated []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM `octo_project` p "+
+			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no "+
+			"  AND g.project_id = p.project_id "+
+			"WHERE p.space_id = ? AND p.status = 1 "+
+			"  AND p.all_member_group_no = ? AND g.status <> 2 LIMIT 1",
+		spaceID, groupNo,
+	).Load(&dedicated); err != nil {
+		return fmt.Errorf("group: preset admission check dedicated group: %w", err)
+	}
+	if len(dedicated) > 0 {
+		// The Project pointer, not the native project_id relation by itself,
+		// makes this group a live all-member projection. Preset admission must
+		// not create a native member outside the Project seat set.
+		return nil
 	}
 
 	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{{

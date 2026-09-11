@@ -1,10 +1,5 @@
-// Package project exposes read-only Project membership and attribution facts
-// that other modules need without importing modules/project.
-//
-// CheckMembership and MemberRole are plain session-runner predicates shared by
-// reconcile and authorization reads. ResolveForGroup answers whether a group
-// belongs to an active Project in the requested Space, and MembershipsInSpace
-// batches the membership facts needed by verification.
+// Package project exposes read-only Project membership facts that other modules
+// need without importing modules/project.
 //
 // This package must never import modules/project (pinned by
 // TestPkgProjectDoesNotImportModulesProject); doing so would put the import
@@ -14,94 +9,6 @@ package project
 import (
 	"github.com/gocraft/dbr/v2"
 )
-
-// CheckMembership reports whether uid is an active member of projectID, for
-// READ paths such as the reconcile scans and the /v1/auth/verify read contract.
-//
-// It is session-scoped and carries the `removing = 0` clause, so every
-// authorization read in the product answers "is this a member?" the same way
-// while a seat is closing. Do NOT use it to gate a write: a session read runs
-// outside the caller's transaction and cannot see the state the write will
-// commit against.
-func CheckMembership(session *dbr.Session, projectID string, uid string) (bool, error) {
-	if projectID == "" || uid == "" {
-		return false, nil
-	}
-	var count int
-	err := session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` "+
-			"WHERE project_id = ? AND uid = ? AND status = 1 AND removing = 0",
-		projectID, uid,
-	).LoadOne(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
-// MemberRole returns uid's role in projectID and whether they hold an active
-// seat at all. ok=false means "not an active member", and role is then
-// meaningless — callers must check ok before reading role.
-//
-// Role numbers are octo_project_member.role: 0 = member, 1 = admin, 2 = owner.
-// Consumers outside octo-server must NOT be handed these to derive permissions
-// from; the verify read contract emits explicit capabilities alongside the role
-// for exactly that reason (D11).
-// The runner is an interface rather than *dbr.Session so a caller that has
-// already opened a transaction can pass its *dbr.Tx. dbr.SessionRunner is the
-// repo's existing way of saying "either one" (modules/user/db_manager.go);
-// widening to it changes no call site.
-func MemberRole(session dbr.SessionRunner, projectID string, uid string) (role int, ok bool, err error) {
-	if projectID == "" || uid == "" {
-		return 0, false, nil
-	}
-	var roles []int
-	rows, err := session.SelectBySql(
-		"SELECT role FROM `octo_project_member` "+
-			"WHERE project_id = ? AND uid = ? AND status = 1 AND removing = 0 LIMIT 1",
-		projectID, uid,
-	).Load(&roles)
-	if err != nil {
-		return 0, false, err
-	}
-	if rows == 0 || len(roles) == 0 {
-		return 0, false, nil
-	}
-	return roles[0], true, nil
-}
-
-// ResolveForGroup answers whether a group in spaceID may be attributed to
-// projectID: the project must exist, be active, and belong to that same Space.
-//
-// ok=false covers all three failures — absent, disbanded, and cross-Space — and
-// the caller must NOT distinguish them on the wire. Doing so turns "create a
-// group" into an oracle: an attacker with a project id they cannot see could
-// learn whether it exists and which Space it lives in, from a Space they do have
-// access to. The reason belongs in the log.
-//
-// Deliberately does NOT check whether the caller is a member of the project.
-// Caller-specific authorization belongs to the operation's own transaction,
-// rather than to this read-only attribution lookup, because a separate read
-// could go stale before the write commits.
-//
-// The status literal is spelled out rather than importing modules/project's
-// constant, for the same reason pkg/space spells out space.status: the import
-// would be a cycle.
-func ResolveForGroup(session *dbr.Session, spaceID, projectID string) (bool, error) {
-	if spaceID == "" || projectID == "" {
-		return false, nil
-	}
-	var count int
-	err := session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project` "+
-			"WHERE project_id = ? AND space_id = ? AND status = 1",
-		projectID, spaceID,
-	).LoadOne(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
 
 // Membership is one project's membership fact for a uid.
 type Membership struct {
@@ -160,4 +67,23 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 		out[r.ProjectID] = r
 	}
 	return out, nil
+}
+
+// IsAllMemberGroup reports whether groupNo is the active Project's dedicated
+// all-member group. The Project pointer is authoritative: a normal group with
+// project_id set is intentionally not treated as protected or synchronized.
+func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, error) {
+	if session == nil || projectID == "" || groupNo == "" {
+		return false, nil
+	}
+	var rows []int
+	_, err := session.SelectBySql(
+		"SELECT 1 FROM `octo_project` p "+
+			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no "+
+			"  AND g.project_id = p.project_id "+
+			"WHERE p.project_id = ? AND p.status = 1 "+
+			"  AND p.all_member_group_no = ? AND g.status <> 2 LIMIT 1",
+		projectID, groupNo,
+	).Load(&rows)
+	return len(rows) > 0, err
 }

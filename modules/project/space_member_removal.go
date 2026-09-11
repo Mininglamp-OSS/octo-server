@@ -138,7 +138,7 @@ func (p *Project) cleanupSpaceMemberProjects(ctx *config.Context, removal spacem
 
 		progressed := false
 		for _, projectID := range projectIDs {
-			changed, err := p.deactivateSeatForCascade(
+			result, err := p.deactivateSeatForCascadeResult(
 				projectID, removal.SpaceID, removal.UID, removal.OperatorUID, removal.Reason)
 			if err != nil {
 				p.Error("被移出 Space 的成员退出项目失败",
@@ -149,11 +149,13 @@ func (p *Project) cleanupSpaceMemberProjects(ctx *config.Context, removal spacem
 				}
 				continue
 			}
-			if changed {
+			if result.changed {
 				closed++
 				progressed = true
-				p.audit(auditCascade, removal.OperatorUID, removal.UID, projectID,
-					removal.SpaceID, removal.Reason)
+				if result.memberChanged {
+					p.audit(auditCascade, removal.OperatorUID, removal.UID, projectID,
+						removal.SpaceID, removal.Reason)
+				}
 			}
 		}
 		// Nothing changed this pass, so the next query would return the same rows: looping
@@ -199,17 +201,34 @@ func (p *Project) cleanupSpaceMemberProjects(ctx *config.Context, removal spacem
 	return errCascadeIncomplete
 }
 
-// deactivateSeatForCascade closes one seat in its own short transaction.
+// deactivateSeatForCascade keeps the historical bool contract for package-local
+// callers: true means that this project had at least one seat transition.
+//
+// The implementation returns the extra memberChanged bit to the walk so an
+// Owner preserved for later ownership transfer is not audited as removed.
+func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID, reason string) (bool, error) {
+	result, err := p.deactivateSeatForCascadeResult(projectID, spaceID, uid, operatorUID, reason)
+	return result.changed, err
+}
+
+type cascadeSeatResult struct {
+	changed       bool
+	memberChanged bool
+}
+
+// deactivateSeatForCascadeResult closes one seat in its own short transaction.
 //
 // One transaction per project, not one for the walk: holding the lock on every
 // project a member belongs to, for the duration of the walk, would block concurrent
 // membership writes across all of them. Short transactions also mean a lease
 // expiring mid-walk costs at most a repeated no-op rather than a rollback.
-func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID, reason string) (bool, error) {
+func (p *Project) deactivateSeatForCascadeResult(
+	projectID, spaceID, uid, operatorUID, reason string,
+) (cascadeSeatResult, error) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
-		return false, fmt.Errorf("project: begin cascade seat close: %w", err)
+		return cascadeSeatResult{}, fmt.Errorf("project: begin cascade seat close: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
@@ -230,126 +249,74 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 	// Lock order: space -> project, taken in that order below.
 	stillSeated, err := p.db.checkSpaceSeatForCleanupTx(tx, spaceID, uid)
 	if err != nil {
-		return false, err
+		return cascadeSeatResult{}, err
 	}
 	if stillSeated {
-		p.Info("级联动手前复核：成员已重新持有 Space 席位，跳过关闭项目席位",
-			zap.String("projectId", projectID), zap.String("spaceId", spaceID),
-			zap.String("uid", uid))
-		return false, nil
+		if err := tx.Commit(); err != nil {
+			return cascadeSeatResult{}, fmt.Errorf("project: commit cascade no-op: %w", err)
+		}
+		return cascadeSeatResult{}, nil
 	}
 
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
-		return false, err
+		return cascadeSeatResult{}, err
 	}
 	if row == nil {
-		// The project is disbanded (or gone). disbandProject closes every seat in the same
-		// transaction, so normally there is nothing here — but close the row anyway rather
-		// than returning "nothing done". An active seat on a disbanded project is an I1
-		// violation the reconcile scan would report forever, and skipping it would also make
-		// the caller's loop see "no progress" and stop with the seat still active.
-		//
-		// No epoch bump: the project is disbanded, so no consumer is watching its epoch, and
-		// disband already moved it.
-		changed, err := p.db.deactivateMemberTx(tx, projectID, uid, now)
+		changed, err := p.db.deactivateStaleMemberTx(tx, projectID, uid, now)
 		if err != nil {
-			return false, err
+			return cascadeSeatResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("project: commit stale seat close: %w", err)
+			return cascadeSeatResult{}, fmt.Errorf("project: commit stale-project cleanup: %w", err)
 		}
 		if changed {
 			p.invalidateProjectMemberCache(projectID, uid)
 		}
-		return changed, nil
+		return cascadeSeatResult{changed: changed}, nil
 	}
 
-	// KNOWN END STATE, deliberately not resolved here: if the departing member is the
-	// project's only owner, this closes their seat and leaves the project active with no
-	// owner. Role change and disband are owner-only in P0 and a Space admin has read access
-	// only, so such a project cannot be renamed, disbanded or re-owned.
+	// The Owner row is deliberately preserved by deactivateMemberTx. Losing a Space
+	// seat removes the person's Project authorization through the Space gate, but
+	// retaining the unique Owner identity lets a later rejoin transfer ownership
+	// without silently assigning control to somebody else.
 	//
-	// Not handled in P0 because the fix is a PRODUCT decision, not a technical gap: auto-
-	// promoting a member changes who controls a project without anyone asking, and auto-
-	// disbanding destroys data. The brief scopes this step to exactly "deactivate every active
-	// row for (space_id, uid) and bump member_epoch when rows were affected"; both of those
-	// resolutions are outside it. Recorded as an Open question in the task brief.
-	//
-	// It is also the SAME end state this repo already accepts one layer down: group's
-	// handOverGroupCreator leaves an ownerless group when nobody can inherit, and documents
-	// that as consistent with the existing groupExit outcome. So this is not a new class of
-	// bad state, and it is not a security one either — no access is widened, nothing leaks;
-	// the members simply keep a project none of them can administer until the P2 admin
-	// surface can adopt it.
-	//
-	// The Warn below is the whole P0 treatment: make it visible, decide it with product.
-	//
-	// Detect-only, read in this transaction so the log line cannot describe a state that had
-	// already changed by the time it was written.
-	wasSoleOwner := false
+	// D13 still applies to an Owner: their non-Owner agent riders must leave this
+	// Project even though the Owner row itself is protected. Keep the rider query
+	// inside this transaction so the project row lock serializes it with every
+	// membership write for this project.
 	member, err := p.db.queryMemberTx(tx, projectID, uid)
 	if err != nil {
-		return false, err
+		return cascadeSeatResult{}, err
 	}
-	if member != nil && member.Status == MemberStatusActive && member.Role == RoleOwner {
-		owners, err := p.db.countActiveOwnersTx(tx, projectID)
+	isActiveMember := member != nil &&
+		member.Status == MemberStatusActive && member.Removing == 0
+	preserveOwner := isActiveMember && member.Role == RoleOwner
+
+	var agents []string
+	if isActiveMember {
+		// Read before changing the human row. The query only returns active,
+		// non-Owner agent seats, and the Owner predicate in its SQL remains a
+		// final defense against a historical illegal bot-owner row.
+		agents, err = p.db.queryOwnedAgentSeatsTx(tx, projectID, uid)
 		if err != nil {
-			return false, err
+			return cascadeSeatResult{}, err
 		}
-		wasSoleOwner = owners <= 1
 	}
 
-	// D13 — the departing member's OWN agents lose their seats with them, read
-	// BEFORE the member's row is touched (queryOwnedAgentSeatsTx filters on
-	// status = 1 AND removing = 0, so reading after would come back short).
-	//
-	// The HUMAN's seat closes directly (status = 0) on this path, because the
-	// Space removal that drove this job also runs modules/group's
-	// cleanupSpaceMemberGroups and the group side is therefore already covered
-	// for them. THE AGENTS GET THE TWO-PHASE CLOSE INSTEAD, and the difference is
-	// the whole point.
-	//
-	// An earlier version of this comment claimed the group side covered the agents
-	// too, "because RemoveGroupMembers pulls the leaver's bots out of every group
-	// with them (#354)". That is true only of the groups the LEAVER is in:
-	// cleanupSpaceMemberGroups enumerates queryGroupsWithMemberUIDAndSpaceID for
-	// the departing person, and RemoveGroupMembers then cascades their bots WITHIN
-	// those groups. An agent sitting in a project group its owner is not a member
-	// of — which D15 makes ordinary, since any member may seat their own agent and
-	// any member may create a project group — is never visited.
-	//
-	// The end state that produced was an I2 violation nothing repairs: the agent
-	// loses its project seat and stays an active member of that group, its own
-	// space_member row was never touched so no Space cascade revisits it, no
-	// project-side job was ever enqueued, and the I2 scan is report-only. Its
-	// owner, now outside the Space, keeps a proxy reading a project group.
-	//
-	// So the agents go through beginMemberRemovalTx + enqueueRemovalJobTx exactly
-	// as the kick and leave paths do (beginRemovalWithAgentsTx), and P1's detach
-	// step then removes that uid from EVERY group of the project rather than from
-	// the subset its owner happened to share. Direct-closing them instead would
-	// also have made the job a no-op even if it were enqueued: removalCancelled
-	// retires any job whose member reads removing = 0, which a directly-closed
-	// seat does.
-	agents, err := p.db.queryOwnedAgentSeatsTx(tx, projectID, uid)
+	memberChanged, err := p.db.deactivateMemberTx(tx, projectID, uid, now)
 	if err != nil {
-		return false, err
-	}
-
-	changed, err := p.db.deactivateMemberTx(tx, projectID, uid, now)
-	if err != nil {
-		return false, err
+		return cascadeSeatResult{}, err
 	}
 	removingAgents := make([]string, 0, len(agents))
-	if changed {
+	if memberChanged || preserveOwner {
 		for _, agentUID := range agents {
 			if agentUID == "" || agentUID == uid {
 				continue
 			}
 			agentChanged, err := p.db.beginMemberRemovalTx(tx, projectID, agentUID, now)
 			if err != nil {
-				return false, err
+				return cascadeSeatResult{}, err
 			}
 			if !agentChanged {
 				continue
@@ -370,20 +337,28 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 				OperatorUID: operatorUID,
 				Reason:      reason,
 			}, now); err != nil {
-				return false, err
+				return cascadeSeatResult{}, err
 			}
 			removingAgents = append(removingAgents, agentUID)
 		}
-		closingUIDs := make([]string, 0, 1+len(removingAgents))
-		closingUIDs = append(closingUIDs, uid)
+	}
+
+	// A preserved Owner with no changed riders is a true no-op. When riders do
+	// close, they are the membership change and move the epoch exactly once.
+	seatChanged := memberChanged || len(removingAgents) > 0
+	if seatChanged {
+		closingUIDs := make([]string, 0, len(removingAgents)+1)
+		if memberChanged {
+			closingUIDs = append(closingUIDs, uid)
+		}
 		closingUIDs = append(closingUIDs, removingAgents...)
 		rolesCleared, err := p.db.deleteMemberCollaborationRolesTx(tx, projectID, closingUIDs)
 		if err != nil {
-			return false, err
+			return cascadeSeatResult{}, err
 		}
 		if rolesCleared {
 			if err := p.db.bumpCollaborationRoleEpochTx(tx, projectID); err != nil {
-				return false, err
+				return cascadeSeatResult{}, err
 			}
 		}
 		// Only when a row actually changed. The step is re-run on every job retry, so
@@ -394,18 +369,21 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 		// leaving with their agents is one membership change, and the epoch is
 		// asserted to move by exactly +1 per write.
 		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
-			return false, err
+			return cascadeSeatResult{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("project: commit cascade seat close: %w", err)
+		return cascadeSeatResult{}, fmt.Errorf("project: commit cascade seat close: %w", err)
 	}
-	if changed {
-		// Invalidate even though this is a background path. The Space gate already
-		// closed synchronously when the Space removal committed, so this is not the
-		// isolation boundary — but leaving a stale positive role cached would make the
-		// project's own membership answer disagree with the database for a full TTL.
-		p.invalidateProjectMemberCache(projectID, uid)
+	if seatChanged {
+		if memberChanged {
+			// Invalidate even though this is a background path. The Space gate already
+			// closed synchronously when the Space removal committed, so this is not
+			// the isolation boundary — but leaving a stale positive role cached would
+			// make the project's own membership answer disagree with the database for
+			// a full TTL.
+			p.invalidateProjectMemberCache(projectID, uid)
+		}
 		// removing = 1 already makes the agent a non-member for every authorization
 		// read, so the cached role is stale from this commit, not from the worker's
 		// later close.
@@ -420,10 +398,8 @@ func (p *Project) deactivateSeatForCascade(projectID, spaceID, uid, operatorUID,
 				auditReasonAgentFollowsOwner)
 		}
 	}
-	if changed && wasSoleOwner {
-		p.Warn("项目唯一 owner 已被移出 Space，项目暂时无人可管理（P0 已知终局，处置待产品决策）",
-			zap.String("projectId", projectID), zap.String("spaceId", spaceID),
-			zap.String("uid", uid))
-	}
-	return changed, nil
+	return cascadeSeatResult{
+		changed:       seatChanged,
+		memberChanged: memberChanged,
+	}, nil
 }

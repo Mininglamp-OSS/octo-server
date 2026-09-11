@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 )
 
 // sqlListProjectGroupRelationsByProjectIDs is the single batched relation query
@@ -26,7 +27,7 @@ const sqlListProjectGroupRelationsByProjectIDs = "SELECT project_id, group_no, n
 	"AND s.project_id = g.project_id COLLATE utf8mb4_general_ci " +
 	"AND s.group_no = g.group_no COLLATE utf8mb4_general_ci " +
 	"AND s.uid = ? " +
-	"WHERE g.space_id = ? AND g.project_id IN ? AND g.status <> ?" +
+	"WHERE g.space_id = ? AND g.project_id IN ? AND g.status <> ? AND g.purpose <> ?" +
 	") AS ranked " +
 	"WHERE project_row_num <= ? " +
 	"ORDER BY project_id ASC, pinned DESC, " +
@@ -104,8 +105,8 @@ func (d *DB) listProjectGroupRelations(
 	if err != nil {
 		return nil, 0, err
 	}
-	countWhere := "g.space_id = ? AND g.project_id = ? AND g.status <> ?"
-	countArgs := []interface{}{access.SpaceID, access.ProjectID, groupStatusDisband}
+	countWhere := "g.space_id = ? AND g.project_id = ? AND g.status <> ? AND g.purpose <> ?"
+	countArgs := []interface{}{access.SpaceID, access.ProjectID, groupStatusDisband, aiteampkg.GroupPurpose}
 	if keyword != "" {
 		countWhere += " AND g.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'"
 		countArgs = append(countArgs, []byte(projectGroupLike(keyword)))
@@ -216,7 +217,7 @@ func (d *DB) listProjectGroupRelationsByProjectIDs(
 
 	query := sqlListProjectGroupRelationsByProjectIDs
 	var rows []*projectGroupRelationRow
-	if _, err := tx.SelectBySql(query, actorUID, spaceID, activeProjectIDs, groupStatusDisband, limit).Load(&rows); err != nil {
+	if _, err := tx.SelectBySql(query, actorUID, spaceID, activeProjectIDs, groupStatusDisband, aiteampkg.GroupPurpose, limit).Load(&rows); err != nil {
 		return nil, fmt.Errorf("%w: list sidebar Project groups: %v", ErrGroupProjectDependency, err)
 	}
 	for _, row := range rows {

@@ -23,21 +23,16 @@ const (
 
 // Environment knobs for eager subsystem provisioning (brief D2, Shape S).
 //
-// Exported where main.go needs the value: the two secret envs are fed into
-// cardactiondispatch.Registry.ValidateNotifyTokenExclusions, which is the ONLY
-// place that also sees the dynamic per-route notify tokens and callback secrets
-// loaded from OCTO_CARD_ACTION_ROUTES. This module can check its two secrets
-// against each other and against the four fixed sibling internal-token envs, but
-// it cannot see route-level credentials — so without that call a single leaked
-// value could authorize BOTH provisioning into a subsystem AND minting a card
-// action, which is exactly the "one credential / one capability" invariant the
-// exclusions guard exists to hold.
+// Exported where main.go needs the values: Fleet's HMAC secret and Drive's
+// internal service token are fed into cardactiondispatch.Registry.ValidateNotifyTokenExclusions,
+// which is the ONLY place that also sees the dynamic per-route notify tokens and
+// callback secrets loaded from OCTO_CARD_ACTION_ROUTES. A single leaked value must
+// never authorize both provisioning into a subsystem and minting a card action.
 const (
-	// ProvisionFleetSecretEnv / ProvisionDriveSecretEnv are the per-target HMAC
-	// secrets. One per target on purpose: a leaked fleet secret must not also
-	// provision drive containers.
+	// ProvisionFleetSecretEnv is Fleet's per-target HMAC secret.
 	ProvisionFleetSecretEnv = "OCTO_PROJECT_PROVISION_FLEET_SECRET"
-	ProvisionDriveSecretEnv = "OCTO_PROJECT_PROVISION_DRIVE_SECRET"
+	// DriveInternalTokenEnv is Drive's X-Internal-Token credential.
+	DriveInternalTokenEnv = "OCTO_DRIVE_INTERNAL_TOKEN"
 
 	// envProvisionTargets is the enablement switch, and it is a LIST rather than
 	// a boolean so the two subsystems can be turned on independently — they are
@@ -86,9 +81,8 @@ const (
 	// irreversible operation in this slice, so it is the one thing that must not run on an
 	// assumption.
 	//
-	// PER TARGET, and not one process-global switch, because a consumer is a per-subsystem
-	// deliverable: fleet and drive land on different teams' schedules, which is why every
-	// other subsystem fact here (enablement, URL, secret, narrowing) is already per target.
+	// other subsystem fact here (enablement, URL, credential, narrowing) is already
+	// per target.
 	// A global switch means the FIRST subsystem to ship a consumer authorizes deletion of
 	// the OTHER one's reclaim records — an irreversible loss, for a target whose consumer
 	// nobody claimed was live, on the rollout order the runbook actually prescribes.
@@ -144,14 +138,16 @@ const (
 	envProvisionMaxAttempts = "OCTO_PROJECT_PROVISION_MAX_ATTEMPTS"
 	envProvisionBatch       = "OCTO_PROJECT_PROVISION_BATCH"
 
-	// Sibling FIXED internal-token envs. A provisioning secret must differ from
-	// every one of them so a single leaked value cannot grant two capabilities.
-	// Same intra-set guard as modules/internal_resolve/config.go; the dynamic
-	// route-level credentials are covered centrally in main.go (see above).
+	// Sibling FIXED internal-token envs. Each provisioning credential must
+	// differ from every other capability so one leaked value cannot authorize
+	// two operations. The dynamic route-level credentials are covered centrally
+	// in main.go (see above).
 	siblingNotifyTokenEnv     = "NOTIFY_INTERNAL_TOKEN"
 	siblingDocsNotifyTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
 	siblingBotMentionTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
-	siblingDriveInternalToken = "OCTO_DRIVE_INTERNAL_TOKEN"
+	// Keep this local alias for the intra-module collision loop and its tests;
+	// the exported DriveInternalTokenEnv is the configuration contract.
+	siblingDriveInternalToken = DriveInternalTokenEnv
 )
 
 // Provisioning defaults.
@@ -221,10 +217,10 @@ type provisionTarget struct {
 }
 
 // ProvisioningConfig is the resolved per-process provisioning configuration.
-//
-// It holds secrets. Nothing in this package logs or serializes it, and nothing
-// should start: a %+v of this struct in a log line would publish both HMAC
-// secrets. The provisioning worker logs target NAMES only.
+// It holds credentials. Nothing in this package logs or serializes it, and nothing
+// should start: a %+v of this struct in a log line would publish either Fleet's
+// HMAC secret or Drive's internal token. The provisioning worker logs target
+// NAMES only.
 type ProvisioningConfig struct {
 	// Targets is the enabled, VALIDATED set. A target named in
 	// OCTO_PROJECT_PROVISION_TARGETS but misconfigured is absent from here — see
@@ -350,7 +346,13 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 		return cfg, problems
 	}
 
-	secrets := map[string]string{}
+	credentials := map[string]string{}
+	requestedCredentialEnvs := make(map[string]struct{}, len(requested))
+	for _, requestedName := range requested {
+		if envs, ok := targetEnvNames(requestedName); ok {
+			requestedCredentialEnvs[envs.secret] = struct{}{}
+		}
+	}
 	for _, name := range requested {
 		envs, ok := targetEnvNames(name)
 		if !ok {
@@ -358,14 +360,20 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 			cfg.Misconfigured = append(cfg.Misconfigured, name)
 			continue
 		}
-		secret := getenv(envs.secret)
+		credential := getenv(envs.secret)
+		wireTarget := projectprovision.Target{
+			Name:      name,
+			EnsureURL: getenv(envs.url),
+			Auth:      envs.auth,
+			Timeout:   cfg.Timeout,
+		}
+		if envs.auth == projectprovision.AuthInternalToken {
+			wireTarget.InternalToken = credential
+		} else {
+			wireTarget.Secret = credential
+		}
 		target := provisionTarget{
-			Target: projectprovision.Target{
-				Name:      name,
-				EnsureURL: getenv(envs.url),
-				Secret:    secret,
-				Timeout:   cfg.Timeout,
-			},
+			Target:   wireTarget,
 			Narrowed: envBoolFrom(getenv, envs.narrowed, false),
 		}
 		if err := projectprovision.ValidateTarget(target.Target); err != nil {
@@ -373,12 +381,14 @@ func loadProvisioningConfig(getenv func(string) string) (ProvisioningConfig, []e
 			cfg.Misconfigured = append(cfg.Misconfigured, name)
 			continue
 		}
-		if err := checkSecretExclusivity(getenv, name, secret, secrets); err != nil {
+		if err := checkSecretExclusivity(
+			getenv, name, credential, envs.secret, credentials, requestedCredentialEnvs,
+		); err != nil {
 			problems = append(problems, err)
 			cfg.Misconfigured = append(cfg.Misconfigured, name)
 			continue
 		}
-		secrets[name] = secret
+		credentials[name] = credential
 		cfg.Targets = append(cfg.Targets, target)
 	}
 	problems = appendDisabledRequeueProblem(problems, cfg)
@@ -441,14 +451,24 @@ func parseProvisionTimeout(getenv func(string) string) (time.Duration, error) {
 	return d, nil
 }
 
-// checkSecretExclusivity refuses a secret that is reused across targets or shared
+// checkSecretExclusivity refuses a credential reused across targets or shared
 // with a fixed sibling internal token.
 //
+// credentialEnv identifies the current target's env so Drive does not reject
+// its own configured X-Internal-Token as a sibling collision. A credential env
+// belonging to another requested target is checked by the accepted-target map
+// instead, so the first requested target remains the one that survives a
+// duplicate configuration.
 // Messages never carry the value, and never carry its length either.
-func checkSecretExclusivity(getenv func(string) string, name, secret string, already map[string]string) error {
-	for otherName, otherSecret := range already {
-		if secret == otherSecret {
-			return fmt.Errorf("project provisioning: %s secret must differ from the %s secret", name, otherName)
+func checkSecretExclusivity(
+	getenv func(string) string,
+	name, credential, credentialEnv string,
+	already map[string]string,
+	requestedCredentialEnvs map[string]struct{},
+) error {
+	for otherName, otherCredential := range already {
+		if credential == otherCredential {
+			return fmt.Errorf("project provisioning: %s credential must differ from the %s credential", name, otherName)
 		}
 	}
 	for _, siblingEnv := range []string{
@@ -457,8 +477,14 @@ func checkSecretExclusivity(getenv func(string) string, name, secret string, alr
 		siblingBotMentionTokenEnv,
 		siblingDriveInternalToken,
 	} {
-		if sibling := getenv(siblingEnv); sibling != "" && sibling == secret {
-			return fmt.Errorf("project provisioning: %s secret must differ from %s", name, siblingEnv)
+		if siblingEnv == credentialEnv {
+			continue
+		}
+		if _, requestedTarget := requestedCredentialEnvs[siblingEnv]; requestedTarget {
+			continue
+		}
+		if sibling := getenv(siblingEnv); sibling != "" && sibling == credential {
+			return fmt.Errorf("project provisioning: %s credential must differ from %s", name, siblingEnv)
 		}
 	}
 	return nil
@@ -466,10 +492,11 @@ func checkSecretExclusivity(getenv func(string) string, name, secret string, alr
 
 // provisionTargetEnvs is the env set that belongs to one target. A struct rather than
 // four return values: the group only grows, and positional returns of the same type are
-// exactly how a url ends up read out of a secret env.
+// exactly how a URL ends up read out of a credential env.
 type provisionTargetEnvs struct {
 	url                 string
 	secret              string
+	auth                projectprovision.AuthMode
 	narrowed            string
 	reclaimConsumerLive string
 }
@@ -517,6 +544,7 @@ var provisionTargetRegistry = []provisionTargetSpec{
 		envs: provisionTargetEnvs{
 			url:                 envProvisionFleetURL,
 			secret:              ProvisionFleetSecretEnv,
+			auth:                projectprovision.AuthHMAC,
 			narrowed:            envProvisionFleetNarrowed,
 			reclaimConsumerLive: envProvisionFleetReclaimConsumerLive,
 		},
@@ -526,7 +554,8 @@ var provisionTargetRegistry = []provisionTargetSpec{
 		name: TargetDrive,
 		envs: provisionTargetEnvs{
 			url:                 envProvisionDriveURL,
-			secret:              ProvisionDriveSecretEnv,
+			secret:              DriveInternalTokenEnv,
+			auth:                projectprovision.AuthInternalToken,
 			narrowed:            envProvisionDriveNarrowed,
 			reclaimConsumerLive: envProvisionDriveReclaimConsumerLive,
 		},

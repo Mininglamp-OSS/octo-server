@@ -147,6 +147,13 @@ var (
 		DefaultMessage: "The group owner and managers cannot be removed through the bot API.",
 		SafeDetailKeys: []string{"uid"},
 	})
+	// ErrBotAPIAllMemberGroupProtected refuses bot-admin membership mutations
+	// against a Project's dedicated all-member group.
+	ErrBotAPIAllMemberGroupProtected = register(codes.Code{
+		ID:             "err.server.bot_api.all_member_group_protected",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
+	})
 	// ErrBotAPINotSpaceMember covers the bot/user-not-a-space-member guard.
 	ErrBotAPINotSpaceMember = register(codes.Code{
 		ID:             "err.server.bot_api.not_space_member",

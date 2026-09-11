@@ -107,6 +107,33 @@ func TestUpdateProjectGroupSettingRepeatedPinKeepsTimestamp(t *testing.T) {
 	assert.Equal(t, 1, repinned.Pinned)
 	assert.NotNil(t, repinned.PinnedAt, "false-to-true must receive a new server timestamp")
 }
+func TestUpdateProjectGroupSettingRepairsLegacyPinnedTimestamp(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerToken, "group-pin-legacy-null")
+	groupNo := util.GenerUUID()
+	seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
+
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO octo_project_group_user_setting "+
+			"(space_id, project_id, group_no, uid, pinned, pinned_at, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, 1, NULL, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+		spaceA, created.ProjectID, groupNo, "owner1",
+	).Exec()
+	require.NoError(t, err)
+
+	path := "/v1/projects/" + created.ProjectID + "/groups/" + groupNo + "/setting"
+	w := doJSON(t, srv, http.MethodPut, path, ownerToken, map[string]any{"pinned": true})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	repaired, ok := readProjectGroupPinWriteRow(t, spaceA, created.ProjectID, groupNo, "owner1")
+	require.True(t, ok)
+	assert.Equal(t, 1, repaired.Pinned)
+	assert.NotNil(t, repaired.PinnedAt,
+		"repeating pin must repair a legacy pinned row whose timestamp is NULL")
+}
 
 func TestUpdateProjectGroupSettingRejectsInvalidBodyAndRelations(t *testing.T) {
 	srv, _ := setup(t)

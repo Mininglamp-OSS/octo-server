@@ -741,21 +741,17 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// Space role lookup AND route notify. Registered by qualified constant,
 		// not a literal, so main_wiring_test.go can assert it stays present.
 		os.Getenv(space.MarketplaceInternalTokenEnv),
-		// The two project provisioning secrets, for the same reason and with the same
+		// The two project provisioning credentials, for the same reason and with the same
 		// limitation: modules/project can check them against each other and against the
-		// four FIXED internal-token envs, but it cannot see the dynamic route-scoped
-		// notify tokens / callback secrets. Without these two arguments an operator who
-		// set a provisioning secret equal to a route's notify_token_env would pass every
-		// local check, and one leaked value would then authorize BOTH provisioning a
-		// container into fleet/drive AND minting that route's card action.
+		// fixed internal-token envs, but it cannot see dynamic route-scoped credentials.
+		// Without these two arguments, a provisioning credential equal to a route's
+		// notify_token_env would pass local checks and authorize both provisioning and
+		// minting that route's card action.
 		//
-		// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions in
-		// modules/project/provisioning_guard_test.go asserts both arguments stay present
-		// so a refactor cannot drop them silently. (This pointer exists so a future
-		// refactorer can find the guard — an earlier version named a file that does not
-		// exist, which defeats the only purpose the comment has.)
+		// TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions in
+		// modules/project/provisioning_guard_test.go asserts both arguments stay present.
 		os.Getenv(project.ProvisionFleetSecretEnv),
-		os.Getenv(project.ProvisionDriveSecretEnv),
+		os.Getenv(project.DriveInternalTokenEnv),
 		// NOT covered here, stated because the absence is otherwise invisible:
 		// modules/bot_task's per-source bearer tokens live inside the
 		// OCTO_BOT_TASK_SOURCES JSON registry rather than in a single env, so no

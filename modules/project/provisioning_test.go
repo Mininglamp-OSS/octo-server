@@ -25,15 +25,11 @@ import (
 // ---------- fixtures ----------
 
 const provTestSecretFleet = "fleet-secret-0123456789abcdefghij"
-const provTestSecretDrive = "drive-secret-0123456789abcdefghij"
+const provTestDriveToken = "drive-token-0123456789abcdefghij"
 
-// fakeTarget stands in for a subsystem's ensure endpoint.
-//
-// It models the ONE property the brief makes a precondition (P-1): ensure is keyed
-// on the supplied container_id and is idempotent, so it records containers in a map
-// and counts calls separately. A test can therefore distinguish "called twice" from
-// "created twice", which is exactly what the at-least-once acceptance item asks
-// about and what a plain call counter cannot answer.
+// fakeTarget stands in for either a Fleet ensure endpoint or the Drive internal
+// create endpoint. Fleet is keyed by container_id; Drive is keyed by project_id
+// and receives a 201-style success.
 type fakeTarget struct {
 	*httptest.Server
 	mu         sync.Mutex
@@ -41,7 +37,7 @@ type fakeTarget struct {
 	containers map[string]int
 	status     int
 	// respondWith overrides the echoed container id when non-empty, for the
-	// mismatch case.
+	// Fleet mismatch case.
 	respondWith string
 }
 
@@ -49,6 +45,28 @@ func newFakeTarget(t *testing.T) *fakeTarget {
 	t.Helper()
 	f := &fakeTarget{containers: map[string]int{}, status: http.StatusOK}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/v1/internal/drive/spaces") {
+			var req projectprovision.DriveRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			f.mu.Lock()
+			f.calls++
+			status := f.status
+			if status == http.StatusOK {
+				f.containers[req.ProjectID]++
+				status = http.StatusCreated
+			}
+			f.mu.Unlock()
+			if status != http.StatusCreated {
+				w.WriteHeader(status)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"id": "shared:fake-drive-space", "project_id": req.ProjectID,
+			})
+			return
+		}
+
 		var req projectprovision.EnsureRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.mu.Lock()
@@ -121,8 +139,9 @@ func fleetTargetOn(f *fakeTarget) provisionTarget {
 
 func driveTargetOn(f *fakeTarget) provisionTarget {
 	return provisionTarget{Target: projectprovision.Target{
-		Name: TargetDrive, EnsureURL: f.URL + "/v1/internal/drive/spaces/ensure",
-		Secret: provTestSecretDrive, Timeout: 2 * time.Second,
+		Name: TargetDrive, EnsureURL: f.URL + "/v1/internal/drive/spaces",
+		Auth: projectprovision.AuthInternalToken, InternalToken: provTestDriveToken,
+		Timeout: 2 * time.Second,
 	}}
 }
 
@@ -452,6 +471,103 @@ func TestWorkerReachesReadyAndConvergesOnReplay(t *testing.T) {
 	assert.Equal(t, 2, calls, "the replay should have called the target again")
 	require.Len(t, containers, 1, "the replay created a second container")
 	assert.Equal(t, 2, containers[rows[0].ContainerID])
+}
+
+// TestDriveWorkerSendsCurrentProjectOwnerAndNoContainerID proves the Drive
+// worker path against a real HTTP server. The Owner changes after enqueue and
+// after the first failed delivery, so a retry built from creator or stale row
+// state would send the wrong super_admin_uid.
+func TestDriveWorkerSendsCurrentProjectOwnerAndNoContainerID(t *testing.T) {
+	var (
+		gotPath  string
+		gotToken string
+		gotBody  map[string]json.RawMessage
+		calls    int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotToken = r.Header.Get(projectprovision.HeaderInternalToken)
+		if signature := r.Header.Get(projectprovision.HeaderSignature); signature != "" {
+			t.Errorf("Drive request carried Fleet HMAC signature %q", signature)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode Drive request: %v", err)
+		}
+		calls++
+		if calls == 1 {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("Drive test server does not support connection hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack Drive connection: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		var projectID string
+		if err := json.Unmarshal(gotBody["project_id"], &projectID); err != nil {
+			t.Errorf("decode project_id: %v", err)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "conflict",
+			"message": fmt.Sprintf("workspace_id %q already bound to a space", projectID),
+		})
+	}))
+	defer server.Close()
+
+	_, p := setup(t)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	enableProvisioning(t, p, provisionTarget{Target: projectprovision.Target{
+		Name: TargetDrive, EnsureURL: server.URL + "/v1/internal/drive/spaces",
+		Auth: projectprovision.AuthInternalToken, InternalToken: provTestDriveToken,
+		Timeout: 2 * time.Second,
+	}})
+
+	created := createVia(t, r, ownerToken, "当前项目全名")
+	p.processProvisioningJobs()
+	rows := readProvisioningRows(t, created.ProjectID)
+	require.Len(t, rows, 1)
+	require.Equal(t, provisionStatusPending, rows[0].Status)
+	assert.Contains(t, rows[0].LastError, "transport_failed")
+	assert.Equal(t, 1, calls)
+
+	// Transfer ownership after the failed attempt. The retry must re-read the
+	// active Project owner rather than replaying creator=owner1.
+	seedUser(t, "owner2")
+	seedSpaceMember(t, spaceA, "owner2", 0, 1)
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerToken, addMembersPayload("owner2"))
+	require.Equal(t, http.StatusOK, w.Code, "add successor: %s", w.Body.String())
+	w = doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID+"/owner", ownerToken,
+		map[string]any{"uid": "owner2"})
+	require.Equal(t, http.StatusOK, w.Code, "transfer owner: %s", w.Body.String())
+
+	makeProvisioningRowDue(t, rows[0].ID)
+	p.processProvisioningJobs()
+	rows = readProvisioningRows(t, created.ProjectID)
+	require.Equal(t, provisionStatusReady, rows[0].Status, "last_error=%q", rows[0].LastError)
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, "/v1/internal/drive/spaces", gotPath)
+	assert.Equal(t, provTestDriveToken, gotToken)
+	_, hasContainerID := gotBody["container_id"]
+	assert.False(t, hasContainerID, "Drive body must not carry the Fleet-only outbox container_id")
+	assert.Len(t, gotBody, 4, "Drive body must contain only its four contract fields")
+
+	var got projectprovision.DriveRequest
+	payload, err := json.Marshal(gotBody)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(payload, &got))
+	assert.Equal(t, projectprovision.DriveRequest{
+		Name: "当前项目全名", OctoSpaceID: spaceA, SuperAdminUID: "owner2", ProjectID: created.ProjectID,
+	}, got)
 }
 
 // requeueProvisioningRow puts a terminal row back to pending and makes it due, so a
@@ -1517,8 +1633,8 @@ func TestLoadProvisioningConfig(t *testing.T) {
 			envProvisionTargets:       " Fleet , drive ,",
 			envProvisionFleetURL:      "https://fleet.internal/api/internal/workspaces/ensure",
 			ProvisionFleetSecretEnv:   okSecretA,
-			envProvisionDriveURL:      "https://drive.internal/v1/internal/drive/spaces/ensure",
-			ProvisionDriveSecretEnv:   okSecretB,
+			envProvisionDriveURL:      "https://drive.internal/v1/internal/drive/spaces",
+			DriveInternalTokenEnv:     okSecretB,
 			envProvisionFleetNarrowed: "true",
 		}))
 		require.Empty(t, problems)
@@ -1529,6 +1645,9 @@ func TestLoadProvisioningConfig(t *testing.T) {
 		drive, ok := cfg.TargetByName(TargetDrive)
 		require.True(t, ok)
 		assert.False(t, drive.Narrowed)
+		assert.Equal(t, projectprovision.AuthInternalToken, drive.Target.Auth)
+		assert.Equal(t, okSecretB, drive.Target.InternalToken)
+		assert.Empty(t, drive.Target.Secret)
 	})
 
 	// The reclaim switches are the gate on the one irreversible statement in the slice, and
@@ -1690,7 +1809,7 @@ func TestLoadProvisioningConfig(t *testing.T) {
 			envProvisionFleetURL:    "https://fleet.internal/ensure",
 			ProvisionFleetSecretEnv: okSecretA,
 			// drive: no URL at all
-			ProvisionDriveSecretEnv: okSecretB,
+			DriveInternalTokenEnv: okSecretB,
 		}))
 		require.Len(t, problems, 1)
 		require.Len(t, cfg.Targets, 1)
@@ -1705,7 +1824,7 @@ func TestLoadProvisioningConfig(t *testing.T) {
 			envProvisionFleetURL:    "https://fleet.internal/ensure",
 			ProvisionFleetSecretEnv: okSecretA,
 			envProvisionDriveURL:    "https://drive.internal/ensure",
-			ProvisionDriveSecretEnv: okSecretA,
+			DriveInternalTokenEnv:   okSecretA,
 		}))
 		require.Len(t, problems, 1)
 		assert.Len(t, cfg.Targets, 1)

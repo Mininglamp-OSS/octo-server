@@ -57,10 +57,10 @@ type i4MissingRow struct {
 //     leaves the project and nobody left can inherit it, and it does not clear
 //     the project's pointer, because modules/group must not write octo_project.
 //
-// One gauge for three states because the operator action is the same in all
-// three: this project has no all-member group and the next write path on it
-// should rebuild one. The log line names which, so the on-call reader can tell a
-// provisioning outage from a cascade side effect.
+// One gauge for three states because the operational response is the same:
+// repair or re-run provisioning for this project. The log line names which
+// state was observed, so the on-call reader can tell a provisioning outage from
+// a cascade side effect.
 func (p *Project) scanMissingAllMemberGroups() {
 	start := time.Now()
 	defer func() {
@@ -122,10 +122,10 @@ func (p *Project) scanMissingAllMemberGroups() {
 // with a `group` lookup per row, every tick, forever. The cost is highest exactly
 // when there is nothing to report.
 //
-// Flag-over-base-page is the shape P0 and P1 use for the same reason, and
-// TestReconcileP2QueriesAreBounded now applies P1's guard to this file so a
-// future scan cannot regress to a filtering WHERE.
-//
+// Flag-over-base-page is the shape P0 and P1 use for the same reason. Keep the
+// computed flag in the SELECT list so LIMIT bounds the active base rows even
+// when every project is healthy; filtering violations in WHERE would scan past
+// the page boundary.
 // `p.status` stays in the WHERE deliberately: it selects the BASE population
 // (active projects are what the invariant is about), and a disbanded project is
 // not a violation to be flagged but a row that is out of scope.

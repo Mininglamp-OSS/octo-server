@@ -1,76 +1,26 @@
-// Package projectprovision is octo-server's ONLY outbound path to the two
-// subsystems that hold a Project's per-project container: octo-fleet (a
-// `workspace`) and octo-drive (a shared `drive_space`).
+// Package projectprovision is octo-server's only outbound path to the two
+// optional Project provisioning subsystems: octo-fleet and octo-drive.
 //
-// It is a separate package on purpose, and the separation is the enforcement
-// mechanism rather than tidiness. The brief's "outbound confinement" rule says no
-// request handler may reach fleet or drive, because a handler that does makes a
-// user request depend on another service being up. A package boundary makes that
-// checkable: no REQUEST HANDLER in this repository may import this package, and
-// modules/project's provisioning worker is the only file that calls Ensure. A source
-// guard in that module asserts both (TestProvisioningClientIsConfinedToTheWorker).
+// No request handler may reach either subsystem. The Project worker is the
+// caller of Ensure and CreateDriveSpace; config_provisioning.go imports this
+// package only to resolve and validate targets at boot. Keeping that boundary
+// in one package makes the no-egress-from-request-path rule checkable.
 //
-// Not "only one file may import it" — modules/project/config_provisioning.go imports it too,
-// for Target and ValidateTarget at boot, which is intended. The earlier wording claimed a
-// property neither the design nor the guard has.
+// This package deliberately does not retry or log. Retry, backoff and the
+// give-up decision belong to the durable outbox row, and callers receive
+// targets that have already been resolved from configuration.
 //
-// # What this package deliberately does NOT do
+// Fleet's Ensure protocol uses an opaque container_id as its idempotency key
+// and authenticates with the per-target HMAC secret. That id is never included
+// in errors or logs.
 //
-//   - It does not retry. Retry, backoff and the give-up decision belong to the
-//     durable outbox row, not to an in-process loop that a pod restart forgets.
-//     Ensure classifies the failure and returns; the worker schedules.
-//   - It does not log. Nothing here holds a logger, because the one field it
-//     handles that must never reach a log line is the container id (see below),
-//     and the cheapest way to guarantee that is to have no log call at all.
-//   - It does not read configuration. Targets arrive fully resolved, so a
-//     misconfigured URL or a short secret is rejected at process start by the
-//     caller rather than on the first delivery attempt.
-//
-// # The container id is a capability, not an identifier
-//
-// Until fleet's R2 and drive's R3 narrow their authorization by Project, knowing
-// a container id is close enough to holding access to it: fleet's workspace gate
-// admits on octo Space membership alone and then materializes the caller as a
-// workspace member. So the id must not appear in an error message, a log line,
-// or an error `details` map. Every error string this package produces is built
-// from a fixed low-cardinality category plus an HTTP status, never from the
-// request body — see EnsureError.Error.
-//
-// It also does not travel in a HEADER. The signature's event-id slot carries
-// sha256(container_id), not the id itself, and the reason is asymmetric exposure
-// rather than principle: request bodies are almost never logged, while headers
-// routinely are — a reverse proxy's custom log format, an APM agent's default
-// header capture. Putting a capability where the id would be picked up by
-// infrastructure nobody in this repository controls is a measurable widening for
-// no gain, since the receiver reads the real id out of the body anyway. The hash
-// keeps everything the slot is for: it is stable across replays of the same job,
-// and it still binds the signature to one specific resource.
-//
-// # What the receiver must do
-//
-// Stated here because it is NOT optional and because neither subsystem has
-// implemented its ensure endpoint yet — this is the contract being handed over,
-// and the first two clauses have no enforcement on this side at all:
-//
-//  1. **Verify the signature** over the canonical string
-//     (pkg/octosign.CanonicalRequest), using the shared per-target
-//     secret. An unsigned or wrongly-signed request must be refused.
-//  2. **Reject a stale timestamp.** X-Octo-Timestamp is inside the signed string,
-//     so it cannot be tampered with, but nothing stops a captured request from
-//     being REPLAYED — and this operation is idempotent, so a replay would
-//     resurrect a container the subsystem had already reclaimed. A bounded skew
-//     window (a few minutes) is what closes that; octosign.Verify
-//     deliberately does not check freshness, so the receiver owns it.
-//  3. **Treat container_id as the idempotency key**: get-first, create,
-//     duplicate-key downgrade. Delivery is at-least-once by construction, so an
-//     ensure that creates a second container on the second call is a defect on
-//     the receiving side.
-//
-// And one thing the receiver should NOT expect: `name` is a fixed, low-information
-// label, not the project's name (see the field comment on EnsureRequest). A
-// receiver that wants a human-readable label should build one from `project_id`,
-// which is in every request — octo-server deliberately does not egress
-// user-supplied text here.
+// Drive's internal create protocol is intentionally separate: it authenticates
+// with X-Internal-Token and sends the current Project name, octo_space_id,
+// super_admin_uid and project_id. It does not send Fleet's container_id and
+// does not read or persist Drive's remote space id. A same-project 409 is
+// accepted only when Drive's conflict envelope names the requested project_id
+// exactly; all other statuses remain failures for the worker to retry or
+// abandon according to its category.
 package projectprovision
 
 import (
@@ -93,7 +43,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/octosign"
 )
 
-// Header names. Same three headers, same canonical string and same v1 HMAC as
+// Fleet HMAC header names. They use the same canonical string and v1 HMAC as
 // pkg/octosign, because a receiver that already verifies card
 // callbacks can verify these with the code it has.
 const (
@@ -101,6 +51,23 @@ const (
 	HeaderTimestamp = octosign.HeaderTimestamp
 	HeaderEventID   = octosign.HeaderEventID
 )
+
+// AuthMode selects the wire authentication contract for a target.
+//
+// AuthHMAC is the zero value for backwards compatibility with the fleet
+// ensure client. AuthInternalToken is used by Drive's internal create route;
+// the two credential fields are mutually exclusive and ValidateTarget enforces
+// that separation.
+type AuthMode uint8
+
+const (
+	AuthHMAC AuthMode = iota
+	AuthInternalToken
+)
+
+// HeaderInternalToken carries an internal service token to a target that uses
+// token authentication instead of the Fleet HMAC contract.
+const HeaderInternalToken = "X-Internal-Token"
 
 const (
 	// defaultTimeout bounds one ensure call. Deliberately short: the worker is
@@ -122,34 +89,24 @@ const (
 // something.
 type Target struct {
 	// Name is the low-cardinality target label ("fleet" / "drive"). It reaches
-	// metrics and log lines, so it must stay an enum and never a URL.
+	// metrics and log lines, so it must stay an enum and never be a URL.
 	Name string
-	// EnsureURL is the absolute POST endpoint, e.g.
-	// https://fleet.internal/api/internal/workspaces/ensure.
+	// EnsureURL is the absolute POST endpoint. Fleet uses its HMAC ensure route;
+	// Drive uses /v1/internal/drive/spaces with AuthInternalToken.
 	EnsureURL string
-	// Secret is the per-target HMAC secret. One secret per target: a single
-	// leaked value must not authorize provisioning into both subsystems.
+	// Auth selects the target's wire authentication. The zero value is HMAC.
+	Auth AuthMode
+	// Secret is the per-target Fleet HMAC secret.
 	Secret string
+	// InternalToken is the Drive internal-route token. It must not be used as
+	// an HMAC secret or sent to the Fleet route.
+	InternalToken string
 	// Timeout bounds one call; zero means defaultTimeout.
 	Timeout time.Duration
 }
 
-// EnsureRequest is the wire body. Field set is the union of the two targets'
-// contracts (brief D2); IssuePrefix is fleet-only and omitted when empty.
-//
-// project_id travels alongside container_id and is NOT the id: the receiver needs
-// it to answer "which project is this container for" when it later reclaims
-// (D9), and must not derive an id from it.
-//
-// Name is a fixed, low-information label — NOT the project's name. octo-server holds
-// the name authoritatively and never syncs it outbound (brief D3), and a project name
-// is user-supplied free text, so egressing it would make provisioning a content path
-// with its own escaping and disclosure questions. The consequence for the receiver is
-// real and worth stating rather than discovering: every container arrives with the
-// SAME name, so a receiver that shows this string in its own UI will show one label
-// for every project. Build a display label from project_id instead, or read the real
-// name from GET /v1/projects/:project_id, which is what D3 already tells fleet to do
-// for `context`.
+// EnsureRequest is the Fleet wire body. Drive has a separate body type because
+// its project mapping is keyed by project_id and does not use container_id.
 type EnsureRequest struct {
 	ContainerID string `json:"container_id"`
 	ProjectID   string `json:"project_id"`
@@ -158,10 +115,30 @@ type EnsureRequest struct {
 	IssuePrefix string `json:"issue_prefix,omitempty"`
 }
 
-// EnsureResponse is what a target returns. Slug is fleet-only.
+// DriveRequest is the body accepted by Drive's internal create route.
+//
+// ProjectID is the stable project-to-space mapping key. ContainerID is
+// deliberately absent: Drive owns its space id and this client never reads or
+// persists it.
+type DriveRequest struct {
+	Name          string `json:"name"`
+	OctoSpaceID   string `json:"octo_space_id"`
+	SuperAdminUID string `json:"super_admin_uid"`
+	ProjectID     string `json:"project_id"`
+}
+
+// EnsureResponse is what Fleet returns. Drive's remote space id is intentionally
+// not represented because the Project outbox is keyed by project_id.
 type EnsureResponse struct {
 	ContainerID string `json:"container_id"`
 	Slug        string `json:"slug,omitempty"`
+}
+
+// DriveSpaceResponse reports the only Drive result the caller needs. A 201 is
+// a new remote space; an exact same-project 409 is an idempotent duplicate.
+// The remote Drive id is intentionally ignored.
+type DriveSpaceResponse struct {
+	Duplicate bool
 }
 
 // EnsureError carries a low-cardinality category so the worker can label a
@@ -301,48 +278,23 @@ func ValidateTarget(t Target) error {
 	if strings.TrimSpace(t.Name) == "" {
 		return errors.New("projectprovision: target name required")
 	}
-	// Surrounding whitespace is REFUSED, not trimmed, and the difference is the
-	// whole point. A secret mounted from a file carries a trailing newline; trimming
-	// it would let a subtly wrong mount work, so nobody learns the mount is wrong
-	// until the day something stops trimming. Refusing surfaces it at boot, in the
-	// one place an operator is already reading — while trimming silently would have
-	// been indistinguishable from a correct deployment.
-	//
-	// The alternative failure, if this check is absent, is not a clean error either:
-	// every request signs with a value the peer rejects, so the whole retry budget
-	// burns as 401s that look exactly like a rotated secret, and the row lands in
-	// abandoned, which has no automatic re-drive.
-	//
-	// What refusing COSTS, stated because this comment is what the next person
-	// consults: the target is dropped from cfg.Targets, and if it was the only one
-	// then Enabled() goes false and the claim, sweep and purge timers are never
-	// mounted — so rows already `pending` stop being claimed until a valid target
-	// is configured again. The census keeps the backlog visible throughout. That is
-	// still the better trade than 23 minutes of ambiguous 401s, but it is a
-	// different one from "the process refuses to start", which this does not do.
-	//
-	// No value in the message, on the same principle as the length check below.
-	if strings.TrimSpace(t.Secret) != t.Secret {
-		return fmt.Errorf("projectprovision: %s secret has leading or trailing whitespace; "+
-			"a file-mounted secret usually needs its trailing newline removed", t.Name)
-	}
-	if len(t.Secret) < minSecretBytes {
-		// No secret value in the message, and no length either — an error string
-		// that reports the observed length is a (small) oracle in a log.
-		return fmt.Errorf("projectprovision: %s secret must be at least %d bytes", t.Name, minSecretBytes)
-	}
-	if isPublishedConformanceSecret(t.Secret) {
-		// The conformance vectors ship real, working secrets in a source file of a public
-		// repository, and both are long enough to clear the floor above — so an operator who
-		// copies one into OCTO_PROJECT_PROVISION_*_SECRET to "try it out" boots clean holding
-		// a published HMAC key. conformanceTamperedBody is literally the forgery that key
-		// authorises: a valid signature over an attacker-chosen project_id. The MAC is the
-		// load-bearing layer here precisely because ValidateTarget declines to require TLS.
-		//
-		// Compared with subtle.ConstantTimeCompare for consistency with how the rest of this
-		// package treats secret material, not because a timing signal would matter: the
-		// values being compared against are already public.
-		return fmt.Errorf("projectprovision: %s secret is a published conformance vector secret; generate a real one", t.Name)
+	switch t.Auth {
+	case AuthHMAC:
+		if t.InternalToken != "" {
+			return fmt.Errorf("projectprovision: %s HMAC target must not set an internal token", t.Name)
+		}
+		if err := validateCredential(t.Name, "secret", t.Secret); err != nil {
+			return err
+		}
+	case AuthInternalToken:
+		if t.Secret != "" {
+			return fmt.Errorf("projectprovision: %s internal-token target must not set an HMAC secret", t.Name)
+		}
+		if err := validateCredential(t.Name, "internal token", t.InternalToken); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("projectprovision: %s has an unsupported authentication mode", t.Name)
 	}
 	// The same rule as the secret above, and it belongs here for the same reason
 	// the sibling validator applies it (internal/cardactiondispatch/registry.go
@@ -402,6 +354,23 @@ func ValidateTarget(t Target) error {
 	return nil
 }
 
+// validateCredential applies the common no-trimming, minimum-length and
+// published-vector checks to either supported credential kind.
+func validateCredential(name, label, value string) error {
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("projectprovision: %s %s has leading or trailing whitespace; "+
+			"a file-mounted credential usually needs its trailing newline removed", name, label)
+	}
+	if len(value) < minSecretBytes {
+		return fmt.Errorf("projectprovision: %s %s must be at least %d bytes", name, label, minSecretBytes)
+	}
+	if isPublishedConformanceSecret(value) {
+		return fmt.Errorf("projectprovision: %s %s is a published conformance vector secret; generate a real one",
+			name, label)
+	}
+	return nil
+}
+
 // Client is the outbound HTTP client. One per process.
 type Client struct {
 	client *http.Client
@@ -453,6 +422,9 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 	}
 	if req.ContainerID == "" || req.ProjectID == "" || req.OctoSpaceID == "" {
 		return EnsureResponse{}, &EnsureError{Category: "invalid_request"}
+	}
+	if target.Auth != AuthHMAC {
+		return EnsureResponse{}, &EnsureError{Category: "invalid_target"}
 	}
 	if err := ValidateTarget(target); err != nil {
 		return EnsureResponse{}, &EnsureError{Category: "invalid_target", cause: err}
@@ -583,6 +555,107 @@ func (c *Client) Ensure(ctx context.Context, target Target, req EnsureRequest) (
 		return EnsureResponse{}, &EnsureError{Category: "container_id_mismatch", Status: response.StatusCode}
 	}
 	return out, nil
+}
+
+// CreateDriveSpace calls Drive's internal create route exactly once.
+//
+// Drive owns the remote space id, so this method sends only the project mapping
+// fields and returns no remote identifier. A 409 is idempotent only when the
+// response envelope names the same project_id that was requested; every other
+// 409 remains a target failure.
+func (c *Client) CreateDriveSpace(ctx context.Context, target Target, req DriveRequest) (DriveSpaceResponse, error) {
+	if ctx == nil || !validDriveRequest(req) {
+		return DriveSpaceResponse{}, &EnsureError{Category: "invalid_request"}
+	}
+	if target.Auth != AuthInternalToken {
+		return DriveSpaceResponse{}, &EnsureError{Category: "invalid_target"}
+	}
+	if err := ValidateTarget(target); err != nil {
+		return DriveSpaceResponse{}, &EnsureError{Category: "invalid_target", cause: err}
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return DriveSpaceResponse{}, &EnsureError{Category: "encode_failed", cause: err}
+	}
+	timeout := target.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, target.EnsureURL, bytes.NewReader(body))
+	if err != nil {
+		return DriveSpaceResponse{}, &EnsureError{
+			Category: "request_failed", Detail: transportDetail(err), cause: err,
+		}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", "octo-server/project-provisioning-v1")
+	httpReq.Header.Set(HeaderInternalToken, target.InternalToken)
+
+	response, err := c.client.Do(httpReq)
+	if err != nil {
+		return DriveSpaceResponse{}, &EnsureError{
+			Category: "transport_failed", Detail: transportDetail(err), cause: err,
+		}
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusCreated {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
+		return DriveSpaceResponse{}, nil
+	}
+
+	responseBody, readable := readBoundedResponse(response.Body)
+	duplicate := false
+	if response.StatusCode == http.StatusConflict && readable {
+		duplicate = isExactDriveDuplicate(responseBody, req.ProjectID)
+		if duplicate {
+			return DriveSpaceResponse{Duplicate: true}, nil
+		}
+	}
+	if response.StatusCode > http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		return DriveSpaceResponse{}, &EnsureError{
+			Category: "invalid_response",
+			Status:   response.StatusCode,
+			Detail:   "contract requires a synchronous 201",
+		}
+	}
+	return DriveSpaceResponse{}, &EnsureError{
+		Category: statusCategory(response.StatusCode),
+		Status:   response.StatusCode,
+	}
+}
+
+func validDriveRequest(req DriveRequest) bool {
+	if strings.TrimSpace(req.Name) == "" || len(req.Name) > 64 {
+		return false
+	}
+	if strings.TrimSpace(req.OctoSpaceID) == "" || strings.TrimSpace(req.SuperAdminUID) == "" {
+		return false
+	}
+	return strings.TrimSpace(req.ProjectID) != "" && len(req.ProjectID) <= 64
+}
+
+func readBoundedResponse(body io.Reader) ([]byte, bool) {
+	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	return data, err == nil && len(data) <= maxResponseBytes
+}
+
+func isExactDriveDuplicate(body []byte, projectID string) bool {
+	var envelope struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&envelope); err != nil {
+		return false
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return false
+	}
+	return envelope.Error == "conflict" &&
+		envelope.Message == fmt.Sprintf("workspace_id %q already bound to a space", projectID)
 }
 
 // maxDetailBytes bounds a transport Detail.

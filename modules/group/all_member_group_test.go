@@ -1,19 +1,26 @@
 package group
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/stretchr/testify/require"
 )
 
 // Group-side tests for the P2 all-member group.
 //
-// These cover initial provisioning and metadata behaviour. Project member/role
-// changes do not synchronize the native group after creation.
+// These cover initial provisioning, the pointer-scoped live admission hook,
+// and metadata behaviour. Ordinary Project-associated groups remain native
+// snapshots and never enter the dedicated-group hooks.
 
 // seedProjectForGroupTest writes a project and its owner seat directly.
 //
@@ -115,4 +122,68 @@ func TestAllMemberGroupHooksAreRegisteredByTheModule(t *testing.T) {
 
 	require.True(t, projectmod.AllMemberGroupHooksRegisteredForTest(),
 		"module.Setup must leave provisioning and rename hooks registered")
+}
+
+// TestDedicatedAdmissionAndHTTPProtection exercises the dedicated pointer
+// against a real MySQL fixture. The same Project also owns an ordinary
+// associated group; that group must remain outside the live admission hook.
+func TestDedicatedAdmissionAndHTTPProtection(t *testing.T) {
+	s, ctx := newTestServer(t)
+	wireI18nRendererForGroupTest(s)
+	defer testutil.CleanAllTables(ctx)
+
+	f := New(ctx)
+	owner := testutil.UID
+	target := "all-member-target-" + testutil.Token
+	suffix := util.GenerUUID()[:12]
+	projectID := "project-" + suffix
+	spaceID := "space-" + suffix
+	dedicatedNo := "dedicated-" + suffix
+	ordinaryNo := "ordinary-" + suffix
+
+	require.NoError(t, f.userDB.Insert(&user.Model{
+		UID: owner, Name: "all-member owner", ShortNo: "all-member-owner",
+	}))
+	require.NoError(t, f.userDB.Insert(&user.Model{
+		UID: target, Name: "all-member target", ShortNo: "all-member-target",
+	}))
+	seedProjectForGroupTest(t, ctx, projectID, spaceID, owner)
+	seedProjectSeat(t, ctx, projectID, spaceID, target, 0)
+	seedAllMemberGroupRow(t, ctx, dedicatedNo, projectID, spaceID, owner)
+	seedGroupMemberRow(t, ctx, dedicatedNo, owner, MemberRoleCreator)
+
+	// A Project member admission reaches the dedicated group and is idempotent
+	// if the test IM datasource is unavailable after the DB commit.
+	err := f.admitToAllMemberGroup(ctx, spaceID, dedicatedNo, target)
+	if err != nil {
+		require.ErrorIs(t, err, projectpkg.ErrAdmittedButNotSubscribed)
+	}
+	require.True(t, activeMemberExists(t, ctx, dedicatedNo, target),
+		"active Project member must be admitted to its dedicated group")
+
+	// An ordinary associated group with the same project_id is not the
+	// dedicated pointer and must not receive the same target.
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: ordinaryNo, Name: "ordinary associated", Creator: owner,
+		Status: GroupStatusNormal, Version: 1, SpaceID: spaceID, ProjectID: projectID,
+	}))
+	require.NoError(t, f.admitToAllMemberGroup(ctx, spaceID, ordinaryNo, target))
+	require.False(t, activeMemberExists(t, ctx, ordinaryNo, target),
+		"ordinary Project-associated groups remain native snapshots")
+
+	// The real HTTP exit route is protected before IM unsubscribe or any DB
+	// mutation. The dedicated member and group status must remain unchanged.
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest(http.MethodPost, "/v1/groups/"+dedicatedNo+"/exit", bytes.NewReader(nil))
+	require.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "err.server.group.all_member_group_protected")
+	require.True(t, activeMemberExists(t, ctx, dedicatedNo, owner))
+	var status int
+	require.NoError(t, ctx.DB().SelectBySql(
+		"SELECT status FROM `group` WHERE group_no=?", dedicatedNo,
+	).LoadOne(&status))
+	require.Equal(t, GroupStatusNormal, status)
 }

@@ -155,25 +155,6 @@ func (d *DB) UpdateMemberRoleTx(groupNo string, uid string, role int, version in
 	return err
 }
 
-// updateMemberRoleIfLiveTx updates a live member role and reports whether a
-// row matched. The admission/owner-maintenance paths use this to fail closed
-// when a concurrent removal has already soft-deleted the target row.
-func (d *DB) updateMemberRoleIfLiveTx(tx *dbr.Tx, groupNo string, uid string, role int, version int64) (bool, error) {
-	res, err := tx.Update("group_member").
-		Set("role", role).
-		Set("version", version).
-		Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).
-		Exec()
-	if err != nil {
-		return false, err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return affected > 0, nil
-}
-
 // updateMemberForbiddenExpirTimeTx 修改成员禁言时长
 func (d *DB) updateMemberForbiddenExpirTimeTx(groupNo string, uid string, time int, version int64, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").Set("forbidden_expir_time", time).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
@@ -1298,6 +1279,19 @@ func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole
 		return roles[0] == MemberRoleCommon, nil
 	}
 	return roles[0] != MemberRoleCreator, nil
+}
+
+// LockProjectRemovalMemberTx re-reads a dedicated-group target under the
+// caller's group lock. Lifecycle cleanup may remove a stale creator role after
+// the Project lock has established that the seat is no longer active; user
+// removal paths must continue to use LockRemovableMemberTx instead.
+func (d *DB) LockProjectRemovalMemberTx(groupNo, uid string, tx *dbr.Tx) (bool, error) {
+	var rows []int
+	_, err := tx.SelectBySql(
+		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		groupNo, uid,
+	).Load(&rows)
+	return len(rows) > 0, err
 }
 
 // ---------------------------------------------------------------------------

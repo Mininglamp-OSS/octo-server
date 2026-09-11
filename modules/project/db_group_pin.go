@@ -37,7 +37,7 @@ func (d *DB) lockProjectGroupPinTargetTx(tx *dbr.Tx, groupNo string) (*projectGr
 		groupNo,
 	).Load(&rows)
 	if err != nil {
-		return nil, fmt.Errorf("%w: lock group relation: %v", ErrGroupProjectDependency, err)
+		return nil, fmt.Errorf("%w: lock group relation: %w", ErrGroupProjectDependency, err)
 	}
 	if len(rows) == 0 {
 		return nil, nil
@@ -80,7 +80,7 @@ func (d *DB) upsertProjectGroupUserSettingTx(
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE "+
 			"pinned_at = CASE "+
-			"WHEN VALUES(pinned) = 1 AND pinned = 0 THEN VALUES(pinned_at) "+
+			"WHEN VALUES(pinned) = 1 AND (pinned = 0 OR pinned_at IS NULL) THEN VALUES(pinned_at) "+
 			"WHEN VALUES(pinned) = 0 THEN NULL "+
 			"ELSE pinned_at END, "+
 			"updated_at = CASE "+
@@ -90,7 +90,7 @@ func (d *DB) upsertProjectGroupUserSettingTx(
 		spaceID, projectID, groupNo, uid, flag, pinnedAt, now, now,
 	).Exec()
 	if err != nil {
-		return fmt.Errorf("%w: upsert group user setting: %v", ErrGroupProjectDependency, err)
+		return fmt.Errorf("%w: upsert group user setting: %w", ErrGroupProjectDependency, err)
 	}
 	return nil
 }

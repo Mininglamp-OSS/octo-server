@@ -78,6 +78,9 @@ other = "The token was rotated by another request; please retry."
 ["err.server.bot.occupied"]
 other = "Bot is already occupied by another agent."
 
+["err.server.bot_api.all_member_group_protected"]
+other = "This is a project's all-member group; manage its members from the project instead."
+
 ["err.server.bot_api.app_bot_dm_only"]
 other = "App bots can only operate on direct message channels."
 
@@ -410,6 +413,9 @@ other = "The extension list is too long (max {{.max_bytes}} bytes)."
 
 ["err.server.file.upload_too_large"]
 other = "The file exceeds the maximum allowed size of {{.max_size}}."
+
+["err.server.group.all_member_group_protected"]
+other = "This is a project's all-member group; manage its members from the project instead."
 
 ["err.server.group.already_member"]
 other = "You are already a member of this group."

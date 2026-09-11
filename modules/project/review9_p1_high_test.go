@@ -137,12 +137,10 @@ func TestAClosingSeatCannotAdministerTheProject(t *testing.T) {
 	flushProjectCache(t, testCtx)
 
 	// Driven at the SERVICE layer on purpose. projectMiddleware already refuses a
-	// closing seat, because it resolves the role through pkg/project.MemberRole
-	// which carries `removing = 0` — so an HTTP-level test would pass with or
-	// without this fix and prove nothing. actorRoleTx exists precisely because
-	// that middleware answer came from a cache read taken before the transaction
-	// opened; it is the in-transaction re-read, and it is the last thing standing
-	// between a stale positive and a disbanded project.
+	// closing seat, but its cache read is not enough to protect a destructive
+	// operation: actorRoleTx exists precisely because that middleware answer came
+	// from a cache read before the transaction opened. This in-transaction re-read
+	// is the last thing standing between a stale positive and a disbanded project.
 	_, err = p.disbandProject(created.ProjectID, "owner1", spaceA)
 	assert.ErrorIs(t, err, errPermissionDenied,
 		"actorRoleTx must treat a closing seat as a non-member: it is the re-read that "+

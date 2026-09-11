@@ -3,22 +3,288 @@ package group
 import (
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
 // 全员群的群面实现（P2）。
 //
-// 只反向注册初始建群与后续改名钩子；Project 成员和角色变化不再同步
-// 原生群成员/角色，群内权限保持独立。
+// The dedicated all-member group is a live projection of one Project. Ordinary
+// Project-associated groups remain native snapshots and never enter these hooks.
 
 // registerAllMemberGroupHooks 由 1module.go 在模块构造时调用，与
 // registerProjectCascadeSteps 并列。
 func (g *Group) registerAllMemberGroupHooks() {
 	projectmod.RegisterAllMemberGroupProvisioner(g.provisionAllMemberGroup)
+	projectmod.RegisterAllMemberGroupAdmitter(g.admitToAllMemberGroup)
+	projectmod.RegisterAllMemberGroupOwnerTransfer(g.ensureAllMemberGroupOwner)
 	projectmod.RegisterAllMemberGroupRename(g.renameAllMemberGroup)
+}
+
+type allMemberGroupProjectBinding struct {
+	ProjectID string
+	SpaceID   string
+	GroupNo   string
+	Creator   string
+}
+
+// lockAllMemberGroupBindingTx takes the Project lock before the native group
+// lock. Every dedicated-group mutation uses this order; ordinary group
+// admission remains on its native path and is intentionally not changed.
+func lockAllMemberGroupBindingTx(tx *dbr.Tx, groupNo string) (*allMemberGroupProjectBinding, error) {
+	var projects []allMemberGroupProjectBinding
+	if _, err := tx.SelectBySql(
+		"SELECT project_id, space_id, all_member_group_no AS group_no "+
+			"FROM `octo_project` WHERE all_member_group_no = ? AND status = 1 "+
+			"LIMIT 1 FOR UPDATE",
+		groupNo,
+	).Load(&projects); err != nil {
+		return nil, fmt.Errorf("group: lock all-member project: %w", err)
+	}
+	if len(projects) == 0 || projects[0].ProjectID == "" {
+		return nil, nil
+	}
+	var groups []struct {
+		ProjectID string `db:"project_id"`
+		SpaceID   string `db:"space_id"`
+		Creator   string `db:"creator"`
+		Status    int    `db:"status"`
+	}
+	if _, err := tx.SelectBySql(
+		"SELECT project_id, space_id, creator, status FROM `group` "+
+			"WHERE group_no = ? LIMIT 1 FOR UPDATE",
+		groupNo,
+	).Load(&groups); err != nil {
+		return nil, fmt.Errorf("group: lock all-member native group: %w", err)
+	}
+	if len(groups) == 0 || groups[0].Status == GroupStatusDisband ||
+		groups[0].ProjectID != projects[0].ProjectID {
+		return nil, nil
+	}
+	if projects[0].SpaceID != "" && groups[0].SpaceID != projects[0].SpaceID {
+		return nil, nil
+	}
+	return &allMemberGroupProjectBinding{
+		ProjectID: projects[0].ProjectID,
+		SpaceID:   projects[0].SpaceID,
+		GroupNo:   groupNo,
+		Creator:   groups[0].Creator,
+	}, nil
+}
+
+// admitToAllMemberGroup is the only Project-driven native admission path. It
+// validates the dedicated pointer while holding the Project and group locks,
+// then delegates the actual upsert to the native admission funnel.
+func (g *Group) admitToAllMemberGroup(ctx *config.Context, spaceID, groupNo, uid string) error {
+	if ctx == nil || strings.TrimSpace(spaceID) == "" ||
+		strings.TrimSpace(groupNo) == "" || strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
+	if err != nil {
+		return fmt.Errorf("group: generate all-member admission version: %w", err)
+	}
+	tx, err := ctx.DB().Begin()
+	if err != nil {
+		return fmt.Errorf("group: begin all-member admission: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	binding, err := lockAllMemberGroupBindingTx(tx, groupNo)
+	if err != nil {
+		return err
+	}
+	if binding == nil || binding.SpaceID != strings.TrimSpace(spaceID) {
+		return nil
+	}
+	var active []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM `octo_project_member` "+
+			"WHERE project_id = ? AND space_id = ? AND uid = ? "+
+			"AND status = 1 AND removing = 0 LIMIT 1",
+		binding.ProjectID, binding.SpaceID, uid,
+	).Load(&active); err != nil {
+		return fmt.Errorf("group: check all-member Project seat: %w", err)
+	}
+	if len(active) == 0 {
+		return nil
+	}
+	robot := 0
+	var robots []int
+	if _, err := tx.SelectBySql(
+		"SELECT COALESCE(robot, 0) FROM `user` WHERE uid = ? LIMIT 1",
+		uid,
+	).Load(&robots); err != nil {
+		return fmt.Errorf("group: query all-member admission user: %w", err)
+	}
+	if len(robots) > 0 {
+		robot = robots[0]
+	}
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{{
+		UID:       uid,
+		Version:   version,
+		Role:      MemberRoleCommon,
+		InviteUID: binding.Creator,
+		Robot:     robot,
+	}}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("group: commit all-member admission: %w", err)
+	}
+	if err := ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Subscribers: []string{uid},
+	}); err != nil {
+		return fmt.Errorf("%w: group: subscribe all-member admission: %w",
+			projectpkg.ErrAdmittedButNotSubscribed, err)
+	}
+	g.addUsersToGroupThreads(groupNo, []string{uid})
+	return nil
+}
+
+type allMemberGroupNativeMember struct {
+	UID        string `db:"uid"`
+	Role       int    `db:"role"`
+	Status     int    `db:"status"`
+	IsExternal int    `db:"is_external"`
+}
+
+type allMemberGroupProjectOwner struct {
+	UID       string    `db:"uid"`
+	JoinedAt  time.Time `db:"joined_at"`
+	CreatedAt time.Time `db:"created_at"`
+}
+
+// ensureAllMemberGroupOwner converges native creator roles to an active human
+// Project owner. It always locks Project, then group, then group_member rows;
+// ordinary groups never enter this path.
+func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupNo string) error {
+	if ctx == nil || strings.TrimSpace(projectID) == "" || strings.TrimSpace(groupNo) == "" {
+		return nil
+	}
+	tx, err := ctx.DB().Begin()
+	if err != nil {
+		return fmt.Errorf("group: begin all-member owner sync: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	binding, err := lockAllMemberGroupBindingTx(tx, groupNo)
+	if err != nil {
+		return err
+	}
+	if binding == nil || binding.ProjectID != projectID {
+		return nil
+	}
+
+	var members []allMemberGroupNativeMember
+	if _, err := tx.SelectBySql(
+		"SELECT uid, role, status, is_external FROM group_member "+
+			"WHERE group_no = ? AND is_deleted = 0 FOR UPDATE",
+		groupNo,
+	).Load(&members); err != nil {
+		return fmt.Errorf("group: lock all-member native members: %w", err)
+	}
+	memberByUID := make(map[string]allMemberGroupNativeMember, len(members))
+	creators := make([]string, 0, 1)
+	for _, member := range members {
+		memberByUID[member.UID] = member
+		if member.Role == MemberRoleCreator &&
+			member.Status == int(common.GroupMemberStatusNormal) {
+			creators = append(creators, member.UID)
+		}
+	}
+	if len(creators) == 0 {
+		return nil
+	}
+
+	var owners []allMemberGroupProjectOwner
+	if _, err := tx.SelectBySql(
+		"SELECT pm.uid, COALESCE(pm.joined_at, pm.created_at) AS joined_at, "+
+			"pm.created_at FROM `octo_project_member` pm "+
+			"LEFT JOIN `user` u ON u.uid = pm.uid "+
+			"WHERE pm.project_id = ? AND pm.space_id = ? AND pm.status = 1 "+
+			"AND pm.removing = 0 AND pm.role = 2 AND COALESCE(u.robot, 0) = 0 "+
+			"AND COALESCE(u.is_destroy, 0) <> 2 "+
+			"ORDER BY joined_at ASC, pm.created_at ASC, pm.uid ASC",
+		binding.ProjectID, binding.SpaceID,
+	).Load(&owners); err != nil {
+		return fmt.Errorf("group: query all-member Project owners: %w", err)
+	}
+
+	// An ownerless Project, or a Project owner whose dedicated-group admission
+	// has not converged yet, is not a reason to promote a non-owner. Leave the
+	// current creator in place and let the next membership hook retry.
+	target := ""
+	for _, owner := range owners {
+		member, ok := memberByUID[owner.UID]
+		if ok && member.Status == int(common.GroupMemberStatusNormal) &&
+			member.IsExternal == 0 {
+			target = owner.UID
+			break
+		}
+	}
+	if target == "" {
+		return nil
+	}
+
+	changed := memberByUID[target].Role != MemberRoleCreator
+	for _, uid := range creators {
+		if uid != target {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil
+	}
+
+	if memberByUID[target].Role != MemberRoleCreator {
+		version, err := ctx.GenSeq(common.GroupMemberSeqKey)
+		if err != nil {
+			return fmt.Errorf("group: generate all-member owner version: %w", err)
+		}
+		if err := g.db.UpdateMemberRoleTx(
+			groupNo, target, MemberRoleCreator, version, tx,
+		); err != nil {
+			return fmt.Errorf("group: promote all-member owner: %w", err)
+		}
+	}
+	for _, uid := range creators {
+		if uid == target {
+			continue
+		}
+		version, err := ctx.GenSeq(common.GroupMemberSeqKey)
+		if err != nil {
+			return fmt.Errorf("group: generate former all-member owner version: %w", err)
+		}
+		if err := g.db.UpdateMemberRoleTx(
+			groupNo, uid, MemberRoleCommon, version, tx,
+		); err != nil {
+			return fmt.Errorf("group: demote former all-member creator: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("group: commit all-member owner sync: %w", err)
+	}
+	if err := ctx.SendCMD(config.MsgCMDReq{
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		CMD:         common.CMDGroupMemberUpdate,
+		Param:       map[string]interface{}{"group_no": groupNo},
+	}); err != nil {
+		return fmt.Errorf("group: notify all-member owner sync: %w", err)
+	}
+	ctx.SendChannelUpdateToGroup(groupNo)
+	return nil
 }
 
 // provisionAllMemberGroup 为一个项目建出全员群，返回 group_no。

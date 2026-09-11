@@ -235,6 +235,9 @@ func (g *Group) disband(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	if g.refuseIfAllMemberGroup(c, group, allMemberGroupActionDisband) {
+		return
+	}
 	loginMember, err := g.db.QueryMemberWithUID(loginUID, groupNo)
 	if err != nil {
 		g.Error("查询用户群内身份错误", zap.Error(err))
@@ -1085,7 +1088,8 @@ func (g *Group) respondGroupMyModels(c *wkhttp.Context, loginUID string, models 
 		memberCounts, countErr = g.db.queryGroupMemberCounts(groupNos)
 		if countErr != nil {
 			g.Error("查询群成员数量失败", zap.Error(countErr), zap.String("uid", loginUID))
-			memberCounts = make(map[string]int64)
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
 		}
 	}
 	resps := make([]*GroupResp, 0, len(models))
@@ -1659,6 +1663,9 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 	getGroupMs = time.Since(tStep).Milliseconds()
 	if err != nil {
 		respondGroupInfoError(c, err)
+		return
+	}
+	if g.refuseIfAllMemberGroup(c, group, allMemberGroupActionAdd) {
 		return
 	}
 	// 校验操作者是群成员,防止任意用户向任意群添加成员(issue#1018)
@@ -2674,6 +2681,9 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
+	if g.refuseIfAllMemberGroup(c, group, allMemberGroupActionJoin) {
+		return
+	}
 	if group.Invite == 1 {
 		httperr.ResponseErrorL(c, errcode.ErrGroupInviteModeCannotJoin, nil, nil)
 		return
@@ -3024,6 +3034,9 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionTransfer) {
+		return
+	}
 
 	version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
 	if err != nil {
@@ -3238,9 +3251,12 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 判断群是否存在
-	_, err := g.getGroupInfo(groupNo)
+	groupModel, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
+		return
+	}
+	if g.refuseIfAllMemberGroup(c, groupModel, allMemberGroupActionRemove) {
 		return
 	}
 	var loginMember *MemberModel
@@ -3602,6 +3618,9 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
+	if g.refuseIfAllMemberGroup(c, groupInfo, allMemberGroupActionExit) {
+		return
+	}
 	// 调用IM的移除订阅者
 	err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
 		ChannelID:   groupNo,
@@ -3906,6 +3925,9 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 	if group == nil || group.Status == GroupStatusDisband {
 		g.Error("群不存在", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
+	if action == "add" && g.refuseIfAllMemberGroupFields(c, group.GroupNo, group.ProjectID, allMemberGroupActionBlacklist) {
 		return
 	}
 	// 查询是否是管理者

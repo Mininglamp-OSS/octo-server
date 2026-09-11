@@ -305,9 +305,10 @@ func (l *logCapped) write(msg string, fields ...zap.Field) {
 
 // scanOwnerlessProjects counts ACTIVE projects with no active owner.
 //
-// The state is unrecoverable in P0 and was invisible to every other scan: orphan_total asks
-// about the Space, i1_violations and i1_abandoned_cleanup_leak ask about seats that outlived a
-// Space seat, and none of them notices a healthy project nobody can manage.
+// This is a historical or otherwise inconsistent state, not the normal
+// Space-removal outcome: the cascade preserves an active Owner row and only
+// closes non-Owner seats (including agent riders). The scan remains the safety
+// net for legacy/manual writes that leave a Project active without an Owner.
 //
 // A DISBANDED project has no owner either, and that is correct rather than a defect — hence
 // the status predicate, which lives in the violating flag like every other one (see

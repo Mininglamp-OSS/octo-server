@@ -237,11 +237,11 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 	//
 	// Here rather than in the service layer so that the transition is structural — every
 	// present and FUTURE disband path picks it up by construction instead of each caller
-	// having to remember. Today that is one caller (disbandProjectOnce); the Space-removal
-	// cascade only closes seats and the ownerless case is a recorded, deliberately
-	// unresolved end state, so this is where a future cascade would land rather than a
-	// junction that already exists. An earlier version of this comment claimed both
-	// already routed through here, which a reader would grep for and not find.
+	// having to remember. Today that is one caller (disbandProjectOnce). The Space-removal
+	// cascade preserves an Owner seat and closes only non-Owner seats, including agents
+	// owned by a departing Owner, so it does not transition the project subsystem here.
+	// An earlier version of this comment claimed both paths already routed through here,
+	// which a reader would grep for and not find.
 	//
 	// Teardown stays PULL-based (D9): nothing is sent outbound, and the subsystem learns
 	// by asking POST /v1/internal/projects/status.
@@ -578,7 +578,8 @@ func (d *DB) checkSpaceSeatForCleanupTx(tx *dbr.Tx, spaceID, uid string) (bool, 
 func (d *DB) queryMember(projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := d.session.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, "+
+			"COALESCE(joined_at, created_at) AS joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? LIMIT 1",
 		projectID, uid,
 	).Load(&rows)
@@ -598,7 +599,8 @@ func (d *DB) queryMember(projectID, uid string) (*MemberModel, error) {
 func (d *DB) queryMemberTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, "+
+			"COALESCE(joined_at, created_at) AS joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? FOR UPDATE",
 		projectID, uid,
 	).Load(&rows)
@@ -708,6 +710,35 @@ func (d *DB) deactivateMemberTx(tx *dbr.Tx, projectID, uid string, now time.Time
 	return affected > 0, nil
 }
 
+// deactivateStaleMemberTx closes an active seat after the project itself has
+// already been disbanded. A normal Space cascade deliberately preserves an
+// Owner row so a later rejoin can transfer ownership, but a disbanded project
+// has no remaining authorization surface and must not retain an active seat.
+// This path intentionally does not bump member_epoch: disband has already
+// invalidated the project's active membership view.
+func (d *DB) deactivateStaleMemberTx(tx *dbr.Tx, projectID, uid string, now time.Time) (bool, error) {
+	res, err := tx.Update("octo_project_member").
+		Set("status", MemberStatusRemoved).
+		Set("removing", 0).
+		Set("updated_at", now).
+		Where("project_id = ? AND uid = ? AND status = ?", projectID, uid,
+			MemberStatusActive).
+		Exec()
+	if err != nil {
+		return false, fmt.Errorf("project: deactivate stale member: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("project: deactivate stale member affected rows: %w", err)
+	}
+	if affected > 0 {
+		if _, err := d.cancelPendingRemovalJobsTx(tx, projectID, uid, now); err != nil {
+			return false, err
+		}
+	}
+	return affected > 0, nil
+}
+
 // updateMemberRoleTx sets a role and reports whether it changed. The `role <> ?`
 // guard is what makes "setting the role a member already has" a no-op that leaves
 // the epoch alone.
@@ -758,19 +789,28 @@ func (d *DB) countActiveOwnersTx(tx *dbr.Tx, projectID string) (int, error) {
 	return count, nil
 }
 
-// queryActiveProjectIDsForSpaceMember returns up to limit active non-Owner project ids the
-// uid still holds a seat in, within one Space. Owner identities are intentionally preserved
-// when their Space seat disappears, so they are not cleanup work. Excluding them here keeps a
-// page made entirely of preserved Owner rows from making the cascade report no progress forever.
-// Bounded on purpose: the Space-removal cascade walks it in pages so one member of a thousand
-// projects cannot hold a cleanup lease for the whole walk.
+// queryActiveProjectIDsForSpaceMember returns up to limit actionable project ids
+// for a uid leaving a Space. Non-Owner active seats are directly actionable. An
+// Owner row is included only when it has an active non-Owner agent rider owned by
+// that uid: the cascade preserves the Owner identity but must still close those
+// riders. Owner-only rows are omitted so they cannot consume a page forever.
+//
+// Bounded on purpose: the Space-removal cascade walks it in pages so one member
+// of a thousand projects cannot hold a cleanup lease for the whole walk.
 func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int) ([]string, error) {
 	var ids []string
 	_, err := d.session.SelectBySql(
-		"SELECT project_id FROM `octo_project_member` "+
-			"WHERE space_id = ? AND uid = ? AND status = ? AND removing = 0 AND role <> ? "+
-			"ORDER BY project_id LIMIT ?",
-		spaceID, uid, MemberStatusActive, RoleOwner, limit,
+		"SELECT pm.project_id FROM `octo_project_member` pm "+
+			"WHERE pm.space_id = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0 "+
+			"AND (pm.role <> ? OR EXISTS ("+
+			"SELECT 1 FROM `octo_project_member` rider INNER JOIN `robot` r "+
+			"ON r.robot_id = rider.uid COLLATE utf8mb4_general_ci "+
+			"WHERE rider.project_id = pm.project_id AND rider.space_id = pm.space_id "+
+			"AND rider.status = ? AND rider.removing = 0 AND rider.role <> ? "+
+			"AND r.creator_uid = ? AND r.status = 1)) "+
+			"ORDER BY pm.project_id LIMIT ?",
+		spaceID, uid, MemberStatusActive, RoleOwner,
+		MemberStatusActive, RoleOwner, uid, limit,
 	).Load(&ids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active projects of space member: %w", err)

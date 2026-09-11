@@ -20,13 +20,14 @@ type GroupProjectRelation struct {
 type groupProjectRelationRow struct {
 	GroupNo         string  `db:"group_no"`
 	Name            string  `db:"name"`
+	Purpose         string  `db:"purpose"`
 	SpaceID         string  `db:"space_id"`
 	ProjectID       string  `db:"project_id"`
 	ProjectLinkedBy *string `db:"project_linked_by"`
 	Status          int     `db:"status"`
 }
 
-const groupProjectRelationColumns = "group_no, name, space_id, project_id, project_linked_by, status"
+const groupProjectRelationColumns = "group_no, name, purpose, space_id, project_id, project_linked_by, status"
 
 func (d *DB) queryGroupProjectRelation(groupNo string) (*groupProjectRelationRow, error) {
 	var row *groupProjectRelationRow
@@ -59,8 +60,9 @@ func (d *DB) lockGroupProjectRelationTx(tx *dbr.Tx, groupNo string) (*groupProje
 }
 
 // updateGroupProjectRelationTx is the only relation write primitive. The
-// project_id and project_linked_by columns are always changed together.
-func (d *DB) updateGroupProjectRelationTx(tx *dbr.Tx, groupNo, projectID, linkedBy string) error {
+// project_id, project_linked_by, and version columns are always changed
+// together.
+func (d *DB) updateGroupProjectRelationTx(tx *dbr.Tx, groupNo, projectID, linkedBy string, version int64) error {
 	var projectValue interface{}
 	var linkedValue interface{}
 	if strings.TrimSpace(projectID) == "" {
@@ -77,6 +79,7 @@ func (d *DB) updateGroupProjectRelationTx(tx *dbr.Tx, groupNo, projectID, linked
 	_, err := tx.Update("group").
 		Set("project_id", projectValue).
 		Set("project_linked_by", linkedValue).
+		Set("version", version).
 		Where("group_no=?", groupNo).Exec()
 	return err
 }
@@ -97,34 +100,6 @@ func (d *DB) lockGroupManagerTx(tx *dbr.Tx, groupNo, uid string) (bool, error) {
 	}
 	return role == MemberRoleCreator || role == MemberRoleManager, nil
 }
-
-// lockGroupSpaceMemberTx authenticates an unbound relation operation using
-// the authoritative group Space. The caller must not select a Space from input.
-func (d *DB) lockGroupSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
-	var rows []int
-	_, err := tx.SelectBySql(
-		"SELECT 1 FROM `space_member` sm INNER JOIN `space` s ON s.space_id=sm.space_id "+
-			"WHERE sm.space_id=? AND sm.uid=? AND sm.status=1 AND s.status=1 LIMIT 1 FOR UPDATE",
-		spaceID, uid,
-	).Load(&rows)
-	return len(rows) > 0, err
-}
-
-func (d *DB) lockGroupUserEligibleTx(tx *dbr.Tx, uid string) (bool, error) {
-	var rows []struct {
-		Status    int `db:"status"`
-		IsDestroy int `db:"is_destroy"`
-	}
-	_, err := tx.SelectBySql(
-		"SELECT status, IFNULL(is_destroy, 0) AS is_destroy FROM `user` WHERE uid=? LIMIT 1 FOR SHARE",
-		uid,
-	).Load(&rows)
-	if err != nil {
-		return false, err
-	}
-	return len(rows) > 0 && rows[0].Status == 1 && rows[0].IsDestroy != 2, nil
-}
-
 func projectIDFromPointer(value *string) string {
 	if value == nil {
 		return ""

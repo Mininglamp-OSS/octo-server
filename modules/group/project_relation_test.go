@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,12 +32,6 @@ func TestChangedProjectSourceAllowedFailsClosedForUnobservedRebind(t *testing.T)
 				t.Fatalf("changedProjectSourceAllowed(%q, %q, %q) = %v, want %v", tt.initialSource, tt.currentSource, tt.target, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestProjectGroupLikeEscapesLiteralPatternCharacters(t *testing.T) {
-	if got, want := projectGroupLike("100%!_done"), "%100!%!!!_done%"; got != want {
-		t.Fatalf("projectGroupLike escaped pattern = %q, want %q", got, want)
 	}
 }
 
@@ -75,6 +70,108 @@ func TestValidateGroupProjectRelationRejectsStaleActorOnUnboundGroup(t *testing.
 	if err == nil {
 		t.Fatal("unbound group retaining a non-empty relation actor must be rejected")
 	}
+}
+func TestProjectRelationMutationRejectsAIContainerAndBumpsGroupVersion(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	g := New(ctx)
+
+	spaceID := "space-relation-version-" + util.GenerUUID()[:8]
+	projectID := "project-relation-version-" + util.GenerUUID()[:8]
+	actorUID := "relation-version-owner-" + util.GenerUUID()[:8]
+	groupNo := "group-relation-version-" + util.GenerUUID()[:8]
+	seedSpaceSeat(t, ctx, spaceID, actorUID)
+	seedProject(t, ctx, projectID, spaceID)
+	seedProjectMember(t, ctx, projectID, spaceID, actorUID, 0)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, status, is_destroy, robot) VALUES (?, ?, 1, 0, 0)",
+		actorUID, "Relation version owner",
+	).Exec()
+	require.NoError(t, err)
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "Relation version group", Creator: actorUID,
+		Status: GroupStatusNormal, Version: 1, SpaceID: spaceID,
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: groupNo, UID: actorUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+
+	var initial struct {
+		Version int64 `db:"version"`
+	}
+	require.NoError(t, ctx.DB().SelectBySql(
+		"SELECT version FROM `group` WHERE group_no=?", groupNo,
+	).LoadOne(&initial))
+
+	bound, err := g.bindGroupProject(actorUID, groupNo, projectID)
+	require.NoError(t, err)
+	assert.Equal(t, projectID, bound.ProjectID)
+	var afterBind struct {
+		ProjectID string `db:"project_id"`
+		Version   int64  `db:"version"`
+	}
+	require.NoError(t, ctx.DB().SelectBySql(
+		"SELECT project_id, version FROM `group` WHERE group_no=?", groupNo,
+	).LoadOne(&afterBind))
+	assert.Equal(t, projectID, afterBind.ProjectID)
+	assert.NotEqual(t, initial.Version, afterBind.Version,
+		"binding a Project must advance the group version for incremental clients")
+
+	repeated, err := g.bindGroupProject(actorUID, groupNo, projectID)
+	require.NoError(t, err)
+	assert.Equal(t, projectID, repeated.ProjectID)
+	var afterRepeat struct {
+		ProjectID string `db:"project_id"`
+		Version   int64  `db:"version"`
+	}
+	require.NoError(t, ctx.DB().SelectBySql(
+		"SELECT project_id, version FROM `group` WHERE group_no=?", groupNo,
+	).LoadOne(&afterRepeat))
+	assert.Equal(t, afterBind.Version, afterRepeat.Version,
+		"repeated binding must not advance the group version")
+
+	unbound, err := g.unbindGroupProject(actorUID, groupNo)
+	require.NoError(t, err)
+	assert.Empty(t, unbound.ProjectID)
+	var afterUnbind struct {
+		ProjectID string `db:"project_id"`
+		Version   int64  `db:"version"`
+	}
+	require.NoError(t, ctx.DB().SelectBySql(
+		"SELECT project_id, version FROM `group` WHERE group_no=?", groupNo,
+	).LoadOne(&afterUnbind))
+	assert.Empty(t, afterUnbind.ProjectID)
+	assert.NotEqual(t, afterBind.Version, afterUnbind.Version,
+		"unbinding a Project must advance the group version for incremental clients")
+
+	aiUnboundNo := "group-ai-relation-bind-" + util.GenerUUID()[:8]
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: aiUnboundNo, Name: "AI relation bind", Creator: actorUID,
+		Purpose: aiteampkg.GroupPurpose, Status: GroupStatusNormal, Version: 1, SpaceID: spaceID,
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: aiUnboundNo, UID: actorUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+	_, err = g.bindGroupProject(actorUID, aiUnboundNo, projectID)
+	require.ErrorIs(t, err, aiteampkg.ErrContainerProtected)
+	assertGroupProjectRelationRow(t, ctx, aiUnboundNo, "", "")
+
+	aiBoundNo := "group-ai-relation-unbind-" + util.GenerUUID()[:8]
+	linkedBy := actorUID
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: aiBoundNo, Name: "AI relation unbind", Creator: actorUID,
+		Purpose: aiteampkg.GroupPurpose, Status: GroupStatusNormal, Version: 1, SpaceID: spaceID,
+		ProjectID: projectID, ProjectLinkedBy: &linkedBy,
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: aiBoundNo, UID: actorUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+	_, err = g.unbindGroupProject(actorUID, aiBoundNo)
+	require.ErrorIs(t, err, aiteampkg.ErrContainerProtected)
+	assertGroupProjectRelationRow(t, ctx, aiBoundNo, projectID, linkedBy)
 }
 func TestProjectDisbandDetachesRelationPreservingNativeMembers(t *testing.T) {
 	_, ctx := newTestServer(t)

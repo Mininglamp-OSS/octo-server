@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -104,6 +105,45 @@ func TestListProjectGroupsReturnsAllAssociatedGroups(t *testing.T) {
 	assert.Equal(t, []string{allMember.groupNo, mine, theirs}, groupNosOf(decodeGroupList(t, w)),
 		"the relation list must include initial provisioning and must not filter on native group membership")
 	assert.Equal(t, "3", w.Header().Get("X-Total-Count"))
+}
+
+// TestListProjectGroupsExcludesLegacyBoundAIContainers keeps historical
+// AI-container relations out of both the direct Project list and the Sidebar
+// batch projection. The relation write guard prevents new invalid rows, but
+// reads must also fail closed for rows created before that guard existed.
+func TestListProjectGroupsExcludesLegacyBoundAIContainers(t *testing.T) {
+	srv, _ := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "owner1")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	created := createProjectVia(t, srv, spaceA, ownerToken, "groups-no-ai-container")
+
+	regular := util.GenerUUID()
+	legacyAI := util.GenerUUID()
+	seedProjectGroup(t, regular, spaceA, created.ProjectID)
+	seedProjectGroup(t, legacyAI, spaceA, created.ProjectID)
+	_, err := testCtx.DB().Update("group").
+		Set("purpose", aiteampkg.GroupPurpose).
+		Where("group_no=?", legacyAI).Exec()
+	require.NoError(t, err)
+
+	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerToken, nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	list := decodeProjectGroupRelations(t, w)
+	assert.Contains(t, groupNosOf(list), regular)
+	assert.NotContains(t, groupNosOf(list), legacyAI,
+		"legacy AI-container relation must not leak through the direct Project list")
+	assert.Equal(t, fmt.Sprint(len(list)), w.Header().Get("X-Total-Count"),
+		"the count query and page query must apply the same AI-container predicate")
+
+	sidebar, err := ListProjectGroupRelationsByProjectIDs(
+		testCtx, spaceA, "owner1", []string{created.ProjectID},
+	)
+	require.NoError(t, err)
+	sidebarGroups := sidebar[created.ProjectID]
+	assert.Contains(t, groupNosOf(sidebarGroups), regular)
+	assert.NotContains(t, groupNosOf(sidebarGroups), legacyAI,
+		"legacy AI-container relation must not leak through the Sidebar batch list")
 }
 
 // TestListProjectGroupsExcludesDisbandedGroups covers the filter that is load-bearing
