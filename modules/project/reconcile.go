@@ -71,9 +71,16 @@ type reconcileCursors struct {
 	// P1's I3 scan rotates over `group`.id and reuses the idResume/idSave pair.
 	i3Group int64
 	i3Run   int
-	// P2's missing-pointer scan rotates over octo_project.id.
+	// P2 scans (invariant I4). i4Missing rotates over octo_project.id alone;
+	// i4Gap needs the composite (project id, member uid) for the same reason
+	// member scans need it — its page is bounded on MEMBER rows and therefore
+	// cuts projects in half, so a project-only cursor would skip members past
+	// the boundary on every rotation.
 	i4Missing    int64
 	i4MissingRun int
+	i4GapProject int64
+	i4GapUID     string
+	i4GapRun     int
 }
 
 var cursors reconcileCursors
@@ -113,6 +120,24 @@ func (c *reconcileCursors) abandonedSave(project, uid string, running int, done 
 		return
 	}
 	c.abandonedProject, c.abandonedUID, c.abandonRun = project, uid, running
+}
+
+// i4GapResume / i4GapSave are the mixed (int64, string) composite cursor the
+// I4 gap rotation needs. Same contract as i1Resume/i1Save.
+func (c *reconcileCursors) i4GapResume() (int64, string, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.i4GapProject, c.i4GapUID, c.i4GapRun
+}
+
+func (c *reconcileCursors) i4GapSave(project int64, uid string, running int, done bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if done {
+		c.i4GapProject, c.i4GapUID, c.i4GapRun = 0, "", 0
+		return
+	}
+	c.i4GapProject, c.i4GapUID, c.i4GapRun = project, uid, running
 }
 
 // idResume / idSave are the same contract for the single-int64-cursor rotations.
@@ -155,6 +180,7 @@ func resetCursorsForTest() {
 	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
 	cursors.i3Group, cursors.i3Run = 0, 0
 	cursors.i4Missing, cursors.i4MissingRun = 0, 0
+	cursors.i4GapProject, cursors.i4GapUID, cursors.i4GapRun = 0, "", 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly
@@ -179,8 +205,8 @@ func (p *Project) startReconcileWorker() {
 		// announced is worse than a broken one: the gauges sit at zero and read as "no
 		// violations". This line is what makes "we never turned it on" findable.
 		if !p.cfg.ReconcileEnabled {
-			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目 / I4 缺群"+
-				"四项无监控，相关 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
+			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目 / I4 缺群 / I4 缺员"+
+				"五项无监控，五个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
 				zap.String("env", envReconcileEnabled))
 		}
 		p.ctx.Schedule(jitter(p.cfg.ReconcileInterval), p.runReconcile)
@@ -232,11 +258,12 @@ func (p *Project) runReconcile() {
 	// reports cleanup machinery that stopped. Both remain report-only.
 	p.scanI3Violations()
 	p.scanRemovingStalls()
-	// The I4 missing-pointer scan is gated because its join against the legacy
-	// `group` table can be expensive under the production collation shape.
-	// It is report-only; provisioning retries remain on write paths.
+	// The I4 missing-pointer and dedicated missing-member scans are gated because
+	// their joins against legacy group tables can be expensive under the
+	// production collation shape. Both are report-only.
 	if p.cfg.ReconcileEnabled {
 		p.scanMissingAllMemberGroups()
+		p.scanAllMemberGroupGaps()
 	}
 }
 
@@ -489,7 +516,12 @@ func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit in
 			// property Q4 was about — and no index leads with status (the PK is
 			// (project_id, uid), and the three secondary indexes lead with space_id/uid/
 			// project_id).
-			"(pm.status = ? "+
+			// Owner identity is intentionally retained after Space revocation, but it is only an
+			// exemption while the Project itself remains normal. A stale active Owner row on a
+			// disbanded or missing Project has no restoration surface and is a real leak, matching
+			// deactivateStaleMemberTx's write-side cleanup semantics.
+			"(pm.status = ? AND (pm.role <> ? OR NOT EXISTS (SELECT 1 FROM `octo_project` p "+
+			"                  WHERE p.project_id = pm.project_id AND p.status = ?)) "+
 			" AND NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
 			"             WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
 			" AND NOT EXISTS (SELECT 1 FROM `space_member` sm "+
@@ -499,7 +531,7 @@ func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit in
 			"FROM `octo_project_member` pm "+
 			"WHERE (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		MemberStatusActive, cleanupStatusPending, spaceStatusDisbanded,
+		MemberStatusActive, RoleOwner, StatusNormal, cleanupStatusPending, spaceStatusDisbanded,
 		spaceMemberStatusActive, cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
@@ -617,7 +649,11 @@ func (p *Project) queryAbandonedLeakPage(cursorProject, cursorUID string, limit 
 			// The seat is still ACTIVE. In the flag rather than the WHERE clause for the same
 			// reason as the I1 scan: member rows are never deleted, so filtering on status
 			// there would bound rows returned instead of rows examined.
-			"(pm.status = ? "+
+			// A retained Owner is exempt only while the Project itself is normal. Once the
+			// Project is disbanded or missing, an active Owner is stale and must be reported,
+			// matching deactivateStaleMemberTx's write-side cleanup semantics.
+			"(pm.status = ? AND (pm.role <> ? OR NOT EXISTS (SELECT 1 FROM `octo_project` p "+
+			"                  WHERE p.project_id = pm.project_id AND p.status = ?)) "+
 			// An abandoned job exists for this pair: nothing will re-drive THAT job.
 			" AND EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
 			"          WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
@@ -638,7 +674,7 @@ func (p *Project) queryAbandonedLeakPage(cursorProject, cursorUID string, limit 
 			"FROM `octo_project_member` pm "+
 			"WHERE (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		MemberStatusActive, cleanupStatusAbandoned, cleanupStatusPending,
+		MemberStatusActive, RoleOwner, StatusNormal, cleanupStatusAbandoned, cleanupStatusPending,
 		cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {

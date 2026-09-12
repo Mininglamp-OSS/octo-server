@@ -11,9 +11,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// spaceMemberRemovalStepName is the cleanup step's name, which also prefixes the
-// job's last_error.
-const spaceMemberRemovalStepName = "project_member"
+const (
+	spaceMemberRemovalStepName = "project_member"
+	spaceMemberRejoinStepName  = "project_rejoin"
+)
 
 // cascadePageSize bounds ONE QUERY over a removed member's projects; cascadeMaxPages bounds
 // how many such pages one invocation will walk.
@@ -54,9 +55,138 @@ var errCascadeIncomplete = errors.New("project: cascade page budget exhausted, s
 // Reverse registration rather than having modules/space call us: modules/project
 // imports modules/space, so the reverse import would be a cycle. Same mechanism
 // modules/group uses. Registration is by name and latest-wins, which is what lets a
-// test substitute a deliberately failing step.
 func (p *Project) registerSpaceMemberRemovalCleanup() {
 	spacemod.RegisterMemberRemovalCleanupStep(spaceMemberRemovalStepName, p.cleanupSpaceMemberProjects)
+	spacemod.RegisterMemberRejoinCleanupStep(spaceMemberRejoinStepName, p.restoreSpaceMemberProjects)
+}
+
+// restoreSpaceMemberProjects is the projection-only half of a Space rejoin.
+// It walks active Project seats with a stable project_id cursor, restores only
+// the current dedicated-group pointer, and retries broker/owner convergence
+// failures through the same durable Space outbox row.
+func (p *Project) restoreSpaceMemberProjects(ctx *config.Context, rejoin spacemod.MemberRemoval) error {
+	if ctx == nil || rejoin.SpaceID == "" || rejoin.UID == "" {
+		return nil
+	}
+	spaceActive, err := spacepkg.CheckMembership(ctx.DB(), rejoin.SpaceID, rejoin.UID)
+	if err != nil {
+		return fmt.Errorf("project: re-check Space membership before rejoin projection: %w", err)
+	}
+	if !spaceActive {
+		return nil
+	}
+	canonicalSpaceID, found, err := spacepkg.ResolveSpaceID(ctx.DB(), rejoin.SpaceID)
+	if err != nil {
+		return fmt.Errorf("project: resolve Space identity before rejoin projection: %w", err)
+	}
+	if !found {
+		// CheckMembership above can only authorize a real active Space. If the
+		// row disappears between the two reads, fail closed instead of passing
+		// the raw selector to a projection hook.
+		return nil
+	}
+	accountUsable, err := p.rejoinAccountUsable(rejoin.UID)
+	if err != nil {
+		return err
+	}
+	if !accountUsable {
+		return nil
+	}
+
+	cursor := rejoin.RejoinCursor
+	projectIDs, err := p.db.queryActiveProjectIDsForSpaceMemberRejoin(
+		canonicalSpaceID, rejoin.UID, cursor, cascadePageSize,
+	)
+	if err != nil {
+		return err
+	}
+	if len(projectIDs) == 0 {
+		return nil
+	}
+	var firstErr error
+	for _, projectID := range projectIDs {
+		if err := p.restoreSpaceMemberProject(
+			ctx, canonicalSpaceID, rejoin.UID, projectID,
+		); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if len(projectIDs) == cascadePageSize {
+		return &spacemod.MemberRejoinPageIncompleteError{
+			Cursor: projectIDs[len(projectIDs)-1],
+		}
+	}
+	return nil
+}
+
+func (p *Project) rejoinAccountUsable(uid string) (bool, error) {
+	var found []int
+	if _, err := p.db.session.SelectBySql(
+		"SELECT 1 FROM `user` WHERE uid = ? AND status = 1 "+
+			"AND COALESCE(is_destroy, 0) <> 2 LIMIT 1",
+		uid,
+	).Load(&found); err != nil {
+		return false, fmt.Errorf("project: query rejoin account: %w", err)
+	}
+	return len(found) > 0, nil
+}
+
+func (p *Project) restoreSpaceMemberProject(
+	ctx *config.Context, spaceID, uid, projectID string,
+) error {
+	spaceActive, err := spacepkg.CheckMembership(ctx.DB(), spaceID, uid)
+	if err != nil {
+		return fmt.Errorf("project: re-check Space membership for project: %w", err)
+	}
+	if !spaceActive {
+		return nil
+	}
+	member, err := p.db.queryMember(projectID, uid)
+	if err != nil {
+		return err
+	}
+	if member == nil || member.Status != MemberStatusActive || member.Removing != 0 {
+		return nil
+	}
+	project, err := p.db.queryByProjectID(projectID)
+	if err != nil {
+		return err
+	}
+	if project == nil || project.Status != StatusNormal {
+		return nil
+	}
+	projectSpaceID, found, err := spacepkg.ResolveSpaceID(ctx.DB(), project.SpaceID)
+	if err != nil {
+		return fmt.Errorf("project: resolve Project Space identity for restore: %w", err)
+	}
+	if !found || projectSpaceID != spaceID {
+		return nil
+	}
+	groupNo := p.ensureAllMemberGroup(projectID, spaceID)
+	if groupNo == "" {
+		if allMemberGroupProvisioner() == nil {
+			return errors.New("project: all-member provisioner is not registered")
+		}
+		return errors.New("project: dedicated-group pointer is not converged")
+	}
+	admit := allMemberGroupAdmitter()
+	if admit == nil {
+		return errors.New("project: all-member admission hook is not registered")
+	}
+	if err := admit(ctx, spaceID, groupNo, uid); err != nil {
+		return fmt.Errorf("project: restore dedicated-group member: %w", err)
+	}
+	transfer := allMemberGroupOwnerTransfer()
+	if transfer == nil {
+		return errors.New("project: all-member owner hook is not registered")
+	}
+	if err := transfer(ctx, projectID, groupNo); err != nil {
+		return fmt.Errorf("project: restore dedicated-group owner: %w", err)
+	}
+	return nil
 }
 
 // cleanupSpaceMemberProjects closes every project seat a removed Space member still

@@ -627,7 +627,7 @@ func (c *Client) CreateDriveSpace(ctx context.Context, target Target, req DriveR
 }
 
 func validDriveRequest(req DriveRequest) bool {
-	if strings.TrimSpace(req.Name) == "" || len(req.Name) > 64 {
+	if strings.TrimSpace(req.Name) == "" || utf8.RuneCountInString(req.Name) > 64 {
 		return false
 	}
 	if strings.TrimSpace(req.OctoSpaceID) == "" || strings.TrimSpace(req.SuperAdminUID) == "" {

@@ -23,7 +23,12 @@
 - 置顶 upsert 保留 `%w` 错误链，并在重复置顶时修复 `pinned=1,pinned_at=NULL` 的历史偏好；`GET /v1/group/my` 角色列表的成员计数查询失败返回 `query_failed`，不再以成功的 0 掩盖数据库错误。无引用关系辅助函数已删除。
 - `joined_at` 采用 rolling expand：仅新增可空 `DATETIME(3)`，旧二进制可省略，读侧统一 `COALESCE(joined_at,created_at)`，新加入/重新加入写 UTC 时间；本版本不做回填或收缩为非空。Space cascade 保留 active human Owner，只有存在 active non-Owner agent rider 时才处理 rider，Owner-only 行不进入分页。
 - 经授权的 Drive provisioning 以 `project_id` 管理且不要求 Project 返回 Drive ID：远端支持后使用 `POST /v1/internal/drive/spaces`、`X-Internal-Token` 及 Project 名称、`octo_space_id`、当前 Owner `super_admin_uid`、`project_id`；仅 exact same project 重复请求幂等成功，其他 `409/401/500` 按重试/失败策略处理。`OCTO_DRIVE_INTERNAL_TOKEN` 与 Fleet HMAC 分离，功能关闭时不出站；远端接口及 30 字符名称支持是部署前提。
+- Project 对账恢复专属全员群 I4-A 缺群与 I4-B 缺员扫描，保留 `ReconcileEnabled` 昂贵扫描门禁，使用游标分页、宽限期、Space 撤权/移除/封禁/系统 bot 豁免并在完整轮转后发布 gauge；普通 `group.project_id` 关联群保持独立成员快照且不触发该缺员监控。
+- Space 撤权时，在同一事务中降级并移除专属群的原生 Owner 成员，保留 Project Owner 身份；恢复按有效账号、Space、Project 和当前专属指针投影最新真人 Owner，兼容跨表混合 collation。Space 和 Project 重新加入在成员事务内写入 `reason=rejoined` 投影任务；迟到退订的补订阅失败由清理回调补写持久任务，投影 worker 的失败由原任务重试。仅合并尚未执行、无租约、无游标且零次尝试的 pending 任务，避免越过新请求对应的 Project；成功分页持久化游标并归还 attempt。普通关联群保持原生成员快照。
+- Space 清理工单的立即入队与分页续跑时间按数据库毫秒精度截断，保证提交后的工单可立即认领；事件回归测试隔离进程级监听器，支持重复运行。
 - 运维注意：`project_i2_violations_total`、`group_admission_rejected_total` 及全员群 guard failure 计数器已移除，旧面板/告警应删除或允许序列缺失。Bot/IM 提示、订阅及其他提交后通知均按 best-effort 处理，数据库提交事实权威，失败只记录并走既有补偿/重试路径；缺失上述指标本身不是服务故障。
+- Space ID 解析改由数据库按 `space` 表实际 collation 返回存储值，旧 `rejoined` 任务在 worker 边界解析原始 selector；解析/查询失败沿原 lease 重试，`rejoined` 遇 Space 缺失或解散终止恢复，普通 Space removal 仍按原始 selector fail-safe 清理，避免大小写/PAD SPACE 或缺失 Space 导致错误跳过。
+- I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
 
 ## [v1.1.2] - 2026-03-05
 

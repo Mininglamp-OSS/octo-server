@@ -778,6 +778,52 @@ func driveRequestFixture(projectID string) DriveRequest {
 	}
 }
 
+func TestCreateDriveSpaceNameCharacterLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		text      string
+		wantError bool
+	}{
+		{"project CJK maximum", strings.Repeat("中", 30), false},
+		{"Drive Unicode boundary", strings.Repeat("中😀", 32), false},
+		{"over Drive boundary", strings.Repeat("中😀", 32) + "文", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body DriveRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode Drive request: %v", err)
+				}
+				received <- body.Name
+				w.WriteHeader(http.StatusCreated)
+			}))
+			defer server.Close()
+			req := driveRequestFixture("project-name-boundary")
+			req.Name = tc.text
+			_, err := NewClient(nil, nil).CreateDriveSpace(context.Background(),
+				driveTarget(server.URL+"/v1/internal/drive/spaces"), req)
+			if tc.wantError {
+				if err == nil || Category(err) != "invalid_request" {
+					t.Fatalf("expected invalid_request, got %v", err)
+				}
+				select {
+				case <-received:
+					t.Fatal("an over-limit name must be rejected before HTTP")
+				default:
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid Unicode name rejected: %v", err)
+			}
+			if got := <-received; got != tc.text {
+				t.Fatalf("Drive received %q, want complete name %q", got, tc.text)
+			}
+		})
+	}
+}
+
 func TestCreateDriveSpaceUsesInternalTokenAndProjectBody(t *testing.T) {
 	const projectID = "project-1"
 	var got DriveRequest

@@ -2,16 +2,18 @@ package group
 
 import (
 	"context"
-	"testing"
-	"time"
-
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"strings"
+	"testing"
+	"time"
 )
 
 func TestChangedProjectSourceAllowedFailsClosedForUnobservedRebind(t *testing.T) {
@@ -432,4 +434,211 @@ func TestProjectRelationReadRejectsCrossSpaceProjectMember(t *testing.T) {
 	_, err = g.readGroupProject(context.Background(), groupNo, actorUID)
 	require.ErrorIs(t, err, errProjectRelationNotFound,
 		"Project membership from another Space must not authorize relation reads")
+}
+
+// TestProjectRemovalRejoinRepairsMissingNativeMember pins the stale-removal
+// boundary: the Project seat can already be active again while the old
+// callback observes no native row. It must reconcile the current dedicated
+// projection (including IMAdd) rather than returning and letting a later
+// IMRemove strand the active member.
+func TestProjectRemovalRejoinRepairsMissingNativeMember(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	g := New(ctx)
+	stub := newGroupIMStub(t, ctx)
+
+	spaceID := "space-project-rejoin-" + util.GenerUUID()[:8]
+	projectID := "project-rejoin-" + util.GenerUUID()[:8]
+	groupNo := "group-rejoin-" + util.GenerUUID()[:8]
+	uid := "project-rejoin-user-" + util.GenerUUID()[:8]
+	ownerUID := "project-rejoin-owner-" + util.GenerUUID()[:8]
+	seedSpaceSeat(t, ctx, spaceID, ownerUID)
+	seedSpaceSeat(t, ctx, spaceID, uid)
+	seedProjectForGroupTest(t, ctx, projectID, spaceID, ownerUID)
+	seedProjectSeat(t, ctx, projectID, spaceID, uid, 0)
+	seedAllMemberGroupRow(t, ctx, groupNo, projectID, spaceID, ownerUID)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no, status, robot) VALUES (?, ?, ?, 1, 0)",
+		ownerUID, ownerUID, "pro_"+util.GenerUUID()[:8],
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no, status, robot) VALUES (?, ?, ?, 1, 0)",
+		uid, uid, "pro_"+util.GenerUUID()[:8],
+	).Exec()
+	require.NoError(t, err)
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: groupNo, UID: ownerUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+
+	err = g.detachMemberFromProjectGroups(ctx, projectmod.MemberRemoval{
+		ProjectID:   projectID,
+		SpaceID:     spaceID,
+		UID:         uid,
+		OperatorUID: ownerUID,
+		Reason:      "kicked",
+	})
+	require.NoError(t, err)
+	assert.True(t, activeMemberExists(t, ctx, groupNo, uid),
+		"active Project membership with a missing native row must be restored")
+	assert.Contains(t, stub.subscribed(groupNo), uid,
+		"the repair must issue IMAdd for the restored native membership")
+	assert.NotContains(t, stub.unsubscribed(groupNo), uid,
+		"the stale removal callback must not issue IMRemove after rejoin")
+}
+
+// TestProjectRejoinRestoresNativeCurrentOwnerForSpaceIDVariants drives the
+// real Group admission and Owner-sync hooks. A rejoin selector that differs
+// from the stored Space ID by case or PAD SPACE must restore the native row,
+// then converge the current Project Owner to creator.
+func TestProjectRejoinRestoresNativeCurrentOwnerForSpaceIDVariants(t *testing.T) {
+	cases := []struct {
+		name          string
+		storedSpaceID func(string) string
+	}{
+		{
+			name:          "case_variant",
+			storedSpaceID: strings.ToUpper,
+		},
+		{
+			name:          "pad_space",
+			storedSpaceID: func(base string) string { return base + " " },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ctx := newTestServer(t)
+			defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+			g := New(ctx)
+			stub := newGroupIMStub(t, ctx)
+
+			baseSpaceID := "space-project-owner-" + util.GenerUUID()[:8]
+			storedSpaceID := tc.storedSpaceID(baseSpaceID)
+			projectID := "project-owner-rejoin-" + util.GenerUUID()[:8]
+			groupNo := "group-owner-rejoin-" + util.GenerUUID()[:8]
+			ownerUID := "project-owner-rejoin-" + util.GenerUUID()[:8]
+
+			seedSpaceSeat(t, ctx, storedSpaceID, ownerUID)
+			seedProjectForGroupTest(t, ctx, projectID, storedSpaceID, ownerUID)
+			seedAllMemberGroupRow(t, ctx, groupNo, projectID, storedSpaceID, ownerUID)
+			_, err := ctx.DB().InsertBySql(
+				"INSERT INTO `user` (uid, name, short_no, status, robot) VALUES (?, ?, ?, 1, 0)",
+				ownerUID, ownerUID, "owner_"+util.GenerUUID()[:8],
+			).Exec()
+			require.NoError(t, err)
+
+			// No native owner row exists: this is the gap the rejoin projection
+			// must repair. The real admitter starts a restored row as common;
+			// the real owner hook must then promote the current Project Owner.
+			require.NoError(t, g.admitToAllMemberGroup(
+				ctx, baseSpaceID, groupNo, ownerUID,
+			))
+			role, present := liveMemberRole(t, ctx, groupNo, ownerUID)
+			require.True(t, present, "rejoin must restore the native member")
+			assert.Equal(t, MemberRoleCommon, role,
+				"admission itself must not mint creator privileges")
+
+			require.NoError(t, g.ensureAllMemberGroupOwner(ctx, projectID, groupNo))
+			role, present = liveMemberRole(t, ctx, groupNo, ownerUID)
+			require.True(t, present)
+			assert.Equal(t, MemberRoleCreator, role,
+				"the current human Project Owner must own the restored projection")
+			assert.Contains(t, stub.subscribed(groupNo), ownerUID)
+		})
+	}
+}
+
+// TestProjectRemovalRejoinCannotLateUnsubscribe exercises the opposite race:
+// the stale removal starts with no valid seats, blocks in IMRemove, then a
+// rejoin commits and admits the member before the old broker call returns.
+// The stale call must perform a final current-pointer reconciliation and leave
+// the subscriber present.
+func TestProjectRemovalRejoinCannotLateUnsubscribe(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	g := New(ctx)
+	stub := newGroupIMStub(t, ctx)
+	stub.blockSubscriberRemove = true
+
+	spaceID := "space-project-race-" + util.GenerUUID()[:8]
+	projectID := "project-race-" + util.GenerUUID()[:8]
+	groupNo := "group-race-" + util.GenerUUID()[:8]
+	ownerUID := "project-race-owner-" + util.GenerUUID()[:8]
+	uid := "project-race-user-" + util.GenerUUID()[:8]
+	seedSpaceSeat(t, ctx, spaceID, ownerUID)
+	seedSpaceSeat(t, ctx, spaceID, uid)
+	seedProjectForGroupTest(t, ctx, projectID, spaceID, ownerUID)
+	seedProjectSeat(t, ctx, projectID, spaceID, uid, 0)
+	seedAllMemberGroupRow(t, ctx, groupNo, projectID, spaceID, ownerUID)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no, status, robot) VALUES (?, ?, ?, 1, 0)",
+		ownerUID, ownerUID, "rac_"+util.GenerUUID()[:8],
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no, status, robot) VALUES (?, ?, ?, 1, 0)",
+		uid, uid, "rac_"+util.GenerUUID()[:8],
+	).Exec()
+	require.NoError(t, err)
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: groupNo, UID: ownerUID, Role: MemberRoleCreator,
+		Status: 1, Version: 1, Vercode: util.GenerUUID(),
+	}))
+	_, err = ctx.DB().UpdateBySql(
+		"UPDATE space_member SET status=0 WHERE space_id=? AND uid=?",
+		spaceID, uid,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().UpdateBySql(
+		"UPDATE octo_project_member SET status=0, removing=1 WHERE project_id=? AND uid=?",
+		projectID, uid,
+	).Exec()
+	require.NoError(t, err)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- g.detachMemberFromProjectGroups(ctx, projectmod.MemberRemoval{
+			ProjectID: projectID, SpaceID: spaceID, UID: uid,
+			OperatorUID: ownerUID, Reason: "kicked",
+		})
+	}()
+	select {
+	case <-stub.removeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale removal did not reach the blocked IMRemove")
+	}
+
+	_, err = ctx.DB().UpdateBySql(
+		"UPDATE space_member SET status=1 WHERE space_id=? AND uid=?",
+		spaceID, uid,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().UpdateBySql(
+		"UPDATE octo_project_member SET status=1, removing=0 WHERE project_id=? AND uid=?",
+		projectID, uid,
+	).Exec()
+	require.NoError(t, err)
+	require.NoError(t, g.admitToAllMemberGroup(ctx, spaceID, groupNo, uid))
+	stub.failNextSubscriberAdd()
+	close(stub.releaseRemove)
+	require.ErrorIs(t, <-errCh, projectpkg.ErrAdmittedButNotSubscribed)
+
+	var pendingRejoin []int
+	_, err = ctx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM space_member_removal_cleanup "+
+			"WHERE space_id=? AND uid=? AND reason=? AND status=0",
+		spaceID, uid, spacemod.MemberRemoveReasonRejoined,
+	).Load(&pendingRejoin)
+	require.NoError(t, err)
+	require.Len(t, pendingRejoin, 1)
+	assert.Equal(t, 1, pendingRejoin[0],
+		"failed compensation after late IMRemove must leave a durable rejoin intent")
+	require.False(t, stub.currentlySubscribed(groupNo, uid))
+	require.NoError(t, g.reconcileDedicatedGroupProjection(ctx, projectmod.MemberRemoval{
+		ProjectID: projectID, SpaceID: spaceID, UID: uid, OperatorUID: ownerUID,
+	}, groupNo))
+	assert.True(t, stub.currentlySubscribed(groupNo, uid),
+		"retrying the projection must restore the subscriber")
 }

@@ -1165,22 +1165,32 @@ type RemoveGroupMembersServiceReq struct {
 	// removal/disband). User and Bot API callers must leave it false.
 	AllowProtected bool
 
-	// ProjectRemoval/ProjectID mark authoritative Project-seat cleanup. The
-	// removal transaction locks the Project before the native group and member
-	// rows, then rechecks the seat so a concurrent re-admission cannot be
-	// removed after it commits.
+	// SpaceMemberRemoval marks the Space lifecycle path. The service fences the
+	// current Space seat before deleting any native group row. Its caller
+	// supplies exactly one UID per operation; batch lifecycle removal requires
+	// per-UID eligibility and successor exclusion before adding a batch caller.
+	SpaceMemberRemoval bool
+	SpaceID            string
+
+	// ProjectRemoval/ProjectID mark authoritative Project-seat cleanup. In the
+	// Space lifecycle path ProjectID is also the candidate group's Project
+	// association, used to lock and recheck the dedicated pointer.
 	ProjectRemoval bool
 	ProjectID      string
 }
 
 // RemoveGroupMembersServiceResp 移除群成员响应。
 //
-// Removed 是**实际**移除数量，可能小于请求的成员数：群主会被静默跳过，
+// Removed 是**实际**移除数量，可能小于请求的成员数：普通群的群主会被静默跳过，
 // 且锁内重读发现目标刚被提升为群主时也会跳过。调用方若依赖「这个人一定被移除」，
 // 必须检查 Removed 而不是只看 error —— 两种跳过都返回 nil error。
+//
+// LifecycleNoop indicates that the current Space seat makes removal unnecessary
+// because a rejoin won the race. Concurrent native role changes remain retryable.
 type RemoveGroupMembersServiceResp struct {
-	Removed     int      // 实际移除数量
-	RemovedUIDs []string // 实际移除的 UID 列表
+	Removed       int      // 实际移除数量
+	RemovedUIDs   []string // 实际移除的 UID 列表
+	LifecycleNoop bool     // 生命周期栅栏判定当前无需删除
 }
 
 // UpdateGroupInfoServiceReq 更新群信息请求
@@ -1874,6 +1884,12 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 			return nil, aiteampkg.ErrContainerProtected
 		}
 	}
+	if req.SpaceMemberRemoval && !req.AllowProtected {
+		return nil, errors.New("Space member removal requires lifecycle authorization")
+	}
+	if req.SpaceMemberRemoval && req.ProjectRemoval {
+		return nil, errors.New("Space and Project removal modes are mutually exclusive")
+	}
 
 	// 群存在性检查
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
@@ -1906,7 +1922,8 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// 传 false，#354 原样保持。判据见 QueryBotsInvitedByUIDTx 的 requireCommonRole。
 	var removableMembers []*MemberModel
 	for _, m := range targetMembers {
-		if m.IsDeleted == 1 || (m.Role == MemberRoleCreator && !req.ProjectRemoval) {
+		if m.IsDeleted == 1 ||
+			(m.Role == MemberRoleCreator && !req.ProjectRemoval && !req.SpaceMemberRemoval) {
 			continue
 		}
 		removableMembers = append(removableMembers, m)
@@ -1988,6 +2005,130 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 			return &RemoveGroupMembersServiceResp{Removed: 0}, nil
 		}
 	}
+	var dedicatedLifecycle bool
+	if req.SpaceMemberRemoval {
+		if strings.TrimSpace(req.SpaceID) == "" {
+			return nil, errors.New("Space member removal requires space_id")
+		}
+		var seats []struct {
+			MemberStatus int `db:"member_status"`
+			SpaceStatus  int `db:"space_status"`
+		}
+		// This locking read also locks the shared Space row until commit.
+		// Same-Space removals can therefore serialize across the transaction.
+		if _, err := tx.SelectBySql(
+			"SELECT sm.status AS member_status, s.status AS space_status "+
+				"FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id "+
+				"WHERE sm.space_id = ? AND sm.uid IN ? ORDER BY sm.uid FOR UPDATE",
+			req.SpaceID, req.Members,
+		).Load(&seats); err != nil {
+			return nil, fmt.Errorf("lock Space seat for dedicated-group removal: %w", err)
+		}
+		for _, seat := range seats {
+			if seat.MemberStatus == 1 && seat.SpaceStatus != 0 {
+				if err := tx.Commit(); err != nil {
+					return nil, fmt.Errorf("commit cancelled Space dedicated-group removal: %w", err)
+				}
+				return &RemoveGroupMembersServiceResp{
+					LifecycleNoop: true,
+				}, nil
+			}
+		}
+		if strings.TrimSpace(req.ProjectID) != "" {
+			binding, isDedicated, err := lockProjectGroupBindingTx(
+				tx, req.ProjectID, req.GroupNo,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if isDedicated {
+				flags, err := projectBindingMatchFlagsTx(
+					tx, binding.ProjectID, "", binding.ProjectID, req.SpaceID,
+				)
+				if err != nil {
+					return nil, err
+				}
+				dedicatedLifecycle = flags.SpaceIDMatch != 0
+			}
+		}
+	}
+
+	var dedicatedVersion int64
+	dedicatedVersionReady := false
+	if dedicatedLifecycle {
+		for _, member := range removableMembers {
+			if member.Role != MemberRoleCreator {
+				continue
+			}
+			var roles []int
+			if _, err := tx.SelectBySql(
+				"SELECT role FROM group_member WHERE group_no = ? AND uid = ? "+
+					"AND is_deleted = 0 FOR UPDATE",
+				req.GroupNo, member.UID,
+			).Load(&roles); err != nil {
+				return nil, fmt.Errorf("lock dedicated-group creator for removal: %w", err)
+			}
+			if len(roles) == 0 || roles[0] != MemberRoleCreator {
+				continue
+			}
+			if !dedicatedVersionReady {
+				dedicatedVersion, err = s.ctx.GenSeq(common.GroupMemberSeqKey)
+				if err != nil {
+					return nil, fmt.Errorf("generate dedicated-group removal version: %w", err)
+				}
+				dedicatedVersionReady = true
+			}
+			if err := s.db.UpdateMemberRoleTx(
+				req.GroupNo, member.UID, MemberRoleCommon, dedicatedVersion, tx,
+			); err != nil {
+				return nil, fmt.Errorf("demote dedicated-group owner before removal: %w", err)
+			}
+			member.Role = MemberRoleCommon
+		}
+	}
+	if req.SpaceMemberRemoval && !dedicatedLifecycle {
+		for _, member := range removableMembers {
+			if member.Role != MemberRoleCreator {
+				continue
+			}
+			var roles []int
+			if _, err := tx.SelectBySql(
+				"SELECT role FROM group_member WHERE group_no = ? AND uid = ? "+
+					"AND is_deleted = 0 FOR UPDATE",
+				req.GroupNo, member.UID,
+			).Load(&roles); err != nil {
+				return nil, fmt.Errorf("lock ordinary-group creator for removal: %w", err)
+			}
+			if len(roles) == 0 || roles[0] != MemberRoleCreator {
+				continue
+			}
+			successor, err := querySecondOldestNonBotMemberTx(tx, req.GroupNo, member.UID)
+			if err != nil {
+				return nil, fmt.Errorf("query ordinary-group successor: %w", err)
+			}
+			if successor != nil {
+				version, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
+				if err != nil {
+					return nil, fmt.Errorf("generate ordinary-group successor version: %w", err)
+				}
+				if err := s.db.UpdateMemberRoleTx(
+					req.GroupNo, successor.UID, MemberRoleCreator, version, tx,
+				); err != nil {
+					return nil, fmt.Errorf("promote ordinary-group successor: %w", err)
+				}
+			}
+			version, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
+			if err != nil {
+				return nil, fmt.Errorf("generate ordinary-group removal version: %w", err)
+			}
+			if err := s.db.UpdateMemberRoleTx(
+				req.GroupNo, member.UID, MemberRoleCommon, version, tx,
+			); err != nil {
+				return nil, fmt.Errorf("demote ordinary-group creator: %w", err)
+			}
+			member.Role = MemberRoleCommon
+		}
+	}
 
 	var removedUIDs []string
 	var removedVos []*config.UserBaseVo
@@ -1998,24 +2139,15 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		LeaverName string
 		Bots       []*user.Model
 	}
-	// 按 uid 排序后再进锁循环：本函数在**同一个事务**里逐个 FOR UPDATE 锁成员行
-	// （LockRemovableMemberTx），持锁顺序由调用方传进来的名单顺序决定。
+	// Space lifecycle creator handover/demotion above and the member deletion
+	// below share this transaction, so the pointer/seat decision cannot be
+	// separated from the native role transition.
+	// Sort the deletion pass by UID. The ordinary creator/successor locks above
+	// precede this pass and use created_at order; competing removal transactions
+	// can still deadlock, in which case the cleanup job retries the rolled-back work.
 	//
-	// 排序**只**让本函数的多次并发调用之间锁序一致（RGM ↔ RGM），
-	// **并没有关掉整类 ABBA**：handOverGroupCreator 也锁 group_member 行，
-	// 但它是「先锁离开者，再锁继任者扫描命中的行」，而那次扫描是
-	// `ORDER BY created_at LIMIT 1 FOR UPDATE`、group_member 上没有服务该排序的索引，
-	// 于是按存储序锁行，不是 uid 序。所以「同群上并发跑一次批量移除和一次群主交接」
-	// 这一对**仍然可能死锁**：T1 持 A 等 B，T2 扫描先锁到 B 再等 A。
-	// 后果有界（MySQL 回滚一方；清理工单重试收敛，管理端批量踢人得到可重试的 500），
-	// 但别把这次排序读成「这类问题已解决」。
-	//
-	// 真正关掉它需要让 handOverGroupCreator 也按 uid 序取那两把锁，并给
-	// (group_no, created_at) 补索引让继任者扫描不再锁全群 —— 都记在 follow-up。
-	//
-	//
-	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
-	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。
+	// 排的是 removableMembers 而不是 req.Members，避免调用方入参顺序决定
+	// group_member 的加锁顺序。
 	sort.Slice(removableMembers, func(i, j int) bool {
 		return removableMembers[i].UID < removableMembers[j].UID
 	})

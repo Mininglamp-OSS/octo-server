@@ -412,12 +412,48 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 	for _, uid := range uids {
-		if _, err := tx.InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
-				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
+		var existing []struct {
+			Status int `db:"status"`
+		}
+		if _, err := tx.SelectBySql(
+			"SELECT status FROM space_member WHERE space_id=? AND uid=? FOR UPDATE",
 			spaceId, uid,
-		).Exec(); err != nil {
+		).Load(&existing); err != nil {
 			return err
+		}
+		switch {
+		case len(existing) == 0:
+			if _, err := tx.InsertBySql(
+				"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) "+
+					"VALUES (?, ?, 0, 1, NOW(), NOW())",
+				spaceId, uid,
+			).Exec(); err != nil {
+				return err
+			}
+		case existing[0].Status == 0:
+			result, err := tx.Update("space_member").
+				Set("status", 1).Set("updated_at", time.Now()).
+				Where("space_id=? AND uid=? AND status=0", spaceId, uid).Exec()
+			if err != nil {
+				return err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected == 1 {
+				if err := enqueueMemberRejoinIntentTx(tx, spaceId, uid, ""); err != nil {
+					return err
+				}
+			}
+		default:
+			// Preserve the old upsert's timestamp touch for an already-active
+			// seat without emitting a duplicate 0→1 intent.
+			if _, err := tx.Update("space_member").
+				Set("updated_at", time.Now()).
+				Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

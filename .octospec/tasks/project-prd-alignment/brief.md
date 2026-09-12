@@ -74,9 +74,16 @@ Group relations are entry metadata only: association/listing never grants chat r
 
 - P2：AI session container（`purpose=ai_session_container`）在 Group 关系 PUT/DELETE 路由和 service 层均拒绝；关系真实变更同步推进 `group.version`，而重复绑定/解绑不制造版本噪音。Project 关系读列表、分页计数及 Sidebar 批量读取同样排除历史绑定的 AI 容器，普通群关系不受影响。Project 关系与原生群模型保持独立，预设群可与 Project 关系并存，不新增警告或限制。
 - 置顶写入错误保持 `%w` 链；`pinned=1,pinned_at=NULL` 的历史行在重复置顶时修复时间戳，正常重复置顶仍保持原时间。`GET /v1/group/my` 角色列表的成员计数查询失败直接返回 `query_failed`，不再以成功的 0 掩盖数据库错误。已删除无引用的关系辅助函数。
+- F2：Project 对账保留昂贵的 `ReconcileEnabled` 门禁，恢复专属全员群 I4-A 缺群与 I4-B 缺员扫描；采用游标分页、宽限期、Space 撤权/移除/封禁/系统 bot 豁免，完整轮转后发布 gauge，普通 `group.project_id` 关联群保持独立成员快照且不触发该缺员监控。
 - 移除 `project_i2_violations_total`、`group_admission_rejected_total` 及全员群 guard failure 计数器后的运维影响：旧面板/告警应删除或允许序列缺失，缺失这些指标本身不是服务故障。
 - Bot/IM 提示、订阅和其他提交后通知按 best-effort 处理；已提交的数据库事实是权威，通知失败只记录并由既有补偿/重试路径处理，不应让客户端重复已成功的核心写入。
 - Migration 采用 `joined_at` rolling expand：仅新增可空 `DATETIME(3)`，不做回填、不改为 `NOT NULL`；旧二进制可省略该列，读取以 `COALESCE(joined_at,created_at)` 统一，新增/重新加入写真实 UTC 时间，后续收缩迁移不在本版本。Cascade 保留 active human Owner 及其角色；仅在有 active non-Owner agent rider 时处理 rider，并对 rider 只执行一次 member_epoch/清理队列过渡，Owner-only 行不进入分页。
+- F3/F4：Space 撤权时，在同一事务中降级并移除专属群的原生 Owner 成员，保留 Project Owner 身份。恢复按有效账号、active Space、active Project、当前专属指针和当前 Project Owner 投影最新真人 Owner，跨表 JOIN 显式使用兼容 collation；Space ID 由数据库按 `space` 表实际 collation 解析并返回存储值，不用 Go `ToLower`/`TrimSpace` 或字节比较。旧 `rejoined` durable 任务在 worker 边界解析原始 selector，解析/查询错误沿原 lease 重试；Space 缺失/解散时终止该 rejoined 恢复责任。普通 Space removal 保留原始 selector，即使 Space 缺失/解散也继续 fail-safe 清理，不因 canonical resolver 无结果静默 no-op。Project 恢复先前置复核 `Project.space_id` 归属，投影写事务再次校验 Space/Project/当前专属群绑定；Space `0→1` 与既有 Project seat 重新准入同事务写入 `reason=rejoined`；仅复用 pending、空 lease、`attempts=0`、`last_error=''` 的初始任务，已分页、已失败、claimed 或终态任务均建立新责任。迟到 `IMRemove` 的补订阅失败由清理回调持久化；通用 admission 返回错误，由已有投影任务重试，避免派生新任务。纯成功分页持久化 cursor 并归还 attempt；D4 仍取消全部旧 Project pending 任务，普通关联群不进入专属投影。
+- 清理工单立即入队与分页续跑使用 UTC 毫秒精度，避免数据库四舍五入使工单短暂落在未来；队列租约和退避仍按原有规则执行。验证使用真实 WuKongIM，Space 包包含重复 `-race` 运行。
+- 最新审查修复保持现有产品规则：Bot 守卫使用数据库规范群号；Space 撤权在旧专属指针失效后继续按普通群清理，Project-only 清理仍限于当前专属群；I1/abandoned 扫描仅在 Project 正常时豁免 Space 撤权或 Space 解散后写侧保留的 Owner 身份，Project 已解散或不存在但仍 active 且无有效 Space 席位的 Owner 仍须报告，普通成员仍报告；两类查询保持 LIMIT inspected base 分页，生命周期/席位状态留在 SELECT flag 而非过滤返回行的 WHERE。
+- Rejoin 真实失败同时保留失败页的输入游标和错误摘要，沿用原有 attempt/退避；普通成员清理、Owner 身份保留、普通群继任者选择、通知 best-effort 和 Drive 契约保持既有语义。已应用迁移保持不变，当前监控及任务原因口径记录于原规格。
+- 验证（本轮）：`^TestReconcileOwnerLifecycleEligibility$` 先红后绿，确认正常 Project/Space 解散仍豁免 Owner、Project 解散/不存在的 active Owner 与普通成员由 I1/abandoned 报告；`TestSpaceRemovalRejoinRestoresProjectOwnerForRawSpaceID` 的真实 HTTP raw Space ID roundtrip 隔离 `-race` 通过，混合 Owner fixture 隔离验证通过。完整 `-race`：Group 68.086s（`TZ=Asia/Shanghai`）、Project 48.546s、Space 19.633s、Bot API 79.816s、`pkg/space` 1.901s；build、受影响包 vet、i18n extract-check/lint 均通过。
+- Drive client 名称上限保持 64 字符，使用 Unicode 字符计数；30 字符中文 Project 名称与 64 字符混合中文/emoji 原样通过 HTTP 发送，65 字符在出站前拒绝。该边界回归先失败后通过，`internal/projectprovision` 完整 `-race` 与全仓 build 通过。
 
 ## Non-goals
 

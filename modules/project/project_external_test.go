@@ -181,6 +181,109 @@ func TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails(t *testing.T) {
 	assert.Contains(t, lastError[0], "project_member")
 }
 
+// TestSpaceRemovalRejoinRestoresProjectOwnerForRawSpaceID exercises the full
+// Space-removal -> durable rejoin -> projection restore round trip through the
+// real module registry. The persisted Project/Group rows use the canonical
+// spelling, while both Space HTTP calls use a case variant. This reaches
+// restoreSpaceMemberProjects rather than only testing Group's admission hook:
+// the native Owner must be removed on revocation, then restored and promoted
+// after the Space seat rejoins.
+func TestSpaceRemovalRejoinRestoresProjectOwnerForRawSpaceID(t *testing.T) {
+	srv, ctx := newE2EServer(t)
+
+	const (
+		spaceID     = "e2e_raw_rejoin_space"
+		rawSpaceID  = "E2E_RAW_REJOIN_SPACE"
+		spaceOwner  = "e2e_raw_rejoin_owner"
+		target      = "e2e_raw_rejoin_target"
+		trigger     = "e2e_raw_rejoin_trigger"
+		projectID   = "e2e_raw_rejoin_project"
+		dedicatedNo = "e2e_raw_rejoin_group"
+	)
+
+	// The test only needs the broker HTTP boundary. Seeded native rows avoid
+	// making group creation part of this regression, while the cleanup and
+	// rejoin hooks remain the production Group/Project implementations.
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	cfg := ctx.GetConfig()
+	previousIMURL := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = im.URL
+	t.Cleanup(func() {
+		cfg.WuKongIM.APIURL = previousIMURL
+		im.Close()
+	})
+
+	exec(t, ctx,
+		"INSERT INTO `space` (space_id, name, creator, status, max_users) VALUES (?, ?, ?, 1, 100)",
+		spaceID, spaceID, spaceOwner)
+	for _, uid := range []string{spaceOwner, target, trigger} {
+		role := 0
+		if uid == spaceOwner {
+			role = 2
+		}
+		exec(t, ctx,
+			"INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, ?, 1)",
+			spaceID, uid, role)
+		exec(t, ctx,
+			"INSERT INTO `user` (uid, name, short_no, status, robot) VALUES (?, ?, ?, 1, 0)",
+			uid, uid, uid)
+	}
+	exec(t, ctx,
+		"INSERT INTO `octo_project` "+
+			"(project_id, space_id, name, creator, status, all_member_group_no, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())",
+		projectID, spaceID, projectID, spaceOwner, dedicatedNo)
+	exec(t, ctx,
+		"INSERT INTO `octo_project_member` "+
+			"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+			"VALUES (?, ?, ?, 2, 1, 0, ?, NOW(), NOW(), NOW())",
+		projectID, target, spaceID, target)
+	exec(t, ctx,
+		"INSERT INTO `group` "+
+			"(group_no, name, creator, status, version, space_id, project_id) "+
+			"VALUES (?, ?, ?, 1, 1, ?, ?)",
+		dedicatedNo, dedicatedNo, target, spaceID, projectID)
+	exec(t, ctx,
+		"INSERT INTO group_member (group_no, uid, role, is_deleted, status, version) "+
+			"VALUES (?, ?, 1, 0, 1, 1)",
+		dedicatedNo, target)
+
+	ownerToken := seedToken(t, ctx, spaceOwner)
+	w := writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/space/"+rawSpaceID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{target}})
+	require.Equal(t, http.StatusOK, w.Code, "Space removal body: %s", w.Body.String())
+	require.Eventually(t, func() bool {
+		return !activeGroupMemberE2E(ctx, dedicatedNo, target)
+	}, 40*time.Second, 200*time.Millisecond,
+		"Space removal worker must remove the native dedicated-group member")
+	status, removing, ok := projectSeatStateE2E(ctx, projectID, target)
+	require.True(t, ok)
+	assert.Equal(t, 1, status, "Project Owner identity must remain active")
+	assert.Equal(t, 0, removing)
+
+	// Space rejoin reactivates the seat and writes a rejoined outbox row. The
+	// add endpoint itself is intentionally not the worker trigger; removing a
+	// second member kicks the real worker that consumes both rows.
+	w = writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/space/"+rawSpaceID+"/members/add", ownerToken,
+		map[string]any{"uids": []string{target}})
+	require.Equal(t, http.StatusOK, w.Code, "Space rejoin body: %s", w.Body.String())
+	w = writeProjectE2E(t, srv, http.MethodPost,
+		"/v1/space/"+rawSpaceID+"/members/remove", ownerToken,
+		map[string]any{"uids": []string{trigger}})
+	require.Equal(t, http.StatusOK, w.Code, "worker trigger body: %s", w.Body.String())
+
+	require.Eventually(t, func() bool {
+		role, present := activeGroupMemberRoleE2E(ctx, dedicatedNo, target)
+		return present && role == 1
+	}, 40*time.Second, 200*time.Millisecond,
+		"rejoin worker must restore and owner-sync the native dedicated-group member")
+}
+
 // errAlwaysFails is the sentinel the deliberately failing step returns.
 type errAlwaysFails struct{}
 

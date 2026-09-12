@@ -1,9 +1,9 @@
 package group
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -73,7 +73,9 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 		if groupModel == nil || groupModel.Status == GroupStatusDisband {
 			continue
 		}
-		if err := g.exitSpaceMemberFromGroup(groupModel.GroupNo, removal, operatorName); err != nil {
+		if err := g.exitSpaceMemberFromGroup(
+			groupModel.GroupNo, removal, operatorName, groupModel.ProjectID,
+		); err != nil {
 			g.Error("被移出 Space 的成员退群失败",
 				zap.Error(err),
 				zap.String("groupNo", groupModel.GroupNo),
@@ -93,8 +95,8 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // CMDGroupMemberUpdate、邀请人名下 bot 级联（#354 / #1186）、子区成员与订阅清理、
 // 按 Space 隔离的置顶与会话扩展清理、外部群标记回收。自己写一遍必然漏项。
 //
-// RemoveGroupMembers 会静默跳过 role=creator 的成员，所以群主必须先交接、再走移除。
-//
+// 普通群的群主必须先交接、再走移除；当前 Project 专属群不做 handover，
+// 而是在同一事务内把失去 Space 资格的 creator 降为 common 后删除。
 // ⚠️ 已知缺口：IM 退订失败会永久泄漏，且**没有**任何东西兜底。
 //
 // RemoveGroupMembers 内部那次 IMRemoveSubscriber（service.go）失败时只记日志。
@@ -115,7 +117,6 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // 而工单被标成 done。db.go querySubscribableMemberUIDsWithGroupNo 上那条
 // 「下次重载会把他加回来」的 YUJ-4185 注释，在这个版本同样不成立。
 //
-// 为什么这里没有顺手修掉：光把错误上抛没用——删行之后
 // queryAllGroupsWithMemberUIDAndSpaceID 已经查不到这个群，重跑是空转，只会把一次
 // 真实故障洗成 done；把 IMRemoveSubscriber 提到删行之前也没用，那只是换一个
 // 时刻失败。真正的修法是在删行的同一个事务里写一条持久化的 IM-pending 记录
@@ -125,19 +126,15 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 //
 // 上面那次 CheckMembershipForCleanup 覆盖的是「重新加入发生在读之前」，也就是真正
 // 宽的那个窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 #797。
-func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
+func (g *Group) exitSpaceMemberFromGroup(
+	groupNo string, removal spacemod.MemberRemoval, operatorName, projectID string,
+) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
 		return fmt.Errorf("query group member: %w", err)
 	}
 	if member == nil || member.IsDeleted == 1 {
 		return nil // 已经不在群里，幂等返回
-	}
-
-	if member.Role == MemberRoleCreator {
-		if err := g.handOverGroupCreator(groupNo, removal.UID); err != nil {
-			return fmt.Errorf("hand over group creator: %w", err)
-		}
 	}
 
 	// 何时抑制默认的「被 X 移出群聊」系统消息：
@@ -178,18 +175,22 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		BotCascadeTipAction:   cascadeAction,
 		SuppressBotCascadeTip: spaceGone,
 		AllowProtected:        true,
+		SpaceMemberRemoval:    true,
+		SpaceID:               removal.SpaceID,
+		ProjectID:             projectID,
 	})
 	if err != nil {
+		if errors.Is(err, errGroupMemberNotInGroup) {
+			return nil
+		}
 		return fmt.Errorf("remove group member: %w", err)
 	}
-	// 必须检查 Removed，不能只看 error。
-	//
-	// RemoveGroupMembers 对群主是**静默跳过 + 返回 nil**。上面那次
-	// QueryMemberWithUID 是无锁读，目标可能在读到调用之间被提升为群主
-	// （群主转让接口，或另一条清理工单为它做的交接）——那样这次移除就是一次
-	// 无声的空操作，而工单会被标成 done：人永久留在群里、IM 订阅还在，
-	// 却再没有任何东西会回来看一眼。
-	// 返回错误让工单重试：下一次尝试读到 role=creator，先交接再移除，收敛。
+	if resp != nil && resp.LifecycleNoop {
+		return nil
+	}
+	// Space 资格恢复的 no-op 已在上面返回。此处
+	// Removed==0 只表示锁内发现目标并非可移除角色（例如普通群并发交接）；
+	// 返回错误让工单重试，而不是把仍在群里的成员误判为完成。
 	if resp == nil || resp.Removed == 0 {
 		return fmt.Errorf("group member not removed, role changed concurrently: group=%s uid=%s",
 			groupNo, removal.UID)
@@ -220,76 +221,6 @@ func (g *Group) sendGroupExitTip(groupNo, uid, groupRemark string) {
 	if err := sendGroupExitNotice(g.ctx, groupNo, uid, showName); err != nil {
 		g.Warn("发送退群提示失败", zap.Error(err), zap.String("groupNo", groupNo))
 	}
-}
-
-// handOverGroupCreator 把群主交接给第二元老（排除 bot），并把离开者降为普通成员。
-//
-// 两步必须在同一事务里：只提升继任者而没降走原群主会出现两个 creator；只降原群主
-// 而没提升继任者会留下无主群（无继任者时这是可接受的终局，见下）。
-//
-// 没有可继任者（群里只剩他自己，或只剩 bot）时仍然要把他降为普通成员，否则
-// RemoveGroupMembers 会跳过 creator，人就永远留在群里了。此时群成为无主空群，
-// 与既有 groupExit 在同样情形下的终局一致。
-func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
-	tx, err := g.db.session.Begin()
-	if err != nil {
-		return fmt.Errorf("begin creator handover: %w", err)
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	// 事务内、行锁下重读离开者的角色。调用方那次 QueryMemberWithUID 是无锁读，
-	// 而租约到期后同一条工单可能被另一个 worker 并发重跑：两边都读到 creator，
-	// 就会各自提升一个继任者，群里留下两个 role=creator 的行。而
-	// RemoveGroupMembers 会静默跳过 creator，于是那个成员被永久卡在群里。
-	// 锁内重读后若已不是 creator，说明别人刚交接过，直接当成功返回。
-	var roles []int
-	if _, err = tx.SelectBySql(
-		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
-		groupNo, leaverUID,
-	).Load(&roles); err != nil {
-		return fmt.Errorf("re-read leaver role: %w", err)
-	}
-	if len(roles) == 0 || roles[0] != MemberRoleCreator {
-		return nil // 已经不是群主（并发交接已完成 / 人已不在群）
-	}
-
-	// 继任者也在同一事务内查，避免用事务外的陈旧快照
-	successor, err := querySecondOldestNonBotMemberTx(tx, groupNo, leaverUID)
-	if err != nil {
-		return fmt.Errorf("query successor: %w", err)
-	}
-
-	if successor != nil {
-		version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
-		if err != nil {
-			return fmt.Errorf("generate successor version: %w", err)
-		}
-		if err := g.db.UpdateMemberRoleTx(groupNo, successor.UID, MemberRoleCreator, version, tx); err != nil {
-			return fmt.Errorf("promote successor: %w", err)
-		}
-	}
-
-	version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
-	if err != nil {
-		return fmt.Errorf("generate leaver version: %w", err)
-	}
-	if err := g.db.UpdateMemberRoleTx(groupNo, leaverUID, MemberRoleCommon, version, tx); err != nil {
-		return fmt.Errorf("demote leaver: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit creator handover: %w", err)
-	}
-	if successor != nil {
-		g.Info("Space 成员移除触发群主交接",
-			zap.String("groupNo", groupNo),
-			zap.String("from", leaverUID),
-			zap.String("to", successor.UID))
-	} else {
-		g.Warn("群主被移出 Space 但群内无可继任者，群将无主",
-			zap.String("groupNo", groupNo), zap.String("uid", leaverUID))
-	}
-	return nil
 }
 
 // resolveOperatorName 取操作者展示名，查不到就退回 UID。

@@ -429,11 +429,28 @@ func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, op
 }
 
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
-	_, err := d.session.Update("space_member").
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	result, err := tx.Update("space_member").
 		Set("status", 1).Set("role", role).
 		Set("updated_at", time.Now()).
-		Where("space_id=? and uid=?", spaceId, uid).Exec()
-	return err
+		Where("space_id=? and uid=? and status=0", spaceId, uid).Exec()
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 1 {
+		if err := enqueueMemberRejoinIntentTx(tx, spaceId, uid, uid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // updateMemberRole 更新成员角色，仅用于非 owner 角色（0/1）的变更。
@@ -845,15 +862,25 @@ func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUser
 		}
 	}
 
-	// Reactivate member
-	_, err = tx.Update("space_member").
+	// Only a removed row is a reactivation. The status predicate prevents a
+	// stale caller from turning an already-active seat into a second rejoin
+	// intent, and RowsAffected gives the exact 0→1 transition.
+	result, err := tx.Update("space_member").
 		Set("status", 1).Set("role", 0).
 		Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=?", spaceId, uid).Exec()
+		Where("space_id=? AND uid=? AND status=0", spaceId, uid).Exec()
 	if err != nil {
 		return err
 	}
-
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 1 {
+		if err := enqueueMemberRejoinIntentTx(tx, spaceId, uid, uid); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -1050,11 +1077,18 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 		return approveSpaceFull, row.InviteCode, nil
 	}
 
-	// 6. 写入或重新激活成员行
+	// 6. 写入或重新激活成员行。只有原先存在且已失活的行才是
+	// 0→1，且 intent 与成员状态共享这一个事务提交。
 	if memberRows > 0 {
-		_, err = tx.Update("space_member").
+		result, err = tx.Update("space_member").
 			Set("status", 1).Set("role", 0).Set("updated_at", time.Now()).
-			Where("space_id=? AND uid=?", spaceId, row.UID).Exec()
+			Where("space_id=? AND uid=? AND status=0", spaceId, row.UID).Exec()
+		if err == nil {
+			affected, err = result.RowsAffected()
+			if err == nil && affected == 1 {
+				err = enqueueMemberRejoinIntentTx(tx, spaceId, row.UID, reviewerUID)
+			}
+		}
 	} else {
 		_, err = tx.InsertBySql(
 			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",

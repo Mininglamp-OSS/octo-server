@@ -23,6 +23,28 @@ func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, er
 	return count > 0, nil
 }
 
+// ResolveSpaceID returns the value stored in the Space table for a selector
+// accepted by that table's collation. The bool distinguishes "no such Space"
+// from a database failure; callers handling recovery must not manufacture a
+// canonical value when it is false.
+func ResolveSpaceID(session *dbr.Session, spaceID string) (string, bool, error) {
+	if session == nil || spaceID == "" {
+		return "", false, nil
+	}
+	var ids []string
+	_, err := session.SelectBySql(
+		"SELECT space_id FROM space WHERE space_id = ? LIMIT 1",
+		spaceID,
+	).Load(&ids)
+	if err != nil {
+		return "", false, err
+	}
+	if len(ids) == 0 {
+		return "", false, nil
+	}
+	return ids[0], true, nil
+}
+
 // ActiveMembers is CheckMembership for a batch: it returns the subset of uids
 // that are active members of the given active Space.
 //

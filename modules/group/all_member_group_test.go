@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
-	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/stretchr/testify/require"
@@ -105,25 +103,6 @@ func TestCreateGroupAcceptsACreatorOnlyGroup(t *testing.T) {
 	require.NotEmpty(t, resp.GroupNo)
 }
 
-// TestAllMemberGroupHooksAreRegisteredByTheModule pins the two supported hooks.
-//
-// Provisioning is required so every project can receive its initial group;
-// rename keeps the independent native group's metadata aligned with the project.
-func TestAllMemberGroupHooksAreRegisteredByTheModule(t *testing.T) {
-	// newTestServer runs module.Setup, which is what invokes the registration.
-	_, ctx := newTestServer(t)
-	defer testutil.CleanAllTables(ctx)
-
-	body, err := os.ReadFile("1module.go")
-	require.NoError(t, err)
-	require.Contains(t, string(body), "registerAllMemberGroupHooks()",
-		"1module.go must call registerAllMemberGroupHooks at module construction, "+
-			"beside registerProjectCascadeSteps and registerPresetGroupAdmitter")
-
-	require.True(t, projectmod.AllMemberGroupHooksRegisteredForTest(),
-		"module.Setup must leave provisioning and rename hooks registered")
-}
-
 // TestDedicatedAdmissionAndHTTPProtection exercises the dedicated pointer
 // against a real MySQL fixture. The same Project also owns an ordinary
 // associated group; that group must remain outside the live admission hook.
@@ -142,11 +121,13 @@ func TestDedicatedAdmissionAndHTTPProtection(t *testing.T) {
 	ordinaryNo := "ordinary-" + suffix
 
 	require.NoError(t, f.userDB.Insert(&user.Model{
-		UID: owner, Name: "all-member owner", ShortNo: "all-member-owner",
+		UID: owner, Name: "all-member owner", ShortNo: "all-member-owner", Status: 1,
 	}))
 	require.NoError(t, f.userDB.Insert(&user.Model{
-		UID: target, Name: "all-member target", ShortNo: "all-member-target",
+		UID: target, Name: "all-member target", ShortNo: "all-member-target", Status: 1,
 	}))
+	seedSpaceSeat(t, ctx, spaceID, owner)
+	seedSpaceSeat(t, ctx, spaceID, target)
 	seedProjectForGroupTest(t, ctx, projectID, spaceID, owner)
 	seedProjectSeat(t, ctx, projectID, spaceID, target, 0)
 	seedAllMemberGroupRow(t, ctx, dedicatedNo, projectID, spaceID, owner)

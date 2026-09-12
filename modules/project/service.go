@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
@@ -977,6 +978,7 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	}
 
 	toAdmit := make([]memberAdd, 0, len(members))
+	rejoinIntents := make(map[string]struct{}, len(members))
 	newSeats := 0
 	for _, item := range members {
 		existing, qerr := p.db.queryMemberTx(tx, projectID, item.UID)
@@ -990,9 +992,12 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 			continue
 		}
 		toAdmit = append(toAdmit, item)
+		if existing != nil && (existing.Status != MemberStatusActive || existing.Removing != 0) {
+			rejoinIntents[item.UID] = struct{}{}
+		}
 		// A closing seat is not counted by countActiveMembersTx, but this admission
-		// clears removing and makes it effective again. Count it exactly like a removed
-		// seat so a pending removal cannot be used as a quota slot.
+		// clears removing and makes it effective again. Count it exactly like a
+		// removed seat so a pending removal cannot be used as a quota slot.
 		if existing == nil || existing.Status != MemberStatusActive || existing.Removing != 0 {
 			newSeats++
 		}
@@ -1019,6 +1024,15 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 		})
 		if aerr != nil {
 			return nil, aerr
+		}
+		if didChange {
+			if _, ok := rejoinIntents[item.UID]; ok {
+				if err := spacemod.EnqueueMemberRejoinIntentTx(
+					tx, row.SpaceID, item.UID, actorUID,
+				); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if _, cerr := p.db.cancelPendingRemovalJobsTx(tx, projectID, item.UID, now); cerr != nil {
 			return nil, cerr

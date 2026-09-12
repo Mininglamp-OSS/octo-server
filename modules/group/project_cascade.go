@@ -7,7 +7,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -64,6 +66,87 @@ func (g *Group) queryDedicatedGroupNo(projectID string) (string, error) {
 	return pointers[0], nil
 }
 
+// reconcileDedicatedGroupProjection performs the final, pointer-scoped
+// decision immediately around the broker operation. The native group row is
+// protected by the admission/removal transactions, but IM is a separate
+// service: a stale removal may be blocked while a rejoin commits and sends
+// IMAdd. Rechecking both before and after IMRemove makes that interleaving
+// converge to the current projection instead of allowing a late IMRemove to
+// strand the member. A pointer that moved away from groupNo is never touched.
+func (g *Group) reconcileDedicatedGroupProjection(
+	ctx *config.Context, removal projectmod.MemberRemoval, groupNo string,
+) (resultErr error) {
+	if ctx == nil || groupNo == "" || removal.UID == "" {
+		return nil
+	}
+	defer func() {
+		if !errors.Is(resultErr, projectpkg.ErrAdmittedButNotSubscribed) {
+			return
+		}
+		// A Project rejoin may already have cancelled the removal job. This
+		// callback must hand a failed late-IMRemove compensation to a fresh
+		// durable projection; admission itself leaves retries with its caller.
+		if err := spacemod.EnqueueMemberRejoinIntent(ctx, removal.SpaceID, removal.UID, removal.OperatorUID); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("group: persist dedicated projection retry: %w", err))
+		}
+	}()
+	currentGroupNo, err := g.queryDedicatedGroupNo(removal.ProjectID)
+	if err != nil {
+		return err
+	}
+	if currentGroupNo != groupNo {
+		return nil
+	}
+	projectActive, err := projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
+	if err != nil {
+		return fmt.Errorf("group: recheck Project seat for dedicated projection: %w", err)
+	}
+	if projectActive {
+		spaceActive, checkErr := spacepkg.CheckMembership(ctx.DB(), removal.SpaceID, removal.UID)
+		if checkErr != nil {
+			return fmt.Errorf("group: recheck Space seat for dedicated projection: %w", checkErr)
+		}
+		if spaceActive {
+			if err := g.admitToAllMemberGroup(ctx, removal.SpaceID, groupNo, removal.UID); err != nil {
+				return fmt.Errorf("group: restore dedicated-group projection: %w", err)
+			}
+			return nil
+		}
+	}
+	if err := removeDedicatedGroupSubscriber(ctx, groupNo, removal.UID); err != nil {
+		return err
+	}
+
+	// IMRemove may have been blocked while the Space/Project admission
+	// transaction committed and issued IMAdd. Re-run the same pointer-scoped
+	// decision after it returns; only the current group may be repaired.
+	currentGroupNo, err = g.queryDedicatedGroupNo(removal.ProjectID)
+	if err != nil {
+		return err
+	}
+	if currentGroupNo != groupNo {
+		return nil
+	}
+	projectActive, err = projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
+	if err != nil {
+		return fmt.Errorf("group: recheck Project seat after dedicated IMRemove: %w", err)
+	}
+	if !projectActive {
+		return nil
+	}
+	spaceActive, err := spacepkg.CheckMembership(ctx.DB(), removal.SpaceID, removal.UID)
+	if err != nil {
+		return fmt.Errorf("group: recheck Space seat after dedicated IMRemove: %w", err)
+	}
+	if !spaceActive {
+		return nil
+	}
+	if err := g.admitToAllMemberGroup(ctx, removal.SpaceID, groupNo, removal.UID); err != nil {
+		return fmt.Errorf("group: restore dedicated-group projection after late IMRemove: %w", err)
+	}
+	return nil
+}
+
 // detachMemberFromProjectGroups removes one closing Project seat from the
 // dedicated group. The worker has already marked the seat removing=1; the
 // removal service rechecks that state under Project → group → group_member
@@ -82,9 +165,16 @@ func (g *Group) detachMemberFromProjectGroups(
 	if err != nil {
 		return fmt.Errorf("group: query dedicated-group member for removal: %w", err)
 	}
-	// Recheck the Project seat before touching either native membership or IM.
-	// A stale removal callback can race a rejoin after its worker-level fence;
-	// even with no native row left, it must not unsubscribe the new membership.
+	// Recheck the Project and Space seats before touching either native
+	// membership or IM. A stale removal callback can race a rejoin after its
+	// worker-level fence; even with no native row left, it must reconcile the
+	// current dedicated projection rather than returning and letting a late
+	// IMRemove strand the active member. The Space check is deliberately the
+	// authorization predicate (not CheckMembershipForCleanup): a preserved
+	// Project Owner without a current Space seat is not admitted back.
+	// Reconcile once before touching the native row or IM. This also covers
+	// the missing/deleted-row branches: a rejoin may have committed while the
+	// unlocked native lookup was in flight.
 	readmitted, err := projectpkg.CheckMembership(
 		ctx.DB(), removal.ProjectID, removal.UID,
 	)
@@ -92,17 +182,10 @@ func (g *Group) detachMemberFromProjectGroups(
 		return fmt.Errorf("group: recheck Project seat before dedicated removal: %w", err)
 	}
 	if readmitted {
-		return nil
+		return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
 	}
-	if member == nil {
-		// The native row may already have been removed by a previous attempt
-		// whose broker call failed. Keep retrying the idempotent unsubscribe;
-		// otherwise the outbox would observe an empty group result and retire
-		// the job while the user still receives group traffic.
-		return removeDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
-	}
-	if member.IsDeleted == 1 {
-		return removeDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
+	if member == nil || member.IsDeleted == 1 {
+		return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
 	}
 	resp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:              groupNo,
@@ -118,29 +201,17 @@ func (g *Group) detachMemberFromProjectGroups(
 		// still reconcile the broker subscription; a real transport failure keeps
 		// the outbox job retryable.
 		if errors.Is(err, errGroupMemberNotInGroup) {
-			readmitted, checkErr := projectpkg.CheckMembership(
-				ctx.DB(), removal.ProjectID, removal.UID,
-			)
-			if checkErr != nil {
-				return fmt.Errorf("group: recheck Project seat after concurrent removal: %w", checkErr)
-			}
-			if readmitted {
-				return addDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
-			}
-			return removeDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
+			return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
 		}
 		// The native transaction may have committed before the broker failed.
-		// If a rejoin won the race after that commit, restore the subscription
-		// rather than letting the stale callback strand the active member.
+		// Reconcile around the broker operation so a rejoin that won the race
+		// restores both the native row and IM subscription. If reconciliation
+		// itself fails, preserve the original transport error for the retry.
 		if resp != nil {
-			readmitted, checkErr := projectpkg.CheckMembership(
-				ctx.DB(), removal.ProjectID, removal.UID,
-			)
-			if checkErr != nil {
-				return fmt.Errorf("group: recheck Project seat after dedicated removal: %w", checkErr)
-			}
-			if readmitted {
-				return addDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
+			if reconcileErr := g.reconcileDedicatedGroupProjection(ctx, removal, groupNo); reconcileErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("%w (dedicated projection reconcile: %v)", err, reconcileErr)
 			}
 		}
 		return err
@@ -153,39 +224,37 @@ func (g *Group) detachMemberFromProjectGroups(
 			return readErr
 		}
 		if member != nil {
+			// If the seat became eligible again, the service deliberately
+			// refused a destructive delete; reconcile the current projection
+			// instead of reporting a false success.
+			readmitted, checkErr := projectpkg.CheckMembership(
+				ctx.DB(), removal.ProjectID, removal.UID,
+			)
+			if checkErr != nil {
+				return fmt.Errorf("group: recheck Project seat after cancelled removal: %w", checkErr)
+			}
+			if readmitted {
+				spaceMember, spaceErr := spacepkg.CheckMembership(
+					ctx.DB(), removal.SpaceID, removal.UID,
+				)
+				if spaceErr != nil {
+					return fmt.Errorf("group: recheck Space seat after cancelled removal: %w", spaceErr)
+				}
+				if spaceMember {
+					return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
+				}
+			}
 			return fmt.Errorf(
 				"group: dedicated-group member %s was not removed", removal.UID,
 			)
 		}
 	}
 	// The DB transaction and this callback are not one atomic operation with
-	// the broker. Reconcile once after the removal too: a rejoin that committed
-	// while the native transaction was finishing must not lose its IM access.
-	readmitted, err = projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
-	if err != nil {
-		return fmt.Errorf("group: recheck Project seat after dedicated removal: %w", err)
-	}
-	if readmitted {
-		return addDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
-	}
-	if member == nil {
-		return removeDedicatedGroupSubscriber(ctx, groupNo, removal.UID)
-	}
-	return nil
-}
-
-func addDedicatedGroupSubscriber(ctx *config.Context, groupNo, uid string) error {
-	if ctx == nil || groupNo == "" || uid == "" {
-		return nil
-	}
-	if err := ctx.IMAddSubscriber(&config.SubscriberAddReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: []string{uid},
-	}); err != nil {
-		return fmt.Errorf("group: restore dedicated-group IM subscriber: %w", err)
-	}
-	return nil
+	// the broker. Reconcile immediately before and after the IM operation:
+	// a rejoin that committed while the native transaction was finishing must
+	// not lose its IM access, and every missing/deleted-row early return above
+	// follows the same pointer-scoped rule.
+	return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
 }
 
 func removeDedicatedGroupSubscriber(ctx *config.Context, groupNo, uid string) error {

@@ -824,8 +824,9 @@ func (ba *BotAPI) refuseIfAllMemberGroup(c *wkhttp.Context, groupNo string) bool
 	}
 	var row struct {
 		ProjectID string `db:"project_id"`
+		GroupNo   string `db:"group_no"`
 	}
-	err := ba.db.session.Select("project_id").From("`group`").
+	err := ba.db.session.Select("project_id", "group_no").From("`group`").
 		Where("group_no=?", groupNo).LoadOne(&row)
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
@@ -838,7 +839,7 @@ func (ba *BotAPI) refuseIfAllMemberGroup(c *wkhttp.Context, groupNo string) bool
 	if row.ProjectID == "" {
 		return false
 	}
-	protected, err := projectpkg.IsAllMemberGroup(ba.ctx.DB(), row.ProjectID, groupNo)
+	protected, err := projectpkg.IsAllMemberGroup(ba.ctx.DB(), row.ProjectID, row.GroupNo)
 	if err != nil {
 		ba.Error("query all-member group predicate failed; refusing mutation", zap.Error(err), zap.String("groupNo", groupNo))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)

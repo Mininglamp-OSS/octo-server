@@ -72,18 +72,35 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 // IsAllMemberGroup reports whether groupNo is the active Project's dedicated
 // all-member group. The Project pointer is authoritative: a normal group with
 // project_id set is intentionally not treated as protected or synchronized.
+//
+// Read the two sides separately. `octo_project` is pinned to utf8mb4_general_ci
+// while production imports of the legacy `group` table may still use
+// utf8mb4_0900_ai_ci; comparing their identifiers in one JOIN raises MySQL
+// error 1267 and also prevents the group unique index from serving the lookup.
 func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, error) {
 	if session == nil || projectID == "" || groupNo == "" {
 		return false, nil
 	}
+
+	var pointers []string
+	if _, err := session.SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` "+
+			"WHERE project_id = ? AND status = 1",
+		projectID,
+	).Load(&pointers); err != nil {
+		return false, err
+	}
+	if len(pointers) == 0 || pointers[0] != groupNo {
+		return false, nil
+	}
+
 	var rows []int
-	_, err := session.SelectBySql(
-		"SELECT 1 FROM `octo_project` p "+
-			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no "+
-			"  AND g.project_id = p.project_id "+
-			"WHERE p.project_id = ? AND p.status = 1 "+
-			"  AND p.all_member_group_no = ? AND g.status <> 2 LIMIT 1",
-		projectID, groupNo,
-	).Load(&rows)
-	return len(rows) > 0, err
+	if _, err := session.SelectBySql(
+		"SELECT 1 FROM `group` "+
+			"WHERE group_no = ? AND status <> 2 AND project_id = ?",
+		groupNo, projectID,
+	).Load(&rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }

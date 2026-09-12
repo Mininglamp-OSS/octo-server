@@ -49,6 +49,15 @@ var (
 		Help: "Active projects with no usable all-member group (I4 scan A). " +
 			"Published only after a complete rotation.",
 	})
+
+	// allMemberGroupMemberGaps 是 I4 扫描 B 的 gauge：当下有多少个"项目活跃成员
+	// 不在全员群里"的对子。
+	allMemberGroupMemberGaps = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "all_member_group_member_gaps",
+		Help: "Active project members missing from their project's all-member group (I4 scan B). " +
+			"Published only after a complete rotation.",
+	})
 )
 
 func observeAllMemberGroupProvisionFailure(reason string) {

@@ -35,6 +35,39 @@ type allMemberGroupProjectBinding struct {
 	Creator   string
 }
 
+// projectBindingMatchFlagsTx asks MySQL to compare every cross-table
+// identifier against the authoritative Project columns in one query. Go byte
+// equality would reject historical rows that differ only by case or PAD
+// SPACE, while separate probes would reread the same locked Project.
+func projectBindingMatchFlagsTx(
+	tx *dbr.Tx, projectID, groupNo, groupProjectID, groupSpaceID string,
+) (projectBindingMatchFlags, error) {
+	if tx == nil || projectID == "" {
+		return projectBindingMatchFlags{}, nil
+	}
+	var rows []projectBindingMatchFlags
+	if _, err := tx.SelectBySql(
+		"SELECT "+
+			"(project_id = ?) AS project_id_match, "+
+			"(all_member_group_no = ?) AS pointer_match, "+
+			"(space_id = ?) AS space_id_match "+
+			"FROM `octo_project` WHERE project_id = ? LIMIT 1",
+		groupProjectID, groupNo, groupSpaceID, projectID,
+	).Load(&rows); err != nil {
+		return projectBindingMatchFlags{}, fmt.Errorf("group: compare Project binding identities: %w", err)
+	}
+	if len(rows) == 0 {
+		return projectBindingMatchFlags{}, nil
+	}
+	return rows[0], nil
+}
+
+type projectBindingMatchFlags struct {
+	ProjectIDMatch int `db:"project_id_match"`
+	PointerMatch   int `db:"pointer_match"`
+	SpaceIDMatch   int `db:"space_id_match"`
+}
+
 // lockAllMemberGroupBindingTx takes the Project lock before the native group
 // lock. Every dedicated-group mutation uses this order; ordinary group
 // admission remains on its native path and is intentionally not changed.
@@ -64,11 +97,17 @@ func lockAllMemberGroupBindingTx(tx *dbr.Tx, groupNo string) (*allMemberGroupPro
 	).Load(&groups); err != nil {
 		return nil, fmt.Errorf("group: lock all-member native group: %w", err)
 	}
-	if len(groups) == 0 || groups[0].Status == GroupStatusDisband ||
-		groups[0].ProjectID != projects[0].ProjectID {
+	if len(groups) == 0 || groups[0].Status == GroupStatusDisband {
 		return nil, nil
 	}
-	if projects[0].SpaceID != "" && groups[0].SpaceID != projects[0].SpaceID {
+	flags, err := projectBindingMatchFlagsTx(
+		tx, projects[0].ProjectID, groupNo, groups[0].ProjectID, groups[0].SpaceID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if flags.ProjectIDMatch == 0 || flags.PointerMatch == 0 ||
+		(projects[0].SpaceID != "" && flags.SpaceIDMatch == 0) {
 		return nil, nil
 	}
 	return &allMemberGroupProjectBinding{
@@ -77,6 +116,66 @@ func lockAllMemberGroupBindingTx(tx *dbr.Tx, groupNo string) (*allMemberGroupPro
 		GroupNo:   groupNo,
 		Creator:   groups[0].Creator,
 	}, nil
+}
+
+// lockProjectGroupBindingTx locks a Project row before its candidate native
+// group, then reports whether that group is the current dedicated projection.
+// Space cleanup uses it even for ordinary Project-associated groups: locking
+// the Project row prevents the pointer from changing between the decision and
+// the native member delete.
+func lockProjectGroupBindingTx(
+	tx *dbr.Tx, projectID, groupNo string,
+) (*allMemberGroupProjectBinding, bool, error) {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(groupNo) == "" {
+		return nil, false, nil
+	}
+	var projects []struct {
+		ProjectID string `db:"project_id"`
+		SpaceID   string `db:"space_id"`
+		GroupNo   string `db:"group_no"`
+		Status    int    `db:"status"`
+	}
+	if _, err := tx.SelectBySql(
+		"SELECT project_id, space_id, all_member_group_no AS group_no, status "+
+			"FROM `octo_project` WHERE project_id = ? LIMIT 1 FOR UPDATE",
+		projectID,
+	).Load(&projects); err != nil {
+		return nil, false, fmt.Errorf("group: lock Project pointer for Space cleanup: %w", err)
+	}
+	var groups []struct {
+		ProjectID string `db:"project_id"`
+		SpaceID   string `db:"space_id"`
+		Creator   string `db:"creator"`
+		Status    int    `db:"status"`
+	}
+	if _, err := tx.SelectBySql(
+		"SELECT project_id, space_id, creator, status FROM `group` "+
+			"WHERE group_no = ? LIMIT 1 FOR UPDATE",
+		groupNo,
+	).Load(&groups); err != nil {
+		return nil, false, fmt.Errorf("group: lock candidate group for Space cleanup: %w", err)
+	}
+	if len(projects) == 0 || len(groups) == 0 {
+		return nil, false, nil
+	}
+	flags, err := projectBindingMatchFlagsTx(
+		tx, projects[0].ProjectID, groupNo, groups[0].ProjectID, groups[0].SpaceID,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	if projects[0].Status != projectmod.StatusNormal ||
+		groups[0].Status == GroupStatusDisband ||
+		flags.ProjectIDMatch == 0 || flags.PointerMatch == 0 ||
+		(projects[0].SpaceID != "" && flags.SpaceIDMatch == 0) {
+		return nil, false, nil
+	}
+	return &allMemberGroupProjectBinding{
+		ProjectID: projects[0].ProjectID,
+		SpaceID:   projects[0].SpaceID,
+		GroupNo:   groupNo,
+		Creator:   groups[0].Creator,
+	}, true, nil
 }
 
 // admitToAllMemberGroup is the only Project-driven native admission path. It
@@ -96,24 +195,61 @@ func (g *Group) admitToAllMemberGroup(ctx *config.Context, spaceID, groupNo, uid
 		return fmt.Errorf("group: begin all-member admission: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
+	var spaceSeat []struct {
+		SpaceID string `db:"space_id"`
+	}
+	if _, err := tx.SelectBySql(
+		"SELECT s.space_id AS space_id FROM `space_member` sm "+
+			"INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.space_id = ? AND sm.uid = ? AND sm.status = 1 "+
+			"LIMIT 1 FOR UPDATE",
+		spaceID, uid,
+	).Load(&spaceSeat); err != nil {
+		return fmt.Errorf("group: check all-member Space seat: %w", err)
+	}
+	if len(spaceSeat) == 0 {
+		return nil
+	}
+	canonicalSpaceID := spaceSeat[0].SpaceID
 
 	binding, err := lockAllMemberGroupBindingTx(tx, groupNo)
 	if err != nil {
 		return err
 	}
-	if binding == nil || binding.SpaceID != strings.TrimSpace(spaceID) {
+	if binding == nil {
 		return nil
 	}
+	flags, err := projectBindingMatchFlagsTx(
+		tx, binding.ProjectID, groupNo, binding.ProjectID, canonicalSpaceID,
+	)
+	if err != nil {
+		return err
+	}
+	if flags.SpaceIDMatch == 0 {
+		return nil
+	}
+
 	var active []int
 	if _, err := tx.SelectBySql(
 		"SELECT 1 FROM `octo_project_member` "+
 			"WHERE project_id = ? AND space_id = ? AND uid = ? "+
 			"AND status = 1 AND removing = 0 LIMIT 1",
-		binding.ProjectID, binding.SpaceID, uid,
+		binding.ProjectID, canonicalSpaceID, uid,
 	).Load(&active); err != nil {
 		return fmt.Errorf("group: check all-member Project seat: %w", err)
 	}
 	if len(active) == 0 {
+		return nil
+	}
+	var usable []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM `user` WHERE uid = ? AND status = 1 "+
+			"AND COALESCE(is_destroy, 0) <> 2 LIMIT 1 FOR SHARE",
+		uid,
+	).Load(&usable); err != nil {
+		return fmt.Errorf("group: query all-member admission account: %w", err)
+	}
+	if len(usable) == 0 {
 		return nil
 	}
 	robot := 0
@@ -181,7 +317,16 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 	if err != nil {
 		return err
 	}
-	if binding == nil || binding.ProjectID != projectID {
+	if binding == nil {
+		return nil
+	}
+	flags, err := projectBindingMatchFlagsTx(
+		tx, binding.ProjectID, "", projectID, "",
+	)
+	if err != nil {
+		return err
+	}
+	if flags.ProjectIDMatch == 0 {
 		return nil
 	}
 
@@ -202,20 +347,20 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 			creators = append(creators, member.UID)
 		}
 	}
-	if len(creators) == 0 {
-		return nil
-	}
 
 	var owners []allMemberGroupProjectOwner
 	if _, err := tx.SelectBySql(
 		"SELECT pm.uid, COALESCE(pm.joined_at, pm.created_at) AS joined_at, "+
 			"pm.created_at FROM `octo_project_member` pm "+
-			"LEFT JOIN `user` u ON u.uid = pm.uid "+
+			"INNER JOIN space_member sm ON sm.space_id = pm.space_id COLLATE utf8mb4_general_ci "+
+			"AND sm.uid = pm.uid COLLATE utf8mb4_general_ci AND sm.status = 1 "+
+			"INNER JOIN space s ON s.space_id = pm.space_id COLLATE utf8mb4_general_ci AND s.status = 1 "+
+			"LEFT JOIN `user` u ON u.uid = pm.uid COLLATE utf8mb4_general_ci "+
 			"WHERE pm.project_id = ? AND pm.space_id = ? AND pm.status = 1 "+
-			"AND pm.removing = 0 AND pm.role = 2 AND COALESCE(u.robot, 0) = 0 "+
-			"AND COALESCE(u.is_destroy, 0) <> 2 "+
+			"AND pm.removing = 0 AND pm.role = ? AND COALESCE(u.robot, 0) = 0 "+
+			"AND COALESCE(u.status, 0) = 1 AND COALESCE(u.is_destroy, 0) <> 2 "+
 			"ORDER BY joined_at ASC, pm.created_at ASC, pm.uid ASC",
-		binding.ProjectID, binding.SpaceID,
+		binding.ProjectID, binding.SpaceID, projectmod.RoleOwner,
 	).Load(&owners); err != nil {
 		return fmt.Errorf("group: query all-member Project owners: %w", err)
 	}
@@ -233,6 +378,17 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 		}
 	}
 	if target == "" {
+		return nil
+	}
+	var usableTarget []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM `user` WHERE uid = ? AND status = 1 "+
+			"AND COALESCE(is_destroy, 0) <> 2 LIMIT 1 FOR SHARE",
+		target,
+	).Load(&usableTarget); err != nil {
+		return fmt.Errorf("group: query all-member owner account: %w", err)
+	}
+	if len(usableTarget) == 0 {
 		return nil
 	}
 
@@ -275,6 +431,8 @@ func (g *Group) ensureAllMemberGroupOwner(ctx *config.Context, projectID, groupN
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("group: commit all-member owner sync: %w", err)
 	}
+	// Role state is committed. CMD/channel delivery is best-effort: a retry
+	// observing unchanged roles does not replay these notifications.
 	if err := ctx.SendCMD(config.MsgCMDReq{
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),

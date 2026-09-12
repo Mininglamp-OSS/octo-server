@@ -818,6 +818,43 @@ func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int)
 	return ids, nil
 }
 
+// queryActiveProjectIDsForSpaceMemberRejoin returns every active Project seat
+// for a current Space member, including an Owner-only seat. Rejoin projection
+// uses a stable lexicographic cursor so retries and worker restarts never
+// depend on OFFSET over a changing result set.
+func (d *DB) queryActiveProjectIDsForSpaceMemberRejoin(
+	spaceID, uid, after string, limit int,
+) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var (
+		ids []string
+		err error
+	)
+	if after == "" {
+		_, err = d.session.SelectBySql(
+			"SELECT pm.project_id FROM `octo_project_member` pm "+
+				"INNER JOIN `octo_project` p ON p.project_id = pm.project_id AND p.status = ? "+
+				"WHERE pm.space_id = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0 "+
+				"ORDER BY pm.project_id LIMIT ?",
+			StatusNormal, spaceID, uid, MemberStatusActive, limit,
+		).Load(&ids)
+	} else {
+		_, err = d.session.SelectBySql(
+			"SELECT pm.project_id FROM `octo_project_member` pm "+
+				"INNER JOIN `octo_project` p ON p.project_id = pm.project_id AND p.status = ? "+
+				"WHERE pm.space_id = ? AND pm.uid = ? AND pm.status = ? AND pm.removing = 0 "+
+				"AND pm.project_id > ? ORDER BY pm.project_id LIMIT ?",
+			StatusNormal, spaceID, uid, MemberStatusActive, after, limit,
+		).Load(&ids)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("project: query active projects for rejoin: %w", err)
+	}
+	return ids, nil
+}
+
 // queryIsOfficialFlags reads is_official for the D6 guard test.
 func (d *DB) queryIsOfficialFlags(spaceID string) ([]*officialFlagModel, error) {
 	var rows []*officialFlagModel

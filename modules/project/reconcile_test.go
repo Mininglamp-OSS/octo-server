@@ -66,6 +66,26 @@ func TestReconcileFlagsInjectedI1Violation(t *testing.T) {
 	assert.Equal(t, spaceA, rows[0].SpaceID)
 }
 
+func TestReconcileExemptsRetainedOwnerButFlagsOrphanMembers(t *testing.T) {
+	srv, p := setup(t)
+	_, _, created := projectWithMembers(t, srv)
+	removeSpaceMember(t, spaceA, "owner1")
+	seedUser(t, "orphan")
+	injectOrphanSeat(t, created.ProjectID, spaceA, "orphan")
+	enqueueCleanupJob(t, spaceA, "owner1", cleanupStatusAbandoned)
+	enqueueCleanupJob(t, spaceA, "orphan", cleanupStatusAbandoned)
+	rows, err := p.queryI1ViolationPage("", "", p.cfg.ReconcileLimit)
+	require.NoError(t, err)
+	violations := violatingI1Rows(rows)
+	require.Len(t, violations, 1)
+	assert.Equal(t, "orphan", violations[0].UID)
+	rows, err = p.queryAbandonedLeakPage("", "", p.cfg.ReconcileLimit)
+	require.NoError(t, err)
+	violations = violatingI1Rows(rows)
+	require.Len(t, violations, 1)
+	assert.Equal(t, "orphan", violations[0].UID)
+}
+
 // TestReconcileExemptsPairsWithPendingCleanupJob is the exemption that keeps the alert
 // meaningful.
 //
@@ -139,26 +159,15 @@ func TestReconcileDoesNotFlagBannedSpaceMembers(t *testing.T) {
 			"membership, not about the ban")
 }
 
-// TestReconcileFlagsDisbandedSpaceMembers pins that the relaxed predicate's OTHER side is
-// still a violation: a DISBANDED Space (status=0) holds no seats, so every surviving active
-// project seat in it is real.
-//
-// The expected count is 2, not 1 — the owner is flagged as well as the removed member, even
-// though the owner's space_member row is still status=1, because CheckMembership requires
-// space.status=1 and the Space is gone. That is the intended reading: once a Space is
-// disbanded nobody in it holds a seat.
-//
-// In production those seats do not sit there flagged: the Space disband path enqueues a
-// cleanup job for every member in the same transaction, so all of them are exempt while
-// their jobs are pending and closed once the jobs run. This case sets status=0 directly,
-// with no jobs, which is the post-cascade leak shape rather than the normal one.
+// Disbanded Spaces grant no access. Cleanup closes ordinary Project seats but
+// preserves Owner identity; I1 must flag only the ordinary seat left behind.
 func TestReconcileFlagsDisbandedSpaceMembers(t *testing.T) {
 	srv, p := setup(t)
 	_, _, _ = projectWithMembers(t, srv, "m1")
 	removeSpaceMember(t, spaceA, "m1")
 	setSpaceStatus(t, spaceA, 0)
-	assert.Equal(t, 2, violationCount(t, p),
-		"a disbanded Space holds no seats, so both the owner and the removed member are violations")
+	assert.Equal(t, 1, violationCount(t, p),
+		"the ordinary seat is a leak; retained Owner identity does not grant access")
 
 	// And with cleanup jobs pending — what the disband path actually writes — none of them
 	// is reported.

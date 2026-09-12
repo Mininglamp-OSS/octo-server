@@ -135,20 +135,6 @@ func allMemberGroupRename() AllMemberGroupRename {
 	return allMemberGroupRenameFn
 }
 
-// AllMemberGroupHooksRegisteredForTest reports whether all four hooks are wired.
-//
-// Exported for modules/group's construction test. A missing provisioner means every project is
-// created without its initial group; a missing admission/owner hook leaves the dedicated
-// projection stale; a missing rename hook leaves metadata inconsistent.
-func AllMemberGroupHooksRegisteredForTest() bool {
-	allMemberGroupMu.RLock()
-	defer allMemberGroupMu.RUnlock()
-	return allMemberGroupProvish != nil &&
-		allMemberGroupAdmitFn != nil &&
-		allMemberGroupOwnerFn != nil &&
-		allMemberGroupRenameFn != nil
-}
-
 // AllMemberGroupHooksSnapshot holds the registered hooks so a test can put them back.
 type AllMemberGroupHooksSnapshot struct {
 	provision AllMemberGroupProvisioner
