@@ -131,9 +131,9 @@ type sidebarSectionResp struct {
 }
 
 type sidebarProjectSectionResp struct {
-	ProjectID        string               `json:"project_id"`
-	ProjectName      string               `json:"project_name"`
-	Logo             string               `json:"logo"`
-	AllMemberGroupNo string               `json:"all_member_group_no"`
-	Groups           []*project.GroupResp `json:"groups"`
+	ProjectID        string                         `json:"project_id"`
+	ProjectName      string                         `json:"project_name"`
+	Logo             string                         `json:"logo"`
+	AllMemberGroupNo string                         `json:"all_member_group_no"`
+	Groups           []project.ProjectGroupRelation `json:"groups"`
 }

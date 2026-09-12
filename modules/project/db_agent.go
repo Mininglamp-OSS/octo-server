@@ -3,6 +3,7 @@ package project
 import (
 	"fmt"
 
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -102,6 +103,70 @@ func (d *DB) queryAgentRowsTx(tx *dbr.Tx, uids []string) (map[string]agentRow, e
 	return out, nil
 }
 
+// queryAgentRows is the preparation read used to discover creator seats before
+// a membership write transaction starts. It only supplies candidate identities;
+// queryAgentRowsTx is called again after the write locks are held.
+func (d *DB) queryAgentRows(uids []string) (map[string]agentRow, error) {
+	out := make(map[string]agentRow, len(uids))
+	if len(uids) == 0 {
+		return out, nil
+	}
+	var rows []agentRow
+	_, err := d.session.SelectBySql(
+		"SELECT u.uid AS uid, IFNULL(r.creator_uid, '') AS creator_uid, "+
+			"IFNULL(r.agent_hosting, '') AS hosting, u.robot AS robot, "+
+			"(u.status = 1 AND COALESCE(u.is_destroy, 0) <> 2) AS account_usable "+
+			"FROM `user` u "+
+			"LEFT JOIN `robot` r ON r.robot_id = u.uid AND r.status = 1 "+
+			"WHERE u.uid IN ?",
+		uids,
+	).Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("project: query agent rows for preparation: %w", err)
+	}
+	for _, row := range rows {
+		out[row.UID] = row
+	}
+	return out, nil
+}
+
+// queryDirectoryAgentUIDsTx mirrors the Space directory's visible-agent
+// predicate. The caller still combines it with the shared agent classifier so
+// account and Space-seat checks cannot silently diverge from project creation.
+func (d *DB) queryDirectoryAgentUIDsTx(
+	tx *dbr.Tx, spaceID string, uids []string,
+) (map[string]bool, error) {
+	out := make(map[string]bool, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return out, nil
+	}
+	systemBots := spacepkg.SystemBotList()
+	var eligible []string
+	_, err := tx.SelectBySql(
+		"SELECT bot_sm.uid "+
+			"FROM `space_member` bot_sm "+
+			"INNER JOIN `robot` r ON r.robot_id = bot_sm.uid "+
+			"  AND r.status = 1 AND r.agent_hosting = 'octo_hosted' "+
+			"INNER JOIN `user` bot_u ON bot_u.uid = r.robot_id AND bot_u.robot = 1 "+
+			"INNER JOIN `space_member` owner_sm ON owner_sm.space_id = bot_sm.space_id "+
+			"  AND owner_sm.uid = r.creator_uid AND owner_sm.status = 1 "+
+			"INNER JOIN `user` owner_u ON owner_u.uid = owner_sm.uid "+
+			"  AND owner_u.robot = 0 AND owner_u.status = 1 "+
+			"  AND COALESCE(owner_u.is_destroy, 0) <> 2 "+
+			"WHERE bot_sm.space_id = ? AND bot_sm.status = 1 "+
+			"  AND bot_sm.uid IN ? AND bot_sm.uid NOT IN ? "+
+			"  AND owner_sm.uid NOT IN ?",
+		spaceID, uids, systemBots, systemBots,
+	).Load(&eligible)
+	if err != nil {
+		return nil, fmt.Errorf("project: query directory agent eligibility: %w", err)
+	}
+	for _, uid := range eligible {
+		out[uid] = true
+	}
+	return out, nil
+}
+
 // sqlOwnedAgentSeats 是 queryOwnedAgentSeatsTx 执行的语句，提成常量，好让漂移库上的
 // 执行计划守卫 EXPLAIN 生产真正跑的那一份（与 pkg/project 的两条同一条纪律）。
 const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
@@ -120,12 +185,11 @@ const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
 	//   pm eq_ref PRIMARY             rows=1   ← 比较落在 general_ci，而 pm 自己
 	//                                            就是 general_ci，主键可用
 	//
-	// 救它的不是 robot 的主键，是下面那条 creator_uid 字面量谓词给了优化器一个
-	// 有选择性的入口。所以这条语句不必等排序规则转换，但它的代价随"一个主人
-	// 名下的分身数"增长，而不是随项目席位数增长。计划由
-	// TestAgentSeatJoinKeepsAnIndexUnderCollationDrift 钉住。
+	// The selective entry point is creator_uid, so the work scales with the
+	// departing person's riders rather than with every project seat. Keep that
+	// property when changing the projection or predicates.
 	"INNER JOIN `robot` r ON r.robot_id = pm.uid COLLATE utf8mb4_general_ci " +
-	"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 " +
+	"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 AND pm.role <> ? " +
 	// creator_uid 比的是一个**字面量**，不是另一张表的列。字面量是可强制
 	// 转换的，不会报 1267，所以这里不加 COLLATE——加了只会让 idx_robot_creator_uid
 	// 失效，换不到任何安全性。
@@ -133,30 +197,27 @@ const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
 	// 稳定顺序：级联会逐个开事务处理，固定顺序让并发的两次移除以同样的
 	// 顺序碰这些行，少一种死锁形状。
 	"ORDER BY pm.uid " +
-	// **加锁读，且只锁 pm。**
-	//
-	// 这次读直接授权紧随其后的写（把这些席位置为 removing=1）。非加锁读
-	// answers from the snapshot：本事务的读视图在第一条语句就打开了，于是
-	// 一个在那之后提交的新分身席位对这次读不可见，它会被漏掉——人走了、
-	// 他的分身席位还活着，正是 D13 要防的那个终局，而且没有任何东西会回来
-	// 补上。TestNoWriteAuthorisingAggregateIsANonLockingRead 钉住这条规则，
-	// 并且是它先发现了这里的漏洞。
-	//
-	// FOR UPDATE OF pm 而不是裸 FOR UPDATE：不锁 `robot`。robot 不在本模块
-	// 声明的锁序里（space_member → space → project → group → group_member →
-	// octo_project_member），锁它等于凭空加一条没人分析过的边。
-	// lockSpaceSeatsTx 用 FOR SHARE OF sm 是同一个手法。
+	// This read authorizes the immediately following beginMemberRemovalTx writes,
+	// so it must see rows committed after the transaction's read view opens.
+	// Lock only the project-member rows: `robot` is outside this module's lock
+	// order (space_member → space → project → group → group_member →
+	// octo_project_member), and lockSpaceSeatsTx uses the same scoped-lock
+	// pattern for its own table.
 	"FOR UPDATE OF pm"
 
-// queryOwnedAgentSeatsTx 读出 ownerUID 名下、当前在这个项目里有活跃席位的分身。
+// queryOwnedAgentSeatsTx 读出 ownerUID 名下、当前在这个项目里有活跃席位且自身不是
+// Owner 的分身。
 //
 // D13「分身跟人走」的输入：一个人的项目席位关闭时，他名下的分身席位一并关闭。
+// Owner-role seats are excluded as a final cascade guard: an Owner can never be
+// treated as a rider, even if a historical illegal transfer left a Bot in that
+// role.
 //
 // 判定字段是 robot.creator_uid，与群侧 QueryBotsInvitedByUIDTx 同源
 // （modules/group/db.go，#354「bot 永远跟随其主人，无角色例外」）。同源不是巧合而是
 // 要求：群侧已经在移除一个人时按这个字段带走他的 bot，项目侧若按别的字段判断
-// （比如 invite_uid），两边就会对"谁的分身"给出不同答案，于是出现"群里被带走了、
-// 项目席位还在"的行——正是 I4 要防的那种。
+// （比如 invite_uid），就会对"谁的分身"给出不同答案，于是出现"群里被带走了、
+// 项目席位还在"的行——正是 I4 要防的那个终局。
 //
 // r.status = 1：没有活跃 robot 行的 bot（孤儿 / 已禁用）不算任何人的分身，与群侧
 // 那条 INNER JOIN 的口径一致。它的席位由 I1 / I4 对账报出，不在这里静默处理。
@@ -167,7 +228,7 @@ func (d *DB) queryOwnedAgentSeatsTx(tx *dbr.Tx, projectID, ownerUID string) ([]s
 	var uids []string
 	_, err := tx.SelectBySql(
 		sqlOwnedAgentSeats,
-		projectID, MemberStatusActive, ownerUID,
+		projectID, MemberStatusActive, RoleOwner, ownerUID,
 	).Load(&uids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query owned agent seats: %w", err)
@@ -258,9 +319,9 @@ func (d *DB) queryAgentClassTx(tx *dbr.Tx, uid string) (agentClass, error) {
 // 不是，所以两个数按算术相加就等于 len(uids)。性质没变，理由变了（第八轮 review：
 // 注释还在描述已经不存在的那条语句）。
 //
-// 只有会话版，没有事务版。它服务的是**响应渲染**，不授权任何写入；一个事务内的
-// 版本会被 TestNoWriteAuthorisingAggregateIsANonLockingRead 要求成为加锁读，
-// 而为一个纯展示用的计数在成员表上取锁是没有理由的。
+// This read serves response rendering only and is intentionally non-locking.
+// Write authorization paths use their own transactional locking reads rather
+// than reusing this display aggregate.
 //
 // 没有 user 行的成员仍然计为人：他不会出现在 bot 那一批里。这与 listMembers 的
 // LEFT JOIN 是同一个口径——名册和计数不能各说各话。

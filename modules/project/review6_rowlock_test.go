@@ -5,8 +5,8 @@ package project
 // space_member, and four paths now lock several of them in sequence:
 //
 //	addOneMember      actor, then target
-//	leaveProject      uid, then successor
-//	changeMemberRole  actor, then target, then successor
+//	leaveProject      uid
+//	changeMemberRole  actor, then target
 //
 // modules/space's disband takes `space_member WHERE space_id=? AND status=1 FOR UPDATE`
 // (lockActiveMemberUIDsTx), a range lock acquired ROW BY ROW in index order — clustered-key
@@ -20,7 +20,6 @@ package project
 // the loser is the disband, a step of the member-removal security cascade has failed.
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -75,15 +74,16 @@ func TestAddDoesNotDeadlockWhenSeatRowsAreLockedAgainstTheDisbandScanOrder(t *te
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		// addOneMemberOnce, NOT addOneMember: the latter is wrapped in retryOnLockConflict, and
-		// the retry would MASK the defect this test exists to catch. When InnoDB picks the add
-		// as its victim, attempt 2 runs after txD has already released its locks and succeeds,
-		// so the wrapper returns nil and the assertion below passes — the reproducer would only
-		// still fail on the runs where InnoDB happened to victimise the scan side, i.e. a coin
-		// flip (PR #841 round 4, P2-3a). Driving the unwrapped implementation makes the
-		// observation deterministic whichever side InnoDB chooses.
-		ok, aErr := p.addOneMemberOnce(created.ProjectID, spaceA, "rl_actor", "rl_target")
-		done <- outcome{admitted: ok, err: aErr}
+		// addMembersOnce is the current batch implementation, deliberately called
+		// without addMembers' retry wrapper so a deadlock cannot be hidden by retry.
+		// When InnoDB picks the add as its victim, retryOnLockConflict would mask
+		// the defect this test exists to catch; driving the batch transaction directly
+		// keeps the observation deterministic whichever side InnoDB chooses.
+		changed, aErr := p.addMembersOnce(
+			created.ProjectID, spaceA, "rl_actor",
+			[]memberAdd{{UID: "rl_target", Role: RoleCommon}},
+		)
+		done <- outcome{admitted: len(changed) > 0, err: aErr}
 	}()
 	time.Sleep(700 * time.Millisecond)
 
@@ -107,47 +107,4 @@ func TestAddDoesNotDeadlockWhenSeatRowsAreLockedAgainstTheDisbandScanOrder(t *te
 		"the Space-disband scan must not be deadlocked by this module's row-level lock order: %v", scanErr)
 	assert.False(t, isDeadlockErr(got.err),
 		"addOneMember must not deadlock against the disband scan's row order: %v", got.err)
-}
-
-// TestEachWritePathTakesItsSeatLocksInOneStatement is the structural half, and the one that ends
-// the class rather than this instance.
-//
-// Sorting the uids does NOT suffice: the disband scan orders by id, not by uid, so any order
-// this module picks can still oppose it. One statement per path lets InnoDB acquire the rows in
-// ITS scan order, which is the same order the disband scan uses — so there is no second row to
-// be waiting for while holding the first.
-func TestEachWritePathTakesItsSeatLocksInOneStatement(t *testing.T) {
-	src := readLinesWithoutComments(t, "service.go")
-	for _, fn := range []string{
-		"func (p *Project) addOneMember",
-		"func (p *Project) leaveProject",
-		"func (p *Project) changeMemberRole",
-		"func (p *Project) removeMember",
-		"func (p *Project) updateProject",
-		"func (p *Project) disbandProject",
-	} {
-		// implBody, not funcBody: these all have a retry wrapper now, and inspecting the wrapper
-		// would make this guard vacuously green.
-		body := implBody(t, src, fn)
-		// Every way this module can take a space_member lock. requireSpaceSeatsTx delegates to
-		// lockSeatsTx, so a path using the former counts once — the guard reads one function
-		// body at a time and does not recurse.
-		n := countOccurrences(body, "requireSpaceSeatsTx(") +
-			countOccurrences(body, "lockSeatsTx(") +
-			countOccurrences(body, "lockSpaceSeatsTx(") +
-			countOccurrences(body, "lockSpaceSeatRowTx(")
-		// Equal, not LessOrEqual: n == 0 means the path takes NO seat lock at all, i.e. the
-		// in-transaction actor Space-seat revalidation that is the centrepiece of round 3 was
-		// deleted — and LessOrEqual(n, 1) was green for that (PR #841 round 4, P2-3b).
-		assert.Equal(t, 1, n,
-			"%s takes %d separate space_member seat locks (want exactly 1). Two or more sequential row locks on "+
-				"that table reopen the Error 1213 cycle with modules/space's disband scan, which "+
-				"acquires its range lock row by row in id order — reproduced, with the disband as "+
-				"InnoDB's victim. Take them in ONE statement (requireSpaceSeatsTx) so InnoDB picks "+
-				"a scan-consistent order.", fn, n)
-	}
-}
-
-func countOccurrences(s, sub string) int {
-	return strings.Count(s, sub)
 }

@@ -9,253 +9,19 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
-	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Group-membership admission — the single entry every path goes through.
+// Group-membership admission is the single native membership write primitive.
 //
-// # Why this file exists
-//
-// Invariant I2 — for a group whose project_id is not the empty sentinel, every
-// active group_member row belongs to an active member of that project (system
-// bots exempted) — is the ENTIRE security mechanism of the Project layer. There
-// is no read-path filter behind it: a uid with a group_member row sees the group
-// in /v1/sidebar/sync, receives its messages over WuKongIM, and can post. So one
-// missed admission path is not a cosmetic bug, it is the whole hole.
-//
-// Before this file, group membership was admitted by ELEVEN distinct code paths
-// with no shared funnel: two near-duplicate implementations, nine sites calling
-// the DAO primitives directly, and two doing raw DML from outside modules/group
-// entirely. The invariant they shared was maintained by hand-copied comments
-// (「与 Service.AddGroupMembers 保持一致」 appears five times in this module).
-// P0's journal recorded what that costs: its own I1 checks were added one review
-// round at a time, each round finding another path.
-//
-// The counter-move, and what this file is:
-//
-//  1. one admission entry every path goes through (admitOrRestoreMembersTx),
-//  2. a source guard that fails CI when a new path writes group_member outside
-//     the allowlist (admission_guard_test.go),
-//  3. a per-entry-point rejection metric, so a path that silently stopped
-//     enforcing shows up in production rather than in the next review,
-//  4. a reconcile scan reporting violations that got in anyway (modules/project).
-//
-// Items 2 and 3 are not decoration. A funnel with no guard is a convention, and
-// a convention is what the five copied comments already were.
+// Every path that adds or restores a group_member row uses
+// admitOrRestoreMembersTx.  Project affiliation is deliberately not consulted
+// here: native group membership and Project membership are independent sources
+// of access.  Relation endpoints and Project-backed group creation perform
+// their own Project authorization where the operation requires it.
 const admissionMetricNamespace = "group"
-
-// Admission entry points. Every path that can put a uid into a group's active
-// member set has a label here, and the acceptance requires the test suite to
-// emit every one of them at least once: a label that is never emitted is a path
-// that is not enforcing.
-//
-// The numbering follows the task brief's inventory so the two can be read
-// side by side. A9 (IService.AddMember) has no label because it was DELETED
-// rather than converged — it had zero non-test callers, no transaction, no Space
-// check, and no version, and it was exported on IService, so any future module
-// could have bypassed every gate through it.
-const (
-	// AdmissionEntryInviteConfirm is addMembersTxWithSpace, reached from
-	// groupMemberInviteSure — mounted on the openGroup route group with NO
-	// AuthMiddleware. The most exposed admission path in the product.
-	AdmissionEntryInviteConfirm = "a1_invite_confirm"
-	// AdmissionEntryAddMembers is Service.AddGroupMembers.
-	AdmissionEntryAddMembers = "a2_add_members"
-	// AdmissionEntryCreateGroup is CreateGroup's initial member list.
-	AdmissionEntryCreateGroup = "a3_create_group"
-	// AdmissionEntryCreateGroupBot is CreateGroup's req.BotUID.
-	AdmissionEntryCreateGroupBot = "a4_create_group_bot"
-	// AdmissionEntryScanJoin is groupScanJoin (QR-code join).
-	AdmissionEntryScanJoin = "a5_scan_join"
-	// AdmissionEntryRegisterUser is handleRegisterUserEvent.
-	AdmissionEntryRegisterUser = "a6_register_user"
-	// AdmissionEntryOrgCreate is handleOrgOrDeptCreateEvent. Converged, not
-	// deleted: no publisher exists in this repository, but the event table is a
-	// database queue whose Wait rows can predate the deploy, and #797 classifies
-	// these handlers as org-directory offboarding paths. See D7.
-	AdmissionEntryOrgCreate = "a7_org_create"
-	// AdmissionEntryOrgEmployeeUpdate is handleOrgOrDeptEmployeeUpdate's add branch.
-	AdmissionEntryOrgEmployeeUpdate = "a8_org_employee_update"
-	// AdmissionEntryPresetGroups is modules/space's joinPresetGroups, reached
-	// through the registered admitter because modules/space cannot import
-	// modules/group (group already imports space).
-	AdmissionEntryPresetGroups = "a10_preset_groups"
-	// AdmissionEntryUnblacklist is the un-blacklist branch of the blacklist
-	// handler.
-	//
-	// This one is the reason a gate installed only in the two admission
-	// primitives is not enough. It restores a uid to the active member set by
-	// flipping group_member.status back to Normal, re-subscribes them to the IM
-	// channel and to the group's threads, and touches NEITHER InsertMemberTx nor
-	// recoverMemberTx. It is an admission path because that is what it does.
-	AdmissionEntryUnblacklist = "a11_unblacklist"
-	// AdmissionEntryAllMemberGroup is the P2 all-member group admitter, reached
-	// through the registry modules/project exposes (modules/project cannot import
-	// modules/group). It runs when a uid becomes a project member, putting them
-	// into that project's all-member group.
-	//
-	// A twelfth entry rather than reusing a10_preset_groups, which it structurally
-	// resembles: the label breakdown exists so a path that silently stopped
-	// enforcing is visible per path, and folding two paths onto one label is
-	// exactly the visibility this metric was added to buy.
-	AdmissionEntryAllMemberGroup = "a12_all_member_group"
-)
-
-// Rejection reasons. Low-cardinality enum; never a free-form message.
-const (
-	admissionReasonNotProjectMember = "not_project_member"
-	admissionReasonNotSpaceMember   = "not_space_member"
-)
-
-// admissionRejectedTotal counts refused admissions by entry point.
-//
-// The breakdown IS the metric. A single undifferentiated counter cannot tell you
-// that one of eleven paths stopped enforcing; a per-entry breakdown can, because
-// a path that was converted and then regressed goes silent while its siblings
-// keep counting.
-//
-// No group_no / project_id / uid labels: unbounded cardinality.
-var admissionRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Namespace: admissionMetricNamespace,
-	Name:      "admission_rejected_total",
-	Help:      "Group-membership admissions refused, by entry point and reason.",
-}, []string{"entry", "reason"})
-
-// ErrAdmissionRefused is the sentinel every admission refusal wraps, so callers
-// can distinguish "this uid may not be admitted" from "the database broke"
-// without string matching.
-var ErrAdmissionRefused = errors.New("group: admission refused")
-
-// AdmissionRefusedError names the uids that were refused and why.
-//
-// It carries the uids because the batch paths must be able to tell the operator
-// WHICH member of a 200-uid batch was the problem. It does NOT reach the wire in
-// that shape: handlers map it to a registered i18n code, and the uid list goes
-// to the log.
-type AdmissionRefusedError struct {
-	Entry  string
-	Reason string
-	UIDs   []string
-}
-
-func (e *AdmissionRefusedError) Error() string {
-	return fmt.Sprintf("group: admission refused at %s (%s): %s",
-		e.Entry, e.Reason, strings.Join(e.UIDs, ","))
-}
-
-func (e *AdmissionRefusedError) Unwrap() error { return ErrAdmissionRefused }
-
-// assertAdmissibleTx is THE composite gate: may these uids join this group?
-//
-// The predicate is
-//
-//	active Space member AND (project is the empty sentinel OR active project member)
-//
-// evaluated for every uid, and it is deliberately a CONJUNCTION. P0's
-// Space→Project cascade is asynchronous — a 10-second poller, a 10-minute lease,
-// backoff, a terminal abandoned state — so between a Space removal committing
-// and that cascade running, octo_project_member still holds status = 1 rows for
-// a uid with no Space seat. A gate that asked only "is this an active project
-// member?" would admit a removed Space member into a project group for the whole
-// of that window. With the conjunction the window costs nothing: the Space half
-// fails first. P0's space_member_removal.go says the tolerance for that window
-// "expires in P1"; this is where it expires.
-//
-// # Space-direct groups pay NOTHING for this (C1)
-//
-// projectID == "" returns before issuing any query at all. That is a hard
-// requirement, not an optimization: this gate is on the admission path of every
-// group in the product, and a gate that runs and passes is still a latency
-// regression on every group join. The short-circuit is asserted by a test that
-// COUNTS queries, because "I read the code and it returns early" is not evidence.
-//
-// # Why the Space half is a session read and the project half is not
-//
-// The Space half calls pkg/space.ActiveMembers on a *dbr.Session — outside the
-// caller's transaction, exactly as all eleven paths already did individually. It
-// therefore proves nothing about state at COMMIT time. That weakness is
-// pre-existing and deliberately UNCHANGED here: tightening it into the
-// transaction is a strict improvement and a behaviour change on every group join
-// in the product, so it is a separate task, not a rider on this one.
-//
-// The project half must not copy it. pkg/project.AssertMembersInProjectTx takes
-// the caller's *dbr.Tx and a shared lock on the member rows, so a concurrent
-// project-seat removal cannot commit between the check and the admission. A
-// check outside the transaction is a TOCTOU with a comment.
-func (d *DB) assertAdmissibleTx(tx *dbr.Tx, spaceID, projectID string, uids []string, entry string) error {
-	// C1 — no query, no allocation, nothing, for a Space-direct group.
-	if projectID == "" || len(uids) == 0 {
-		return nil
-	}
-
-	// System bots are exempt from the WHOLE gate, not just its project half.
-	//
-	// The narrower reading — exempt from the project check, still subject to the
-	// Space check — was tried and is wrong for a concrete reason: platform bots
-	// (botfather, fileHelper, u_10000) have no space_member row at all. They are
-	// global infrastructure the platform adds to groups itself, not members of
-	// any Space. Subjecting them to the Space half therefore refuses them from
-	// every project group, which is the opposite of an exemption.
-	//
-	// Filtering them out HERE rather than inside each half also means the two
-	// halves cannot disagree about who is exempt.
-	gated := make([]string, 0, len(uids))
-	for _, uid := range uids {
-		if uid == "" || spacepkg.IsSystemBot(uid) {
-			continue
-		}
-		gated = append(gated, uid)
-	}
-	if len(gated) == 0 {
-		return nil
-	}
-
-	// Space half. Only project groups reach it, so this adds no cost to the
-	// paths that carry the product's traffic today.
-	if spaceID != "" {
-		active, err := spacepkg.ActiveMembers(d.ctx.DB(), spaceID, gated)
-		if err != nil {
-			return fmt.Errorf("group: admission space check: %w", err)
-		}
-		missing := make([]string, 0)
-		for _, uid := range gated {
-			if !active[uid] {
-				missing = append(missing, uid)
-			}
-		}
-		if len(missing) > 0 {
-			admissionRejectedTotal.WithLabelValues(entry, admissionReasonNotSpaceMember).
-				Add(float64(len(missing)))
-			return &AdmissionRefusedError{
-				Entry:  entry,
-				Reason: admissionReasonNotSpaceMember,
-				UIDs:   missing,
-			}
-		}
-	}
-
-	// Project half — in-transaction, locked. pkg/project applies the same
-	// system-bot exemption internally; passing the already-filtered list keeps
-	// the two from having to agree by coincidence.
-	missing, err := projectpkg.AssertMembersInProjectTx(tx, projectID, gated)
-	if err != nil {
-		return fmt.Errorf("group: admission project check: %w", err)
-	}
-	if len(missing) > 0 {
-		admissionRejectedTotal.WithLabelValues(entry, admissionReasonNotProjectMember).
-			Add(float64(len(missing)))
-		return &AdmissionRefusedError{
-			Entry:  entry,
-			Reason: admissionReasonNotProjectMember,
-			UIDs:   missing,
-		}
-	}
-	return nil
-}
 
 // MemberAdmission is one uid's worth of the columns that differ between paths.
 //
@@ -295,7 +61,7 @@ type aiTeamActiveMember struct {
 // AI-team container is created or repaired. AI-team provisioning owns the surrounding
 // transaction, so calling the public AddGroupMembers service would break the
 // atomic group/association/session write. Keeping the write here still routes
-// it through the single admission primitive introduced for project isolation.
+// it through the single native membership primitive.
 //
 // The bridge deliberately accepts exactly one owner and one Bot and verifies
 // the freshly-created parent row. It is not a general escape hatch for callers
@@ -347,7 +113,7 @@ func AdmitAITeamContainerMembersTx(
 		return false, err
 	}
 
-	if err = NewDB(ctx).admitOrRestoreMembersTx(tx, groupNo, spaceID, "", []MemberAdmission{
+	if err = NewDB(ctx).admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{
 		{
 			UID:       ownerUID,
 			Version:   ownerVersion,
@@ -361,7 +127,7 @@ func AdmitAITeamContainerMembersTx(
 			InviteUID: ownerUID,
 			Robot:     1,
 		},
-	}, AdmissionEntryCreateGroup); err != nil {
+	}); err != nil {
 		return false, err
 	}
 
@@ -399,19 +165,17 @@ func hasExactAITeamMembers(members []*aiTeamActiveMember, ownerUID, botUID strin
 	return foundOwner && foundBot
 }
 
-// admitOrRestoreMembersTx is the single admission entry. Every path that adds a
-// uid to a group's active member set goes through it.
+// admitOrRestoreMembersTx is the single native membership write primitive.
 //
-// It enforces the composite gate, then writes the members in ONE statement that
-// decides insert-vs-restore per row, and it writes the full column set both
-// branches need.
+// It writes the members in ONE statement that decides insert-vs-restore per
+// row, and it writes the full column set both branches need.
 //
 // # Insert vs restore, and why it is one statement
 //
 // group_member rows are soft-deleted (DeleteMemberTx only sets is_deleted = 1)
 // and carry `unique index group_no_uid (group_no, uid)`, so re-joining is an
-// UPDATE, not an INSERT. A gate installed only in InsertMemberTx would cover
-// first joins and miss every rejoin.
+// UPDATE, not an INSERT. A single upsert covers both first joins and re-joins
+// without the old read-then-branch race.
 //
 // What every path did before was a racy three-statement stand-in: a session-scope
 // ExistMemberDelete read, then a branch, then the write. joinPresetGroups fell
@@ -458,30 +222,23 @@ func hasExactAITeamMembers(members []*aiTeamActiveMember, ownerUID, botUID strin
 // group path on every Space join.
 func (d *DB) admitOrRestoreMembersTx(
 	tx *dbr.Tx,
-	groupNo, spaceID, projectID string,
+	groupNo string,
 	admissions []MemberAdmission,
-	entry string,
 ) error {
 	if len(admissions) == 0 {
 		return nil
 	}
 
-	uids := make([]string, 0, len(admissions))
 	for _, a := range admissions {
 		if a.UID == "" {
-			return fmt.Errorf("group: admission at %s carries an empty uid", entry)
+			return errors.New("group: admission carries an empty uid")
 		}
 		if a.Version == 0 {
 			// A missing version breaks incremental member sync silently — the
 			// row exists but no client ever syncs it. Refusing here is how that
 			// stops being discoverable only in production.
-			return fmt.Errorf("group: admission at %s carries no version for uid %s", entry, a.UID)
+			return fmt.Errorf("group: admission carries no version for uid %s", a.UID)
 		}
-		uids = append(uids, a.UID)
-	}
-
-	if err := d.assertAdmissibleTx(tx, spaceID, projectID, uids, entry); err != nil {
-		return err
 	}
 
 	const cols = "(group_no, uid, remark, role, `version`, status, vercode, is_deleted, " +
@@ -516,7 +273,7 @@ func (d *DB) admitOrRestoreMembersTx(
 		"  is_deleted      = 0"
 
 	if _, err := tx.InsertBySql(sql, args...).Exec(); err != nil {
-		return fmt.Errorf("group: admit or restore members at %s: %w", entry, err)
+		return fmt.Errorf("group: admit or restore members: %w", err)
 	}
 	return nil
 }
@@ -567,7 +324,7 @@ func observeLegacyDirectoryListener(listener string) {
 }
 
 // ---------------------------------------------------------------------------
-// Project cascade metrics
+// Project disband relation metrics
 // ---------------------------------------------------------------------------
 
 // Reasons a group left a project. Low-cardinality enum.
@@ -578,10 +335,6 @@ const (
 	// because it had no owner left. Distinguished from a human disband because
 	// it means nobody chose this, and a spike in it is worth looking at.
 	detachReasonOwnerlessDisband = "ownerless_disband"
-	// detachReasonNoSuccessor — a group's creator left the project and no
-	// remaining member of that group was still in the project, so the group fell
-	// back to Space-direct rather than being force-transferred or disbanded.
-	detachReasonNoSuccessor = "no_successor"
 )
 
 var projectGroupDetachedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -589,42 +342,3 @@ var projectGroupDetachedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name:      "project_detached_total",
 	Help:      "Groups reverted from a Project to Space-direct, by reason.",
 }, []string{"reason"})
-
-// projectCascadeCancelledTotal counts fan-outs stopped because the member was
-// re-admitted to the project while the cascade was running.
-//
-// Its own counter because it is the only externally visible sign that D4's
-// cancellation reached the fan-out rather than only the queue. A cascade that
-// stopped mid-way leaves a member in some of the project's groups and not
-// others — legitimate, and confusing enough to look up. If this counter is
-// always zero while support tickets say "I re-added them and they still lost
-// their groups", the per-group re-check has regressed.
-var projectCascadeCancelledTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Namespace: admissionMetricNamespace,
-	Name:      "project_cascade_cancelled_total",
-	Help:      "Project-removal cascades stopped mid fan-out because the member was re-admitted.",
-})
-
-// projectCascadeGroupLeftTotal counts groups skipped because they left the
-// project between the cascade's snapshot and the removal.
-//
-// Separate from the cancellation counter: that one means the MEMBER came back,
-// this one means the GROUP did not stay. Both leave a member in some of the
-// project's groups and not others, and only the pair of counters tells an
-// operator which explanation applies to a given ticket.
-var projectCascadeGroupLeftTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Namespace: admissionMetricNamespace,
-	Name:      "project_cascade_group_left_total",
-	Help:      "Groups skipped by a removal cascade because they left the project mid fan-out.",
-})
-
-// projectGroupHandoverTotal counts ownership handovers performed by the cascade.
-//
-// Worth its own counter rather than a log line: it is the one place the system
-// changes who controls a group without anyone asking, and the product decision
-// to do that automatically is only defensible while the number stays small.
-var projectGroupHandoverTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Namespace: admissionMetricNamespace,
-	Name:      "project_cascade_handover_total",
-	Help:      "Group ownership handovers performed because the creator left the project.",
-})

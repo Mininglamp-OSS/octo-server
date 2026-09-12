@@ -14,11 +14,9 @@ import (
 // blow up Prometheus memory.
 const metricNamespace = "project"
 
-// Admission-rejection entry points. The breakdown is the point of the metric, not
-// decoration: P1 adds several more membership write paths (group admission, the
-// removing intermediate state), and a single undifferentiated counter cannot tell
-// you that one of them forgot to check I1. Adding a path without adding its entry
-// value here is the failure this label exists to expose.
+// Admission-rejection entry points. The breakdown is the point of the metric,
+// not decoration: each Project membership write path (add, role change, remove,
+// leave, and the removing intermediate state) must account for its failures.
 const (
 	entryMemberAdd               = "member_add"
 	entryRoleChange              = "role_change"
@@ -47,7 +45,6 @@ const (
 	reasonFlagOff                        = "flag_off"
 	reasonPermissionDenied               = "permission_denied"
 	reasonLastOwner                      = "last_owner"
-	reasonNameDuplicated                 = "name_duplicated"
 	reasonCollaborationRoleNameInvalid   = "collaboration_role_name_invalid"
 	reasonCollaborationRoleInvalid       = "collaboration_role_invalid"
 	reasonCollaborationRoleTargetInvalid = "collaboration_role_target_invalid"
@@ -132,9 +129,8 @@ var (
 	// spaceProjectCountDistribution is the detector for a condition PR-5 named and
 	// could not otherwise see.
 	//
-	// PR-5's ORDER BY sorts by a per-caller pin, which no index can serve, so
-	// listVisibleInSpace now sorts every project visible to the caller in the Space
-	// before LIMIT applies (measured in TestTheProjectListReachesItsRowsByAnIndex:
+	// The project list endpoint sorts every project visible to the caller in the
+	// Space before LIMIT applies (measured in TestTheProjectListReachesItsRowsByAnIndex:
 	// 0.28ms before, 7.9ms at 2000 visible projects). The escalation condition is
 	// "a Space reaches the thousands", and without this histogram it would arrive
 	// as user-visible latency rather than as a signal.
@@ -203,10 +199,10 @@ var (
 	// only), so like i1_abandoned_cleanup_leak this is a standing figure needing a human, not
 	// a transient that clears.
 	//
-	// It exists because the state was reachable and invisible: the concurrency route is now
-	// closed (see countActiveOwnersTx), and the remaining route — a sole owner removed from
-	// the Space — is a filed product decision. This gauge is what lets that decision be made
-	// from data rather than a guess.
+	// It exists because legacy or manual writes can still leave this state and
+	// normal Space-removal now deliberately preserves Owner rows. The gauge lets
+	// operators distinguish that historical/inconsistent state from a healthy
+	// project instead of inferring it from a request failure.
 	ownerlessProjects = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricNamespace,
 		Name:      "ownerless_total",
@@ -243,21 +239,8 @@ func observeCollaborationRoleWrite(action, outcome string) {
 }
 
 // ---------------------------------------------------------------------------
-// P1 — group-binding invariants
+// P1 — group attribution and removal machinery
 // ---------------------------------------------------------------------------
-
-// i2Violations counts active group_member rows in a project group whose uid is
-// not an active member of that project.
-//
-// The one to alert on. I2 has NO read-path filter behind it: a violating row
-// means that person sees the group in sidebar/sync, receives its messages over
-// WuKongIM, and can post in it. Non-zero is a live access-control failure, not a
-// data-quality nit.
-var i2Violations = promauto.NewGauge(prometheus.GaugeOpts{
-	Namespace: metricNamespace,
-	Name:      "i2_violations_total",
-	Help:      "Active members of a project group who are not active members of that project.",
-})
 
 // i3Violations counts groups whose project_id points at a project that is
 // disbanded, in another Space, or absent.
@@ -269,10 +252,9 @@ var i3Violations = promauto.NewGauge(prometheus.GaugeOpts{
 
 // removingStalls counts seats stuck mid-removal past the stall threshold.
 //
-// A DISTINCT signal from i2_violations_total, with the opposite meaning: I2 says
-// the invariant broke, this says the cascade stopped. Alerting on them together
-// would make an operator treat a stuck worker as a security incident and a
-// security incident as a stuck worker.
+// A stalled seat is a worker-health signal, not a native group-membership
+// violation: authorization excludes a seat as soon as removing=1, while the
+// worker retains it in storage until registered cleanup completes.
 var removingStalls = promauto.NewGauge(prometheus.GaugeOpts{
 	Namespace: metricNamespace,
 	Name:      "removing_stalled_total",
@@ -288,13 +270,11 @@ var removalBacklog = promauto.NewGauge(prometheus.GaugeOpts{
 
 // removalAbandoned counts cascade jobs that ran out of attempts.
 //
-// The brief asks for backlog AND abandoned counts and only backlog was built.
 // The two answer different questions and the second is the one that pages: an
-// abandoned job is terminal, and it leaves a member's seat at removing = 1 with
-// their group rows still in place — the state nothing else will repair. The
-// stall gauge does notice it, but only once the seat has sat there past the
-// stall threshold; this moves the moment the job gives up, which is when an
-// operator can still read last_error and act on it.
+// abandoned job is terminal while its seat remains at removing = 1, requiring
+// an operator to inspect last_error and decide how to recover. The stall gauge
+// notices it only after the seat has sat there past the threshold; this counter
+// moves at the moment the job gives up.
 //
 // A counter rather than a gauge: it is an event, and a gauge derived from a
 // COUNT would go back to zero as soon as the retention purge ran.

@@ -23,6 +23,28 @@ func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, er
 	return count > 0, nil
 }
 
+// ResolveSpaceID returns the value stored in the Space table for a selector
+// accepted by that table's collation. The bool distinguishes "no such Space"
+// from a database failure; callers handling recovery must not manufacture a
+// canonical value when it is false.
+func ResolveSpaceID(session *dbr.Session, spaceID string) (string, bool, error) {
+	if session == nil || spaceID == "" {
+		return "", false, nil
+	}
+	var ids []string
+	_, err := session.SelectBySql(
+		"SELECT space_id FROM space WHERE space_id = ? LIMIT 1",
+		spaceID,
+	).Load(&ids)
+	if err != nil {
+		return "", false, err
+	}
+	if len(ids) == 0 {
+		return "", false, nil
+	}
+	return ids[0], true, nil
+}
+
 // ActiveMembers is CheckMembership for a batch: it returns the subset of uids
 // that are active members of the given active Space.
 //
@@ -47,6 +69,30 @@ func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[str
 	}
 	var found []string
 	_, err := session.SelectBySql(
+		"SELECT sm.uid FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.space_id = ? AND sm.uid IN ? AND sm.status = 1",
+		spaceID, uids,
+	).Load(&found)
+	if err != nil {
+		return nil, err
+	}
+	for _, uid := range found {
+		active[uid] = true
+	}
+	return active, nil
+}
+
+// ActiveMembersTx is the transaction-scoped form of ActiveMembers. It keeps
+// the exact Space predicate while allowing a caller-owned transaction to use
+// one repeatable-read snapshot with its other authorization checks.
+func ActiveMembersTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
+	active := make(map[string]bool, len(uids))
+	if tx == nil || spaceID == "" || len(uids) == 0 {
+		return active, nil
+	}
+	var found []string
+	_, err := tx.SelectBySql(
 		"SELECT sm.uid FROM space_member sm "+
 			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
 			"WHERE sm.space_id = ? AND sm.uid IN ? AND sm.status = 1",

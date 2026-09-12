@@ -42,7 +42,7 @@ func TestCascadeFinishesEveryPage(t *testing.T) {
 	for i := 0; i < seats; i++ {
 		proj := createProjectVia(t, srv, spaceA, ownerTok, "wide-"+string(rune('a'+i)))
 		w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+proj.ProjectID+"/members/add",
-			ownerTok, map[string]any{"uids": []string{"wide"}})
+			ownerTok, addMembersPayload("wide"))
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	}
 
@@ -57,6 +57,72 @@ func TestCascadeFinishesEveryPage(t *testing.T) {
 	).LoadOne(&remaining))
 	assert.Equal(t, 0, remaining,
 		"every seat must be closed; a surviving one is the permanent leak this fix removes")
+}
+
+func TestCascadeSkipsPreservedOwnersBeforePageBoundary(t *testing.T) {
+	_, p := setup(t)
+	seedSpace(t, spaceA, 1)
+	seedUser(t, "cascade-owner")
+	seedSpaceMember(t, spaceA, "cascade-owner", 0, 1)
+	seedUser(t, "cascade-other")
+	seedSpaceMember(t, spaceA, "cascade-other", 0, 1)
+
+	// The first page is deliberately all preserved Owner rows. The third project has the
+	// removed uid as a normal member and must still be processed in the same invocation.
+	projects := []struct {
+		id       string
+		role     int
+		creator  string
+		inviteBy string
+	}{
+		{id: "000-owner-a", role: RoleOwner, creator: "cascade-owner", inviteBy: "cascade-owner"},
+		{id: "001-owner-b", role: RoleOwner, creator: "cascade-owner", inviteBy: "cascade-owner"},
+		{id: "002-member-c", role: RoleCommon, creator: "cascade-other", inviteBy: "cascade-other"},
+	}
+	for _, project := range projects {
+		_, err := testCtx.DB().InsertBySql(
+			"INSERT INTO octo_project "+
+				"(project_id, space_id, name, creator, status, created_at, updated_at) "+
+				"VALUES (?, ?, ?, ?, 1, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+			project.id, spaceA, project.id, project.creator,
+		).Exec()
+		require.NoError(t, err)
+		_, err = testCtx.DB().InsertBySql(
+			"INSERT INTO octo_project_member "+
+				"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+				"VALUES (?, ?, ?, ?, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+			project.id, "cascade-owner", spaceA, project.role, project.inviteBy,
+		).Exec()
+		require.NoError(t, err)
+		if project.role == RoleCommon {
+			_, err = testCtx.DB().InsertBySql(
+				"INSERT INTO octo_project_member "+
+					"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+					"VALUES (?, ?, ?, ?, 1, 0, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+				project.id, "cascade-other", spaceA, RoleOwner, "cascade-other",
+			).Exec()
+			require.NoError(t, err)
+		}
+	}
+
+	removeSpaceMember(t, spaceA, "cascade-owner")
+	origPage := cascadePageSize
+	cascadePageSize = 2
+	t.Cleanup(func() { cascadePageSize = origPage })
+
+	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-other",
+		spacemod.MemberRemoveReasonKicked))
+
+	for _, projectID := range []string{"000-owner-a", "001-owner-b"} {
+		status, removing := seatState(t, projectID, "cascade-owner")
+		assert.Equal(t, MemberStatusActive, status,
+			"the preserved Owner identity must remain active in %s", projectID)
+		assert.Zero(t, removing)
+	}
+	status, removing := seatState(t, "002-member-c", "cascade-owner")
+	assert.Equal(t, MemberStatusRemoved, status,
+		"the non-Owner seat after a page of preserved Owners must still be closed")
+	assert.Zero(t, removing)
 }
 
 // TestCascadeReturnsRetryableErrorWhenBudgetExhausted pins the other half: when the page
@@ -77,7 +143,7 @@ func TestCascadeReturnsRetryableErrorWhenBudgetExhausted(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		proj := createProjectVia(t, srv, spaceA, ownerTok, "budget-"+string(rune('a'+i)))
 		w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+proj.ProjectID+"/members/add",
-			ownerTok, map[string]any{"uids": []string{"wide"}})
+			ownerTok, addMembersPayload("wide"))
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	}
 
@@ -180,10 +246,13 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 	// how every write path now takes these locks (see lockSpaceSeatsTx: one statement is what
 	// keeps this module out of the row-level 1213 cycle with the Space disband scan). Asserting
 	// them together also pins that a batch judges each uid independently.
+	refs, err := p.db.resolveSpaceSeatIDs(spaceA,
+		[]string{"target", "elsewhere", "nobody-at-all"})
+	require.NoError(t, err)
 	tx, err := p.db.session.Begin()
 	require.NoError(t, err)
 	held, err := p.db.lockSpaceSeatsTx(tx, spaceA,
-		[]string{"target", "elsewhere", "nobody-at-all"})
+		[]string{"target", "elsewhere", "nobody-at-all"}, refs)
 	require.NoError(t, err, "FOR SHARE OF sm must parse (needs MySQL 8.0.1+)")
 	assert.True(t, held["target"])
 	assert.False(t, held["elsewhere"], "a member of another Space must not satisfy I1 here")
@@ -195,8 +264,7 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 	setSpaceStatus(t, spaceA, 2)
 	tx, err = p.db.session.Begin()
 	require.NoError(t, err)
-	held, err = p.db.lockSpaceSeatsTx(tx, spaceA, []string{"target"})
-	require.NoError(t, err)
+	held, err = p.db.lockSpaceSeatsTx(tx, spaceA, []string{"target"}, refs)
 	assert.False(t, held["target"], "space.status=2 must fail an authorization predicate")
 	require.NoError(t, tx.Rollback())
 	setSpaceStatus(t, spaceA, 1)
@@ -206,8 +274,7 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 	// session-scoped read left open.
 	tx, err = p.db.session.Begin()
 	require.NoError(t, err)
-	held, err = p.db.lockSpaceSeatsTx(tx, spaceA, []string{"target"})
-	require.NoError(t, err)
+	held, err = p.db.lockSpaceSeatsTx(tx, spaceA, []string{"target"}, refs)
 	require.True(t, held["target"])
 
 	blocked := probeSpaceMemberUpdateBlocks(t, spaceA, "target")

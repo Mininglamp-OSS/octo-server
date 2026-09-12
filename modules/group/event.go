@@ -177,15 +177,13 @@ func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) 
 			commit(err)
 			return
 		}
-		// 收口到唯一准入口（A6）。系统群不属于任何 Space 或项目，闸门在
-		// project_id 为空串时直接短路，一次查询都不发。
 		err = g.db.admitOrRestoreMembersTx(tx,
-			g.ctx.GetConfig().Account.SystemGroupID, "", "",
+			g.ctx.GetConfig().Account.SystemGroupID,
 			[]MemberAdmission{{
 				UID:     g.ctx.GetConfig().Account.SystemUID,
 				Version: memberVersion,
 				Role:    MemberRoleCreator,
-			}}, AdmissionEntryRegisterUser)
+			}})
 		if err != nil {
 			g.Error("设置系统群创建者失败")
 			tx.Rollback()
@@ -328,13 +326,12 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 			commit(err)
 			return
 		}
-		// 收口到唯一准入口（A7 创建者）。组织架构建的群不带 Space/项目归属。
-		err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo, "", "",
+		err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo,
 			[]MemberAdmission{{
 				UID:     req.Operator,
 				Version: memberVersion,
 				Role:    MemberRoleCreator,
-			}}, AdmissionEntryOrgCreate)
+			}})
 		if err != nil {
 			g.Error("设置群创建者失败")
 			tx.Rollback()
@@ -352,12 +349,12 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 					commit(err)
 					return
 				}
-				err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo, "", "",
+				err = g.db.admitOrRestoreMembersTx(tx, req.GroupNo,
 					[]MemberAdmission{{
 						UID:     member.EmployeeUid,
 						Version: memberVersion,
 						Role:    MemberRoleCommon,
-					}}, AdmissionEntryOrgCreate)
+					}})
 				if err != nil {
 					g.Error("添加群成员错误")
 					tx.Rollback()
@@ -514,19 +511,8 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 
 	// 添加或修改群成员
 	for groupNo, members := range list {
-		// 群的 Space / 项目归属，供准入闸门使用。用会话读而不是事务读是安全的：
-		// I3 让 project_id 在建群后不可变，唯一的写是 detach（把它清空），所以一次
-		// 读旧可能得到「其实已经 detach 了的项目 ID」，闸门于是多跑一次并可能拒绝
-		// ——失败方向是保守的。反过来（该有项目却读到空）不可能发生。
-		var groupSpaceID, groupProjectID string
-		if gm, qErr := g.db.QueryWithGroupNo(groupNo); qErr != nil {
-			g.Error("查询群信息失败！", zap.Error(qErr), zap.String("groupNo", groupNo))
-			tx.Rollback()
-			commit(qErr)
-			return
-		} else if gm != nil {
-			groupSpaceID, groupProjectID = gm.SpaceID, gm.ProjectID
-		}
+		// Organization-directory admission follows native group membership
+		// rules; Project attribution is not an admission prerequisite.
 		for _, member := range members {
 			version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
 			if err != nil {
@@ -536,16 +522,13 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 				return
 			}
 			if member.Action == "add" {
-				// 收口到唯一准入口（A8）。这条路径原先自己查 ExistMemberDelete
-				// 再分支，现在由 upsert 内部决定插入还是恢复。
-				//
-				err = g.db.admitOrRestoreMembersTx(tx, groupNo, groupSpaceID, groupProjectID,
+				err = g.db.admitOrRestoreMembersTx(tx, groupNo,
 					[]MemberAdmission{{
 						UID:       member.EmployeeUid,
 						Version:   version,
 						Role:      MemberRoleCommon,
 						InviteUID: member.Operator,
-					}}, AdmissionEntryOrgEmployeeUpdate)
+					}})
 				if err != nil {
 					g.Error("添加群成员失败！", zap.Error(err))
 					tx.Rollback()

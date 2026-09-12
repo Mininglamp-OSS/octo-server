@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: sidebar-project-sections"
-description: Make the 关注 tab's top-level list one user-orderable sequence mixing manual categories and Projects as peers, with Project entries auto-provisioned on create, admit, or pin and removed on explicit unpin; every Sidebar-facing project_id ships its paired project_name; and Project groups remain mutually exclusive with manual categorization.
+description: Make the 关注 tab's top-level list one user-orderable sequence mixing manual categories and actively joined Projects as peers, with Project entries provisioned on create or admit and removed on explicit unpin; every Sidebar-facing project_id ships its paired project_name; Project groups remain relation metadata, mutually exclusive with manual categorization, and never grant native chat access.
 tags: ["space", "isolation", "acl", "wire-contract", "error-response", "i18n", "rate-limit", "testing", "commit", "migration"]
 timestamp: 2026-09-09T00:00:00Z
 # --- octospec extension fields ---
@@ -15,37 +15,42 @@ source: self
 > One task = one `.octospec/tasks/<slug>/` directory. This brief is the spec for
 > the work. AI may draft it from existing code; a human confirms it.
 >
-> **Status: IMPLEMENTED.** D1-D5 and the additive `project_name` contract are
-> implemented on `feat/sidebar-project-sections`. D6 remains deferred pending
-> Q2; D7 remains an unchanged client-side concern.
-> Client integration contract: [`docs/sidebar-project-sections-api.md`](../../../docs/sidebar-project-sections-api.md).
+> **Status: SERVER IMPLEMENTED; CLIENT CUTOVER PENDING.** D1-D5 and the additive
+> `project_name` contract are implemented in the server working tree. Project
+> visibility is membership-only: Space-listed pinning without a Project seat does
+> not create or restore a Sidebar entry. D6 remains deferred pending Q2; D7 remains
+> a client-side ordering concern; native group membership synchronization is outside
+> this Sidebar task and is not changed by its relation projection.
+> Client integration contract: [`docs/sidebar-project-sections-api.md`](../../../docs/sidebar-project-sections-api.md);
+> the coordinated client deployment is not claimed here.
 >
 > | | |
 > |---|---|
-> | **Confirmed** (requester, 2026-09-09) | The prototype mapping (Background §1); Project-group ↔ manual-category **mutual exclusion** (D3); category stays a per-user private view, never shared/admin-managed; Project creation, admission, and #861 pin each add the Project to the caller's 关注; explicit unpin removes it even while the caller remains a Project member; every Sidebar-facing `project_id` in this task is paired with `project_name` |
-> | **Implemented in this task** | D1 (new ordering table), D2 (reuse the shipped project-groups query), D3 (mutual exclusion), D4 (auto-provision on create+admit+pin and hide on unpin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
-> | **Deferred / unchanged** | D6 (`SidebarItem.ProjectID *string`) remains gated on Q2; D7 (全员群 pinning) remains a client concern |
-> | **Open** | Q2–Q4 |
+> | **Confirmed** (requester, 2026-09-11) | The prototype mapping (Background §1); Project-group ↔ manual-category **mutual exclusion** (D3); category stays a per-user private view, never shared/admin-managed; Project creation and admission add the Project to the caller's 关注; only an active Project member may pin; explicit unpin removes it even while the caller remains a Project member; every Sidebar-facing `project_id` in this task is paired with `project_name`; relation metadata never grants native chat permissions |
+> | **Implemented in this task** | D1 (new ordering table), D2 (reuse the final Project-group relation projection with SQL per-Project cap), D3 (mutual exclusion), D4 (auto-provision on create+admit and hide on unpin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
+> | **Deferred / unchanged** | D6 (`SidebarItem.ProjectID *string`) remains gated on Q2; D7 (全员群首位) remains a client concern; native group membership synchronization is outside this Sidebar task; ordinary Project-created and associated groups retain their existing independent semantics |
+> | **Open** | Q2–Q4 and coordinated client rollout |
 >
 > Line references measured at `98d2092` unless marked otherwise.
-
 ## Goal
 
 The 关注 (Follow) tab's top-level list becomes **one user-orderable sequence
 whose entries are of two kinds**: the caller's manually-created categories,
-and eligible Projects. Both are draggable against each other in one order. An
-eligible Project is one the caller actively belongs to, or a Space-listed
-Project they explicitly pinned under #861; only its group contents are
-determined by the caller's Project membership — automatic, never user-curated
-— and a group that belongs to a Project can never also be filed into one of the
-caller's own categories.
-Creating or joining a Project auto-adds its entry to the caller's list, the
-way a default category is auto-provisioned today. A successful #861 pin does
-the same: a Space member may pin a Space-listed Project without receiving a
-Project seat, and sees an entry with an empty `groups` list. Pinning never
-grants Project or group membership. Explicitly unpinning is a durable personal
-opt-out: it removes the Project from 关注 even if the caller still has an active
-Project seat, and a later pin restores the retained ordering entry.
+and Projects in which the caller has an active membership seat. Both are draggable
+against each other in one order. An eligible Project's group contents are the
+Project's live associated groups, regardless of whether the caller has a native
+`group_member` seat, including non-native or blacklisted native relations; these
+groups are metadata only and do not grant chat or subarea access. A group that
+belongs to a Project can never also be filed into one of the caller's own categories.
+
+Creating or joining a Project auto-adds its entry to the caller's list, the way a
+default category is auto-provisioned today. Only an active Project member may use
+#861 pinning to add or restore the entry. A Space member without a Project seat
+cannot make a Space-listed Project visible by pinning, and a historical non-member
+pin is ignored by the read backstop. Pinning never grants Project or group membership.
+Explicitly unpinning is a durable personal opt-out: it removes the Project from
+关注 even if the caller still has an active Project seat, and a later pin restores
+the retained ordering entry.
 
 ## Background
 
@@ -92,9 +97,10 @@ Confirmed against the 2026-09-09 prototype screenshot by the requester:
   = 直属 Space, never `NULL`. Index `group_space_project (space_id, project_id)`
   at `:78`.
 - `GET /v1/projects/:project_id/groups` (`project-p2-product-surfaces` D1-D3,
-  `modules/project/api_group.go:41`) already answers "which groups in this
-  Project am I in": membership-scoped, disbanded-excluded, blacklist-aware,
-  narrow field set.
+  `modules/project/api_group.go:41`) answers which live groups are associated
+  with this Project: Project-relation-scoped, disbanded-excluded, pinned-first,
+  and independent of the caller's native `group_member` seat. Its narrow
+  `ProjectGroupRelation` field set is the shared Sidebar contract.
 - `POST /v1/sidebar/sync` (`modules/message/api_sidebar.go:189-196`, `tab` ∈
   {`follow`,`recent`}) is the endpoint behind the screenshot. Its `SidebarItem`
   (`:107-152`) carries `CategoryID *string` and `ProjectID string` as two
@@ -119,9 +125,10 @@ what makes it a peer and not a filter.
   「Project is explicitly not a read boundary — Space remains the only
   security boundary」. The unified list is gated by the same
   `spacepkg.CheckMembership` `category.list` already performs
-  (`modules/category/api.go:133-142`); a Project entry's *contents* inherit
-  `listMyProjectGroups`'s own predicate, which the shipped code documents as
-  「the predicate IS the gate」 (`modules/project/db_group.go:96-104`).
+  (`modules/category/api.go:133-142`); a Project entry's *contents* use the
+  Project-owned relation-only batch reader. It requires an active Project seat
+  (and active account/Space), but does not require native `group_member`
+  membership for each related group.
   Nothing here turns Project into a read boundary.
 - **`migration` — the ordering table is authoritative for BOTH entry kinds.**
   See D1. The backfill must seed a row per existing category (carrying its
@@ -145,15 +152,11 @@ what makes it a peer and not a filter.
     product. Independent of D1-D5, gated on Q2. Until and after that decision,
     every non-empty, Space-scoped sidebar `project_id` must carry the matching
     `project_name`; both fields are omitted on the unscoped path.
-- **`error-response` / `i18n` — the module's guard is a HARD-CODED file list,
-  verified at HEAD.** `modules/category/api_i18n_test.go:33` is literally
-  `files := []string{"api.go"}`. A new handler file in this module is **not**
-  covered automatically — the opposite of `modules/project`'s dynamic
-  `moduleSourceFiles` glob, and the same staleness `modules/group`'s guard had
-  until `project-p2-product-surfaces` PR-2 converted it to directory
-  discovery. **Recommendation: convert category's guard to dynamic discovery
-  as part of this task** rather than hand-adding one filename, because a
-  hard-coded list cannot see the *next* new file either.
+- **`error-response` / `i18n` — the module guard discovers source files.**
+  `modules/category/api_i18n_test.go:33` reads the category directory and scans every
+  production Go file for legacy response calls, so the Sidebar handler files are
+  covered without a stale hand-maintained filename list. Keep the directory
+  discovery when adding future handlers.
 - **`rate-limit`.** `SharedUIDRateLimiter` is already mounted after
   `AuthMiddleware` on both category route groups (`modules/category/api.go:40-53`);
   new routes mount the same way. Tests hitting them must reset
@@ -190,16 +193,13 @@ what makes it a peer and not a filter.
   `space → category → space` cycle; `modules/space` calls it at four sites
   (`api.go:369,861,1357`, `api_manager.go:666`) and the read path calls it
   again defensively (`modules/category/api.go:147-149`). **GH #1228 is what
-  happens when a call site is missed** — the create/join paths did not
-  provision, users got an empty list, and a backfill migration was needed. D4
-  needs the mirror hook on the Project side at `createProjectOnce`
-  (`modules/project/service.go:371`), `admitMemberTx`
-  (`modules/project/db.go:837`), and #861's successful `updateSettingHandler`
-  pin — **all three**, plus the read-path backstop. The backstop's visibility
-  predicate is active Project membership **or** a `pinned=1` setting on a
-  Space-listed Project, except that an explicit `pinned=0` row is a durable
-  personal opt-out and wins over membership. It must not turn a pin into
-  Project/group access or undo an unpin during read repair.
+  happens when a call site is missed** — the create/join paths did not provision,
+  users got an empty list, and a backfill migration was needed. D4 therefore
+  requires Project-side hooks at `createProjectOnce` (`modules/project/service.go:371`)
+  and `admitMemberTx` (`modules/project/db.go:837`). A successful #861 setting
+  update may add or restore the entry only for an active Project member; the
+  read-path backstop uses the same membership-only predicate and never treats a
+  `pinned=1` row from a non-member as an admission path.
 - **There is no third Project admission path today.** `join_mode = 0`
   self-join is unimplemented at HEAD — the column exists with no writer and no
   reader (`modules/project/db.go:48-50`). Recorded so nobody hooks a path that
@@ -248,24 +248,29 @@ matching `octo_project_user_setting`'s rule in
    rejection the *default* — a Project's `ref_id` is simply never a valid
    `category_id`.
 
-**D2 — A Project entry's group list preserves the shipped
-`listMyProjectGroups` semantics through a Project-owned batch reader. Not
-re-implemented in category, not proxied over HTTP. RECOMMENDED.**
+**D2 — A Project entry's group list reuses the final Project relation semantics
+through a Project-owned batch reader. Not re-implemented in category, not
+proxied over HTTP. RECOMMENDED.**
 
-`modules/project/db_group.go:148` already encodes four decisions this task
-would otherwise have to re-derive and could get subtly wrong: membership-scoped
-rather than project-wide (`project-p2-product-surfaces` D1), disbanded groups
-excluded, the strict active-member predicate that **hides a group which
-blacklisted the caller** (`db_group.go:120-136`, pinned by
-`TestListProjectGroupsHidesAGroupThatBlacklistedMe`), and an index-driven plan
-pinned by `TestTheProjectGroupListReachesItsRowsByAnIndex`. A second copy of
-that predicate is a copy that will drift — the exact failure mode
-`project-p2-product-surfaces` documents for `GroupResp`'s two mappers. The
-unified sidebar therefore calls `ListMyProjectGroupsByProjectIDs` once for all
-visible Projects. The Project module performs one membership-scoped group query
-and one grouped member-count query, partitions in memory, and preserves the
-same 50-row limit per Project. Sort validation uses section metadata only and
-never renders Project contents.
+`modules/project/db_group.go` owns the relation-only projection used by
+`GET /v1/projects/:project_id/groups` and the unified Sidebar. It returns the
+Project's live associated groups rather than filtering by the caller's native
+`group_member` seat, excludes disbanded groups, carries only
+`ProjectGroupRelation` fields, and preserves the endpoint's pinned-first order
+and 50-row default page. Active Space and Project membership authorize the read;
+a non-member Project receives no Sidebar entry, even if a historical pin exists.
+
+The unified Sidebar calls `ListProjectGroupRelationsByProjectIDs` once for all
+visible Projects. The Project module batches the relation read, applies a
+SQL `ROW_NUMBER()` cap per Project, and retains an in-memory defensive cap. It
+does not duplicate the endpoint's relation predicate in category, and it does
+not load native chat member counts or avatar fields. Sort validation uses section
+metadata only and never renders Project contents.
+
+The project-owned legacy native-membership reader and `modules/project.GroupResp`
+projection were removed after their production callers disappeared. Native chat
+surfaces continue to use their own `modules/group` readers; they are not a
+Sidebar compatibility source.
 
 Sub-question to settle in implementation, not a product call: **which module
 owns the unified-list handler.** `modules/category` is the natural home (it
@@ -295,27 +300,27 @@ The user-visible effect on the day this ships: a Project group someone had
 filed under a manual category moves to its Project entry. It does not vanish.
 That is the argument for doing it silently (Q3).
 
-**D4 — Auto-provision the Project entry at create, admit, and successful #861
-pin; hide it on explicit unpin; and retain a read-path backstop. CONFIRMED
-(requester, 2026-09-09).**
+**D4 — Auto-provision the Project entry at create and admit; allow active-member
+#861 pin to restore it; hide it on explicit unpin; and retain a read-path
+backstop. CONFIRMED (requester, 2026-09-11).**
 
 Without it, 「新建 Project 后要出现在分组列表」— the ask that started this task —
 does not hold. Hook points: `createProjectOnce`
-(`modules/project/service.go:371`) for the creator, `admitMemberTx`
-(`modules/project/db.go:837`) for everyone admitted afterwards, and the
-post-commit `pinned=true` branch in #861's `updateSettingHandler` for the
-caller who explicitly pins a visible Project. A pin may be by a Space member
-without a Project seat only when the Project is Space-listed; it creates the
-top-level entry but `listMyProjectGroups` still returns `[]`, so it cannot
-disclose or grant any group. Failure degrades to a warn and never rolls back
-the committed Project, membership, or pin write —
+(`modules/project/service.go:371`) for the creator and `admitMemberTx`
+(`modules/project/db.go:837`) for everyone admitted afterwards. The post-commit
+`pinned=true` branch in #861's `updateSettingHandler` may add or restore the
+entry only after the caller's active Project membership is checked. A Space
+member without a Project seat cannot create a visible entry by pinning a
+Space-listed Project. Failure degrades to a warn and never rolls back the
+committed Project, membership, or pin write —
 `modules/space/hooks.go`'s own reasoning transfers verbatim: 「生产 flow（创建/
-加入空间）绝不能因 category 初始化失败而回滚」. The read path calls the same
-ensure-function inline, as `category.list` does at `api.go:147-149`, because
-GH #1228 proved a best-effort hook can miss a site and the read is the backstop
-that keeps the list correct anyway. It repairs only an active Project member or
-a `pinned=1` setting on a Space-listed Project; an unlisted Project's stale
-non-member pin is intentionally not rendered.
+加入空间）绝不能因 category 初始化失败而回滚」.
+
+The read path calls the same ensure-function inline, as `category.list` does at
+`api.go:147-149`, because GH #1228 proved a best-effort hook can miss a site and
+the read is the backstop that keeps the list correct anyway. It repairs only
+active Project members; a historical `pinned=1` setting from a non-member is
+ignored and cannot resurrect an ordering row.
 
 An explicit `pinned=false` is also an explicit removal from 关注, including for
 an active Project member. The setting row is the durable opt-out used by both
@@ -323,8 +328,8 @@ the render predicate and the repair predicate; the ordering row is retained as
 `status=2` so unpin is not confused with departure/disband and a later pin can
 reactivate the previous position. The post-commit hide hook remains best-effort:
 if it fails, `pinned=0` still suppresses the Project on the next read. A later
-`pinned=true` reactivates the row, and the read backstop repairs a missed
-reactivation hook.
+eligible `pinned=true` reactivates the row, and the read backstop repairs a
+missed reactivation hook.
 
 **D5 — The old `GET/PUT /v1/spaces/:space_id/categories(/sort)` stay, but
 source their ordering from `octo_sidebar_section`. RECOMMENDED — and this is
@@ -375,48 +380,30 @@ must not fail the hot sidebar response, but it must never manufacture a name or
 query outside `space_id`.
 
 **D7 — 全员群's position stays a client-side concern; the backend does not
-promise it is first. RECOMMENDED.**
+promise it is first. CONFIRMED (requester, 2026-09-11).**
 
-Measured, not assumed: `sqlListMyProjectGroups` orders by `g.id ASC`, and its
-own comment (`modules/project/db_group.go:52-65`) states the consequence
-outright — the all-member group is *usually* first because #855 provisions it
-with the Project, but a group rebuilt by `ensureAllMemberGroup` after a failed
-provision, a disband, or a detach takes a fresh higher id and sorts wherever it
-lands. 「**Position is a convenience, never the contract.**」 The endpoint also
-deliberately ships **no** "is the all-member group" flag
-(`modules/project/api_group.go:36-39`): the client already holds
-`all_member_group_no` from the Project detail and compares two strings.
-
-So if the prototype requires 全员群 pinned first **always**, that guarantee does
-not exist today. Two ways to get it:
-
-- **(a) Client-side, recommended.** The client must already compare `group_no`
-  against `all_member_group_no` to label the row; pinning it first is the same
-  comparison used for sort instead of decoration. Zero backend change, and it
-  keeps `g.id ASC` — the only *total* ordering available, which OFFSET
-  pagination needs to avoid dropping and duplicating rows across pages.
-- **(b) Backend, e.g. `ORDER BY (g.group_no = ?) DESC, g.id ASC`.** Possible,
-  but it changes a shipped endpoint's contract, needs the plan guard
-  re-verified (the leading expression is not indexable), and hands every other
-  consumer a pinning rule they did not ask for.
-
-**Requires product confirmation** that (a) is acceptable — i.e. that 全员群
-being first is a UI rule, not an API guarantee. If the answer is (b), it is a
-change to a shipped endpoint and belongs in this task's scope explicitly, not
-as a side effect.
+The relation projection orders pinned rows first, then by stable group identity;
+the all-member group may therefore move after a rebuild or re-association. The
+endpoint deliberately ships no "is the all-member group" flag: the client holds
+`all_member_group_no` from the Project payload and compares two strings.
+Position is a convenience, never the contract.
+The client may compare `group_no` against `all_member_group_no` to label or place
+the all-member group. This Sidebar task does not promise backend ordering or
+native membership synchronization; the relation projection leaves ordinary
+Project-created and associated groups under their existing independent semantics.
 
 ## API surface
 
 | Endpoint | Change | Risk |
 |---|---|---|
-| `GET /v1/spaces/:space_id/sidebar-sections` *(placeholder name)* | **New** — unified ordered list, both entry kinds; each Project object pairs `project_id` with `project_name` | low, additive |
+| `GET /v1/spaces/:space_id/sidebar-sections` *(placeholder name)* | **New** — unified ordered list, both entry kinds; only active Project members see Project entries; each Project object pairs `project_id` with `project_name` and relation-only `groups[]` | low, additive |
 | `PUT /v1/spaces/:space_id/sidebar-sections/sort` | **New** — accepts typed items `[{type,id}]`, not the old bare `category_ids[]` | low, additive |
 | `GET /v1/spaces/:space_id/categories` | Ordering source moves to the new table; response shape unchanged (D5) | **medium** — shipped, in use |
 | `PUT /v1/spaces/:space_id/categories/sort` | Write target moves to the new table (D5) | **medium** — authority handover, ordering can scramble if done wrong |
 | `PUT /v1/groups/:group_no/category` | New rejection branch for Project groups (D3) | low — previously-legal request now errors; needs release-note mention |
-| `GET /v1/projects/:project_id/groups` | **Reused unchanged** (D2). Only D7(b), if chosen, would alter it | none as recommended |
+| `GET /v1/projects/:project_id/groups` | **Reused relation projection** (D2) — active Project members receive pinned-first `groups[]`, at most 50 rows per Project; no native member fields or chat permission | low, additive |
 | `POST /v1/sidebar/sync` | `SidebarItem.ProjectID` → `*string` (D6); add paired `project_name` only for a non-empty, Space-scoped Project ID | **high** for D6, gated on Q2; `project_name` is additive and fails soft |
-| *(internal, no HTTP surface)* `createProjectOnce`, `admitMemberTx`, #861 `updateSettingHandler` | Provision on create/admit/pin; retain-and-hide on unpin (D4) | low — pin remains personal preference, not membership |
+| *(internal, no HTTP surface)* `createProjectOnce`, `admitMemberTx`, #861 `updateSettingHandler` | Provision on create/admit; active-member pin may restore; retain-and-hide on unpin (D4) | low — pin remains personal preference, not membership |
 
 ## Open questions
 
@@ -472,11 +459,12 @@ golangci-lint run ./...
   Projects with 3 categories gets 5 entries, correctly typed.
 - Every Project entry carries both `project_id` and the current `project_name`.
 - `TestSidebarSectionProjectContentMatchesProjectGroupsEndpoint` — a Project
-  entry's groups are identical to `GET /v1/projects/:project_id/groups` for the
-  same caller (pins D2's "same query, not a second copy").
-- `TestListMyProjectGroupResponsesByProjectIDsUsesTwoQueries` — multiple
-  Projects cost one group query plus one member-count query, with the per-Project
-  response cap applied before counts are loaded.
+  entry's relation groups are identical to `GET /v1/projects/:project_id/groups`
+  for the same caller, including a related group outside the caller's native
+  roster (pins D2's Project-wide relation semantics).
+- `TestTheBatchProjectGroupListReachesItsRowsByAnIndex` — the batched relation
+  query keeps one group read, applies a SQL per-Project row bound, and preserves
+  the relation projection's explainable group/setting indexes.
 - `TestSidebarSortValidationDoesNotRenderProjectContents` — sorting validates
   only visible section metadata and cannot invoke the full Project-group render.
 - `TestSidebarSectionsOrderInterleavesTypesAndOldCategoriesKeepRelativeOrder`
@@ -503,12 +491,9 @@ golangci-lint run ./...
 
 - `TestProjectCreateProvisionsSidebarSection` and
   `TestProjectAdmitProvisionsSidebarSection` — both hook points, separately.
-- `TestPinningSpaceListedProjectProvisionsSidebarSection` — a Space member with
-  no Project seat pins a Space-listed Project through #861 and receives its
-  personal section; this does not add a Project-member row.
-- `TestPinnedSpaceListedProjectBackfillsAndRendersSidebarSection` — if the pin
-  hook misses, the read backstop materializes the Project entry with paired
-  `project_id` / `project_name` and an empty `groups` array.
+- `TestPinnedSpaceListedProjectIsNotVisibleWithoutMembership` — a Space member
+  with no Project seat and a historical `pinned=1` row does not receive a
+  Sidebar entry, and the read backstop does not materialize one.
 - `TestSidebarSectionsListsJoinedProjectsAndOwnCategories` — the read-path
   backstop covers members whose hook did not run.
 - `TestUnpinningProjectRemovesItFromFollowAndRepinningRestoresIt` — an explicit
@@ -539,7 +524,6 @@ golangci-lint run ./...
 
 **Guard hygiene**
 
-- `TestCategoryNoLegacyResponseError` covers every new file in the module —
-  which, given `api_i18n_test.go:33` is a hard-coded `[]string{"api.go"}`,
-  means either converting it to directory discovery (recommended) or extending
-  the list by hand and accepting the same staleness for the next file.
+- `TestCategoryNoLegacyResponseError` scans every production Go file in the module
+  for legacy response calls, so new Sidebar handlers are covered automatically;
+  retain directory discovery when adding future handlers.

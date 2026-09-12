@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -83,10 +82,10 @@ type i4MissingRow struct {
 //     leaves the project and nobody left can inherit it, and it does not clear
 //     the project's pointer, because modules/group must not write octo_project.
 //
-// One gauge for three states because the operator action is the same in all
-// three: this project has no all-member group and the next write path on it
-// should rebuild one. The log line names which, so the on-call reader can tell a
-// provisioning outage from a cascade side effect.
+// One gauge for three states because the operational response is the same:
+// repair or re-run provisioning for this project. The log line names which
+// state was observed, so the on-call reader can tell a provisioning outage from
+// a cascade side effect.
 func (p *Project) scanMissingAllMemberGroups() {
 	start := time.Now()
 	defer func() {
@@ -148,10 +147,10 @@ func (p *Project) scanMissingAllMemberGroups() {
 // with a `group` lookup per row, every tick, forever. The cost is highest exactly
 // when there is nothing to report.
 //
-// Flag-over-base-page is the shape P0 and P1 use for the same reason, and
-// TestReconcileP2QueriesAreBounded now applies P1's guard to this file so a
-// future scan cannot regress to a filtering WHERE.
-//
+// Flag-over-base-page is the shape P0 and P1 use for the same reason. Keep the
+// computed flag in the SELECT list so LIMIT bounds the active base rows even
+// when every project is healthy; filtering violations in WHERE would scan past
+// the page boundary.
 // `p.status` stays in the WHERE deliberately: it selects the BASE population
 // (active projects are what the invariant is about), and a disbanded project is
 // not a violation to be flagged but a row that is out of scope.
@@ -166,25 +165,16 @@ func (p *Project) scanMissingAllMemberGroups() {
 //
 // # The LEFT JOIN's plan, stated accurately
 //
-// An earlier version of this comment said the join is "a point lookup per examined
-// row against group_groupNo, so the work per row is one index dive, not a scan".
-// That holds in CI and NOT in production, and the difference is this file's own
-// COLLATE rule: an explicit COLLATE has coercibility 0, so the comparison is
-// general_ci and `group`.group_no — 0900_ai_ci in production — must be converted
-// per row, which its UNIQUE index cannot serve. Measured on MySQL 8.0.46 with
-// `group` at 0900_ai_ci: `g ALL key=NULL rows=<all groups>`, plus `Using temporary`
-// on the driving side, which also defeats the ORDER BY / LIMIT paging this scan
-// depends on. CI creates its database with general_ci on both sides, so every plan
-// there is eq_ref and the suite cannot see it.
+// The explicit COLLATE has coercibility 0, so the comparison is general_ci and
+// `group`.group_no — 0900_ai_ci in production — must be converted per row,
+// which its UNIQUE index cannot serve. A production plan can therefore show a
+// full scan of `group` plus a temporary table, defeating the ORDER BY / LIMIT
+// paging this scan depends on. CI uses general_ci on both sides, so it reports
+// an eq_ref plan instead.
 //
-// Not fixed by moving the COLLATE to the `group` side: that is correct only until
-// the legacy-collation conversion lands and then silently wrong in the mirror
-// direction. The two user-facing predicates (pkg/project.IsAllMemberGroup and
-// queryAllMemberGroupNo) were split into single-table reads instead, which needs no
-// collation opinion at all — but a paged scan cannot be split that way. So this one
-// inherits P0/P1's pending conversion, and open_verification carries the EXPLAIN
-// item. Bounded meanwhile by ReconcileLimit and a 5-minute interval. PR #855's
-// fifth review measured it.
+// The scan remains bounded by ReconcileLimit and reconcileMaxPages, and the
+// ReconcileEnabled gate keeps the measured production cost explicit until the
+// collation conversion is complete.
 func (p *Project) queryMissingAllMemberGroupPage(cursor int64, limit int) ([]*i4MissingRow, error) {
 	var rows []*i4MissingRow
 	_, err := p.db.session.SelectBySql(
@@ -251,6 +241,9 @@ type i4GapRow struct {
 //     the design.
 //  4. a project in a BANNED Space (space.status = 2), which P1's I2 scan exempts
 //     for the mirror reason.
+//  5. a retained Project seat whose Space membership is inactive. Space
+//     revocation removes access while preserving the Owner identity for a later
+//     restoration, so this seat is not an active-access gap until it returns.
 //
 // Exemption 4 was left out of the first version on the argument that no NEW gap
 // can open during a ban — lockSpaceSeatsTx joins `space` on status = 1, so every
@@ -262,7 +255,7 @@ type i4GapRow struct {
 // would publish violations with no available remedy for the whole duration of a
 // ban, which is precisely the condition the exemption exists to suppress.
 //
-//  5. a project whose pointer names a group that is gone, disbanded, or detached
+//  6. a project whose pointer names a group that is gone, disbanded, or detached
 //     to another project. Scan A reports that project as ONE row; counting it
 //     here too would double-report one problem in two gauges and make both move
 //     together for one cause — inflated by project size, since scan B counts
@@ -281,11 +274,11 @@ func (p *Project) scanAllMemberGroupGaps() {
 		reconcileDuration.WithLabelValues("i4_gap").Observe(time.Since(start).Seconds())
 	}()
 
-	cursorProject, cursorUID, total := cursors.i4GapResume()
+	cursorProjectID, cursorUID, total := cursors.i4GapResume()
 	log := &logCapped{p: p, scan: "i4_gap"}
 	completed := false
-	for page := 0; page < reconcileMaxPages; page++ {
-		rows, err := p.queryAllMemberGroupGapPage(cursorProject, cursorUID, p.cfg.ReconcileLimit)
+	for range reconcileMaxPages {
+		rows, err := p.queryAllMemberGroupGapPage(cursorProjectID, cursorUID, p.cfg.ReconcileLimit)
 		if err != nil {
 			noteScanFailure("i4_gap")
 			p.Warn("对账 I4-B 扫描失败", zap.Error(err))
@@ -307,7 +300,7 @@ func (p *Project) scanAllMemberGroupGaps() {
 			total++
 		}
 		last := rows[len(rows)-1]
-		cursorProject, cursorUID = last.ID, last.UID
+		cursorProjectID, cursorUID = last.ID, last.UID
 		if len(rows) < p.cfg.ReconcileLimit {
 			completed = true
 			break
@@ -316,7 +309,7 @@ func (p *Project) scanAllMemberGroupGaps() {
 	if completed {
 		allMemberGroupMemberGaps.Set(float64(total))
 	}
-	cursors.i4GapSave(cursorProject, cursorUID, total, completed)
+	cursors.i4GapSave(cursorProjectID, cursorUID, total, completed)
 }
 
 // queryAllMemberGroupGapPage returns one bounded page of (project, active member)
@@ -353,7 +346,7 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			// wrong exemption AND the wrong number for the line it sits on: the ban
 			// is exemption 4, and its own line is below. PR #855's tenth review.
 			"  (gm.uid IS NULL AND pm.updated_at < ? "+
-			// exemption 5: the pointed-at group is not usable. Scan A already
+			// exemption 6: the pointed-at group is not usable. Scan A already
 			// reports that project as ONE row; without this, once the disband
 			// event asynchronously clears group_member, scan B flags EVERY member
 			// of it — the same problem double-reported in two gauges, inflated by
@@ -369,12 +362,17 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			// binary whose migration set lacks modules/space gets a stub table, and
 			// the LEFT JOIN itself yields NULL for a project whose Space row is gone.
 			"   AND (sp.status IS NULL OR sp.status <> 2) "+
+			// exemption 5: an inactive Space seat. Space revocation retains the
+			// Project Owner identity for restoration but removes active access, so
+			// the retained row is outside scan B until its Space seat returns.
+			// This is a base-population qualification, not a flag exemption: the
+			// composite cursor must advance only through active-access seats.
 			// exemption 2: whitelisted system bots. In the flag rather than the
-			// WHERE like the other three. The list is tiny and the effect is the
-			// same either way, so this is consistency rather than a measured cost:
+			// WHERE like the other exemptions. The list is tiny and the effect is
+			// the same either way, so this is consistency rather than a measured cost:
 			// the comment above states that exemptions are flags over the base
 			// page, and one of them sitting in the WHERE is how a rule stops being
-			// read as a rule. PR #855s second review noticed the contradiction.
+			// read as a rule. PR #855's second review noticed the contradiction.
 			"   AND pm.uid NOT IN ?) AS violating "+
 			"FROM `octo_project` p "+
 			"INNER JOIN `octo_project_member` pm "+
@@ -382,6 +380,13 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 			// adding one between two same-collation columns makes the predicate
 			// non-sargable and gives up the PRIMARY KEY on octo_project_member.
 			"  ON pm.project_id = p.project_id AND pm.status = ? AND pm.removing = 0 "+
+			// The active Space seat is required for a Project member to be an
+			// actionable I4-B population row. The retained Owner row remains in
+			// octo_project_member while revoked and is handled by restoration.
+			"INNER JOIN `space_member` sm "+
+			"  ON sm.space_id = p.space_id COLLATE utf8mb4_general_ci "+
+			"  AND sm.uid = pm.uid COLLATE utf8mb4_general_ci "+
+			"  AND sm.status = 1 "+
 			// Crosses into the legacy schema, so it carries COLLATE on the
 			// general_ci side's values.
 			"LEFT JOIN `group_member` gm "+
@@ -409,7 +414,7 @@ func (p *Project) queryAllMemberGroupGapPage(cursorProjectID int64, cursorUID st
 	return rows, nil
 }
 
-// admitGrace is how long a freshly written project seat is exempt from scan B.
+// admitGrace is how long a freshly written Project seat is exempt from scan B.
 //
 // The admitter runs after the seat transaction commits and makes its own
 // transaction plus a blocking IM call (D12), so the seat legitimately exists
@@ -434,22 +439,17 @@ func (p *Project) admitGrace() time.Duration {
 	return defaultAllMemberGroupAdmitGrace
 }
 
-// groupStatusDisband is modules/group.GroupStatusDisband, reached through
-// pkg/project rather than restated here.
-//
-// modules/project must never import modules/group (pkg/project/import_guard_test.go
-// pins it at zero), and this scan reads the `group` table directly — which it may,
-// exactly as modules/space does, because reading a column is not a module
-// dependency. What it must not do is keep its own copy of the number: this file
-// and pkg/project both compare against it, and two literals for one fact is the
-// shape this change has already paid for twice.
-const groupStatusDisband = projectpkg.GroupStatusDisband
+// systemBotUIDsForScan keeps the scan's exemption list sourced from the shared
+// Space package, rather than maintaining a second list that could drift.
+func systemBotUIDsForScan() []string {
+	uids := spacepkg.SystemBotList()
+	if len(uids) == 0 {
+		// IN () is invalid SQL; this sentinel cannot match a real UID.
+		return []string{"\x00-no-system-bot"}
+	}
+	return uids
+}
 
-// systemBotExemptForScan reports whether uid is exempt from I4 for the same
-// reason it is exempt from I2: the platform adds these accounts to groups itself
-// and they hold no project seat.
-//
-// Unused by the SQL above (which filters with systemBotUIDsForScan) and kept for
-// the Go-side assertions in the scan tests, so the two cannot disagree about who
-// is exempt.
-func systemBotExemptForScan(uid string) bool { return spacepkg.IsSystemBot(uid) }
+// groupStatusDisband mirrors modules/group.GroupStatusDisband. Project keeps the
+// literal locally because importing modules/group would create a dependency cycle.
+const groupStatusDisband = 2

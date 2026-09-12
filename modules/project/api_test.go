@@ -359,34 +359,20 @@ func TestJoinAcrossSpaceMemberAndUserHasNoCollationError(t *testing.T) {
 	require.NoError(t, err, "collation mismatch across the reconcile JOIN (MySQL 1267)")
 }
 
-// TestGeneratedActiveNameFreesTheNameOnDisband covers D4 end to end, through the real
-// DAO: create -> disband -> recreate the same name succeeds, and a duplicate ACTIVE
-// name is rejected with the registered code. It also proves no statement names the
-// generated column (that would be MySQL 3105).
-func TestGeneratedActiveNameFreesTheNameOnDisband(t *testing.T) {
+// TestProjectNamesMayRepeatWithinASpace verifies names are labels rather than
+// identity keys; both active and disbanded rows may share one name.
+func TestProjectNamesMayRepeatWithinASpace(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
 	token := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 
 	first := createProjectVia(t, srv, spaceA, token, "Q3 delivery")
-
-	// A duplicate ACTIVE name is rejected.
-	w := doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
-		map[string]any{"name": "Q3 delivery"})
-	assertProjectErrorCode(t, w, "err.server.project.name_duplicated")
-
-	// Disband, then the name is free again.
-	w = doJSON(t, srv, http.MethodDelete, "/v1/projects/"+first.ProjectID, token, nil)
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-
 	second := createProjectVia(t, srv, spaceA, token, "Q3 delivery")
 	assert.NotEqual(t, first.ProjectID, second.ProjectID)
 
-	// And a second disbanded row with the same name coexists with the first: repeated
-	// NULLs do not collide in a unique index.
-	w = doJSON(t, srv, http.MethodDelete, "/v1/projects/"+second.ProjectID, token, nil)
-	require.Equal(t, http.StatusOK, w.Code)
+	w := doJSON(t, srv, http.MethodDelete, "/v1/projects/"+first.ProjectID, token, nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	third := createProjectVia(t, srv, spaceA, token, "Q3 delivery")
 	assert.NotEqual(t, second.ProjectID, third.ProjectID)
 }
@@ -421,7 +407,7 @@ func TestIsOfficialStaysZeroThroughCRUD(t *testing.T) {
 	doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
 		map[string]any{"name": "p2"})
 	doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", token,
-		map[string]any{"uids": []string{"member1"}})
+		addMembersPayload("member1"))
 	doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID+"/members/member1/role", token,
 		map[string]any{"role": RoleAdmin})
 	doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave", other, nil)
@@ -489,8 +475,8 @@ func TestMigrationUpDownUpLeavesNoResidue(t *testing.T) {
 
 	assertApplied := func(stage string) {
 		assert.Equal(t, 4, tableCount(), "%s: project and collaboration-role tables must exist", stage)
-		assert.Equal(t, 1, generatedColumns(), "%s: active_name must be a generated column", stage)
-		assert.Greater(t, indexOverGenerated(), 0, "%s: the unique index over active_name must exist", stage)
+		assert.Equal(t, 1, generatedColumns(), "%s: active_name storage column must remain for legacy rows", stage)
+		assert.Equal(t, 0, indexOverGenerated(), "%s: active-name uniqueness must be removed", stage)
 		assert.Equal(t, 1, collaborationEpochColumns(), "%s: collaboration_role_epoch must exist", stage)
 	}
 	assertGone := func(stage string) {
@@ -554,6 +540,9 @@ var projectMigrationFiles = []string{
 	"sql/20260907000002_project_all_member_group.sql",
 	"sql/20260908000001_project_user_setting.sql",
 	"sql/20260909000001_project_collaboration_role.sql",
+	"sql/20260910000001_project_read_default.sql",
+	"sql/20260911000001_project_group_user_setting.sql",
+	"sql/20260911000002_project_member_joined_at.sql",
 }
 
 // applyProjectMigration executes one section of every migration file this module
@@ -658,7 +647,8 @@ func TestRoutesRejectWithoutSpaceHeaderOrQuery(t *testing.T) {
 		{http.MethodPut, "/v1/projects/" + created.ProjectID, map[string]any{"name": "x"}},
 		{http.MethodDelete, "/v1/projects/" + created.ProjectID, nil},
 		{http.MethodGet, "/v1/projects/" + created.ProjectID + "/members", nil},
-		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/members/add", map[string]any{"uids": []string{"x"}}},
+		{http.MethodGet, "/v1/projects/" + created.ProjectID + "/members/x", nil},
+		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/members/add", addMembersPayload("x")},
 		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/members/remove", map[string]any{"uids": []string{"x"}}},
 		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/leave", nil},
 		{http.MethodPut, "/v1/projects/" + created.ProjectID + "/members/x/role", map[string]any{"role": 0}},
@@ -687,10 +677,9 @@ func TestRoutesRejectWithoutSpaceHeaderOrQuery(t *testing.T) {
 	}
 }
 
-// TestUnlistedProjectIsIndistinguishableFromNonexistent pins the anti-enumeration
-// contract: a non-member must not be able to tell an unlisted project apart from one
-// that never existed, while members and Space admins get the real payload.
-func TestUnlistedProjectIsIndistinguishableFromNonexistent(t *testing.T) {
+// TestUnlistedProjectRequiresMembership pins the Project-member read boundary:
+// discoverability never bypasses active Project membership.
+func TestUnlistedProjectRequiresMembership(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
@@ -707,19 +696,13 @@ func TestUnlistedProjectIsIndistinguishableFromNonexistent(t *testing.T) {
 
 	unlisted := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, strangerTok, nil)
 	nonexistent := doJSON(t, srv, http.MethodGet, "/v1/projects/"+util.GenerUUID(), strangerTok, nil)
-
-	assert.Equal(t, nonexistent.Code, unlisted.Code)
-	assert.JSONEq(t, nonexistent.Body.String(), unlisted.Body.String(),
-		"an unlisted project must be byte-identical to a nonexistent one for a non-member")
+	assert.JSONEq(t, nonexistent.Body.String(), unlisted.Body.String())
 	assertProjectErrorCode(t, unlisted, "err.server.project.not_found")
 
-	// A member sees it.
 	member := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, ownerTok, nil)
 	require.Equal(t, http.StatusOK, member.Code, "body: %s", member.Body.String())
-	// And so does a Space admin who never joined.
 	admin := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, adminTok, nil)
-	require.Equal(t, http.StatusOK, admin.Code, "body: %s", admin.Body.String())
-	assert.Equal(t, roleNonMember, decodeResp(t, admin).MyRole)
+	assertProjectErrorCode(t, admin, "err.server.project.not_found")
 }
 
 // TestCrossSpaceProjectLooksNonexistent covers the second anti-enumeration case: a
@@ -767,7 +750,7 @@ func TestCreateDisabledFreezesWritesButNotReads(t *testing.T) {
 		{http.MethodPost, "/v1/space/" + spaceA + "/projects", map[string]any{"name": "n"}},
 		{http.MethodPut, "/v1/projects/" + created.ProjectID, map[string]any{"name": "n"}},
 		{http.MethodDelete, "/v1/projects/" + created.ProjectID, nil},
-		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/members/add", map[string]any{"uids": []string{"member1"}}},
+		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/members/add", addMembersPayload("member1")},
 		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/members/remove", map[string]any{"uids": []string{"member1"}}},
 		{http.MethodPost, "/v1/projects/" + created.ProjectID + "/leave", nil},
 		{http.MethodPut, "/v1/projects/" + created.ProjectID + "/members/member1/role", map[string]any{"role": 0}},
@@ -873,14 +856,13 @@ func TestQuotasRejectAtTheirBoundary(t *testing.T) {
 		created := decodeResp(t, w)
 
 		w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", token,
-			map[string]any{"uids": []string{"m1", "m2"}})
-		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-		var outcomes []memberOutcome
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
-		require.Len(t, outcomes, 2)
-		assert.True(t, outcomes[0].OK)
-		assert.False(t, outcomes[1].OK)
-		assert.Equal(t, reasonQuotaMembers, outcomes[1].Reason)
+			addMembersPayload("m1", "m2"))
+		assertProjectErrorCode(t, w, "err.server.project.quota_members")
+		for _, uid := range []string{"m1", "m2"} {
+			member, err := testDB.queryMember(created.ProjectID, uid)
+			require.NoError(t, err)
+			assert.Nil(t, member, "atomic quota rejection must not admit %s", uid)
+		}
 	})
 }
 
@@ -898,7 +880,7 @@ func TestMemberBatchIsStructurallyBounded(t *testing.T) {
 	created := decodeResp(t, w)
 
 	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", token,
-		map[string]any{"uids": []string{"a", "b", "c", "d"}})
+		addMembersPayload("a", "b", "c", "d"))
 	assertProjectErrorCode(t, w, "err.server.project.batch_too_large")
 	env := decodeProjectEnvelope(t, w.Body.Bytes())
 	assert.Equal(t, float64(3), env.Error.Details["max"])
@@ -921,6 +903,9 @@ func TestValidationRejectsOversizeFields(t *testing.T) {
 	w := doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 		map[string]any{"name": ""})
 	assertProjectErrorCode(t, w, "err.server.project.name_invalid")
+	w = doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
+		map[string]any{"name": long(maxNameChars)})
+	require.Equal(t, http.StatusOK, w.Code, "exact Unicode name limit must be accepted")
 
 	w = doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 		map[string]any{"name": long(maxNameChars + 1)})

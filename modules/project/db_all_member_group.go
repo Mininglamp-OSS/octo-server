@@ -7,23 +7,15 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-// 全员群那一列的读写原语（D4 / D5）。
+// 全员群的建群事务提交后读写原语（初始 provisioning）。
 //
-// # 为什么是租约而不是行锁
+// 建群钩子在项目事务提交之后运行：它要在 modules/group 的表上开自己的事务，还要在
+// 提交后调用 WuKongIM 建频道。把这些放进项目事务会跨模块持有项目锁，并把网络调用
+// 关进锁里。
 //
-// 建全员群这件事必须发生在**项目事务提交之后**：钩子要在 modules/group 的表上开
-// 自己的事务，还要在提交后调 WuKongIM 建频道，把项目行的排他锁跨到这些上面会让
-// 建项目与该项目的每一次群写入互相串行，而且会把一个网络调用关进行锁。
-//
-// 代价是项目行锁**用不上**了：两个并发的写路径（建项目本身、随后的任何一次加成员）
-// 都可能发现 all_member_group_no 为空、都去补建，各自建出一个群。这一对操作跨越了
-// 事务边界，所以互斥必须由数据本身承担。
-//
-// 于是用一次 CAS 认领：谁把 lease_until 从"空或已过期"改成"现在 + 租约"谁去建；
-// 影响 0 行的直接跳过。租约到期即可被下一个写路径重新认领，因此进程在建群中途被
-// 打死不会把这个项目永久钉在"没有全员群"上。这与 space_member_removal_cleanup 和
-// octo_project_member_removal_cleanup 的租约是同一个形状，只是租的是一行上的一个
-// 字段而不是一整条工单。
+// 初始建群失败不回滚 Project；lease 只防止同一个 Project 的补偿/重复触发并发创建，
+// 直到某次尝试成功写回 all_member_group_no。成员增删和角色变更不触发这里，也不改
+// 原生 group_member。
 
 const (
 	// allMemberGroupLease 一次补建认领的租约时长。
@@ -36,80 +28,6 @@ const (
 	// 正常建群长一个数量级，比一个人从"建项目失败"到"再点一次加成员"的间隔短。
 	allMemberGroupLease = 2 * time.Minute
 )
-
-// clearStaleAllMemberGroupPointer 把指向"已经不是本项目全员群"的指针清空，返回是否清了。
-//
-// # 为什么必须有这一步
-//
-// queryAllMemberGroupNo 会校验群侧（群还在、群的 project_id 还是本项目），所以
-// P1 把群 detach 成 Space 直属之后，那个查询正确地答"没有全员群"。但认领用的
-// CAS 谓词要求 all_member_group_no 为空串，而指针**并没有被清空**——modules/group
-// 不能写 octo_project。
-//
-// 于是两个谓词对同一件事给出不同答案，补建被卡死在中间：ensureAllMemberGroup 看到
-// "没有群"于是继续，claimAllMemberGroupProvision 看到"指针非空"于是永远认领不到，
-// 既不建群也不报错。之后每一个新成员的 admitAllMemberGroup 都空操作，I4 扫描 A
-// 报着一个谁也修不好的项目——正是补建存在的意义被静默取消。
-//
-// 这个缺口是上一轮修 queryAllMemberGroupNo 时引入的：那个修复让读侧变严，却没让
-// 写侧跟上。清指针把两侧重新对齐。
-//
-// 谓词与 queryAllMemberGroupNo 互为补集：只在"指针非空、但它指的群已经不合格"时
-// 才清。指针为空、或群仍然合格，都影响 0 行。
-//
-// # 三条单表语句，不是一条 JOIN UPDATE
-//
-// 上一版是 `UPDATE octo_project p LEFT JOIN group g ...`，COLLATE 写在驱动侧——
-// 与 IsAllMemberGroup 当初一样的形状，也就是同一个代价：生产里 `group` 是
-// 0900_ai_ci，显式 COLLATE 让比较落在 general_ci，group_groupNo 用不上，每调用一次
-// 就是一次 `group` 全表扫。这是本改动里最后一条留着那个形状的**写路径**语句，
-// 第六轮 review 点了名。
-//
-// 暴露面确实小：ensureAllMemberGroup 只在 queryAllMemberGroupNo 返回空之后才走到
-// 这里，健康项目根本不会调用。但有一种会**反复**踩到的状态——一个没有活跃 owner
-// 的项目在补建前就返回了，于是它的每一次 members/add 都付这次全表扫而什么都换不到。
-//
-// 拆成三步之后没有任何跨 schema 比较：读指针（走 uk_octo_project_project_id）、
-// 单表核对群行（走 group_groupNo）、按**读到的那个指针值**做栅栏的单表 UPDATE。
-// 栅栏是拆分带来的、原来没有的保障：如果这中间别人写回了一个新群号，UPDATE 影响
-// 0 行，不会把新指针误清掉。
-//
-// 原子性上的差别可以忽略：一个群从"不合格"回到"合格"是不可能的——解散是终态，
-// group.project_id 由 I3 定为不可变，detach 之后不会再指回来。
-func (d *DB) clearStaleAllMemberGroupPointer(projectID string) (bool, error) {
-	if projectID == "" {
-		return false, nil
-	}
-	var pointers []string
-	if _, err := d.session.SelectBySql(
-		sqlProjectAllMemberGroupPointer, projectID, StatusNormal,
-	).Load(&pointers); err != nil {
-		return false, fmt.Errorf("project: read pointer before stale clear: %w", err)
-	}
-	if len(pointers) == 0 || pointers[0] == "" {
-		return false, nil // 指针本来就是空的，没有陈旧可言
-	}
-	var alive []int
-	if _, err := d.session.SelectBySql(
-		sqlProjectAllMemberGroupRow, pointers[0], groupStatusDisband, projectID,
-	).Load(&alive); err != nil {
-		return false, fmt.Errorf("project: check group before stale clear: %w", err)
-	}
-	if len(alive) > 0 {
-		return false, nil // 群仍然合格，指针不陈旧
-	}
-	result, err := d.session.UpdateBySql(
-		sqlProjectClearStaleAllMemberGroup, projectID, StatusNormal, pointers[0],
-	).Exec()
-	if err != nil {
-		return false, fmt.Errorf("project: clear stale all-member group pointer: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("project: read stale pointer clear result: %w", err)
-	}
-	return affected == 1, nil
-}
 
 // claimAllMemberGroupProvisionTx 尝试认领"给这个项目建全员群"的活。
 //
@@ -207,7 +125,7 @@ func (d *DB) releaseAllMemberGroupProvision(projectID string, deadline time.Time
 //
 // 结果是项目指向 Ga —— A 那份更旧的名册快照建出来的群，窗口期内加进项目的人一个都
 // 不在里面；而带着完整名册的 Gb 留成一个普通项目群，于是这个 Space 里出现两个以项目
-// 命名的群。缺的那些人是 I4 缺口，扫描 B 过了宽限期才报，而且没有自动修复。
+// 命名的群。这里记录的是建群快照竞态；Project 关系和原生群成员是独立事实。
 //
 // 租约超时不是异常路径：allMemberGroupLease 的注释自己说，IM 建频道是"这里唯一可能
 // 慢到分钟级的部分"，2 分钟是按它的数量级取的——超出它正是租约被设计出来要处理的情况。
@@ -265,63 +183,37 @@ func (d *DB) clearAllMemberGroupNoTx(tx *dbr.Tx, projectID string) error {
 	return nil
 }
 
-// queryAllMemberGroupNo 的两条语句，提成常量，好让排序规则漂移下的执行计划守卫
-// EXPLAIN**生产真正跑的那一份**而不是一份抄件——抄件会把一条没人跑的语句的计划
-// 钉住，而那正是这套守卫要防的错误，只是低了一层。
+// queryAllMemberGroupNo's two statements, kept as constants so the rename path
+// executes the exact SQL covered by its collation guard.
 const (
 	sqlProjectAllMemberGroupPointer = "SELECT all_member_group_no FROM `octo_project` " +
 		"WHERE project_id = ? AND status = ? AND all_member_group_no <> ''"
 	sqlProjectAllMemberGroupRow = "SELECT 1 FROM `group` " +
 		"WHERE group_no = ? AND status <> ? AND project_id = ?"
-
-	// 清陈旧指针的写，按读到的指针值做栅栏。单表，无跨 schema 比较。
 	sqlProjectClearStaleAllMemberGroup = "UPDATE `octo_project` " +
 		"SET all_member_group_no = '', all_member_group_lease_until = NULL " +
 		"WHERE project_id = ? AND status = ? AND all_member_group_no = ?"
 )
 
-// queryAllMemberGroupNo 读一个活跃项目**当前仍然拥有**的全员群号。
+// queryAllMemberGroupNo reads the active Project's currently associated native
+// all-member group number. It is used only by the metadata rename hook.
 //
-// 返回 "" 表示没有：项目不存在、已解散、尚未建成，或者那个群已经不属于本项目了。
-// 四者对调用方是同一个答案——这个项目现在没有全员群可操作。
-//
-// # 为什么必须同时校验群侧
-//
-// 只读 all_member_group_no 是不够的，而且不够的方式是**静默**的。P1 的成员移除
-// 级联在群主离开项目、且项目里没人能继任时，会把群回退成 Space 直属
-// （project_id 置空），并且**不会**清掉项目这一侧的指针——modules/group 不能写
-// octo_project。I4 扫描 A 把这种状态明确记作"指向已解散或已脱离的群"。
-//
-// 若这里不校验，那之后：
-//   - 新加入项目的人会被塞进一个已经与项目无关的群（admitAllMemberGroup）；
-//   - 项目改名会去改那个群的名字（syncAllMemberGroupName）；
-//   - 群主同步会去动那个群的群主（syncAllMemberGroupOwner）。
-//
-// 三件都是对一个"别人的群"的写入。pkg/project.IsAllMemberGroup 早就是两半都查的，
-// D7 的保护因此正确；这里当初只查了一半，两个谓词对同一个问题给出不同答案。
+// A blank result means the Project is absent, disbanded, not provisioned, or the
+// native group no longer points back at this Project. The rename hook treats all
+// of those states as "nothing to rename".
 func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	if projectID == "" {
 		return "", nil
 	}
-	// 两条单表查询，不是一次连接 —— 与 pkg/project.IsAllMemberGroup 同一个理由，
-	// 那里有实测：显式 COLLATE 的 coercibility 是 0，所以比较落在 general_ci，
-	// 而生产里 0900_ai_ci 的 `group`.group_no 必须逐行转换，group_groupNo 用不上，
-	// 计划从 const 退化成全表扫。跨过 schema 的比较一旦不存在，就不需要对排序规则
-	// 有任何意见，转换落地之后也不用回来改。
-	//
-	// 这条查询在加人批次的开头、群主同步、改名同步上各跑一次，都是写路径。
 	var pointers []string
 	if _, err := d.session.SelectBySql(
-		sqlProjectAllMemberGroupPointer,
-		projectID, StatusNormal,
+		sqlProjectAllMemberGroupPointer, projectID, StatusNormal,
 	).Load(&pointers); err != nil {
 		return "", fmt.Errorf("project: query all-member group pointer: %w", err)
 	}
 	if len(pointers) == 0 || pointers[0] == "" {
 		return "", nil
 	}
-	// 群侧那一半：群还在、没解散、而且**还属于本项目**。缺了它，一个被 P1 detach
-	// 成 Space 直属的群仍会被当成全员群使用（见本函数上方的注释）。
 	var alive []int
 	if _, err := d.session.SelectBySql(
 		sqlProjectAllMemberGroupRow,
@@ -335,44 +227,62 @@ func (d *DB) queryAllMemberGroupNo(projectID string) (string, error) {
 	return pointers[0], nil
 }
 
-// queryActiveOwnerCandidatesForProvision 按资历返回项目的活跃 owner 候选（最老在前）。
-//
-// 补建全员群时用来决定"谁当群主"。不能用 octo_project.creator：那一列记的是
-// 当初是谁建的项目，**永不改变**，而这个人可能早就离开了项目或 Space。用他去建群
-// 会被准入闸门当场拒掉（他不是项目活跃成员），于是一个初次建群失败过的项目
-// **永远**补建不出来——每一次写路径都认领租约、建群失败、释放租约，循环到底。
-//
-// 选人规则与 pkg/project.PickActiveOwner 一致（资历最老），刻意同源：那个是群侧
-// 群主同步用的，两边对"谁该拥有这个群"必须给出同一个答案，否则补建刚建好，
-// 群主同步就把它改掉。
-//
-// # 为什么是候选**列表**而不是一个人
-//
-// 前一版只取 LIMIT 1，把那个 uid 直接交给 CreateGroup —— 而 CreateGroup 的第一件事
-// 就是 CheckMembership(space, creator)：项目席位不蕴含 Space 席位。资历最老的那位
-// owner 一旦成了 I1 泄漏（项目席位还活着、Space 席位没了，P0 的级联工单放弃后就是
-// 这个状态，i1_abandoned_cleanup_leak 这个指标就是为它设的），补建就会失败——而且
-// 因为这个选择是**确定性全序**，它会以完全相同的方式失败每一次，哪怕项目里还有
-// 别的 owner 本可以通过。一个只报不修的扫描 A，加上一条永远修不好的补建路径。
-//
-// 返回有序候选，由调用方按 Space 席位筛，是把"谁能当群主"这个判断交给会真正校验它
-// 的那个谓词。
-//
-// limit 由调用方按 max_members 传入，而不是一个自选的小常数。前一版写死 16，而没有
-// 任何东西把一个项目的 owner 数量限制在 16 以内——如果最资深的 16 位恰好都是 I1 泄漏
-// 而第 17 位持有席位，补建会以完全相同的方式失败每一次，也就是刚修掉的那个缺陷的
-// 窄版本。owner 是成员的子集，所以成员配额就是这里天然的、有意义的界。
+// clearStaleAllMemberGroupPointer clears a non-empty pointer whose native group
+// is gone, disbanded, or no longer attributed to this Project. The pointer value
+// is part of the UPDATE predicate so a concurrent successful provision cannot be
+// cleared by a stale repair.
+func (d *DB) clearStaleAllMemberGroupPointer(projectID string) (bool, error) {
+	if projectID == "" {
+		return false, nil
+	}
+	var pointers []string
+	if _, err := d.session.SelectBySql(
+		sqlProjectAllMemberGroupPointer, projectID, StatusNormal,
+	).Load(&pointers); err != nil {
+		return false, fmt.Errorf("project: read all-member group pointer before clear: %w", err)
+	}
+	if len(pointers) == 0 || pointers[0] == "" {
+		return false, nil
+	}
+	var alive []int
+	if _, err := d.session.SelectBySql(
+		sqlProjectAllMemberGroupRow, pointers[0], groupStatusDisband, projectID,
+	).Load(&alive); err != nil {
+		return false, fmt.Errorf("project: check all-member group before clear: %w", err)
+	}
+	if len(alive) > 0 {
+		return false, nil
+	}
+	result, err := d.session.UpdateBySql(
+		sqlProjectClearStaleAllMemberGroup, projectID, StatusNormal, pointers[0],
+	).Exec()
+	if err != nil {
+		return false, fmt.Errorf("project: clear stale all-member group pointer: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("project: read stale all-member group clear result: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// queryActiveOwnerCandidatesForProvision returns human Project-owner
+// candidates in seniority order. The caller filters against the current Space
+// roster before choosing one, because a Project seat can outlive a Space seat
+// while its removal cleanup is pending.
 func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string, limit int) ([]string, error) {
 	if projectID == "" || limit <= 0 {
 		return nil, nil
 	}
 	var uids []string
 	_, err := d.session.SelectBySql(
-		"SELECT uid FROM `octo_project_member` "+
-			"WHERE project_id = ? AND role = ? AND status = ? AND removing = 0 "+
-			// created_at 不是全序（同毫秒会并列），补 uid 让选择可测且跨副本一致。
-			"ORDER BY created_at ASC, uid ASC LIMIT ?",
-		projectID, RoleOwner, MemberStatusActive, limit,
+		"SELECT pm.uid FROM `octo_project_member` pm "+
+			"LEFT JOIN `user` u ON u.uid = pm.uid "+
+			"WHERE pm.project_id = ? AND pm.role = 2 AND pm.status = 1 "+
+			"AND pm.removing = 0 AND COALESCE(u.robot, 0) = 0 "+
+			"AND COALESCE(u.is_destroy, 0) <> 2 "+
+			"ORDER BY COALESCE(pm.joined_at, pm.created_at) ASC, pm.created_at ASC, pm.uid ASC LIMIT ?",
+		projectID, limit,
 	).Load(&uids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active owner candidates: %w", err)
@@ -380,35 +290,18 @@ func (d *DB) queryActiveOwnerCandidatesForProvision(projectID string, limit int)
 	return uids, nil
 }
 
-// queryActiveMemberUIDsForRebuild 读一个项目当前的活跃成员 uid，供 D4 补建把整份
-// 名册当作建群的初始成员（见 ensureAllMemberGroup）。
-//
-// 排除 removing = 1：那些席位正在关闭，级联马上会把他们从项目的每个群里移走，
-// 把他们放进新群等于建出来就要再拆掉一次。
-//
-// 不排除系统 bot：它们本来就不持有项目席位（I2/I4 都豁免它们），所以这条查询
-// 读不到它们，不需要额外的谓词。
-//
-// limit 由调用方传入，而且调用方要传 **max_members + 1**，不是 max_members。
-//
-// 因为这个函数只负责有界，判断"有没有被截断"是调用方的事，而它只能通过"拿回来的
-// 行数超过了配额"来判断——如果 limit 就等于配额，那个条件按构造永远不成立，检查
-// 变成死代码。上一轮就是这么错的：nit 说 `>=` 会在项目正好满员时误报，我只把比较符
-// 改成 `>`，于是唯一的信号没了，截断变成静默的。
-//
-// 截断本身是可达的：updateProject 允许调小 max_members，且不校验当前活跃席位数。
-//
-// 有界是硬要求而不是防御：这条语句在一次 HTTP 请求里同步执行。
+// queryActiveMemberUIDsForRebuild returns the bounded active Project roster
+// used as the initial native membership snapshot for a rebuilt dedicated group.
 func (d *DB) queryActiveMemberUIDsForRebuild(projectID string, limit int) ([]string, error) {
+	if projectID == "" || limit <= 0 {
+		return nil, nil
+	}
 	var uids []string
 	_, err := d.session.SelectBySql(
-		// 按 created_at, uid 排序而不是随便什么顺序：建群时的成员顺序会决定
-		// group_member 的写入顺序，稳定的顺序让两次补建产生一样的结果，测试
-		// 才断言得了。
 		"SELECT uid FROM `octo_project_member` "+
-			"WHERE project_id = ? AND status = ? AND removing = 0 "+
-			"ORDER BY created_at, uid LIMIT ?",
-		projectID, MemberStatusActive, limit,
+			"WHERE project_id = ? AND status = 1 AND removing = 0 "+
+			"ORDER BY COALESCE(joined_at, created_at) ASC, created_at ASC, uid ASC LIMIT ?",
+		projectID, limit,
 	).Load(&uids)
 	if err != nil {
 		return nil, fmt.Errorf("project: query active member uids for rebuild: %w", err)

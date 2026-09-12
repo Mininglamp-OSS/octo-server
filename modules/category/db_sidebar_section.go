@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -114,11 +113,10 @@ func (d *categoryDB) querySidebarProjectSections(uid, spaceID string) ([]*sideba
 		Where("ss.uid=? AND ss.space_id=? AND ss.section_type=? AND ss.status=1 "+
 			"AND NOT EXISTS (SELECT 1 FROM octo_project_user_setting ps_hidden "+
 			"WHERE ps_hidden.project_id=p.project_id AND ps_hidden.uid=ss.uid AND ps_hidden.pinned=0) "+
-			"AND (EXISTS (SELECT 1 FROM octo_project_member pm WHERE pm.project_id=p.project_id AND pm.uid=? "+
-			"AND pm.space_id=p.space_id AND pm.status=1 AND pm.removing=0) OR "+
-			"(p.discoverability=? AND EXISTS (SELECT 1 FROM octo_project_user_setting ps "+
-			"WHERE ps.project_id=p.project_id AND ps.uid=ss.uid AND ps.pinned=1)))",
-			uid, spaceID, sidebarSectionTypeProject, uid, projectmod.DiscoverabilitySpaceListed).
+			"AND EXISTS (SELECT 1 FROM octo_project_member pm "+
+			"WHERE pm.project_id=p.project_id AND pm.uid=? "+
+			"AND pm.space_id=p.space_id AND pm.status=1 AND pm.removing=0)",
+			uid, spaceID, sidebarSectionTypeProject, uid).
 		OrderAsc("ss.sort").
 		OrderAsc("ss.id").
 		Load(&models)
@@ -126,10 +124,9 @@ func (d *categoryDB) querySidebarProjectSections(uid, spaceID string) ([]*sideba
 }
 
 // ensureActiveProjectSidebarSections is the list-path compensator for the
-// post-commit project hooks. A hook may be unavailable during a rolling deploy
-// or its independent write may fail; active membership and an explicit pin of a
-// Space-listed Project are both valid ways into the personal sidebar, so a read
-// repairs every missing section before rendering the unified list.
+// post-commit Project hooks. Only active Project membership makes a Project
+// eligible for the personal sidebar; a historical pin from a non-member must
+// not resurrect an ordering row.
 func (d *categoryDB) ensureActiveProjectSidebarSections(uid, spaceID string) error {
 	projectIDs, err := d.queryVisibleProjectSidebarRefs(uid, spaceID)
 	if err != nil {
@@ -158,11 +155,10 @@ func (d *categoryDB) queryVisibleProjectSidebarRefs(uid, spaceID string) ([]stri
 		Where("p.space_id=? AND p.status=1 AND "+
 			"NOT EXISTS (SELECT 1 FROM octo_project_user_setting ps_hidden "+
 			"WHERE ps_hidden.project_id=p.project_id AND ps_hidden.uid=? AND ps_hidden.pinned=0) AND "+
-			"(EXISTS (SELECT 1 FROM octo_project_member pm WHERE pm.project_id=p.project_id AND pm.uid=? "+
-			"AND pm.space_id=p.space_id AND pm.status=1 AND pm.removing=0) OR "+
-			"(p.discoverability=? AND EXISTS (SELECT 1 FROM octo_project_user_setting ps "+
-			"WHERE ps.project_id=p.project_id AND ps.uid=? AND ps.pinned=1)))",
-			spaceID, uid, uid, projectmod.DiscoverabilitySpaceListed, uid).
+			"EXISTS (SELECT 1 FROM octo_project_member pm "+
+			"WHERE pm.project_id=p.project_id AND pm.uid=? "+
+			"AND pm.space_id=p.space_id AND pm.status=1 AND pm.removing=0)",
+			spaceID, uid, uid).
 		OrderAsc("p.id").
 		Load(&projectIDs)
 	return projectIDs, err

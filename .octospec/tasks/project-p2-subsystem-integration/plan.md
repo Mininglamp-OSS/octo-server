@@ -73,7 +73,8 @@ D9 要求 `unknown` 把「项目不存在」和「不在本 consumer 的 grant �
 | `internal/cardactiondispatch/signature.go` | v1 原语搬到 `pkg/octosign` 后改为纯委托（唯一改到已上线路径的改动之一） |
 | `internal/cardactiondispatch/http.go` | 三个 header 常量改为别名 `pkg/octosign` 的 |
 
-**没有新增 pkg/errcode 码，也没有新增 zh-CN 条目** —— 这是核对后的结论而不是漏做：
+**没有新增 pkg/errcode 码；专属全员群 guard 复用既有码并已补齐 bot_api/group 的 zh-CN 条目**：
+这是与本切片并行收口的 Group/Bot guard 变更，不引入新的错误码。Provisioning
 本切片唯一新增的用户可见失败是「建项目因 outbox 写失败而失败」，客户端对它和对任何
 存储失败能做的事完全一样，所以复用 `ErrProjectStoreFailed`（500 / `Internal=true` /
 先记 `zap.Error`）。真正需要区分的是运维视角，那走的是 metric label
@@ -133,7 +134,7 @@ import 守卫拿 `"internal/projectprovision"`（带前引号）去匹配，而�
 | 回滚不留行 / 提交后每目标恰好一行且 container_id 已就位 | `TestProvisioningEnqueueFailureRollsBackTheWholeCreate` + `TestCreateEnqueuesExactlyOneRowPerEnabledTarget` |
 | worker 幂等：重放收敛到 ready 且不造第二个容器 | `TestWorkerReachesReadyAndConvergesOnReplay`（假目标按 container_id 记账，所以能区分「调了两次」和「建了两个」） |
 | 无读路径以本表为门 | `TestNoHandlerReachesTheProvisioningTable`（禁用标识符集**从 DAO 源码派生**，改名不会让守卫落空） |
-| 两个 secret 进 exclusions、且与任何内部 token 不同 | `TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions` + `TestLoadProvisioningConfig` 的四个 sibling 用例 |
+| 两个 secret 进 exclusions、且与任何内部 token 不同 | `TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions` + `TestLoadProvisioningConfig` 的四个 sibling 用例 |
 | 解散移到 `disband_pending` 且不发出网请求 | `TestDisbandMovesRowsToDisbandPendingAndSendsNothing`（解散后再跑一轮 worker，断言假目标计数不变） |
 | 出网客户端只在 worker 包，`modules/project` / `modules/user` 的 handler 都到不了 | `TestProvisioningClientIsConfinedToTheWorker` |
 | 未收窄容器数量有 gauge | `TestUnnarrowedContainerGaugeCountsReadyRowsOnUnnarrowedTargets`（含「条件消失后回落到 0」） |

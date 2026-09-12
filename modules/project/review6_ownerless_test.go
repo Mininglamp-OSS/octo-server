@@ -5,9 +5,9 @@ package project
 // looks for an active project with zero active owners, and P0 cannot repair the state — role
 // change and disband are owner-only, and a Space admin has read access only.
 //
-// Two reachable routes exist: the concurrency hole (now fixed and pinned) and the sole owner
-// being removed from the Space, which is a filed product decision. A detection signal is what
-// makes the second one answerable with data rather than a guess.
+// A legacy/manual write can still leave the sole Owner absent from an active
+// project. Normal Space removal now preserves the Owner row, so this test
+// exercises the historical state directly rather than the cascade.
 
 import (
 	"testing"
@@ -18,9 +18,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestReconcileFlagsAnActiveProjectWithNoOwner drives the real scan against a project whose
-// only owner's seat has been closed without a successor — exactly what the cascade leaves
-// behind when a sole owner is removed from the Space.
+// TestReconcileFlagsAnActiveProjectWithNoOwner drives the real scan against a
+// project whose only Owner seat was closed directly, leaving an inconsistent
+// active project for the monitor to report.
 func TestReconcileFlagsAnActiveProjectWithNoOwner(t *testing.T) {
 	srv, p := setup(t)
 	_, _, created := projectWithMembers(t, srv, "keep1")

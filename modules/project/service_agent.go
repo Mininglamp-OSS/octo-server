@@ -9,19 +9,20 @@ import (
 
 // AI 分身进出项目的资格规则（D2 / D15）。
 //
-// 弹窗上的那句话是「仅可带入自己的分身，确认后直接加入」。它在建项目那一刻的含义
-// 是显然的，在建项目**之后**的含义原本是空白的——`members/add` 今天对目标是不是
-// bot、bot 归谁没有任何规则，任何管理员都能把任何持有 Space 席位的 bot 加进项目，
-// 而普通成员反而没有入口带自己的分身。D15 把弹窗的承诺延伸成一条持续成立的规则。
+// 建项目时，弹窗上的「仅可带入自己的分身，确认后直接加入」仍然只适用于
+// 创建者带入自己的 agent_uids。项目创建后的 members/add 则是人员管理入口：
+// 只有 Owner/Admin 能调用，目标 bot 必须同时满足组织通讯录可见条件和本模块的
+// agent 事实校验；不再把“目标必须属于调用方”作为额外限制，也不恢复普通成员
+// 添加自己 bot 的人员管理例外。
 
 var (
 	// errAgentNotEligible 是 D3 / D15 的**唯一**分身拒绝理由。
 	//
-	// 六种真实原因合并成一个：不是你的 / 不是 bot / 是本地分身 / 不在本 Space /
-	// 是系统 bot / 不存在。区分开就等于把加人接口变成一个探测器——拿着一个 uid
-	// 就能问出"它存不存在、是不是 bot、归谁"。真正的原因进日志。
-	//
-	// 与 P1 建项目群那个 ErrGroupProjectUnavailable 是同一条反探测口径。
+	// 建项目的 own-agent 路径与 members/add 的目录路径共享这个 envelope；具体
+	// 原因（不是 bot、孤儿/无活跃 robot、本地分身、不在本 Space、系统 bot、账号
+	// 不可用或目录 owner 不合格）合并返回，避免接口成为身份探测器。创建路径还会
+	// 记录“不是创建者自己的 agent”，而 members/add 按目标真实 creator 分组复用
+	// 基础事实，不额外套 actor-only 限制。
 	errAgentNotEligible = errors.New("project: agent is not eligible for this project")
 )
 
@@ -52,7 +53,13 @@ const (
 	agentReasonOKPlaceholder   = ""
 )
 
-// classifyAgentsTx 判定一批 uid 是否可以作为 ownerUID 的分身进入 spaceID 下的项目。
+// classifyAgentsTx 判定一批 uid 是否可以作为指定 ownerUID 的分身进入项目。
+//
+// ownerUID 表示期望的 robot.creator_uid，而不是“当前 HTTP 调用者”。创建路径
+// 传入项目创建者；members/add 按每个目标 bot 的真实 creator 分组调用它，因而
+// 复用相同的 bot/account/Space-seat 基础事实，却不凭空要求 creator 必须是 actor。
+// members/add 另外在 service.go 叠加组织通讯录的 octo_hosted、human-owner
+// 条件；创建路径则保留自己的 agent_uids 规则。
 //
 // 判定在**事务内**，且依赖两件事：
 //   - `robot` / `user` 的行（queryAgentRowsTx）；
@@ -63,10 +70,9 @@ const (
 // 顺序是 P0 定死的（见 createProjectOnce 里那段关于 1213 的论证）。在这里再查一次
 // 就会在项目行锁之后再碰 space_member，把已经分析过的锁序推翻。
 //
-// hosting 的口径与通讯录（GET /v1/space/directory）一致：排除 self_hosted。
-// 这是**产品一致性**，不是安全边界——agent_hosting 是客户端自报值，服务端只校验
-// 形状不校验取值（见 modules/botfather/sql 的那条迁移）。排除它的理由是：用户在
-// 选择器里看不到的分身，不该能从接口带进来。
+// classifier 本身拒绝 self_hosted；members/add 的目录层还要求精确的 octo_hosted
+// 展示值。agent_hosting 是客户端自报字段，服务端的资格判断只把它作为既有
+// 目录展示规则的一部分，不把它当作 Owner/权限信号。
 func (p *Project) classifyAgentsTx(
 	tx *dbr.Tx, ownerUID string, uids []string, held map[string]bool,
 ) (map[string]agentEligibility, error) {
@@ -83,8 +89,9 @@ func (p *Project) classifyAgentsTx(
 			continue
 		}
 		if spacepkg.IsSystemBot(uid) {
-			// 系统 bot 在 I2 里是被豁免的（不需要项目席位就能进项目群），
-			// 所以给它一个席位既无意义也会让豁免与席位两套机制互相干扰。
+			// System bots are platform-managed identities, not user-owned Project
+			// agent seats. Rejecting them here also keeps the agent API from
+			// exposing the platform bot whitelist as a Project roster.
 			out[uid] = agentEligibility{Reason: agentReasonSystemBot}
 			continue
 		}
@@ -161,13 +168,6 @@ func ineligibleAgentReasons(uids []string, verdicts map[string]agentEligibility)
 	}
 	return reasons
 }
-
-// canManageOwnAgents 是 D15(b) 的窄能力：任何活跃项目成员都可以带自己的分身进来、
-// 把自己的分身移出去，不需要 canManageMembers。
-//
-// 单独成为一个能力位而不是让客户端从 role 推导，与 capabilitiesFor 的整体口径一致：
-// 客户端一旦自己推导权限矩阵，它就会在矩阵第一次变化时与服务端分叉。
-func canManageOwnAgents(projectRole int) bool { return isProjectMember(projectRole) }
 
 // agentNotEligibleError carries the ineligible SUBSET out to the handler.
 //

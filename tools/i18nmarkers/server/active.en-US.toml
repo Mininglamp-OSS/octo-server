@@ -513,8 +513,8 @@ other = "You are not a member of this group."
 ["err.server.group.notify_failed"]
 other = "Failed to send group notification."
 
-["err.server.group.project_member_required"]
-other = "Only members of this project can be added to the group."
+["err.server.group.project_conflict"]
+other = "The group and Project association conflicts with the current state."
 
 ["err.server.group.project_unavailable"]
 other = "This project is unavailable."
@@ -846,8 +846,8 @@ other = "Project member not found."
 ["err.server.project.member_not_space_member"]
 other = "The target user is not an active member of this space."
 
-["err.server.project.name_duplicated"]
-other = "A project with this name already exists in this space."
+["err.server.project.member_role_conflict"]
+other = "The project member already has a different role."
 
 ["err.server.project.name_invalid"]
 other = "Project name is required and must not exceed the maximum length."

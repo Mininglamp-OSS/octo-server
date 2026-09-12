@@ -530,6 +530,9 @@ other = "授权码与当前登录用户不匹配。"
 ["err.server.group.qrcode_member_only"]
 other = "只有群成员才能生成二维码。"
 
+["err.server.group.all_member_group_protected"]
+other = "这是项目的全员群，请从项目中管理其成员。"
+
 ["err.server.group.not_found"]
 other = "群不存在。"
 
@@ -1147,11 +1150,12 @@ other = "机器人不是该群管理员。"
 ["err.server.bot_api.cannot_remove_privileged"]
 other = "群主和管理员不能通过机器人 API 移除。"
 
-["err.server.bot_api.all_member_group_protected"]
-other = "这是项目的全员群，请到项目中管理成员。"
 
 ["err.server.bot_api.not_space_member"]
 other = "不是该空间成员。"
+
+["err.server.bot_api.all_member_group_protected"]
+other = "这是项目的全员群，请从项目中管理其成员。"
 
 ["err.server.bot_api.app_bot_unsupported"]
 other = "应用机器人不支持该操作。"
@@ -1467,6 +1471,9 @@ other = "所选的 AI 分身中有无法加入本项目的，请调整后重试�
 ["err.server.project.role_invalid"]
 other = "项目成员角色无效。"
 
+["err.server.project.member_role_conflict"]
+other = "项目成员已有不同角色。"
+
 ["err.server.project.collaboration_role_name_invalid"]
 other = "项目协作角色名称无效。"
 
@@ -1481,6 +1488,8 @@ other = "你没有权限执行此操作。"
 
 ["err.server.project.not_member"]
 other = "你不是该项目的成员。"
+["err.server.project.member_not_found"]
+other = "项目成员不存在或已被移除。"
 
 ["err.server.project.disabled"]
 other = "项目功能已被管理员关闭。"
@@ -1518,11 +1527,6 @@ other = "你今天创建的项目数量已达上限。"
 ["err.server.project.not_found"]
 other = "项目不存在。"
 
-["err.server.project.member_not_found"]
-other = "项目成员不存在。"
-
-["err.server.project.name_duplicated"]
-other = "该空间内已存在同名项目。"
 
 ["err.server.project.collaboration_role_duplicated"]
 other = "该项目内已存在同名协作角色。"
@@ -1562,11 +1566,11 @@ other = "保存 AI 团队数据失败。"
 ["err.server.ai_team.im_unavailable"]
 other = "AI 会话尚未就绪，请稍后重试。"
 
-["err.server.group.project_member_required"]
-other = "只有该项目的成员才能被加入这个群聊。"
 
-["err.server.group.all_member_group_protected"]
-other = "这是项目的全员群，请到项目中管理成员。"
 
 ["err.server.group.project_unavailable"]
 other = "该项目不可用。"
+
+
+["err.server.group.project_conflict"]
+other = "群与项目的关联状态已变化，请刷新后重试。"

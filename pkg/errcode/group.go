@@ -47,59 +47,9 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "This project is unavailable.",
 	})
-	// ErrGroupProjectMemberRequired refuses an admission into a group that
-	// belongs to a Project when the target is not an active member of that
-	// Project (invariant I2).
-	//
-	// ONE code for every refusal reason, deliberately. The gate can refuse
-	// because the uid is not in the project, because their project seat is
-	// being closed (removing = 1), or because they lost their Space seat while
-	// the asynchronous cascade had not caught up. Emitting a distinct code per
-	// reason would turn "add this uid to a group" into an oracle for project
-	// membership — a caller could enumerate who belongs to a project they
-	// cannot see. The specific reason goes to the log and to the
-	// group_admission_rejected_total metric, never to the wire.
-	//
-	// The refused uids are NOT in Details for the same reason: the caller
-	// already knows which uids they sent, and echoing a subset back tells them
-	// which of those are project members.
-	ErrGroupProjectMemberRequired = register(codes.Code{
-		ID:             "err.server.group.project_member_required",
-		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "Only members of this project can be added to the group.",
-	})
-	// ErrGroupAllMemberGroupProtected refuses the FIVE group operations that
-	// would break a project's all-member group (P2 D7): disband, exit, remove a
-	// member, hand over the owner, and blacklist a member.
-	//
-	// The all-member group's roster IS the project's roster (invariant I4), so
-	// each of those has a project-side equivalent that must be used instead:
-	// leave the project, remove the member from the project, transfer project
-	// ownership. Disbanding has no equivalent — the group ends when the project
-	// does. Blacklisting has none either: it removes the member from the roster
-	// as a side effect, which is the same I4 break by another name.
-	//
-	// This list said "four" and omitted blacklist while the paragraph below
-	// already counted five call sites — and this is the one place a client author
-	// reads to find out what the code means. PR #855's tenth review.
-	//
-	// details.action names which of the five was refused, so a client can render
-	// the right redirection ("leave the project instead") rather than a generic
-	// refusal.
-	//
-	// What it exposes is BOUNDED, not nothing. Two of the five call sites — member
-	// removal and exit — run the guard before reading the caller's own membership,
-	// the exit one because the handler unsubscribes from the IM channel first and
-	// the guard has to precede that. So a non-member can learn from this refusal
-	// that the group belongs to a project. The bound is that the same handler's
-	// getGroupInfo has already answered "does this group exist" with its 404, so
-	// the increment is "and it is a project's". Stated accurately here because the
-	// next person to move the guard will cite this line.
-	//
-	// The refusal is on the HTTP handlers ONLY. The service-layer primitives stay
-	// open, because P1's project cascade, the Space-removal cascade, botfather's
-	// bot deletion and P2's own owner-sync hook all go through them — blocking
-	// there would block the very cascades that keep I2 and I4 true.
+	// ErrGroupAllMemberGroupProtected blocks manual mutations that would break
+	// the Project's dedicated all-member-group projection. System lifecycle
+	// cleanup and owner synchronization bypass this handler-only guard.
 	ErrGroupAllMemberGroupProtected = register(codes.Code{
 		ID:             "err.server.group.all_member_group_protected",
 		HTTPStatus:     http.StatusBadRequest,
@@ -320,5 +270,14 @@ var (
 		HTTPStatus:     http.StatusInternalServerError,
 		DefaultMessage: "Failed to send group notification.",
 		Internal:       true,
+	})
+
+	// ErrGroupProjectConflict covers a concurrent/occupied/cross-Space
+	// Group↔Project association conflict. Relation writes are atomic and never
+	// partially update project_id or its linked-by actor.
+	ErrGroupProjectConflict = register(codes.Code{
+		ID:             "err.server.group.project_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The group and Project association conflicts with the current state.",
 	})
 )

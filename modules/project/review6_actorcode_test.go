@@ -48,10 +48,10 @@ func TestEveryWritePathNamesTheActorsOwnMissingSpaceSeat(t *testing.T) {
 	_, rErr := p.removeMember(pid, spaceA, "ac9", "owner1")
 	assert.ErrorIs(t, rErr, errActorNotSpaceMember, "removeMember must name the ACTOR's seat")
 
-	_, lErr := p.leaveProject(pid, spaceA, "ac9", "")
+	lErr := p.leaveProject(pid, spaceA, "ac9")
 	assert.ErrorIs(t, lErr, errActorNotSpaceMember, "leaveProject must name the ACTOR's seat")
 
-	_, _, cErr := p.changeMemberRole(pid, spaceA, "ac9", "owner1", RoleCommon, "")
+	_, cErr := p.changeMemberRole(pid, spaceA, "ac9", "owner1", RoleCommon)
 	assert.ErrorIs(t, cErr, errActorNotSpaceMember, "changeMemberRole must name the ACTOR's seat")
 
 	_, aErr := p.addOneMember(pid, spaceA, "ac9", "acT")

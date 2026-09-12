@@ -2,17 +2,10 @@ package project
 
 // The cost guards, applied to the file the P1 scans actually live in.
 //
-// PR #844's review found the gap: TestReconcileQueriesAreBounded reads
-// reconcile.go, and the cost guard's src() reads reconcile.go, so the three
-// scans added by P1 — in reconcile_p1.go — were covered by neither. The
-// omission was not theoretical: queryI2Page carried `g.status <> 2` in its WHERE
-// clause, which is exactly what the cost guard forbids and for exactly the
-// reason it forbids it.
-//
-// This file re-applies both rules to reconcile_p1.go rather than widening the
-// existing guards in place, so the P0 guards keep failing on P0's terms and the
-// two exemptions P1 needs are declared here, next to their reasons, instead of
-// being loosened into a shared rule.
+// The query-bound guard used to miss the P1 scans because TestReconcileQueriesAreBounded
+// reads reconcile.go while these scans live in reconcile_p1.go. This file applies the same
+// bounded-query rules directly to the P1 implementation, so a new scan or query cannot
+// silently escape the cost contract.
 
 import (
 	"os"
@@ -63,9 +56,9 @@ func TestP1ReconcileQueriesAreBounded(t *testing.T) {
 
 	lineSrc := readLinesWithoutComments(t, reconcileP1File)
 	scans := scanFuncNames(lineSrc)
-	require.GreaterOrEqual(t, len(scans), 3,
-		"expected at least the three P1 scans, found %d: %v — the enumeration stopped "+
-			"matching, which would make this check vacuous", len(scans), scans)
+	require.Equal(t, 2, len(scans),
+		"expected the two P1 scans (I3 and removal stalls), found %d: %v — update this "+
+			"guard when the P1 scan inventory changes", len(scans), scans)
 
 	for _, scan := range scans {
 		if why, exempt := scansExemptFromPaging[scan]; exempt {
@@ -82,48 +75,17 @@ func TestP1ReconcileQueriesAreBounded(t *testing.T) {
 	}
 }
 
-// whereMustNotFilterOn lists, per paged query, the predicates that are allowed
-// to stay in the WHERE clause despite the flag-over-base-page rule.
-//
-// One entry, and it is the reason the rule cannot simply be copied: moving the
-// project_id emptiness test into the violating flag would make every Space-direct
-// group's members base rows — a walk of the whole group_member table every tick,
-// which is the opposite of what the rule is for. It is also the selective
-// predicate: what it excludes is most of the product.
-//
-// Everything else belongs in the flag. `g.status <> 2` was in the WHERE until
-// PR #844's review; `group`.status leads no index, so as disbanded groups
-// accumulate it put LIMIT back to bounding rows RETURNED rather than examined.
+// whereMustNotFilterOn lists predicates that must not narrow a paged query's
+// base rows in the WHERE clause. Such predicates belong in the per-row flag.
 var whereMustNotFilterOn = []string{"status"}
 
-// innerJoinOnExemptions declares, per predicate, why it is allowed to sit in an
-// INNER JOIN's ON clause.
-//
-// The WHERE check above was, on its own, a claim the guard did not check: for
-// cost purposes an INNER JOIN's ON clause filters base rows exactly as WHERE
-// does, so moving a predicate from one to the other satisfies the rule while
-// changing nothing. Raised by PR #846's review as P2-3.
-//
-// LEFT JOINs are a different matter and are deliberately not inspected: a LEFT
-// JOIN's ON clause cannot eliminate a base row, only decide whether the right
-// side is NULL. That is why `jobp.status = 0` / `jobs.status = 0` are fine where
-// they are, and why the rule has to distinguish the two join kinds rather than
-// banning a needle everywhere it appears.
-// goStringGlue matches the `" +` … `"` (optionally with a // comment line in
-// between) that separates adjacent fragments of one SQL string in the source.
+// An INNER JOIN's ON clause filters base rows just like WHERE does. Keep the
+// check separate from the WHERE check so a predicate cannot evade the cost
+// contract by moving between equivalent clauses.
 var goStringGlue = regexp.MustCompile(`"\s*\+\s*(?://[^\n]*\n\s*)*"`)
 
-var innerJoinOnExemptions = map[string]string{
-	"gm.is_deleted = 0": "moving it into the flag makes every soft-deleted member row a " +
-		"base row — the whole tombstone history walked each tick, which is worse than " +
-		"what the rule is protecting against",
-	"gm.status = 1": "rides the same group_member.group_no index lookup as the join key " +
-		"itself, so it costs nothing where it is; in the flag it would widen the base " +
-		"page by every blacklisted member",
-}
-
-// TestP1PagedQueriesUseTheFlagOverBasePageShape is the cost guard's rule,
-// applied to reconcile_p1.go.
+// TestP1PagedQueriesUseTheFlagOverBasePageShape applies the cost guard to
+// reconcile_p1.go.
 func TestP1PagedQueriesUseTheFlagOverBasePageShape(t *testing.T) {
 	src := p1Src(t)
 
@@ -136,10 +98,9 @@ func TestP1PagedQueriesUseTheFlagOverBasePageShape(t *testing.T) {
 		require.Positive(t, paren, "unexpected signature shape: %s", line)
 		fns = append(fns, line[:paren+len("Page")])
 	}
-	require.Equal(t, 2, len(fns),
-		"expected exactly two paged P1 queries, found %d: %v — if you added one, cover it "+
-			"here; if one vanished, that is the regression this floor exists to catch",
-		len(fns), fns)
+	require.Equal(t, 1, len(fns),
+		"expected exactly one paged P1 query, found %d: %v — update this guard if the "+
+			"P1 query inventory changes", len(fns), fns)
 
 	for _, fn := range fns {
 		i := strings.Index(src, fn)
@@ -159,15 +120,10 @@ func TestP1PagedQueriesUseTheFlagOverBasePageShape(t *testing.T) {
 		}
 
 		for _, on := range innerJoinOnClauses(body) {
-			stripped := on
-			for exempt := range innerJoinOnExemptions {
-				stripped = strings.ReplaceAll(stripped, exempt, "")
-			}
 			for _, banned := range whereMustNotFilterOn {
-				assert.NotContains(t, stripped, banned,
+				assert.NotContains(t, on, banned,
 					"%s filters on %q in an INNER JOIN's ON clause, which bounds base rows "+
-						"exactly as WHERE does — put it in the violating flag, or add it to "+
-						"innerJoinOnExemptions with the reason: %s", fn, banned, on)
+						"exactly as WHERE does — move it into the violating flag", fn, banned)
 			}
 		}
 	}
@@ -178,7 +134,7 @@ func TestP1PagedQueriesUseTheFlagOverBasePageShape(t *testing.T) {
 // as one.
 //
 // A clause ends at the next JOIN, WHERE, ORDER BY or the end of the statement.
-// LEFT JOINs are skipped for the reason innerJoinOnExemptions gives.
+// LEFT JOINs are skipped because their ON clauses do not eliminate base rows.
 func innerJoinOnClauses(body string) []string {
 	// Collapse the Go string concatenation glue (and the comments that sit
 	// between the fragments) so a clause split across source lines reads as one —

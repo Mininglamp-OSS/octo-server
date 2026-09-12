@@ -80,6 +80,13 @@ var (
 		DefaultMessage: "Invalid project member role.",
 		SafeDetailKeys: []string{"field"},
 	})
+	// ErrProjectMemberRoleConflict means one atomic membership request
+	// conflicts with an already active role (or repeats a UID with two roles).
+	ErrProjectMemberRoleConflict = register(codes.Code{
+		ID:             "err.server.project.member_role_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The project member already has a different role.",
+	})
 	ErrProjectCollaborationRoleNameInvalid = register(codes.Code{
 		ID:             "err.server.project.collaboration_role_name_invalid",
 		HTTPStatus:     http.StatusBadRequest,
@@ -243,14 +250,6 @@ var (
 
 	// ---- conflict (409) ------------------------------------------------------
 
-	// ErrProjectNameDuplicated covers a duplicate ACTIVE name in the same Space.
-	// A disbanded project frees its name (see the active_name generated column),
-	// so this only fires against a live sibling.
-	ErrProjectNameDuplicated = register(codes.Code{
-		ID:             "err.server.project.name_duplicated",
-		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "A project with this name already exists in this space.",
-	})
 	ErrProjectCollaborationRoleDuplicated = register(codes.Code{
 		ID:             "err.server.project.collaboration_role_duplicated",
 		HTTPStatus:     http.StatusConflict,

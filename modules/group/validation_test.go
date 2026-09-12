@@ -37,6 +37,11 @@ func TestGroupReq_Check(t *testing.T) {
 			req:     groupReq{Name: "", Members: []string{"uid1"}},
 			wantErr: false, // name 不是必填
 		},
+		{
+			name:    "Project snapshot may omit request members",
+			req:     groupReq{Name: "项目群", ProjectID: "project-1", SpaceID: "space-1"},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {

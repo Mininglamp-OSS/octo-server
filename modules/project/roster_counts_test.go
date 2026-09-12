@@ -4,14 +4,9 @@ package project
 //
 // 详情路由的分裂由 TestCreateProjectSeatsTheCreatorsAgents 覆盖，列表路由一直没有用例。
 //
-// 上一版这里写的立论是「列表路由的两个数来自两条语句」——**那已经不成立了**：PR-5 把
-// seat_count 挪进了 fillMemberCounts，两个数现在出自同一次名册读取（见 db.go 上
-// fillMemberCounts 的注释，本 PR 自己也在 api.go 里这么写）。同一个 PR 里两处注释对同一个
-// 函数说了相反的话，正是本 PR 在别处修的那一类漂移。PR #868 的 review，P2-4。
-//
-// 真正的立论更简单，也仍然成立：两条路由必须给出同一套口径，而它们的两个数由**不同的
-// 代码**算出来（详情走 countActiveSeatsByKind，列表走 fillMemberCounts）。下面最后那三行
-// ——列表与详情逐字段相等——是这个文件真正值钱的地方。
+// The list and detail routes must give the same roster-count meaning. The list read path now
+// computes the split from its repeatable-read snapshot, while detail uses its own read snapshot;
+// the observable contract is that both DTOs agree and the three counts add up.
 //
 // 三个字段的含义在 GA 前被改回来了：member_count 是全部席位（D16 之前的含义，也是
 // modules/opanalytics 对同名字段的含义），人/分身的拆分放在 human_member_count 与
@@ -48,7 +43,7 @@ func TestListRouteSplitsTheRosterAndTheThreeCountsAddUp(t *testing.T) {
 	created := decodeResp(t, w)
 
 	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", owner,
-		map[string]any{"uids": []string{"u_cnt_mate"}})
+		addMembersPayload("u_cnt_mate"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	// 两个人 + 两个分身。
@@ -56,8 +51,14 @@ func TestListRouteSplitsTheRosterAndTheThreeCountsAddUp(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	var list []*Resp
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &list))
-	require.Len(t, list, 1)
-	row := list[0]
+	var row *Resp
+	for _, candidate := range list {
+		if candidate.ProjectID == created.ProjectID {
+			row = candidate
+			break
+		}
+	}
+	require.NotNil(t, row, "the created Project must be found by semantic ID")
 
 	assert.Equal(t, 2, row.HumanMemberCount, "human_member_count 只算人")
 	assert.Equal(t, 2, row.AgentMemberCount, "agent_member_count 只算分身席位")

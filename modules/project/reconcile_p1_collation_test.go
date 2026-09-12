@@ -1,24 +1,17 @@
 package project
 
-// P1's answer to the question P0's round 5 raised: do the new scans need the
-// OCTO_PROJECT_RECONCILE_ENABLED gate too?
+// P1's answer to the question P0's round 5 raised: do the remaining scans need
+// the OCTO_PROJECT_RECONCILE_ENABLED gate too?
 //
 // P0 gates three scans because they JOIN legacy Space tables with no COLLATE and
-// therefore fail with MySQL 1267 on the drifted shape production is MEASURED to
-// have — at statement RESOLUTION, so empty tables do not save them, and because
-// each gauge publishes only on a complete rotation they would sit at zero
-// forever and read as "no violations".
+// therefore fail with MySQL 1267 on the drifted production shape, at statement
+// resolution. P1's two remaining scans have different properties: I3 carries
+// explicit COLLATE on its cross-schema comparisons, while removal-stall reads
+// only project tables. Both therefore run ungated.
 //
-// P1's three scans are written the other way: every comparison that crosses from
-// a legacy table into an `octo_project*` one carries an explicit COLLATE. So they
-// survive the drift and run UNGATED — which matters, because I2 is the invariant
-// with teeth (there is no read-path filter behind it) and defaulting its monitor
-// to off would put the most consequential of the five in the dark.
-//
-// That is a claim about SQL, and this file is what makes it evidence instead of a
-// comment. Its own probe database rather than an addition to P0's: that test is a
-// shipped file with its own fixed table list, and P1's non-regression rule is
-// that no existing test file is edited.
+// This is a claim about SQL, and this file makes it evidence instead of a
+// comment by running the I3 query against a deliberately drifted database and
+// after the legacy tables are converted back.
 
 import (
 	"os"
@@ -27,11 +20,42 @@ import (
 	"testing"
 
 	"github.com/gocraft/dbr/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const p1CollationProbeDB = "octo_project_p1_collation_probe"
+
+// scanRuns reads the sample count for one scan's duration histogram label. Each
+// scan defers exactly one Observe, so this is the execution count used by the
+// reconcile-gate behavior test below.
+func scanRuns(t *testing.T, scan string) uint64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "project_reconcile_duration_seconds" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "scan" && label.GetValue() == scan {
+					return metric.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func currentSchemaName(t *testing.T) string {
+	t.Helper()
+	var name string
+	require.NoError(t, testCtx.DB().SelectBySql("SELECT DATABASE()").LoadOne(&name))
+	require.NotEmpty(t, name)
+	return name
+}
 
 // p1ProbeTables is what P1's scans touch, with the collation each has in
 // production. `legacy` means "created without COLLATE, so it inherited the server
@@ -42,23 +66,7 @@ var p1ProbeTables = []struct {
 }{
 	{"octo_project", false},
 	{"octo_project_member", false},
-	{"octo_project_member_removal_cleanup", false},
-	// PR #861's pin table. Its own statements are octo_project*-only today, but the
-	// probe is what makes that checkable rather than asserted: a future join from it
-	// into a legacy table has to fail here instead of in production.
-	{"octo_project_user_setting", false},
-	{"space_member_removal_cleanup", false}, // migration-created, explicitly general_ci
-	{"space", true},
 	{"group", true},
-	{"group_member", true},
-	// P2 adds statements that cross into these two as well (the member roster
-	// flags agents and names their owner; the agent-eligibility reads join both).
-	// Both are 2019 legacy tables, so they drift with the rest. Listed here rather
-	// than in a second probe because the P1 statements do not touch them, so a
-	// superset changes nothing for them — and one probe means one place to keep
-	// in step with production.
-	{"user", true},
-	{"robot", true},
 }
 
 // newP1CollationProbe builds an isolated database in the measured production
@@ -135,10 +143,6 @@ func TestP1ScansSurviveCollationDrift(t *testing.T) {
 	p, converge := newP1CollationProbe(t)
 
 	statements := map[string]func() error{
-		"queryI2Page": func() error {
-			_, err := p.queryI2Page(0, "", 10)
-			return err
-		},
 		"queryI3Page": func() error {
 			_, err := p.queryI3Page(0, 10)
 			return err
@@ -163,15 +167,13 @@ func TestP1ScansSurviveCollationDrift(t *testing.T) {
 	}
 }
 
-// TestP1ScansRunWithTheReconcileGateOff pins the scope decision itself.
-//
 // Written in both directions, like P0's gate test: it fails if the P1 scans are
-// skipped when the flag is off (the monitor with teeth going dark by default),
-// and the drift test above is what makes that safe rather than optimistic.
+// skipped when the flag is off, and the drift test above is what makes that safe
+// rather than optimistic.
 func TestP1ScansRunWithTheReconcileGateOff(t *testing.T) {
 	_, p := setup(t)
 
-	p1Scans := []string{"i2", "i3", "removing_stall"}
+	p1Scans := []string{"i3", "removing_stall"}
 	before := map[string]uint64{}
 	for _, s := range p1Scans {
 		before[s] = scanRuns(t, s)
@@ -183,20 +185,18 @@ func TestP1ScansRunWithTheReconcileGateOff(t *testing.T) {
 
 	for _, s := range p1Scans {
 		assert.Greater(t, scanRuns(t, s), before[s],
-			"%s must run with the reconcile gate off: its cross-schema comparisons carry an "+
-				"explicit COLLATE (TestP1ScansSurviveCollationDrift), so the reason P0's three "+
-				"scans are gated does not apply — and I2 has no read-path filter behind it, so "+
-				"defaulting its monitor to off would darken the most consequential of the five", s)
+			"%s must run with the reconcile gate off: I3 carries explicit COLLATE "+
+				"(TestP1ScansSurviveCollationDrift), while the removal-stall scan touches "+
+				"only Project tables", s)
 	}
 }
 
 // TestP1ScanLabelsAgreeAcrossMetrics is the reconcile_p1.go half of P0's
-// TestScanLabelsAgreeAcrossMetrics, which reads reconcile.go only and therefore
-// cannot see the three scans added in the other file.
+// TestScanLabelsAgreeAcrossMetrics, which reads reconcile.go only.
 //
-// The defect it guards against is the one P0 hit for real: a failure counter
-// labelled "abandoned_leak" while the histogram said "abandoned". Nothing breaks;
-// the dashboard simply will not join.
+// The defect it guards against is a failure counter using a different label
+// from the duration histogram. Nothing breaks; the dashboard simply will not
+// join the two series.
 func TestP1ScanLabelsAgreeAcrossMetrics(t *testing.T) {
 	src := readLinesWithoutComments(t, "reconcile_p1.go")
 
@@ -204,8 +204,8 @@ func TestP1ScanLabelsAgreeAcrossMetrics(t *testing.T) {
 	for _, m := range scanLabelPattern.FindAllStringSubmatch(src, -1) {
 		histogram[m[1]] = true
 	}
-	require.Len(t, histogram, 3,
-		"expected exactly three scan labels in reconcile_p1.go, found %v — the parse probably "+
+	require.Len(t, histogram, 2,
+		"expected exactly two scan labels in reconcile_p1.go, found %v — the parse probably "+
 			"broke, which would make this guard vacuous", histogram)
 
 	for _, pattern := range []*regexp.Regexp{
@@ -213,7 +213,7 @@ func TestP1ScanLabelsAgreeAcrossMetrics(t *testing.T) {
 		regexp.MustCompile(`logCapped\{p: p, scan: "([a-z_0-9]+)"\}`),
 	} {
 		found := pattern.FindAllStringSubmatch(src, -1)
-		require.Len(t, found, 3, "expected three matches for %s — guard would be vacuous", pattern)
+		require.Len(t, found, 2, "expected two matches for %s — guard would be vacuous", pattern)
 		for _, m := range found {
 			assert.True(t, histogram[m[1]],
 				"scan label %q is used by %s but is not one of reconcile_p1.go's duration "+

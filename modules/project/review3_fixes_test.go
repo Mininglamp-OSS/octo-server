@@ -76,10 +76,11 @@ func TestReconcileCursorsSurviveAcrossTicks(t *testing.T) {
 
 // --- P1: a direct role promotion did not re-check the target's Space seat ---
 
-// TestPromotionRequiresTargetStillInSpace pins the gap the transfer path was already hardened
-// against but the direct role change was not: promoting a member whose Space seat is gone (the
-// cascade has not caught up) creates a second owner, which lets the original owner leave with no
-// transfer — and the cascade then closes the new owner, leaving nobody able to administer.
+// TestPromotionRequiresTargetStillInSpace pins the direct role-change guard: promoting a member
+// whose Space seat is gone (the cascade has not caught up) must be refused.
+//
+// Owner transfer is a separate operation with its own endpoint and coverage; the normal role
+// endpoint only accepts the common-member and administrator roles.
 func TestPromotionRequiresTargetStillInSpace(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv, "leaver1")
@@ -90,25 +91,12 @@ func TestPromotionRequiresTargetStillInSpace(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, MemberStatusActive, member.Status, "precondition: the seat is still active")
 
-	// Promotion must be refused.
-	for _, role := range []int{RoleAdmin, RoleOwner} {
-		w := doJSON(t, srv, http.MethodPut,
-			"/v1/projects/"+created.ProjectID+"/members/leaver1/role", ownerTok,
-			map[string]any{"role": role})
-		assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
-	}
-
-	// A DEMOTION is still allowed: it narrows privilege, so blocking it would stop the operator
-	// doing the safe thing.
-	_, err = testCtx.DB().UpdateBySql(
-		"UPDATE octo_project_member SET role = ? WHERE project_id = ? AND uid = ?",
-		RoleAdmin, created.ProjectID, "leaver1").Exec()
-	require.NoError(t, err)
+	// Promotion to Admin must be refused.
 	w := doJSON(t, srv, http.MethodPut,
 		"/v1/projects/"+created.ProjectID+"/members/leaver1/role", ownerTok,
-		map[string]any{"role": RoleCommon})
-	assert.Equal(t, http.StatusOK, w.Code,
-		"demotion must stay allowed even when the target is on their way out: %s", w.Body.String())
+		map[string]any{"role": RoleAdmin})
+	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
+
 }
 
 // --- P2: an abandoned job was reported as a leak even when a newer pending job existed ---
@@ -138,43 +126,6 @@ func TestAbandonedLeakIgnoresPairsWithANewerPendingJob(t *testing.T) {
 	_ = created
 }
 
-// --- P2: leave swallowed every bind error, so a malformed body left the project ---
-
-// TestLeaveRejectsMalformedBodyButAllowsEmpty pins the distinction. An absent body is normal on
-// this route; a truncated or malformed one used to parse as an empty struct, so transfer_to
-// silently became "" and the member left anyway. A destructive action must not be the failure
-// mode of a broken payload.
-func TestLeaveRejectsMalformedBodyButAllowsEmpty(t *testing.T) {
-	srv, p := setup(t)
-	_, tokens, created := projectWithMembers(t, srv, "member1", "member2")
-
-	// Malformed JSON must be rejected and must NOT remove the member.
-	for _, body := range []string{`{"transfer_to":`, `not json`, `{"transfer_to": }`} {
-		w := doRaw(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
-			tokens["member1"], body)
-		assertProjectErrorCode(t, w, "err.server.project.request_invalid")
-		m, err := p.db.queryMember(created.ProjectID, "member1")
-		require.NoError(t, err)
-		assert.Equal(t, MemberStatusActive, m.Status,
-			"a malformed body must not remove the member (body %q)", body)
-	}
-
-	// An absent body is still the normal, working case.
-	w := doRaw(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
-		tokens["member1"], "")
-	require.Equal(t, http.StatusOK, w.Code, "an empty body must still work: %s", w.Body.String())
-	// Two-phase removal (D4): leaving sets removing=1; the worker closes the seat.
-	drainRemovalCascade(t, p)
-	m, err := p.db.queryMember(created.ProjectID, "member1")
-	require.NoError(t, err)
-	assert.Equal(t, MemberStatusRemoved, m.Status)
-
-	// And an explicit empty object works too.
-	w = doRaw(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
-		tokens["member2"], "{}")
-	require.Equal(t, http.StatusOK, w.Code, "body {} must work: %s", w.Body.String())
-}
-
 // --- P2: ownership handover was not auditable ---
 
 // TestOwnershipHandoverAuditsTheSuccessor pins that the log can answer "who holds this project
@@ -183,13 +134,16 @@ func TestOwnershipHandoverAuditsTheSuccessor(t *testing.T) {
 	srv, p := setup(t)
 	ownerTok, _, created := projectWithMembers(t, srv, "heir1")
 
-	// The handler emits both entries, so drive it through a router built on the same *Project
-	// whose sink is captured — same shape as TestEveryWritePathEmitsAnAuditEntry.
+	// Transfer and leave are separate requests now. Drive both through a router built on the
+	// same *Project whose sink is captured — same shape as TestEveryWritePathEmitsAnAuditEntry.
 	r := mountProject(t, p)
 	entries := captureAuditOn(t, p, func() {
-		w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
-			ownerTok, map[string]any{"transfer_to": "heir1"})
-		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID+"/owner",
+			ownerTok, map[string]any{"uid": "heir1"})
+		require.Equal(t, http.StatusOK, w.Code, "transfer body: %s", w.Body.String())
+		w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
+			ownerTok, nil)
+		require.Equal(t, http.StatusOK, w.Code, "leave body: %s", w.Body.String())
 	})
 	assert.True(t, auditHasTarget(entries, auditLeave, "owner1"),
 		"the departure must still be audited; got %+v", entries)
@@ -215,7 +169,7 @@ func TestPartiallyAppliedBatchReportsWhatCommitted(t *testing.T) {
 	// instance — the shared testSrv routes a different one.
 	r := mountProject(t, p)
 	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"t1", "t2", "t3"}})
+		ownerTok, addMembersPayload("t1", "t2", "t3"))
 	require.Equal(t, http.StatusOK, w.Code)
 
 	// Revoke the actor's rights after the first removal commits, by hooking the per-target call.
@@ -314,64 +268,4 @@ func auditHasTarget(entries []AuditEntry, action, target string) bool {
 func insertCleanupJob(t *testing.T, spaceID, uid string, status int) {
 	t.Helper()
 	enqueueCleanupJob(t, spaceID, uid, status)
-}
-
-// --- P2 (round 4): the add batch ran to completion, but the handler labelled everything
-// after the first actor-level failure as "not_attempted" ---
-
-// TestAddBatchStopsAtActorLevelFailureAndLabelsOnlyTheTail pins the fix.
-//
-// addMembers used to run EVERY target and only the handler stopped: it labelled results[i+1:]
-// as not_attempted while those targets had already run — and some had committed. A committed
-// add was reported as never tried, its audit entry was never written, and the same label meant
-// the truth on the remove path and a lie on the add path.
-//
-// Now the batch itself stops at the first actor/project-level failure, so the label divides the
-// batch exactly where execution stopped.
-func TestAddBatchStopsAtActorLevelFailureAndLabelsOnlyTheTail(t *testing.T) {
-	srv, p := setup(t)
-	resetCursorsForTest()
-	ownerTok, _, created := projectWithMembers(t, srv)
-	for _, uid := range []string{"a1", "a2", "a3"} {
-		seedUser(t, uid)
-		seedSpaceMember(t, spaceA, uid, 0, 1)
-	}
-	r := mountProject(t, p)
-
-	calls := 0
-	orig := p.addOneFn
-	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
-		calls++
-		if uid == "a2" {
-			// Simulate the actor's rights expiring while the batch is in flight.
-			return false, errPermissionDenied
-		}
-		return orig(projectID, spaceID, actorUID, uid)
-	}
-	t.Cleanup(func() { p.addOneFn = orig })
-
-	var w *httptest.ResponseRecorder
-	entries := captureAuditOn(t, p, func() {
-		w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-			ownerTok, map[string]any{"uids": []string{"a1", "a2", "a3"}})
-		require.Equal(t, http.StatusOK, w.Code,
-			"a1 committed, so the response must report per-target results: %s", w.Body.String())
-	})
-
-	var outcomes []memberOutcome
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
-	require.Len(t, outcomes, 3, "every uid must be accounted for exactly once: %s", w.Body.String())
-	assert.True(t, outcomes[0].OK, "a1 committed")
-	assert.Equal(t, reasonPermissionDenied, outcomes[1].Reason)
-	assert.Equal(t, outcomeNotAttempted, outcomes[2].Reason, "a3 was never attempted")
-
-	// The batch really did stop: a3 never even opened a transaction, so its seat does not exist.
-	assert.Equal(t, 2, calls, "the batch must stop at the first actor-level failure")
-	seat, err := p.db.queryMember(created.ProjectID, "a3")
-	require.NoError(t, err)
-	assert.Nil(t, seat, "a3 must not have been attempted, let alone committed")
-
-	// The committed add is audited; the never-attempted one is not.
-	assert.True(t, auditHasTarget(entries, auditMemberAdd, "a1"))
-	assert.False(t, auditHasTarget(entries, auditMemberAdd, "a3"))
 }

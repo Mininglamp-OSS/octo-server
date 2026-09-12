@@ -38,15 +38,7 @@ type Project struct {
 	// the "every write path audits" contract is assertable without capturing the
 	// process-wide logger.
 	auditSink auditSink
-
-	// addOneFn / removeOneFn are the per-target execution seams for the batch endpoints.
-	//
-	// Fields on the instance, not package-level vars: the earlier form put a mutable,
-	// not-thread-safe function pointer named ForTest on the production authorization path
-	// (yujiawei Q7, PR #841 round 1). New installs the real implementations; a test that
-	// needs mid-batch behavior swaps the field on ITS OWN instance (mounted via
-	// mountProject) and restores it, so nothing global is rewritable in production.
-	addOneFn    func(projectID, spaceID, actorUID, uid string) (bool, error)
+	// removeOneFn is the per-target execution seam for the remove endpoint.
 	removeOneFn func(projectID, spaceID, actorUID, targetUID string) (bool, error)
 
 	// updateFn / disbandFn are the execution seams for the two single-shot write handlers.
@@ -113,11 +105,8 @@ func New(ctx *config.Context) *Project {
 	if ctx.GetRedisConn() != nil {
 		p.spaceCache = spacepkg.NewRedisMembershipCache(ctx.GetRedisConn())
 	}
-	// The batch seams are instance fields (see the struct comment): production gets the real
-	// implementations here, and tests swap them on their own instance.
-	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
-		return p.addOneMember(projectID, spaceID, actorUID, uid)
-	}
+	// The remaining batch seam is for the remove endpoint; production gets the real
+	// implementation here, and tests swap it on their own instance.
 	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		return p.removeMember(projectID, spaceID, actorUID, targetUID)
 	}
@@ -135,7 +124,6 @@ func New(ctx *config.Context) *Project {
 	p.nudgeProvisioningFn = p.nudgeProvisioningWorker
 
 	p.registerSpaceMemberRemovalCleanup()
-	p.registerAllMemberGroupOwnerFinalizer()
 	// Publish the provisioning configuration verdict at CONSTRUCTION, not in Route():
 	// a rejected target must be visible even in a crash loop that never reaches Route,
 	// and a startup log line alone is lost within minutes.
@@ -181,7 +169,7 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 	)
 	{
 		spaceScoped.POST("/:space_id/projects", p.createProjectHandler)
-		spaceScoped.GET("/:space_id/projects", p.listProjectsHandler)
+		spaceScoped.GET("/:space_id/projects", p.listProjectsReadHandler)
 	}
 
 	projectScoped := r.Group("/v1/projects",
@@ -190,22 +178,20 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		p.projectMiddleware(),
 	)
 	{
-		projectScoped.GET("/:project_id", p.getProjectHandler)
+		projectScoped.GET("/:project_id", p.getProjectReadHandler)
 		projectScoped.PUT("/:project_id", p.updateProjectHandler)
 		projectScoped.DELETE("/:project_id", p.disbandProjectHandler)
 
-		// Read-only, and gated by the caller's own group membership rather than by
-		// a role check — see listProjectGroupsHandler.
 		projectScoped.GET("/:project_id/groups", p.listProjectGroupsHandler)
-
-		// Personal preferences for one project (pinning). A settings bag rather
-		// than /pin + /unpin, mirroring PUT /v1/groups/:group_no/setting.
+		projectScoped.PUT("/:project_id/groups/:group_no/setting", p.updateProjectGroupSettingHandler)
 		projectScoped.PUT("/:project_id/setting", p.updateSettingHandler)
-
-		projectScoped.GET("/:project_id/members", p.listMembersHandler)
+		projectScoped.GET("/:project_id/members", p.listMembersReadHandler)
+		projectScoped.GET("/:project_id/member-candidates", p.listMemberCandidatesHandler)
+		projectScoped.GET("/:project_id/members/:uid", p.getMemberReadHandler)
 		projectScoped.POST("/:project_id/members/add", p.addMembersHandler)
 		projectScoped.POST("/:project_id/members/remove", p.removeMembersHandler)
 		projectScoped.POST("/:project_id/leave", p.leaveProjectHandler)
+		projectScoped.PUT("/:project_id/owner", p.transferOwnerHandler)
 		projectScoped.PUT("/:project_id/members/:uid/role", p.updateMemberRoleHandler)
 
 		projectScoped.GET("/:project_id/collaboration-roles", p.listCollaborationRolesHandler)
@@ -388,9 +374,6 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 		// It used to answer with the target-level one, whose message blames "the target
 		// user" — there is no target on this endpoint.
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
-	case errors.Is(err, errNameDuplicated):
-		observeRejected(entryProjectCreate, reasonNameDuplicated)
-		httperr.ResponseErrorL(c, errcode.ErrProjectNameDuplicated, nil, nil)
 	case errors.Is(err, errProvisioningEnqueueFailed):
 		// Same wire answer as any other store failure — a client cannot act on it —
 		// but its own metric reason, so an operator can tell that create started
@@ -435,130 +418,6 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 }
 
 // ---------- read ----------
-
-func (p *Project) listProjectsHandler(c *wkhttp.Context) {
-	spaceID := spacepkg.GetSpaceID(c)
-	uid := c.GetLoginUID()
-	offset, limit := pageParams(c)
-
-	// `ok` is NOT discardable, and MemberRole's own doc comment says so: its role return is
-	// an int whose zero value is a VALID role, so a caller that ignores ok hands ordinary
-	// member rights to a non-member.
-	//
-	// This route's Space gate is spaceIDParamMiddleware, which answers from the shared
-	// space:member:{spaceID}:{uid} cache — and that cache can hold a stale POSITIVE two ways:
-	// the Space module's DEL and its negative-cache fallback both failing (a branch
-	// modules/space/member_removal.go logs explicitly), or cache-aside `Set` landing after a
-	// concurrent Space-side DEL and reinstating a positive entry for the full TTL. In either
-	// case this read is the authoritative answer and the only one left, so it decides. It is
-	// a live database read on every request, which is what makes the refusal immediate rather
-	// than eventual.
-	//
-	// The refusal shape is the middleware's own (respondForbidden), so a caller sees the same
-	// answer whether the cache was warm, cold, or stale — the alternative would make the
-	// cache's state observable from the wire.
-	spaceRole, isSpaceMember, err := spacepkg.MemberRole(p.ctx.DB(), spaceID, uid)
-	if err != nil {
-		p.Error("查询 Space 角色失败", zap.Error(err),
-			zap.String("spaceId", spaceID), zap.String("uid", uid))
-		respondQueryFailed(c)
-		return
-	}
-	if !isSpaceMember {
-		p.Warn("Space 成员缓存给出了过期的正命中，列表端点按库内实况拒绝",
-			zap.String("spaceId", spaceID), zap.String("uid", uid))
-		respondForbidden(c)
-		return
-	}
-
-	rows, err := p.db.listVisibleInSpace(spaceID, uid, offset, limit)
-	if err != nil {
-		p.Error("查询项目列表失败", zap.Error(err), zap.String("spaceId", spaceID))
-		respondQueryFailed(c)
-		return
-	}
-	resps := make([]*Resp, 0, len(rows))
-	for _, row := range rows {
-		model := row.Model
-		// Both halves of the split come from fillMemberCounts, out of one roster
-		// read, so a list card and the detail route agree about what the counts
-		// mean, and their sum IS the seat count rather than a third number hoping
-		// to match.
-		//
-		// This used to say "two bounded correlated subqueries", which was one too
-		// many after #855 removed member_count's and zero too many after PR-5
-		// removed seat_count's.
-		resps = append(resps, p.toResp(&model, row.MyRole, spaceRole, row.HumanCount, row.AgentCount(), row.Pinned == 1))
-	}
-	c.Response(resps)
-}
-
-func (p *Project) getProjectHandler(c *wkhttp.Context) {
-	row := requestProject(c)
-	if row == nil {
-		p.Error("projectMiddleware 未注入项目行", zap.String("path", c.FullPath()))
-		respondQueryFailed(c)
-		return
-	}
-	humans, agents := p.splitSeatCounts(row.ProjectID)
-	c.Response(p.toResp(row, requestProjectRole(c), requestSpaceRole(c), humans, agents,
-		p.pinnedOrFalse(row.ProjectID, c.GetLoginUID())))
-}
-
-func (p *Project) listMembersHandler(c *wkhttp.Context) {
-	row := requestProject(c)
-	if row == nil {
-		p.Error("projectMiddleware 未注入项目行", zap.String("path", c.FullPath()))
-		respondQueryFailed(c)
-		return
-	}
-	// The roster is members-only (plus Space admins). A space_listed project shows
-	// its metadata to any Space member, but who is in it is not part of that.
-	if !canViewMembers(requestProjectRole(c), requestSpaceRole(c)) {
-		httperr.ResponseErrorL(c, errcode.ErrProjectNotMember, nil, nil)
-		return
-	}
-	offset, limit := pageParams(c)
-	rows, err := p.db.listMembers(row.ProjectID, offset, limit)
-	if err != nil {
-		p.Error("查询项目成员失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	uids := make([]string, 0, len(rows))
-	for _, member := range rows {
-		uids = append(uids, member.UID)
-	}
-	rolesByUID, err := p.db.memberCollaborationRoles(row.ProjectID, uids)
-	if err != nil {
-		p.Error("查询项目成员协作角色失败", zap.Error(err), zap.String("projectId", row.ProjectID))
-		respondQueryFailed(c)
-		return
-	}
-	resps := make([]*MemberResp, 0, len(rows))
-	for _, m := range rows {
-		roles := rolesByUID[m.UID]
-		if m.Robot == 1 {
-			roles = []CollaborationRoleResp{}
-		}
-		resps = append(resps, &MemberResp{
-			// D16 — the roster tells people and agents apart, and names each
-			// agent's owner, so a client can nest agents under their owner the
-			// way the Space directory does. Both come from LEFT JOINs, so a
-			// member with no user row reads as robot=0 and owner_uid="" rather
-			// than dropping out of the roster.
-			Robot:              m.Robot,
-			OwnerUID:           m.OwnerUID,
-			UID:                m.UID,
-			Name:               m.Name,
-			Role:               m.Role,
-			InviteUID:          m.InviteUID,
-			CollaborationRoles: roles,
-			CreatedAt:          formatTime(m.CreatedAt),
-		})
-	}
-	c.Response(resps)
-}
 
 // ---------- update / disband ----------
 
@@ -632,10 +491,6 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	case errors.Is(err, errNoFieldsToUpdate):
 		respondProjectRequestInvalid(c, "name|description|logo|discoverability|max_members")
 		return
-	case errors.Is(err, errNameDuplicated):
-		observeRejected(entryProjectUpdate, reasonNameDuplicated)
-		httperr.ResponseErrorL(c, errcode.ErrProjectNameDuplicated, nil, nil)
-		return
 	default:
 		p.Error("更新项目失败", zap.Error(err), zap.String("projectId", row.ProjectID))
 		respondStoreFailed(c)
@@ -705,11 +560,11 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 // regardless of who sits in it.
 //
 // member_count is DERIVED here as humans + agents rather than read as a third
-// count. Both callers produce the two halves by classifying ONE roster read --
-// countActiveSeatsByKind on the detail path, fillMemberCounts on the list path --
-// so their sum already IS the seat count, exactly. Reading a total separately
-// would add a number that can disagree with the two beside it for no gain, and
-// deriving it puts the identity a client renders (member_count ==
+// count. Both callers produce the two halves from their repeatable-read roster
+// snapshot -- the detail path directly and the list path through its batched seat
+// count -- so their sum already IS the seat count, exactly. Reading a total
+// separately would add a number that can disagree with the two beside it for no
+// gain, and deriving it puts the identity a client renders (member_count ==
 // human_member_count + agent_member_count) beyond reach of a future edit that
 // gives the reads different predicates.
 //

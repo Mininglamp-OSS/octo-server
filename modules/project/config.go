@@ -112,9 +112,10 @@ const (
 	defaultMetricsInterval = 15 * time.Minute
 )
 
-// Field length caps.
+// Field length caps follow the Project contract. Name is measured in Unicode
+// code points (the HTTP layer uses utf8.RuneCountInString), not bytes.
 const (
-	maxNameChars        = 64
+	maxNameChars        = 30
 	maxDescriptionChars = 500
 	maxLogoChars        = 200
 )
@@ -138,9 +139,7 @@ type Config struct {
 	ReconcileInterval              time.Duration
 	ReconcileLimit                 int
 	// AllMemberGroupAdmitGrace exempts a project seat written within this window
-	// from I4 scan B, because the admitter runs AFTER the seat transaction commits
-	// (D12) and there is therefore a real interval in which the seat exists and
-	// the group row does not. Without it the scan reports the design.
+	// from I4 scan B, because the admitter runs after the seat transaction commits.
 	AllMemberGroupAdmitGrace time.Duration
 	MetricsInterval          time.Duration
 	// Provisioning is the eager subsystem-container configuration (brief D2).

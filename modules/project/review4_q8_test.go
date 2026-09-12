@@ -64,16 +64,14 @@ func TestMembershipWriteDoesNotTouchProjectUpdatedAt(t *testing.T) {
 	// A REAL add (fresh uid), not a no-op re-add: the epoch must move while updated_at must
 	// not — the two signals are now cleanly separated.
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"fresh1"}})
+		ownerTok, addMembersPayload("fresh1"))
 	require.Equal(t, 200, w.Code, "body: %s", w.Body.String())
 	var outcomes []memberOutcome
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
 	require.Len(t, outcomes, 1)
 	require.True(t, outcomes[0].OK, "seeding add failed: %s", outcomes[0].Reason)
-	// committed itself is deliberately off the wire; its BEHAVIOR is pinned by
-	// TestNoOpBatchWithActorFailureStaysOneStatusCode in review4_blocker_test.go. Here the
-	// observable consequences are asserted below: the DB row exists, updated_at is unmoved,
-	// the epoch moved.
+	// committed itself is deliberately off the wire; the observable consequences are asserted
+	// below: the DB row exists, updated_at is unmoved, and the epoch moved.
 
 	after := updatedAtOf(t, created.ProjectID)
 	assert.Equal(t, before.UpdatedAt, after.UpdatedAt,

@@ -1,19 +1,8 @@
 package group
 
-// A10 (preset-group auto-join) exercised through its own function, not the funnel.
-//
-// PR #846's review noted that six of the eleven entry points are covered only by
-// calling admitOrRestoreMembersTx directly — which proves the funnel refuses, not
-// that the path reaches the funnel with the group's real attribution. A10 is the
-// cheapest of the six to pin at path level: it is a plain function that
-// modules/space calls through a registered hook, with no HTTP request and no
-// Space-join flow needed.
-//
-// What this catches that the funnel tests cannot: admitToPresetGroup reading the
-// project_id from the group row rather than passing "". Passing "" would be
-// correct today (modules/space refuses to preset a project group) and would be a
-// silent fail-OPEN the moment that check moved — which is precisely the argument
-// the function's own doc comment makes.
+// A10 (preset-group auto-join) is exercised through its own function, not the
+// invitation HTTP flow. Preset eligibility remains a Space concern, while
+// native membership is independent from Project membership.
 
 import (
 	"testing"
@@ -22,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPresetGroupAdmissionRefusesANonProjectMember(t *testing.T) {
+func TestPresetGroupAdmissionAdmitsANonProjectMember(t *testing.T) {
 	_, ctx := newTestServer(t)
 	f := New(ctx)
 
@@ -32,14 +21,10 @@ func TestPresetGroupAdmissionRefusesANonProjectMember(t *testing.T) {
 	seedSpaceSeat(t, ctx, spaceID, "a10_outsider")
 	seedProject(t, ctx, projectID, spaceID)
 	seedGroupRow(t, ctx, groupNo, spaceID, projectID)
-	// Deliberately no octo_project_member row.
 
-	err := f.admitToPresetGroup(ctx, spaceID, groupNo, "a10_outsider")
-	require.ErrorIs(t, err, ErrAdmissionRefused,
-		"a Space member who is not a project member must not be auto-joined into a "+
-			"project group, however the group came to be listed as a preset")
-	require.False(t, activeMemberExists(t, ctx, groupNo, "a10_outsider"),
-		"I2 has no read-path filter: the row IS the access")
+	require.NoError(t, f.admitToPresetGroup(ctx, spaceID, groupNo, "a10_outsider"))
+	require.True(t, activeMemberExists(t, ctx, groupNo, "a10_outsider"),
+		"native preset admission must not require a Project seat")
 }
 
 func TestPresetGroupAdmissionAdmitsAProjectMember(t *testing.T) {
@@ -59,8 +44,30 @@ func TestPresetGroupAdmissionAdmitsAProjectMember(t *testing.T) {
 		"the gate must not have become a blanket refusal")
 }
 
-// TestPresetGroupAdmissionAdmitsIntoASpaceDirectGroup keeps the refusal above
-// honest: without a project the same call must sail through.
+func TestPresetGroupAdmissionSkipsDedicatedAllMemberGroup(t *testing.T) {
+	_, ctx := newTestServer(t)
+	f := New(ctx)
+
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	projectID := util.GenerUUID()
+	groupNo := util.GenerUUID()
+	seedSpaceSeat(t, ctx, spaceID, "a10_preset_outsider")
+	seedProject(t, ctx, projectID, spaceID)
+	seedGroupRow(t, ctx, groupNo, spaceID, projectID)
+	_, err := ctx.DB().Update("octo_project").
+		Set("all_member_group_no", groupNo).
+		Where("project_id=?", projectID).Exec()
+	require.NoError(t, err)
+
+	require.NoError(t, f.admitToPresetGroup(
+		ctx, spaceID, groupNo, "a10_preset_outsider",
+	))
+	require.False(t, activeMemberExists(t, ctx, groupNo, "a10_preset_outsider"),
+		"preset admission must not bypass the dedicated Project group projection")
+}
+
+// TestPresetGroupAdmissionAdmitsIntoASpaceDirectGroup covers the same native
+// policy for a Space-direct group.
 func TestPresetGroupAdmissionAdmitsIntoASpaceDirectGroup(t *testing.T) {
 	_, ctx := newTestServer(t)
 	f := New(ctx)
