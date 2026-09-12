@@ -45,6 +45,10 @@ func (s *Service) CreateProjectGroup(req *CreateGroupServiceReq) (*CreateGroupSe
 		return nil, projectmod.ErrGroupProjectForbidden
 	}
 	requestedMembers := projectGroupUniqueUIDs(req.Members)
+	if botUID != "" {
+		// Include the Bot in the existing Space-seat lock set on every snapshot retry.
+		requestedMembers = append(requestedMembers, botUID)
+	}
 	candidates := projectGroupUniqueUIDs(append(append([]string{}, preparedMembers...), requestedMembers...))
 
 	groupNo := util.GenerUUID()
@@ -194,6 +198,11 @@ func (s *Service) insertProjectGroupTx(
 	spaceMemberUIDs := make(map[string]struct{}, len(access.SpaceMemberUIDs))
 	for _, uid := range access.SpaceMemberUIDs {
 		spaceMemberUIDs[uid] = struct{}{}
+	}
+	if botUID != "" {
+		if _, ok := spaceMemberUIDs[botUID]; !ok {
+			return nil, false, projectmod.ErrGroupProjectForbidden
+		}
 	}
 	isExternalGroup := 0
 	for _, uid := range members {

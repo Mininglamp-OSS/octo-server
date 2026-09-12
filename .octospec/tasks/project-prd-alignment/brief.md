@@ -27,6 +27,7 @@ Group relations are entry metadata only: association/listing never grants chat r
 - Spec 7: member additions use `{members:[{uid,role}]}` with roles 0/1, lock current organization and Project state in one transaction, deduplicate identical requests, reject role conflicts/invalid targets atomically, and safely re-admit removed rows with the requested role; organization removal denies access while preserving the Owner role record.
 - Project 专用成员候选接口 `GET /v1/projects/:project_id/member-candidates` 仅面向有效组织真人目录，Owner/Admin 才能访问；单次 RR 读快照完成权限、三状态（`current_user`、`already_member`、`invitable`）分类、字面姓名搜索、Project 分页和 `X-Total-Count`，active 且 `removing=0` 的 Project 席位才算已在，离开者可再次邀请，不暴露 email 等额外个人信息。
 - Spec 10/11/12 where touched: no partial local mutation on failed core transactions, controlled lock order/current reads, migrated callers/tests/error responses, and documented external contract cutover.
+- Project 建群服务的 `BotUID` 必须在同一建群事务中复核目标 Space 的 active 席位；复用现有候选人锁顺序。验收包括跨 Space Bot 拒绝且无部分写入、Space 内非 Project Bot 正常入群并设置 `bot_admin`、已在 Project 快照内的 Bot 保持单条成员记录及管理权限。普通成员准入、Bot 的 Project 成员资格要求和提交后 IM 策略不扩展。
 
 ## Sidebar and relation metadata contract
 

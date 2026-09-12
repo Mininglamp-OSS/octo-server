@@ -15,6 +15,7 @@
   `ProjectGroupRelation` 投影：返回 Project 的存活关联群，不再按调用者的原生
   `group_member` 席位过滤，同时保留 Project 成员授权、置顶排序和默认 50 条上限。
 - Project-backed 建群将非成员、禁用目标和跨 Space 等预期拒绝返回本地化 D14 4xx envelope（legacy wire status 仍为 400），`POST /v1/group/create` 同时接入共享 UID 限流；原生群管理门和 active 角色冲突的整批原子拒绝补齐回归覆盖。
+- Project 建群服务补齐 `BotUID` 的目标 Space 席位校验，与建群写入共用事务及既有锁顺序。跨 Space Bot 会拒绝整次建群；Space 内 Bot 无需先加入 Project，已有 Project Bot 成员保持单条原生记录及 `bot_admin`。
 - 统一 Sidebar 的 Project 条目仅对有效 Project 成员可见；Space-listed 非成员的历史
   pin 不回填入口。`groups[]` 是不授予原生聊天权限的关系元数据，客户端字段切换需
   协调上线且本版本不声称已部署；原生群成员同步不属于本 Sidebar 契约，普通发起群和

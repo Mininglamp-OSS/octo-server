@@ -275,3 +275,83 @@ func TestProjectGroupCreateRejectsExplicitInactiveNativeMemberAtomically(t *test
 	).LoadOne(&groups))
 	assert.Zero(t, groups, "an invalid explicit target must not leave a partially-created Project group")
 }
+
+func TestProjectGroupCreateBotSpaceEligibility(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		inSpace   bool
+		inProject bool
+	}{
+		{name: "outside_space"},
+		{name: "space_member_outside_project", inSpace: true},
+		{name: "project_snapshot_member", inSpace: true, inProject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ctx := newTestServer(t)
+			defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+			spaceID := "space-" + util.GenerUUID()
+			projectID := "project-" + util.GenerUUID()
+			creator := "creator-" + util.GenerUUID()
+			botUID := "bot-" + util.GenerUUID()
+			seedSpaceSeat(t, ctx, spaceID, creator)
+			seedProject(t, ctx, projectID, spaceID)
+			seedProjectMember(t, ctx, projectID, spaceID, creator, 0)
+			if tc.inSpace {
+				seedSpaceSeat(t, ctx, spaceID, botUID)
+			} else {
+				seedSpaceSeat(t, ctx, "other-"+util.GenerUUID(), botUID)
+			}
+			if tc.inProject {
+				seedProjectMember(t, ctx, projectID, spaceID, botUID, 0)
+			}
+			f := New(ctx)
+			require.NoError(t, f.userDB.Insert(&projectuser.Model{
+				UID: creator, ShortNo: creator, Name: "Creator", Status: 1,
+				IsDestroy: projectuser.IsDestroyNo,
+			}))
+			require.NoError(t, f.userDB.Insert(&projectuser.Model{
+				UID: botUID, ShortNo: botUID, Name: "Bot", Status: 1,
+				IsDestroy: projectuser.IsDestroyNo, Robot: 1,
+			}))
+			im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer im.Close()
+			ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+			resp, err := f.groupService.CreateGroup(&CreateGroupServiceReq{
+				Creator: creator, ProjectID: projectID, SpaceID: spaceID, BotUID: botUID,
+			})
+			if !tc.inSpace {
+				assert.ErrorIs(t, err, projectmod.ErrGroupProjectForbidden)
+				assert.Nil(t, resp)
+				var groups, members int
+				require.NoError(t, ctx.DB().SelectBySql(
+					"SELECT COUNT(*) FROM `group` WHERE project_id=?", projectID,
+				).LoadOne(&groups))
+				require.NoError(t, ctx.DB().SelectBySql(
+					"SELECT COUNT(*) FROM group_member WHERE uid IN ?", []string{creator, botUID},
+				).LoadOne(&members))
+				assert.Zero(t, groups, "an ineligible Bot must not leave a Project group")
+				assert.Zero(t, members, "an ineligible Bot must not leave partial native membership")
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			var rows []struct {
+				Status   int `db:"status"`
+				BotAdmin int `db:"bot_admin"`
+				Robot    int `db:"robot"`
+			}
+			_, err = ctx.DB().SelectBySql(
+				"SELECT status, bot_admin, robot FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+				resp.GroupNo, botUID,
+			).Load(&rows)
+			require.NoError(t, err)
+			require.Len(t, rows, 1, "both admission paths must produce exactly one native Bot member")
+			assert.Equal(t, int(common.GroupMemberStatusNormal), rows[0].Status)
+			assert.Equal(t, 1, rows[0].BotAdmin)
+			assert.Equal(t, 1, rows[0].Robot)
+		})
+	}
+}
