@@ -510,8 +510,8 @@ func ValidateEmailAddress(email string) error {
 // PreflightSMTP exercises the same SMTP transaction used for real mail. The
 // sender address is used as the recipient because no new deployment setting
 // is introduced for a probe mailbox. This deliberately sends a real probe;
-// callers invoke it only when enabling/validating manager MFA or during the
-// startup warning check.
+// callers invoke it only when enabling or modifying the manager MFA SMTP
+// configuration.
 func (s *EmailService) PreflightSMTP(ctx context.Context) error {
 	smtpAddr, fromAddr, pwd := s.resolveSMTP()
 	if err := ValidateSMTPConfiguration(smtpAddr, fromAddr, pwd); err != nil {

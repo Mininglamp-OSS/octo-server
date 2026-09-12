@@ -45,10 +45,13 @@ type systemSettingUpdateReq struct {
 //   - Value: the DB-stored value, or "" if not configured. For encrypted
 //     types this is the secretMask placeholder whenever a non-empty
 //     ciphertext is stored; cleartext is never returned.
-//   - EffectiveValue: the value currently in effect after applying the
-//     DB → yaml → code-default fallback chain. For encrypted types this is
-//     secretMask whenever the effective plaintext is non-empty (whether the
-//     source is DB or yaml), and "" otherwise. Plaintext is NEVER returned.
+//   - EffectiveValue: the value currently displayed by the manager
+//     configuration surface. Most settings use the DB → yaml → code-default
+//     fallback chain. The support.email* settings are intentionally different:
+//     this admin surface reads them from the database only, so an absent DB
+//     row is shown as empty rather than presenting a YAML-only SMTP config as
+//     an admin-managed value. For encrypted types this is secretMask only when
+//     a non-empty database plaintext exists. Plaintext is NEVER returned.
 type systemSettingItemResp struct {
 	Category       string `json:"category"`
 	Key            string `json:"key"`
@@ -100,6 +103,10 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 
 	items := make([]systemSettingItemResp, 0, len(systemSettingSchema))
 	schema := make([]systemSettingSchemaResp, 0, len(systemSettingSchema))
+	// The manager configuration surface treats SMTP as database-owned. Keep
+	// this local to the handler: ordinary SupportEmail* getters still retain
+	// their YAML fallback for existing user-facing mail flows.
+	managerSMTP := m.systemSettings.managerEmailMFASMTPSettings()
 	for _, def := range systemSettingSchema {
 		schema = append(schema, systemSettingSchemaResp{
 			Category:    def.Category,
@@ -129,12 +136,22 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 			}
 		}
 
-		// EffectiveValue resolves DB → yaml → code default through the typed
-		// getters bound on the schema entry. Encrypted plaintext is replaced
-		// with secretMask before serialisation — a yaml SMTP password must
-		// never leak through this endpoint.
+		// EffectiveValue normally resolves DB → yaml → code default through the
+		// typed getter bound on the schema entry. The manager-facing SMTP rows
+		// are the exception: they must reflect the database snapshot only, so
+		// the UI cannot mistake a YAML fallback for a persisted admin setting.
 		if def.Effective != nil {
-			effective := def.Effective(m.systemSettings)
+			effective := ""
+			switch {
+			case def.Category == "support" && def.Key == "email":
+				effective = managerSMTP.from
+			case def.Category == "support" && def.Key == "email_smtp":
+				effective = managerSMTP.address
+			case def.Category == "support" && def.Key == "email_pwd":
+				effective = managerSMTP.password
+			default:
+				effective = def.Effective(m.systemSettings)
+			}
 			if def.Type == settingTypeEncrypted {
 				if effective != "" {
 					item.EffectiveValue = secretMask
@@ -161,9 +178,11 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 //  4. Encrypted columns: empty value is silently skipped (preserves the
 //     existing ciphertext); non-empty values are AES-256-GCM encrypted
 //     via encryptKey before storage.
-//  5. After all rows are upserted, SystemSettings.Reload is called so
-//     this instance serves the new values immediately. Other instances
-//     pick it up within reloadTTL.
+//  5. Manager MFA/SMTP writes validate the merged final configuration and
+//     perform a real SMTP preflight before the transaction commits. After all
+//     rows are upserted, SystemSettings.Load is called so this instance serves
+//     the new values immediately. Other instances observe the database through
+//     their existing reload mechanism.
 func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		c.ResponseError(err)
@@ -184,6 +203,10 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// half-applied write. The actual writes happen later in one
 	// transaction.
 	plans := make([]preparedSetting, 0, len(req.Items))
+	// Use one database-only snapshot for the manager SMTP merge. In particular,
+	// retaining email_pwd must not silently pull a YAML password into the MFA
+	// configuration when the database has no password row.
+	managerSMTP := m.systemSettings.managerEmailMFASMTPSettings()
 	for _, item := range req.Items {
 		def := findSchemaDef(item.Category, item.Key)
 		if def == nil {
@@ -268,7 +291,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				// or accidentally store "****" as the real password.
 				p.skip = true
 				if item.Category == "support" && item.Key == "email_pwd" {
-					p.effectiveValue = m.systemSettings.SupportEmailPwd()
+					p.effectiveValue = managerSMTP.password
 				}
 				break
 			}
@@ -298,51 +321,70 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// Manager MFA uses the merged final configuration. This check is purposely
 	// before the database transaction: a failed SMTP preflight cannot leave a
 	// partially committed MFA switch or SMTP value behind.
-	managerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
-	managerMFATouched := false
+	currentManagerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
+	managerMFAOn := currentManagerMFAOn
+	// smtpTouched means the merged SMTP value differs from the current
+	// database snapshot. Merely including an unchanged SMTP field in a form
+	// submission must not send a real probe email.
 	smtpTouched := false
-	prospectiveSMTP := smtpSettingsSnapshot{
-		from:     m.systemSettings.SupportEmail(),
-		address:  m.systemSettings.SupportEmailSmtp(),
-		password: m.systemSettings.SupportEmailPwd(),
-	}
+	smtpClearRequested := false
+	prospectiveSMTP := managerSMTP
 	for _, p := range plans {
 		if p.def.Category == "login" && p.def.Key == "manager_email_mfa_on" {
-			managerMFATouched = true
 			managerMFAOn = p.value == "1"
 		}
 		if p.def.Category == "support" && !p.skip {
 			switch p.def.Key {
 			case "email":
 				prospectiveSMTP.from = p.effectiveValue
-				smtpTouched = true
 			case "email_smtp":
 				prospectiveSMTP.address = p.effectiveValue
-				smtpTouched = true
 			case "email_pwd":
 				prospectiveSMTP.password = p.effectiveValue
-				smtpTouched = true
 			}
 		}
 	}
-	managerMFAProbeSucceeded := false
-	if managerMFAOn && (managerMFATouched || smtpTouched) {
-		if err := commonbase.ValidateSMTPConfiguration(
-			prospectiveSMTP.address, prospectiveSMTP.from, prospectiveSMTP.password,
-		); err != nil {
-			m.Warn("管理端 MFA SMTP 配置校验失败", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
-			return
+	// Decide from the final merged values, not from individual request items.
+	// This keeps duplicate keys or a change-then-revert batch from causing a
+	// real SMTP probe when the committed effective configuration is unchanged.
+	smtpTouched = prospectiveSMTP.from != managerSMTP.from ||
+		prospectiveSMTP.address != managerSMTP.address ||
+		prospectiveSMTP.password != managerSMTP.password
+	smtpClearRequested = (prospectiveSMTP.from != managerSMTP.from && strings.TrimSpace(prospectiveSMTP.from) == "") ||
+		(prospectiveSMTP.address != managerSMTP.address && strings.TrimSpace(prospectiveSMTP.address) == "")
+	// The admin console submits the complete settings form on every save. Treat
+	// the MFA switch as touched only when its merged final value actually
+	// changes, so saving an unrelated setting while MFA is already enabled does
+	// not send another real SMTP probe or re-query the operator account.
+	managerMFATouched := managerMFAOn != currentManagerMFAOn
+	if smtpTouched || (managerMFATouched && managerMFAOn) {
+		// Clearing SMTP is allowed only while manager MFA is off. Any
+		// non-clearing SMTP update, and every MFA enable, must validate and probe
+		// the merged final configuration before the transaction is committed.
+		if strings.TrimSpace(prospectiveSMTP.address) == "" ||
+			strings.TrimSpace(prospectiveSMTP.from) == "" {
+			if managerMFAOn || !smtpClearRequested {
+				m.Warn("管理端 MFA SMTP 配置校验失败：配置不完整")
+				httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
+				return
+			}
+		} else {
+			if err := commonbase.ValidateSMTPConfiguration(
+				prospectiveSMTP.address, prospectiveSMTP.from, prospectiveSMTP.password,
+			); err != nil {
+				m.Warn("管理端 MFA SMTP 配置校验失败", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+			probeErr := commonbase.NewEmailService(m.ctx, prospectiveSMTP).PreflightSMTP(probeCtx)
+			cancel()
+			if probeErr != nil {
+				m.Warn("管理端 MFA SMTP 预检失败", zap.Error(probeErr))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrUserManagerMFAMisconfigured, nil, nil)
+				return
+			}
 		}
-		probeCtx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
-		probeErr := commonbase.NewEmailService(m.ctx, prospectiveSMTP).PreflightSMTP(probeCtx)
-		cancel()
-		if probeErr != nil {
-			m.Warn("管理端 MFA SMTP 预检失败", zap.Error(probeErr))
-			httperr.ResponseErrorLWithStatus(c, errcode.ErrUserManagerMFAMisconfigured, nil, nil)
-			return
-		}
-		managerMFAProbeSucceeded = true
 	}
 	if managerMFAOn && managerMFATouched {
 		var operator struct{ Email string }
@@ -535,10 +577,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	committed = true
 
 	// The merged prospective configuration was already SMTP-probed before the
-	// transaction. Use the no-probe load here so this instance publishes that
-	// result without sending a duplicate probe email; generic Reload callers
-	// still trigger a one-shot probe when they observe a settings change.
-	generation, reloadErr := m.systemSettings.loadWithGeneration(false)
+	// transaction. Reload only publishes the committed database snapshot; it
+	// never sends a duplicate startup or reload probe.
+	reloadErr := m.systemSettings.Load()
 	if reloadErr != nil {
 		// 配置已提交但本实例 reload 失败：属于系统配置基础设施故障，本实例仍在
 		// 服务旧快照，最长等到下一次 60s 自动 reload 才收敛。
@@ -551,14 +592,6 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			zap.Error(reloadErr),
 			zap.String("trace_id", c.GetString(reqid.GinKey)),
 			zap.String("operator", c.GetLoginUID()))
-	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
-		// The probe above used the merged prospective values. Publish its
-		// result only when the live snapshot still contains those exact values;
-		// a concurrent partial SMTP update must not make an unprobed
-		// combination look ready.
-		if !m.systemSettings.RecordManagerEmailMFAPreflightIfMatches(generation, prospectiveSMTP) {
-			m.Warn("丢弃与当前配置不匹配的管理端 MFA SMTP 预检结果")
-		}
 	}
 
 	// 写入若涉及 login.local_off,直接用刚刚校验过的 plan.value 触发 safety
@@ -598,9 +631,10 @@ func (m *Manager) finishSettingUpdate(c *wkhttp.Context, audits []settingAuditEn
 
 // testSystemSettingEmail handles POST /v1/manager/common/system_setting/test_email.
 //
-// Sends a no-op test message to the requested address using the currently
-// effective SMTP config (DB values, falling back to yaml). Lets admins
-// validate SMTP credentials without registering a real user.
+// Sends a no-op test message to the requested address using the same
+// database-backed SMTP snapshot as the manager-console MFA flow. This keeps
+// the admin diagnostic from reporting YAML-fallback health for a configuration
+// that MFA itself cannot use.
 func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		c.ResponseError(err)
@@ -619,15 +653,15 @@ func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 		return
 	}
 
-	emailSvc := commonbase.NewEmailService(m.ctx, m.systemSettings)
+	managerSMTP := m.systemSettings.ManagerEmailMFASMTPSettings()
+	emailSvc := commonbase.NewEmailService(m.ctx, managerSMTP)
 	// Pre-send log:遇到「投出去但收件人没收到」时,这条记录至少证明 endpoint
 	// 走到了发送阶段,排查时可以直接对比 SMTP 服务器 sent log;同时把当前
-	// effective 的发件人 / 服务器记下来,方便确认 DB override 与 yaml fallback
-	// 的最终生效值,避免再去 GET /system_setting 二次核对。
+	// MFA 实际使用的发件人 / 服务器记下来,避免自测结果与 MFA 发码路径不一致。
 	m.Info("SMTP 测试邮件已尝试投递",
 		zap.String("to", req.To),
-		zap.String("from", m.systemSettings.SupportEmail()),
-		zap.String("smtp", m.systemSettings.SupportEmailSmtp()))
+		zap.String("from", managerSMTP.SupportEmail()),
+		zap.String("smtp", managerSMTP.SupportEmailSmtp()))
 
 	if err := emailSvc.SendTransactionalHTML(
 		c.Request.Context(),
@@ -641,8 +675,8 @@ func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 		// 调用方是 SuperAdmin,降低 HAR 抓包外流时的信息量。
 		m.Error("SMTP 测试邮件投递失败",
 			zap.String("to", req.To),
-			zap.String("from", m.systemSettings.SupportEmail()),
-			zap.String("smtp", m.systemSettings.SupportEmailSmtp()),
+			zap.String("from", managerSMTP.SupportEmail()),
+			zap.String("smtp", managerSMTP.SupportEmailSmtp()),
 			zap.Error(err))
 		c.ResponseError(errors.New("发送失败，请查看服务端日志"))
 		return
