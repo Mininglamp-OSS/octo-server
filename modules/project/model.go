@@ -6,9 +6,8 @@ import "time"
 
 // Project status (octo_project.status).
 const (
-	// StatusDisbanded — the project has been disbanded. Terminal: its name is
-	// released (the active_name generated column goes NULL) and every read path
-	// treats it as nonexistent.
+	// StatusDisbanded — the project has been disbanded. Read paths treat it
+	// as nonexistent; project names are independent labels.
 	StatusDisbanded = 0
 	// StatusNormal — active.
 	StatusNormal = 1
@@ -46,15 +45,12 @@ func IsValidRole(r int) bool { return r == RoleCommon || r == RoleAdmin || r == 
 
 // Discoverability (octo_project.discoverability).
 //
-// Named for what it is. These values filter the Space project list and directory
-// search; they are NOT a security boundary — a Space admin can still enumerate
-// project metadata. Calling the field "visibility" or "secret" would invite
-// readers to treat it as isolation, which it is not.
+// Project discoverability is retained for storage compatibility; all Project
+// reads still require an active Space identity and active Project membership.
 const (
-	// DiscoverabilitySpaceListed — appears in the Space project list.
+	// DiscoverabilitySpaceListed — legacy display classification.
 	DiscoverabilitySpaceListed = 0
-	// DiscoverabilityUnlisted — hidden from the list; reachable by its members
-	// and by Space admins.
+	// DiscoverabilityUnlisted — legacy display classification.
 	DiscoverabilityUnlisted = 1
 )
 
@@ -107,11 +103,10 @@ type Model struct {
 	// none yet. "" is the sentinel and the column is NOT NULL, so every
 	// predicate in the feature is written `= ''` / `!= ''` (see D5).
 	//
-	// Empty is a REACHABLE state, not an error: the group is provisioned after
-	// the create transaction commits (the hook opens its own transaction in
-	// modules/group), so a provisioning failure leaves the project alive with no
-	// group. D4 makes that recoverable rather than terminal — the next write path
-	// on this project retries under a lease, and reconcile scan A reports it.
+	// Empty is a reachable state, not an error: provisioning runs after the
+	// create transaction commits (the hook opens its own modules/group
+	// transaction), so a failure leaves the Project alive without a group.
+	// Reconcile scan A reports that missing artifact for operational repair.
 	AllMemberGroupNo string    `db:"all_member_group_no"`
 	CreatedAt        time.Time `db:"created_at"`
 	UpdatedAt        time.Time `db:"updated_at"`
@@ -128,13 +123,17 @@ type MemberModel struct {
 	// while Status is still MemberStatusActive.
 	//
 	// Every authorization read treats Removing == 1 as a NON-member — the member
-	// list, the group admission gate, the middleware's role resolution. Status
-	// stays active until the group detach finishes, and that is what keeps I2
-	// from being literally violated by the removal itself: the group_member rows
-	// that have not been cleaned up yet still belong to a member of record.
+	// list and middleware's role resolution use this clause. Status stays active
+	// until the removal worker finishes registered cleanup; native group membership
+	// is independent and is not mutated by this Project-side seat close.
 	Removing  int       `db:"removing"`
 	InviteUID string    `db:"invite_uid"`
 	CreatedAt time.Time `db:"created_at"`
+	// JoinedAt is the start of the current active membership round. During the
+	// rolling expand window legacy writers may leave it NULL; every read projection
+	// uses COALESCE(joined_at, created_at) before scanning this time.Time field.
+	// New admissions initialize it with CreatedAt and re-admissions refresh it.
+	JoinedAt  time.Time `db:"joined_at"`
 	UpdatedAt time.Time `db:"updated_at"`
 }
 
@@ -189,14 +188,24 @@ type settingReq struct {
 	Pinned *bool `json:"pinned"`
 }
 
+// memberAdd is the per-target role contract for an atomic members/add batch.
+// Role 0 (member) is the default when omitted; RoleOwner is never accepted
+// here because owner changes have a dedicated atomic transfer endpoint.
+type memberAdd struct {
+	UID  string `json:"uid"`
+	Role int    `json:"role"`
+}
+
 type membersReq struct {
+	Members []memberAdd `json:"members"`
+}
+
+type memberUIDsReq struct {
 	UIDs []string `json:"uids"`
 }
 
-type leaveReq struct {
-	// TransferTo names the successor when the caller is the last owner. Leaving
-	// without it is rejected rather than silently producing an ownerless project.
-	TransferTo string `json:"transfer_to"`
+type ownerTransferReq struct {
+	UID string `json:"uid"`
 }
 
 type roleReq struct {
@@ -207,9 +216,6 @@ type roleReq struct {
 	// handler was hardened against in round 1. Matches updateReq, where every optional
 	// field is a pointer for the same reason.
 	Role *int `json:"role"`
-	// TransferTo is required when demoting the last owner, for the same reason as
-	// in leaveReq.
-	TransferTo string `json:"transfer_to"`
 }
 
 type collaborationRoleNameReq struct {
@@ -313,11 +319,6 @@ type Capabilities struct {
 	CanChangeRole   bool `json:"can_change_role"`
 	CanLeave        bool `json:"can_leave"`
 	CanViewMembers  bool `json:"can_view_members"`
-	// CanManageOwnAgents is the narrow capability D15 adds: any active project
-	// member may seat and unseat THEIR OWN agents, without holding
-	// CanManageMember. It is deliberately not derivable from the role number —
-	// an ordinary member has it and cannot manage anyone else.
-	CanManageOwnAgents bool `json:"can_manage_own_agents"`
 }
 
 // MemberResp is one row of the project member roster.
@@ -337,6 +338,7 @@ type MemberResp struct {
 	OwnerUID           string                  `json:"owner_uid"`
 	CollaborationRoles []CollaborationRoleResp `json:"collaboration_roles"`
 	CreatedAt          string                  `json:"created_at"`
+	JoinedAt           string                  `json:"joined_at"`
 }
 
 const (
@@ -366,67 +368,6 @@ type CollaborationRoleResp struct {
 type collaborationRoleCatalogResp struct {
 	CollaborationRoleEpoch int64                   `json:"collaboration_role_epoch"`
 	Roles                  []CollaborationRoleResp `json:"roles"`
-}
-
-// GroupResp is one row of the project group list.
-//
-// Deliberately NARROW, and not a copy of modules/group's GroupResp. That struct
-// is forty-odd fields of per-user group state, and it is served by the routes a
-// client already calls for exactly that (GET /v1/group/my, GET /v1/groups/:group_no).
-// Restating it here would create a second wire contract for one piece of state,
-// and the two would drift the first time either changed — while this module,
-// which cannot import modules/group, would have no compiler to notice.
-//
-// So this answers one question — which groups in this project am I in — with the
-// fields the tree renders, and the client fetches everything else where it
-// already does. The avatar fields travel together because they are one decision
-// on the client: avatar_text/avatar_color override, is_upload_avatar wins over
-// both, and is_named decides the fallback when none is set. Shipping a subset
-// would make the list render group avatars differently from every other surface.
-type GroupResp struct {
-	GroupNo string `json:"group_no"`
-	Name    string `json:"name"`
-	// IsNamed is 1 for a group created BEFORE the 2026-06-29 avatar revamp and 0
-	// for one created after: legacy groups render the group name's first two
-	// characters into the default avatar, new ones fall back to the two-person
-	// icon. NOT "the user chose this name" — that was the column's original
-	// meaning and 20260629000002_refresh_avatar_comments.sql retired it.
-	//
-	// On THIS endpoint the value is therefore always 0: modules/group hardcodes
-	// IsNamed: 0 at BOTH create sites in modules/group/service.go, and 1 exists only where
-	// the #500 migration backfilled it, which no project group can be. It is
-	// shipped anyway so the avatar fallback chain is evaluated by the same code
-	// on every surface rather than special-cased here — a client that hardcodes
-	// the fallback for this list is the drift the field exists to prevent.
-	IsNamed int `json:"is_named"`
-	// AvatarText is the custom avatar text; "" falls back per IsNamed.
-	AvatarText string `json:"avatar_text"`
-	// AvatarColor is the custom palette index; null derives it from group_no.
-	// A pointer because the column is nullable and null is NOT index 0.
-	AvatarColor    *int `json:"avatar_color"`
-	IsUploadAvatar int  `json:"is_upload_avatar"`
-	// MemberCount counts active members (is_deleted = 0 AND status = 1),
-	// everyone in the group — the same meaning the project's own member_count
-	// carries, and the same one modules/opanalytics uses.
-	//
-	// This comment used to warn that the two were different populations, because
-	// #855 had narrowed the project's member_count to humans. That narrowing was
-	// reverted before GA precisely to remove the hazard this line described: one
-	// name, one meaning, with the human/agent split in its own two fields. The
-	// populations are still different — a group's roster is not a project's — but
-	// the QUESTION the name asks is now the same everywhere.
-	MemberCount int `json:"member_count"`
-}
-
-// memberRosterModel is the member roster joined to `user` for display names.
-type memberRosterModel struct {
-	MemberModel
-	Name string `db:"name"`
-	// Robot / OwnerUID come from `user` and `robot` respectively, both LEFT
-	// JOINed: a member whose user row is missing must still appear (see
-	// listMembers), and a robot row is absent for every person.
-	Robot    int    `db:"robot"`
-	OwnerUID string `db:"owner_uid"`
 }
 
 const respTimeFormat = "2006-01-02 15:04:05"

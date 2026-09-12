@@ -51,8 +51,8 @@ func seedVerifyProject(t *testing.T, ctx *config.Context, projectID, spaceID str
 func seedVerifyProjectMember(t *testing.T, ctx *config.Context, projectID, spaceID, uid string, role int) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
-		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, 1, 0, '', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+		"INSERT INTO `octo_project_member` (project_id, uid, space_id, role, status, removing, invite_uid, created_at, joined_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, 1, 0, '', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
 		projectID, uid, spaceID, role).Exec()
 	require.NoError(t, err)
 }

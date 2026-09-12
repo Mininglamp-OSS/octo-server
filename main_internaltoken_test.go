@@ -41,7 +41,6 @@ func TestFixedInternalTokenExclusionsAcceptDistinctValues(t *testing.T) {
 		internal_resolve.DriveInternalTokenEnv:         strings.Repeat("d", 32),
 		internal_membership.MembershipInternalTokenEnv: strings.Repeat("e", 32),
 		project.ProvisionFleetSecretEnv:                strings.Repeat("f", 32),
-		project.ProvisionDriveSecretEnv:                strings.Repeat("g", 32),
 	}))
 	if len(got) != 0 {
 		t.Fatalf("distinct tokens must report no collision, got %v", got)
@@ -54,7 +53,6 @@ func TestFixedInternalTokenExclusionsAllowUnsetEnvs(t *testing.T) {
 	got := fixedInternalTokenCollisions(envFromMap(map[string]string{
 		internal_membership.MembershipInternalTokenEnv: strings.Repeat("e", 32),
 		project.ProvisionFleetSecretEnv:                strings.Repeat("f", 32),
-		project.ProvisionDriveSecretEnv:                strings.Repeat("g", 32),
 	}))
 	if len(got) != 0 {
 		t.Fatalf("unset siblings must not collide, got %v", got)
@@ -285,7 +283,7 @@ func TestModuleLocalRefusalsCoverTheCentralRegistry(t *testing.T) {
 			name:   "project provisioning",
 			file:   "modules/project/config_provisioning.go",
 			marker: "for _, siblingEnv := range []string{",
-			own:    []string{project.ProvisionFleetSecretEnv, project.ProvisionDriveSecretEnv},
+			own:    []string{project.ProvisionFleetSecretEnv, project.DriveInternalTokenEnv},
 		},
 	}
 	for _, tc := range cases {

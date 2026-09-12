@@ -55,7 +55,17 @@ func resetDefaultCategoryName() {
 
 // seedSpaceAndMember inserts a space and makes testutil.UID a member with given role.
 func seedSpaceAndMember(t *testing.T, f *Category, spaceID string, role int) {
-	_, err := f.db.session.InsertInto("space").
+	// Project read authorization requires an active user directory row in addition
+	// to the Space seat. Upsert because a few category tests seed multiple Spaces
+	// for the same authenticated test uid in one case.
+	_, err := f.db.session.InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no, status, is_destroy) VALUES (?, ?, ?, 1, 0) "+
+			"ON DUPLICATE KEY UPDATE status=1, is_destroy=0",
+		testutil.UID, "测试用户", testutil.UID,
+	).Exec()
+	assert.NoError(t, err)
+
+	_, err = f.db.session.InsertInto("space").
 		Columns("space_id", "name", "creator", "status").
 		Values(spaceID, "测试空间", testutil.UID, 1).Exec()
 	assert.NoError(t, err)

@@ -128,6 +128,10 @@ func (p *Project) createCollaborationRole(
 func (p *Project) createCollaborationRoleOnce(
 	projectID, spaceID, actorUID, name, normalizedName string,
 ) (*CollaborationRoleModel, error) {
+	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, []string{actorUID})
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -135,7 +139,7 @@ func (p *Project) createCollaborationRoleOnce(
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID); err != nil {
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seatRefs); err != nil {
 		return nil, err
 	}
 	project, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -200,6 +204,10 @@ func (p *Project) renameCollaborationRole(
 func (p *Project) renameCollaborationRoleOnce(
 	projectID, spaceID, actorUID, roleID, name, normalizedName string,
 ) (*CollaborationRoleModel, bool, error) {
+	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, []string{actorUID})
+	if err != nil {
+		return nil, false, err
+	}
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -207,7 +215,7 @@ func (p *Project) renameCollaborationRoleOnce(
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID); err != nil {
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seatRefs); err != nil {
 		return nil, false, err
 	}
 	project, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -270,13 +278,17 @@ func (p *Project) deleteCollaborationRole(
 func (p *Project) deleteCollaborationRoleOnce(
 	projectID, spaceID, actorUID, roleID string,
 ) (bool, error) {
+	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, []string{actorUID})
+	if err != nil {
+		return false, err
+	}
 	tx, err := p.db.session.Begin()
 	if err != nil {
 		return false, fmt.Errorf("project: begin delete collaboration role: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID); err != nil {
+	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seatRefs); err != nil {
 		return false, err
 	}
 	project, err := p.db.lockActiveProjectTx(tx, projectID)
@@ -335,6 +347,10 @@ func (p *Project) replaceMemberCollaborationRoles(
 func (p *Project) replaceMemberCollaborationRolesOnce(
 	projectID, spaceID, actorUID, targetUID string, roleIDs []string,
 ) (bool, error) {
+	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, []string{actorUID, targetUID})
+	if err != nil {
+		return false, err
+	}
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
@@ -342,7 +358,7 @@ func (p *Project) replaceMemberCollaborationRolesOnce(
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	held, err := p.lockSeatsTx(tx, spaceID, actorUID, nil, []string{targetUID})
+	held, err := p.lockSeatsTx(tx, spaceID, actorUID, nil, []string{targetUID}, seatRefs)
 	if err != nil {
 		return false, err
 	}

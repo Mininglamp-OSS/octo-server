@@ -25,70 +25,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/gocraft/dbr/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// spentTx returns a transaction that has been committed, so every statement on
-// it fails. Using one as a probe turns "did this function query?" into a
-// yes/no the test can read.
-func spentTx(t *testing.T, ctx *config.Context) *dbr.Tx {
-	t.Helper()
-	tx, err := ctx.DB().Begin()
-	require.NoError(t, err)
-	require.NoError(t, tx.Commit())
-	return tx
-}
-
-// TestTheGateIssuesNoQueryForASpaceDirectGroup is C1.
-//
-// The gate is on the admission path of every group in the product. A gate that
-// runs and passes is still a latency regression on every group join, so the
-// requirement is not "cheap", it is "no query at all".
-func TestTheGateIssuesNoQueryForASpaceDirectGroup(t *testing.T) {
-	_, ctx := newTestServer(t)
-	f := New(ctx)
-
-	uids := []string{"c1_a", "c1_b", "c1_c"}
-
-	// Space-direct: project_id is the empty sentinel.
-	require.NoError(t,
-		f.db.assertAdmissibleTx(spentTx(t, ctx), "sp_c1", "", uids, AdmissionEntryAddMembers),
-		"the gate must return before issuing any statement for a Space-direct group; "+
-			"this transaction is spent, so any query at all would have failed here")
-
-	// An empty uid list is the other short-circuit.
-	require.NoError(t,
-		f.db.assertAdmissibleTx(spentTx(t, ctx), "sp_c1", util.GenerUUID(), nil, AdmissionEntryAddMembers))
-
-	// A batch of nothing but exempt uids reduces to the empty case AFTER the
-	// filter, which is the branch that would regress if the filter moved.
-	require.NoError(t,
-		f.db.assertAdmissibleTx(spentTx(t, ctx), "sp_c1", util.GenerUUID(),
-			[]string{"", "u_10000", "fileHelper"}, AdmissionEntryAddMembers))
-
-	// The control, and it has to be precise: a project group DOES query, and the
-	// spent transaction must be what makes it fail. Without this, every assertion
-	// above would also pass on a probe that was silently usable.
-	//
-	// The uids need real Space seats first. The Space half runs before the
-	// project half and would refuse them outright, and a refusal would satisfy a
-	// bare require.Error while proving nothing about whether the transaction was
-	// ever touched.
-	spaceID := "sp_" + util.GenerUUID()[:8]
-	for _, uid := range uids {
-		seedSpaceSeat(t, ctx, spaceID, uid)
-	}
-	err := f.db.assertAdmissibleTx(spentTx(t, ctx), spaceID, util.GenerUUID(), uids,
-		AdmissionEntryAddMembers)
-	require.Error(t, err, "a project group must reach the in-transaction project check")
-	require.NotErrorIs(t, err, ErrAdmissionRefused,
-		"the control must fail on the spent transaction, not on a membership refusal — "+
-			"otherwise it does not prove the probe works: %v", err)
-	require.Contains(t, err.Error(), "admission project check",
-		"the failure must come from the in-transaction half: %v", err)
-}
 
 // memberRow is the full written column set C2 is about.
 type memberRow struct {
@@ -118,13 +57,12 @@ func readMemberRow(t *testing.T, ctx *config.Context, groupNo, uid string) membe
 	return rows[0]
 }
 
-func admitFull(t *testing.T, f *Group, groupNo, spaceID, projectID string, a MemberAdmission, entry string) error {
+func admitFull(t *testing.T, f *Group, groupNo string, a MemberAdmission) error {
 	t.Helper()
 	tx, err := f.ctx.DB().Begin()
 	require.NoError(t, err)
 	defer tx.RollbackUnlessCommitted()
-	if err := f.db.admitOrRestoreMembersTx(tx, groupNo, spaceID, projectID,
-		[]MemberAdmission{a}, entry); err != nil {
+	if err := f.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{a}); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -142,7 +80,7 @@ func TestTheInsertBranchWritesTheWholeColumnSet(t *testing.T) {
 
 	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	require.NoError(t, err)
-	require.NoError(t, admitFull(t, f, groupNo, spaceID, "", MemberAdmission{
+	require.NoError(t, admitFull(t, f, groupNo, MemberAdmission{
 		UID:           "c2_new",
 		Version:       version,
 		Role:          MemberRoleCommon,
@@ -151,7 +89,7 @@ func TestTheInsertBranchWritesTheWholeColumnSet(t *testing.T) {
 		Vercode:       "vc-fixed",
 		IsExternal:    1,
 		SourceSpaceID: "sp_origin",
-	}, AdmissionEntryAddMembers))
+	}))
 
 	got := readMemberRow(t, ctx, groupNo, "c2_new")
 	assert.Equal(t, memberRow{
@@ -201,7 +139,7 @@ func TestTheRestoreBranchReproducesRecoverMemberTx(t *testing.T) {
 
 	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	require.NoError(t, err)
-	require.NoError(t, admitFull(t, f, groupNo, spaceID, "", MemberAdmission{
+	require.NoError(t, admitFull(t, f, groupNo, MemberAdmission{
 		UID:           "c2_back",
 		Version:       version,
 		Role:          MemberRoleCommon,
@@ -210,7 +148,7 @@ func TestTheRestoreBranchReproducesRecoverMemberTx(t *testing.T) {
 		Vercode:       "vc-ignored",
 		IsExternal:    0,
 		SourceSpaceID: "",
-	}, AdmissionEntryAddMembers))
+	}))
 
 	got := readMemberRow(t, ctx, groupNo, "c2_back")
 	assert.Equal(t, memberRow{
@@ -257,12 +195,12 @@ func TestReAddingAnActiveMemberChangesNothing(t *testing.T) {
 
 	version, err := ctx.GenSeq(common.GroupMemberSeqKey)
 	require.NoError(t, err)
-	require.NoError(t, admitFull(t, f, groupNo, spaceID, "", MemberAdmission{
+	require.NoError(t, admitFull(t, f, groupNo, MemberAdmission{
 		UID:       "c2_active",
 		Version:   version,
 		Role:      MemberRoleCommon,
 		InviteUID: "second-op",
-	}, AdmissionEntryPresetGroups))
+	}))
 
 	assert.Equal(t, before, readMemberRow(t, ctx, groupNo, "c2_active"),
 		"re-adding an already active member must change nothing — not the role, not the "+

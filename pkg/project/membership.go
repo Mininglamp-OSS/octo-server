@@ -1,19 +1,5 @@
-// Package project exposes the Project membership facts that other modules need
-// in order to enforce invariant I2, without importing modules/project.
-//
-// I2 — for a group whose project_id is not the empty sentinel, every active
-// group_member row belongs to a uid that is an active member of that project
-// (system bots exempted by whitelist).
-//
-// Why a pkg/ package rather than a method on modules/project's service:
-// modules/group needs a PREDICATE, not a module. pkg/space is the precedent —
-// CheckMembership, MemberRole: plain functions over a session, no module import,
-// no init-order coupling — and it is what lets modules/group and modules/project
-// both depend on the same fact without either importing the other. The
-// dependency that DOES run module-to-module is the cascade, and it runs the
-// other way, reverse-registered: modules/group registers its detach step into
-// modules/project, exactly as modules/group and modules/project already register
-// steps into modules/space.
+// Package project exposes read-only Project membership facts that other modules
+// need without importing modules/project.
 //
 // This package must never import modules/project (pinned by
 // TestPkgProjectDoesNotImportModulesProject); doing so would put the import
@@ -24,7 +10,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,265 +18,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/user"
 	"github.com/gocraft/dbr/v2"
 )
-
-// exemptFromMembership reports whether uid is admissible to a project group
-// without holding a project seat.
-//
-// The whitelist is pkg/space's system-bot list — botfather, fileHelper and the
-// other platform bots that are added to groups by the platform itself and have
-// no user to grant them a project seat. Reusing that list rather than declaring
-// a second one is deliberate: two whitelists drift, and the divergence shows up
-// as "the file bot silently stopped being added to project groups".
-//
-// An ORDINARY bot is NOT exempt. A bot that some user invited into a group is
-// admitted through the same gate as a person and needs an explicit project seat,
-// because otherwise "invite a bot" becomes a way to put a listener inside a
-// project group without anyone granting it access.
-//
-// pkg/space depends only on octo-lib — it imports no octo-server module — so
-// taking the list from there adds no coupling this package did not already have.
-func exemptFromMembership(uid string) bool {
-	return space.IsSystemBot(uid)
-}
-
-// AssertMembersInProjectTx answers, inside the caller's transaction, which of
-// `uids` may NOT be admitted to a group belonging to `projectID`.
-//
-// It returns the inadmissible uids, in the order they were given, so the caller
-// can name them in an error. An empty result means every uid passed.
-//
-// projectID == "" means the group is Space-direct and this predicate does not
-// apply; callers MUST short-circuit before calling (see C1 — a gate that runs
-// and passes is still a latency regression on every group join in the product),
-// but passing "" here is answered "everything is admissible" rather than
-// panicking, because a predicate that fails open on its own is worse than one
-// that is simply not reached.
-//
-// # Why this takes a *dbr.Tx and locks
-//
-// The check has to be inside the transaction that commits the admission, or it
-// is a TOCTOU with a comment. pkg/space.CheckMembership takes a *dbr.Session, so
-// it necessarily runs on a different pooled connection in its own implicit
-// transaction: a read there proves nothing about the state at COMMIT time. That
-// is a known, tolerated weakness of the Space half of the composite gate —
-// tightening it changes behaviour on every group join in the product and is out
-// of scope here — but the project half must not copy it. `FOR SHARE` makes a
-// concurrent project-seat removal block until this transaction commits.
-//
-// # Lock order — what is actually true, and what is not
-//
-// An earlier version of this comment claimed the module's table order
-//
-//	space_member -> space -> project -> group -> group_member -> octo_project_member
-//
-// held here, with octo_project_member "deliberately LAST", and concluded that
-// calling this at the point of admission "with the group rows already held"
-// could not close a cycle. That was wrong, and PR #846's review reproduced the
-// consequence on MySQL 8.0.46. On the primary admission path the group rows are
-// NOT held: admitOrRestoreMembersTx calls the gate FIRST and issues the
-// group_member upsert SECOND, so the real acquisition order there is
-// octo_project_member -> group_member. A11 (the un-blacklist branch) is the
-// same. The project-group handover goes the other way — group_member first,
-// then this function's shared lock.
-//
-// Two such transactions do not deadlock, because both take octo_project_member
-// SHARED. Three can, because InnoDB will not grant a shared request that is
-// queued behind a waiting exclusive one:
-//
-//	T1 admission     holds S(pm)                    wants X(gm)
-//	T2 seat removal                                 wants X(pm)  -> queued behind T1
-//	T3 handover      holds X(gm)                    wants S(pm)  -> queued behind T2
-//
-// T1 -> T3 -> T2 -> T1. InnoDB picks a victim; the cascade job backs off and
-// retries and the API call errors, so the consequence is bounded — but it is
-// reachable, and the previous comment said it was impossible, which is the part
-// that cost something: nobody would look for it in a deadlock log.
-//
-// # The invariant that DOES hold, and must keep holding
-//
-//	No path takes an EXCLUSIVE lock on octo_project_member while holding any
-//	group_member lock.
-//
-// Every path was checked against it: the funnel and A11 take S(pm) before any
-// group_member row; the handover takes S(pm) — shared, deliberately, so a
-// concurrent admission is not serialised behind it — while holding group_member
-// rows; modules/project's seat writes take X(pm) holding no group locks at all.
-// TestNoExclusiveProjectMemberLockUnderAGroupMemberLock pins it.
-//
-// Tightening the handover's `FOR SHARE OF pm` to `FOR UPDATE` is what the
-// invariant forbids, and it is the change that looks harmless: it would turn
-// the three-way cycle above into a plain two-way ABBA between the funnel and
-// the handover, on the hottest write path in the module.
-//
-// uids are sorted before the IN clause so that two concurrent admissions to
-// different groups of the same project acquire their locks in the same order.
-// Without that, two overlapping batches deadlock on each other in whichever
-// order MySQL happens to evaluate them — the same reason RemoveGroupMembers
-// sorts its targets by uid.
-func AssertMembersInProjectTx(tx *dbr.Tx, projectID string, uids []string) ([]string, error) {
-	if projectID == "" || len(uids) == 0 {
-		return nil, nil
-	}
-
-	// Deduplicate and drop exempt uids before the query. A caller passing the
-	// same uid twice must not turn into two lock acquisitions.
-	lookup := make([]string, 0, len(uids))
-	seen := make(map[string]bool, len(uids))
-	for _, uid := range uids {
-		if uid == "" || seen[uid] || exemptFromMembership(uid) {
-			continue
-		}
-		seen[uid] = true
-		lookup = append(lookup, uid)
-	}
-	if len(lookup) == 0 {
-		return nil, nil
-	}
-	sort.Strings(lookup)
-
-	// One query for the whole batch (D10). Per-uid checks would put N queries
-	// inside the admission transaction and lengthen it in proportion to batch
-	// size, and the batch cap is 200.
-	//
-	// `removing = 1` counts as a non-member here, which is the entire point of
-	// that column: the seat is closing, its group rows are being torn down, and
-	// admitting into another of the project's groups in the middle of that would
-	// race the cascade it is already running.
-	var present []string
-	_, err := tx.SelectBySql(
-		"SELECT uid FROM `octo_project_member` "+
-			"WHERE project_id = ? AND uid IN ? AND status = 1 AND removing = 0 "+
-			"FOR SHARE",
-		projectID, lookup,
-	).Load(&present)
-	if err != nil {
-		return nil, err
-	}
-
-	ok := make(map[string]bool, len(present))
-	for _, uid := range present {
-		ok[uid] = true
-	}
-
-	// Report in the caller's original order, deduplicated: an error message that
-	// reorders the uids the caller sent is harder to act on.
-	missing := make([]string, 0)
-	reported := make(map[string]bool, len(lookup))
-	for _, uid := range uids {
-		if uid == "" || exemptFromMembership(uid) || reported[uid] {
-			continue
-		}
-		if !ok[uid] {
-			reported[uid] = true
-			missing = append(missing, uid)
-		}
-	}
-	if len(missing) == 0 {
-		return nil, nil
-	}
-	return missing, nil
-}
-
-// CheckMembership reports whether uid is an active member of projectID, for
-// READ paths that are not committing an admission — the reconcile scans and the
-// /v1/auth/verify read contract.
-//
-// It is the session-scoped sibling of AssertMembersInProjectTx and carries the
-// same `removing = 0` clause, so every authorization read in the product answers
-// "is this a member?" the same way while a seat is closing. Do NOT use it to
-// gate a write: a session read runs outside the caller's transaction and cannot
-// see the state the write will commit against.
-//
-// Unlike the Tx variant this does NOT apply the system-bot exemption. Exemption
-// is an admission rule ("may this uid be put in a group of this project"), not a
-// membership fact ("is this uid a member of this project"), and a read path that
-// reported system bots as project members would put them in member counts and in
-// the verify response.
-func CheckMembership(session *dbr.Session, projectID string, uid string) (bool, error) {
-	if projectID == "" || uid == "" {
-		return false, nil
-	}
-	var count int
-	err := session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` "+
-			"WHERE project_id = ? AND uid = ? AND status = 1 AND removing = 0",
-		projectID, uid,
-	).LoadOne(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
-// MemberRole returns uid's role in projectID and whether they hold an active
-// seat at all. ok=false means "not an active member", and role is then
-// meaningless — callers must check ok before reading role.
-//
-// Role numbers are octo_project_member.role: 0 = member, 1 = admin, 2 = owner.
-// Consumers outside octo-server must NOT be handed these to derive permissions
-// from; the verify read contract emits explicit capabilities alongside the role
-// for exactly that reason (D11).
-// The runner is an interface rather than *dbr.Session so a caller that has
-// already opened a transaction can pass its *dbr.Tx. That is not a convenience:
-// modules/group's all-member owner sync holds FOR UPDATE locks on the group's
-// group_member rows while it asks this question, and asking it on a pooled
-// connection reads a DIFFERENT snapshot than the one its writes will land in —
-// the role can change inside that window and the sync only re-fires on a project
-// owner change. dbr.SessionRunner is the repo's existing way of saying "either
-// one" (modules/group/bot_ownership.go, modules/user/db_manager.go), and widening
-// to it changes no call site.
-func MemberRole(session dbr.SessionRunner, projectID string, uid string) (role int, ok bool, err error) {
-	if projectID == "" || uid == "" {
-		return 0, false, nil
-	}
-	var roles []int
-	rows, err := session.SelectBySql(
-		"SELECT role FROM `octo_project_member` "+
-			"WHERE project_id = ? AND uid = ? AND status = 1 AND removing = 0 LIMIT 1",
-		projectID, uid,
-	).Load(&roles)
-	if err != nil {
-		return 0, false, err
-	}
-	if rows == 0 || len(roles) == 0 {
-		return 0, false, nil
-	}
-	return roles[0], true, nil
-}
-
-// ResolveForGroup answers whether a group in spaceID may be attributed to
-// projectID: the project must exist, be active, and belong to that same Space.
-//
-// ok=false covers all three failures — absent, disbanded, and cross-Space — and
-// the caller must NOT distinguish them on the wire. Doing so turns "create a
-// group" into an oracle: an attacker with a project id they cannot see could
-// learn whether it exists and which Space it lives in, from a Space they do have
-// access to. The reason belongs in the log.
-//
-// Deliberately does NOT check whether the caller is a member of the project.
-// That is the admission gate's job, and it happens inside the create
-// transaction: the creator is admitted through admitOrRestoreMembersTx like
-// every other member, so a non-member creating a project group is refused there,
-// under lock, rather than here in a read that could go stale before the commit.
-//
-// The status literal is spelled out rather than importing modules/project's
-// constant, for the same reason pkg/space spells out space.status: the import
-// would be a cycle.
-func ResolveForGroup(session *dbr.Session, spaceID, projectID string) (bool, error) {
-	if spaceID == "" || projectID == "" {
-		return false, nil
-	}
-	var count int
-	err := session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project` "+
-			"WHERE project_id = ? AND space_id = ? AND status = 1",
-		projectID, spaceID,
-	).LoadOne(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
 
 // Membership is one project's membership fact for a uid.
 type Membership struct {
@@ -314,10 +40,9 @@ type Membership struct {
 // exist, and the cheapest way to guarantee that is for both to produce the same
 // absence rather than two branches that could drift.
 //
-// `removing = 0` is here for the same reason it is in every other predicate in
-// this package: a seat being closed is not a member, and a consumer that
-// disagreed with the admission gate about that would be authorizing access to a
-// project whose groups are being torn down.
+// `removing = 0` is part of the membership fact: a seat being closed is not a
+// member, and a consumer that disagreed would authorize access to a Project
+// whose memberships are being torn down.
 func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []string) (map[string]Membership, error) {
 	out := make(map[string]Membership, len(projectIDs))
 	if spaceID == "" || uid == "" || len(projectIDs) == 0 {
@@ -407,7 +132,17 @@ func (e *SentinelAnomalyError) Unwrap() error { return ErrLiveProjectOnAbsentSen
 // the whole point here is that the endpoint that HIT the anomaly can fix it. The
 // shared statement shape is pinned by the write-discipline guard, which scans for
 // exactly this increment form.
-func RepairAbsentSentinelEpoch(session *dbr.Session, projectID string) (bool, error) {
+// Takes a context because its only production caller runs it in a detached
+// goroutine that holds an in-flight marker for this project id. On the process-wide
+// session dbr reaches sql.DB with context.Background() and no Timeout, so both the
+// pool acquisition and the statement were unbounded — and an unbounded one there does
+// not merely leak a goroutine, it never releases the marker, which then rejects EVERY
+// later repair attempt for that project for the life of the process. Recovery would
+// fall back to the reconcile cursor, the hours-scale path this repair exists to avoid.
+//
+// Tests may pass context.Background(): they are not holding a marker, and pinning a
+// deadline is the caller's job.
+func RepairAbsentSentinelEpoch(ctx context.Context, session *dbr.Session, projectID string) (bool, error) {
 	if projectID == "" {
 		return false, nil
 	}
@@ -415,7 +150,7 @@ func RepairAbsentSentinelEpoch(session *dbr.Session, projectID string) (bool, er
 		"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
 			"WHERE project_id = ? AND status = 1 AND member_epoch = ?",
 		projectID, AbsentEpochSentinel,
-	).Exec()
+	).ExecContext(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -776,7 +511,7 @@ func ProjectMemberships(ctx context.Context, session *dbr.Session, spaceID, proj
 	// absent sentinel, so 0 != E; unbanned gives E != 0). It cannot close an answer
 	// torn ACROSS the ban commit, because that answer carries both halves.
 	//
-	// Read-only, no locks, four point reads — and the isolation level is NAMED here
+	// Read-only, no locks, five point reads — and the isolation level is NAMED here
 	// rather than inherited, which is the half of this fix that is easy to leave out.
 	//
 	// REPEATABLE READ establishes the view at the first read in the transaction and
@@ -820,8 +555,8 @@ func ProjectMemberships(ctx context.Context, session *dbr.Session, spaceID, proj
 	// The CALLER's context, not context.Background(), and that matters more since
 	// round 16 than it did before it.
 	//
-	// Before the snapshot fix these four reads borrowed and returned a pooled
-	// connection each. Now one transaction holds a connection across all four round
+	// Before the snapshot fix these five reads borrowed and returned a pooled
+	// connection each. Now one transaction holds a connection across all five round
 	// trips, and sql.DB.BeginTx is where the wait for that connection happens. With
 	// Background() nothing bounds it: a retrying peer at the configured burst can park
 	// hundreds of goroutines waiting on a pool octo-lib defaults to 100 connections,
@@ -829,7 +564,7 @@ func ProjectMemberships(ctx context.Context, session *dbr.Session, spaceID, proj
 	// on the route bounds the SOCKET, not the pool, so it offers nothing here.
 	//
 	// Passing the request's context also means a peer that hangs up frees its
-	// connection immediately rather than at the end of four queries.
+	// connection immediately rather than at the end of five queries.
 	tx, err := session.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,
 		ReadOnly:  true,
@@ -841,17 +576,30 @@ func ProjectMemberships(ctx context.Context, session *dbr.Session, spaceID, proj
 	// read view just as commit would.
 	defer tx.RollbackUnlessCommitted()
 
-	// Bound every statement on this transaction, including the three issued from
+	// Bound every statement on this transaction, including the four issued from
 	// pkg/project, pkg/space and pkg/user through the SessionRunner they are handed.
 	//
-	// dbr applies runner.GetTimeout() around each query, and Tx inherits the session's
-	// — which is unset process-wide, i.e. no deadline at all. Setting it here is the
-	// one place that reaches all four reads without giving three packages a context
-	// parameter they otherwise have no use for. A blocked read holds the connection AND
-	// the read view, so an unbounded one is the expensive half of the same hazard.
+	// Tx inherits the session's timeout — which is unset process-wide, i.e. no deadline
+	// at all. Setting it here is the one place that reaches all five reads without
+	// giving three packages a context parameter they otherwise have no use for. A
+	// blocked read holds the connection AND the read view, so an unbounded one is the
+	// expensive half of the same hazard.
+	//
+	// # The guarantee is a property of the CALL SHAPE, not of dbr
+	//
+	// This used to say "dbr applies runner.GetTimeout() around each query", full stop.
+	// That is true of dbr's query()/exec(), which Load and LoadOne go through, and NOT
+	// of queryRows(), which discards the runner's timeout on purpose — its own comment
+	// says "the context should not be canceled implicitly here". So `.Rows()`,
+	// `.Iterate()` and `.IterateContext()` on this transaction are UNBOUNDED, and a
+	// future read added in that shape would lose the deadline with no signal.
+	//
+	// Every read on this path is Load or LoadOne today, so the bound holds at this
+	// head. TestVerifyTransactionReadsAreAllTimeoutBearing pins it, because "all five
+	// reads are bounded" is otherwise a claim no test can fail.
 	//
 	// The value is per-STATEMENT, not for the whole transaction; the caller's context
-	// bounds the whole. Four point reads on indexed predicates, so this is an outlier
+	// bounds the whole. Five point reads on indexed predicates, so this is an outlier
 	// cutoff rather than a budget.
 	tx.Timeout = membershipReadTimeout
 
@@ -1029,12 +777,26 @@ func SetMembershipTearHookForTest(fn func()) (restore func(), err error) {
 
 // membershipReadTimeout caps ONE statement inside ProjectMemberships' transaction.
 //
-// Not a budget for the request: each of the four reads is a point lookup on an
+// Not a budget for the request: each of the five reads is a point lookup on an
 // indexed predicate and returns in single-digit milliseconds on a healthy engine.
 // It is the cutoff past which a read has stopped being slow and started being stuck,
 // and holding a pooled connection plus a read view while stuck is what makes an
 // authorization endpoint able to starve the rest of the process.
+//
+// Worst case behind it is therefore 5 x 5s = 25s, not 20s: ProjectEpochsInSpace issues
+// TWO statements, not one — the octo_project select and then space.IsActiveSpace. Worth
+// stating in the same breath as the number, next to a route whose own read deadline is
+// 15s and whose peer contract declares a cache bound of 1-300s.
 const membershipReadTimeout = 5 * time.Second
+
+// EpochsReadTimeout is the same cutoff for the epochs endpoint's transaction.
+//
+// Exported, and deliberately the SAME constant rather than a second literal:
+// modules/internal_membership opens that transaction itself (it owns the store), and
+// two independently drifting deadlines on the two halves of one peer contract is how
+// the pair stops meaning anything. A named accessor rather than an exported var so it
+// cannot be reassigned at runtime.
+func EpochsReadTimeout() time.Duration { return membershipReadTimeout }
 
 // dedupeNonEmpty drops empty and repeated ids while preserving first-seen order.
 //
@@ -1052,4 +814,40 @@ func dedupeNonEmpty(in []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// IsAllMemberGroup reports whether groupNo is the active Project's dedicated
+// all-member group. The Project pointer is authoritative: a normal group with
+// project_id set is intentionally not treated as protected or synchronized.
+//
+// Read the two sides separately. `octo_project` is pinned to utf8mb4_general_ci
+// while production imports of the legacy `group` table may still use
+// utf8mb4_0900_ai_ci; comparing their identifiers in one JOIN raises MySQL
+// error 1267 and also prevents the group unique index from serving the lookup.
+func IsAllMemberGroup(session *dbr.Session, projectID, groupNo string) (bool, error) {
+	if session == nil || projectID == "" || groupNo == "" {
+		return false, nil
+	}
+
+	var pointers []string
+	if _, err := session.SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` "+
+			"WHERE project_id = ? AND status = 1",
+		projectID,
+	).Load(&pointers); err != nil {
+		return false, err
+	}
+	if len(pointers) == 0 || pointers[0] != groupNo {
+		return false, nil
+	}
+
+	var rows []int
+	if _, err := session.SelectBySql(
+		"SELECT 1 FROM `group` "+
+			"WHERE group_no = ? AND status <> 2 AND project_id = ?",
+		groupNo, projectID,
+	).Load(&rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }

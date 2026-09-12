@@ -3194,3 +3194,38 @@ map 的键，只在「这扇门被找到了」时才会被查到；门没被找�
 多报一个原语，那是 fail-closed、会大声红。更难堪的是我为这条规则写的 fixture 根本没钉住它：
 它以 `"UPDATE robot SET status="` 开头，而这个字面量自己就能匹配，所以规则在与不在它都通过。
 **为一条规则写的例子，如果删掉规则它还绿，那它证明的不是这条规则。**
+
+## 2026-09-12 — internal-membership（PR #852 合并 main #887：两条分支对同一条语句做了相反的决定）
+
+把 main 合进来，11 个文件冲突。真正要想的只有一处：`lockSpaceSeatsTx` / `lockSpaceSeatRowsTx`
+要不要 JOIN `user`。
+
+本分支的结论是**不 JOIN**：实测 8.0.33，`INNER JOIN user` 会让优化器把 `user` 选成驱动表
+（3 个和 200 个 uid 都是），于是 space_member 的行锁按 user 主键顺序一个个 eq_ref 拿，和
+modules/space 解散扫描的 id 顺序相反，1213。账号存活性因此被挪出去，变成一次单独的
+`pkg/user.ActiveAccounts` 读。#887 的结论是**JOIN，但把计划钉死**：`STRAIGHT_JOIN` 让 `user`
+不可能驱动，`FORCE INDEX (PRIMARY)` + 精确 `sm.id IN (...)` 把访问路径固定成聚簇键，
+`FOR SHARE OF sm, u` 让 `user` 是加锁读而不是一致性读（所以不会提前开读视图）。
+
+**两条论证针对同一个测量，后者更强**：前者是消掉「user 可能驱动」的一种方式，后者是消掉
+优化器的选择权本身。所以合并取 main 的形状。
+
+有意思的是它顺手关掉了本分支第 19 轮评审的那个 P1。那个 P1 是「三处 `ActiveAccounts` 用的是
+进程级 session，而事务正握着 space_member 和 octo_project 的锁；session 没有 Timeout，dbr 走到
+`sql.DB.QueryContext(context.Background())`，池子耗尽时无限等待、无法取消」。评审给的修法是加
+deadline。但采用 #887 之后这三处**是重复检查**（同一个谓词已经在加锁语句里），所以正确的修法是
+删掉它们——顺带连 TOCTOU 和「一个新调用点可能忘了这条单独的读」一起没了。
+
+**一条冲突解法，抵得上一个补丁。** 如果我按评审字面去加 deadline，会得到一个被加固的、但仍然
+多余、仍然可被遗忘的第二条语句。
+
+**代价要如实记**：#887 把 `refs` 用**数据库拼写**做键，而查找用调用方拼写，于是任何大小写漂移
+的 uid 一律被拒——本分支花了几轮修掉的 fail-CLOSED 又回来了。改成折叠查找、并把**数据库的拼写**
+带出去（`lockSpaceSeatTargets` 返回 target.uid = 存储值），两边的性质才同时成立。这也是第 13 轮
+那条规则的又一次应用：**加宽比较的同时必须重绑写入**，只做前一半就是 fail-OPEN，只做后一半就是
+fail-CLOSED。
+
+还有一处合并特有的坑：`fixedInternalTokenEnvs` 差点出现重复项。#887 让 Drive 的配置凭证从
+`OCTO_PROJECT_PROVISION_DRIVE_SECRET` 改为复用 `OCTO_DRIVE_INTERNAL_TOKEN`，于是注册表里两个常量
+指向同一个 env 名。碰撞检测是按**值**建 map 的，同名两次意味着它会报告这个值和它自己冲突——
+一个真检测器退化成每次部署都打的固定 ERROR 行。**一个「找重复」的清单，自己有重复项时是静默失效的。**

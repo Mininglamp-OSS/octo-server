@@ -18,11 +18,8 @@ import (
 )
 
 // withNoRemovalSteps empties the reverse-registration registry for the duration
-// of one case and restores it afterwards.
-//
-// The registry is package state, which is exactly why this test can reach it:
-// modules/group registers its detach step into this package at construction, so
-// there is no way to build a "no steps registered" world other than to make one.
+// of one case and restores it afterwards. The project worker owns this registry
+// even when no optional project-side cleanup callback is installed.
 func withNoRemovalSteps(t *testing.T) {
 	t.Helper()
 	cascadeMu.Lock()
@@ -36,32 +33,30 @@ func withNoRemovalSteps(t *testing.T) {
 	})
 }
 
-// TestAnEmptyStepRegistryDoesNotCloseTheSeat.
+// TestAnEmptyStepRegistryClosesTheProjectSeat.
 //
-// Falling through an empty step list reads as "every step succeeded", and the
-// worker then closes the seat with the member's group_member rows never
-// detached — the I2 violation the two-phase close exists to avoid, produced
-// silently, with the job marked done. Failing instead leaves the seat at
-// removing = 1, where the member is already a non-member for every
-// authorization read, and surfaces as backlog plus the stall alert.
-func TestAnEmptyStepRegistryDoesNotCloseTheSeat(t *testing.T) {
+// Group-owned native membership cleanup is no longer registered here: Project removal must
+// still complete its own seat closure rather than retrying forever on an intentionally empty
+// registry. The absence of project cleanup steps means there is no local side effect to wait
+// for; native group membership remains owned by the group module.
+func TestAnEmptyStepRegistryClosesTheProjectSeat(t *testing.T) {
 	p, job := claimedJob(t, "worker-a")
 	withNoRemovalSteps(t)
 
 	p.workRemovalJob(job, "worker-a")
 
 	status, removing := seatState(t, job.ProjectID, job.UID)
-	require.Equal(t, MemberStatusActive, status,
-		"with no cascade registered the seat must NOT close: the group rows are still there")
-	require.Equal(t, 1, removing, "and it must stay in the closing state, visible to the stall scan")
+	require.Equal(t, MemberStatusRemoved, status,
+		"with no project-side cleanup steps, the Project seat must still close")
+	require.Zero(t, removing)
 
 	jobStatus, _ := jobRow(t, job.ID)
-	require.Equal(t, removalJobPending, jobStatus,
-		"the job must stay pending so the backlog shows it, rather than reading as done")
+	require.Equal(t, removalJobDone, jobStatus,
+		"an intentionally empty cleanup registry must not leave the job pending")
 }
 
 // TestAFullyRegisteredCascadeDoesCloseTheSeat is the control. Without it,
-// breaking the worker outright would satisfy the case above.
+// breaking the worker outright would satisfy the empty-registry case above.
 func TestAFullyRegisteredCascadeDoesCloseTheSeat(t *testing.T) {
 	p, job := claimedJob(t, "worker-a")
 

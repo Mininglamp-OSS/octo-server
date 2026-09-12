@@ -83,10 +83,16 @@ func TestEveryExportedDeclarationInThisPackageIsDocumented(t *testing.T) {
 
 	// A parser guard that parses nothing reports a package with no contract as a
 	// package in perfect shape. There were 22 exported declarations when this was
-	// written; a materially lower count means the sweep stopped finding them.
-	require.GreaterOrEqual(t, checked, 20,
-		"the sweep examined %d exported declarations; there were 22 when this guard was "+
-			"written", checked)
+	// written and 15 after main's #887 moved the all-member-group surface out of this
+	// package; a materially lower count means the sweep stopped finding them.
+	//
+	// The floor is re-based rather than left where it was, because a floor that fails
+	// for a legitimate deletion teaches people to lower it without reading it — and it
+	// is lowered only to just under the real count, so it still catches a parser that
+	// stops matching.
+	require.GreaterOrEqual(t, checked, 14,
+		"the sweep examined %d exported declarations; there were 15 when this floor was "+
+			"last re-based", checked)
 }
 
 const undocumented = "%s: exported %s %s has no doc comment.\n\n" +

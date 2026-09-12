@@ -96,14 +96,14 @@ func TestSeatTransitionStepsHaveOneCaller(t *testing.T) {
 func TestSeatDoorsUseTheFunnel(t *testing.T) {
 	doors := map[string][]string{
 		"db_manager.go": {
-			"openSeatTx(tx, spaceId, uid, nil)",                                          // upsertMembersOnce
+			"openSeatTx(tx, spaceId, uid, nil, \"\")",                                    // upsertMembersOnce
 			"closeSeatTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved)", // removeMembersForceOnce
 			"closeSeatTx(tx, spaceId, uid, operatorUID, reason)",                         // removeMemberLockedOnce
 		},
 		"db.go": {
-			"openSeatTx(tx, spaceId, uid, &role)",           // reactivateMember
-			"openSeatTx(tx, spaceId, uid, &roleCommon)",     // atomicReactivateMemberIfNotFullOnce
-			"openSeatTx(tx, spaceId, row.UID, &roleCommon)", // approveJoinApplyAtomic
+			"openSeatTx(tx, spaceId, uid, &role, uid)",                   // reactivateMember
+			"openSeatTx(tx, spaceId, uid, &roleCommon, uid)",             // atomicReactivateMemberIfNotFullOnce
+			"openSeatTx(tx, spaceId, row.UID, &roleCommon, reviewerUID)", // approveJoinApplyAtomic
 		},
 		"member_removal_all_spaces.go": {
 			"closeSeatTx(tx, spaceID, uid, operatorUID, reason)", // closeOneSeatAndEnqueueTx

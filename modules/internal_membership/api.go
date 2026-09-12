@@ -233,8 +233,15 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 //
 // So the window now costs availability rather than a permanent grant: 500, the
 // peer retries, and the retry succeeds because logLookupFailure repairs the named
-// row OUT OF BAND on the way out (see it, ~300 lines below). The practical bound
-// is ONE request.
+// row OUT OF BAND on the way out (see it, ~300 lines below).
+//
+// The practical bound is ONE request PER ANOMALOUS ROW IN THE BATCH, not one request
+// flat. ProjectEpochsInSpace returns on the FIRST sentinel row it meets, so a 50-id
+// batch containing N of them needs N+1 requests and SQL row order decides which is
+// repaired first. During a partial rollout several projects can sit on the sentinel
+// at once, so N > 1 is the expected case rather than a corner. Stated with the
+// quantifier because this struct is the peer integrator's contract and an unqualified
+// "one request" would read as a guarantee the code does not make.
 //
 // An earlier version of this sentence said "repaired within one scan rotation",
 // which is the recovery model this file corrects everywhere else and is wrong:
@@ -283,7 +290,7 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 		return
 	}
 
-	found, err := m.store.Epochs(spaceID, projectIDs)
+	found, err := m.store.Epochs(c.Request.Context(), spaceID, projectIDs)
 	if err != nil {
 		m.logLookupFailure("membership epochs", err, spaceID, len(projectIDs))
 		respondInternal(c)
@@ -513,7 +520,7 @@ func (m *Module) verifyProjectMemberships(c *wkhttp.Context) {
 
 	// The request's context, so a peer that hangs up or a proxy that times out
 	// releases the pooled connection this call holds instead of it being held to the
-	// end of four round trips. See membershipStore.Memberships.
+	// end of five round trips. See membershipStore.Memberships.
 	epoch, roles, err := m.store.Memberships(c.Request.Context(), spaceID, projectID, uids)
 	if err != nil {
 		m.logLookupFailure("verify project memberships", err, spaceID, len(uids),
@@ -624,7 +631,21 @@ func (m *Module) repairSentinelOutOfBand(projectID string) {
 				m.Error("sentinel out-of-band repair panicked", zap.Any("recover", r))
 			}
 		}()
-		repaired, err := projectpkg.RepairAbsentSentinelEpoch(m.ctx.DB(), projectID)
+		// The in-flight marker above is released by the deferred Delete, so the write
+		// under it must be guaranteed to return. On the process-wide session it was
+		// not: no Timeout is set anywhere, so dbr reached sql.DB with
+		// context.Background() and BOTH the pool acquisition and the UPDATE were
+		// unbounded. A stall there would leave the marker set forever and every
+		// subsequent repair of this project would be rejected as already in flight —
+		// turning a self-healing fast path into a permanent one, with the hours-scale
+		// reconcile cursor as the only remaining recovery.
+		//
+		// Reuses the read deadline rather than introducing a second number: this is one
+		// indexed single-row UPDATE, so the same "stopped being slow, started being
+		// stuck" cutoff applies.
+		ctx, cancel := context.WithTimeout(context.Background(), projectpkg.EpochsReadTimeout())
+		defer cancel()
+		repaired, err := projectpkg.RepairAbsentSentinelEpoch(ctx, m.ctx.DB(), projectID)
 		if err != nil {
 			m.Error("sentinel out-of-band repair failed; the reconcile scan remains the backstop",
 				zap.Error(err), zap.String("project_id", projectID))

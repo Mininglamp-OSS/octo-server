@@ -38,10 +38,24 @@ import (
 //
 // role 为 nil 表示不改角色（管理端批量添加就是这个语义：重新加入不该悄悄改角色）。
 //
+// operatorUID 是触发这次重新打开的人，写进 rejoin 工单：自助回归时等于 uid，管理端
+// 批量添加时为空（没有单一操作人），审批通过时是审批人。
+//
 // 返回 changed=false 表示**没有可翻转的已关闭席位**——可能这行根本不存在，也可能
 // 它已经是活跃的。两种情况都不该发失效信号：前者没有存活的项目席位会因此重新可达，
 // 后者是空写。调用方按自己的语义决定接下来做什么（插入新行，或直接返回）。
-func openSeatTx(tx *dbr.Tx, spaceID, uid string, role *int) (bool, error) {
+//
+// # rejoin 工单也在这里，和 closeSeatTx 的清理工单对称
+//
+// 合并 main 的 #887 之前，四扇门各自在自己的 `affected == 1` 分支里调
+// enqueueMemberRejoinIntentTx。那是一个手工维护的四元枚举——正是本文件开头列出的、
+// 本分支 12 轮里贡献了 6 个 P1 的那种形状。收进来之后它和失效信号共享同一个判据
+// （带谓词的 UPDATE + RowsAffected）和同一个标识符（ResolveSeatTx 的规范拼写），
+// 所以不可能出现「工单写了、epoch 没动」或者「工单带着调用方的漂移拼写」。
+//
+// 顺序与 closeSeatTx 逐字一致：工单 INSERT 在事务步骤（octo_project 的写入）之前，
+// 不引入新的加锁顺序。
+func openSeatTx(tx *dbr.Tx, spaceID, uid string, role *int, operatorUID string) (bool, error) {
 	stmt := tx.Update("space_member").
 		Set("status", 1).
 		Set("updated_at", time.Now())
@@ -63,6 +77,9 @@ func openSeatTx(tx *dbr.Tx, spaceID, uid string, role *int) (bool, error) {
 	// （ResolveSeatTx）。这两句是本分支第 11、12 轮各自的 P1，现在在同一个地方。
 	seat, err := ResolveSeatTx(tx, spaceID, uid)
 	if err != nil {
+		return false, err
+	}
+	if err := enqueueMemberRejoinIntentForSeatTx(tx, seat, operatorUID); err != nil {
 		return false, err
 	}
 	if err := runSeatTransitionTxSteps(tx, SeatTransition{Seat: seat, Opened: true}); err != nil {

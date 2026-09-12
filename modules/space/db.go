@@ -484,7 +484,7 @@ func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
 
 		// 翻转、解析规范拼写、发失效信号，都在 openSeatTx 里（seat_transition.go）。
 		// 席位本就活跃或不存在时它返回 false，那两种情况都不该动 epoch。
-		if _, err := openSeatTx(tx, spaceId, uid, &role); err != nil {
+		if _, err := openSeatTx(tx, spaceId, uid, &role, uid); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -915,10 +915,9 @@ func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, max
 	// Reactivate member
 	// 同 reactivateMember，走同一个入口；这条路径把角色重置为普通成员。
 	roleCommon := 0
-	if _, err = openSeatTx(tx, spaceId, uid, &roleCommon); err != nil {
+	if _, err = openSeatTx(tx, spaceId, uid, &roleCommon, uid); err != nil {
 		return err
 	}
-
 	return tx.Commit()
 }
 
@@ -1170,7 +1169,7 @@ func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId stri
 	// 锁上下文与另外三条路径一致：本事务已在第 3 步对这一行取过 FOR UPDATE，所以步骤里
 	// 那条枚举读的视图晚于该 X 锁。
 	roleCommon := 0
-	reopened, err := openSeatTx(tx, spaceId, row.UID, &roleCommon)
+	reopened, err := openSeatTx(tx, spaceId, row.UID, &roleCommon, reviewerUID)
 	if err != nil {
 		return approveFailed, "", err
 	}

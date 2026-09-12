@@ -41,21 +41,22 @@ type MemberRemoval struct {
 	Reason string
 }
 
-// MemberRemovalStep detaches one uid from whatever the registering module owns.
+// MemberRemovalStep is a best-effort, idempotent cleanup callback for one
+// Project seat. It is exported because modules/group registers its native
+// group-member cleanup without importing this module's internals.
 type MemberRemovalStep func(ctx *config.Context, removal MemberRemoval) error
 
-// ProjectDisband describes a project being disbanded, whether by its owner or by
-// the ownerless-project branch of P0's Space cascade.
+// Keep the internal name used by the worker and package-local tests.
+type memberRemovalStep = MemberRemovalStep
+
+// ProjectDisband describes a project being disbanded, whether by a human
+// request or by a future automated lifecycle worker.
 type ProjectDisband struct {
 	ProjectID string
 	SpaceID   string
-	// ByCascade is true when a background worker disbanded the project because
-	// it had no owner left, rather than a human choosing to.
-	//
-	// P0's round-2 review made the Space cascade hand ownership to the senior
-	// remaining member and disband the project when there is no successor. That
-	// is why the detach step must be reachable from the cascade and not only
-	// from the disband handler: a project can now end without anyone asking.
+	// ByCascade is true when automation disbanded the project, rather than a
+	// human choosing to. The current Space-removal cascade preserves the Owner
+	// row and does not use this branch.
 	ByCascade bool
 }
 
@@ -64,7 +65,7 @@ type DisbandStep func(ctx *config.Context, disband ProjectDisband) error
 
 type namedMemberRemovalStep struct {
 	name string
-	fn   MemberRemovalStep
+	fn   memberRemovalStep
 }
 
 type namedDisbandStep struct {
@@ -78,9 +79,9 @@ var (
 	projectDisbandSteps []namedDisbandStep
 )
 
-// RegisterProjectMemberRemovalStep registers work to run when a project seat
-// closes. Re-registering the same name replaces (latest wins), which is what
-// lets a test install a stand-in.
+// RegisterProjectMemberRemovalStep registers cleanup for Project member
+// removals. Re-registering the same name replaces the callback, which keeps
+// test doubles isolated while preserving deterministic execution order.
 func RegisterProjectMemberRemovalStep(name string, fn MemberRemovalStep) {
 	if name == "" || fn == nil {
 		return

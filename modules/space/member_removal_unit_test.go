@@ -9,6 +9,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// waitForMemberRemovalWorkerIdle keeps shared-context tests deterministic when
+// a previous test's asynchronous afterMembersRemoved hook is still finishing.
+// Production calls intentionally remain non-blocking; tests wait before
+// exercising the synchronous worker contract.
+func waitForMemberRemovalWorkerIdle(t *testing.T) {
+	require.Eventually(t, func() bool {
+		return !removalCleanupRunning.Load() && removalCleanupAsyncRunning.Load() == 0
+	}, 5*time.Second, 5*time.Millisecond,
+		"previous asynchronous member-removal cleanup is still running")
+}
+
 // 本文件只放**不依赖 MySQL / Redis / WuKongIM** 的单元测试，
 // 保证清理工单的枚举、退避、注册表这几层逻辑在没有基础设施的环境里也能验证。
 // 端到端行为（真的退群、真的摘白名单）在 member_removal_test.go 里，需要 CI 的服务容器。
@@ -102,5 +113,17 @@ func swapCleanupStepsForTest(steps []namedCleanupStep) func() {
 		cleanupStepsMu.Lock()
 		cleanupSteps = prev
 		cleanupStepsMu.Unlock()
+	}
+}
+
+func swapRejoinCleanupStepsForTest(steps []namedCleanupStep) func() {
+	rejoinCleanupStepsMu.Lock()
+	prev := rejoinCleanupSteps
+	rejoinCleanupSteps = steps
+	rejoinCleanupStepsMu.Unlock()
+	return func() {
+		rejoinCleanupStepsMu.Lock()
+		rejoinCleanupSteps = prev
+		rejoinCleanupStepsMu.Unlock()
 	}
 }

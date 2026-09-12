@@ -187,31 +187,13 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 	// Run every registered step. A step failing does NOT stop the others: partial
 	// progress is durable (a group already left does not come back), and the job
 	// retries what remains. The first error decides the job's fate.
+	steps := snapshotMemberRemovalSteps()
 	removal := MemberRemoval{
 		ProjectID:   job.ProjectID,
 		UID:         job.UID,
 		SpaceID:     job.SpaceID,
 		OperatorUID: job.OperatorUID,
 		Reason:      job.Reason,
-	}
-	steps := snapshotMemberRemovalSteps()
-	if len(steps) == 0 {
-		// An empty registry must NOT read as "every step succeeded".
-		//
-		// Falling through would call finishRemoval and close the seat with the
-		// member's group_member rows never detached — the exact I2 violation the
-		// two-phase close exists to avoid, produced silently, with the job marked
-		// done. The mirror-image registry in modules/space fails closed for the
-		// same reason (preset_group_admitter.go: joinPresetGroups SKIPS and does
-		// not fall back).
-		//
-		// Failing here instead leaves the seat at removing = 1 — a state in which
-		// the member is already a non-member for every authorization read — and
-		// surfaces as backlog plus the stall alert. Stuck and visible beats closed
-		// and wrong.
-		p.rescheduleAfterFailure(job, owner,
-			fmt.Errorf("project: no member-removal cascade step is registered"))
-		return
 	}
 	var firstErr error
 	for _, step := range steps {

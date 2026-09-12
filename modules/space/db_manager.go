@@ -510,7 +510,7 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 		// 比较——同 removeMembersForceOnce 的做法（它也是靠 status 谓词 + RowsAffected 判断
 		// 「这行真的改了吗」，而不是拿调用方拼写查 map）。
 		// 角色不变（role=nil）：管理端重复添加一个曾是管理员的人，不该把他悄悄降级。
-		reactivated, err := openSeatTx(tx, spaceId, uid, nil)
+		reactivated, err := openSeatTx(tx, spaceId, uid, nil, "")
 		if err != nil {
 			return err
 		}

@@ -1,6 +1,7 @@
 package project
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +105,7 @@ func TestSpaceMemberRejoinMovesTheEpoch(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
+	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, p := setup(t)
 			p.registerSpaceMemberRemovalCleanup()
@@ -115,8 +116,11 @@ func TestSpaceMemberRejoinMovesTheEpoch(t *testing.T) {
 			seedUser(t, "rjTarget")
 			seedSpaceMember(t, spaceA, "rjTarget", 0, 1)
 
-			inProject := createProjectVia(t, srv, spaceA, ownerToken, "rejoin-"+tc.name)
-			untouched := createProjectVia(t, srv, spaceA, ownerToken, "rejoin-none-"+tc.name)
+			// Numbered rather than named after the door: project names are capped at 30
+			// characters, and "rejoin-none-atomicReactivateMemberIfNotFull" is 43. The
+			// subtest name already says which door this is.
+			inProject := createProjectVia(t, srv, spaceA, ownerToken, fmt.Sprintf("rejoin-%d", i))
+			untouched := createProjectVia(t, srv, spaceA, ownerToken, fmt.Sprintf("rejoin-none-%d", i))
 			admitted, err := p.addOneMember(inProject.ProjectID, spaceA, "rjOwner", "rjTarget")
 			require.NoError(t, err)
 			require.True(t, admitted)

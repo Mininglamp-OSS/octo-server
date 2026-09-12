@@ -664,85 +664,48 @@ func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
 // failure signal on a disband rejection, so octo-server must self-check.
 // The raw lookup error is preserved for errors.Is classification. Callers stay
 // fail-closed and decide whether dbr.ErrNotFound is a business not-found result
-// or whether another error is an internal query failure. A missing group row IS
-// dbr.ErrNotFound — see queryGroupStatusAndProject for why that had to be
-// restored after being briefly collapsed into "status 0".
+// or whether another error is an internal query failure.
 func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
 	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
 	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
-	// 两条分支（测试 override、db 未初始化）都在 queryGroupStatusAndProject 里。
-	status, _, err := ba.queryGroupStatusAndProject(groupNo)
+	status, err := ba.queryGroupStatus(groupNo)
 	if err != nil {
 		return false, err
 	}
 	return status == group.GroupStatusDisband, nil
 }
 
-// queryGroupStatusAndProject reads the two `group` columns the bot group handlers
-// need, in ONE query.
+// queryGroupStatus reads the group status in one query.
 //
-// project_id rides along because of the C1 discipline the D7 guard states as a
-// hard requirement: a Space-direct group must cost ZERO extra queries for that
-// guard. The Web-side guard gets project_id free, because its handlers already
-// have the group row; this module did not, so its copy of the guard was issuing
-// its own lookup on every bot-driven member removal — including the Space-direct
-// ones, where the budget is zero. PR #855s fourth review, Q6.
-//
-// # A missing group row is dbr.ErrNotFound, not "status 0"
-//
-// The first version of this function replaced isGroupDisbanded's LoadOne with a
-// Load and returned (0, "", nil) for a missing row. That silently rewrote the
-// contract of the whole bot send-permission surface, which was the point of
-// LoadOne: send.go's callers classify dbr.ErrNotFound into
-// errBotSendPermGroupNotFound and the sendPermissionReasonNotFound metric, whose
-// job is to separate "a bot is probing channel ids that do not exist" from "a
-// query failed" — and send_permission_observability.go gives it its own log
-// level. Reading a missing row as "not disbanded" made both unreachable through
-// the DB, removed the only existence check on the OBO send path (checkOBO
-// returns early with an enabled scope row and nothing downstream re-asks), and
-// left this module answering differently from modules/robot and modules/message,
-// which still use LoadOne on the same question.
-//
-// So the not-found signal is preserved and wrapped, and isGroupDisbanded
-// propagates it unchanged. Saving one query for a latency nit is not a reason to
-// loosen a fail-closed guard on the bot authorization path. PR #855s fifth review.
-//
-// projectID is "" for a group with no project (Space-direct), which short-circuits
-// the D7 guard — the two questions are independent, and collapsing them is what
-// lost the distinction.
-func (ba *BotAPI) queryGroupStatusAndProject(groupNo string) (int, string, error) {
-	// The status seam stays honoured: a stub that answers only status gets ""
-	// for project_id, which reads as Space-direct — the D7 guard then short-circuits
-	// rather than querying, which is the correct answer in a binary with no project
-	// tables anyway.
+// A missing group row is returned as dbr.ErrNotFound rather than "status 0".
+// Send-permission callers classify that sentinel as a business not-found result,
+// distinct from an internal query failure.
+func (ba *BotAPI) queryGroupStatus(groupNo string) (int, error) {
 	if ba.groupStatusQueryOverride != nil {
 		status, err := ba.groupStatusQueryOverride(groupNo)
 		if err != nil {
-			return 0, "", fmt.Errorf("query group status: %w", err)
+			return 0, fmt.Errorf("query group status: %w", err)
 		}
-		return status, "", nil
+		return status, nil
 	}
 	// db 未初始化时（如单元测试 stub 不注入 db），无法查询群状态。跳过而非
 	// fail-closed，理由见 isGroupDisbanded。
 	if ba.db == nil || ba.db.session == nil {
-		return 0, "", nil
+		return 0, nil
 	}
 	var rows []*struct {
-		Status    int    `db:"status"`
-		ProjectID string `db:"project_id"`
+		Status int `db:"status"`
 	}
 	if _, err := ba.db.session.SelectBySql(
-		"SELECT status, IFNULL(project_id, '') AS project_id FROM `group` WHERE group_no=?",
+		"SELECT status FROM `group` WHERE group_no=?",
 		groupNo,
 	).Load(&rows); err != nil {
-		return 0, "", fmt.Errorf("query group status: %w", err)
+		return 0, fmt.Errorf("query group status: %w", err)
 	}
 	if len(rows) == 0 {
-		// Wrapped, not bare, so a reader sees which lookup failed; errors.Is still
-		// matches, which is what every caller classifies on.
-		return 0, "", fmt.Errorf("query group status: %w", dbr.ErrNotFound)
+		return 0, fmt.Errorf("query group status: %w", dbr.ErrNotFound)
 	}
-	return rows[0].Status, rows[0].ProjectID, nil
+	return rows[0].Status, nil
 }
 
 // ==================== Read Receipt ====================

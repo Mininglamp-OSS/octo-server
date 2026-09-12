@@ -36,11 +36,22 @@ func leaseTestProject(t *testing.T, p *Project, name string) *Model {
 	seedSpace(t, spaceA, 1)
 	seedUser(t, "u_owner")
 	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
-	model, err := p.createProjectOnce(createInput{
+
+	// Prepare the exact seat identity before opening the write transaction.
+	// Bypass createProjectOnce's post-commit provisioning hook: these protocol
+	// cases need the project pointer empty before the first explicit claim.
+	in := createInput{
 		SpaceID: spaceA, Creator: "u_owner", Name: name,
 		Discoverability: DiscoverabilitySpaceListed,
-	})
+	}
+	refs, err := p.db.resolveSpaceSeatIDs(in.SpaceID, createSeatUIDs(in))
 	require.NoError(t, err)
+	tx, err := p.db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	model, err := p.createProjectTxWithSeatRefs(tx, in, refs)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 	require.Empty(t, model.AllMemberGroupNo)
 	return model
 }

@@ -48,7 +48,7 @@ func TestProjectMembershipsDeniesAUserRemovedFromTheSpace(t *testing.T) {
 
 	created := createProjectVia(t, srv, spaceA, ownerToken, "space-conjunction")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		ownerToken, map[string]any{"uids": []string{"conjMember"}})
+		ownerToken, addMembersPayload("conjMember"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	// Baseline: both hold seats and both are in the Space. The roles map is keyed by
@@ -373,7 +373,7 @@ func TestSpaceRemovalMovesTheEpochAtCommit(t *testing.T) {
 	untouched := createProjectVia(t, srv, spaceA, ownerToken, "space-removal-untouched")
 	for _, p := range []string{inA.ProjectID, inB.ProjectID} {
 		w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+p+"/members/add",
-			ownerToken, map[string]any{"uids": []string{"epochRemTarget"}})
+			ownerToken, addMembersPayload("epochRemTarget"))
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	}
 

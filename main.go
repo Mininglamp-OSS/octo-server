@@ -98,6 +98,39 @@ func globalRateLimitExcludePaths() []string {
 	return []string{"/v1/ping", "/v1/health", "/v1/bot/heartbeat", "/v1/bot/register"}
 }
 
+// exposeProjectPaginationHeader keeps the existing CORS exposure list and adds the
+// pagination count used by Project and other list endpoints. The shared CORS
+// middleware may already have emitted several comma-separated values (or several
+// header lines), so inspect every token before appending instead of overwriting it.
+func exposeProjectPaginationHeader() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		const (
+			exposeHeader = "Access-Control-Expose-Headers"
+			totalHeader  = "X-Total-Count"
+		)
+		h := c.Writer.Header()
+		if h.Get("Access-Control-Allow-Origin") == "" {
+			// SecureCORSOverrideMiddleware deliberately strips CORS headers for
+			// same-origin or disallowed requests. Do not reintroduce an expose
+			// header after that decision.
+			c.Next()
+			return
+		}
+		values := h.Values(exposeHeader)
+		for _, line := range values {
+			for _, token := range strings.Split(line, ",") {
+				if strings.EqualFold(strings.TrimSpace(token), totalHeader) {
+					c.Next()
+					return
+				}
+			}
+		}
+		values = append(values, totalHeader)
+		h.Set(exposeHeader, strings.Join(values, ", "))
+		c.Next()
+	}
+}
+
 func loadConfigFromFile(cfgFile string) *viper.Viper {
 	vp := viper.New()
 	vp.SetConfigFile(cfgFile)
@@ -451,9 +484,12 @@ func runAPI(ctx *config.Context) {
 	// CORS 白名单覆盖：dmwork-lib 的 server.New 默认注入 "*" + Credentials:true，
 	// 本中间件在其后执行，按 DM_CORS_ALLOWED_ORIGINS 重写/剥离 Allow-Origin/Credentials。
 	// 未配置时等价于禁用跨域（剥离所有 CORS 响应头），仅允许同源调用。
-	route.UseGin(libwkhttp.SecureCORSOverrideMiddleware(
-		libwkhttp.ParseAllowedOrigins(os.Getenv("DM_CORS_ALLOWED_ORIGINS")),
-	))
+	route.UseGin(
+		libwkhttp.SecureCORSOverrideMiddleware(
+			libwkhttp.ParseAllowedOrigins(os.Getenv("DM_CORS_ALLOWED_ORIGINS")),
+		),
+		exposeProjectPaginationHeader(),
+	)
 	// Legacy-database upgrade shim: rewrite the historical filename IDs in
 	// gorp_migrations to the new timestamp-prefixed format before
 	// module.Setup (which internally calls migrate.Exec) runs. Without
@@ -706,21 +742,17 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// Space role lookup AND route notify. Registered by qualified constant,
 		// not a literal, so main_wiring_test.go can assert it stays present.
 		os.Getenv(space.MarketplaceInternalTokenEnv),
-		// The two project provisioning secrets, for the same reason and with the same
+		// The two project provisioning credentials, for the same reason and with the same
 		// limitation: modules/project can check them against each other and against the
-		// four FIXED internal-token envs, but it cannot see the dynamic route-scoped
-		// notify tokens / callback secrets. Without these two arguments an operator who
-		// set a provisioning secret equal to a route's notify_token_env would pass every
-		// local check, and one leaked value would then authorize BOTH provisioning a
-		// container into fleet/drive AND minting that route's card action.
+		// fixed internal-token envs, but it cannot see dynamic route-scoped credentials.
+		// Without these two arguments, a provisioning credential equal to a route's
+		// notify_token_env would pass local checks and authorize both provisioning and
+		// minting that route's card action.
 		//
-		// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions in
-		// modules/project/provisioning_guard_test.go asserts both arguments stay present
-		// so a refactor cannot drop them silently. (This pointer exists so a future
-		// refactorer can find the guard — an earlier version named a file that does not
-		// exist, which defeats the only purpose the comment has.)
+		// TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions in
+		// modules/project/provisioning_guard_test.go asserts both arguments stay present.
 		os.Getenv(project.ProvisionFleetSecretEnv),
-		os.Getenv(project.ProvisionDriveSecretEnv),
+		os.Getenv(project.DriveInternalTokenEnv),
 		// Same reasoning for the membership internal token: modules/internal_membership
 		// only sees the fixed internal-token envs and cannot detect a collision with a
 		// route-level credential.
@@ -890,7 +922,15 @@ var fixedInternalTokenEnvs = []string{
 	// equal to an inbound token is the worse half of that, since handing it to a
 	// peer hands the peer a credential that authenticates back to us.
 	project.ProvisionFleetSecretEnv,
-	project.ProvisionDriveSecretEnv,
+	// Drive's provisioning credential is NOT a second entry here, and its absence is
+	// deliberate rather than an omission. main's #887 stopped giving Drive its own
+	// per-target HMAC secret and pointed provisioning at the existing
+	// OCTO_DRIVE_INTERNAL_TOKEN — so project.DriveInternalTokenEnv and
+	// internal_resolve.DriveInternalTokenEnv are now the same env name. Listing it
+	// twice would make fixedInternalTokenCollisions report the value as colliding with
+	// ITSELF on every deployment that sets it, turning a real detector into a standing
+	// false ERROR line. One value serving two purposes is a decision main made; this
+	// registry's job is to catch the ones nobody decided.
 	// Three more inbound capability credentials, each a single env, each missed
 	// until the sweep test above was written: the webhook HMAC secret
 	// (modules/webhook), the mail gateway secret (modules/agentmailgateway), and

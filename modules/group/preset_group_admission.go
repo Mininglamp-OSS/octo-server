@@ -57,29 +57,43 @@ func (g *Group) admitToPresetGroup(ctx *config.Context, spaceID, groupNo, uid st
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// projectID is READ FROM THE GROUP ROW rather than passed as the empty
-	// sentinel, and that is the whole point of this lookup.
-	//
-	// modules/space has already refused to auto-join a group whose project_id is
-	// non-empty, so passing "" would be correct today — and would become a
-	// fail-OPEN shortcut the moment that check moved or was relaxed, with nothing
-	// here to notice. Reading the row costs one query on a path that runs once per
-	// Space join and keeps the gate answering from the group's own attribution.
-	groupModel, err := g.db.QueryWithGroupNo(groupNo)
+	var groupRow struct {
+		GroupNo string `db:"group_no"`
+	}
+	count, err := tx.SelectBySql(
+		"SELECT group_no FROM `group` WHERE group_no=? FOR SHARE",
+		groupNo,
+	).Load(&groupRow)
 	if err != nil {
 		return fmt.Errorf("group: preset admission query group: %w", err)
 	}
-	if groupModel == nil {
+	if count != 1 {
 		return fmt.Errorf("group: preset admission: group %s not found", groupNo)
 	}
+	var dedicated []int
+	if _, err := tx.SelectBySql(
+		"SELECT 1 FROM `octo_project` p "+
+			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no "+
+			"  AND g.project_id = p.project_id "+
+			"WHERE p.space_id = ? AND p.status = 1 "+
+			"  AND p.all_member_group_no = ? AND g.status <> 2 LIMIT 1",
+		spaceID, groupNo,
+	).Load(&dedicated); err != nil {
+		return fmt.Errorf("group: preset admission check dedicated group: %w", err)
+	}
+	if len(dedicated) > 0 {
+		// The Project pointer, not the native project_id relation by itself,
+		// makes this group a live all-member projection. Preset admission must
+		// not create a native member outside the Project seat set.
+		return nil
+	}
 
-	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, groupModel.SpaceID, groupModel.ProjectID,
-		[]MemberAdmission{{
-			UID:       uid,
-			Version:   version,
-			Role:      MemberRoleCommon,
-			InviteUID: uid,
-		}}, AdmissionEntryPresetGroups); err != nil {
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{{
+		UID:       uid,
+		Version:   version,
+		Role:      MemberRoleCommon,
+		InviteUID: uid,
+	}}); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

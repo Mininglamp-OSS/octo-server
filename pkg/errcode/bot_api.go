@@ -147,35 +147,12 @@ var (
 		DefaultMessage: "The group owner and managers cannot be removed through the bot API.",
 		SafeDetailKeys: []string{"uid"},
 	})
-	// ErrBotAPIAllMemberGroupProtected refuses a bot-API member removal on a
-	// project's all-member group (P2 D7).
-	//
-	// A bot admin is manager-level, and this endpoint calls the service-layer
-	// removal primitive directly rather than re-dispatching into the Web handler,
-	// so the Web-side guard does not cover it. Left open, a bot could take an
-	// ordinary member out of the group while their project seat stays active —
-	// invariant I4 broken, with nothing to repair it: the seat is unchanged, so no
-	// cascade revisits it and the admitter only runs on a fresh add.
-	//
-	// A bot_api code rather than the group one because this module answers in its
-	// own namespace and its adapters branch on that prefix.
-	//
-	// Note for whoever writes the client handling: this answers 403 while its Web
-	// twin (ErrGroupAllMemberGroupProtected) answers 400, so the same "manage this
-	// from the project instead" arrives with two different statuses depending on
-	// the door. Each is consistent inside its own module — modules/group follows
-	// the repo default of pinning 400 for D14 compatibility, and every refusal in
-	// this handler uses the real status — so the divergence is two conventions
-	// meeting, not a mistake. Raised in PR #855s review; recorded rather than
-	// unified, because unifying means changing one module wire contract to match
-	// the other and that is not this change decision to make.
+	// ErrBotAPIAllMemberGroupProtected refuses bot-admin membership mutations
+	// against a Project's dedicated all-member group.
 	ErrBotAPIAllMemberGroupProtected = register(codes.Code{
 		ID:             "err.server.bot_api.all_member_group_protected",
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "This is a project's all-member group; manage its members from the project instead.",
-		// No SafeDetailKeys: the refusal names no uid. Which member the bot tried
-		// to remove is irrelevant — every member of an all-member group is refused,
-		// because the group's roster is the project's.
 	})
 	// ErrBotAPINotSpaceMember covers the bot/user-not-a-space-member guard.
 	ErrBotAPINotSpaceMember = register(codes.Code{

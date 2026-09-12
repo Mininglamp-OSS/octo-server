@@ -44,6 +44,7 @@ type memberRemovalCleanupJob struct {
 	OperatorUID string `db:"operator_uid"`
 	Reason      string `db:"reason"`
 	Attempts    uint32 `db:"attempts"`
+	LastError   string `db:"last_error"`
 }
 
 // enqueueMemberRemovalCleanupTx 在成员移除的同一事务内写出清理工单（transactional
@@ -66,15 +67,88 @@ func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, seat SeatRef, operatorUID, reason
 	// time 去比这一列，而 CURRENT_TIMESTAMP 走的是 MySQL 会话时区。两个时钟一旦
 	// 不同源（部署镜像 TZ=Asia/Shanghai，而 DSN 未指定 loc 时驱动按 UTC 发送），
 	// 新工单会整整一个时区偏移都认领不到。写读两侧都走 Go 的 UTC 即自洽。
+	// Match DATETIME(3) precision before insertion: MySQL rounds finer values,
+	// which can otherwise make an immediately eligible job briefly future-due.
 	_, err := tx.InsertBySql(
 		"INSERT INTO space_member_removal_cleanup (space_id, uid, operator_uid, reason, status, next_attempt_at) "+
 			"VALUES (?, ?, ?, ?, ?, ?)",
-		spaceID, uid, operatorUID, reason, removalCleanupPending, time.Now().UTC(),
+		spaceID, uid, operatorUID, reason, removalCleanupPending, time.Now().UTC().Truncate(time.Millisecond),
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("space: enqueue removal cleanup: %w", err)
 	}
 	return nil
+}
+
+// EnqueueMemberRejoinIntentTx persists a projection-only intent in the caller's
+// lifecycle transaction. Only a pristine, unclaimed intent can absorb another
+// request: a continuation may have passed its project and a failed attempt may
+// have exhausted its retry budget.
+//
+// # It resolves the seat rather than trusting the caller's spelling
+//
+// The identifiers reach this outbox row and, through it, the async projection,
+// which matches them against `octo_project_member` — pinned utf8mb4_general_ci,
+// strictly finer than the utf8mb4_0900_ai_ci `space_member` sits at in
+// production. A drifted pair matches the seat and then enumerates zero project
+// seats, so the job completes SUCCESSFULLY having done nothing. That is the same
+// silent no-op enqueueMemberRemovalCleanupTx takes a SeatRef to make
+// unrepresentable, and this door is not exempt from it just because its reason is
+// a rejoin rather than a removal. See seatref.go.
+//
+// The exported signature stays (spaceID, uid) because modules/project calls it
+// across a package boundary and cannot construct a SeatRef; the resolution
+// happens here, once, so no caller can skip it.
+//
+// A MISSING seat row is not an error on this path, which is the one place this
+// differs from the removal side. The intent is projection-only and its callers
+// include compensations that run when the seat is NOT currently open — a native
+// admission whose WuKongIM subscription failed, or a re-admission racing a second
+// removal. Refusing those would roll back work that has nothing wrong with it. So
+// when the row is absent the caller's own bytes are stored: there is no better
+// spelling available, and the projection finds the same nothing either way. When
+// the row IS there — every ordinary rejoin — the stored bytes win, which is the
+// half that matters, because those are what octo_project_member must be matched
+// with under its stricter collation.
+//
+// The four seat-reopening doors do not reach this function at all: openSeatTx
+// already holds a resolved SeatRef by the time it enqueues, so it calls the
+// by-seat form below directly and cannot fall back.
+func EnqueueMemberRejoinIntentTx(tx *dbr.Tx, spaceID, uid, operatorUID string) error {
+	seat, err := ResolveSeatTx(tx, spaceID, uid)
+	if err != nil {
+		if !errors.Is(err, ErrSeatNotFound) {
+			return err
+		}
+		seat = SeatRef{spaceID: spaceID, uid: uid}
+	}
+	return enqueueMemberRejoinIntentForSeatTx(tx, seat, operatorUID)
+}
+
+// enqueueMemberRejoinIntentForSeatTx is the in-package form for callers that have
+// already resolved the seat — openSeatTx holds one by the time it runs its steps,
+// so re-resolving there would be a second identical read inside the same lock.
+func enqueueMemberRejoinIntentForSeatTx(tx *dbr.Tx, seat SeatRef, operatorUID string) error {
+	if seat.IsZero() {
+		return errors.New("space: rejoin intent requires space_id and uid")
+	}
+	var pending []uint64
+	_, err := tx.SelectBySql(
+		"SELECT id FROM space_member_removal_cleanup "+
+			"WHERE space_id=? AND uid=? AND reason=? AND status=? "+
+			"AND lease_owner='' AND lease_until IS NULL AND attempts=0 AND last_error='' "+
+			"LIMIT 1 FOR UPDATE",
+		seat.SpaceID(), seat.UID(), MemberRemoveReasonRejoined, removalCleanupPending,
+	).Load(&pending)
+	if err != nil {
+		return fmt.Errorf("space: check unclaimed rejoin intent: %w", err)
+	}
+	if len(pending) > 0 {
+		return nil
+	}
+	return enqueueMemberRemovalCleanupTx(
+		tx, seat, operatorUID, MemberRemoveReasonRejoined,
+	)
 }
 
 // enqueueMemberRemovalCleanupBatchTx 一次性为多个成员写出清理工单。
@@ -103,7 +177,7 @@ func enqueueMemberRemovalCleanupBatchTx(tx *dbr.Tx, space SpaceRef, uids []strin
 		return fmt.Errorf("space: unknown member removal reason %q", reason)
 	}
 	const perStatement = 200
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Millisecond)
 	for start := 0; start < len(uids); start += perStatement {
 		end := start + perStatement
 		if end > len(uids) {
@@ -152,7 +226,7 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 
 	var job memberRemovalCleanupJob
 	err = tx.SelectBySql(
-		"SELECT id, space_id, uid, operator_uid, reason, attempts "+
+		"SELECT id, space_id, uid, operator_uid, reason, attempts, last_error "+
 			"FROM space_member_removal_cleanup "+
 			"WHERE status=? AND attempts<? AND next_attempt_at<=? "+
 			"AND (lease_until IS NULL OR lease_until<=?) "+
@@ -319,6 +393,36 @@ func (d *DB) releaseMemberRemovalCleanup(id uint64, owner string, attempts uint3
 	affected, err := result.RowsAffected()
 	if err != nil || affected != 1 {
 		return errors.New("space: removal cleanup lease ownership lost on release")
+	}
+	return nil
+}
+
+// releaseMemberRejoinCleanup advances a paged projection without spending a
+// retry attempt. The worker increments attempts when it claims the job; a
+// complete page is normal progress, so this path refunds that claim and makes
+// the next page immediately eligible.
+func (d *DB) releaseMemberRejoinCleanup(
+	id uint64, owner string, attempts uint32, cursor string,
+) error {
+	previousAttempts := uint32(0)
+	if attempts > 0 {
+		previousAttempts = attempts - 1
+	}
+	next := time.Now().UTC().Truncate(time.Millisecond)
+	lastError := rejoinCursorPrefix + cursor
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_member_removal_cleanup "+
+			"SET attempts=?, next_attempt_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"WHERE id=? AND status=? AND lease_owner=?",
+		previousAttempts, next, truncateCleanupError(lastError),
+		id, removalCleanupPending, owner,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("space: release rejoin cleanup job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return errors.New("space: rejoin cleanup lease ownership lost on release")
 	}
 	return nil
 }

@@ -321,7 +321,7 @@ func TestValidateTarget(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", Target{Name: "fleet", EnsureURL: "https://fleet.internal/api/internal/workspaces/ensure", Secret: testSecret}, false},
-		{"ok_http", Target{Name: "drive", EnsureURL: "http://drive.internal/v1/internal/drive/spaces/ensure", Secret: testSecret}, false},
+		{"ok_http", Target{Name: "drive", EnsureURL: "http://drive.internal/v1/internal/drive/spaces", Auth: AuthInternalToken, InternalToken: testSecret}, false},
 		{"no_name", Target{EnsureURL: "https://x.internal/ensure", Secret: testSecret}, true},
 		{"short_secret", Target{Name: "fleet", EnsureURL: "https://x.internal/ensure", Secret: "short"}, true},
 		{"no_scheme", Target{Name: "fleet", EnsureURL: "fleet.internal/ensure", Secret: testSecret}, true},
@@ -756,5 +756,201 @@ func TestValidateTargetRefusesAnUntrimmedURL(t *testing.T) {
 			t.Errorf("%q must be refused: it survives url.Parse, reaches EscapedPath() as %%20, "+
 				"signature and wire path agree, and the peer answers 404 — retried to abandoned", raw)
 		}
+	}
+}
+
+func driveTarget(url string) Target {
+	return Target{
+		Name:          "drive",
+		EnsureURL:     url,
+		Auth:          AuthInternalToken,
+		InternalToken: "drive-internal-token-0123456789abcdef",
+		Timeout:       2 * time.Second,
+	}
+}
+
+func driveRequestFixture(projectID string) DriveRequest {
+	return DriveRequest{
+		Name:          "完整项目名",
+		OctoSpaceID:   "space-1",
+		SuperAdminUID: "owner-1",
+		ProjectID:     projectID,
+	}
+}
+
+func TestCreateDriveSpaceNameCharacterLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		text      string
+		wantError bool
+	}{
+		{"project CJK maximum", strings.Repeat("中", 30), false},
+		{"Drive Unicode boundary", strings.Repeat("中😀", 32), false},
+		{"over Drive boundary", strings.Repeat("中😀", 32) + "文", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body DriveRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode Drive request: %v", err)
+				}
+				received <- body.Name
+				w.WriteHeader(http.StatusCreated)
+			}))
+			defer server.Close()
+			req := driveRequestFixture("project-name-boundary")
+			req.Name = tc.text
+			_, err := NewClient(nil, nil).CreateDriveSpace(context.Background(),
+				driveTarget(server.URL+"/v1/internal/drive/spaces"), req)
+			if tc.wantError {
+				if err == nil || Category(err) != "invalid_request" {
+					t.Fatalf("expected invalid_request, got %v", err)
+				}
+				select {
+				case <-received:
+					t.Fatal("an over-limit name must be rejected before HTTP")
+				default:
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid Unicode name rejected: %v", err)
+			}
+			if got := <-received; got != tc.text {
+				t.Fatalf("Drive received %q, want complete name %q", got, tc.text)
+			}
+		})
+	}
+}
+
+func TestCreateDriveSpaceUsesInternalTokenAndProjectBody(t *testing.T) {
+	const projectID = "project-1"
+	var got DriveRequest
+	var gotPath string
+	var gotToken string
+	var gotSignature string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotToken = r.Header.Get(HeaderInternalToken)
+		gotSignature = r.Header.Get(HeaderSignature)
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode Drive request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		// The response contains the remote resource id, but the caller must not depend on
+		// or persist it: project_id is the stable lookup key on this integration.
+		_, _ = w.Write([]byte(`{"id":"shared:remote-space","project_id":"project-1"}`))
+	}))
+	defer server.Close()
+
+	target := driveTarget(server.URL + "/v1/internal/drive/spaces")
+	resp, err := NewClient(nil, nil).CreateDriveSpace(context.Background(), target, driveRequestFixture(projectID))
+	if err != nil {
+		t.Fatalf("CreateDriveSpace: %v", err)
+	}
+	if resp.Duplicate {
+		t.Fatal("a 201 response must be reported as a new success, not duplicate")
+	}
+	if gotPath != "/v1/internal/drive/spaces" {
+		t.Fatalf("path = %q, want /v1/internal/drive/spaces", gotPath)
+	}
+	if gotToken != target.InternalToken {
+		t.Fatalf("X-Internal-Token = %q, want configured internal token", gotToken)
+	}
+	if gotSignature != "" {
+		t.Fatalf("Drive internal-token request carried Fleet HMAC header %q", gotSignature)
+	}
+	if got != driveRequestFixture(projectID) {
+		t.Fatalf("body = %+v, want %+v", got, driveRequestFixture(projectID))
+	}
+}
+
+func TestCreateDriveSpaceOnlyAcceptsExactProjectDuplicateConflict(t *testing.T) {
+	const projectID = "project-1"
+	cases := []struct {
+		name       string
+		body       string
+		wantOK     bool
+		wantDup    bool
+		wantStatus string
+	}{
+		{
+			name:    "same project",
+			body:    `{"error":"conflict","message":"workspace_id \"project-1\" already bound to a space"}`,
+			wantOK:  true,
+			wantDup: true,
+		},
+		{
+			name:       "different project",
+			body:       `{"error":"conflict","message":"workspace_id \"project-2\" already bound to a space"}`,
+			wantStatus: "target_4xx",
+		},
+		{
+			name:       "generic conflict",
+			body:       `{"error":"conflict","message":"space name already exists"}`,
+			wantStatus: "target_4xx",
+		},
+		{
+			name:       "folder depth conflict",
+			body:       `{"error":"folder_depth_exceeded","message":"folder depth limit exceeded"}`,
+			wantStatus: "target_4xx",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			resp, err := NewClient(nil, nil).CreateDriveSpace(
+				context.Background(),
+				driveTarget(server.URL+"/v1/internal/drive/spaces"),
+				driveRequestFixture(projectID),
+			)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("same-project duplicate returned error: %v", err)
+				}
+				if !resp.Duplicate {
+					t.Fatal("same-project duplicate must be marked idempotent success")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("non-identical 409 must remain a failure")
+			}
+			if got := Category(err); got != tc.wantStatus {
+				t.Fatalf("category = %q, want %q (err=%v)", got, tc.wantStatus, err)
+			}
+			if resp.Duplicate {
+				t.Fatal("non-identical 409 was incorrectly accepted as duplicate")
+			}
+		})
+	}
+}
+
+func TestCreateDriveSpaceDoesNotUseFleetHMACSecret(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { hits++ }))
+	defer server.Close()
+
+	target := Target{
+		Name:      "drive",
+		EnsureURL: server.URL + "/v1/internal/drive/spaces",
+		Auth:      AuthInternalToken,
+		Secret:    testSecret,
+		Timeout:   2 * time.Second,
+	}
+	_, err := NewClient(nil, nil).CreateDriveSpace(context.Background(), target, driveRequestFixture("project-1"))
+	if err == nil || Category(err) != "invalid_target" {
+		t.Fatalf("Drive with only Fleet Secret = %v, want invalid_target", err)
+	}
+	if hits != 0 {
+		t.Fatalf("invalid Drive credential reached target %d times", hits)
 	}
 }

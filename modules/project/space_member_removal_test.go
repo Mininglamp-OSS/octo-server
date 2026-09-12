@@ -41,7 +41,7 @@ func TestCascadeDeactivatesEverySeatAndIsIdempotent(t *testing.T) {
 	// rather than just the first one it finds.
 	second := createProjectVia(t, srv, spaceA, ownerTok, "second")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+second.ProjectID+"/members/add",
-		ownerTok, map[string]any{"uids": []string{"leaver"}})
+		ownerTok, addMembersPayload("leaver"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	epochFirstBefore := epochOf(t, first.ProjectID)
@@ -193,4 +193,73 @@ func TestCascadeStepIsRegisteredUnderItsName(t *testing.T) {
 	require.NoError(t, runCascade(t, p, spaceA, "ghost", "someone", spacemod.MemberRemoveReasonKicked))
 	assert.False(t, probeRan, "runCascade calls the step directly, so the probe proves "+
 		"registration is accepted rather than that the worker dispatched it")
+}
+
+// TestSpaceRemovalPreservesOwnerAndClosesAgentRiders exercises the production
+// all-Space removal entry point rather than a direct project-seat update. The
+// human Owner row is deliberately retained, while a non-Owner bot seated by
+// that Owner must still be removed from the Project.
+func TestSpaceRemovalPreservesOwnerAndClosesAgentRiders(t *testing.T) {
+	srv, p := setup(t)
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, "cascade-owner")
+	seedSpaceMember(t, spaceA, "cascade-owner", 0, 1)
+	seedAgent(t, spaceA, "cascade-owner-bot", "cascade-owner", "octo_hosted")
+
+	w := doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", ownerToken,
+		map[string]any{
+			"name":       "owner rider cascade",
+			"agent_uids": []string{"cascade-owner-bot"},
+		})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	created := decodeResp(t, w)
+	epochBefore := epochOf(t, created.ProjectID)
+
+	closed, err := spacemod.CloseAllSpaceSeats(
+		testCtx, "cascade-owner", "cascade-operator", spacemod.MemberRemoveReasonForceRemoved)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{spaceA}, closed)
+
+	// CloseAllSpaceSeats is the real Space-side entry point. Its asynchronous
+	// worker may already have run the project step; the direct call is idempotent
+	// and makes this test deterministic about the project-side contract.
+	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-operator",
+		spacemod.MemberRemoveReasonForceRemoved))
+	p.runRemovalCascade()
+	epochAfter := epochOf(t, created.ProjectID)
+	require.Greater(t, epochAfter, epochBefore,
+		"closing the Owner's rider seats must move the project epoch")
+
+	// The delta is not pinned to exactly 1 any more, and that is a real change rather
+	// than a loosened assertion.
+	//
+	// A force-removal now moves the epoch TWICE, at two different times, because two
+	// different membership facts change: the Space seat closing is published
+	// synchronously inside the Space transaction (bumpEpochsOnSeatTransition — this is
+	// the invalidation signal the internal membership endpoints depend on, and an
+	// asynchronous-only signal with a terminal abandoned state is no bound at all), and
+	// the rider agent seat closing is published by the cascade when it actually closes.
+	// Counting those as one would mean a consumer that re-verified between them cached
+	// an answer under an epoch that then never moved again.
+	//
+	// What the test still pins strictly is the property this case exists for: IDEMPOTENCE.
+	// A second cascade pass has neither an active rider nor a human seat to close, so it
+	// must move nothing — a re-run bump would inflate the epoch on every worker retry and
+	// break "a no-op does not change the epoch", which is the rule clients cache against.
+	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-operator",
+		spacemod.MemberRemoveReasonForceRemoved))
+	p.runRemovalCascade()
+	require.Equal(t, epochAfter, epochOf(t, created.ProjectID),
+		"a second cascade pass has nothing to close and must not move the epoch again")
+
+	owner := memberRow(t, created.ProjectID, "cascade-owner")
+	require.NotNil(t, owner)
+	assert.Equal(t, MemberStatusActive, owner.Status)
+	assert.Zero(t, owner.Removing)
+	assert.Equal(t, RoleOwner, owner.Role)
+
+	bot := memberRow(t, created.ProjectID, "cascade-owner-bot")
+	require.NotNil(t, bot)
+	assert.Equal(t, MemberStatusRemoved, bot.Status)
+	assert.Zero(t, bot.Removing)
 }

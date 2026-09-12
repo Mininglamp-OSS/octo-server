@@ -32,7 +32,7 @@ func TestProjectAdmitProvisionsSidebarSection(t *testing.T) {
 	created := createProjectVia(t, srv, spaceA, ownerToken, "sidebar admit")
 
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
-		map[string]any{"uids": []string{"sidebar-member"}})
+		addMembersPayload("sidebar-member"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assertProjectSidebarSection(t, created.ProjectID, "sidebar-member", 1)
 
@@ -41,7 +41,7 @@ func TestProjectAdmitProvisionsSidebarSection(t *testing.T) {
 	assertProjectSidebarSection(t, created.ProjectID, "sidebar-owner", 1)
 }
 
-func TestPinningSpaceListedProjectProvisionsSidebarSection(t *testing.T) {
+func TestPinningProjectProvisionsSidebarSection(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
 	ownerToken := seedUser(t, "sidebar-pin-owner")
@@ -50,11 +50,12 @@ func TestPinningSpaceListedProjectProvisionsSidebarSection(t *testing.T) {
 	seedSpaceMember(t, spaceA, "sidebar-pinner", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerToken, "sidebar pin")
 
-	var seats int
-	require.NoError(t, testCtx.DB().Select("COUNT(*)").From("octo_project_member").
-		Where("project_id=? AND uid=? AND status=1 AND removing=0", created.ProjectID, "sidebar-pinner").
-		LoadOne(&seats))
-	require.Zero(t, seats, "the regression must cover #861's Space-listed non-member pin path")
+	// Pinning is a Project-member preference; Space membership alone is not
+	// enough to write the setting.
+	w := doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerToken,
+		addMembersPayload("sidebar-pinner"))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, pinnerToken, true).Code)
 	assertProjectSidebarSection(t, created.ProjectID, "sidebar-pinner", 1)
 }

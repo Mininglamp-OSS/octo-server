@@ -1,19 +1,7 @@
 package bot_api
 
-// The group-status lookup's missing-row contract.
-//
-// PR #855's fifth review found that collapsing isGroupDisbanded's LoadOne into a
-// Load — done to let the D7 guard read project_id from the same query — turned a
-// missing group row from dbr.ErrNotFound into "status 0, not disbanded". That
-// silently rewired the bot send-permission surface: errBotSendPermGroupNotFound
-// and the sendPermissionReasonNotFound metric both became unreachable through the
-// DB, and on the OBO path the disband guard was the ONLY check that the target
-// channel exists.
-//
-// The suite stayed green because both "missing group" cases in
-// send_permission_observability_test.go drive groupStatusQueryOverride — the stub
-// seam, which the change did not touch. So these cases deliberately drive the REAL
-// query with no stub: the seam demonstrably cannot see this class of change.
+// The group-status lookup's missing-row contract must stay distinct from the
+// test override seam: a real absent row is dbr.ErrNotFound.
 
 import (
 	"testing"
@@ -32,7 +20,7 @@ func TestGroupStatusLookupReportsAMissingRowAsNotFound(t *testing.T) {
 	require.Nil(t, ba.groupStatusQueryOverride,
 		"this case must drive the real query — the stub seam is what hid the regression")
 
-	_, _, err := ba.queryGroupStatusAndProject("no_such_group")
+	_, err := ba.queryGroupStatus("no_such_group")
 	require.Error(t, err, "a group that does not exist is not 'status 0, not disbanded'")
 	assert.ErrorIs(t, err, dbr.ErrNotFound,
 		"callers classify on errors.Is(err, dbr.ErrNotFound): send.go maps it to "+
@@ -47,7 +35,7 @@ func TestGroupStatusLookupReportsAMissingRowAsNotFound(t *testing.T) {
 	assert.False(t, disbanded)
 }
 
-func TestGroupStatusLookupReadsBothColumnsForALiveGroup(t *testing.T) {
+func TestGroupStatusLookupReadsStatusForLiveGroups(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 
@@ -63,16 +51,11 @@ func TestGroupStatusLookupReadsBothColumnsForALiveGroup(t *testing.T) {
 
 	ba := NewBotAPI(ctx)
 
-	status, projectID, err := ba.queryGroupStatusAndProject("gs_project_group")
+	status, err := ba.queryGroupStatus("gs_project_group")
 	require.NoError(t, err)
 	assert.Equal(t, 1, status)
-	assert.Equal(t, "gs_project", projectID,
-		"project_id rides along with status so the D7 guard costs no extra query — "+
-			"that is the whole reason the two reads were merged")
 
-	status, projectID, err = ba.queryGroupStatusAndProject("gs_space_group")
+	status, err = ba.queryGroupStatus("gs_space_group")
 	require.NoError(t, err)
 	assert.Equal(t, 2, status, "a disbanded group still reports its status")
-	assert.Empty(t, projectID,
-		"a Space-direct group reports no project, which short-circuits the D7 guard")
 }

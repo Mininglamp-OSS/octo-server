@@ -2,9 +2,9 @@ package project
 
 // What this file pins:
 //
-//	An ownership transfer must resolve `transfer_to` to the spelling the seat set
-//	returned, and must refuse a successor who IS the departing owner under the same
-//	collation the database compares with.
+//	An ACTIVE project must never end up with zero active owners, and identifier
+//	drift must not be able to produce that state through any of the three doors
+//	that can move the owner seat: leave, role change, and explicit transfer.
 //
 // # The defect it was written for
 //
@@ -15,31 +15,22 @@ package project
 // are owner-only; a Space admin has read-only access), surfaced by
 // project_ownerless_total and repaired by nothing.
 //
-// The chain, with the last owner stored as `tfOwner` and the request naming `TFOWNER`:
+// The original chain ran through a `transfer_to` argument on the leave and role-change
+// doors: the last owner named a case variant of THEMSELVES, the folded seat check
+// passed it, the byte-exact self-transfer guard did not catch it, the member row
+// resolved case-insensitively onto the departing owner's own row, and the role UPDATE
+// no-opped on its `role <> ?` predicate — active project, zero owners.
 //
-//  1. lockSeatsTx always add()s the actor, so heldSeats carries the leaver's own stored
-//     Space seat — leaving a PROJECT does not touch the SPACE seat.
-//  2. FoldedHas(heldSeats, "TFOWNER") folds the needle onto that key and passes.
-//  3. promoteSuccessorTx's self-transfer guard was byte-exact, so "TFOWNER" != "tfOwner"
-//     slipped through it.
-//  4. queryMemberTx resolves under octo_project_member's utf8mb4_general_ci — which is
-//     case-insensitive — onto the departing owner's OWN active row.
-//  5. updateMemberRoleTx no-ops on its `role <> ?` predicate, because that row is
-//     already the owner. The caller discarded the affected-rows result, so the no-op
-//     was invisible.
-//  6. The leave then closes that seat and commits: active project, zero owners.
+// # Why the tests changed shape
 //
-// This is a regression THIS branch introduced: at the merge base the guard was an
-// exact-match `heldSeats[transferTo]`, which refused the request cleanly. Widening it
-// to FoldedHas fixed a real fail-CLOSED bug (a legitimate successor whose stored
-// spelling differed in case was refused) and opened this fail-OPEN one, because the
-// widening stopped at the comparison and never reached the write.
+// main's #887 removed `transfer_to` from both of those doors: the last owner is now
+// refused with errLastOwnerMustTransfer and has to call the explicit transfer endpoint
+// first. That deletes the chain above by construction rather than by guarding it — so
+// these cases assert the doors' refusals and the end state, not the old argument.
 //
-// # Why the assertion is "an owner survives" rather than a specific error
-//
-// The refusal code is worth pinning too, but the invariant that matters is the end
-// state. A future change that returns a different error while still bricking ownership
-// would pass an error-code assertion and fail this one.
+// The invariant is deliberately spelled as "an owner survives" rather than as a
+// specific error code: a future change that returns a different error while still
+// bricking ownership would pass an error-code assertion and fail this one.
 
 import (
 	"strings"
@@ -68,8 +59,22 @@ func activeOwners(t *testing.T, projectID string) int {
 	return n[0]
 }
 
-// TestLastOwnerCannotTransferToACaseVariantOfThemselves covers the leave door.
-func TestLastOwnerCannotTransferToACaseVariantOfThemselves(t *testing.T) {
+// roleOf reads one member's stored role, so a case can assert WHICH row moved rather
+// than only how many owners are left.
+func roleOf(t *testing.T, projectID, uid string) int {
+	t.Helper()
+	var role []int
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT role FROM `octo_project_member` "+
+			"WHERE project_id = ? AND uid = ? AND status = ?",
+		projectID, uid, MemberStatusActive).Load(&role)
+	require.NoError(t, err)
+	require.Len(t, role, 1, "expected exactly one active seat for %s", uid)
+	return role[0]
+}
+
+// TestLastOwnerCannotLeaveWithoutTransferring covers the leave door.
+func TestLastOwnerCannotLeaveWithoutTransferring(t *testing.T) {
 	srv, p := setup(t)
 
 	const owner = "tfOwner"
@@ -80,56 +85,19 @@ func TestLastOwnerCannotTransferToACaseVariantOfThemselves(t *testing.T) {
 	proj := createProjectVia(t, srv, spaceA, ownerToken, "transfer-self-leave")
 	require.Equal(t, 1, activeOwners(t, proj.ProjectID), "fixture must start with one owner")
 
-	self := strings.ToUpper(owner)
-	require.NotEqual(t, owner, self)
-
-	_, err := p.leaveProject(proj.ProjectID, spaceA, owner, self)
+	err := p.leaveProject(proj.ProjectID, spaceA, owner)
 	assert.ErrorIs(t, err, errLastOwnerMustTransfer,
-		"naming a case variant of YOURSELF is still naming yourself: the successor check "+
-			"must compare under the same collation the database resolves the member row with, "+
-			"or the promotion targets the departing owner's own row and no-ops")
+		"the last owner must not be able to walk out of the project: the door has no "+
+			"successor argument any more, so the only safe answer is a refusal")
 	assert.Equal(t, 1, activeOwners(t, proj.ProjectID),
 		"the project must still have an active owner. Zero owners is the state this module "+
 			"documents as unrecoverable — role change and disband are owner-only and a Space "+
 			"admin has read-only access, so nothing in-product can repair it.")
 }
 
-// TestSelfTransferIsRefusedWhenTHEACTORsSpellingDrifts is what makes the folded
-// self-transfer guard load-bearing.
-//
-// Written after mutation testing showed it was not: reverting that guard to a
-// byte-exact compare left the two cases above GREEN, because they pass the actor's
-// stored spelling, so the resolved successor and the departing uid are byte-equal
-// anyway. The guard only earns its fold when the DEPARTING side is the drifted one —
-// the uid arrives from the auth token, which is not the same source as the seat row
-// and need not agree with it byte for byte.
-//
-// Recorded because a guard whose mutation passes is a guard that is not being tested,
-// and this branch has shipped three of those.
-func TestSelfTransferIsRefusedWhenTHEACTORsSpellingDrifts(t *testing.T) {
-	srv, p := setup(t)
-
-	const owner = "tfActorDrift"
-	seedSpace(t, spaceA, 1)
-	ownerToken := seedUser(t, owner)
-	seedSpaceMember(t, spaceA, owner, 2, 1)
-
-	proj := createProjectVia(t, srv, spaceA, ownerToken, "transfer-actor-drift")
-	require.Equal(t, 1, activeOwners(t, proj.ProjectID))
-
-	// The actor names themselves with the STORED spelling while their own uid arrives
-	// drifted: still a self-transfer, and the compare has to see that.
-	_, err := p.leaveProject(proj.ProjectID, spaceA, strings.ToUpper(owner), owner)
-	assert.ErrorIs(t, err, errLastOwnerMustTransfer,
-		"a self-transfer is a self-transfer whichever side carries the drift — the compare "+
-			"must fold both, because the database resolves both onto one row")
-	assert.Equal(t, 1, activeOwners(t, proj.ProjectID),
-		"the project must still have an active owner")
-}
-
-// TestDemotingTheLastOwnerViaACaseVariantIsRefused covers the role-change door, which
-// is the same widening applied to a second call site.
-func TestDemotingTheLastOwnerViaACaseVariantIsRefused(t *testing.T) {
+// TestLastOwnerCannotBeDemoted covers the role-change door, which is the second way
+// the only owner seat can stop being an owner seat.
+func TestLastOwnerCannotBeDemoted(t *testing.T) {
 	srv, p := setup(t)
 
 	const owner = "tfRoleOwner"
@@ -140,23 +108,64 @@ func TestDemotingTheLastOwnerViaACaseVariantIsRefused(t *testing.T) {
 	proj := createProjectVia(t, srv, spaceA, ownerToken, "transfer-self-role")
 	require.Equal(t, 1, activeOwners(t, proj.ProjectID))
 
-	self := strings.ToUpper(owner)
-	_, _, err := p.changeMemberRole(proj.ProjectID, spaceA, owner, owner, RoleCommon, self)
-	assert.ErrorIs(t, err, errLastOwnerMustTransfer,
-		"demoting the last owner while naming a case variant of them as the successor is a "+
-			"self-transfer, and must be refused for the same reason the leave door refuses it")
+	// The refusal comes from canActOnTargetRole rather than from the last-owner guard:
+	// no ordinary member mutation may act on an Owner target at all, so the request is
+	// turned away one step earlier. Asserted as "an error, and the owner survives"
+	// rather than as a specific code on purpose — which of the two guards answers is an
+	// implementation detail, while the end state is the invariant, and a change that
+	// swapped the code while bricking ownership would pass a code assertion.
+	_, err := p.changeMemberRole(proj.ProjectID, spaceA, owner, owner, RoleCommon)
+	assert.Error(t, err,
+		"demoting the last owner is the same end state as letting them leave, and must be "+
+			"refused for the same reason")
 	assert.Equal(t, 1, activeOwners(t, proj.ProjectID),
 		"the project must still have an active owner")
+	assert.Equal(t, RoleOwner, roleOf(t, proj.ProjectID, owner),
+		"and it must still be the same person — a refusal that demoted the row anyway "+
+			"would satisfy a count taken over a different project")
 }
 
-// TestTransferToACaseVariantOfARealSuccessorPromotesTheStoredRow is the other half:
-// the fold must keep WORKING for a genuine successor, and the promotion must land on
-// the stored row rather than creating or missing one.
+// TestSelfTransferIsRefusedWhenTheSuccessorSpellingDrifts is the surviving half of the
+// round-13 defect, on the door that still takes a successor.
 //
-// Without this the P1 could be "fixed" by reverting to the exact match, which
-// reintroduces the fail-CLOSED bug the fold was widened to solve — a legitimate
-// successor refused because the caller typed their uid in a different case.
-func TestTransferToACaseVariantOfARealSuccessorPromotesTheStoredRow(t *testing.T) {
+// The guard at the top of transferProjectOwnerOnce is a BYTE-EXACT `successorUID ==
+// actorUID`, so a case variant of the actor walks past it. What refuses the request is
+// that the member row resolves case-insensitively onto the actor's own seat, which is
+// already an owner. That is a different barrier from the one round 13 fixed, and it is
+// the one this case exists to keep: if it is ever relaxed, the transfer would promote
+// the departing owner's own row, no-op on `role <> ?`, and demote them in the next
+// statement — the zero-owner state, reached through the door built to prevent it.
+func TestSelfTransferIsRefusedWhenTheSuccessorSpellingDrifts(t *testing.T) {
+	srv, p := setup(t)
+
+	const owner = "tfActorDrift"
+	seedSpace(t, spaceA, 1)
+	ownerToken := seedUser(t, owner)
+	seedSpaceMember(t, spaceA, owner, 2, 1)
+
+	proj := createProjectVia(t, srv, spaceA, ownerToken, "transfer-actor-drift")
+	require.Equal(t, 1, activeOwners(t, proj.ProjectID))
+
+	self := strings.ToUpper(owner)
+	require.NotEqual(t, owner, self)
+
+	err := p.transferProjectOwner(proj.ProjectID, spaceA, owner, self)
+	assert.Error(t, err,
+		"naming a case variant of YOURSELF is still naming yourself: the database resolves "+
+			"both spellings onto one row, so the transfer has nowhere to go")
+	assert.Equal(t, 1, activeOwners(t, proj.ProjectID),
+		"the project must still have an active owner")
+	assert.Equal(t, RoleOwner, roleOf(t, proj.ProjectID, owner),
+		"and the actor must still hold it: the failure mode this guards is a promotion "+
+			"that no-ops followed by a demotion that does not")
+}
+
+// TestTransferToARealSuccessorLeavesExactlyOneOwner is the other half: the door must
+// keep WORKING, and it must land the owner seat on the successor and nowhere else.
+//
+// Without it the case above could be "fixed" by refusing every transfer, which would
+// make the last owner unable to leave at all.
+func TestTransferToARealSuccessorLeavesExactlyOneOwner(t *testing.T) {
 	srv, p := setup(t)
 
 	const (
@@ -174,20 +183,12 @@ func TestTransferToACaseVariantOfARealSuccessorPromotesTheStoredRow(t *testing.T
 	require.NoError(t, err)
 	require.True(t, admitted)
 
-	promoted, err := p.leaveProject(proj.ProjectID, spaceA, owner, strings.ToUpper(successor))
-	require.NoError(t, err, "a genuine successor named in a different case must still be "+
-		"accepted — that is what widening the guard to a folded lookup was for")
-	assert.Equal(t, successor, promoted,
-		"the reported successor must be the STORED spelling: it is written to the audit "+
-			"record and used as the member-cache invalidation key, and a key built from the "+
-			"caller's bytes invalidates an entry nobody reads")
+	require.NoError(t, p.transferProjectOwner(proj.ProjectID, spaceA, owner, successor))
 
-	var role []int
-	_, err = testCtx.DB().SelectBySql(
-		"SELECT role FROM `octo_project_member` WHERE project_id = ? AND uid = ? AND status = ?",
-		proj.ProjectID, successor, MemberStatusActive).Load(&role)
-	require.NoError(t, err)
-	require.Len(t, role, 1)
-	assert.Equal(t, RoleOwner, role[0], "the stored successor row must actually be owner now")
-	assert.Equal(t, 1, activeOwners(t, proj.ProjectID))
+	assert.Equal(t, RoleOwner, roleOf(t, proj.ProjectID, successor),
+		"the successor's stored row must actually be owner now")
+	assert.Equal(t, RoleAdmin, roleOf(t, proj.ProjectID, owner),
+		"and the former owner must be demoted to admin rather than left as a second owner")
+	assert.Equal(t, 1, activeOwners(t, proj.ProjectID),
+		"exactly one owner: two would make the last-owner guard unreachable on the next leave")
 }

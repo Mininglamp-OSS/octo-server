@@ -44,10 +44,16 @@ type stubStore struct {
 	lastProject string
 	lastUIDs    []string
 	lastIDs     []string
+	// lastEpochCtx / lastMemberCtx record the context each handler passed down, so
+	// TestBothHandlersPassTheRequestContextToTheStore can assert the plumbing is
+	// real rather than trusting the signature.
+	lastEpochCtx  context.Context
+	lastMemberCtx context.Context
 }
 
-func (s *stubStore) Epochs(spaceID string, projectIDs []string) (map[string]int64, error) {
+func (s *stubStore) Epochs(ctx context.Context, spaceID string, projectIDs []string) (map[string]int64, error) {
 	s.epochCalls++
+	s.lastEpochCtx = ctx
 	s.lastSpaceID = spaceID
 	s.lastIDs = projectIDs
 	if s.epochErr != nil {
@@ -70,8 +76,9 @@ func (s *stubStore) Epochs(spaceID string, projectIDs []string) (map[string]int6
 	return out, nil
 }
 
-func (s *stubStore) Memberships(_ context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
+func (s *stubStore) Memberships(ctx context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	s.memberCalls++
+	s.lastMemberCtx = ctx
 	s.lastSpaceID = spaceID
 	s.lastProject = projectID
 	s.lastUIDs = uids
@@ -950,5 +957,74 @@ func TestSentinelRepairCollapsesConcurrentAttempts(t *testing.T) {
 	}
 	if release < spawn {
 		t.Error("the release must be inside the goroutine (a deferred Delete), not before it")
+	}
+}
+
+// ============================================================================
+// Context plumbing — both handlers
+// ============================================================================
+
+// TestBothHandlersPassTheRequestContextToTheStore pins the plumbing, not the
+// signature.
+//
+// Both store methods take a context because the connection wait underneath them is
+// otherwise unbounded: the process-wide session has no Timeout, so dbr reaches
+// sql.DB with context.Background() and a retrying peer at the configured burst can
+// park goroutines on a pool octo-lib defaults to 100 connections. The deadline only
+// exists if the HANDLER actually hands its request context down — passing
+// context.Background(), or a context.TODO() left behind by a refactor, compiles and
+// type-checks and silently restores the hazard.
+//
+// Probed with a value carried on the REQUEST's context rather than by comparing the
+// context the store received against Background(). httptest.NewRequest hands back a
+// request whose own context IS Background, so that comparison would fail for a
+// correctly plumbed handler and pass for nothing — a guard that is red either way
+// teaches people to delete it. A marker only the request carries can only arrive at
+// the store by being passed down.
+func TestBothHandlersPassTheRequestContextToTheStore(t *testing.T) {
+	type ctxProbeKey struct{}
+
+	s := &stubStore{epochs: map[string]int64{"p1": 7}, epoch: 7}
+	r := newRouter(newTestModule(s))
+
+	serve := func(req *http.Request) *httptest.ResponseRecorder {
+		t.Helper()
+		req.Header.Set(internalTokenHeader, testInternalToken)
+		req = req.WithContext(context.WithValue(req.Context(), ctxProbeKey{}, "carried"))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	w := serve(httptest.NewRequest(http.MethodGet, epochsPath+"?space_id=sp1&project_ids=p1", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("epochs: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.epochCalls != 1 {
+		t.Fatalf("epochs handler did not reach the store: calls=%d", s.epochCalls)
+	}
+	if s.lastEpochCtx == nil || s.lastEpochCtx.Value(ctxProbeKey{}) != "carried" {
+		t.Error("membershipEpochs must pass the REQUEST's context to the store. With " +
+			"context.Background() the pool wait underneath is unbounded and a peer that " +
+			"hangs up frees nothing — and this is the polling half of the integration, " +
+			"so it is the half most likely to arrive in a burst.")
+	}
+
+	body, err := json.Marshal(verifyRequest{SpaceID: "sp1", ProjectID: "p1", UIDs: []string{"u1"}})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, verifyPath, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if w := serve(req); w.Code != http.StatusOK {
+		t.Fatalf("verify: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.memberCalls != 1 {
+		t.Fatalf("verify handler did not reach the store: calls=%d", s.memberCalls)
+	}
+	if s.lastMemberCtx == nil || s.lastMemberCtx.Value(ctxProbeKey{}) != "carried" {
+		t.Error("verifyProjectMemberships must pass the REQUEST's context to the store: " +
+			"that call holds a pooled connection across every read in its transaction, so " +
+			"an uncancellable wait for it is the expensive half of the same hazard")
 	}
 }

@@ -122,6 +122,7 @@ func newRenderedTestServer() (*server.Server, *config.Context) {
 // 存活在 Redis 里，CleanAllTables 不会清理它，跨用例累积会让后续用例收到 429。
 func setup(t *testing.T) (*server.Server, *Space, error) {
 	t.Helper()
+	waitForMemberRemovalWorkerIdle(t)
 	err := testutil.CleanAllTables(testCtx)
 	assert.NoError(t, err)
 	resetSpaceUIDRateLimit(t, testCtx)

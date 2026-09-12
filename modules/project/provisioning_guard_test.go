@@ -372,16 +372,16 @@ func TestNoLogFieldCarriesTheContainerID(t *testing.T) {
 	}
 }
 
-// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions pins the boot-time
+// TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions pins the boot-time
 // wiring, which no test in this package can reach at runtime.
 //
 // TestLoadProvisioningConfig's collision cases build their own argument list, so they
 // would still pass with the production arguments deleted. Only the central call in
 // main.go sees the DYNAMIC route-scoped notify tokens and callback secrets loaded from
-// OCTO_CARD_ACTION_ROUTES; without these arguments a provisioning secret set equal to
-// a route's notify token would pass every local check, and one leaked value would
-// authorize both provisioning a container and minting that route's card action.
-func TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions(t *testing.T) {
+// OCTO_CARD_ACTION_ROUTES; without these arguments a provisioning credential set equal
+// to a route's notify token would pass every local check, and one leaked value would
+// authorize both provisioning and minting that route's card action.
+func TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions(t *testing.T) {
 	root := repoRootForGuard(t)
 	src, err := os.ReadFile(filepath.Join(root, "main.go"))
 	if err != nil {
@@ -399,7 +399,7 @@ func TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions(t *testin
 	// i.e. the guard would be green and the check would be doing nothing.
 	for _, want := range []string{
 		"os.Getenv(project.ProvisionFleetSecretEnv)",
-		"os.Getenv(project.ProvisionDriveSecretEnv)",
+		"os.Getenv(project.DriveInternalTokenEnv)",
 	} {
 		if !strings.Contains(strings.Join(strings.Fields(args), ""), strings.ReplaceAll(want, " ", "")) {
 			t.Errorf("main.go: ValidateNotifyTokenExclusions(...) no longer includes %s "+

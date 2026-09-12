@@ -35,6 +35,21 @@ func listProjectIDs(t *testing.T, srv *server.Server, spaceID, token string) []s
 	return out
 }
 
+func withoutProjectIDs(ids []string, excluded ...string) []string {
+	blocked := make(map[string]struct{}, len(excluded))
+	for _, id := range excluded {
+		blocked[id] = struct{}{}
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := blocked[id]; ok {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
 func pinnedFlags(t *testing.T, srv *server.Server, spaceID, token string) map[string]bool {
 	t.Helper()
 	w := doJSON(t, srv, http.MethodGet, "/v1/space/"+spaceID+"/projects", token, nil)
@@ -68,18 +83,20 @@ func TestPinnedProjectSortsFirstAndLeavesTheRestAlone(t *testing.T) {
 	second := createProjectVia(t, srv, spaceA, tok, "pin-b")
 	third := createProjectVia(t, srv, spaceA, tok, "pin-c")
 
-	// The list is newest-first (ORDER BY p.id DESC), so this is the baseline the
-	// pin has to preserve for the rows it does not touch.
-	require.Equal(t,
-		[]string{third.ProjectID, second.ProjectID, first.ProjectID},
-		listProjectIDs(t, srv, spaceA, tok))
+	// Capture the complete semantic baseline so the pin assertion is independent
+	// of how many explicit Projects the fixture creates.
+	original := listProjectIDs(t, srv, spaceA, tok)
+	require.Contains(t, original, first.ProjectID)
+	require.Contains(t, original, second.ProjectID)
+	require.Contains(t, original, third.ProjectID)
 
 	w := setPinned(t, srv, first.ProjectID, tok, true)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
-	assert.Equal(t,
-		[]string{first.ProjectID, third.ProjectID, second.ProjectID},
-		listProjectIDs(t, srv, spaceA, tok),
+	got := listProjectIDs(t, srv, spaceA, tok)
+	require.NotEmpty(t, got)
+	assert.Equal(t, first.ProjectID, got[0])
+	assert.Equal(t, withoutProjectIDs(original, first.ProjectID), got[1:],
 		"the pinned project leads, and the unpinned tail keeps the order it had")
 }
 
@@ -95,12 +112,14 @@ func TestPinIsPerUser(t *testing.T) {
 	seedSpaceMember(t, spaceA, "mate", 0, 1)
 
 	created := createProjectVia(t, srv, spaceA, ownerTok, "pin-per-user")
+	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
+		addMembersPayload("mate")).Code)
 	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, ownerTok, true).Code)
-
 	assert.True(t, pinnedFlags(t, srv, spaceA, ownerTok)[created.ProjectID],
 		"the caller who pinned it sees pinned = true")
 	assert.False(t, pinnedFlags(t, srv, spaceA, mateTok)[created.ProjectID],
-		"another Space member sees the same project unpinned; a pin stored on the "+
+		"another Project member sees the same project unpinned; a pin stored on the "+
 			"project row rather than per user would leak one caller's preference to "+
 			"everyone")
 }
@@ -167,13 +186,17 @@ func TestUnpinRestoresTheOriginalOrder(t *testing.T) {
 
 	first := createProjectVia(t, srv, spaceA, tok, "unpin-a")
 	second := createProjectVia(t, srv, spaceA, tok, "unpin-b")
+	original := listProjectIDs(t, srv, spaceA, tok)
+	require.Contains(t, original, first.ProjectID)
+	require.Contains(t, original, second.ProjectID)
 
 	require.Equal(t, http.StatusOK, setPinned(t, srv, first.ProjectID, tok, true).Code)
-	require.Equal(t, []string{first.ProjectID, second.ProjectID},
+	assert.Equal(t,
+		append([]string{first.ProjectID}, withoutProjectIDs(original, first.ProjectID)...),
 		listProjectIDs(t, srv, spaceA, tok))
 
 	require.Equal(t, http.StatusOK, setPinned(t, srv, first.ProjectID, tok, false).Code)
-	assert.Equal(t, []string{second.ProjectID, first.ProjectID},
+	assert.Equal(t, original,
 		listProjectIDs(t, srv, spaceA, tok),
 		"unpinning must put the project back where it was, not leave it floating")
 
@@ -204,15 +227,21 @@ func TestRepinMovesToTheFront(t *testing.T) {
 
 	older := createProjectVia(t, srv, spaceA, tok, "repin-a")
 	newer := createProjectVia(t, srv, spaceA, tok, "repin-b")
+	original := listProjectIDs(t, srv, spaceA, tok)
+	require.Contains(t, original, older.ProjectID)
+	require.Contains(t, original, newer.ProjectID)
+	tail := withoutProjectIDs(original, older.ProjectID, newer.ProjectID)
 
 	require.Equal(t, http.StatusOK, setPinned(t, srv, older.ProjectID, tok, true).Code)
 	require.Equal(t, http.StatusOK, setPinned(t, srv, newer.ProjectID, tok, true).Code)
-	require.Equal(t, []string{newer.ProjectID, older.ProjectID},
+	assert.Equal(t,
+		append([]string{newer.ProjectID, older.ProjectID}, tail...),
 		listProjectIDs(t, srv, spaceA, tok), "most recently pinned leads")
 
 	require.Equal(t, http.StatusOK, setPinned(t, srv, older.ProjectID, tok, false).Code)
 	require.Equal(t, http.StatusOK, setPinned(t, srv, older.ProjectID, tok, true).Code)
-	assert.Equal(t, []string{older.ProjectID, newer.ProjectID},
+	assert.Equal(t,
+		append([]string{older.ProjectID, newer.ProjectID}, tail...),
 		listProjectIDs(t, srv, spaceA, tok),
 		"re-pinning must move the project to the front; if pinned_at survived the "+
 			"unpin it would still sort by the original pin time")
@@ -252,13 +281,9 @@ func TestPinnedIsReportedByEveryRouteThatReturnsAProject(t *testing.T) {
 	assert.True(t, pinnedFlags(t, srv, spaceA, tok)[created.ProjectID])
 }
 
-// TestASpaceAdminCanPinAProjectTheyNeverJoined pins the decision not to gate this
-// on project membership.
-//
-// A space_listed project is visible to any Space member, so it is in their list and
-// they can reasonably want it at the top. Requiring a project seat would make the
-// endpoint refuse a caller who can see the row it refuses to let them pin.
-func TestASpaceAdminCanPinAProjectTheyNeverJoined(t *testing.T) {
+// TestASpaceMemberCannotPinAProjectTheyNeverJoined pins the Project-membership
+// boundary on the settings write: Space visibility alone does not grant pin access.
+func TestASpaceMemberCannotPinAProjectTheyNeverJoined(t *testing.T) {
 	srv, _ := setup(t)
 	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
@@ -269,10 +294,15 @@ func TestASpaceAdminCanPinAProjectTheyNeverJoined(t *testing.T) {
 	created := createProjectVia(t, srv, spaceA, ownerTok, "pin-nonmember")
 
 	w := setPinned(t, srv, created.ProjectID, adminTok, true)
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.True(t, pinnedFlags(t, srv, spaceA, adminTok)[created.ProjectID])
-	assert.False(t, pinnedFlags(t, srv, spaceA, ownerTok)[created.ProjectID],
-		"and it stays their own preference")
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assertProjectErrorCode(t, w, "err.server.project.not_found")
+	assert.Equal(t, http.StatusNotFound, decodeProjectEnvelope(t, w.Body.Bytes()).Error.HTTPStatus)
+
+	var rows int
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		created.ProjectID, "spaceadmin").LoadOne(&rows))
+	assert.Zero(t, rows, "a non-member refusal must not write a setting row")
 }
 
 // TestSettingRefusalsAreIndistinguishable inherits projectMiddleware's
@@ -488,56 +518,6 @@ func TestDisbandedProjectsDoNotSpendThePinBudget(t *testing.T) {
 		"a pin on a disbanded project must not hold a slot the caller can no longer free")
 }
 
-// TestUnlistedProjectsDoNotSpendThePinBudget is the sibling of
-// TestDisbandedProjectsDoNotSpendThePinBudget, and PR #861's review found it
-// missing: the disband trap was handled, the unlisted trap produced the identical
-// unreachable state while status stayed normal.
-//
-// The sequence is all ordinary actions. A common Space member pins a space_listed
-// project they never joined (explicitly allowed — see
-// TestASpaceAdminCanPinAProjectTheyNeverJoined). Its owner flips discoverability to
-// unlisted, which is a routine owner action. The project now leaves the pinner's
-// list, and projectMiddleware answers not_found on PUT /:project_id/setting — the
-// ONLY unpin path — so the pin is unreachable through every API surface. If it
-// still counted, each flip would permanently burn one of six slots with no
-// self-service remedy, and the refusal would say "you have pinned 6" to someone
-// whose own list shows 5.
-func TestUnlistedProjectsDoNotSpendThePinBudget(t *testing.T) {
-	srv, p := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
-	seedSpace(t, spaceA, 1)
-	ownerTok := seedUser(t, "owner1")
-	pinnerTok := seedUser(t, "pinner")
-	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	seedSpaceMember(t, spaceA, "pinner", 0, 1) // ordinary member, NOT a Space admin
-
-	max := p.cfg.MaxPinned
-	trapped := createProjectVia(t, srv, spaceA, ownerTok, "unlisted-trap")
-	require.Equal(t, http.StatusOK, setPinned(t, srv, trapped.ProjectID, pinnerTok, true).Code,
-		"a space_listed project is pinnable by any Space member")
-
-	// A routine owner action.
-	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPut,
-		"/v1/projects/"+trapped.ProjectID, ownerTok,
-		map[string]any{"discoverability": DiscoverabilityUnlisted}).Code)
-
-	// The pin is now unreachable: gone from the list, and unpin is refused.
-	assert.NotContains(t, pinnedFlags(t, srv, spaceA, pinnerTok), trapped.ProjectID,
-		"an unlisted project leaves a non-member's list")
-	assertProjectErrorCode(t, setPinned(t, srv, trapped.ProjectID, pinnerTok, false),
-		"err.server.project.not_found")
-
-	// So it must not hold a slot. The full budget stays available.
-	for i := 0; i < max; i++ {
-		visible := createProjectVia(t, srv, spaceA, ownerTok, fmt.Sprintf("unlisted-ok-%d", i))
-		require.Equal(t, http.StatusOK, setPinned(t, srv, visible.ProjectID, pinnerTok, true).Code,
-			"pin %d of %d must succeed: a pin the caller can neither see nor remove must "+
-				"not consume their budget", i+1, max)
-	}
-	assert.Len(t, pinnedFlagsPinnedOnly(t, srv, spaceA, pinnerTok), max,
-		"and the count the quota enforces equals what the list shows")
-}
-
 // TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget is the same trap by the
 // other door: the pin was legitimate while the caller was a member, and closing
 // their seat makes an unlisted project invisible to them without touching the row.
@@ -553,7 +533,7 @@ func TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget(t *testing.T) {
 	created := createProjectVia(t, srv, spaceA, ownerTok, "removed-member-pin")
 	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
 		"/v1/projects/"+created.ProjectID+"/members/add", ownerTok,
-		map[string]any{"uids": []string{"mate"}}).Code)
+		addMembersPayload("mate")).Code)
 	require.Equal(t, http.StatusOK, setPinned(t, srv, created.ProjectID, mateTok, true).Code)
 	require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPut,
 		"/v1/projects/"+created.ProjectID, ownerTok,
@@ -570,17 +550,57 @@ func TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget(t *testing.T) {
 			"doors made it unreachable")
 }
 
-// pinnedFlagsPinnedOnly is pinnedFlags narrowed to the projects actually pinned,
-// which is the number a user compares against the cap when the refusal arrives.
-func pinnedFlagsPinnedOnly(t *testing.T, srv *server.Server, spaceID, token string) []string {
-	t.Helper()
-	out := []string{}
-	for id, pinned := range pinnedFlags(t, srv, spaceID, token) {
-		if pinned {
-			out = append(out, id)
+// TestRemovedMemberAtPinCapCanPinVisibleProject proves that a Project seat closed
+// through the real remove API no longer makes its stale pin consume quota.
+//
+// The removed project must disappear from the caller's list, while another visible
+// project remains pinnable at the same cap. This exercises the state transition
+// instead of manufacturing an inactive member row with a direct SQL fixture.
+func TestRemovedMemberAtPinCapCanPinVisibleProject(t *testing.T) {
+	srv, p := setup(t)
+	stubAllMemberGroup(t, util.GenerUUID())
+	seedSpace(t, spaceA, 1)
+	ownerTok := seedUser(t, "owner1")
+	memberTok := seedUser(t, "mate")
+	seedSpaceMember(t, spaceA, "owner1", 0, 1)
+	seedSpaceMember(t, spaceA, "mate", 0, 1)
+
+	max := p.cfg.MaxPinned
+	created := make([]*Resp, 0, max+1)
+	for i := 0; i <= max; i++ {
+		project := createProjectVia(t, srv, spaceA, ownerTok,
+			fmt.Sprintf("removed-at-cap-%d", i))
+		created = append(created, project)
+		require.Equal(t, http.StatusOK, doJSON(t, srv, http.MethodPost,
+			"/v1/projects/"+project.ProjectID+"/members/add", ownerTok,
+			addMembersPayload("mate")).Code)
+		if i < max {
+			require.Equal(t, http.StatusOK, setPinned(t, srv, project.ProjectID, memberTok, true).Code,
+				"pin %d of %d must succeed", i+1, max)
 		}
 	}
-	return out
+	assert.Equal(t, max, countPinnedForTest(t, spaceA, "mate"))
+	require.Contains(t, listProjectIDs(t, srv, spaceA, memberTok), created[0].ProjectID)
+
+	removed := doJSON(t, srv, http.MethodPost,
+		"/v1/projects/"+created[0].ProjectID+"/members/remove", ownerTok,
+		map[string]any{"uids": []string{"mate"}})
+	require.Equal(t, http.StatusOK, removed.Code, "body: %s", removed.Body.String())
+	drainRemovalCascade(t, p)
+	flushProjectCache(t, testCtx)
+
+	assert.Equal(t, max-1, countPinnedForTest(t, spaceA, "mate"),
+		"the stale pin on a removed Project must not consume a quota slot")
+	listed := listProjectIDs(t, srv, spaceA, memberTok)
+	assert.NotContains(t, listed, created[0].ProjectID,
+		"a removed Project must no longer be visible to the former member")
+	assert.Contains(t, listed, created[max].ProjectID,
+		"an unpinned Project where membership remains must stay visible")
+
+	require.Equal(t, http.StatusOK, setPinned(t, srv, created[max].ProjectID, memberTok, true).Code,
+		"the freed slot must allow pinning a still-visible Project")
+	assert.Equal(t, max, countPinnedForTest(t, spaceA, "mate"))
+	assert.True(t, pinnedFlags(t, srv, spaceA, memberTok)[created[max].ProjectID])
 }
 
 // countPinnedForTest reaches the quota predicate directly, so the assertion is about
@@ -616,15 +636,10 @@ func TestUnpinningSomethingNeverPinnedPersistsOptOut(t *testing.T) {
 	assert.Zero(t, pinned, "the explicit unpin must persist a durable opt-out")
 }
 
-// TestACommittedPinIsNotReportedAsAFailure is the regression for the defect PR
-// #861's review found: a display read that fails must not turn a COMMITTED write
-// into a 500.
-//
-// Driven by breaking the read rather than by hoping it fails: the pin lands, then
-// the settings table is dropped out from under the response's own re-read. What the
-// caller must see is 200 with the write intact — telling them their pin failed when
-// it did not is the one thing a response after a successful write must not do.
-func TestACommittedPinIsNotReportedAsAFailure(t *testing.T) {
+// TestCommittedPinAndSettingsReadFailureAreReportedSeparately proves that a successful
+// pin is observable as a success while a later settings read failure remains a real
+// query error instead of being silently converted to pinned=false.
+func TestCommittedPinAndSettingsReadFailureAreReportedSeparately(t *testing.T) {
 	srv, _ := setup(t)
 	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
@@ -632,8 +647,19 @@ func TestACommittedPinIsNotReportedAsAFailure(t *testing.T) {
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, tok, "pin-failsoft")
 
-	// Make every read of the settings table fail, leaving the write path intact by
-	// restoring the table before the assertions that need it.
+	// The write and its response read both succeed while storage is healthy.
+	put := setPinned(t, srv, created.ProjectID, tok, true)
+	require.Equal(t, http.StatusOK, put.Code, "body: %s", put.Body.String())
+	assert.True(t, decodeResp(t, put).Pinned, "the committed pin must be reported as success")
+
+	var pinned int
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT pinned FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		created.ProjectID, "owner1").LoadOne(&pinned))
+	assert.Equal(t, 1, pinned, "the successful response must correspond to a committed pin")
+
+	// Break only the subsequent display read. The detail route must surface the
+	// database failure, using D14's wire 400 and the real nested 500.
 	_, err := testCtx.DB().Exec("ALTER TABLE octo_project_user_setting RENAME TO octo_project_user_setting_hidden")
 	require.NoError(t, err)
 	restored := false
@@ -643,30 +669,20 @@ func TestACommittedPinIsNotReportedAsAFailure(t *testing.T) {
 		}
 	}()
 
-	// With the table gone the write fails too, which is a legitimate 5xx — so this
-	// half asserts the OTHER handler, where the write has already committed
-	// elsewhere and only the display read is broken.
-	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, tok, nil)
-	assert.Equal(t, http.StatusOK, w.Code,
-		"the detail route must degrade to pinned=false rather than 500 when the "+
-			"settings read fails: body %s", w.Body.String())
-	assert.False(t, decodeResp(t, w).Pinned)
-
-	upd := doJSON(t, srv, http.MethodPut, "/v1/projects/"+created.ProjectID, tok,
-		map[string]any{"name": "pin-failsoft-renamed"})
-	assert.Equal(t, http.StatusOK, upd.Code,
-		"a rename COMMITS before the pin is read back; a broken read must not report "+
-			"that committed write as a failure: body %s", upd.Body.String())
+	detail := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID, tok, nil)
+	require.Equal(t, http.StatusBadRequest, detail.Code, "body: %s", detail.Body.String())
+	assertProjectErrorCode(t, detail, "err.server.project.query_failed")
+	assert.Equal(t, http.StatusInternalServerError,
+		decodeProjectEnvelope(t, detail.Body.Bytes()).Error.HTTPStatus)
 
 	_, err = testCtx.DB().Exec("ALTER TABLE octo_project_user_setting_hidden RENAME TO octo_project_user_setting")
 	require.NoError(t, err)
 	restored = true
 
-	// And the rename really did land, which is what makes the 200 honest.
-	row, err := testDB.queryByProjectID(created.ProjectID)
-	require.NoError(t, err)
-	require.NotNil(t, row)
-	assert.Equal(t, "pin-failsoft-renamed", row.Name)
+	require.NoError(t, testCtx.DB().SelectBySql(
+		"SELECT pinned FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		created.ProjectID, "owner1").LoadOne(&pinned))
+	assert.Equal(t, 1, pinned, "a failed later read must not erase the earlier committed pin")
 }
 
 // TestAMemberOfAnUnlistedProjectStillSpendsAPinSlot is the POSITIVE branch of the

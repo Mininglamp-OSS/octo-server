@@ -92,11 +92,16 @@ const (
 	botMentionInternalTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	driveInternalTokenEnv      = "OCTO_DRIVE_INTERNAL_TOKEN"
 	provisionFleetSecretEnv    = "OCTO_PROJECT_PROVISION_FLEET_SECRET"
-	provisionDriveSecretEnv    = "OCTO_PROJECT_PROVISION_DRIVE_SECRET"
-	webhookSecretEnv           = "TS_WEBHOOK_SECRET_KEY"
-	mailGatewaySecretEnv       = "OCTO_MAIL_GATEWAY_SECRET"
-	grpcAuthTokenEnv           = "TS_GRPC_AUTH_TOKEN"
-	marketplaceTokenEnv        = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
+	// Drive's provisioning credential is NOT a separate env any more: main's #887
+	// pointed project provisioning at the existing OCTO_DRIVE_INTERNAL_TOKEN rather
+	// than giving Drive its own per-target secret, so driveInternalTokenEnv above
+	// already covers it. Re-adding OCTO_PROJECT_PROVISION_DRIVE_SECRET here would
+	// make this module refuse a collision with an env nothing reads, which reads as
+	// coverage and is not.
+	webhookSecretEnv     = "TS_WEBHOOK_SECRET_KEY"
+	mailGatewaySecretEnv = "OCTO_MAIL_GATEWAY_SECRET"
+	grpcAuthTokenEnv     = "TS_GRPC_AUTH_TOKEN"
+	marketplaceTokenEnv  = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 
 	// internalTokenHeader is the wire header carrying the credential. Same
 	// value as modules/notify, modules/bot_mention and modules/internal_resolve
@@ -204,7 +209,6 @@ var siblingFixedTokenEnvs = []string{
 	botMentionInternalTokenEnv,
 	driveInternalTokenEnv,
 	provisionFleetSecretEnv,
-	provisionDriveSecretEnv,
 	webhookSecretEnv,
 	mailGatewaySecretEnv,
 	grpcAuthTokenEnv,

@@ -181,10 +181,11 @@ func TestActiveAccountsUsesTheCanonicalPredicate(t *testing.T) {
 // so the peer would re-verify and be told the fresh (wrong) answer with confidence.
 //
 // Both admission entry points are covered because they take DIFFERENT seat locks:
-// addOneMember goes through the JOINing lockSeatsTx, createProject through the
-// deliberately JOIN-free lockSpaceSeatRowTx (see
-// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin for why that distinction
-// cannot be collapsed).
+// addMembers goes through lockSpaceSeatsTx, which also joins `space`, while
+// createProject goes through lockSpaceSeatRowsTx, which does not — a table outside
+// the FOR SHARE list would open the read view before the quota counts. The account
+// predicate is the same `user` STRAIGHT_JOIN in both, so a ban has to be refused on
+// both paths or neither.
 func TestBannedAccountCannotBeAdmittedToAProject(t *testing.T) {
 	srv, p := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -209,14 +210,16 @@ func TestBannedAccountCannotBeAdmittedToAProject(t *testing.T) {
 }
 
 // TestBannedAccountCannotCreateAProject covers createProject, whose seat check is
-// the JOIN-free helper.
+// the helper that does NOT join `space`.
 //
-// The gate here must NOT be a JOIN added to that helper. lockSpaceSeatRowTx is
-// JOIN-free on purpose: a table outside `FOR SHARE OF` is read as a consistency
-// read, which OPENS the read view, and all three creation quotas are counted after
-// it — measured, six concurrent creates all passed MaxPerSpace=1 when that
-// regressed. So liveness is a separate single-table read, and
-// TestCreateQuotaStillHoldsUnderConcurrency below is what keeps it that way.
+// The distinction that matters is not "JOIN or no JOIN" but which side of
+// `FOR SHARE OF` a joined table sits on. A table OUTSIDE that list is read as a
+// consistency read, which OPENS the read view, and all three creation quotas are
+// counted after it — measured, six concurrent creates all passed MaxPerSpace=1 when
+// that regressed. `user` is inside the list, so the liveness gate costs no read view;
+// `space` would be outside it, so lockSpaceSeatRowsTx does not join it at all and the
+// Space's activeness is rechecked under the exclusive lock instead.
+// TestCreateQuotaStillHoldsUnderConcurrency below is what keeps that property.
 func TestBannedAccountCannotCreateAProject(t *testing.T) {
 	_, p := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -279,9 +282,10 @@ func TestCreateQuotaStillHoldsUnderConcurrency(t *testing.T) {
 	assert.Equal(t, 1, won,
 		"exactly one of %d concurrent creates may pass MaxPerSpace=1. More than one means the "+
 			"transaction's read view is being opened before the `space` lock — the classic "+
-			"cause is a JOIN inside the seat-lock statement (a table outside FOR SHARE OF is a "+
-			"consistency read). The account-liveness gate must therefore stay a SEPARATE "+
-			"single-table read on createProject's path, never a JOIN in lockSpaceSeatRowTx",
+			"cause is a joined table OUTSIDE the seat-lock statement's FOR SHARE list, which "+
+			"makes it a consistency read. `user` is inside that list and `space` is not "+
+			"joined at all on createProject's path — TestSeatLockStatementPinsItsPlan is the "+
+			"structural half of this",
 		attempts)
 
 	var total int
@@ -328,12 +332,12 @@ func TestSentinelAnomalyNamesTheProjectAndRepairsInOneStatement(t *testing.T) {
 	assert.Equal(t, created.ProjectID, anomaly.ProjectID)
 
 	// The repair itself: one statement, and its predicate is its own CAS.
-	repaired, err := projectpkg.RepairAbsentSentinelEpoch(testCtx.DB(), created.ProjectID)
+	repaired, err := projectpkg.RepairAbsentSentinelEpoch(context.Background(), testCtx.DB(), created.ProjectID)
 	require.NoError(t, err)
 	assert.True(t, repaired, "the anomalous row must have been lifted off the sentinel")
 
 	// Idempotent under a race: a second attempt (or another replica) changes nothing.
-	repaired, err = projectpkg.RepairAbsentSentinelEpoch(testCtx.DB(), created.ProjectID)
+	repaired, err = projectpkg.RepairAbsentSentinelEpoch(context.Background(), testCtx.DB(), created.ProjectID)
 	require.NoError(t, err)
 	assert.False(t, repaired,
 		"the member_epoch = 0 predicate is the CAS, so N replicas racing produce exactly "+
@@ -360,7 +364,7 @@ func TestRepairAbsentSentinelEpochLeavesDisbandedRowsAlone(t *testing.T) {
 		"UPDATE `octo_project` SET status = ? WHERE project_id = ?", StatusDisbanded, created.ProjectID).Exec()
 	require.NoError(t, err)
 
-	repaired, err := projectpkg.RepairAbsentSentinelEpoch(testCtx.DB(), created.ProjectID)
+	repaired, err := projectpkg.RepairAbsentSentinelEpoch(context.Background(), testCtx.DB(), created.ProjectID)
 	require.NoError(t, err)
 	assert.False(t, repaired,
 		"a DISBANDED project on 0 is not an anomaly — 0 is what it must answer. Repairing it "+

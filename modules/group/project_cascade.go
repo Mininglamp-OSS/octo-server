@@ -1,27 +1,23 @@
 package group
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
 // Project → Group cascade.
 //
-// Two steps, both reverse-registered into modules/project because
-// modules/project must never import modules/group:
-//
-//   - projectMemberRemovalStepName: a project seat closed, so that uid leaves
-//     every group of that project;
-//   - projectDisbandStepName: a project ended, so its groups revert to
-//     Space-direct with their members untouched.
-//
-// Both satisfy the step contract stated on modules/project's registry:
-// idempotent, self-deciding, and safe to re-run after a partial failure.
+// The member-removal step is deliberately pointer-scoped: only the Project's
+// all_member_group_no projection is live-synchronized. Ordinary Project-
+// associated groups retain their initial native snapshot.
 const (
 	projectMemberRemovalStepName = "group_project_detach"
 	projectDisbandStepName       = "group_project_revert"
@@ -30,338 +26,249 @@ const (
 // registerProjectCascadeSteps is called from 1module.go at construction, beside
 // the Space-side registrations.
 func (g *Group) registerProjectCascadeSteps() {
-	projectmod.RegisterProjectMemberRemovalStep(projectMemberRemovalStepName, g.detachMemberFromProjectGroups)
+	projectmod.RegisterProjectMemberRemovalStep(
+		projectMemberRemovalStepName, g.detachMemberFromProjectGroups,
+	)
 	projectmod.RegisterProjectDisbandStep(projectDisbandStepName, g.revertProjectGroupsToSpace)
 }
 
-// detachMemberFromProjectGroups removes uid from every group of the project
-// whose seat is closing.
-//
-// # Idempotence
-//
-// The group set comes from queryProjectGroupNosWithActiveMember, which only
-// returns groups where the uid still has an undeleted member row. A re-run after
-// a partial failure therefore sees a shorter list, and a complete re-run sees an
-// empty one and does nothing.
-//
-// # Why RemoveGroupMembers rather than a delete
-//
-// Removal is not "set is_deleted = 1". RemoveGroupMembers also unsubscribes from
-// the IM channel, emits CMDGroupMemberUpdate so clients update their member
-// lists, cascades to bots the departing member invited, cleans up thread_member
-// and thread_setting, clears Space-scoped pinned messages and conversation
-// extras, and reclaims the group's is_external_group flag. Every one of those is
-// an omission waiting to happen in a reimplementation, and
-// modules/group/space_member_removal.go says so in as many words about the
-// Space-side cascade.
-//
-// SuppressRemoveNotice is set: "X was removed by Y" is the wrong sentence. The
-// operator here is whoever closed the project seat, and the group is not where
-// that decision was made or explained. BotCascadeTipAction is left at its
-// default, so a bot the departing member brought in still produces its own tip —
-// group members seeing a bot vanish are owed the reason, which is a separate
-// question from who removed whom.
-//
-// # The group-creator case
-//
-// RemoveGroupMembers SILENTLY SKIPS role = creator. Left alone, a project member
-// who owns a group would keep their group_member row forever while their project
-// seat closed, which is an I2 violation the reconcile scan would report and no
-// automatic path would repair.
-//
-// So the creator's group gets its NORMAL owner handover first: ownership passes
-// to the senior remaining member who is ALSO an active member of the project,
-// and the departing uid is then an ordinary member and removable. That narrowing
-// is what keeps the handover from creating the violation it is preventing.
-//
-// When no such successor exists the group is DETACHED to Space-direct instead,
-// with its members untouched — the same rule as project disband, deliberately,
-// so the two situations are one rule rather than two. It is not disbanded: group
-// disband only flips group.status and leaves every group_member row in place, so
-// it would destroy access without cleaning anything up.
-func (g *Group) detachMemberFromProjectGroups(ctx *config.Context, removal projectmod.MemberRemoval) error {
-	if removal.ProjectID == "" || removal.UID == "" {
-		return nil
+// queryDedicatedGroupNo returns the currently valid all-member group pointer.
+// It intentionally does not inspect ordinary Project-associated groups.
+func (g *Group) queryDedicatedGroupNo(projectID string) (string, error) {
+	if projectID == "" {
+		return "", nil
 	}
-	// An empty SpaceID must FAIL, not report success.
-	//
-	// queryProjectGroupNosWithActiveMember returns (nil, nil) for an empty
-	// spaceID, so without this the step would report done having detached
-	// nothing — and the worker would then close the seat with every group row
-	// intact, which is the I2 violation the two-phase close exists to avoid.
-	// Not reachable through the API (projectMiddleware sets it and the enqueue
-	// carries it), which is exactly why it needs to be loud rather than absent:
-	// a job that got here with no Space is a bug upstream, and reporting success
-	// is how it would stay one.
-	if removal.SpaceID == "" {
-		return fmt.Errorf(
-			"group: project removal cascade for %s/%s carries no space_id",
-			removal.ProjectID, removal.UID)
+	var pointers []string
+	if _, err := g.db.session.SelectBySql(
+		"SELECT all_member_group_no FROM `octo_project` "+
+			"WHERE project_id = ? AND status = 1 AND all_member_group_no <> '' LIMIT 1",
+		projectID,
+	).Load(&pointers); err != nil {
+		return "", fmt.Errorf("group: query dedicated-group pointer: %w", err)
 	}
-	groupNos, err := g.db.queryProjectGroupNosWithActiveMember(removal.SpaceID, removal.ProjectID, removal.UID)
-	if err != nil {
-		return fmt.Errorf("group: list project groups for cascade: %w", err)
+	if len(pointers) == 0 || pointers[0] == "" {
+		return "", nil
 	}
-	if len(groupNos) == 0 {
-		return nil
+	var groups []struct {
+		ProjectID string `db:"project_id"`
+		Status    int    `db:"status"`
 	}
-
-	var firstErr error
-	for _, groupNo := range groupNos {
-		// Re-check the seat BEFORE every group, not once per job.
-		//
-		// D4 says re-admission cancels the cascade, and three comments in
-		// modules/project claim the worker enforces that "before every batch".
-		// There is one batch per job, so the worker's single check happens before
-		// this loop — and the fan-out is the loop. Without this, an admin who
-		// removes a member from a five-group project and immediately re-adds them
-		// gets a 200 while the worker goes on to strip them from the remaining
-		// groups: active in the project, member of none of its groups, repairable
-		// only by re-adding each group by hand.
-		//
-		// CheckMembership already answers `removing = 1` as "not a member", so
-		// true here means exactly one thing: the seat was re-opened while this
-		// cascade was running. Stop and let the job retire; the groups already
-		// detached stay detached, which is the subset relation holding, not a
-		// violation.
-		//
-		// One indexed session read per group, on a background path. It is
-		// deliberately NOT the Tx variant: there is no transaction spanning the
-		// loop, and a lock taken here would be held across RemoveGroupMembers'
-		// own transaction and its IM calls.
-		readmitted, err := projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
-		if err != nil {
-			g.Error("项目级联：复查项目席位失败",
-				zap.String("group_no", groupNo),
-				zap.String("project_id", removal.ProjectID),
-				zap.String("uid", removal.UID),
-				zap.Error(err))
-			if firstErr == nil {
-				firstErr = fmt.Errorf("group: recheck project seat: %w", err)
-			}
-			break
-		}
-		if readmitted {
-			g.Info("项目级联：成员在级联进行中被重新加入，停止摘除剩余群",
-				zap.String("project_id", removal.ProjectID),
-				zap.String("uid", removal.UID),
-				zap.String("next_group_no", groupNo))
-			projectCascadeCancelledTotal.Inc()
-			return firstErr
-		}
-		if err := g.detachMemberFromOneProjectGroup(groupNo, removal); err != nil {
-			// One group failing must not abandon the rest: partial progress is
-			// durable (a group already left does not come back in the next
-			// round's list), and the job retries what remains.
-			g.Error("项目级联：从群移除成员失败",
-				zap.String("group_no", groupNo),
-				zap.String("project_id", removal.ProjectID),
-				zap.String("uid", removal.UID),
-				zap.Error(err))
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
+	if _, err := g.db.session.SelectBySql(
+		"SELECT project_id, status FROM `group` WHERE group_no = ? LIMIT 1",
+		pointers[0],
+	).Load(&groups); err != nil {
+		return "", fmt.Errorf("group: query dedicated-group row: %w", err)
 	}
-	return firstErr
+	if len(groups) == 0 || groups[0].Status == GroupStatusDisband ||
+		groups[0].ProjectID != projectID {
+		return "", nil
+	}
+	return pointers[0], nil
 }
 
-func (g *Group) detachMemberFromOneProjectGroup(groupNo string, removal projectmod.MemberRemoval) error {
-	// Handover, if needed, in its own transaction before the removal. It has to
-	// be separate: RemoveGroupMembers opens and commits its own transaction, and
-	// nesting is not available.
-	handedOver, detached, err := g.handOverProjectGroupIfCreator(groupNo, removal)
+// reconcileDedicatedGroupProjection performs the final, pointer-scoped
+// decision immediately around the broker operation. The native group row is
+// protected by the admission/removal transactions, but IM is a separate
+// service: a stale removal may be blocked while a rejoin commits and sends
+// IMAdd. Rechecking both before and after IMRemove makes that interleaving
+// converge to the current projection instead of allowing a late IMRemove to
+// strand the member. A pointer that moved away from groupNo is never touched.
+func (g *Group) reconcileDedicatedGroupProjection(
+	ctx *config.Context, removal projectmod.MemberRemoval, groupNo string,
+) (resultErr error) {
+	if ctx == nil || groupNo == "" || removal.UID == "" {
+		return nil
+	}
+	defer func() {
+		if !errors.Is(resultErr, projectpkg.ErrAdmittedButNotSubscribed) {
+			return
+		}
+		// A Project rejoin may already have cancelled the removal job. This
+		// callback must hand a failed late-IMRemove compensation to a fresh
+		// durable projection; admission itself leaves retries with its caller.
+		if err := spacemod.EnqueueMemberRejoinIntent(ctx, removal.SpaceID, removal.UID, removal.OperatorUID); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("group: persist dedicated projection retry: %w", err))
+		}
+	}()
+	currentGroupNo, err := g.queryDedicatedGroupNo(removal.ProjectID)
 	if err != nil {
 		return err
 	}
-	if detached {
-		// The group left the project entirely; its members, including the
-		// departing uid, stay. Nothing further to do for this group.
-		g.Info("项目级联：群无可继任的项目成员，已改为 Space 直属",
-			zap.String("group_no", groupNo),
-			zap.String("project_id", removal.ProjectID),
-			zap.String("uid", removal.UID))
+	if currentGroupNo != groupNo {
 		return nil
 	}
-	if handedOver {
-		// An ownership change nobody asked for, performed by a background job.
-		// It is the right outcome (see handOverProjectGroupIfCreator) but it is
-		// not a thing to do silently: this line is the only record of WHY a group
-		// changed hands, and it is what an operator will look for when the new
-		// owner asks.
-		g.Info("项目级联：群主随项目席位关闭而交接",
-			zap.String("group_no", groupNo),
-			zap.String("project_id", removal.ProjectID),
-			zap.String("former_creator", removal.UID))
-	}
-
-	// Re-read the attribution before removing anyone.
-	//
-	// The group list was snapshotted at the top of the fan-out. Between then and
-	// now the group can have LEFT the project: a project disband, or another
-	// group's no-successor detach above, both set project_id = ''. Removing the
-	// member then takes them out of a group that is now Space-direct — against
-	// the contract that disband and detach preserve their members, and for a
-	// reason no longer connected to anything the member did.
-	//
-	// The creator case was already covered: querySuccessorForProjectGroupTx
-	// filters on project_id, so a departed group yields no successor, the detach
-	// is a zero-row update and the step returns early. This is the other branch —
-	// the departing member is an ordinary member, so the handover returns at the
-	// creator check and nothing looks at project_id again.
-	//
-	// This narrows the window rather than closing it: RemoveGroupMembers opens
-	// and commits its own transaction, so the read cannot be held under the same
-	// lock, and a detach landing in between still loses a member. Closing it
-	// would mean threading a transaction through the group service's removal
-	// path, which is a much larger change than the outcome justifies — a member
-	// dropped from a group that is leaving the project anyway, recoverable by
-	// re-adding.
-	stillOurs, err := g.db.groupStillBelongsToProject(groupNo, removal.ProjectID)
+	projectActive, err := projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
 	if err != nil {
-		return fmt.Errorf("group: re-read group attribution before removal: %w", err)
+		return fmt.Errorf("group: recheck Project seat for dedicated projection: %w", err)
 	}
-	if !stillOurs {
-		g.Info("项目级联：群在级联进行中已离开本项目，跳过摘除",
-			zap.String("group_no", groupNo),
-			zap.String("project_id", removal.ProjectID),
-			zap.String("uid", removal.UID))
-		projectCascadeGroupLeftTotal.Inc()
-		return nil
+	if projectActive {
+		spaceActive, checkErr := spacepkg.CheckMembership(ctx.DB(), removal.SpaceID, removal.UID)
+		if checkErr != nil {
+			return fmt.Errorf("group: recheck Space seat for dedicated projection: %w", checkErr)
+		}
+		if spaceActive {
+			if err := g.admitToAllMemberGroup(ctx, removal.SpaceID, groupNo, removal.UID); err != nil {
+				return fmt.Errorf("group: restore dedicated-group projection: %w", err)
+			}
+			return nil
+		}
+	}
+	if err := removeDedicatedGroupSubscriber(ctx, groupNo, removal.UID); err != nil {
+		return err
 	}
 
+	// IMRemove may have been blocked while the Space/Project admission
+	// transaction committed and issued IMAdd. Re-run the same pointer-scoped
+	// decision after it returns; only the current group may be repaired.
+	currentGroupNo, err = g.queryDedicatedGroupNo(removal.ProjectID)
+	if err != nil {
+		return err
+	}
+	if currentGroupNo != groupNo {
+		return nil
+	}
+	projectActive, err = projectpkg.CheckMembership(ctx.DB(), removal.ProjectID, removal.UID)
+	if err != nil {
+		return fmt.Errorf("group: recheck Project seat after dedicated IMRemove: %w", err)
+	}
+	if !projectActive {
+		return nil
+	}
+	spaceActive, err := spacepkg.CheckMembership(ctx.DB(), removal.SpaceID, removal.UID)
+	if err != nil {
+		return fmt.Errorf("group: recheck Space seat after dedicated IMRemove: %w", err)
+	}
+	if !spaceActive {
+		return nil
+	}
+	if err := g.admitToAllMemberGroup(ctx, removal.SpaceID, groupNo, removal.UID); err != nil {
+		return fmt.Errorf("group: restore dedicated-group projection after late IMRemove: %w", err)
+	}
+	return nil
+}
+
+// detachMemberFromProjectGroups removes one closing Project seat from the
+// dedicated group. The worker has already marked the seat removing=1; the
+// removal service rechecks that state under Project → group → group_member
+// locks, so a concurrent re-admission cannot remove the new membership.
+func (g *Group) detachMemberFromProjectGroups(
+	ctx *config.Context, removal projectmod.MemberRemoval,
+) error {
+	if ctx == nil || removal.ProjectID == "" || removal.UID == "" {
+		return nil
+	}
+	groupNo, err := g.queryDedicatedGroupNo(removal.ProjectID)
+	if err != nil || groupNo == "" {
+		return err
+	}
+	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
+	if err != nil {
+		return fmt.Errorf("group: query dedicated-group member for removal: %w", err)
+	}
+	// Recheck the Project and Space seats before touching either native
+	// membership or IM. A stale removal callback can race a rejoin after its
+	// worker-level fence; even with no native row left, it must reconcile the
+	// current dedicated projection rather than returning and letting a late
+	// IMRemove strand the active member. The Space check is deliberately the
+	// authorization predicate (not CheckMembershipForCleanup): a preserved
+	// Project Owner without a current Space seat is not admitted back.
+	// Reconcile once before touching the native row or IM. This also covers
+	// the missing/deleted-row branches: a rejoin may have committed while the
+	// unlocked native lookup was in flight.
+	readmitted, err := projectpkg.CheckMembership(
+		ctx.DB(), removal.ProjectID, removal.UID,
+	)
+	if err != nil {
+		return fmt.Errorf("group: recheck Project seat before dedicated removal: %w", err)
+	}
+	if readmitted {
+		return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
+	}
+	if member == nil || member.IsDeleted == 1 {
+		return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
+	}
 	resp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:              groupNo,
 		Members:              []string{removal.UID},
 		OperatorUID:          removal.OperatorUID,
 		SuppressRemoveNotice: true,
+		ProjectRemoval:       true,
+		ProjectID:            removal.ProjectID,
 	})
 	if err != nil {
+		// Another cleanup path may have removed the native row after the unlocked
+		// precheck above. Treat that race as idempotent at the database layer, but
+		// still reconcile the broker subscription; a real transport failure keeps
+		// the outbox job retryable.
+		if errors.Is(err, errGroupMemberNotInGroup) {
+			return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
+		}
+		// The native transaction may have committed before the broker failed.
+		// Reconcile around the broker operation so a rejoin that won the race
+		// restores both the native row and IM subscription. If reconciliation
+		// itself fails, preserve the original transport error for the retry.
+		if resp != nil {
+			if reconcileErr := g.reconcileDedicatedGroupProjection(ctx, removal, groupNo); reconcileErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("%w (dedicated projection reconcile: %v)", err, reconcileErr)
+			}
+		}
 		return err
 	}
 	if resp != nil && resp.Removed == 0 {
-		// Nothing was removed and no error: either the uid was already gone
-		// (idempotent re-run) or they are still the creator, which the handover
-		// above should have resolved. Report the second case rather than looping.
-		creator, cErr := g.creatorOf(groupNo)
-		if cErr == nil && creator == removal.UID {
-			return fmt.Errorf(
-				"group: %s still owned by departing project member %s after handover",
-				groupNo, removal.UID)
+		// A concurrent retry may have removed the row already. Re-read it to
+		// distinguish that harmless idempotent result from a stale relation.
+		member, readErr := g.db.QueryMemberWithUID(removal.UID, groupNo)
+		if readErr != nil {
+			return readErr
 		}
+		if member != nil {
+			// If the seat became eligible again, the service deliberately
+			// refused a destructive delete; reconcile the current projection
+			// instead of reporting a false success.
+			readmitted, checkErr := projectpkg.CheckMembership(
+				ctx.DB(), removal.ProjectID, removal.UID,
+			)
+			if checkErr != nil {
+				return fmt.Errorf("group: recheck Project seat after cancelled removal: %w", checkErr)
+			}
+			if readmitted {
+				spaceMember, spaceErr := spacepkg.CheckMembership(
+					ctx.DB(), removal.SpaceID, removal.UID,
+				)
+				if spaceErr != nil {
+					return fmt.Errorf("group: recheck Space seat after cancelled removal: %w", spaceErr)
+				}
+				if spaceMember {
+					return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
+				}
+			}
+			return fmt.Errorf(
+				"group: dedicated-group member %s was not removed", removal.UID,
+			)
+		}
+	}
+	// The DB transaction and this callback are not one atomic operation with
+	// the broker. Reconcile immediately before and after the IM operation:
+	// a rejoin that committed while the native transaction was finishing must
+	// not lose its IM access, and every missing/deleted-row early return above
+	// follows the same pointer-scoped rule.
+	return g.reconcileDedicatedGroupProjection(ctx, removal, groupNo)
+}
+
+func removeDedicatedGroupSubscriber(ctx *config.Context, groupNo, uid string) error {
+	if ctx == nil || groupNo == "" || uid == "" {
+		return nil
+	}
+	if err := ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Subscribers: []string{uid},
+	}); err != nil {
+		return fmt.Errorf("group: remove dedicated-group IM subscriber: %w", err)
 	}
 	return nil
-}
-
-// creatorOf reads a group's creator outside a transaction, for diagnostics only.
-//
-// One statement. The first version listed the managers and creator and then asked
-// "is this one the creator?" per uid — an N+1 on the error path of a background
-// job, i.e. exactly where nobody would notice it.
-func (g *Group) creatorOf(groupNo string) (string, error) {
-	var uids []string
-	_, err := g.db.session.SelectBySql(
-		"SELECT uid FROM group_member "+
-			"WHERE group_no = ? AND role = ? AND is_deleted = 0 LIMIT 1",
-		groupNo, MemberRoleCreator,
-	).Load(&uids)
-	if err != nil {
-		return "", err
-	}
-	if len(uids) == 0 {
-		return "", nil
-	}
-	return uids[0], nil
-}
-
-// handOverProjectGroupIfCreator transfers ownership away from the departing
-// member, or detaches the group when nobody can take it.
-//
-// Returns (handedOver, detached, error). Both false means the departing member
-// was not the creator and nothing was needed.
-func (g *Group) handOverProjectGroupIfCreator(groupNo string, removal projectmod.MemberRemoval) (bool, bool, error) {
-	tx, err := g.ctx.DB().Begin()
-	if err != nil {
-		return false, false, fmt.Errorf("group: begin handover: %w", err)
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	creator, err := g.db.queryGroupCreatorTx(tx, groupNo)
-	if err != nil {
-		return false, false, fmt.Errorf("group: read group creator: %w", err)
-	}
-	if creator != removal.UID {
-		return false, false, tx.Commit()
-	}
-
-	successor, err := g.db.querySuccessorForProjectGroupTx(tx, groupNo, removal.ProjectID, removal.UID)
-	if err != nil {
-		return false, false, fmt.Errorf("group: pick successor: %w", err)
-	}
-
-	if successor == "" {
-		// Nobody in this group is still in the project. Revert the group to
-		// Space-direct and leave everyone in it — including the departing
-		// member, who keeps a group they own. Disbanding would destroy a working
-		// group; force-transferring to a non-project member would create the I2
-		// violation this cascade exists to prevent.
-		version, err := g.ctx.GenSeq(common.GroupSeqKey)
-		if err != nil {
-			return false, false, fmt.Errorf("group: GenSeq for detach: %w", err)
-		}
-		changed, err := g.db.detachGroupFromProjectTx(tx, groupNo, removal.ProjectID, version)
-		if err != nil {
-			return false, false, fmt.Errorf("group: detach group from project: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return false, false, fmt.Errorf("group: commit detach: %w", err)
-		}
-		if changed {
-			g.Info("项目级联：群主即将离开项目且群内已无其他项目成员，群回落为 Space 直属",
-				zap.String("group_no", groupNo),
-				zap.String("project_id", removal.ProjectID),
-				zap.String("creator", removal.UID))
-			projectGroupDetachedTotal.WithLabelValues(detachReasonNoSuccessor).Inc()
-		}
-		return false, true, nil
-	}
-
-	// Normal owner handover: the successor becomes creator, the departing member
-	// becomes an ordinary member and is then removable by the funnel.
-	successorVersion, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
-	if err != nil {
-		return false, false, fmt.Errorf("group: GenSeq for successor: %w", err)
-	}
-	promoted, err := g.db.updateMemberRoleIfLiveTx(tx, groupNo, successor, MemberRoleCreator, successorVersion)
-	if err != nil {
-		return false, false, fmt.Errorf("group: promote successor: %w", err)
-	}
-	if !promoted {
-		// The successor row was picked under FOR UPDATE, so reaching this is a
-		// bug rather than a race — but it MUST NOT fall through to the demote.
-		// A demote on top of a promotion that landed nowhere is how a group ends
-		// up with no creator at all, silently, with the cascade logging success.
-		// Returning an error rolls the transaction back and re-drives the job.
-		return false, false, fmt.Errorf(
-			"group: promote successor %s in %s affected no live member row", successor, groupNo)
-	}
-	departingVersion, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
-	if err != nil {
-		return false, false, fmt.Errorf("group: GenSeq for departing member: %w", err)
-	}
-	if err := g.db.UpdateMemberRoleTx(groupNo, removal.UID, MemberRoleCommon, departingVersion, tx); err != nil {
-		return false, false, fmt.Errorf("group: demote departing creator: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, false, fmt.Errorf("group: commit handover: %w", err)
-	}
-	g.Info("项目级联：群主离开项目，群主已交接",
-		zap.String("group_no", groupNo),
-		zap.String("project_id", removal.ProjectID),
-		zap.String("from", removal.UID),
-		zap.String("to", successor))
-	projectGroupHandoverTotal.Inc()
-	return true, false, nil
 }
 
 // revertProjectGroupsToSpace reverts every group of a disbanded project to

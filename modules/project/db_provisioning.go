@@ -10,9 +10,10 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-// Data access for octo_project_provisioning — the transactional outbox that is
-// also the project→container mapping (D12: one table, because the row that drives
-// the retry is the row that records the outcome).
+// Data access for octo_project_provisioning — the transactional outbox and
+// local Project-to-target accounting. Fleet uses container_id as its remote
+// idempotency key; Drive maps project_id to its own remote space and never
+// treats this local container_id as a Drive id or URL.
 //
 // Two conventions carried over from db.go, both silent when wrong:
 //
@@ -72,15 +73,12 @@ func (d *DB) enqueueProvisioningTx(tx *dbr.Tx, projectID, spaceID string, target
 		"(project_id, space_id, target, container_id, status, next_attempt_at, created_at) VALUES " +
 		strings.Join(placeholders, ",")
 	if _, err := tx.InsertBySql(sql, args...).Exec(); err != nil {
-		// A duplicate key on uk_octo_project_provisioning_container is the one failure
-		// whose MySQL message embeds the container id verbatim
-		// ("Duplicate entry 'octows-...' for key ..."), and the caller logs this chain
-		// with zap.Error — so passing it through would put a capability in a log line.
-		// It needs a 128-bit collision to happen at all (every attempt mints a fresh id,
-		// so a retry never reuses one), but "essentially unreachable" is not the same as
-		// "cannot happen", and the zap-field guard cannot see a leak that arrives through
-		// an error string. Replaced with a fixed summary; the row is identifiable from
-		// project_id, which the caller already logs.
+		// A duplicate key on the local uk_octo_project_provisioning_container
+		// index is the one failure whose MySQL message embeds container_id.
+		// That value is a Fleet wire key; Drive keeps the column only as an
+		// opaque internal task key and its request uses project_id instead.
+		// The caller logs this chain, so replace database text with a fixed
+		// summary rather than allowing a capability to reach an error string.
 		if isDuplicateKeyErr(err) {
 			return errors.Join(errProvisioningEnqueueFailed,
 				errors.New("project: provisioning row already exists for this project and target"))
@@ -94,27 +92,64 @@ func (d *DB) enqueueProvisioningTx(tx *dbr.Tx, projectID, spaceID string, target
 	return nil
 }
 
+// provisioningProject is the current authoritative identity needed by Drive.
+// The outbox row intentionally carries only the enqueue-time SpaceID; a Drive
+// retry must re-read the Project name and active human Owner instead of trusting
+// stale creator data or a client-supplied UID.
+type provisioningProject struct {
+	ProjectID string `db:"project_id"`
+	SpaceID   string `db:"space_id"`
+	Name      string `db:"name"`
+	OwnerUID  string `db:"owner_uid"`
+}
+
+// queryProvisioningProject returns the active Project and its current human
+// Owner for a Drive delivery. A missing row means the Project is disbanded,
+// its Space seat is no longer active, or its Owner is no longer a valid human;
+// callers must not send an internal create request in that case.
+func (d *DB) queryProvisioningProject(projectID string) (*provisioningProject, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return nil, nil
+	}
+	var rows []provisioningProject
+	_, err := d.session.SelectBySql(
+		"SELECT p.project_id, p.space_id, p.name, pm.uid AS owner_uid "+
+			"FROM `octo_project` p "+
+			"INNER JOIN `octo_project_member` pm "+
+			"ON pm.project_id = p.project_id AND pm.space_id = p.space_id "+
+			"INNER JOIN `space_member` sm "+
+			"ON sm.space_id = p.space_id AND sm.uid = pm.uid "+
+			"INNER JOIN `user` u ON u.uid = pm.uid "+
+			"WHERE p.project_id = ? AND p.status = ? "+
+			"AND pm.status = ? AND pm.removing = 0 AND pm.role = ? "+
+			"AND sm.status = 1 AND u.robot = 0 AND u.status = 1 "+
+			"AND COALESCE(u.is_destroy, 0) <> 2 LIMIT 1",
+		projectID, StatusNormal, MemberStatusActive, RoleOwner,
+	).Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("project: query provisioning project: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
+}
+
 // markProvisioningDisbandPendingTx moves every non-terminal row of a project to
 // disband_pending, inside the disband transaction.
 //
-// Called from disbandProjectTx rather than from the service layer on purpose: putting the
-// transition in the DAO makes "any disband marks its containers reclaimable" structural,
-// so a future disband path inherits it instead of having to remember. On this base that
-// DAO function has exactly one caller (disbandProjectOnce) — the Space-removal cascade
-// only closes seats and the ownerless case is a recorded, unresolved end state — so the
-// claim is about where a future path would land, not about a junction that exists today.
+// Called from disbandProjectTx rather than from the service layer on purpose:
+// putting the transition in the DAO makes "any project disband marks its
+// containers reclaimable" structural. On this base the DAO has exactly one
+// caller (disbandProjectOnce). A Space-removal cascade preserves the active
+// human Owner and closes non-Owner seats/riders; it does not disband projects
+// or transition their provisioning rows. Any future Space-level project-disband
+// path must call this DAO explicitly.
 //
-// A related gap worth recording where someone will find it: no path disbands a project
-// when its SPACE is disbanded, so a project in a dead Space keeps its `ready` rows and
-// its containers are never marked reclaimable. D9's pull-based reclaim has no answer for
-// that today; it belongs to the Space-cascade work, not to this slice.
-//
-// abandoned rows move too. They record "we never confirmed a container", but we may
-// well have created one and failed to record it, so they are exactly as reclaimable
-// as a ready row — and last_error survives, so the failure history is still
-// readable. Leaving them behind would also pin the abandoned gauge above zero
-// forever for a project that no longer exists, which trains the on-call to ignore
-// the one signal that needs a human.
+// Abandoned rows move too. They record "we never confirmed a container", but
+// we may have created one and failed to record it, so they are exactly as
+// reclaimable as a ready row. last_error survives, so the failure history stays
+// readable.
 func (d *DB) markProvisioningDisbandPendingTx(tx *dbr.Tx, projectID string, now time.Time) error {
 	if projectID == "" {
 		return errors.New("project: provisioning disband requires project_id")
@@ -382,10 +417,10 @@ func (d *DB) abandonExhaustedProvisioningJobs(targets []string, maxAttempts uint
 // someone decided to retry" rather than "attempts ever". Leaving it at max would
 // have the sweep re-abandon the row on its next tick without a single outbound call.
 //
-// container_id is deliberately NOT reissued: it is the peer's idempotency key, and a
-// fresh id would orphan whatever container the previous attempts may already have
-// created (ensure is at-least-once, so a lost response leaves a real container
-// behind a row that never reached `ready`).
+// container_id is deliberately NOT reissued. Fleet retries need the same remote
+// idempotency key, while Drive keeps this local opaque task key unchanged for
+// row identity and uses project_id for remote duplicate detection. A fresh
+// local key on either path would make the prior attempt's result unaccounted.
 //
 // last_error is APPENDED to, matching abandonExhaustedProvisioningJobs: while the row
 // is parked, the reason provisioning gave up is the operator's durable evidence, and

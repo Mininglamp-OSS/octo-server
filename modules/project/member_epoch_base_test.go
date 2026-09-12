@@ -75,7 +75,7 @@ func TestEpochStillIncrementsFromTheNewBase(t *testing.T) {
 	require.NoError(t, err)
 
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		token, map[string]any{"uids": []string{"epochBumpTarget"}})
+		token, addMembersPayload("epochBumpTarget"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	after, err := testDB.queryByProjectID(created.ProjectID)
@@ -96,9 +96,23 @@ func TestEpochStillIncrementsFromTheNewBase(t *testing.T) {
 // that does not look at a fresh row, which is why this pins the mechanism as well
 // as the outcome.
 func TestCreateBumpsTheEpochRatherThanSeedingIt(t *testing.T) {
-	create := funcBody(t, readLinesWithoutComments(t, "service.go"), "func (p *Project) createProjectOnce(")
+	src := readLinesWithoutComments(t, "service.go")
+
+	// The transaction body, not createProjectOnce, since #887 split the two: the
+	// outer function now prepares the seat refs, opens the transaction, commits and
+	// runs the post-commit hooks, while every statement this guard is about lives in
+	// createProjectTxWithSeatRefs. The delegation is asserted first so a later split
+	// cannot leave this guard reading a function that no longer performs the create —
+	// the way it silently would have read an empty createProjectOnce after the merge.
+	outer := funcBody(t, src, "func (p *Project) createProjectOnce(")
+	require.Contains(t, outer, "createProjectTxWithSeatRefs",
+		"createProjectOnce must delegate the create transaction to createProjectTxWithSeatRefs; "+
+			"if that changed, point the assertions below at whatever function now holds the "+
+			"project insert, rather than letting them pass against a body that has neither")
+
+	create := funcBody(t, src, "func (p *Project) createProjectTxWithSeatRefs(")
 	assert.True(t, strings.Contains(create, "bumpMemberEpochTx"),
-		"createProjectOnce must move the epoch off the column default, or every new project "+
+		"the create transaction must move the epoch off the column default, or every new project "+
 			"reports the value the integration contract reserves for a project that does not exist")
 
 	// Via the shared increment, NOT by seeding the column at insert. member_epoch
@@ -116,7 +130,7 @@ func TestCreateBumpsTheEpochRatherThanSeedingIt(t *testing.T) {
 	// silently does nothing — a failure with no error and no test, unless pinned.
 	insertAt := strings.Index(create, "insertProjectTx")
 	bumpAt := strings.Index(create, "bumpMemberEpochTx")
-	require.Greater(t, insertAt, -1, "createProjectOnce must insert the project row")
+	require.Greater(t, insertAt, -1, "the create transaction must insert the project row")
 	require.Greater(t, bumpAt, insertAt,
 		"the epoch bump must come AFTER the project insert, or its status guard matches no row")
 
@@ -126,7 +140,7 @@ func TestCreateBumpsTheEpochRatherThanSeedingIt(t *testing.T) {
 	// while the response reports 1. Every other call site may ignore the count —
 	// a no-op on a disbanded project is intended there.
 	assert.Contains(t, create, "bumped == 0",
-		"createProjectOnce must check that the epoch bump matched a row; discarding the count "+
+		"the create transaction must check that the epoch bump matched a row; discarding the count "+
 			"turns the one case where a no-op is a security state into a silent wrong answer")
 }
 
@@ -219,7 +233,7 @@ func TestReconcileLeavesHealthyAndDisbandedEpochsAlone(t *testing.T) {
 	// A healthy project, moved past the base by a real roster write.
 	healthy := createProjectVia(t, srv, spaceA, token, "epoch-healthy")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+healthy.ProjectID+"/members/add",
-		token, map[string]any{"uids": []string{"epochLeaveTarget"}})
+		token, addMembersPayload("epochLeaveTarget"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	healthyBefore, err := testDB.queryByProjectID(healthy.ProjectID)
 	require.NoError(t, err)
@@ -265,7 +279,7 @@ func TestMigrationBackfillLiftsOnlyTheSentinelRows(t *testing.T) {
 
 	past := createProjectVia(t, srv, spaceA, token, "epoch-backfill-past")
 	w := doJSON(t, srv, http.MethodPost, "/v1/projects/"+past.ProjectID+"/members/add",
-		token, map[string]any{"uids": []string{"epochBackfillTarget"}})
+		token, addMembersPayload("epochBackfillTarget"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	pastBefore, err := testDB.queryByProjectID(past.ProjectID)
 	require.NoError(t, err)

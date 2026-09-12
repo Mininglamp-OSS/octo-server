@@ -11,23 +11,18 @@ import (
 //
 // # Why removal is two-phase
 //
-// A project seat gates group admission (I2). If removal flipped status to 0 and
-// then detached groups asynchronously, there would be a window in which
-// octo_project_member says "not a member" while group_member rows for that uid
-// still exist in the project's groups — I2 violated, by the removal itself,
-// every time.
-//
-// So the order is inverted: `removing = 1` is set in the SAME transaction that
-// begins the removal, `status` stays 1, and the worker flips status only after
-// the groups are detached. Every authorization read treats removing = 1 as a
-// non-member, so the seat stops granting anything immediately, while the rows
-// that have not been cleaned up yet still belong to a member of record.
+// `removing = 1` is set in the SAME transaction that begins the removal, while
+// `status` stays active until the worker has completed every registered cleanup
+// step. Every authorization read treats removing = 1 as a non-member, so the
+// seat stops granting access immediately without coupling this module to native
+// group membership. If no cleanup step is registered, the worker closes the seat
+// directly; an empty registry must not create an endless retry loop.
 //
 // The states, and what each means to a reader:
 //
 //	status=1 removing=0  — an ordinary active member
 //	status=1 removing=1  — seat closing; NOT a member for any authorization
-//	                       purpose; group rows may still exist
+//	                       purpose; registered cleanup may still be pending
 //	status=0 removing=0  — removed, cleanup finished
 //	status=0 removing=1  — must not exist; the reconcile scan reports it
 
@@ -68,8 +63,12 @@ type RemovalJob struct {
 	CreatedAt   time.Time `db:"created_at"`
 }
 
-// beginMemberRemovalTx sets removing = 1 on an active seat and reports whether a
-// row actually changed.
+// beginMemberRemovalTx sets removing = 1 on an active non-Owner seat and reports
+// whether a row actually changed.
+//
+// The Owner predicate is a final defense for every cascade caller, including
+// agent riders and Space-seat cleanup. Endpoint-level Owner checks are not
+// sufficient because those callers can arrive through independent transactions.
 //
 // The `status = active AND removing = 0` predicate is what makes the whole
 // removal path idempotent: a second request for a uid already being removed
@@ -79,8 +78,8 @@ type RemovalJob struct {
 func (d *DB) beginMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.Time) (bool, error) {
 	res, err := tx.UpdateBySql(
 		"UPDATE `octo_project_member` SET removing = 1, updated_at = ? "+
-			"WHERE project_id = ? AND uid = ? AND status = ? AND removing = 0",
-		now, projectID, uid, MemberStatusActive,
+			"WHERE project_id = ? AND uid = ? AND status = ? AND removing = 0 AND role <> ?",
+		now, projectID, uid, MemberStatusActive, RoleOwner,
 	).Exec()
 	if err != nil {
 		return false, fmt.Errorf("project: begin member removal: %w", err)
@@ -123,14 +122,15 @@ func (d *DB) finishMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.T
 // checkSpaceSeatForCleanupTx re-check inside deactivateSeatForCascade, and as
 // cleanupSpaceMemberGroups's.
 //
-// A cancellation landing mid-batch leaves the member in the project but out of
-// some of its groups. That is NOT an invariant violation — the subset relation
-// still holds — it is visible in the member lists, and an admin can re-add. Say
-// so here, or the next reader will "fix" it into something worse.
+// A cancellation landing mid-batch can leave an external cleanup step partially
+// complete. That is not a Project membership invariant violation: native group
+// membership and Project membership are independent facts, and the worker
+// re-checks the seat before any subsequent step.
 func (d *DB) lockMemberForCascadeTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, "+
+			"COALESCE(joined_at, created_at) AS joined_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? FOR UPDATE",
 		projectID, uid,
 	).Load(&rows)
@@ -227,13 +227,10 @@ func (d *DB) claimRemovalJobs(owner string, limit int, now time.Time, lease time
 	// The claim reads the FULL row, not just the id, so there is no second
 	// SELECT after the UPDATE.
 	//
-	// That is not a micro-optimization. A plain SELECT later in this transaction
-	// would be a CONSISTENT read, and modules/project has a source guard —
-	// TestNoWriteAuthorisingAggregateIsANonLockingRead — forbidding exactly that
-	// shape after P0 shipped it and it cost a project with zero owners and a
-	// bypassable member cap. Reading everything under the same FOR UPDATE SKIP
-	// LOCKED removes the question instead of arguing about whether this
-	// particular instance happens to be safe.
+	// A plain SELECT later in this transaction would be a CONSISTENT read and
+	// could miss a row committed after the transaction's read view opened. The
+	// full row is therefore selected under the same FOR UPDATE SKIP LOCKED
+	// boundary used by the UPDATE below.
 	//
 	// SKIP LOCKED is what lets several pods poll the same queue without
 	// contending: a row another worker already claimed is skipped, not waited on.

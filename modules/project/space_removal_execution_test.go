@@ -358,7 +358,9 @@ func TestSpaceMemberEpochBumpSeesConcurrentAdmission(t *testing.T) {
 	require.NoError(t, err)
 	defer admTx.RollbackUnlessCommitted()
 
-	held, err := p.db.lockSpaceSeatsTx(admTx, spaceA, []string{"rvOwner", "rvTarget"})
+	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceA, []string{"rvOwner", "rvTarget"})
+	require.NoError(t, err)
+	held, err := p.db.lockSpaceSeatsTx(admTx, spaceA, []string{"rvOwner", "rvTarget"}, seatRefs)
 	require.NoError(t, err)
 	require.True(t, held["rvTarget"], "the fixture target must hold a Space seat")
 

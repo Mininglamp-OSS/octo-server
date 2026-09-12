@@ -1,7 +1,8 @@
 # Follow Sidebar Project Sections API
 
-本文档面向客户端，描述 `sidebar-project-sections` 引入的接口与兼容性变化。
-对应服务端实现见 PR #878。
+本文档面向客户端，描述统一 Sidebar Sections 接口、关系群字段及兼容性变化。
+对应服务端实现位于 Project 对齐改动（PR #887）；本文描述的是待协调的接口契约，不表示已部署。
+
 
 ## 1. 客户端接入概览
 
@@ -11,11 +12,13 @@
    `PUT /v1/spaces/{space_id}/sidebar-sections/sort`。
 4. 使用 `POST /v1/sidebar/sync` 获取会话、未读数等动态数据；请求必须携带
    `X-Space-ID`，客户端才能获得 `project_id` / `project_name`。
-5. `PUT /v1/projects/{project_id}/setting` 设置 `pinned=true` 后 Project 进入关注；
-   设置 `pinned=false` 后从关注移除，即使用户仍是该 Project 的成员。
+5. 当前 Project 成员可通过 `PUT /v1/projects/{project_id}/setting` 设置
+   `pinned=true` 进入关注；设置 `pinned=false` 后从关注移除，即使用户仍是该
+   Project 的成员。非成员不能通过置顶获得 Project 入口或访问权限。
 
-所有接口沿用现有登录鉴权。新建的 Sidebar Sections 接口还要求当前用户是路径中
-`space_id` 对应 Space 的有效成员。
+所有接口沿用现有登录鉴权。Sidebar Sections 接口还要求当前用户是路径中
+`space_id` 对应 Space 的有效成员；Project 条目另外要求当前用户是该 Project 的
+有效成员。历史遗留的非成员 pin 偏好不会让条目重新出现。
 
 ## 2. 数据类型
 
@@ -65,11 +68,9 @@ interface ProjectPayload {
 interface ProjectGroup {
   group_no: string;
   name: string;
-  is_named: number;            // 0 | 1
-  avatar_text: string;
-  avatar_color: number | null;
-  is_upload_avatar: number;    // 0 | 1
-  member_count: number;
+  project_id: string;
+  linked_by: string | null;
+  pinned: boolean;
 }
 
 interface SidebarSectionSortItem {
@@ -84,10 +85,18 @@ interface SidebarSectionSortItem {
 - `id` 必须等于对应对象中的 `category_id` 或 `project_id`。
 - 客户端应直接采用响应数组顺序。`sort` 用于表达服务端顺序，但不应假设其永久连续或唯一。
 - `groups` 始终是数组；没有数据时为 `[]`，不是 `null`。
-- Project 的 `groups` 与 `GET /v1/projects/{project_id}/groups` 默认第一页口径一致，
-  最多返回 50 条。需要更多群时继续调用原 Project groups 分页接口。
+- 对当前 Project 成员，Project 的 `groups` 与 `GET /v1/projects/{project_id}/groups` 默认第一页口径一致：
+  返回当前 Project 的全部存活关联群，不按调用者是否有原生 `group_member` 席位过滤，
+  包括非原生成员或被原生黑名单标记的关系，最多返回 50 条。需要更多群时继续调用
+  原 Project groups 分页接口。
+- `groups` 是 Project 关系元数据，不包含原生群成员计数，也不授予原生群读写、子区
+  或成员权限。
 - `groups[0]` 不保证是全员群。如 UI 要固定全员群在首位，请比较
   `group_no === all_member_group_no` 后由客户端排序。
+
+- Sidebar 只读取 Project 关系元数据，不定义或改变原生群成员同步。普通 Project 发起群
+  和关联已有群保持各自独立的既有成员/关系语义；同步细节不属于本接口，也不改变
+  `groups[]` 不授予原生权限的约束。
 
 ## 3. 获取关注页顶层结构
 
@@ -132,11 +141,9 @@ HTTP `200`，响应体为数组，不额外包裹 `data`：
         {
           "group_no": "group-all-001",
           "name": "全员群",
-          "is_named": 0,
-          "avatar_text": "",
-          "avatar_color": null,
-          "is_upload_avatar": 0,
-          "member_count": 12
+          "project_id": "project-001",
+          "linked_by": null,
+          "pinned": false
         }
       ]
     }
@@ -146,14 +153,16 @@ HTTP `200`，响应体为数组，不额外包裹 `data`：
 
 ### 可见性规则
 
-- 用户创建或加入 Project 后，Project 默认进入关注。
-- 用户置顶一个可见的 Space-listed Project 后，该 Project 进入关注。
-- 非 Project 成员置顶 Space-listed Project 时，Project 可见，但 `groups: []`；
-  置顶不会授予 Project 席位或群成员权限。
+- 用户创建或加入 Project 后，Project 默认进入关注；只有当前用户的有效 Project
+  成员席位会使条目可见。
+- `pinned=true` 只对当前 Project 成员生效。非成员的置顶请求不能制造 Sidebar
+  条目，也不授予 Project 席位或任何群成员权限。
+- 历史遗留的非成员 `pinned=1` 偏好会被忽略，不会由读路径回填条目。
 - 用户显式取消置顶后，该 Project 从关注移除，即使用户仍是 Project 成员。
 - 再次置顶会恢复该 Project，保留此前的顶层排序位置。
 - 已退出、已解散或不再可见的 Project 不会返回。
-- Project 群只会出现在 Project 下，不会同时出现在手动分类中。
+- Project 群只会出现在 Project 下，不会同时出现在手动分类中；`groups` 仅是
+  关联元数据，不授予原生群读写、子区或成员权限。
 
 ## 4. 更新关注页顶层排序
 
@@ -227,8 +236,10 @@ Content-Type: application/json
 
 行为说明：
 
-- `pinned=true`：Project 加入关注；重复调用幂等。
-- `pinned=false`：Project 从关注移除；重复调用幂等。
+- `pinned=true`：仅当前 Project 成员可成功置顶并加入关注；重复调用幂等。非成员
+  请求不能创建可见条目，也不改变 Project 或群权限。
+- `pinned=false`：当前成员可从关注移除；重复调用幂等。历史非成员偏好不会因此
+  变为可见条目。
 - 取消置顶不退出 Project、不退出群，也不改变任何成员权限。
 - 再次置顶会恢复此前保留的顶层排序位置。
 - 设置接口不返回完整 Sidebar Sections。调用成功后，客户端可以先更新本地 UI，随后
@@ -287,6 +298,15 @@ interface SidebarItemProjectFields {
 - 名称查询为 fail-soft：极端存储故障时，主 sidebar 请求仍可能成功且仅缺少
   `project_name`。因此客户端类型必须允许字段缺失，并使用无名称占位展示，不能用名称
   判定权限或身份。
+
+
+客户端切换注意：
+
+- Project Section 的 `groups[]` 已切换为 `ProjectGroup` 关系投影；旧版依赖原生群
+  成员字段（如 `member_count`、头像或当前用户成员状态）的客户端必须改用上述字段，
+  不得继续假设这些字段存在。
+- 服务端与客户端应按版本窗口协调上线；本文是契约和迁移说明，不代表客户端或服务端
+  已经部署完成。
 
 ## 7. 旧接口兼容性变化
 
@@ -370,6 +390,9 @@ UID 限流触发时，沿用现有 `X-RateLimit-*` 响应头；客户端应按
   ├─ PUT /projects/{id}/setting
   └─ 本地更新后重新 GET /sidebar-sections 校准
 ```
+
+读取入口只返回当前用户有效 Project 成员席位对应的 Project；Space 成员身份、历史
+非成员 pin 或 `groups: []` 都不能替代 Project 授权。
 
 客户端不要从 `my_role`、`groups` 是否为空或 Project 是否置顶推导权限；权限继续以
 Project 响应中的 `capabilities` 和具体操作接口返回结果为准。
