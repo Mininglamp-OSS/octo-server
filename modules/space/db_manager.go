@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -227,13 +228,19 @@ func (d *managerDB) forceDisbandSpace(spaceId string, operatorUID string) ([]str
 		Where("space_id=?", spaceId).Exec(); err != nil {
 		return nil, err
 	}
+	// 规范化 space_id，与用户侧 disbandSpace 同一处理、同一理由：这行刚被上面那条
+	// UPDATE X 锁住，加锁读不等人也不建立 read view；工单的两列必须同源。见 SpaceRef。
+	spaceRef, err := ResolveSpaceIDTx(tx, spaceId)
+	if err != nil {
+		return nil, err
+	}
 	if _, err = tx.Update("space_member").Set("status", 0).Set("updated_at", now).
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
 		return nil, err
 	}
 	// 批量入队：本事务正握着 space_member 的 FOR UPDATE 范围锁，逐条 INSERT 会把
 	// 上万次往返都压在锁内，期间所有并发加入路径全部阻塞。
-	if err := enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+	if err := enqueueMemberRemovalCleanupBatchTx(tx, spaceRef, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -401,8 +408,67 @@ func (d *managerDB) updateSpaceProfile(
 	return &before, nil
 }
 
-// upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）
+// upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）。
+//
+// 「重新激活」这一半会让**移除窗口里存活的项目席位重新可达**，而中间没有任何项目侧
+// 写入，所以必须在同一事务内发失效信号（见 SeatTransitionTxStep）。此前这里被
+// 当成「只会插入不存在的席位」，而函数名与注释本身就写着 upsert / 重新激活 —— 唯一索引
+// spacemember_spaceid_uid 让 ON DUPLICATE 分支对任何已移除行都会命中。
+//
+// 外层包 RetryOnLockConflict：见下面第 (a) 点，这条路径**会**遇到瞬时死锁，而它原先没有
+// 重试，1213 会直接变成整批回滚的 ErrSpaceStoreFailed。与同一次改动给
+// atomicReactivateMemberIfNotFull 加重试是同一个理由。
 func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
+	return dbpkg.RetryOnLockConflict(func() error {
+		return d.upsertMembersOnce(spaceId, uids)
+	})
+}
+
+// upsertMembersOnce 是一次尝试；重试语义见 upsertMembers。
+//
+// # 为什么不用 affected-rows 分流
+//
+// `ON DUPLICATE KEY UPDATE` 的 ROW_COUNT() 惯例是 1=插入 / 2=更新 / 0=无变化，看着
+// 正好够用。**实测（MySQL 8.0.33）证明它在这里不够用**：
+//
+//	全新插入                    -> 1
+//	已移除行(status=0)被重新激活 -> 2
+//	已活跃成员(status=1)重复 upsert，同一秒内 -> 0
+//	已活跃成员(status=1)重复 upsert，跨秒     -> 2   ← 和「重新激活」不可区分
+//
+// 因为 `updated_at=NOW()` 让跨秒的重复 upsert 也算「有变化」。按 affected==2 分流会让
+// 每一次重复添加都 bump 一次 epoch，破坏「空写不动 epoch」——那是消费方缓存所依赖的
+// 规则，而且是让每个消费方白做一次复核的净损失。
+//
+// 所以要先知道那一行**当前**的 status。而「怎么读」这件事有两个反直觉的坑，都实测过：
+//
+// # (a) 逐个 uid 加锁读会自己造出死锁，而本包 320 行之上就写着别这么做
+//
+// 第一版把 `SELECT ... WHERE uid=? FOR UPDATE` 放在**循环里**。对**不存在**的行做加锁读
+// 拿到的是间隙锁，间隙锁互相兼容，于是两个并发批量添加各拿一个，随后各自的 INSERT 需要
+// 与对方间隙锁互斥的插入意向锁 —— 环成立，1213。实测（8.0.33，两个新 uid 落在同一间隙）：
+//
+//	T1 SELECT ... 'm_new1' FOR UPDATE   Empty set
+//	T2 SELECT ... 'm_new2' FOR UPDATE   Empty set
+//	T1 INSERT 'm_new1' ...              ERROR 1213
+//	对照（改动前的裸 upsert，无加锁读）：两个都 Query OK，无等待
+//
+// 这正是 atomicJoinInitialSpace 头上那段「**刻意不加 FOR UPDATE**」所禁止的形状
+// （modules/space/db.go，附一次真实事故与 20 并发只活 1 个的实测）。加回来是本轮 review
+// 抓到的回归。
+//
+// # (b) 逐圈取锁还会反转锁序，而受害者是成员移除
+//
+// 席位锁在循环里取，意味着第 i+1 圈去要 space_member 的 X 锁时，**手上已经握着**第 i 圈
+// epoch bump 留下的 octo_project X 锁。那就把每条移除路径都遵守的
+// space_member → octo_project 顺序反了过来。实测中 InnoDB 挑的受害者正是**成员移除**——
+// 而按事务内步骤的契约，那意味着一次撤销失败，恰是这一步存在的目的所要防止的状态。
+//
+// 两个坑一个解法，而且本仓已有现成形状：**一条语句锁住全部目标行**，就像
+// removeMembersForceOnce 做的那样（`... uid IN ? ... FOR UPDATE`）。循环里从此不再取任何
+// space_member 锁，(b) 消失；(a) 的间隙锁仍然存在（IN 列表里不存在的 uid 照样拿间隙锁），
+// 由外层的有界重试兜住 —— 这也是为什么两半都必须有。
+func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
@@ -411,49 +477,55 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
+
+	// 一条语句取全部目标行的锁。放在任何写入之前：循环里就不会在持有 octo_project 锁
+	// 之后再去要 space_member 锁（见上面 (b)）。
+	//
+	// 只取锁，**不把结果当判据**。第一版把这条读的结果存进 map[uid]status 再用调用方的
+	// uid 去查，那是本轮 review 抓到的 P1：见下面「判据必须来自写入」。
+	if _, err = tx.SelectBySql(
+		"SELECT uid FROM space_member WHERE space_id=? AND uid IN ? FOR UPDATE",
+		spaceId, uids,
+	).ReturnStrings(); err != nil {
+		return err
+	}
+
 	for _, uid := range uids {
-		var existing []struct {
-			Status int `db:"status"`
-		}
-		if _, err := tx.SelectBySql(
-			"SELECT status FROM space_member WHERE space_id=? AND uid=? FOR UPDATE",
-			spaceId, uid,
-		).Load(&existing); err != nil {
+		// 判据来自**写入**，不来自 Go 里的字符串比较。
+		//
+		// 上一版是 `priorStatus[uid]`——map 的键是**数据库返回的拼写**，查询用的是**调用方
+		// 的拼写**。而 `space_member.uid` 在生产上是 utf8mb4_0900_ai_ci，大小写与重音都不
+		// 敏感：请求 `ALICE` 而库里存 `alice` 时，加锁读找得到那行、键为 `alice`，Go 查询
+		// 落空 → 判定「不是重新激活」；但下面的 `ON DUPLICATE` 照样命中唯一索引，席位真的
+		// 从 0 翻到 1 —— **席位重开了，失效信号没发**。消费方缓存的那条拒绝会一直和 epoch
+		// 对得上。
+		//
+		// 折叠解决不了这个：FoldID 是刻意 ASCII-only 的，其「严格更细」的论证成立于**读**
+		// 路径，因为那里落空是 fail-CLOSED（多答一次 absent）。这里落空是 fail-OPEN，极性反
+		// 了；而 0900_ai_ci 连重音都不敏感，`José` 与 `Jose` 对唯一索引是一行、对任何 ASCII
+		// 折叠是两个键，折了照样漏。
+		//
+		// 所以先用一条**带谓词的 UPDATE** 去尝试重新激活，让 RowsAffected 回答「这次到底有没
+		// 有把一个已关闭的席位打开」。数据库用它自己的 collation 匹配，Go 侧不再有可漂移的
+		// 比较——同 removeMembersForceOnce 的做法（它也是靠 status 谓词 + RowsAffected 判断
+		// 「这行真的改了吗」，而不是拿调用方拼写查 map）。
+		// 角色不变（role=nil）：管理端重复添加一个曾是管理员的人，不该把他悄悄降级。
+		reactivated, err := openSeatTx(tx, spaceId, uid, nil, "")
+		if err != nil {
 			return err
 		}
-		switch {
-		case len(existing) == 0:
-			if _, err := tx.InsertBySql(
-				"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) "+
-					"VALUES (?, ?, 0, 1, NOW(), NOW())",
-				spaceId, uid,
-			).Exec(); err != nil {
-				return err
-			}
-		case existing[0].Status == 0:
-			result, err := tx.Update("space_member").
-				Set("status", 1).Set("updated_at", time.Now()).
-				Where("space_id=? AND uid=? AND status=0", spaceId, uid).Exec()
-			if err != nil {
-				return err
-			}
-			affected, err := result.RowsAffected()
-			if err != nil {
-				return err
-			}
-			if affected == 1 {
-				if err := enqueueMemberRejoinIntentTx(tx, spaceId, uid, ""); err != nil {
-					return err
-				}
-			}
-		default:
-			// Preserve the old upsert's timestamp touch for an already-active
-			// seat without emitting a duplicate 0→1 intent.
-			if _, err := tx.Update("space_member").
-				Set("updated_at", time.Now()).
-				Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
-				return err
-			}
+		if reactivated {
+			continue
+		}
+
+		// 剩下的两种情形交给 upsert：行不存在（插入）、已经是活跃成员（空写）。
+		// 两者都不该动 epoch，所以都不经过 openSeatTx。
+		if _, err := tx.InsertBySql(
+			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
+				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
+			spaceId, uid,
+		).Exec(); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
@@ -471,7 +543,24 @@ var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer owner
 // 反向窗口（先本事务删除 → 再被并发 transfer 提升为 owner）由 transferOwnerAdmin 内部的
 // `AND status=1` 守卫关掉：本事务 commit 后该 uid 的 status=0，后续 transfer 的 UPDATE 影响 0 行。
 // 返回本次真正被移除的 uid，供调用方精确地做失效缓存与事件广播。
+// removeMembersForce 是 removeMembersForceOnce 加上有界的 1213/1205 重试，
+// 见 pkg/db.RetryOnLockConflict。事务型步骤（runSeatTransitionTxSteps）的失败会
+// 回滚整次移除，而死锁是**瞬时**失败：不重试就等于把「这次踢人失败」的 500 甩给
+// 管理端，而它无法区分「重试就好」和「永久失败」。
+//
+// 从 BEGIN 重跑是安全的：失败的那次已被 InnoDB 回滚，包括 outbox 工单，所以
+// 重试不会留下重复的清理工单。
 func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUID string) ([]string, error) {
+	var removed []string
+	err := dbpkg.RetryOnLockConflict(func() error {
+		var e error
+		removed, e = d.removeMembersForceOnce(spaceId, uids, operatorUID)
+		return e
+	})
+	return removed, err
+}
+
+func (d *managerDB) removeMembersForceOnce(spaceId string, uids []string, operatorUID string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
@@ -481,39 +570,48 @@ func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUI
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	var ownerCount int
+	// 锁定**全部**目标行，而不只是 role=2 的那些，然后在 Go 侧判 owner。
+	//
+	// 两个理由，第二个是本次改动的原因：
+	//
+	//  1. 原来的 `... AND role=2 AND status=1 FOR UPDATE` 只保证 owner 行被锁；
+	//     非 owner 目标行是否被锁取决于 index condition pushdown 是否把 role
+	//     下推到存储引擎（下推则不加锁）。TOCTOU 防护不该依赖优化器行为。
+	//
+	//  2. 批量路径的**事务内步骤**依赖「目标的 space_member 行已被本事务 X 锁」
+	//     这个前提：project 侧的 epoch bump 用一次非锁定读枚举席位，其正确性靠
+	//     的就是「未提交的席位准入被 space_member 锁挡住、已提交的早于本事务
+	//     read view」（见 modules/project.bumpMemberEpochForSpaceMemberTx）。
+	//     逐圈才锁下一个 uid 的话，read view 在第一个 uid 的步骤里就固定了，
+	//     而第二个 uid 的席位可能在那之后才被并发准入提交——枚举读看不到，
+	//     epoch 就不动。一条语句锁住全部目标行，read view 才晚于所有 X 锁。
+	var locked []struct {
+		UID  string `db:"uid"`
+		Role int    `db:"role"`
+	}
 	if _, err = tx.SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid IN ? AND role=2 AND status=1 FOR UPDATE",
+		"SELECT uid, role FROM space_member WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE",
 		spaceId, uids,
-	).Load(&ownerCount); err != nil {
+	).Load(&locked); err != nil {
 		return nil, err
 	}
-	if ownerCount > 0 {
-		return nil, ErrCannotRemoveOwner
+	for _, row := range locked {
+		if row.Role == 2 {
+			return nil, ErrCannotRemoveOwner
+		}
 	}
 
-	now := time.Now()
 	removed := make([]string, 0, len(uids))
 	for _, uid := range uids {
-		result, err := tx.Update("space_member").
-			Set("status", 0).
-			Set("updated_at", now).
-			Where("space_id=? AND uid=? AND status=1", spaceId, uid).Exec()
+		// 只给真正被改动的成员行入队——closeSeatTx 的 status=1 谓词保证了这一点。
+		// 无谓词地入队会产出永远无事可做的工单，还会让一次误传的 uid 触发一遍别人的
+		// 会话面清理。
+		closed, err := closeSeatTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved)
 		if err != nil {
 			return nil, err
 		}
-		// 只给真正被改动的成员行入队。此前这里没有 status=1 谓词，对已移除 / 不存在
-		// 的 uid 也会"更新"一次；无谓词地入队会产出永远无事可做的工单，还会让
-		// 一次误传的 uid 触发一遍别人的会话面清理。
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if affected == 0 {
+		if !closed {
 			continue
-		}
-		if err := enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonForceRemoved); err != nil {
-			return nil, err
 		}
 		removed = append(removed, uid)
 	}
@@ -594,6 +692,21 @@ var ErrRemoveHierarchy = errors.New("operator does not outrank removal target")
 // 清理任务落库同生共死，进程在两者之间崩溃也不会留下"已移除但没清理"的成员。
 // 提前返回的三条分支（行不存在 / owner / 角色不够）都没有改动成员行，因此不入队。
 func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) (bool, error) {
+	var removed bool
+	err := dbpkg.RetryOnLockConflict(func() error {
+		var e error
+		removed, e = removeMemberLockedOnce(sess, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
+		return e
+	})
+	return removed, err
+}
+
+// removeMemberLockedOnce 是一次尝试；重试语义见 removeMemberLocked。
+//
+// 单独一层而不是在调用方各自重试：踢出（api.go）、自助退出（api.go）与
+// DB.removeMemberLocked（db.go）三个入口共用同一条事务，重试放在事务边界上
+// 才不会漏掉将来新增的第四个入口。
+func removeMemberLockedOnce(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) (bool, error) {
 	tx, err := sess.Begin()
 	if err != nil {
 		return false, err
@@ -616,13 +729,16 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 	if roles[0] >= rejectRoleAtOrAbove {
 		return false, ErrRemoveHierarchy
 	}
-	if _, err = tx.Update("space_member").
-		Set("status", 0).Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
+	// closeSeatTx 的 UPDATE 带 `AND status=1` 谓词，而此前这里没有。语义不变：上面那条
+	// `SELECT role ... AND status=1 FOR UPDATE` 已经确认这行是活跃的并对它持 X 锁，所以
+	// 谓词必然命中。改动的只是「如果那个不变量被破坏会怎样」——现在报错回滚，而不是静默
+	// 地当作移除成功了。
+	closed, err := closeSeatTx(tx, spaceId, uid, operatorUID, reason)
+	if err != nil {
 		return false, err
 	}
-	if err = enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, reason); err != nil {
-		return false, err
+	if !closed {
+		return false, errSeatVanishedUnderLock
 	}
 	if err = tx.Commit(); err != nil {
 		return false, err

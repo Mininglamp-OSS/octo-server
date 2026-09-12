@@ -4,11 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gocraft/dbr/v2"
+
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"go.uber.org/zap"
 )
 
@@ -98,7 +100,19 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 		if spaceID == "" {
 			continue
 		}
-		ok, err := closeOneSeatAndEnqueueTx(ctx, spaceID, uid, operatorUID, reason)
+		// 有界的 1213/1205 重试，与另外几扇席位门一致。
+		//
+		// 这条门此前是七扇里唯一没有包装的：它在同一事务内按 space_member -> octo_project
+		// 的顺序取锁（epoch 步骤所在），和其它关席位路径完全同形，所以死锁的可能性也同形。
+		// 失败模式此前是有界且可见的（逐 Space 提交、首个错误返回给调用方，而 BotFather
+		// 删 Bot 会因此中止并可重试），所以两位 reviewer 都评为 P2 而非阻塞——但既然
+		// 是一次瞬时失败，让它在这里重试比让整次 Bot 删除失败要好。
+		var ok bool
+		err := dbpkg.RetryOnLockConflict(func() error {
+			var runErr error
+			ok, runErr = closeOneSeatAndEnqueueTx(session, spaceID, uid, operatorUID, reason)
+			return runErr
+		})
 		if err != nil {
 			// 单个 Space 失败不中断其余 Space：已提交的那些工单已经落库，
 			// 中断反而会让后面那些 Space 连工单都没有。
@@ -127,8 +141,12 @@ func closeSeatsAllSpaces(ctx *config.Context, uid, operatorUID, reason string) (
 // 返回 false 表示这次没有改动成员行（席位本来就不在），此时**不入队**——对着一个
 // 不存在的席位入队会产出一条永远无事可做的工单，还会让别人的会话面清理被触发一次。
 // 这是 removeMemberLocked 与 forceRemove 都遵守的规矩，见 db_manager.go 的注释。
-func closeOneSeatAndEnqueueTx(ctx *config.Context, spaceID, uid, operatorUID, reason string) (bool, error) {
-	tx, err := ctx.DB().Begin()
+// Takes the session rather than the *config.Context it used to: the only thing it
+// wanted from the context was DB(), and a session parameter is what lets the
+// collation-drift probe drive this door against a deliberately drifted schema.
+// removeMemberLocked already has this shape for the same reason.
+func closeOneSeatAndEnqueueTx(session *dbr.Session, spaceID, uid, operatorUID, reason string) (bool, error) {
+	tx, err := session.Begin()
 	if err != nil {
 		return false, fmt.Errorf("space: begin close seat: %w", err)
 	}
@@ -155,24 +173,23 @@ func closeOneSeatAndEnqueueTx(ctx *config.Context, spaceID, uid, operatorUID, re
 		return false, nil
 	}
 
-	result, err := tx.Update("space_member").
-		Set("status", 0).
-		Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=? AND status=1", spaceID, uid).Exec()
+	// 关席位 + 写工单 + 发失效信号，全在 closeSeatTx 里（seat_transition.go）。
+	//
+	// 三条关席位路径走同一个入口，而「一致」在这里不是整洁是正确性：任何一条跳过失效
+	// 信号，那一类 uid 的 epoch 一致性就不再是充分条件。本函数当初落地时就恰好漏了它
+	// ——工单入了队，epoch 没动，于是对端缓存的授权比 Bot 删除活得更久，工单被
+	// abandoned 之后就是永久。收进一个入口是为了让那次遗漏不再是能写出来的状态。
+	//
+	// 失败会让这个 Space 的关席位回滚。调用方按 Space 逐个提交，所以已经成功的那些保留，
+	// 失败的这个由 err 报告——与本函数原有的部分成功语义一致。
+	closed, err := closeSeatTx(tx, spaceID, uid, operatorUID, reason)
 	if err != nil {
-		return false, fmt.Errorf("space: close seat: %w", err)
+		return false, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("space: read close seat result: %w", err)
-	}
-	if affected == 0 {
+	if !closed {
 		return false, nil
 	}
 
-	if err := enqueueMemberRemovalCleanupTx(tx, spaceID, uid, operatorUID, reason); err != nil {
-		return false, err
-	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("space: commit close seat: %w", err)
 	}

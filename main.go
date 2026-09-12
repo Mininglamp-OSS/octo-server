@@ -30,6 +30,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/internal_membership"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/project"
@@ -752,6 +753,10 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// modules/project/provisioning_guard_test.go asserts both arguments stay present.
 		os.Getenv(project.ProvisionFleetSecretEnv),
 		os.Getenv(project.DriveInternalTokenEnv),
+		// Same reasoning for the membership internal token: modules/internal_membership
+		// only sees the fixed internal-token envs and cannot detect a collision with a
+		// route-level credential.
+		os.Getenv(internal_membership.MembershipInternalTokenEnv),
 		// NOT covered here, stated because the absence is otherwise invisible:
 		// modules/bot_task's per-source bearer tokens live inside the
 		// OCTO_BOT_TASK_SOURCES JSON registry rather than in a single env, so no
@@ -763,6 +768,24 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// reader counts the arguments and concludes the set is complete.
 	); err != nil {
 		return nil, err
+	}
+	for _, clash := range fixedInternalTokenCollisions(os.Getenv) {
+		// Deliberately NOT fatal. This repository's established posture is that a
+		// collision between two FIXED internal-token envs disables the affected
+		// capability module-locally and lets the server boot, while a collision
+		// with a DYNAMIC route credential (checked just above) fails startup —
+		// see TestCardActionDispatchScopesBotMentionTokenCollisionFailures, which
+		// pins both halves. Escalating the fixed-vs-fixed case here would refuse
+		// to boot a deployment that has been running with the collision, which is
+		// a rollout decision rather than a bug fix.
+		//
+		// What this loop adds is VISIBILITY. The module-local checks are
+		// asymmetric — notify checks one sibling, bot_mention two,
+		// internal_resolve three — so a pair neither side checks leaves BOTH
+		// capabilities enabled on one credential and nothing says so. This is the
+		// only place that sees every env, so it is the only place that can.
+		log.Error("two internal-token envs share a value; one credential must grant exactly one capability",
+			zap.String("env", clash[0]), zap.String("collides_with", clash[1]))
 	}
 	// OCTO_CARD_MESSAGE_ENABLED is the deployment-level master gate (rollout /
 	// emergency rollback). With it off, the card_action ingress rejects every
@@ -854,6 +877,111 @@ const (
 	docsNotifyProducerID    = carddispatch.ProducerID("docs-notify")
 	actionOutcomeProducerID = carddispatch.ProducerID("action-outcome")
 )
+
+// fixedInternalTokenEnvs is the set of deployment-configured, capability-scoped
+// credentials that live in a single env var. One credential must grant exactly
+// one capability, so no two of these may hold the same value.
+//
+// NOT every credential in this binary, and the boundary is worth stating rather
+// than implying. modules/bot_task holds per-source bearer tokens inside a JSON
+// registry (OCTO_BOT_TASK_SOURCES) rather than in one env, and it dedupes only
+// WITHIN that registry — so a value shared between a bot_task source and any env
+// listed here is detected by nothing. Closing that needs the registry to expose
+// its configured token values, which is a change to that module rather than to
+// this list; recorded here so the next reader looks instead of trusting the
+// word "every".
+//
+// What this list DOES claim is every fixed, single-env, service-to-service
+// capability credential — and that claim is now checked rather than asserted.
+// TestFixedInternalTokenRegistryIsCompleteBySweep walks the tree for
+// credential-shaped env literals and requires each one to be either in this list
+// or in an annotated exclusion, so a capability that was never registered fails
+// instead of passing silently. It found three: TS_WEBHOOK_SECRET_KEY,
+// OCTO_MAIL_GATEWAY_SECRET and TS_GRPC_AUTH_TOKEN, which are now here.
+//
+// Each owning module also refuses a collision with the siblings it happens to
+// know about, but those local checks are ASYMMETRIC and always have been —
+// modules/notify checks one sibling, modules/bot_mention two,
+// modules/internal_resolve three. A pair neither side happens to check (say
+// OCTO_DOCS_NOTIFY_TOKEN against OCTO_DRIVE_INTERNAL_TOKEN) slips through every
+// module-local switch. Adding a capability made that worse rather than better,
+// because every new token multiplies the pairs the hand-rolled checks would have
+// to cover.
+//
+// So the check across THIS set lives here, in the one place that sees all of
+// them at once.
+var fixedInternalTokenEnvs = []string{
+	"NOTIFY_INTERNAL_TOKEN",
+	"OCTO_DOCS_NOTIFY_TOKEN",
+	"OCTO_DOCS_BOT_MENTION_TOKEN",
+	internal_resolve.DriveInternalTokenEnv,
+	internal_membership.MembershipInternalTokenEnv,
+	// The two project provisioning secrets. Outbound rather than inbound — they
+	// are presented to fleet and drive — and included for the same reason the
+	// inbound ones are: one value must serve one purpose. An outbound secret
+	// equal to an inbound token is the worse half of that, since handing it to a
+	// peer hands the peer a credential that authenticates back to us.
+	project.ProvisionFleetSecretEnv,
+	// Drive's provisioning credential is NOT a second entry here, and its absence is
+	// deliberate rather than an omission. main's #887 stopped giving Drive its own
+	// per-target HMAC secret and pointed provisioning at the existing
+	// OCTO_DRIVE_INTERNAL_TOKEN — so project.DriveInternalTokenEnv and
+	// internal_resolve.DriveInternalTokenEnv are now the same env name. Listing it
+	// twice would make fixedInternalTokenCollisions report the value as colliding with
+	// ITSELF on every deployment that sets it, turning a real detector into a standing
+	// false ERROR line. One value serving two purposes is a decision main made; this
+	// registry's job is to catch the ones nobody decided.
+	// Three more inbound capability credentials, each a single env, each missed
+	// until the sweep test above was written: the webhook HMAC secret
+	// (modules/webhook), the mail gateway secret (modules/agentmailgateway), and
+	// the gRPC server auth token (modules/webhook). Sharing a value between any
+	// of these and, say, the membership token means one leaked value grants
+	// membership reads plus webhook forgery.
+	"TS_WEBHOOK_SECRET_KEY",
+	"OCTO_MAIL_GATEWAY_SECRET",
+	"TS_GRPC_AUTH_TOKEN",
+	// The Space internal API's token, added when main's #827 landed it. It arrived
+	// already wired into the notify-token exclusion call above but not into THIS
+	// list, which is the asymmetry that list exists to remove: it authorizes reading
+	// any uid's role in any Space, so a value shared with the membership token means
+	// one leaked credential grants the Space role lookup AND project membership reads.
+	//
+	// Found by the sweep test rather than by review — and specifically by CI, because
+	// the local regression runs on this branch covered modules/... and pkg/... but not
+	// the ROOT package where that test lives. A merge is exactly when this check earns
+	// its keep: both sides were fine, the combination was not.
+	space.MarketplaceInternalTokenEnv,
+}
+
+// fixedInternalTokenCollisions reports every pair of fixed internal-token envs
+// that share a value, as {env, collides_with} pairs in registry order.
+//
+// Unset envs are skipped: an unconfigured capability is disabled, not colliding,
+// and treating several empty strings as equal would report a collision on every
+// deployment that does not enable all of them.
+//
+// Returns pairs rather than logging directly so the detection is testable
+// without capturing the process-wide logger. Values never leave this function —
+// callers get env NAMES.
+func fixedInternalTokenCollisions(getenv func(string) string) [][2]string {
+	if getenv == nil {
+		return nil
+	}
+	var out [][2]string
+	seenBy := make(map[string]string, len(fixedInternalTokenEnvs))
+	for _, env := range fixedInternalTokenEnvs {
+		value := getenv(env)
+		if value == "" {
+			continue
+		}
+		if other, clash := seenBy[value]; clash {
+			out = append(out, [2]string{env, other})
+			continue
+		}
+		seenBy[value] = env
+	}
+	return out
+}
 
 func printServerInfo(ctx *config.Context) {
 	infoStr := `

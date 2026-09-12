@@ -1,0 +1,552 @@
+schema_version: 1
+task: loop-project-fleet-integration
+brief: .octospec/tasks/loop-project-fleet-integration/brief.md
+resolved_at: 2026-09-07T15:20:00+00:00
+
+# This increment implements O2 + O3 only — the two inbound internal endpoints.
+# O1 (schema) and O4-O7 (the outbound event chain) are deliberately not here;
+# see `increment` at the bottom.
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      Both endpoints answer authorization questions about project membership, so
+      a cross-Space answer is a cross-tenant leak. The rule's usual mechanism —
+      "go through the Space middleware" — does not apply: these routes have no
+      end user and no uid, so isolation is enforced instead by making space_id a
+      REQUIRED part of every query predicate, with a project in another Space
+      folded into the same answer as one that does not exist. The rule also asks
+      that skipping AuthMiddleware be documented in code; Route()'s doc comment
+      does that explicitly.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Every refusal goes through httperr.ResponseErrorLWithStatus with a
+      registered pkg/errcode code; no raw c.JSON / AbortWithStatusJSON anywhere.
+      No new codes were registered — the shared err.shared.* set covers all three
+      shapes, which is also the anti-enumeration choice: a per-reason code would
+      tell an unauthenticated caller whether a token is unset versus wrong.
+      make i18n-extract-check and make i18n-lint both pass.
+  - id: rate-limit
+    source: repo
+    load_bearing: true
+    why: >
+      Applies with its default INVERTED, and the inversion is the point. The rule
+      says authenticated routes mount SharedUIDRateLimiter; these routes have no
+      logged-in uid, so that middleware would silently fail open. They mount
+      StrictIPRateLimitMiddleware instead, on a new tag that shares no bucket
+      with any existing one, with env values passed through ratelimit.SanitizeRPS
+      / SanitizeBurst so a NaN typo cannot disable the control. No hand-rolled
+      Redis counter.
+  - id: trust-boundary
+    source: repo
+    load_bearing: true
+    applied: partial
+    why: >
+      Matched via the wire-contract touches tag and read in full. Most of it does
+      not apply: no adapter, no external content rendered into message payloads,
+      no markdown or URL destinations, so the escaping, adapter-parity and
+      URL-breakout rules have nothing to bind to. One rule DOES apply and is
+      implemented — "bound the payload": structural limits (<=50 uids, <=50
+      project ids) enforced ON TOP OF a byte cap, because a byte cap alone still
+      admits a well-formed-but-pathological payload and both inputs become SQL IN
+      lists. Recorded as partial rather than false so the applicable half is not
+      lost the next time this rule is resolved.
+  - id: testing
+    source: repo
+    load_bearing: false
+    why: >
+      The design puts a membershipStore seam between the handlers and
+      pkg/project — the same shape modules/internal_resolve uses for
+      identityResolver — so every answer-shape and fail-closed assertion runs
+      with no infrastructure rather than being deferred to an integration suite.
+      Ordering and predicate properties that cannot be observed single-threaded
+      are held by source guards, following TestMemberEpochOnlyEverIncrements.
+      A real MySQL/Redis/WuKongIM stack became available later in the increment,
+      so the review fixes are covered against the ENGINE as well: the epoch
+      repair, the migration backfill statement, and both pkg/project predicates
+      (which had no engine coverage in any lane) now run against real rows from
+      modules/project. Stub-only coverage was what let the P1 sentinel collision
+      through — a fake store agreed with itself about the epoch.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Implement does not commit. Finish uses an English Conventional Commit
+      subject.
+
+decisions:
+  - id: C1
+    status: decided
+    what: project_id is a 36-character hyphenated canonical UUID.
+    impact_on_this_increment: none
+    note: >
+      Both endpoints treat project_id as an opaque string, so the format change
+      does not reach them. It lands in O1 together with the generator change.
+  - id: C3
+    status: decided
+    what: projects gain an archivable, restorable state.
+    impact_on_this_increment: conditional
+    note: >
+      DEPENDS ON HOW ARCHIVE IS MODELLED, and this increment does not decide it.
+      If archive is a distinct `status` value, the existing `status = 1`
+      predicate already folds it into epoch 0 with no change here. If it is a
+      separate `archived_at` column beside `status = 1` — the shape O1b drafted
+      and then retracted — the predicate needs an explicit `archived_at IS NULL`
+      and does NOT come for free. The earlier note asserted the first reading
+      unconditionally; it is recorded as conditional until O1 lands the column.
+      Either way epochs is the backstop for a lost or delayed lifecycle event:
+      the consumer sees an epoch mismatch rather than "archived", and the
+      archived state itself travels by event.
+  - id: C2
+    status: contract-only
+    note: No code change. Consumers must read context_error, not context_included.
+  - id: C4
+    status: follows-C3
+    note: Lifecycle version column lands with the archived state in O1.
+  - id: C5
+    status: provisional
+    note: >
+      Implemented at the provisional path from the integration document, which
+      states that adjusting the URI does not change the section's semantics.
+      Role encoding (0/1/2) and the batch bound (50) are already agreed by both
+      documents; error codes and SLA remain for contract review.
+
+review_fixes:
+  - id: P1
+    finding: >
+      member_epoch 0 is a real value for a fresh, active project, so the
+      endpoints' documented "epoch 0 is fail-closed" property did not hold.
+      Confirmed empirically against MySQL, not inferred: a newly created project
+      reads member_epoch=0, status=1, active_members=1.
+    decision: >
+      Fixed at the source rather than on the wire — creation BUMPS the epoch
+      through the shared bumpMemberEpochTx, and a migration increments existing
+      zero rows. That is the only option requiring no change from the consumer:
+      the frozen numeric contract stays exactly as written. A null or negative
+      sentinel would change the contract, and null unmarshals to 0 in Go, which
+      is the same collision on the other side.
+      NOTE the mechanism: the first attempt SEEDED member_epoch in the insert
+      column list and was rejected by TestIsOfficialHasNoWriter, which pins that
+      the column may only ever be written as `member_epoch + 1`. Satisfying the
+      guard produced the better fix — creation writes the owner seat, which IS a
+      membership write. Recorded because this file described the rejected shape
+      for a round.
+    touches: >
+      modules/project (create path, reconcile scan, one migration). This gives
+      up the property that the PR touched no modules/project files, which is a
+      scheduling cost against PR #850 rather than a correctness one.
+  - id: P1b
+    finding: >
+      The epoch>=1 invariant that P1's fix rests on was enforced at ONE INSTANT:
+      the create-path bump covers only new binaries, and the backfill runs once
+      per deployment and is recorded in the migration ledger. A rolling deploy
+      keeps old pods inserting at the column default after the backfill has run,
+      and the migration Down section told operators "rolling back the binary is
+      enough" — true for readers, false for writers, since rollback restores the
+      zero-inserting create path indefinitely while the ledger prevents a
+      re-run. Nothing detected either: scanEpochSanity did not select status.
+    decision: >
+      Enforced continuously instead. The scheduled scan now reports
+      `status = 1 AND member_epoch = 0` as an anomaly and repairs it with the
+      same increment-only statement, whose own WHERE clause is its
+      compare-and-swap so no cross-pod lease is needed. The three artifacts that
+      claimed 0 was unreachable (endpoint doc, migration comment, journal) now
+      state which of the three writers enforces what.
+    touches: modules/project (reconcile.go, db.go), docs/project-member-epoch-rollout.md
+  - id: P1e
+    finding: >
+      P1b's continuous enforcement bounded the window but did not close the
+      stale-grant direction inside it, and the comment shipped with it claimed it
+      had. Reproduced against the engine: an old pod creates P at epoch 0 with
+      status 1; the peer verifies and caches a positive grant keyed on 0; P is
+      disbanded before the scan reaches it (disband bumps the epoch and THEN
+      flips status, so the row leaves the epochs predicate); the peer re-reads
+      and is answered 0; 0 == 0, the staleness check agrees, the grant never
+      expires. The repair scan cannot undo it afterwards — its predicate needs
+      status = 1 and the row is disbanded forever.
+    decision: >
+      The read layer now REFUSES to serve an active project found on the
+      sentinel, rather than relying on scan latency. pkg/project returns
+      ErrLiveProjectOnAbsentSentinel and both endpoints answer 500 — byte
+      identical to a database outage on the wire, distinguishable in the log,
+      which names the project id. The window costs availability instead of a
+      permanent grant, and the rollback runbook no longer DEPENDS on the
+      reconcile loop being enabled: with the loop off the endpoint refuses
+      instead of quietly serving the collision.
+    touches: pkg/project/membership.go, modules/internal_membership/api.go
+  - id: P2e
+    finding: >
+      The trailing-content fix (P1d) addressed the SECOND read but left the
+      FIRST one unbounded: a body that never completes parks the first Decode
+      just as long, and the comment read as a general solution.
+    decision: >
+      A read deadline is set on the connection before the decode
+      (boundBodyReadTime, readBodyTimeout = 15s), best-effort because
+      SetReadDeadline is unsupported on a ResponseRecorder. Verified over a real
+      socket: an unfinished Content-Length answers 400 after the deadline instead
+      of parking forever. The comment now scopes both reads and states what the
+      buffered check cannot see (a tail in a later TCP segment).
+    touches: modules/internal_membership/api.go, config.go
+  - id: P1f
+    finding: >
+      Convergent blocker from two reviewers, and a regression this increment
+      introduced: adding the Space conjunction to ProjectMemberships alone made
+      the two predicates disagree about whether Space status is part of the
+      answer, and the disagreement landed on the epoch — the peer's only
+      invalidation channel. A Space ban flips space.status and touches no project
+      row and no epoch, so after a ban _verify answers member:false while epochs
+      still answers E: the peer's check agrees with its own cached grant and the
+      grant survives the ban. Unban is the mirror: a denial cached during the ban
+      survives the unban for every member of every project in that Space. Space
+      DISBAND is permanent, because nothing disbands the projects of a disbanded
+      Space and their rows stay status = 1 forever.
+    decision: >
+      ProjectEpochsInSpace folds an inactive parent Space into the absent answer,
+      through the new space.IsActiveSpace, and reads it LAST for the same
+      fail-closed reason the seat/Space order already used. Because
+      ProjectMemberships routes through it for step 1, one change closes both
+      endpoints and both directions. A single-row lookup rather than a JOIN,
+      deliberately - octo_project pins utf8mb4_general_ci while `space` is a 2019
+      table measured at utf8mb4_0900_ai_ci in production, so an implicit
+      cross-schema comparison is error 1267 THERE while green in CI, which on a
+      fail-closed endpoint denies the peer everything.
+    touches: pkg/space/membership.go, pkg/project/membership.go
+  - id: P2f
+    finding: >
+      boundBodyReadTime was called from inside decodeVerifyRequest, so the
+      deadline was only installed for requests that REACHED the handler. Requests
+      aborting at the limiter or at auth got none, and the GET route got none at
+      all - yet net/http still drains a declared body under 256 KiB after the
+      handler returns, with a plain blocking read. So an UNAUTHENTICATED caller
+      could POST a Content-Length it never fills, take its 401, and pin a
+      goroutine and a connection indefinitely.
+    decision: >
+      Mounted as the FIRST handler on both routes, ahead of the limiter, pinned
+      by the route-order guard and by a real-socket test that presents a rejected
+      token. An oversized declared Content-Length is also refused before decoding,
+      since MaxBytesReader bounds bytes read, not bytes declared.
+    touches: modules/internal_membership/api.go
+  - id: P2g
+    finding: >
+      TestFixedInternalTokenEnvsCoversEveryKnownCapability built its expectation
+      as a hand copy of the registry, so it pinned that the list equals itself
+      and a capability never registered passed silently. Three were missing.
+    decision: >
+      Replaced by a tree sweep: every credential-shaped env literal in non-test
+      source must be in the registry or in an annotated exclusion with a reason.
+      TS_WEBHOOK_SECRET_KEY, OCTO_MAIL_GATEWAY_SECRET and TS_GRPC_AUTH_TOKEN are
+      now registered and refused by both module-local lists.
+    touches: main.go, main_internaltoken_test.go, modules/internal_membership/config.go, modules/project/config_provisioning.go
+  - id: P1g
+    finding: >
+      Convergent blocker from two reviewers. The Space conjunction fixed FRESH
+      answers, but Space MEMBER removal still did not move member_epoch, and this
+      PR ships a peer-facing document presenting epoch re-reading as how the
+      consumer decides its cache is good. The seat closes, and only then bumps,
+      when the async cleanup job reaches it - that job can sit in backoff for
+      minutes and has a terminal abandoned state after which nothing re-claims
+      it. So a revoked grant survived for minutes normally and forever once the
+      job gave up, while the peer's own staleness check kept agreeing. Two
+      aggravators both reviewers named: the rollout doc contained the word
+      "Space" zero times, and the only detector (scanAbandonedCleanupLeak) sits
+      behind OCTO_PROJECT_RECONCILE_ENABLED, which defaults to false.
+    decision: >
+      Bump the epoch in the Space-removal TRANSACTION, not in the cascade.
+      modules/space gained RegisterMemberRemovalTxStep - a synchronous sibling of
+      the existing async cleanup registry, whose failure ROLLS THE REMOVAL BACK,
+      because committing a removal whose invalidation signal did not fire is the
+      exact state it exists to prevent. modules/project registers one statement:
+      a single aliased UPDATE joining octo_project to octo_project_member, so a
+      member of N projects costs one statement rather than N in a user-facing
+      transaction. Both tables are octo_project*, same pinned collation, so no
+      cross-schema hazard. The rollout doc gained a Space section naming every
+      axis and the gated detector.
+      Chosen over the alternative (a hard TTL in the peer contract) because that
+      would make our correctness depend on a peer commitment we do not have.
+    touches: modules/space (member_removal.go, db_manager.go), modules/project (db.go, space_member_removal.go), docs
+  - id: P2h
+    finding: >
+      Three P2s, all defects in artifacts this increment added. (a) Answers were
+      keyed by the spelling the DATABASE returned; the tables are
+      utf8mb4_general_ci, so a case-variant id matched in SQL but missed the Go
+      map and was served as the "does not exist" / member:false sentinel - a real
+      member of a live project denied. (b) The credential sweep's regex could not
+      express two real envs (OCTO_SEARCH_OS_PASSWORD, SPEECH_API_KEY), so a guard
+      reported green for shapes it structurally could not see. (c) An assertion in
+      the incomplete-body test built a FRESH stub instead of the wired one and
+      therefore could not fail.
+    decision: >
+      (a) Answers are keyed by the caller's string and matched on a folded form -
+      folding rather than rejecting, because the peer round-trips ids through its
+      own store and no spelling here is canonical. The stub now models the
+      case-insensitive database, so an exact-match stub can no longer agree with a
+      wrong handler. (b) Prefix restriction dropped and PASSWORD/PASSPHRASE/
+      CREDENTIAL/SALT added; the widening immediately surfaced a third env, now
+      annotated. (c) Stub hoisted into a variable; verified it can now fail.
+    touches: modules/internal_membership, main_internaltoken_test.go
+  - id: P1c
+    finding: >
+      ProjectMemberships answered from the project seat alone. The Space to
+      project cascade is asynchronous and its cleanup gives up after a retry cap
+      with the row kept but never re-claimed, so a user removed from a Space
+      kept a seat that read as an active membership for an unbounded window —
+      and the epoch does not move while the seat is untouched, so the consumer
+      staleness check agreed with the stale positive.
+    decision: >
+      The Space half is conjoined server-side, through space.ActiveMembers so it
+      cannot drift from CheckMembership, and read AFTER the seats because that
+      read can only narrow the answer. Server-side rather than by consumer
+      obligation: this consumer asks about a THIRD party whose token it does not
+      hold, and no endpoint here answers "is uid X in Space S" for someone else,
+      so the documented "layer your Space check on top" is advice it cannot act
+      on. MembershipsInSpace is unchanged — it answers for the caller own token
+      holder behind SpaceMiddleware.
+    open: >
+      CLOSED in round 6 — see P1g. This entry is kept because two review rounds
+      reasoned against it.
+    touches: pkg/project/membership.go
+  - id: P1d
+    finding: >
+      decodeVerifyRequest rejected trailing content with a second
+      decoder.Decode, which cannot return without reading another byte off the
+      socket. A peer or proxy that stalls after a complete object parked the
+      handler indefinitely — MaxBytesReader bounds bytes, not time, and the
+      route is served by a zero-value http.Server.
+    decision: >
+      Switched to the shape this repository already adjudicated in PR #837 and
+      settled on in modules/bot_task: inspect decoder.Buffered, which cannot
+      wait on the socket. Strictness against trailing content is unchanged.
+    touches: modules/internal_membership/api.go
+
+deviations:
+  - what: 401 for an unset token, not 503.
+    why: >
+      The integration document specifies 503 for "not configured" and 401 for
+      "bad token". Implemented as 401 for both, matching
+      modules/internal_resolve and modules/bot_mention. Splitting them lets an
+      unauthenticated caller probe deployment state; operators get the
+      distinction from a startup log line naming the misconfigured env, which is
+      where it is actionable. Pinned by TestUnauthorizedIsIndistinguishable.
+  - what: No new error codes, against the brief's load-bearing item that predicted some.
+    why: >
+      The shared err.shared.* codes cover every shape, and reusing them is the
+      stronger choice for the same anti-enumeration reason. Nothing was skipped:
+      make i18n-extract-check and make i18n-lint pass with no new registrations.
+  - what: >
+      The startup collision check across fixed internal-token envs reports rather
+      than refuses to boot.
+    why: >
+      It was written as a boot failure first, and that broke
+      TestCardActionDispatchScopesBotMentionTokenCollisionFailures, which pins a
+      deliberate contract: a fixed-vs-fixed token collision disables the affected
+      capability module-locally and the server still boots, while a collision
+      with a dynamic route credential fails startup. Escalating the first case
+      would refuse to start deployments that run with the collision today — a
+      rollout decision, not something to change while adding a capability. The
+      check now logs the colliding env NAMES at error level, which adds the
+      missing visibility without changing behaviour.
+  - what: >
+      The verify endpoint REJECTS duplicate uids rather than deduplicating them,
+      and rejects identifiers carrying surrounding whitespace.
+    why: >
+      Its answers are an ARRAY, so a repeated uid would produce a repeated or
+      missing answer a consumer could mis-pair; the epochs endpoint answers a
+      MAP and therefore dedupes instead. Padded ids are rejected for the same
+      reason: trimming would answer under a different key than the caller asked
+      about, and the response echoes project_id and every uid back. Both are
+      STRICTER than the integration document, which says "dedupe" — recorded
+      because Fleet implements against that word, and the contract has to be
+      aligned before it does. Fail-closed either way.
+  - what: >
+      The module-local token-collision refusal lists cover main.go registry in
+      full, while the older modules (notify, bot_mention, internal_resolve)
+      remain asymmetric.
+    why: >
+      Widening those is a change to those modules, not to this capability. The
+      two lists this PR owns or pairs with are complete and pinned by
+      TestModuleLocalRefusalsCoverTheCentralRegistry; the asymmetry elsewhere is
+      the documented pre-existing norm.
+  - what: >
+      The strict IP bucket is consumed BEFORE the token check, so it is spent by
+      whoever shares the peer observed source IP rather than by the credential
+      holder.
+    why: >
+      Pre-auth is deliberate — otherwise token probing aborts before consuming
+      the strict bucket and falls back to the far wider global one. The cost is
+      that a co-located unauthenticated actor can drain the burst and cause the
+      deny-end-users outcome the loose sizing exists to avoid. The fix is a
+      second, credential-scoped quota AFTER auth, which needs a per-consumer
+      identity the current one-shared-token contract does not have. Recorded in
+      config.go beside the sizing rationale.
+  - what: >
+      main.go grew a fixed-internal-token collision REGISTRY, beyond the
+      acceptance item's "add the new env to the existing exclusion call".
+    why: >
+      The module-local checks are asymmetric by history (notify checks one
+      sibling, bot_mention two, internal_resolve three), so pairs existed that no
+      module compared. Adding a capability multiplies those pairs. The registry
+      is the one place that sees all of them; it reports rather than refuses, per
+      the pinned boot contract recorded above. Scope the brief does not describe,
+      recorded here so it is not re-discovered as unexplained.
+  - what: >
+      The strict IP bucket is keyed on a caller-supplied header chain
+      (X-Real-Ip, then rightmost X-Forwarded-For, then RemoteAddr), and nothing
+      in this repository calls SetTrustedProxies.
+    why: >
+      A pre-existing property of octo-lib's limiter shared by every
+      strict-limited route here, not something these endpoints introduce, so it
+      is recorded rather than fixed by forking the shared middleware for one
+      module. What is specific to these routes is the failure mode: draining the
+      bucket denies the PEER'S AUTHORIZATION PATH rather than slowing a
+      background poll. The config.go comment previously claimed the residual was
+      bounded by "the peer's egress is not shared with untrusted traffic", which
+      is not true of a key the caller supplies; it now says so. Whether an edge
+      proxy normalizes those headers on /v1/internal is on the human-verify list.
+  - what: >
+      role is reported without a paired capabilities field.
+    why: >
+      Role encoding (0/1/2) is agreed by both integration documents; a
+      capability list is not, and inventing one here would freeze a vocabulary
+      the peer has not agreed to. Open for contract review with C5.
+
+  - id: P1-round8-account-axis
+    finding: >
+      A globally banned or destroyed account was served to the peer as an active
+      project member, with its real role. pkg/space.ActiveMembers is byte-for-byte
+      CheckMembership's predicate and has no join on `user`; liftBanUser writes only
+      the user row (session revocation, device kick, IM channel ban) and
+      modules/user/api_destroy.go references none of space_member,
+      octo_project_member or member_epoch. Reproduced on the engine before fixing.
+      The ban's own session revocation cannot reach this endpoint because its
+      subject presents nothing — the same argument that put the Space half here.
+    decision: >
+      Conjoined in BOTH directions. Read path: pkg/user.ActiveAccounts (new package,
+      dbr only, mirroring pkg/space) as the LAST narrowing read in
+      ProjectMemberships. Write path: `user` joined into lockSpaceSeatsTx, plus a
+      separate single-table read in createProject. Both halves are needed — without
+      the admission gate the read gate holds only until someone re-adds the banned
+      uid, and that add bumps the epoch, so the wrong answer is served as a FRESH
+      one. Predicate is the canonical `status = 1 AND is_destroy <> 2`: teardown can
+      leave status = 1, and a cooling-off account (is_destroy = 1) can still send
+      and receive so it stays live.
+      TWO TRAPS on the same line of code, both measured, and one review
+      recommendation NOT followed as a result. (a) Collation: `user` is
+      dump-imported 0900_ai_ci while octo_project_member is migration-created
+      general_ci, so a join FROM an octo_* table is error 1267 in production and
+      green in CI — hence a separate query on the read path. A join rooted at
+      space_member is safe because all three tables drifted together, which is where
+      the write-path join went. (b) Read view: the reviews said the seat-lock join is
+      safe; that is true of lockSpaceSeatsTx but NOT of lockSpaceSeatRowTx, which is
+      JOIN-free on purpose — a table outside FOR SHARE OF is a consistency read, it
+      assigns the read view before the `space` lock, and all three creation quotas
+      are counted after it (six concurrent creates passed MaxPerSpace=1 when that
+      regressed). Re-measured: JOIN form then COUNT sees 0, current shape sees 1.
+      createProject therefore uses a separate single-table read, and
+      TestCreateQuotaStillHoldsUnderConcurrency pins the quota.
+    open: >
+      The CACHED-GRANT half is deferred and recorded as a named deviation in
+      docs/project-member-epoch-rollout.md section 5 and in the writer-guard
+      baseline. A ban does not move member_epoch, so a grant cached before the ban
+      keeps agreeing with every subsequent epochs read. Moving it would mean
+      modules/user bumping project epochs, i.e. a cross-module dependency outside
+      this slice. Mitigation the peer must apply: an independent TTL on cached
+      decisions. Bounded in practice on token-bearing paths, since the ban revokes
+      sessions and devices.
+
+  - id: P1-round8-rejoin-direction
+    finding: >
+      Reopening a Space seat moved no epoch, so a cached DENIAL rode epoch agreement
+      indefinitely — the mirror image of the removal bump shipped in round 7, and
+      reachable through the ordinary re-invite flow. Remove (epoch moves, peer caches
+      member:false at the new value) -> re-add before the async cascade arrives ->
+      the cascade deliberately PRESERVES the surviving project seats -> _verify
+      answers member:true while epochs still answers the value the denial was cached
+      under. Unbounded in a quiet project.
+    decision: >
+      A MemberReactivationTxStep registry mirroring the removal one, wired into both
+      reactivation paths (reactivateMember, atomicReactivateMemberIfNotFull) and
+      reusing the SAME enumerate-then-update statement so the lock order and the
+      non-locking-enumeration argument live in one place rather than two that can
+      drift. Fires only when a row actually changed, so a no-op re-add does not churn
+      the epoch. reactivateMember previously ran outside any transaction and now owns
+      one, under the shared bounded lock-conflict retry.
+      Since the Space conjunction landed, space_member.status is part of the answer in
+      BOTH directions, so the writer guard's "does not close a seat" exemption
+      criterion contradicted the invariant its own file states; it now reads "does not
+      change the answer in either direction".
+
+  - id: P2-round8-disclosure-and-docs
+    finding: >
+      Deferring the bot-deletion fix was defensible; recording it only in an internal
+      test file was not. Rollout doc section 5 presents itself as the exhaustive
+      enumeration of axes that move the epoch and contained the word "bot" zero times,
+      while the ops note asserted seat leakage no longer affects authorization
+      correctness. Separately, section 4 told operators concurrent pod startup was
+      safe, four lines after stating the backfill locks the whole table.
+    decision: >
+      Both unfixed axes (bot deletion, the account axis's cached-grant half) are now
+      in section 5, marked as NOT moving the epoch, each saying what the peer must do
+      (an independent TTL — epoch agreement is not sufficient on either axis). The ops
+      note is scoped to human-member removals. Section 4 is corrected: pod B's
+      identical backfill is a current read that blocks on pod A's whole-table locks and
+      becomes ERROR 1205 at innodb_lock_wait_timeout, which pkg/db/mysql.go turns into
+      a boot panic and a crash loop — the instruction is now to serialize the first
+      rollout.
+      Also closed: the sentinel refusal's recovery bound (SentinelAnomalyError carries
+      the project id, Unwrap keeps errors.Is working, and the handler repairs that one
+      row out of band off the request path so the 500 stays timing-identical to an
+      outage), and the exported removal test seams (now refuse outside a test binary
+      via testing.Testing() — a build tag would hide the file from vet and from any
+      build that forgets the tag).
+
+  - id: process-round8-mutation-verification
+    finding: >
+      Two new tests would have shipped as false coverage, and one existing guard
+      failed a correct change.
+    decision: >
+      Recorded because both are recurring shapes. (a) The collation drift test
+      exercised the two halves (ActiveAccounts, lockSpaceSeatsTx) but not the composed
+      ProjectMemberships, so a join reintroduced INSIDE it was caught by the source
+      guard and invisible to the drift test; an end-to-end entry was added and the
+      mutation now reddens both with the real 1267. (b) The drift test carries a
+      CONTROL assertion that the must-fail join really does fail on the probe database
+      — mutation-verified by un-drifting the fixture, which is exactly the state that
+      would otherwise let the whole test pass vacuously. (c) The existing log guard
+      pinned a literal m.Error count; a correctly-added third branch failed it. A guard
+      that must be edited to accept a correct change teaches people to edit guards, so
+      it now derives the count from the branch structure.
+      The new non-locking enumeration legitimately violated the existing
+      "tx-scoped reads of octo_project_member must be locking reads" guard, whose
+      REASON does not hold in another module's transaction. The rule was not widened:
+      the exception is a named-function registry with two enforced obligations (an
+      exempt reader must not write the same table, and the name must still match
+      something, so a stale exemption cannot be inherited by a same-named successor).
+      All three directions mutation-verified.
+
+security_notes:
+  - Tests and fixtures use synthetic UIDs, Space IDs and Project IDs only.
+  - Token values never reach logs, errors or metric labels; every message names
+    the ENV. Pinned by TestTokenErrorsNeverContainTheValue and the collision
+    tests.
+  - >
+    A non-member answer omits `role` on the wire rather than sending 0, because
+    0 is a real role. Asserted at the byte level, not through the decoded struct.
+  - >
+    Store failures are 500, never an empty 200 — an empty answer set would read
+    as "nobody is a member" to a consumer whose contract is to fail closed.
+
+increment:
+  implemented: [O2, O3]
+  deferred:
+    - id: O1
+      reason: >
+        schema — unblocked by the C1/C3 decisions. Drafted on a separate branch
+        and NOT in this increment; the one schema-adjacent artifact that did
+        land here is the member_epoch backfill migration, which is a data fix
+        for the P1 blocker rather than part of O1.
+    - id: O4-O7
+      reason: outbound event chain — depends on O1.

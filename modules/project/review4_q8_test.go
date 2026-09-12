@@ -93,7 +93,8 @@ func TestBumpMemberEpochSkipsDisbandedProjects(t *testing.T) {
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	require.NoError(t, err)
-	require.NoError(t, p.db.bumpMemberEpochTx(tx, created.ProjectID, now))
+	_, bumpErr := p.db.bumpMemberEpochTx(tx, created.ProjectID, now)
+	require.NoError(t, bumpErr)
 	require.NoError(t, tx.Commit())
 
 	assert.Equal(t, disbandedEpoch, epochOf(t, created.ProjectID),

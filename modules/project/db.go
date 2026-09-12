@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -268,20 +269,219 @@ func (d *DB) disbandProjectTx(tx *dbr.Tx, projectID string, now time.Time) (int6
 // row. An unconditional bump would inflate the epoch on the Space-cascade step's
 // no-op reruns — the step is re-executed on every job retry — and break the
 // "a no-op write does not change the epoch" rule that clients cache against.
-func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) error {
+//
+// Returns the number of rows the statement matched, because the status guard
+// means "no error" and "it happened" are different facts. Most callers can
+// ignore it — a no-op on a disbanded project is the intended behaviour there.
+// createProjectOnce cannot: a silent zero-row bump would leave a fresh project on
+// the reserved absent sentinel while the create response reports 1, which is the
+// exact state migration 20260908000002 exists to remove.
+func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) (int64, error) {
 	_ = now // the statement is clock-free now; the parameter stays for call-site stability
 	// updated_at is deliberately NOT written here: it is the field a client diffs to decide
 	// whether the project's PROFILE changed, and member_epoch already carries the roster
 	// signal — writing both made every roster edit churn the profile clock (yujiawei Q8,
 	// PR #841 round 1). The status predicate makes the method safe on its own terms instead
 	// of by caller convention: a disbanded project's epoch must not move.
-	_, err := tx.UpdateBySql(
+	result, err := tx.UpdateBySql(
 		"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
 			"WHERE project_id = ? AND status = ?",
 		projectID, StatusNormal,
 	).Exec()
 	if err != nil {
-		return fmt.Errorf("project: bump member epoch: %w", err)
+		return 0, fmt.Errorf("project: bump member epoch: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: bump member epoch rows: %w", err)
+	}
+	return affected, nil
+}
+
+// absentEpochSentinel is the value the membership integration contract reserves
+// for "project does not exist or is not visible".
+//
+// It is spelled out here rather than written as a bare 0 because the whole point
+// of migration 20260908000002 is that this value must never be reachable by a
+// real, active project. Naming it makes the two places that care — the repair
+// predicate below and the reconcile scan that drives it — obviously the same
+// value as the contract's.
+const absentEpochSentinel = 0
+
+// repairAbsentSentinelEpoch lifts ONE active project off the absent-sentinel
+// value, and reports whether it actually had to.
+//
+// Why this exists even though migration 20260908000002 already backfilled every
+// row: the migration enforces the invariant at ONE INSTANT — the boot that runs
+// it. Two windows re-open it afterwards, and neither is hypothetical:
+//
+//   - Rolling deploy. The first upgraded pod applies the backfill while pods on
+//     the old image keep inserting projects at the column default. Those rows
+//     hold the sentinel until some unrelated roster write moves them.
+//   - Rollback. The migration's Down is a no-op and its ledger row stays, so
+//     rolling the binary back restores the zero-inserting create path
+//     indefinitely and rolling forward again never re-runs the backfill.
+//
+// A one-instant invariant is not one the endpoint's fail-closed reasoning can
+// rest on, so the scheduled scan turns it into a continuously enforced one. The
+// statement is `member_epoch + 1`, the same increment-only shape as every other
+// write to this column, so monotonicity survives the repair — this raises an
+// epoch, it never assigns one.
+//
+// The predicate is repeated in full rather than trusting the row the scan read:
+// the scan reads outside a transaction, so between the read and this statement
+// the project may have been disbanded or had its epoch moved by a real roster
+// write. Both cases match no row, and the caller learns that from the returned
+// count rather than logging a repair that did not happen.
+func (d *DB) repairAbsentSentinelEpoch(projectID string) (int64, error) {
+	result, err := d.session.UpdateBySql(
+		"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
+			"WHERE project_id = ? AND status = ? AND member_epoch = ?",
+		projectID, StatusNormal, absentEpochSentinel,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: repair absent-sentinel epoch: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: repair absent-sentinel epoch rows: %w", err)
+	}
+	return affected, nil
+}
+
+// spaceMemberEpochBumpChunk bounds ONE bump statement's IN list.
+//
+// The enumerated set is bounded by the per-Space project quota (1000 today), so a
+// single statement would work — but the quota is a config value and this runs in a
+// user-facing transaction, so the statement width is pinned here rather than left
+// to whatever the quota becomes. Chunks accumulate locks in the same transaction,
+// which is what the correctness argument below requires.
+const spaceMemberEpochBumpChunk = 500
+
+// bumpMemberEpochForSpaceMemberTx raises member_epoch on every ACTIVE project in
+// spaceID where uid still holds an active seat, in the caller's transaction.
+//
+// This runs inside the SPACE-REMOVAL transaction, and it is the only thing that
+// makes the epoch a complete invalidation channel for that path.
+//
+// Why it cannot be left to the cascade. Closing the seats is asynchronous: the
+// cleanup job may sit in backoff for minutes, and once it exhausts
+// removalCleanupMaxAttempts it is terminal and never re-claimed. Until it runs,
+// `_verify` already answers member:false (its Space conjunction sees the removal)
+// while `epochs` still answers the old value — so a peer holding a grant cached
+// under that epoch re-reads it, gets the same number, and its staleness check
+// AGREES. The revocation survives for minutes normally and forever when the job
+// is abandoned. Bumping here closes that: the epoch moves at the same instant the
+// answer does.
+//
+// # TWO statements, and the split is the whole point
+//
+// The first version of this was ONE statement:
+//
+//	UPDATE octo_project p INNER JOIN octo_project_member pm ON ... SET p.member_epoch = ...
+//
+// which is a lock-order bug that no amount of reading the SQL reveals, because the
+// order is not in the SQL — the OPTIMIZER picks the driving table, and it flips
+// with cardinality. Measured on MySQL 8.0.33 against this schema:
+//
+//	3 active projects / 3 seats     -> p driving (ref), pm eq_ref   => project -> member
+//	200 active projects / 3 seats   -> pm driving (index_merge)     => member -> project
+//
+// The second shape is the production one (a Space has many projects; one user sits
+// in a few), and it inverts the order this module documents at the top of
+// service.go. Both deadlock directions were then reproduced, including the one
+// where InnoDB picks the SPACE REMOVAL as its victim:
+//
+//	(1) HOLDS   octo_project_member PRIMARY  S  (p1,u1) (p2,u1)
+//	(1) WAITING octo_project uk_..._project_id X -> p2
+//	(2) HOLDS   octo_project uk_..._project_id X -> p2
+//	(2) WAITING octo_project_member (p2,u1) X
+//	ERROR 1213
+//
+// A 1213 here rolls the member removal back (that is this step's contract), so
+// under contention the REVOCATION FAILS — the exact outcome the step exists to
+// prevent.
+//
+// So: enumerate first, then update. The UPDATE touches only octo_project, which
+// takes this step out of the p <-> pm cycle entirely rather than betting on a join
+// order. It is not an optimization and must not be folded back into one statement.
+//
+// # Why the enumeration may be a NON-LOCKING read
+//
+// Taking S locks on octo_project_member here would re-create the inversion, so the
+// enumeration is a plain consistency read. Under REPEATABLE READ that reads the
+// transaction's snapshot, and the snapshot can be older than the statement — which
+// would matter if a project seat could be created for this uid after the snapshot
+// and still be live after this transaction commits. It cannot, and the argument has
+// exactly two legs:
+//
+//  1. Every seat admission locks the target's space_member row FIRST — one
+//     statement, `FOR SHARE OF sm` (lockSpaceSeatsTx), before it touches
+//     octo_project or octo_project_member. The removal transaction holds that row
+//     under FOR UPDATE by the time this step runs. So an admission that has not
+//     committed is BLOCKED, and when it unblocks it finds status = 0 and is
+//     refused.
+//  2. An admission that HAS committed did so before the removal took that X lock,
+//     therefore before this transaction's read view was assigned (RR assigns it at
+//     the first CONSISTENCY read, and every statement before this one on the
+//     removal path is a locking read or a DML). So it is visible here.
+//
+// Verified, not assumed: with the two transactions interleaved so the admission
+// commits while the removal is blocked on space_member, this read returns the seat
+// the admission just inserted.
+//
+// Leg 1 is a property of the OTHER module's write paths, so it is pinned by a test
+// rather than by this comment — see TestSpaceMemberEpochBumpSeesConcurrentAdmission
+// and the source guard over octo_project_member writers.
+//
+// Increment-only, like every other writer of this column, so the write-discipline
+// guard holds. Idempotent in the sense that matters: a retried removal finds the
+// seats already closed by the cascade and enumerates nothing. A retry that lands
+// BEFORE the cascade bumps a second time, which costs the peer one extra
+// re-verify — the safe direction.
+func (d *DB) bumpMemberEpochForSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) error {
+	if spaceID == "" || uid == "" {
+		return nil
+	}
+
+	// Step 1 — enumerate. Non-locking on purpose; see the doc comment.
+	var ids []string
+	if _, err := tx.SelectBySql(
+		"SELECT project_id FROM `octo_project_member` "+
+			"WHERE space_id = ? AND uid = ? AND status = ? AND removing = 0 "+
+			"ORDER BY project_id",
+		spaceID, uid, MemberStatusActive,
+	).Load(&ids); err != nil {
+		return fmt.Errorf("project: enumerate seats for space member removal: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Step 2 — bump, touching octo_project ONLY. space_id and status are kept in
+	// the predicate even though project_id is unique: a seat row whose
+	// denormalized space_id has drifted must not be able to move another Space's
+	// epoch, and a disbanded project's epoch must not move (its answer is already
+	// the absent sentinel).
+	for start := 0; start < len(ids); start += spaceMemberEpochBumpChunk {
+		end := start + spaceMemberEpochBumpChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]interface{}, 0, len(chunk)+2)
+		args = append(args, spaceID, StatusNormal)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		if _, err := tx.UpdateBySql(
+			"UPDATE octo_project SET member_epoch = member_epoch + 1 "+
+				"WHERE space_id = ? AND status = ? AND project_id IN ("+placeholders+")",
+			args...,
+		).Exec(); err != nil {
+			return fmt.Errorf("project: bump member epoch for space member removal: %w", err)
+		}
 	}
 	return nil
 }
@@ -383,23 +583,58 @@ func (d *DB) countActiveMembersTx(tx *dbr.Tx, projectID string) (int, error) {
 // called; see createProjectOnce for why that direction and not the reverse.
 //
 // Returns false when the Space does not exist or is not active.
-func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
+// Returns the space_id the `space` row STORES, not the one the caller sent.
+//
+// It used to select `1` and discard it, which left every octo_* row this transaction
+// writes carrying the request's bytes. Those rows are later matched under
+// utf8mb4_general_ci by the epoch step, while `space` and `space_member` are
+// utf8mb4_0900_ai_ci in production — so a drifted space_id passes this lock, gets
+// denormalised into octo_project / octo_project_member, and is then unreachable from
+// the spelling a seat transition resolves out of space_member. Same defect as the uid
+// axis, one table up; see modules/space/seatref.go for the measurements.
+//
+// The row is under an exclusive lock either way, so reading the column costs nothing.
+func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (string, bool, error) {
 	if spaceID == "" {
-		return false, nil
+		return "", false, nil
 	}
-	var found []int
+	var found []string
 	_, err := tx.SelectBySql(
-		"SELECT 1 FROM `space` WHERE space_id = ? AND status = 1 FOR UPDATE", spaceID,
+		"SELECT space_id FROM `space` WHERE space_id = ? AND status = 1 FOR UPDATE", spaceID,
 	).Load(&found)
 	if err != nil {
-		return false, fmt.Errorf("project: lock space row: %w", err)
+		return "", false, fmt.Errorf("project: lock space row: %w", err)
 	}
-	return len(found) > 0, nil
+	if len(found) == 0 {
+		return "", false, nil
+	}
+	return found[0], true, nil
 }
 
 // lockSpaceSeatTargets orders prepared seat identities by their clustered
 // primary key. The preparation query is deliberately outside the write
 // transaction; this helper never treats it as authorization.
+//
+// # The lookup is FOLDED, and the target carries the DATABASE's spelling
+//
+// resolveSpaceSeatIDs keys refs by the uid `space_member` STORES, while the uids
+// here are the caller's. Those two need not agree byte for byte: the column is
+// case-insensitive under either production collation, so `ALICE` resolves the row
+// that holds `alice`. A byte-exact lookup therefore drops a real, seated member —
+// fail-CLOSED, but a legitimate caller refused, which is the same defect in the
+// opposite direction from the one this branch spent rounds on.
+//
+// Folding here also decides what the rest of the chain sees. The target's uid goes
+// into the locking statement's `sm.uid IN (...)`, into the id/uid revalidation, and
+// out through `held`, whose keys callers write into octo_project_member — a column
+// pinned utf8mb4_general_ci while space_member is looser in production. Carrying the
+// stored bytes from this one point means every one of those sees the spelling the
+// epoch step will later have to match, instead of whatever the request happened to
+// contain. See modules/space/seatref.go for the same rule on the removal side.
+//
+// FoldID is ASCII-only by design, so it is strictly FINER than either collation:
+// every pair it folds, the database folds too. A spelling that diverges beyond ASCII
+// case still misses here and is refused, which is the safe direction.
 func lockSpaceSeatTargets(uids []string, refs spaceSeatRefs) []struct {
 	uid string
 	id  int64
@@ -408,12 +643,23 @@ func lockSpaceSeatTargets(uids []string, refs spaceSeatRefs) []struct {
 		uid string
 		id  int64
 	}, 0, len(uids))
+	folded := make(map[string]struct {
+		uid string
+		id  int64
+	}, len(refs))
+	for storedUID, id := range refs {
+		folded[projectpkg.FoldID(storedUID)] = struct {
+			uid string
+			id  int64
+		}{uid: storedUID, id: id}
+	}
 	seen := make(map[int64]struct{}, len(uids))
-	for _, uid := range uids {
-		id, ok := refs[uid]
-		if !ok || id <= 0 {
+	for _, caller := range uids {
+		ref, ok := folded[projectpkg.FoldID(caller)]
+		if !ok || ref.id <= 0 {
 			continue
 		}
+		uid, id := ref.uid, ref.id
 		if _, ok := seen[id]; ok {
 			continue
 		}

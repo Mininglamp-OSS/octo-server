@@ -225,10 +225,18 @@ func jitter(base time.Duration) time.Duration {
 
 // runReconcile executes every scan.
 //
-// Read-only, so it is safe on every pod: duplicate detection only duplicates
-// alerts. Any MUTATING reconcile action added later must first take a database CAS
-// claim, in the shape of the welcome ledger's claim_owner/claim_expire_at lease —
-// otherwise two pods repair the same row concurrently.
+// Every scan but one is read-only, so it is safe on every pod: duplicate detection
+// only duplicates alerts. Any MUTATING reconcile action must not let two pods repair
+// the same row twice, and there are two ways to get that: a database CAS claim in the
+// shape of the welcome ledger's claim_owner/claim_expire_at lease, or a statement
+// whose own WHERE clause IS the compare-and-swap.
+//
+// scanEpochSanity's absent-sentinel repair takes the second route:
+// `UPDATE ... SET member_epoch = member_epoch + 1 WHERE project_id = ? AND status = ?
+// AND member_epoch = ?` matches only while the row still holds the sentinel, so the
+// second pod's copy of the statement affects 0 rows and reports nothing. A repair
+// WITHOUT a self-guarding predicate still needs the lease — a bare increment run on
+// every pod would inflate the epoch once per replica.
 func (p *Project) runReconcile() {
 	if !reconcileRunning.CompareAndSwap(false, true) {
 		return // a scan is already in flight; skip this tick rather than pile on
@@ -822,9 +830,14 @@ type epochRow struct {
 	ID          int64  `db:"id"`
 	ProjectID   string `db:"project_id"`
 	MemberEpoch int64  `db:"member_epoch"`
+	// Status is selected because the absent-sentinel check is only meaningful for
+	// an ACTIVE project: a disbanded one is supposed to read as "gone", and the
+	// epochs endpoint filters it out anyway.
+	Status int `db:"status"`
 }
 
-// scanEpochSanity flags negative epochs and same-replica regressions.
+// scanEpochSanity flags negative epochs, same-replica regressions, and active
+// projects sitting on the absent sentinel — repairing the last of these.
 func (p *Project) scanEpochSanity() {
 	start := time.Now()
 	defer func() { reconcileDuration.WithLabelValues("epoch").Observe(time.Since(start).Seconds()) }()
@@ -835,7 +848,7 @@ func (p *Project) scanEpochSanity() {
 	for page := 0; page < reconcileMaxPages; page++ {
 		var rows []*epochRow
 		_, err := p.db.session.SelectBySql(
-			"SELECT id, project_id, member_epoch FROM `octo_project` "+
+			"SELECT id, project_id, member_epoch, status FROM `octo_project` "+
 				"WHERE id > ? ORDER BY id LIMIT ?",
 			cursor, p.cfg.ReconcileLimit,
 		).Load(&rows)
@@ -850,6 +863,29 @@ func (p *Project) scanEpochSanity() {
 				epochAnomalies.Inc()
 				log.errorf("member_epoch 为负值", zap.String("projectId", row.ProjectID),
 					zap.Int64("epoch", row.MemberEpoch))
+				continue
+			}
+			if row.Status == StatusNormal && row.MemberEpoch == absentEpochSentinel {
+				// The invariant migration 20260908000002 establishes is re-breakable by a
+				// rolling deploy and by the rollback its own Down section prescribes, so it
+				// is enforced here continuously instead of only at that migration's boot.
+				// See repairAbsentSentinelEpoch for both windows.
+				//
+				// Repair before counting: an anomaly the scan silently fixed is still an
+				// anomaly worth alerting on (it means an epoch-0 writer is live), but a row
+				// that no longer matches by the time the statement runs was fixed by a real
+				// roster write and is not one.
+				repaired, err := p.db.repairAbsentSentinelEpoch(row.ProjectID)
+				if err != nil {
+					noteScanFailure("epoch")
+					p.Warn("对账 member_epoch 哨兵值修复失败", zap.Error(err),
+						zap.String("projectId", row.ProjectID))
+				} else if repaired > 0 {
+					epochAnomalies.Inc()
+					log.errorf("活跃项目的 member_epoch 落在契约保留的 0 上，已提升为 1；"+
+						"通常意味着有仍按旧逻辑写入的实例，或迁移被回滚",
+						zap.String("projectId", row.ProjectID))
+				}
 				continue
 			}
 			if regressed, previous := lastSeenEpoch.observe(row.ProjectID, row.MemberEpoch); regressed {

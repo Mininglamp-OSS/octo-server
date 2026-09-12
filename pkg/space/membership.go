@@ -57,12 +57,22 @@ func ResolveSpaceID(session *dbr.Session, spaceID string) (string, bool, error) 
 // failed. Absent from the map means "not an active member of that Space"; the
 // map is never nil on success.
 //
-// Like CheckMembership this takes a *dbr.Session, so it runs outside any caller
-// transaction and proves nothing about state at COMMIT time. That is the
-// long-standing shape of the Space half of every group admission check, and
-// changing it is a behaviour change on every group join in the product — see
-// modules/group/admission.go for why the project half does NOT copy it.
-func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[string]bool, error) {
+// The parameter is dbr.SessionRunner, satisfied by both *dbr.Session and *dbr.Tx,
+// and which one a caller passes changes what the answer MEANS:
+//
+//   - a *dbr.Session runs outside any caller transaction and proves nothing about
+//     state at COMMIT time. That is the long-standing shape of the Space half of
+//     every group admission check, and changing it is a behaviour change on every
+//     group join in the product — see modules/group/admission.go for why the
+//     project half does NOT copy it.
+//   - a *dbr.Tx joins the caller's snapshot. pkg/project.ProjectMemberships passes
+//     one deliberately: its four reads have to describe ONE instant, because an
+//     answer torn across a Space ban carries a denial beside a live epoch and the
+//     peer's cache has no bound on that combination.
+//
+// So do not "simplify" a *dbr.Tx caller back to the session. It is not a stylistic
+// choice there; it is the fix.
+func ActiveMembers(session dbr.SessionRunner, spaceID string, uids []string) (map[string]bool, error) {
 	active := make(map[string]bool, len(uids))
 	if spaceID == "" || len(uids) == 0 {
 		return active, nil
@@ -83,9 +93,42 @@ func ActiveMembers(session *dbr.Session, spaceID string, uids []string) (map[str
 	return active, nil
 }
 
+// IsActiveSpace reports whether the Space itself is active, with no reference to
+// any user.
+//
+// The `status = 1` here is byte-for-byte CheckMembership's Space half, and must
+// stay that way: a caller that answered "is this Space usable" differently from
+// the gate every authenticated route runs would be authorizing against a
+// different definition of the same word. A banned Space (status 2) and a
+// disbanded one (status 0) both answer false — see CheckMembershipForCleanup for
+// the ONE place where banned must count, and why it is a separate predicate
+// rather than a relaxation of this one.
+//
+// It exists for callers that hold no uid: a peer-facing predicate answering
+// about a project or a container, where the parent Space's state is part of the
+// answer but there is nobody whose membership to check.
+func IsActiveSpace(session dbr.SessionRunner, spaceID string) (bool, error) {
+	if spaceID == "" {
+		return false, nil
+	}
+	var count int
+	err := session.SelectBySql(
+		"SELECT COUNT(*) FROM space WHERE space_id = ? AND status = 1", spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // ActiveMembersTx is the transaction-scoped form of ActiveMembers. It keeps
 // the exact Space predicate while allowing a caller-owned transaction to use
 // one repeatable-read snapshot with its other authorization checks.
+//
+// Subsumed by ActiveMembers since that one took dbr.SessionRunner: a *dbr.Tx
+// satisfies it, so ActiveMembers(tx, ...) is this function. Kept because it is
+// main's exported name and this is a merge, not a rename — but do not reach for
+// it in new code, and do not let the two predicates drift apart.
 func ActiveMembersTx(tx *dbr.Tx, spaceID string, uids []string) (map[string]bool, error) {
 	active := make(map[string]bool, len(uids))
 	if tx == nil || spaceID == "" || len(uids) == 0 {

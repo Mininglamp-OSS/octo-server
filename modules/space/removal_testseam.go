@@ -1,0 +1,152 @@
+package space
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
+)
+
+// errNotATestBinary is returned rather than panicking: a caller that reaches these
+// in production gets an error it must handle, not a crashed process.
+var errNotATestBinary = errors.New(
+	"space: the *ForTest removal seams are only callable from a test binary")
+
+func refuseOutsideTests() error {
+	if !testing.Testing() {
+		return errNotATestBinary
+	}
+	return nil
+}
+
+// Test-only entry points into the two member-removal transactions.
+//
+// Why exported production code rather than an _test.go helper: the transactions
+// live in THIS package (unexported), and the test that has to exercise them lives
+// in modules/project — a `_test.go` file here is not visible from there, and
+// modules/project cannot import modules/space's test binary.
+//
+// The alternative was driving the HTTP handlers from modules/project, which needs
+// this module's auth fixtures, the Space middleware and a role-bearing operator
+// token. That machinery is what made the epoch bump untested in the first place:
+// modules/space's own tx-step tests register STUBS, and modules/project's tests
+// hand-rolled their own transaction — so the real statement had never run inside
+// the real removal transaction in any lane. A two-function seam is the cheaper
+// price.
+//
+// `ForTest` in the name and nothing in production calling them; the source guard
+// over space_member writers counts the statements in db_manager.go, so these
+// wrappers cannot become a way to add an unaccounted writer.
+//
+// # They REFUSE to run outside a test binary
+//
+// These functions enter the removal and reactivation transactions directly, past
+// every handler-level check the real routes apply — operator identity, super-admin,
+// role hierarchy. Nothing calls them in production today, but "nothing calls it" is
+// a property of the current tree, not a boundary: any package in this binary could,
+// and the writer guard cannot see a call that adds no statement.
+//
+// So the boundary is enforced at run time by testing.Testing(), which the stdlib
+// sets only in a binary built by `go test`. A build tag was the alternative and is
+// worse here: it silently excludes the file from `go vet ./...` and from any build
+// that forgets the tag, so a typo inside would go unnoticed until someone ran the
+// tests with it — whereas this compiles and is vetted everywhere, and simply cannot
+// fire in the shipped binary.
+
+// RemoveMemberForTest runs the single-member removal transaction — the kick and
+// self-leave path — including its registered synchronous tx steps.
+func RemoveMemberForTest(
+	ctx *config.Context, spaceID, uid string, rejectRoleAtOrAbove int, operatorUID, reason string,
+) (bool, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return false, err
+	}
+	return removeMemberLocked(ctx.DB(), spaceID, uid, rejectRoleAtOrAbove, operatorUID, reason)
+}
+
+// RemoveMembersForceForTest runs the admin batch removal transaction — one
+// transaction for the whole batch — including its registered synchronous tx steps.
+func RemoveMembersForceForTest(
+	ctx *config.Context, spaceID string, uids []string, operatorUID string,
+) ([]string, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return nil, err
+	}
+	return newManagerDB(ctx.DB()).removeMembersForce(spaceID, uids, operatorUID)
+}
+
+// ReactivateMemberForTest runs the single-member reactivation transaction — the
+// invite/add-back path — including its registered synchronous tx steps.
+func ReactivateMemberForTest(ctx *config.Context, spaceID, uid string, role int) error {
+	if err := refuseOutsideTests(); err != nil {
+		return err
+	}
+	return NewDB(ctx).reactivateMember(spaceID, uid, role)
+}
+
+// ReactivateMemberIfNotFullForTest runs the capacity-checked reactivation
+// transaction — the join path — including its registered synchronous tx steps.
+func ReactivateMemberIfNotFullForTest(ctx *config.Context, spaceID, uid string, maxUsers int) error {
+	if err := refuseOutsideTests(); err != nil {
+		return err
+	}
+	return NewDB(ctx).atomicReactivateMemberIfNotFull(spaceID, uid, maxUsers)
+}
+
+// ApproveJoinApplyForTest runs the join-apply approval transaction — including its
+// reactivation branch, which reopens an existing removed seat.
+func ApproveJoinApplyForTest(
+	ctx *config.Context, applyID int64, reviewerUID, spaceID string, maxUsers int,
+) (string, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return "", err
+	}
+	outcome, code, err := NewDB(ctx).approveJoinApplyAtomic(applyID, reviewerUID, spaceID, maxUsers)
+	if err != nil {
+		return code, err
+	}
+	if outcome != approveOK {
+		return code, fmt.Errorf("space: approval did not take: outcome=%d", outcome)
+	}
+	return code, nil
+}
+
+// UpsertJoinApplyForTest creates or resets a pending join apply and returns its id.
+func UpsertJoinApplyForTest(ctx *config.Context, spaceID, uid string) (int64, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return 0, err
+	}
+	return NewDB(ctx).upsertJoinApply(&spaceJoinApplyModel{SpaceId: spaceID, UID: uid})
+}
+
+// UpsertMembersForTest runs the admin bulk add/reactivate transaction — the
+// ON DUPLICATE KEY branch of which reopens an existing removed seat.
+func UpsertMembersForTest(ctx *config.Context, spaceID string, uids []string) error {
+	if err := refuseOutsideTests(); err != nil {
+		return err
+	}
+	return newManagerDB(ctx.DB()).upsertMembers(spaceID, uids)
+}
+
+// SeatRefForTest builds a SeatRef from bytes a test already knows, without a database
+// round trip.
+//
+// It lives HERE, behind the same testing.Testing() fence as the other seams, because
+// it is the one way to obtain a SeatRef without going through ResolveSeatTx — and
+// ResolveSeatTx reading the canonical spelling back out of `space_member` is the whole
+// point of the type. An unfenced constructor taking two strings is a conversion from
+// `string` in all but name, and this branch spent four rounds establishing that no such
+// conversion should exist.
+//
+// It was previously exported as NewSeatRefFromStored with a doc comment asking callers
+// to only pass database-sourced bytes. Nothing in production called it — only tests —
+// so the honest form is a test seam rather than a request. That is the same reasoning
+// this file already applies to the removal entry points: "nothing calls it" is a
+// property of the current tree, not a boundary.
+func SeatRefForTest(spaceID, storedUID string) (SeatRef, error) {
+	if err := refuseOutsideTests(); err != nil {
+		return SeatRef{}, err
+	}
+	return SeatRef{spaceID: spaceID, uid: storedUID}, nil
+}

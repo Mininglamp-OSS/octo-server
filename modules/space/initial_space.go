@@ -88,7 +88,19 @@ func (s *Space) autoJoinInitialSpace(uid, spaceID string) (InitialSpaceJoinOutco
 	//
 	// 放在事务之外是硬要求:这些副作用会起 goroutine、调外部服务,持在事务里既拉长
 	// 锁的持有时间,又会在回滚后留下已经外发的副作用。
-	s.afterJoinSpace(uid, spaceID, sp)
+	//
+	// 传 sp.SpaceId 而不是调用方的 spaceID，把规范化做完整。
+	//
+	// atomicJoinInitialSpace 里已经把席位行重绑到了 `space` 行存的那串字节，但这四个
+	// 副作用（joinPresetGroups / ensureDefaultCategoryProvisioned /
+	// fireSpaceMemberJoinEvent / SpaceMemberCacheInvalidator）此前仍拿的是调用方拼写。
+	// 改之前两边都用调用方拼写、至少是自洽的；只改一半反而让这个模块「看起来已经规范化」
+	// 而实际是混的 —— 缓存失效是按精确键做的，键不对就等于没失效。sp 就是权威行且已经
+	// 在手里，所以这是补完，不是新增判断。
+	//
+	// 可达性确实很低（spaceID 来自配置，且每个副作用单独看行为都与改前一致），所以它
+	// 不是一个 bug 修复；它是不让下一个人从这里读出一条错误的规范化边界。
+	s.afterJoinSpace(uid, sp.SpaceId, sp)
 	return InitialSpaceJoined, nil
 }
 

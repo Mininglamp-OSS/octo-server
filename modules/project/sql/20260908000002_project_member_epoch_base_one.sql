@@ -1,0 +1,135 @@
+-- +migrate Up
+
+-- member_epoch starts at 1, so 0 can mean "no such project".
+--
+-- THE COLLISION. The integration contract this column feeds defines 0 as
+-- "project does not exist or is not visible" -- the peer reads it and refuses to
+-- renew. But 0 was also the DDL default AND the value every freshly created
+-- project carried, because creation deliberately does not bump the epoch:
+-- creation is where the roster comes into existence rather than changes. So a
+-- solo project that nobody had added to or removed from -- the common case --
+-- was an active, visible project with a real member and an epoch the contract
+-- reserved for "gone".
+--
+-- Measured, not reasoned about: a project created through the real handler reads
+-- member_epoch=0, status=1, active_members=1.
+--
+-- WHY THAT IS A SECURITY BUG AND NOT A COSMETIC ONE. The peer caches an
+-- authorization answer keyed by the epoch and re-reads the epoch to decide
+-- whether that answer is still good. Cache a positive grant for a fresh project
+-- at epoch 0, then disband the project: the epoch query filters on status, the
+-- project drops out, the endpoint answers 0 for the absent key -- and 0 equals
+-- the cached 0, so the check AGREES and the grant survives. The epoch never
+-- moves again, so it survives forever. The reverse direction is an availability
+-- bug in the same collision: a brand new project truthfully reports 0, which a
+-- consumer following the contract reads as "does not exist" and denies.
+--
+-- WHY FIX IT HERE RATHER THAN ON THE WIRE. Three wire-side alternatives were
+-- considered and rejected, all for the same reason -- they renegotiate a frozen
+-- contract, and one of them reintroduces the bug on the other side:
+--
+--   * null for absent: the contract explicitly refuses to expand the response
+--     beyond a bare number, and null unmarshals into a Go int64 as 0, so the
+--     consumer -- also Go -- lands back on the identical collision.
+--   * a negative sentinel: still a contract change, and the sentinel still lives
+--     inside the value domain, so the next value chosen carelessly collides too.
+--   * omitting absent projects: a consumer cannot tell a missing key from an
+--     entry that was dropped in transit, which is why the endpoint answers every
+--     requested id in the first place.
+--
+-- Starting real epochs at 1 is the only option that needs no change from the
+-- consumer at all. The contract stays exactly as written; 0 stops being a value
+-- an active project rests on, which is what makes its documented meaning true.
+--
+-- THIS STATEMENT ALONE DOES NOT MAKE 0 UNREACHABLE, and the comment used to say
+-- it did. It enforces the invariant at ONE INSTANT -- the boot that applies it.
+-- A rolling deploy has old pods still inserting at the column default while the
+-- backfill has already run, and a rollback (see the Down section) restores that
+-- create path indefinitely while the ledger row keeps this migration from ever
+-- re-running. Continuous enforcement is the reconcile scan
+-- (modules/project.repairAbsentSentinelEpoch), which lifts an ACTIVE project off
+-- 0 on every rotation and counts it as an anomaly. This migration is the
+-- one-shot that clears the existing backlog cheaply; the scan is what the
+-- endpoint fail-closed reasoning actually rests on.
+--
+-- THE BACKFILL DIRECTION IS SAFE. It is written as an increment rather than an
+-- assignment, matching the write discipline the whole column is held to -- the
+-- only statement anywhere that touches member_epoch is member_epoch + 1, which
+-- is what makes monotonicity checkable by grep. Semantically it IS one more
+-- change to the roster from a consumer perspective: anyone holding a snapshot of
+-- 0 sees 1, mismatches, and re-verifies once. Invalidating a cached
+-- authorization is the safe direction; the unsafe direction is the one this
+-- migration removes.
+--
+-- Bounded: it touches only rows still at the initial value, so re-running it is
+-- NOT idempotent by accident -- it is idempotent because after the first run no
+-- row matches the predicate.
+UPDATE `octo_project` SET `member_epoch` = `member_epoch` + 1 WHERE `member_epoch` = 0;
+
+-- +migrate Down
+--
+-- Deliberately a no-op, and that is a choice rather than an omission.
+--
+-- Reversing it would mean setting some rows back to 0, and nothing records WHICH
+-- rows were at 0 before the Up ran -- a project that legitimately reached epoch 1
+-- through a real membership change is indistinguishable afterwards from one this
+-- migration lifted. Guessing would reintroduce the collision on exactly the rows
+-- it was meant to remove it from, and it would move an epoch BACKWARDS, which
+-- every consumer of this column is entitled to assume never happens.
+--
+-- WHY THE DDL DEFAULT STAYS 0, WHICH LOOKS LIKE AN OVERSIGHT AND IS NOT.
+--
+-- The obvious companion to this backfill is
+-- ALTER TABLE octo_project ALTER COLUMN member_epoch SET DEFAULT 1, so a
+-- statement that OMITS the column stops landing on the reserved value. It has
+-- been proposed in review and it does not work as a one-line change, measured
+-- rather than argued: with the default at 1 a freshly created project reads 2,
+-- and two cases go red (TestFreshProjectEpochIsNeverTheAbsentSentinel,
+-- TestCreateProjectSeatsTheCreatorsAgents).
+--
+-- The reason is that the create path already compensates for the 0 default. It
+-- inserts the row, then runs the SAME bumpMemberEpochTx every other membership
+-- write runs, with the affected-row count checked -- because this column may only
+-- ever be written as member_epoch + 1, a rule TestIsOfficialHasNoWriter and
+-- TestMemberEpochOnlyEverIncrements enforce between them. Seeding the value at
+-- INSERT instead is exactly the write shape those guards exist to forbid. So
+-- moving the default means either fresh projects start at 2, or the create path
+-- stops bumping and the write discipline gets a second, exempt shape.
+--
+-- What the default would have bought is the ROLLBACK direction: a pre-branch
+-- binary omits the column and starts its projects on the sentinel. That window is
+-- already bounded to one request by the read-layer refusal plus the request
+-- triggered out-of-band repair (see the Down section below), so the default is a
+-- tidiness improvement rather than a safety one. Left to a follow-up, with this
+-- note here so the next reviewer does not spend a round re-deriving it.
+--
+-- Rolling back the binary is safe for READERS: the old code reads the column
+-- without caring that some values are one higher than it would have written.
+--
+-- It is NOT safe for writers, and an operator acting on the sentence this
+-- comment used to carry would have been misled. The old create path inserts at
+-- the column default 0 again, this migration stays recorded as applied so
+-- rolling forward never re-runs it, and every project created in between sits on
+-- the value the integration contract reserves for "does not exist".
+--
+-- What makes the rollback direction survivable is the READ-LAYER refusal plus the
+-- out-of-band repair the refusal triggers: a request naming such a project is
+-- answered 500 and the handler lifts that one row off the sentinel on its way
+-- out, so the practical window is one request. The reconcile scan is a backstop
+-- and NOT the bound -- an earlier version of this comment said it repairs those
+-- rows "within one rotation" and that was wrong. scanEpochSanity walks a bounded
+-- page budget per tick behind a persisted cursor, a row written by an
+-- un-upgraded pod carries the highest id, and on a large octo_project reaching
+-- it takes hours. The refusal is per BATCH of ids, so during that window every
+-- request whose batch contains the id fails, not only requests naming it.
+--
+-- A rollback should still keep the reconcile loop running (it is what repairs
+-- rows nobody happens to query), and an operator should expect one epoch bump --
+-- hence one consumer re-verify -- per affected project. See
+-- docs/project-member-epoch-rollout.md.
+--
+-- No apostrophes in any comment in this file, on purpose -- the migration test in
+-- this module splits statements naively and treats a quote as a string
+-- delimiter, and the failure pairs up so an even count can pass while an odd one
+-- fails.
+SELECT 1;

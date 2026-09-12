@@ -226,15 +226,31 @@ func TestSpaceRemovalPreservesOwnerAndClosesAgentRiders(t *testing.T) {
 	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-operator",
 		spacemod.MemberRemoveReasonForceRemoved))
 	p.runRemovalCascade()
-	require.Equal(t, epochBefore+1, epochOf(t, created.ProjectID),
-		"closing the Owner's rider seats bumps the project epoch once")
+	epochAfter := epochOf(t, created.ProjectID)
+	require.Greater(t, epochAfter, epochBefore,
+		"closing the Owner's rider seats must move the project epoch")
 
-	// A second pass has neither an active rider nor a human seat to close. It
-	// must not move the epoch again.
+	// The delta is not pinned to exactly 1 any more, and that is a real change rather
+	// than a loosened assertion.
+	//
+	// A force-removal now moves the epoch TWICE, at two different times, because two
+	// different membership facts change: the Space seat closing is published
+	// synchronously inside the Space transaction (bumpEpochsOnSeatTransition — this is
+	// the invalidation signal the internal membership endpoints depend on, and an
+	// asynchronous-only signal with a terminal abandoned state is no bound at all), and
+	// the rider agent seat closing is published by the cascade when it actually closes.
+	// Counting those as one would mean a consumer that re-verified between them cached
+	// an answer under an epoch that then never moved again.
+	//
+	// What the test still pins strictly is the property this case exists for: IDEMPOTENCE.
+	// A second cascade pass has neither an active rider nor a human seat to close, so it
+	// must move nothing — a re-run bump would inflate the epoch on every worker retry and
+	// break "a no-op does not change the epoch", which is the rule clients cache against.
 	require.NoError(t, runCascade(t, p, spaceA, "cascade-owner", "cascade-operator",
 		spacemod.MemberRemoveReasonForceRemoved))
 	p.runRemovalCascade()
-	require.Equal(t, epochBefore+1, epochOf(t, created.ProjectID))
+	require.Equal(t, epochAfter, epochOf(t, created.ProjectID),
+		"a second cascade pass has nothing to close and must not move the epoch again")
 
 	owner := memberRow(t, created.ProjectID, "cascade-owner")
 	require.NotNil(t, owner)

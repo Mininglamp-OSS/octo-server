@@ -3,6 +3,7 @@ package project
 import (
 	"errors"
 	"fmt"
+	"github.com/gocraft/dbr/v2"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -57,7 +58,48 @@ var errCascadeIncomplete = errors.New("project: cascade page budget exhausted, s
 // modules/group uses. Registration is by name and latest-wins, which is what lets a
 func (p *Project) registerSpaceMemberRemovalCleanup() {
 	spacemod.RegisterMemberRemovalCleanupStep(spaceMemberRemovalStepName, p.cleanupSpaceMemberProjects)
+	// And the SYNCHRONOUS half. Closing the seats stays asynchronous; moving the
+	// invalidation signal does not, because the signal is what a peer uses to
+	// decide a cached authorization is stale, and an async signal with a terminal
+	// abandoned state is not a bound at all. See bumpMemberEpochForSpaceMemberTx.
+	//
+	// ONE registration for BOTH directions. It used to be two — a removal step and a
+	// reactivation step registered separately, with byte-identical implementations —
+	// and that symmetry was the shape of two P1s on this branch: round 8 had the
+	// removal side wired and the rejoin side not, round 9 had two of the four rejoin
+	// doors wired. Neither was a missed scenario; both were a hand-maintained pair
+	// with one half missing. With one registry there is no other half to miss.
+	spacemod.RegisterSeatTransitionTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSeatTransition)
 	spacemod.RegisterMemberRejoinCleanupStep(spaceMemberRejoinStepName, p.restoreSpaceMemberProjects)
+}
+
+// bumpEpochsOnSeatTransition moves member_epoch for every project the member still
+// holds a seat in, inside the Space transaction that flipped their seat.
+//
+// # Both directions, one statement, and deliberately so
+//
+// Closing a seat and reopening one change the SAME fact — whether this uid is a
+// member of those projects — and a consumer caches the DECISION, not only positive
+// grants. A stuck cached denial locks a valid returning member out exactly as long as
+// a stuck cached grant leaks access, and in a quiet project neither window has an
+// upper bound. So the set of affected projects is the same set, the statement is the
+// same statement, and `t.Opened` is not read: there is nothing this step should do
+// differently in one direction.
+//
+// It takes spacemod.SeatTransition rather than two strings because the uid inside it
+// is the spelling `space_member` STORES. That is the only thing that can be matched
+// against `octo_project_member` — that table is pinned utf8mb4_general_ci while
+// space_member is utf8mb4_0900_ai_ci in production, and the latter's equivalence
+// classes are strictly coarser for compatibility characters. See
+// modules/space/seatref.go.
+//
+// One statement, and its failure rolls the whole transition back — see
+// spacemod.SeatTransitionTxStep for why that is the right direction: committing a
+// seat change whose invalidation signal did not fire hands a peer an authorization
+// state it cannot detect as stale, and the async compensation has no upper bound
+// once its job is abandoned.
+func (p *Project) bumpEpochsOnSeatTransition(tx *dbr.Tx, t spacemod.SeatTransition) error {
+	return p.db.bumpMemberEpochForSpaceMemberTx(tx, t.Seat.SpaceID(), t.Seat.UID())
 }
 
 // restoreSpaceMemberProjects is the projection-only half of a Space rejoin.
@@ -498,7 +540,11 @@ func (p *Project) deactivateSeatForCascadeResult(
 		// ONE bump for the member and every agent that went with them: a member
 		// leaving with their agents is one membership change, and the epoch is
 		// asserted to move by exactly +1 per write.
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		//
+		// The affected-row count is discarded here. Only createProject checks it, where a
+		// silent no-op would ship a project on the reserved absent-epoch sentinel; on this
+		// path the seat writes above already established the project row exists.
+		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return cascadeSeatResult{}, err
 		}
 	}

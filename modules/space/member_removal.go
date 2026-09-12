@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -163,6 +164,106 @@ func RegisterMemberRemovalCleanupStep(name string, fn MemberRemovalCleanupStep) 
 		}
 	}
 	cleanupSteps = append(cleanupSteps, namedCleanupStep{name: name, fn: fn})
+}
+
+// SeatTransition 是一次 space_member 席位状态翻转，交给已注册的事务内步骤。
+//
+// # 为什么是一个注册表而不是两个
+//
+// 关席位和开席位对下游是**同一个事实**：「这个人是不是成员」的答案变了。此前这里是
+// 两套逐字对称的机件——两个 type、两个 mutex、两个 slice、两个 Register、两个 run——
+// 而唯一的注册方 modules/project 给两边注册的是**逐字相同的一行**。
+//
+// 那份对称不是白拿的，它是本分支两个 P1 的**形状**：
+//
+//   - 第八轮：移除方向接上了、重新加入方向没接，于是消费方缓存的一条**拒绝**
+//     一直和 epoch 对得上，合法回归的成员被持续拒绝，安静的项目里没有上界。
+//   - 第九轮：四扇重新激活门只接了两扇，而另外两扇的函数名里根本没有 "reactivate"
+//     字样（approveJoinApplyAtomic 甚至是设计好的重新加入漏斗）。
+//
+// 两次都不是「没想到这个场景」，而是「一个必须手工保持成对的枚举漏了一个元素」。
+// 合成一个注册表之后，**「只接了一半」不再可表达**——没有另一半可以漏。
+//
+// 方向没有丢，它变成了数据（Opened）。需要区分方向的步骤仍然写得出来，而**忘记**
+// 区分不再是一个默认行为。
+//
+// # 与 MemberRemovalCleanupStep 的区别是本质的，不是时机上的微调
+//
+//   - 清理步骤是**异步**的，可以退避、可以重试、耗尽后进 abandoned 终态。适合
+//     「把这个人从各处摘出去」这类最终一致就够的收尾工作。
+//   - 事务步骤是**同步**的，它的失败会让整次翻转回滚。只放那些「一旦提交就必须
+//     已经成立」的事实——典型的是对外发布的失效信号：如果翻转提交了而信号没发，
+//     消费方会拿着一个它自己检查不出过期的判定，而异步补偿的窗口在作业被 abandoned
+//     之后是无限的。
+type SeatTransition struct {
+	// Seat 的 uid 是 `space_member` **存的**那串字节，不是调用方发来的。
+	// 见 seatref.go：步骤要拿它去匹配 collation 更严的表。
+	Seat SeatRef
+	// Opened 为 true 表示一个已关闭的席位被重新打开；false 表示一个活跃席位被关闭。
+	Opened bool
+}
+
+// SeatTransitionTxStep 是在席位翻转**事务内**同步执行的一步。
+//
+// 契约：
+//   - 必须只做一件小事，并且是**一条语句量级**的。它跑在面向用户的事务里。
+//   - 返回 error 会让整次翻转失败。这是刻意的：宁可这次失败让调用方重试，
+//     也不要提交一次没有失效信号的翻转。
+//   - 必须幂等：调用方可能重试整个事务。
+//   - 两个方向都会调用它。如果某一步真的只该对一个方向生效，读 t.Opened——
+//     但先确认那不是又一次「只做一半」。
+type SeatTransitionTxStep func(tx *dbr.Tx, t SeatTransition) error
+
+var (
+	txStepsMu sync.RWMutex
+	txSteps   []namedTxStep
+)
+
+type namedTxStep struct {
+	name string
+	fn   SeatTransitionTxStep
+}
+
+// RegisterSeatTransitionTxStep 由下游模块在 init 中反向注册事务内步骤。
+//
+// 反向注册的理由与 RegisterMemberRemovalCleanupStep 相同：modules/project 已经
+// import modules/space，反向 import 即构成 import cycle。
+//
+// 同名重复注册会覆盖（latest wins），方便测试替身。
+func RegisterSeatTransitionTxStep(name string, fn SeatTransitionTxStep) {
+	if name == "" || fn == nil {
+		return
+	}
+	txStepsMu.Lock()
+	defer txStepsMu.Unlock()
+	for i := range txSteps {
+		if txSteps[i].name == name {
+			txSteps[i].fn = fn
+			return
+		}
+	}
+	txSteps = append(txSteps, namedTxStep{name: name, fn: fn})
+}
+
+// runSeatTransitionTxSteps 在翻转事务内依次执行已注册的同步步骤。
+//
+// 第一个失败即返回，**不继续执行后续步骤**——与异步清理相反。异步那边步骤之间互不
+// 阻塞，因为整条工单会重跑；这边一旦有步骤失败，事务就要回滚，继续跑余下的步骤只是
+// 在做注定被丢弃的工作。
+//
+// 不由业务代码直接调：openSeatTx / closeSeatTx 是唯二的调用点
+// （seat_transition.go），这样「翻了席位却忘了发信号」不是一个能写出来的状态。
+func runSeatTransitionTxSteps(tx *dbr.Tx, t SeatTransition) error {
+	txStepsMu.RLock()
+	steps := make([]namedTxStep, len(txSteps))
+	copy(steps, txSteps)
+	txStepsMu.RUnlock()
+	for _, step := range steps {
+		if err := step.fn(tx, t); err != nil {
+			return fmt.Errorf("space: seat transition tx step %s: %w", step.name, err)
+		}
+	}
+	return nil
 }
 
 // snapshotCleanupSteps 取注册表快照，避免执行期间持锁。

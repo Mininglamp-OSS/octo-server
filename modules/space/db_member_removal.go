@@ -50,10 +50,16 @@ type memberRemovalCleanupJob struct {
 // enqueueMemberRemovalCleanupTx 在成员移除的同一事务内写出清理工单（transactional
 // outbox）。调用方必须已经确认这次移除真的改动了成员行——对不存在 / 已移除的成员
 // 入队会产出一条永远无事可做的工单。
-func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, spaceID, uid, operatorUID, reason string) error {
-	if spaceID == "" || uid == "" {
+//
+// 收 SeatRef 而不是裸 uid：这条工单里的 uid 会被异步级联拿去查 octo_project_member
+// （collation 更严），所以它必须是 space_member 存的那串字节。用调用方的拼写，级联
+// 会先用松 collation 匹配上 Space 成员、再枚举到 0 个项目席位，然后**成功**收工——
+// 席位永久孤儿，而且看起来一切正常。见 seatref.go。
+func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, seat SeatRef, operatorUID, reason string) error {
+	if seat.IsZero() {
 		return errors.New("space: removal cleanup requires space_id and uid")
 	}
+	spaceID, uid := seat.SpaceID(), seat.UID()
 	if !IsMemberRemoveReason(reason) {
 		return fmt.Errorf("space: unknown member removal reason %q", reason)
 	}
@@ -78,14 +84,61 @@ func enqueueMemberRemovalCleanupTx(tx *dbr.Tx, spaceID, uid, operatorUID, reason
 // lifecycle transaction. Only a pristine, unclaimed intent can absorb another
 // request: a continuation may have passed its project and a failed attempt may
 // have exhausted its retry budget.
+//
+// # It resolves the seat rather than trusting the caller's spelling
+//
+// The identifiers reach this outbox row and, through it, the async projection,
+// which matches them against `octo_project_member` — pinned utf8mb4_general_ci,
+// strictly finer than the utf8mb4_0900_ai_ci `space_member` sits at in
+// production. A drifted pair matches the seat and then enumerates zero project
+// seats, so the job completes SUCCESSFULLY having done nothing. That is the same
+// silent no-op enqueueMemberRemovalCleanupTx takes a SeatRef to make
+// unrepresentable, and this door is not exempt from it just because its reason is
+// a rejoin rather than a removal. See seatref.go.
+//
+// The exported signature stays (spaceID, uid) because modules/project calls it
+// across a package boundary and cannot construct a SeatRef; the resolution
+// happens here, once, so no caller can skip it.
+//
+// A MISSING seat row is not an error on this path, which is the one place this
+// differs from the removal side. The intent is projection-only and its callers
+// include compensations that run when the seat is NOT currently open — a native
+// admission whose WuKongIM subscription failed, or a re-admission racing a second
+// removal. Refusing those would roll back work that has nothing wrong with it. So
+// when the row is absent the caller's own bytes are stored: there is no better
+// spelling available, and the projection finds the same nothing either way. When
+// the row IS there — every ordinary rejoin — the stored bytes win, which is the
+// half that matters, because those are what octo_project_member must be matched
+// with under its stricter collation.
+//
+// The four seat-reopening doors do not reach this function at all: openSeatTx
+// already holds a resolved SeatRef by the time it enqueues, so it calls the
+// by-seat form below directly and cannot fall back.
 func EnqueueMemberRejoinIntentTx(tx *dbr.Tx, spaceID, uid, operatorUID string) error {
+	seat, err := ResolveSeatTx(tx, spaceID, uid)
+	if err != nil {
+		if !errors.Is(err, ErrSeatNotFound) {
+			return err
+		}
+		seat = SeatRef{spaceID: spaceID, uid: uid}
+	}
+	return enqueueMemberRejoinIntentForSeatTx(tx, seat, operatorUID)
+}
+
+// enqueueMemberRejoinIntentForSeatTx is the in-package form for callers that have
+// already resolved the seat — openSeatTx holds one by the time it runs its steps,
+// so re-resolving there would be a second identical read inside the same lock.
+func enqueueMemberRejoinIntentForSeatTx(tx *dbr.Tx, seat SeatRef, operatorUID string) error {
+	if seat.IsZero() {
+		return errors.New("space: rejoin intent requires space_id and uid")
+	}
 	var pending []uint64
 	_, err := tx.SelectBySql(
 		"SELECT id FROM space_member_removal_cleanup "+
 			"WHERE space_id=? AND uid=? AND reason=? AND status=? "+
 			"AND lease_owner='' AND lease_until IS NULL AND attempts=0 AND last_error='' "+
 			"LIMIT 1 FOR UPDATE",
-		spaceID, uid, MemberRemoveReasonRejoined, removalCleanupPending,
+		seat.SpaceID(), seat.UID(), MemberRemoveReasonRejoined, removalCleanupPending,
 	).Load(&pending)
 	if err != nil {
 		return fmt.Errorf("space: check unclaimed rejoin intent: %w", err)
@@ -94,28 +147,32 @@ func EnqueueMemberRejoinIntentTx(tx *dbr.Tx, spaceID, uid, operatorUID string) e
 		return nil
 	}
 	return enqueueMemberRemovalCleanupTx(
-		tx, spaceID, uid, operatorUID, MemberRemoveReasonRejoined,
+		tx, seat, operatorUID, MemberRemoveReasonRejoined,
 	)
 }
 
-func enqueueMemberRejoinIntentTx(tx *dbr.Tx, spaceID, uid, operatorUID string) error {
-	return EnqueueMemberRejoinIntentTx(tx, spaceID, uid, operatorUID)
-}
-
 // enqueueMemberRemovalCleanupBatchTx 一次性为多个成员写出清理工单。
+//
+// 收 SpaceRef 而不是裸 space_id，理由和单条版收 SeatRef 完全一样，只是换了一列：
+// 这批工单里的 space_id 会被异步级联拿去查 octo_project_member（collation 更严）。
+// 两个解散入口此前都直接把 `c.Param("space_id")` 传进来 —— uid 是从 space_member
+// 读出来的规范拼写，space_id 却是调用方的，于是级联按 (space_id, uid) 匹配不到任何
+// 项目席位，工单**成功**收工，整个 Space 的项目席位永久留在 status=1。见 seatref.go
+// 里 SpaceRef 的说明。
 //
 // 解散场景会在同一个事务里为全体成员入队，而那个事务正握着 space_member 的
 // FOR UPDATE 范围锁；逐条 INSERT 意味着上万次往返都在锁内完成，期间任何并发的
 // 加入路径（atomicAddMemberIfNotFull / approveJoinApply 都要在同一范围上取
 // FOR UPDATE）全部阻塞，甚至撞上 innodb_lock_wait_timeout。多值 INSERT 分批发出，
 // 把锁内往返从 N 次压到 N/batch 次。
-func enqueueMemberRemovalCleanupBatchTx(tx *dbr.Tx, spaceID string, uids []string, operatorUID, reason string) error {
+func enqueueMemberRemovalCleanupBatchTx(tx *dbr.Tx, space SpaceRef, uids []string, operatorUID, reason string) error {
 	if len(uids) == 0 {
 		return nil
 	}
-	if spaceID == "" {
+	if space.IsZero() {
 		return errors.New("space: removal cleanup requires space_id")
 	}
+	spaceID := space.SpaceID()
 	if !IsMemberRemoveReason(reason) {
 		return fmt.Errorf("space: unknown member removal reason %q", reason)
 	}

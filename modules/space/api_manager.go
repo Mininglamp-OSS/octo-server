@@ -653,6 +653,13 @@ func (m *Manager) addMembers(c *wkhttp.Context) {
 		respondSpaceBatchTooLarge(c, managerMaxBatchUIDs)
 		return
 	}
+	// The space row's own spelling from here on, not the URL parameter. These handlers
+	// write space_member, and a parameter that merely matches the row under the loose
+	// production collation is not the same bytes — a seat stored under the caller's
+	// version is unreachable from the project-side epoch enumeration, which compares
+	// under a stricter one. The row is already loaded; using it costs nothing.
+	// See modules/space.isSpaceActive for the same correction on the non-manager routes.
+	spaceId = sp.SpaceId
 	if err := m.managerDB.upsertMembers(spaceId, uids); err != nil {
 		m.Error("添加成员失败", zap.Error(err), zap.String("spaceId", spaceId), zap.Strings("uids", uids))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
@@ -705,6 +712,13 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 		return
 	}
 	operator := c.GetLoginUID()
+	// The space row's own spelling from here on, not the URL parameter. These handlers
+	// write space_member, and a parameter that merely matches the row under the loose
+	// production collation is not the same bytes — a seat stored under the caller's
+	// version is unreachable from the project-side epoch enumeration, which compares
+	// under a stricter one. The row is already loaded; using it costs nothing.
+	// See modules/space.isSpaceActive for the same correction on the non-manager routes.
+	spaceId = sp.SpaceId
 	removed, err := m.managerDB.removeMembersForce(spaceId, uids, operator)
 	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {
@@ -913,7 +927,13 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 
 	operator := c.GetLoginUID()
 	model := &InvitationModel{
-		SpaceId: spaceId,
+		// sp.SpaceId, not the URL parameter. Every seat created by redeeming this
+		// invitation inherits this column (executeJoinSpace -> atomicAddMemberIfNotFull,
+		// and approveJoinApplyAtomicOnce through space_join_apply), so a drifted value
+		// here poisons the seat rather than just the invitation — and a poisoned seat
+		// makes the removal funnel hand its tx step drifted bytes, freezing member_epoch
+		// while membership changes. The row is already loaded above.
+		SpaceId: sp.SpaceId,
 		Creator: operator,
 		Status:  1,
 	}
@@ -958,11 +978,15 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 	}
 	c.Response(map[string]interface{}{
 		"invite_code": code,
-		"space_id":    spaceId,
-		"creator":     operator,
-		"max_uses":    model.MaxUses,
-		"expires_at":  expiresStr,
-		"status":      model.Status,
+		// The row's spelling, matching what was stored. Nothing writes off this echo
+		// — later invite operations key on the code — so the only cost of returning
+		// the URL parameter was a console showing a spelling the database does not
+		// hold. Truthful for free.
+		"space_id":   sp.SpaceId,
+		"creator":    operator,
+		"max_uses":   model.MaxUses,
+		"expires_at": expiresStr,
+		"status":     model.Status,
 	})
 }
 

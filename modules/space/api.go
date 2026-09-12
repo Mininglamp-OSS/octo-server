@@ -75,17 +75,27 @@ func New(ctx *config.Context) *Space {
 }
 
 // checkSpaceActive 检查空间是否处于活跃状态，返回 true 表示已处理错误（空间不活跃）
-func (s *Space) checkSpaceActive(c *wkhttp.Context, spaceId string) bool {
-	active, err := s.db.isSpaceActive(spaceId)
+// Returns the space_id the `space` row stores alongside the refusal flag, and every
+// caller REBINDS its local spaceId to it.
+//
+// The rebinding is the point. These handlers go on to write that identifier into
+// space_member and space_invitation, and a URL parameter that merely matches the row
+// under the loose production collation is not the same bytes as the row. Storing the
+// caller's version poisons the seat for the project-side epoch enumeration, which
+// compares under a stricter collation — see isSpaceActive.
+//
+// TestEverySpaceActiveCheckRebindsTheSpaceID pins that no call site drops it.
+func (s *Space) checkSpaceActive(c *wkhttp.Context, spaceId string) (string, bool) {
+	stored, active, err := s.db.isSpaceActive(spaceId)
 	if err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-		return true
+		return "", true
 	}
 	if !active {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
-		return true
+		return "", true
 	}
-	return false
+	return stored, false
 }
 
 // Route 路由配置
@@ -487,7 +497,8 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -814,7 +825,8 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -908,7 +920,8 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -970,7 +983,8 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -1011,7 +1025,8 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 	spaceId := c.Param("space_id")
 	targetUID := c.Param("uid")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -1091,7 +1106,8 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -1570,7 +1586,8 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 	spaceId := c.Param("space_id")
 	code := c.Param("code")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -1636,7 +1653,8 @@ func (s *Space) listInvites(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 
@@ -1698,7 +1716,8 @@ func (s *Space) deleteInvite(c *wkhttp.Context) {
 	spaceId := c.Param("space_id")
 	code := c.Param("code")
 
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 

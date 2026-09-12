@@ -8,6 +8,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
+	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
@@ -56,47 +58,21 @@ import (
 // on no-op reruns and break the "a no-op write does not change the epoch" rule that
 // clients cache against.
 
-// txRetryAttempts bounds the retry budget for transient lock conflicts. Three: enough for the
-// pathological interleaving to have passed, few enough that a genuine hot spot surfaces as an
-// error rather than as latency.
-const txRetryAttempts = 3
+// txRetryAttempts and the two helpers below are thin aliases over pkg/db, which now
+// owns the canonical copy. Kept as package-local names because every call site in this
+// file reads `retryOnLockConflict(...)` and the tests assert on `txRetryAttempts`; the
+// reasoning that justifies retrying at all moved with the implementation.
+const txRetryAttempts = dbpkg.LockRetryAttempts
 
 // retryOnLockConflict re-runs fn while it fails with a TRANSIENT lock conflict.
 //
-// Why this exists even though the seat locks are now taken in one statement: three consecutive
-// review rounds each found a lock-order cycle that careful reasoning had missed — table order
-// vs. modules/space, then row order within space_member. "We reasoned about the order" is
-// demonstrably not sufficient on its own, and the cost of being wrong is not a retry, it is
-// store_failed (Internal, HTTP 500) — and when InnoDB picks the Space disband as its victim, a
-// failed step of the member-removal security cascade.
-//
-// Only 1213 (deadlock) and 1205 (lock wait timeout) are retried, matching
-// modules/common's isRetryableTxErr. Everything else — 1062, every service sentinel — is
-// returned verbatim on the first attempt, so callers' errors.Is checks are untouched. fn must
-// own its whole transaction: a retry re-runs it from BEGIN, which is only sound because a
-// deadlock has already rolled the failed attempt back.
-func retryOnLockConflict(fn func() error) error {
-	var lastErr error
-	for attempt := 0; attempt < txRetryAttempts; attempt++ {
-		err := fn()
-		if err == nil || !isRetryableTxErr(err) {
-			return err
-		}
-		lastErr = err
-	}
-	return fmt.Errorf("project: transaction retries exhausted: %w", lastErr)
-}
+// See pkg/db.RetryOnLockConflict. fn must own its whole transaction: a retry re-runs it
+// from BEGIN, which is only sound because a deadlock has already rolled the failed
+// attempt back.
+func retryOnLockConflict(fn func() error) error { return dbpkg.RetryOnLockConflict(fn) }
 
-// isRetryableTxErr reports whether err is a transient InnoDB lock conflict. Spelled out here
-// rather than imported from modules/common, whose copy is unexported; the predicate is
-// deliberately identical.
-func isRetryableTxErr(err error) bool {
-	var myErr *mysql.MySQLError
-	if errors.As(err, &myErr) {
-		return myErr.Number == 1213 || myErr.Number == 1205
-	}
-	return false
-}
+// isRetryableTxErr reports whether err is a transient InnoDB lock conflict (1213/1205).
+func isRetryableTxErr(err error) bool { return dbpkg.IsRetryableLockErr(err) }
 
 // Sentinel errors the API layer maps onto registered error codes. Returning typed
 // errors rather than responding from the service keeps the transaction boundary and
@@ -202,14 +178,59 @@ func (p *Project) lockSeatsTx(
 	if err != nil {
 		return nil, err
 	}
+
+	// ACCOUNT liveness is NOT a second read here, and its absence is the fix rather than
+	// an omission.
+	//
+	// A Space seat does not imply a live account: a super-admin ban writes only the `user`
+	// row (modules/user.liftBanUser) and account destroy cascades no membership removal,
+	// so a banned or destroyed uid keeps its seat and could keep administering projects.
+	// That gate is real and it is still enforced — it is the `user` STRAIGHT_JOIN inside
+	// lockSpaceSeatsTx above, with the same predicate ActiveAccounts uses, so a uid that
+	// is seated but not live simply does not come back in `held`.
+	//
+	// This branch briefly did it as a separate pkg/user.ActiveAccounts read on the SESSION,
+	// on the measurement that a plain `INNER JOIN user` lets the optimizer drive from the
+	// `user` PK and take lockSpaceSeatsTx's row-order argument away. #887 answered the same
+	// measurement by pinning the plan instead (STRAIGHT_JOIN, FORCE INDEX (PRIMARY), an
+	// exact id list, ORDER BY sm.id ASC, and `user` inside the FOR SHARE list so it is a
+	// locking read rather than one that opens the read view). With the plan pinned there is
+	// nothing left for the separate read to buy, and keeping it cost three real things:
+	//
+	//   - it was a SESSION read issued while this transaction holds space_member shared
+	//     locks and, downstream, the octo_project row lock. The session has no Timeout, so
+	//     dbr reaches sql.DB.QueryContext with context.Background() and the wait for a second
+	//     pooled connection is UNBOUNDED — under pool pressure a lock-holding transaction
+	//     parks forever and nothing times it out.
+	//   - it was a TOCTOU the join does not have: a ban committing between the read and the
+	//     commit was invisible, whereas the joined row is locked FOR SHARE.
+	//   - it made account liveness a second statement a new call site could forget, which is
+	//     this branch's most-repeated failure shape.
+	//
+	// TestSeatLockStatementPinsItsPlan pins the mechanism the removal depends on.
+	//
+	// # Scope: this now covers the TARGETS too, which is a change worth naming
+	//
+	// The separate read was deliberately actor-only, so that a deactivated AGENT target was
+	// refused by classifyAgentsTx's single D2 agent refusal rather than by the less specific
+	// errNotSpaceMember. The joined statement does not have that seam: every uid it locks is
+	// filtered by the same predicate, so a non-live target is absent from `held` and the
+	// `required` loop below answers errNotSpaceMember. That is #887's behaviour and it is
+	// fail-closed in both cases; it is recorded here because the previous comment claimed the
+	// opposite and a reader tracing D2 would otherwise look for a seam that is gone.
+
 	// The ACTOR is checked first, so a caller who has lost their own seat is told that rather
 	// than being told something about the target. Their project role may well still be active,
 	// because the Space-removal cascade is asynchronous by design.
-	if !held[actorUID] {
+	//
+	// A banned actor lands in the same answer rather than a distinct sentinel: a caller learning
+	// "your account is banned" from a project endpoint is an enumeration answer, and the ban is
+	// already reported on the paths that own it.
+	if !projectpkg.FoldedHas(held, actorUID) {
 		return nil, errActorNotSpaceMember
 	}
 	for _, uid := range required {
-		if uid != "" && uid != actorUID && !held[uid] {
+		if uid != "" && uid != actorUID && !projectpkg.FoldedHas(held, uid) {
 			return nil, errNotSpaceMember
 		}
 	}
@@ -260,10 +281,26 @@ func createSeatUIDs(in createInput) []string {
 // outside would let two concurrent creates both pass the check and both land, which
 // is the whole failure mode a quota exists to prevent.
 //
-// member_epoch stays at its default 0. The acceptance list for "the epoch strictly
-// increases" covers add / remove / leave / role change / Space cascade / disband —
-// creation is where the roster comes into existence rather than changing, so 0 is
-// its initial value and the first real membership change makes it 1.
+// member_epoch is BUMPED by creation, so a new project lands on 1 rather than on
+// the column default of 0.
+//
+// Creation used to be the one membership write exempted from the bump, on the
+// reasoning that it is where the roster comes into existence rather than
+// changes. That exemption is what put a real project on a reserved value: the
+// integration contract that consumes this column defines 0 as "the project does
+// not exist or is not visible", so a solo project nobody had yet added to was
+// active, visible, had a real member, and reported the same epoch as a project
+// that had been disbanded. A consumer caching an authorization answer under
+// epoch 0 kept it forever, because the disbanded project answers 0 too and the
+// staleness check therefore agreed. See migration 20260908000002.
+//
+// Removing the exemption is also the more honest reading of the rule: creation
+// writes the owner seat into octo_project_member, which IS a membership write,
+// and every membership write bumps the epoch. It is done with the same
+// bumpMemberEpochTx every other path uses rather than by seeding the column at
+// insert, because member_epoch may only ever be written as member_epoch + 1 —
+// a property TestIsOfficialHasNoWriter and TestMemberEpochOnlyEverIncrements
+// enforce between them, and one this change deliberately does not weaken.
 func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	seatRefs, err := p.db.resolveSpaceSeatIDs(in.SpaceID, createSeatUIDs(in))
 	if err != nil {
@@ -337,9 +374,51 @@ func (p *Project) createProjectTxWithSeatRefs(
 	if err != nil {
 		return nil, err
 	}
-	if !agentSeats[in.Creator] {
+	// Folded, and the hit REBINDS the creator to the spelling `space_member` stores.
+	//
+	// agentSeats is keyed by the database's bytes (see lockSpaceSeatTargets). Every
+	// octo_* row below denormalises this value — octo_project.creator, the owner seat's
+	// octo_project_member.uid, and the invite_uid on the agent seats — and the epoch
+	// step matches that column under utf8mb4_general_ci while this lock resolved it
+	// under space_member's looser one. Writing the request's bytes is the admission-side
+	// half of the identity rule modules/space/seatref.go states for the removal side.
+	storedCreator, creatorSeated := projectpkg.FoldedLookup(agentSeats, in.Creator)
+	if !creatorSeated {
 		return nil, errNotSpaceMember
 	}
+	in.Creator = storedCreator
+	agentUIDs = withoutUID(agentUIDs, in.Creator)
+
+	// The ACCOUNT half is inside lockSpaceSeatRowsTx above, not a second read here.
+	//
+	// A Space seat does not imply a live account: a super-admin ban writes only the `user`
+	// row (modules/user.liftBanUser) and account destroy cascades no membership removal, so
+	// a banned or destroyed uid keeps its seat and could create projects indefinitely. The
+	// `user` STRAIGHT_JOIN in that statement carries the same predicate ActiveAccounts uses,
+	// so a creator who is seated but not live is simply absent from agentSeats and the check
+	// above has already refused them as errNotSpaceMember — the same sentinel, because a
+	// caller learning "your account is banned" from a project endpoint is an enumeration
+	// answer and the ban is already reported on the paths that own it.
+	//
+	// The read-view argument that once put this in a separate SELECT is satisfied by the
+	// statement rather than lost: `user` is INSIDE that statement's `FOR SHARE OF sm, u`
+	// list, so it is a locking read, and a locking read does not assign the transaction's
+	// consistent-read view. `space` is still not joined there at all. Both of the properties
+	// the three quota counts below depend on therefore still hold, and
+	// TestCreateQuotaStillHoldsUnderConcurrency remains their regression net.
+	//
+	// Removing the separate read also removes an unbounded wait: it ran on the process-wide
+	// session, which has no Timeout, so it reached sql.DB.QueryContext with
+	// context.Background() while this transaction already held the creator's space_member
+	// lock — under pool pressure that parks a lock-holding transaction with nothing to time
+	// it out. See lockSeatsTx for the same removal on the shared write path.
+	//
+	// Scope note: the joined statement covers the AGENTS too, where the separate read was
+	// creator-only so that classifyAgentsTx could fold a deactivated agent into the single
+	// D2 agent refusal. An agent absent from agentSeats now reaches classifyAgentsTx as an
+	// ineligible uid rather than being distinguished here, so D2's "the six reasons are not
+	// distinguishable on the wire" still holds for agents; what changed is that the creator
+	// and the agents are filtered by one predicate instead of two.
 
 	// NOW lock the Space row. Two things depend on it, and neither is optional:
 	//
@@ -354,9 +433,16 @@ func (p *Project) createProjectTxWithSeatRefs(
 	//      already joins on space.status = 1, but it read that under a shared lock on
 	//      space_member only, so a ban or disband could still commit in between — this is the
 	//      authoritative recheck, and it is why it stays.
-	spaceActive, err := p.db.lockSpaceRowTx(tx, in.SpaceID)
+	storedSpaceID, spaceActive, err := p.db.lockSpaceRowTx(tx, in.SpaceID)
 	if err != nil {
 		return nil, err
+	}
+	// Every octo_* row below is denormalised with the SPACE row's spelling, not the
+	// request's. The epoch step matches octo_project_member on (space_id, uid) under a
+	// stricter collation than the one that resolved this lock, so bytes that differ
+	// here are bytes the invalidation signal cannot find later.
+	if spaceActive {
+		in.SpaceID = storedSpaceID
 	}
 	if !spaceActive {
 		// Deliberately the same answer as "you hold no seat here", which renders as
@@ -495,6 +581,38 @@ func (p *Project) createProjectTxWithSeatRefs(
 			}
 		}
 	}
+
+	// AFTER EVERY roster write in this transaction: the owner seat above and the
+	// creator's agent seats with it. The epoch is the invalidation channel for the
+	// project's MEMBER SET, so it must be bumped once that set is final. Bumping it
+	// before the agent inserts would publish an epoch a consumer could cache against a
+	// roster still growing inside this transaction.
+	//
+	// It runs after the project INSERT rather than before because bumpMemberEpochTx is
+	// guarded on status = StatusNormal and would otherwise match no row.
+	//
+	// And BEFORE the provisioning enqueue below, which the lock order requires to be the
+	// last statement in this transaction. This bump takes no new lock — octo_project is
+	// already held from the insert above — so it cannot affect that ordering.
+	//
+	// The affected-row count is CHECKED here and ignored everywhere else, because this is
+	// the one call site where a silent no-op is a security state rather than the intended
+	// behaviour: it would leave a fresh project on the reserved absent-epoch sentinel
+	// while the response below reports 1 — the exact state migration 20260908000002
+	// exists to remove. It holds today because the insert above writes StatusNormal in
+	// this same transaction; it stops holding the moment a two-phase create (O6) gives a
+	// project a non-normal initial status, and this turns that from a silent wrong answer
+	// into a failed create.
+	bumped, err := p.db.bumpMemberEpochTx(tx, model.ProjectID, now)
+	if err != nil {
+		return nil, err
+	}
+	if bumped == 0 {
+		return nil, fmt.Errorf(
+			"project: create bumped no epoch row for %s; the project would ship on the "+
+				"reserved absent-epoch sentinel while reporting 1", model.ProjectID)
+	}
+	model.MemberEpoch++
 
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
 	// construction under which "the project exists ⟹ its provisioning jobs exist" is
@@ -705,7 +823,7 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	// Bump BEFORE the status flip: bumpMemberEpochTx guards on status=1 (the predicate that
 	// keeps a disbanded project's epoch frozen), and disband is exactly the write that must
 	// move the epoch — the brief lists it alongside add/remove/leave/role-change/cascade.
-	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
 	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
@@ -959,6 +1077,23 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	if err != nil {
 		return nil, err
 	}
+	// The uids that get WRITTEN are the ones `space_member` stores, not the ones the
+	// caller sent. `held` is keyed by the database's spelling and the two can differ
+	// under space_member's case-insensitive collation, so rebinding here is what keeps
+	// octo_project_member reachable from the epoch step's enumeration, which matches
+	// that column under a STRICTER collation. Admission-side half of the identity rule
+	// in modules/space/seatref.go.
+	//
+	// Done once, right after the lock and before anything reads a uid again, so the
+	// member lookup, the rejoin intent, the outbox cancel and the seat insert all agree
+	// on one spelling. lockSeatsTx has already refused any target that is not seated,
+	// so a miss here is impossible for a required uid; the loop leaves such an item
+	// untouched rather than silently dropping it.
+	for i := range members {
+		if stored, ok := projectpkg.FoldedLookup(held, members[i].UID); ok {
+			members[i].UID = stored
+		}
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return nil, err
@@ -1015,7 +1150,10 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 		didChange, aerr := p.db.admitMemberTx(tx, &MemberModel{
 			ProjectID: projectID,
 			UID:       item.UID,
-			SpaceID:   spaceID,
+			// row.SpaceID, not the request's: the seat belongs to this project, so its
+			// denormalised space_id has to be the project row's own bytes or the epoch
+			// step's `WHERE space_id = ?` enumeration cannot reach it.
+			SpaceID:   row.SpaceID,
 			Role:      item.Role,
 			InviteUID: actorUID,
 			CreatedAt: now,
@@ -1042,7 +1180,7 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 		}
 	}
 	if len(changed) > 0 {
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return nil, err
 		}
 	}
@@ -1335,7 +1473,7 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 		return false, err
 	}
 	if changed {
-		if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return false, err
 		}
 	}
@@ -1412,13 +1550,26 @@ func (p *Project) transferProjectOwnerOnce(projectID, spaceID, actorUID, success
 		// classification through this authorization endpoint.
 		return errMemberNotFound
 	}
-	if _, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now); err != nil {
+	// The affected-rows result is checked, not discarded. It is 0 exactly when the row
+	// is already an owner — which, with the self-transfer guard above now folded, means
+	// a promotion that changed nothing and must not be reported as a transfer.
+	promoted, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now)
+	if err != nil {
 		return err
+	}
+	if !promoted {
+		// The row was already an owner, so this transfer changed nothing and must not
+		// be reported as one. The read above refuses that state, which makes this
+		// unreachable today — it is kept because it is the only one of the guards on
+		// this path that does not depend on a Go-side comparison being right, and
+		// because updateMemberRoleTx carries a `role <> ?` predicate whose no-op is
+		// otherwise silent.
+		return errMemberRoleConflict
 	}
 	if _, err := p.db.updateMemberRoleTx(tx, projectID, actorUID, RoleAdmin, now); err != nil {
 		return err
 	}
-	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1645,7 +1796,8 @@ func (p *Project) beginRemovalWithAgentsTx(
 		}
 	}
 
-	if err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+	// bumpMemberEpochTx returns the affected-row count now; only createProject checks it (a silent no-op there would ship a project on the absent sentinel). Here the seat write above already established the row exists.
+	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return false, nil, err
 	}
 	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{

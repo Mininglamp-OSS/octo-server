@@ -23,7 +23,8 @@ func (s *Space) searchMembers(c *wkhttp.Context) {
 	// 空间必须处于激活态。封禁(status=2)只更新 space 行、不会把 space_member 置为
 	// 非激活,因此仅靠成员行 status=1 的 gate 会让封禁/解散空间的 admin 仍能搜出成员
 	// (含掩码 email/phone),绕过封禁冻结。显式校验 space.status=1 统一挡掉封禁与解散。
-	if s.checkSpaceActive(c, spaceId) {
+	spaceId, refused := s.checkSpaceActive(c, spaceId)
+	if refused {
 		return
 	}
 

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +165,20 @@ func seedUser(t *testing.T, uid string) string {
 	require.NoError(t, testCtx.Cache().Set(
 		testCtx.GetConfig().Cache.TokenCachePrefix+token, uid+"@test"))
 	return token
+}
+
+// seedUserBare inserts a live `user` row and nothing else.
+//
+// seedUser additionally mints a cache token, which is a Redis round trip per uid —
+// fine for a handful of fixtures, too slow for the thousands a plan-shape test needs
+// to give the optimizer a real choice. This is for fixtures that only have to EXIST
+// (and be live: status and is_destroy take their column defaults, 1 and 0).
+func seedUserBare(t *testing.T, uid string) {
+	t.Helper()
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, short_no) VALUES (?, ?, ?)", uid, "user-"+uid, uid,
+	).Exec()
+	require.NoError(t, err)
 }
 
 // seedSpace creates an active Space.
@@ -528,21 +543,49 @@ const (
 //
 // Down is applied in REVERSE order for the usual reason: the later file's Down
 // drops objects the earlier file's Down would otherwise pull out from under it.
-var projectMigrationFiles = []string{
-	"sql/20260904000001_project_core.sql",
-	"sql/20260906000001_project_group_binding.sql",
-	// Same day, next sequence: PR #850 landed 20260907000001_project_provisioning
-	// on main first, so this one is 000002. Two files sharing a sequence still
-	// apply (sql-migrate breaks the tie on the full filename), but the sequence is
-	// what the convention uses to express apply order, and a silent lexical
-	// tiebreak is not an order anybody chose.
-	"sql/20260907000001_project_provisioning.sql",
-	"sql/20260907000002_project_all_member_group.sql",
-	"sql/20260908000001_project_user_setting.sql",
-	"sql/20260909000001_project_collaboration_role.sql",
-	"sql/20260910000001_project_read_default.sql",
-	"sql/20260911000001_project_group_user_setting.sql",
-	"sql/20260911000002_project_member_joined_at.sql",
+//
+// EDITED AGAIN. A hand-maintained list re-arms the same trap the paragraph above
+// describes every time a migration is added and the list is not: two more files
+// (#850's provisioning tables and this module's member_epoch backfill) were on
+// disk and absent from the list before this changed. The list is now DERIVED from
+// the embedded directory, which is the same set `migrate.Exec` applies at boot, so
+// the two cannot drift. Filename order is apply order — the `<yyyyMMdd>-<seq>`
+// convention exists for exactly that — and ReadDir returns entries sorted by name.
+var projectMigrationFiles = discoverProjectMigrations()
+
+func discoverProjectMigrations() []string {
+	entries, err := sqlFS.ReadDir("sql")
+	if err != nil {
+		panic("project: read embedded migrations: " + err.Error())
+	}
+	files := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		files = append(files, "sql/"+e.Name())
+	}
+	return files
+}
+
+// TestProjectMigrationFilesCoverTheDirectory keeps the derivation honest: it must
+// find every .sql file the module embeds, and it must find at least the ones that
+// existed when this was written, so a broken glob cannot make the migration lap
+// pass vacuously.
+func TestProjectMigrationFilesCoverTheDirectory(t *testing.T) {
+	entries, err := sqlFS.ReadDir("sql")
+	require.NoError(t, err)
+	var want []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			want = append(want, "sql/"+e.Name())
+		}
+	}
+	require.Equal(t, want, projectMigrationFiles)
+	require.GreaterOrEqual(t, len(projectMigrationFiles), 4,
+		"the module shipped four migrations when this was written; a shorter list means the "+
+			"derivation stopped seeing files, which is how the Down/Up lap rebuilds a stale schema")
+	require.Contains(t, projectMigrationFiles, "sql/20260908000002_project_member_epoch_base_one.sql")
 }
 
 // applyProjectMigration executes one section of every migration file this module

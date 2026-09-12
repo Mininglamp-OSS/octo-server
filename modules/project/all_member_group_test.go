@@ -200,10 +200,24 @@ func TestCreateProjectSeatsTheCreatorsAgents(t *testing.T) {
 			"all initial seats must use the create transaction's admission time")
 	}
 
-	// D11 — the epoch stays at 0. Agents are part of the roster coming into
-	// existence, not a change to it.
-	require.Equal(t, int64(0), epochOf(t, resp.ProjectID),
-		"creating with agents must not move member_epoch")
+	// D11's intent survives, its VALUE does not: agents are part of the roster coming
+	// into existence rather than a change to it, so seating them must not cost an EXTRA
+	// bump — but a fresh project can no longer read 0.
+	//
+	// 0 is now reserved by the membership integration contract for "this project does
+	// not exist or is not visible" (pkg/project.AbsentEpochSentinel), and the read layer
+	// REFUSES to serve an active project holding it
+	// (pkg/project.ErrLiveProjectOnAbsentSentinel) rather than hand a consumer a grant it
+	// can cache forever. So creation bumps once, to 1, whether or not agents came with
+	// it — see the bump at the end of createProjectOnce and
+	// TestFreshProjectNeverShipsOnTheAbsentSentinel.
+	//
+	// Asserted as exactly 1, not ">= 1": the point of D11 is that agents add no bump of
+	// their own, and only an exact value can express that.
+	require.Equal(t, int64(1), epochOf(t, resp.ProjectID),
+		"creating with agents must cost exactly ONE bump — the same as creating without "+
+			"them. A fresh project reads 1 because 0 is the contract's \"does not exist\" "+
+			"sentinel and the read layer refuses to serve an active project on it")
 
 	// D16 — the counts are split, and the total still matches the seats the quota
 	// counts.

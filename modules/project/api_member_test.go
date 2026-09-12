@@ -227,7 +227,8 @@ func TestMemberEpochBumpIsInTheSameTransaction(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, changed)
-	require.NoError(t, p.db.bumpMemberEpochTx(tx, created.ProjectID, now))
+	_, bumpErr := p.db.bumpMemberEpochTx(tx, created.ProjectID, now)
+	require.NoError(t, bumpErr)
 	require.NoError(t, tx.Rollback())
 
 	assert.Equal(t, before, epochOf(t, created.ProjectID),

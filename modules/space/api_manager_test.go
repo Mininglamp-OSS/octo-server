@@ -199,7 +199,7 @@ func TestManager_ForceDisband(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	active, err := testSpaceDB.isSpaceActive("mgr-force")
+	_, active, err := testSpaceDB.isSpaceActive("mgr-force")
 	assert.NoError(t, err)
 	assert.False(t, active, "space should be disbanded")
 

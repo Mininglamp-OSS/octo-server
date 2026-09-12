@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -25,13 +26,29 @@ func NewDB(ctx *config.Context) *DB {
 }
 
 // isSpaceActive 检查空间是否处于活跃状态
-func (d *DB) isSpaceActive(spaceId string) (bool, error) {
-	var count int
-	_, err := d.session.SelectBySql("SELECT COUNT(*) FROM space WHERE space_id=? AND status=1", spaceId).Load(&count)
+// isSpaceActive answers "is this Space live", and returns the space_id the row STORES.
+//
+// It used to COUNT(*) and throw the identifier away. That is the same shape as three
+// other reads on this branch that had the authoritative row in hand and kept only a
+// boolean — and it is the shape that matters here, because the handlers then insert the
+// caller's URL parameter into space_member / space_invitation. `space` and space_member
+// are utf8mb4_0900_ai_ci in production while octo_* are pinned utf8mb4_general_ci, so a
+// drifted spelling passes this check, gets stored, and is afterwards invisible to the
+// project-side enumeration that the membership epoch depends on — the seat funnel then
+// faithfully propagates poisoned bytes and member_epoch freezes while membership moves.
+//
+// Returning the column costs nothing on a read that already found the row.
+func (d *DB) isSpaceActive(spaceId string) (string, bool, error) {
+	var stored []string
+	_, err := d.session.SelectBySql(
+		"SELECT space_id FROM space WHERE space_id=? AND status=1 LIMIT 1", spaceId).Load(&stored)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return count > 0, nil
+	if len(stored) == 0 {
+		return "", false, nil
+	}
+	return stored[0], true, nil
 }
 
 // ---------- Space CRUD ----------
@@ -143,6 +160,14 @@ func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSp
 	if sp.SpaceId == "" || sp.Status != SpaceStatusNormal {
 		return nil, InitialSpaceInactive, nil
 	}
+	// 从这里起改用行里的拼写。
+	//
+	// 第 4 步会把 space_id 写进 space_member，而下游的 epoch 枚举拿它去查
+	// octo_project_member（utf8mb4_general_ci，比 space/space_member 的
+	// 0900_ai_ci 严），所以存进去的必须是 `space` 行自己的字节，不能是调用方传的。
+	// 这里 id 来自配置而不是请求，可达性比 #852 修掉的那几处低，但形状是同一个：
+	// **权威行已经在手里，却把列丢了**。见 seatref.go 的 SpaceRef。
+	spaceId = sp.SpaceId
 
 	// 3) 容量。与 atomicAddMemberIfNotFull 同语义:max_users=0 表示不限,此时这条
 	//    COUNT 给不出任何判断,跳过它连带省掉一把覆盖全空间成员的锁。
@@ -232,11 +257,19 @@ func (d *DB) disbandSpace(spaceId, operatorUID string) ([]string, error) {
 		Where("space_id=?", spaceId).Exec(); err != nil {
 		return nil, err
 	}
+	// 规范化 space_id：上面那条 UPDATE 已经把这行 X 锁住了，所以这次加锁读不等任何人，
+	// 也不会提前建立 read view。工单里的 uid 来自 space_member（规范拼写），space_id
+	// 必须同源，否则异步级联按 (space_id, uid) 查 octo_project_member 会枚举到 0 个
+	// 席位并「成功」收工。见 SpaceRef。
+	spaceRef, err := ResolveSpaceIDTx(tx, spaceId)
+	if err != nil {
+		return nil, err
+	}
 	if _, err = tx.Update("space_member").Set("status", 0).Set("updated_at", now).
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
 		return nil, err
 	}
-	if err = enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+	if err = enqueueMemberRemovalCleanupBatchTx(tx, spaceRef, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -428,29 +461,34 @@ func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, op
 	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
 }
 
+// reactivateMember 重新打开一个已被移除的成员席位。
+//
+// 现在跑在事务里，且事务内执行已注册的 reactivation 步骤——理由见
+// SeatTransitionTxStep：重新打开席位和关闭席位一样会翻转下游发布出去的成员判定，
+// 所以失效信号必须在同一次提交里发出，否则消费方缓存的那条**拒绝**会一直和自己的
+// epoch 对得上，一个合法回归的成员被无上界地拒绝。
+//
+// 步骤失败会回滚整次重新加入。与移除方向同样刻意：宁可这次加入失败让调用方重试，
+// 也不要提交一次没有失效信号的加入。
+//
+// 只在**真的改动了行**时跑步骤。对已经是 status=1 的成员重复调用不该动 epoch——
+// 每一次 bump 都让该项目的所有消费方多做一次复核，而「空写不动 epoch」是消费方
+// 缓存所依赖的规则（见 modules/project 的 bumpMemberEpochTx）。
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
-	tx, err := d.session.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.RollbackUnlessCommitted()
-	result, err := tx.Update("space_member").
-		Set("status", 1).Set("role", role).
-		Set("updated_at", time.Now()).
-		Where("space_id=? and uid=? and status=0", spaceId, uid).Exec()
-	if err != nil {
-		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 1 {
-		if err := enqueueMemberRejoinIntentTx(tx, spaceId, uid, uid); err != nil {
+	return dbpkg.RetryOnLockConflict(func() error {
+		tx, err := d.session.Begin()
+		if err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		defer tx.RollbackUnlessCommitted()
+
+		// 翻转、解析规范拼写、发失效信号，都在 openSeatTx 里（seat_transition.go）。
+		// 席位本就活跃或不存在时它返回 false，那两种情况都不该动 epoch。
+		if _, err := openSeatTx(tx, spaceId, uid, &role, uid); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 // updateMemberRole 更新成员角色，仅用于非 owner 角色（0/1）的变更。
@@ -839,6 +877,18 @@ func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) 
 // atomicReactivateMemberIfNotFull atomically checks capacity and reactivates a member.
 // Returns ErrSpaceFull if the space has reached its member limit.
 func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUsers int) error {
+	// 与 reactivateMember 对称地包上有界的 1213/1205 重试。此前只有那一条包了，
+	// 而两者现在都在同一事务内跑 reactivation 步骤、都按 space_member → octo_project
+	// 的顺序取锁，重试与否不该看函数名。步骤失败会回滚整次加入，而死锁是**瞬时**
+	// 失败——不重试就等于把「这次加入失败」的错误甩给用户。
+	//
+	// 从 BEGIN 重跑是安全的：失败的那次已被 InnoDB 回滚。
+	return dbpkg.RetryOnLockConflict(func() error {
+		return d.atomicReactivateMemberIfNotFullOnce(spaceId, uid, maxUsers)
+	})
+}
+
+func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, maxUsers int) error {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
@@ -862,24 +912,11 @@ func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUser
 		}
 	}
 
-	// Only a removed row is a reactivation. The status predicate prevents a
-	// stale caller from turning an already-active seat into a second rejoin
-	// intent, and RowsAffected gives the exact 0→1 transition.
-	result, err := tx.Update("space_member").
-		Set("status", 1).Set("role", 0).
-		Set("updated_at", time.Now()).
-		Where("space_id=? AND uid=? AND status=0", spaceId, uid).Exec()
-	if err != nil {
+	// Reactivate member
+	// 同 reactivateMember，走同一个入口；这条路径把角色重置为普通成员。
+	roleCommon := 0
+	if _, err = openSeatTx(tx, spaceId, uid, &roleCommon, uid); err != nil {
 		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 1 {
-		if err := enqueueMemberRejoinIntentTx(tx, spaceId, uid, uid); err != nil {
-			return err
-		}
 	}
 	return tx.Commit()
 }
@@ -984,7 +1021,30 @@ const (
 //
 // 邀请码在事务内**重新读取**，而不是沿用调用方在 CAS 之前读到的那份快照：
 // 并发重申可能已经把这行改成了另一个码，沿用旧快照会记账到错码上（round 2 P2-1）。
+// 有界的 1213/1205 重试，与另外两条重新激活路径对称。
+//
+// 补这个包装是因为**同一轮**给上面第 2 步加了 FOR UPDATE：这条路径此前只有 CAS 一处
+// 当前读，加锁定读把「瞬时死锁」从不可能变成可能，而它是四条重新激活门里唯一没有重试
+// 包装的一条——1213 会直接冒泡给审批人，表现为一次无理由失败的审批。两位 reviewer 分别
+// 提了「加 FOR UPDATE」和「这条路径没有重试包装（既有问题、本次未变）」，但没人把两者
+// 连起来：单独做前者会让后者从潜在缺陷变成实际缺陷。
+//
+// 从 BEGIN 重跑是安全的：失败的那次已被 InnoDB 完整回滚，CAS 会在重跑时重新判定，
+// 落空则返回 approveAlreadyHandled——与并发审批的既有语义一致。
 func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, maxUsers int) (approveOutcome, string, error) {
+	var (
+		outcome approveOutcome
+		code    string
+	)
+	err := dbpkg.RetryOnLockConflict(func() error {
+		var runErr error
+		outcome, code, runErr = d.approveJoinApplyAtomicOnce(applyID, reviewerUID, spaceId, maxUsers)
+		return runErr
+	})
+	return outcome, code, err
+}
+
+func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId string, maxUsers int) (approveOutcome, string, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return approveFailed, "", err
@@ -1012,8 +1072,15 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 		UID        string
 		InviteCode string
 	}
+	// FOR UPDATE, not a plain SELECT. Step 1's CAS already holds X on this row, so this
+	// takes no NEW lock and cannot deadlock — but in REPEATABLE READ the transaction's
+	// read view is assigned by the first CONSISTENT read, and a plain SELECT here would
+	// be that read. Everything after it, including the reactivation enumeration below,
+	// would then see a snapshot taken BEFORE the seat's X lock, which is exactly what
+	// the comment further down claims is not the case. One word, and it makes that
+	// comment true instead of aspirational.
 	if _, err = tx.SelectBySql(
-		"SELECT uid, invite_code FROM space_join_apply WHERE id=?", applyID,
+		"SELECT uid, invite_code FROM space_join_apply WHERE id=? FOR UPDATE", applyID,
 	).Load(&row); err != nil {
 		return approveFailed, "", err
 	}
@@ -1077,26 +1144,47 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 		return approveSpaceFull, row.InviteCode, nil
 	}
 
-	// 6. 写入或重新激活成员行。只有原先存在且已失活的行才是
-	// 0→1，且 intent 与成员状态共享这一个事务提交。
-	if memberRows > 0 {
-		result, err = tx.Update("space_member").
-			Set("status", 1).Set("role", 0).Set("updated_at", time.Now()).
-			Where("space_id=? AND uid=? AND status=0", spaceId, row.UID).Exec()
-		if err == nil {
-			affected, err = result.RowsAffected()
-			if err == nil && affected == 1 {
-				err = enqueueMemberRejoinIntentTx(tx, spaceId, row.UID, reviewerUID)
-			}
-		}
-	} else {
-		_, err = tx.InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-			spaceId, row.UID,
-		).Exec()
-	}
+	// 6. 写入或重新激活成员行
+	//
+	// 这两个分支不是同一件事，区别对下游是**载荷性**的：INSERT 建的是一个此前不存在的
+	// 席位，而 UPDATE 把一个已关闭的席位重新打开——后者会让**移除窗口里存活的项目席位
+	// 重新可达**，而这中间没有任何项目侧写入，所以除了下面那步没有任何东西会移动
+	// member_epoch。漏掉它，消费方缓存的那条**拒绝**会一直和 epoch 对得上（见
+	// SeatTransitionTxStep）。
+	//
+	// 本函数是**设计好的重新加入漏斗**，不是边缘路径：resetApprovedApplyForRejoin 存在
+	// 的目的就是把陈旧的已通过申请打回待审批，让被移除的人重新申请并从这里回来。
+	// 三个审批入口（空间内 / 管理端 / H5 auth_code）都汇聚到这里。
+	// 判据来自**写入**，而不是「之前那条读回了几行」。
+	//
+	// `memberRows > 0` 在今天是对的（行数由数据库给出、`row.UID` 也一路是数据库的拼写），
+	// 但那个正确性依赖一段论证，而同类判定在 upsertMembers 上就是靠一段论证塌掉的：那边
+	// 拿调用方拼写去查以数据库拼写为键的 map，在 0900_ai_ci 下漏判、席位重开而信号不发。
+	// 这里改成带 `status=0` 谓词的 UPDATE + RowsAffected，让数据库用自己的 collation 回答
+	// 「这次到底有没有把一个已关闭的席位打开」——判据不再有可漂移的中间量。
+	//
+	// row.UID 是 space_join_apply 的拼写——**第三张表**，又一次可能与 space_member 存的
+	// 字节不同。openSeatTx 内部会把标识符换成 space_member 自己的那串再交给步骤。
+	//
+	// 锁上下文与另外三条路径一致：本事务已在第 3 步对这一行取过 FOR UPDATE，所以步骤里
+	// 那条枚举读的视图晚于该 X 锁。
+	roleCommon := 0
+	reopened, err := openSeatTx(tx, spaceId, row.UID, &roleCommon, reviewerUID)
 	if err != nil {
 		return approveFailed, "", err
+	}
+	if !reopened {
+		// 不是重新激活：要么这行根本不存在（插入），要么它已经是活跃成员——而后者在第 3 步
+		// 就以 approveAlreadyMember 提前返回了，所以走到这里只剩「不存在」。
+		//
+		// 新插入的席位不发失效信号：它此前不存在，所以不可能有存活的项目席位被它重新变得
+		// 可达（新成员进项目要走项目侧写入，那边自己会 bump）。
+		if _, err = tx.InsertBySql(
+			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+			spaceId, row.UID,
+		).Exec(); err != nil {
+			return approveFailed, "", err
+		}
 	}
 
 	if err = tx.Commit(); err != nil {

@@ -138,16 +138,29 @@ const (
 	envProvisionMaxAttempts = "OCTO_PROJECT_PROVISION_MAX_ATTEMPTS"
 	envProvisionBatch       = "OCTO_PROJECT_PROVISION_BATCH"
 
-	// Sibling FIXED internal-token envs. Each provisioning credential must
-	// differ from every other capability so one leaked value cannot authorize
-	// two operations. The dynamic route-level credentials are covered centrally
-	// in main.go (see above).
+	// Sibling FIXED internal-token envs. A provisioning secret must differ from
+	// every one of them so a single leaked value cannot grant two capabilities.
+	// Same intra-set guard as modules/internal_resolve/config.go; the dynamic
+	// route-level credentials are covered centrally in main.go (see above).
+	//
+	// The membership token is here for the reason main.go's registry comment
+	// gives: an OUTBOUND secret equal to an INBOUND token is the worse half of
+	// the collision, because handing it to a peer hands the peer a credential
+	// that authenticates back to us. The central check sees this pair, but it
+	// only LOGS — leaving both capabilities live — so the refusal has to exist on
+	// at least one of the two sides. It exists on both; the reciprocal entry is
+	// modules/internal_membership's siblingFixedTokenEnvs.
 	siblingNotifyTokenEnv     = "NOTIFY_INTERNAL_TOKEN"
 	siblingDocsNotifyTokenEnv = "OCTO_DOCS_NOTIFY_TOKEN"
 	siblingBotMentionTokenEnv = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	// Keep this local alias for the intra-module collision loop and its tests;
 	// the exported DriveInternalTokenEnv is the configuration contract.
 	siblingDriveInternalToken = DriveInternalTokenEnv
+	siblingMembershipTokenEnv = "OCTO_MEMBERSHIP_INTERNAL_TOKEN"
+	siblingWebhookSecretEnv   = "TS_WEBHOOK_SECRET_KEY"
+	siblingMailGatewaySecret  = "OCTO_MAIL_GATEWAY_SECRET"
+	siblingGRPCAuthTokenEnv   = "TS_GRPC_AUTH_TOKEN"
+	siblingMarketplaceToken   = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
 )
 
 // Provisioning defaults.
@@ -476,6 +489,11 @@ func checkSecretExclusivity(
 		siblingDocsNotifyTokenEnv,
 		siblingBotMentionTokenEnv,
 		siblingDriveInternalToken,
+		siblingMembershipTokenEnv,
+		siblingWebhookSecretEnv,
+		siblingMailGatewaySecret,
+		siblingGRPCAuthTokenEnv,
+		siblingMarketplaceToken,
 	} {
 		if siblingEnv == credentialEnv {
 			continue
