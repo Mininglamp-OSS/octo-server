@@ -148,7 +148,7 @@ func TestMemberRemovalEnqueuesRevocationWithoutAVersion(t *testing.T) {
 
 	created := createProjectOn(t, r, spaceA, token, "event-revoke")
 	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
-		token, map[string]any{"uids": []string{"evtTarget"}})
+		token, addMembersPayload("evtTarget"))
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
