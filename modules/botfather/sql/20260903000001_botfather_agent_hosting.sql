@@ -28,15 +28,30 @@
 -- 转换，应用镜像又固定 TZ=Asia/Shanghai —— MySQL session 时区非 UTC 时两个时间戳会相差
 -- 8 小时且无任何标记解释。生产 MySQL 目前是 UTC，所以那是潜伏而非已发生；改用 NOW() 则
 -- 彻底不再依赖这个前提。
+-- **不能 pin ALGORITHM=INSTANT**：robot 表带函数索引
+--   UNIQUE KEY `idx_robot_bot_token` ((NULLIF(`bot_token`,'')))
+-- （modules/robot/sql/20260226000002_robot_legacy01.sql 建，seq 远早于本脚本，故任何
+-- 全量建库跑到这里时它一定已存在）。MySQL 用**隐藏虚拟生成列**实现函数索引，而带虚拟列
+-- 的表不支持 INSTANT ADD COLUMN，会报：
+--   Error 1846 (0A000): ALGORITHM=INSTANT is not supported. Reason: INPLACE ADD or
+--   DROP of virtual columns cannot be combined with other ALTER TABLE actions.
+-- 这句 reason 是**字面事实不是误导**。排查时注意：隐藏虚拟列**不出现在**
+-- information_schema.COLUMNS，靠查该表得出"本表无生成列"会把人带偏，要查
+-- information_schema.STATISTICS.EXPRESSION 或 SHOW CREATE TABLE。
+--
+-- 与目标 MySQL 发行版无关（原生 8.0 同样失败），也与加一列还是多列无关：实测在
+-- CREATE TABLE LIKE robot 的表上单列 + INSTANT 也报同一个 1846；而在无函数索引的表上
+-- 四种写法全过 —— 这正是同样 pin 了 INSTANT 的
+-- modules/opanalytics/sql/20260830000001（octo_fact_* 无函数索引）能成功的原因。
+--
+-- 所以此处不 pin 算法，交给引擎自选：robot 表体积很小，INPLACE 或 COPY 都
+-- 可接受。原先 pin INSTANT 的意图是"让不满足条件的环境早失败而非静默锁表"，但在**本表上
+-- INSTANT 永久不可满足**，pin 它的实际效果是让每个首次建库的环境启动即 panic。
 ALTER TABLE `robot`
   ADD COLUMN `agent_hosting` VARCHAR(64) NOT NULL DEFAULT ''
     COMMENT 'Agent自报托管形态,小写slug如self_hosted/octo_hosted/<vendor>_hosted;空+时间戳NULL=从未上报,空+时间戳非NULL=已显式清空;不可用于鉴权',
   ADD COLUMN `agent_reported_hosting_at` TIMESTAMP NULL DEFAULT NULL
-    COMMENT '最近一次收到agent_hosting上报的时间(SQL NOW()写入)；仅hosting上报时前进；判定agent_hosting新鲜度',
-  -- 显式 INSTANT：不 pin 的话，若目标 MySQL 无法满足会**静默退化为 COPY 锁表**
-  -- （同 modules/opanalytics/sql/20260830000001 的理由）。robot 表小、影响面有限，
-  -- 但显式声明能让不满足条件的环境早失败，而不是悄悄锁表。
-  ALGORITHM=INSTANT;
+    COMMENT '最近一次收到agent_hosting上报的时间(SQL NOW()写入)；仅hosting上报时前进；判定agent_hosting新鲜度';
 
 -- +migrate Down
 ALTER TABLE `robot`
