@@ -102,8 +102,12 @@ func (d *DB) insertLifecycleEventTx(tx *dbr.Tx, row lifecycleEventRow, now time.
 // anywhere, the correct shape is a cheap candidate read followed by a narrow
 // FOR UPDATE on those ids, and doing that here would rewrite the claim in the
 // same commit that is fixing two blockers. Recorded so the next person has the
-// numbers instead of the reassurance. An EXPLAIN under a synthetic backlog is
-// worth doing before this feed is enabled anywhere.
+// numbers instead of the reassurance.
+//
+// An EXPLAIN under a synthetic backlog is a PRECONDITION of enabling this feed
+// anywhere, not a suggestion — the one state in which this query runs hot is the
+// one nobody will be watching for. Stated again at envLifecycleEventsEnabled,
+// which is what an operator reads when they flip the switch.
 //
 // The alternative — a window function — cannot be combined with FOR UPDATE.
 func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease time.Duration) ([]lifecycleEventRow, error) {

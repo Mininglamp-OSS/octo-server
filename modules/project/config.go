@@ -84,6 +84,23 @@ const (
 	// worth more than the events a split switch would have preserved.
 	//
 	// Default OFF, like every other switch in this module.
+	//
+	// # Two preconditions before this is turned on anywhere
+	//
+	// Neither is enforced in code, because neither is a property this process can
+	// check. They are recorded here because this constant is what the person
+	// flipping the switch is looking at.
+	//
+	//  1. EXPLAIN the claim query under a synthetic backlog. claimLifecycleEvents
+	//     measures ~96x the no-antijoin cost and holds ~1000 record locks to claim
+	//     six rows at a 505-row backlog, and those locks reach insertLifecycleEventTx
+	//     inside a user-facing transaction. The numbers and the corrective shape (a
+	//     cheap candidate read, then a narrow FOR UPDATE on those ids) are in
+	//     db_lifecycle_event.go. Confirm the rewrite is not needed BEFORE the feed
+	//     runs hot, not after.
+	//  2. Confirm this deployment has projects the peer can accept. One switch drives
+	//     enqueue and delivery together for the reason above, so enabling it on a
+	//     deployment that already has projects needs the backfill named there.
 	envLifecycleEventsEnabled = "OCTO_PROJECT_LIFECYCLE_EVENTS_ENABLED"
 	// envLifecycleEventURL is the absolute POST endpoint events are delivered to,
 	// path included. Absolute rather than a base URL with a path appended here,
