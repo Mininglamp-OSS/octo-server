@@ -109,6 +109,16 @@ func (d *DB) insertLifecycleEventTx(tx *dbr.Tx, row lifecycleEventRow, now time.
 // one nobody will be watching for. Stated again at envLifecycleEventsEnabled,
 // which is what an operator reads when they flip the switch.
 //
+// Two things belong in that same rewrite, from review:
+//
+//   - A COVERING INDEX. idx_..._pending is (project_id, id) and does not cover the
+//     antijoin's status filter, which is part of why the optimizer declines it.
+//     (project_id, status, id) does.
+//   - A CONCURRENCY TEST, asserting that an open claim cannot block an unrelated
+//     project's transactional enqueue. That is the property the lock footprint
+//     threatens, it is the one an EXPLAIN cannot show, and insertLifecycleEventTx
+//     runs inside a user-facing transaction.
+//
 // The alternative — a window function — cannot be combined with FOR UPDATE.
 func (d *DB) claimLifecycleEvents(owner string, limit int, now time.Time, lease time.Duration) ([]lifecycleEventRow, error) {
 	tx, err := d.session.Begin()

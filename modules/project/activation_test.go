@@ -3,6 +3,7 @@ package project
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -514,4 +515,46 @@ func TestAProjectWithNoFleetJobIsLatchedEvenWhileFleetIsEnabled(t *testing.T) {
 		"a project with NO fleet job must be latched even while fleet is enabled: nothing "+
 			"will ever confirm it, the confirmation repair needs a ready job it does not have, "+
 			"and the alternative is invisible to the peer forever")
+}
+
+// TestBothActivationRepairsRunEvenWhenTheFirstFails pins that one repair's error
+// does not skip the other.
+//
+// A source guard rather than an engine test, because the condition is a DB error
+// from the first statement and there is no seam to inject one: p.db is a concrete
+// *DB, and every way of breaking latchUnconfirmableProjects from the outside
+// (dropping the provisioning table, say) breaks its sibling too, which is the one
+// thing the test would need to keep working.
+//
+// It is worth pinning anyway because of WHICH one used to be dropped. The early
+// return sat after the first call, so a transient failure there skipped
+// repairConfirmedButUnlatched — the repair that recovers projects the peer
+// currently reads as ABSENT, with their members denied on the peer side for as
+// long as it keeps failing. The one that kept running was the benign one: it
+// latches rows nothing will ever confirm, where a tick late changes nothing. The
+// two read different predicates, share no transaction, and have no ordering
+// between them, so there was never a reason to couple their failures.
+func TestBothActivationRepairsRunEvenWhenTheFirstFails(t *testing.T) {
+	body := funcBody(t, readStripped(t, "activation.go"), "func (p *Project) scanUnlatchedActivations(")
+
+	latchAt := strings.Index(body, "p.db.latchUnconfirmableProjects(")
+	repairAt := strings.Index(body, "p.db.repairConfirmedButUnlatched(")
+	require.GreaterOrEqual(t, latchAt, 0, "scanUnlatchedActivations must still latch unconfirmable projects")
+	require.GreaterOrEqual(t, repairAt, 0, "scanUnlatchedActivations must still repair confirmed-but-unlatched projects")
+	require.Less(t, latchAt, repairAt, "fixture drift: this guard assumes the latch runs first")
+
+	// Tokenised, not split on newlines: readStripped collapses the source to a
+	// single whitespace-separated line, so a line-based check silently passes on
+	// everything. The first version of this guard did exactly that and survived its
+	// own mutation — the failure mode two guards on this branch already had.
+	//
+	// scanUnlatchedActivations returns nothing, so any `return` token in it is a
+	// bare early return and there is no `return expr` to distinguish.
+	between := body[latchAt:repairAt]
+	for _, tok := range strings.Fields(between) {
+		require.NotEqual(t, "return", tok,
+			"no early return may sit between the two repairs: it would skip "+
+				"repairConfirmedButUnlatched, which is the one that makes peer-invisible "+
+				"projects visible again. Log the first failure and carry on.\nbetween: "+between)
+	}
 }

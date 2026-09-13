@@ -309,7 +309,29 @@ func (c *lifecycleHTTPClient) Send(ctx context.Context, env lifecycleEventEnvelo
 	// Read a bounded prefix. The body is only used to extract an error code, and
 	// an unbounded read from a peer that is misbehaving is how a delivery worker
 	// becomes a memory incident.
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+
+	// A truncated read is only allowed to change the answer on a 2xx, and that
+	// asymmetry is the whole point.
+	//
+	// lifecycleErrNetwork's own doc says it covers truncated responses, and until
+	// now nothing could produce it: the error was discarded, so a connection that
+	// broke mid-body on a 200 marked the event DELIVERED on a response this
+	// process never finished reading. That is the one direction that loses an
+	// event, and a redelivery is free — the peer fingerprints the payload behind
+	// event_id, so the retry is deduplicated rather than doubled.
+	//
+	// Every other status is classified from the STATUS LINE, which arrived intact
+	// before the body did; there the body only carries an error code for the
+	// detail text, and detail() already tolerates its absence. Reclassifying those
+	// would be a regression, not a fix: a truncated 409 is still a permanent
+	// refusal, and calling it a network error would spend the whole retry budget
+	// on a verdict that cannot change.
+	if readErr != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Detail carries no read-error text for the same reason the dial branch
+		// above carries none.
+		return lifecycleDeliveryResult{Retryable: true, Class: lifecycleErrNetwork, Detail: "truncated response"}
+	}
 	return classifyLifecycleResponse(resp.StatusCode, raw)
 }
 

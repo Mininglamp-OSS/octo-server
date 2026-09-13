@@ -259,10 +259,18 @@ func (p *Project) scanUnlatchedActivations() {
 	// all, repair what has one that reached ready. A project whose job exists and
 	// is still working is matched by neither, which is exactly the state that
 	// should keep waiting.
+	// The two repairs are INDEPENDENT, so one failing must not skip the other.
+	//
+	// This used to return on the first error, which cost the wrong one: the second
+	// repair is the one that recovers projects the peer currently reads as absent,
+	// and the first is the one whose failure is benign (it latches rows nothing
+	// will ever confirm — a tick late changes nothing). Different tables, no
+	// shared transaction, no ordering between them; the next tick retries either
+	// way, which is why this is small, but when they do not both run it is
+	// reliably the expensive one that is dropped.
 	latched, err := p.db.latchUnconfirmableProjects(now, p.cfg.ReconcileLimit)
 	if err != nil {
 		p.Warn("补置无人确认的项目激活闩锁失败", zap.Error(err))
-		return
 	}
 	if latched > 0 {
 		// Warn, not Error: a project with no fleet job is the expected shape after
@@ -276,7 +284,6 @@ func (p *Project) scanUnlatchedActivations() {
 	repaired, err := p.db.repairConfirmedButUnlatched(now, p.cfg.ReconcileLimit)
 	if err != nil {
 		p.Warn("修复未置位的项目激活闩锁失败", zap.Error(err))
-		return
 	}
 	if len(repaired) > 0 {
 		// Error, not Info: reaching here means the reactive latch did not run,

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -424,4 +425,89 @@ func TestValidateMatchesTheProvisioningValidator(t *testing.T) {
 	if err := validateLifecycleEndpoint("https://peer.invalid/internal/project-events", good); err != nil {
 		t.Fatalf("a well-formed endpoint must still be accepted, got %v", err)
 	}
+}
+
+// truncatingServer answers with status and a Content-Length that overstates the
+// body it actually writes, then drops the connection.
+//
+// Hijacked rather than written through ResponseWriter because net/http will not
+// help you lie: it reconciles Content-Length with what was written and closes
+// cleanly, which is the opposite of the condition under test. The client's
+// io.ReadAll therefore fails with an unexpected EOF, which is what a peer dying
+// mid-response looks like from this side.
+func truncatingServer(t *testing.T, status int, declared int, partial string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		hj, ok := w.(http.Hijacker)
+		require.True(t, ok, "test server must support hijacking")
+		conn, buf, err := hj.Hijack()
+		require.NoError(t, err)
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 " + strconv.Itoa(status) + " " + http.StatusText(status) + "\r\n")
+		_, _ = buf.WriteString("Content-Type: application/json\r\n")
+		_, _ = buf.WriteString("Content-Length: " + strconv.Itoa(declared) + "\r\n\r\n")
+		_, _ = buf.WriteString(partial)
+		_ = buf.Flush()
+	}))
+}
+
+func sendToTruncatingPeer(t *testing.T, status int, declared int, partial string) lifecycleDeliveryResult {
+	t.Helper()
+	srv := truncatingServer(t, status, declared, partial)
+	defer srv.Close()
+
+	client, err := newLifecycleHTTPClient(srv.URL+"/internal/project-events",
+		"0123456789abcdef0123456789abcdef", 5*time.Second)
+	require.NoError(t, err)
+
+	return client.Send(context.Background(), lifecycleEventEnvelope{
+		EventID:    "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+		EventType:  LifecycleEventMemberRevoked,
+		ProjectID:  "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+		SpaceID:    "sp-1",
+		OccurredAt: "2026-09-08T04:00:00Z",
+		Payload:    json.RawMessage(`{"subject_uid":"u1","member_epoch":12,"reason":"space_removed"}`),
+	})
+}
+
+// TestATruncated2xxIsNotDelivered pins the one direction a discarded read error
+// loses an event.
+//
+// Send used to throw io.ReadAll's error away, so a 200 whose body arrived
+// half-written marked the event DELIVERED against a response this process never
+// finished reading — and lifecycleErrNetwork's own doc claims to cover truncated
+// responses, so the enum documented a class the code could not emit.
+//
+// Retrying is free in the other direction: the peer fingerprints the payload
+// behind event_id, so a redelivery is deduplicated rather than applied twice.
+func TestATruncated2xxIsNotDelivered(t *testing.T) {
+	got := sendToTruncatingPeer(t, http.StatusOK, 4096, `{"st`)
+
+	assert.False(t, got.OK,
+		"a 200 whose body could not be read must not be recorded as delivered: the "+
+			"write that marks it delivered is the one that stops it being retried")
+	assert.True(t, got.Retryable, "a truncated response is transient, so it must retry")
+	assert.Equal(t, lifecycleErrNetwork, got.Class,
+		"and it must land in the class whose doc already claims to cover it")
+	assert.NotContains(t, got.Detail, "127.0.0.1",
+		"detail must not carry host or port, same rule as the dial branch")
+}
+
+// TestATruncatedTerminalRefusalStaysTerminal is the other half, and the reason
+// the capture is conditioned on the status rather than applied to every response.
+//
+// 409 is the one refusal that must never retry. The status line arrives intact
+// BEFORE the body, so a truncated body costs only the peer's error code — which
+// detail() already tolerates. Reclassifying it as a network error would spend the
+// whole attempt budget re-asking a question whose answer cannot change, and then
+// abandon the event for the wrong reason.
+func TestATruncatedTerminalRefusalStaysTerminal(t *testing.T) {
+	got := sendToTruncatingPeer(t, http.StatusConflict, 4096, `{"er`)
+
+	assert.False(t, got.OK)
+	assert.False(t, got.Retryable,
+		"a truncated 409 is still a permanent refusal; retrying it cannot change the verdict")
+	assert.Equal(t, lifecycleErrConflict, got.Class,
+		"the status line decides this, not the body that failed to arrive")
 }
