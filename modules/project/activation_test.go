@@ -355,23 +355,37 @@ func TestARejectedFleetConfigDoesNotDemolishTheGate(t *testing.T) {
 	p.cfg.Provisioning.Targets = nil
 	p.cfg.Provisioning.Misconfigured = []string{TargetFleet}
 
-	require.True(t, p.twoPhaseCreateApplies(),
-		"a REQUESTED target that was rejected at load is still something that can confirm "+
-			"once the env is fixed; only a target that was never configured is not")
+	require.False(t, p.twoPhaseCreateApplies(),
+		"a rejected target is not something that will confirm a project created NOW; what "+
+			"protects the project below is its existing job row, not this predicate")
 
 	p.scanUnlatchedActivations()
 
 	assert.Nil(t, activatedAtOf(t, created.ProjectID),
-		"a rejected fleet configuration must NOT latch projects awaiting confirmation. The "+
-			"latch is irreversible, so one boot-time typo would make them visible to the peer "+
-			"forever — and the sharpest trigger is this module's own credential guard, which "+
-			"drops the fleet target on a secret collision it exists to refuse")
+		"a rejected fleet configuration must NOT latch a project that is already awaiting "+
+			"confirmation. Its job row exists, so a confirmation is still one env fix away, "+
+			"and the latch is irreversible — one boot-time typo would otherwise make it "+
+			"visible to the peer forever. The sharpest trigger is this module's own credential "+
+			"guard, which drops the fleet target on a secret collision it exists to refuse.")
 }
 
-// TestARejectedFleetConfigStillGatesNewProjects covers the same conflation on
-// the insert path, which shares the predicate. Without it, new projects created
-// during the misconfiguration window skip the gate entirely.
-func TestARejectedFleetConfigStillGatesNewProjects(t *testing.T) {
+// TestARejectedFleetConfigActivatesNewProjectsAtInsertAndStaysThatWay is the
+// end-to-end case the insert path never had, and the one that exposed the
+// contradiction this replaces.
+//
+// It used to assert the opposite — that a project created while fleet is
+// requested-but-rejected WAITS — and that assertion was true only until the next
+// reconcile tick. Such a project gets no fleet job row (a rejected target never
+// reaches enqueueProvisioningTx), and latchUnconfirmableProjects' predicate is
+// exactly "no fleet job exists", so the tick latched it: irreversibly, behind a
+// count-only Warn indistinguishable from the benign straggler case, with the
+// awaiting-activation gauge dropping back to zero. The suite could not see it
+// because this case stopped at the insert and never ran a tick.
+//
+// So the policy is now the one the repair already enforced, and the assertion runs
+// the tick to prove the two agree rather than stopping where they still look like
+// they might.
+func TestARejectedFleetConfigActivatesNewProjectsAtInsertAndStaysThatWay(t *testing.T) {
 	fleet := newFakeTarget(t)
 	p, r, token := provisioningSetup(t, fleet)
 	p.cfg.Provisioning.Targets = nil
@@ -379,9 +393,24 @@ func TestARejectedFleetConfigStillGatesNewProjects(t *testing.T) {
 
 	created := createVia(t, r, token, "rejected-config-create")
 
-	assert.Nil(t, activatedAtOf(t, created.ProjectID),
-		"while fleet is requested-but-rejected, a new project must still wait: the operator "+
-			"is one env fix from a working confirmation, and the latch cannot be taken back")
+	at := activatedAtOf(t, created.ProjectID)
+	require.NotNil(t, at,
+		"a rejected target will not confirm a project created now, so the insert must say so "+
+			"rather than promising a wait the reconcile then cancels")
+
+	// No job row, which is WHY the old insert-time wait could not survive: this is
+	// exactly the state latchUnconfirmableProjects treats as unconfirmable.
+	assert.Empty(t, readProvisioningRows(t, created.ProjectID),
+		"a rejected target writes no fleet job, which is exactly the state "+
+			"latchUnconfirmableProjects reads as unconfirmable")
+
+	// And the tick changes nothing, because there is nothing left to disagree about.
+	p.scanUnlatchedActivations()
+	after := activatedAtOf(t, created.ProjectID)
+	require.NotNil(t, after)
+	assert.Equal(t, at.UTC(), after.UTC(),
+		"the repair must not move a latch the insert already set; a second timestamp here "+
+			"would mean the two statements still disagree, just more quietly")
 }
 
 // TestNeverConfiguredFleetStillLatches is the other side, and it is what stops
@@ -444,31 +473,40 @@ func TestAnOldPodDoesNotLatchANewPodsInFlightProject(t *testing.T) {
 
 // TestAProjectWithNoFleetJobIsLatchedEvenWhileFleetIsEnabled is P1-C case (b).
 //
-// A project created during a rejected-config window gets no fleet job at all,
-// because provisioning is enqueued from cfg.Targets and the rejection dropped
-// fleet from it. Skipping such a row while fleet is "requested" left it
-// unreachable by BOTH repairs — the other one needs a job in ready state — so it
-// was invisible to the peer forever, and fixing the env did not recover it.
+// A project can hold activated_at NULL with no fleet job at all: a pod that died
+// between the project INSERT and enqueueProvisioningTx, or a row written by an
+// older binary. Skipping such a row while fleet is "requested" left it unreachable
+// by BOTH repairs — the other one needs a job in ready state — so it was invisible
+// to the peer forever, and fixing the env did not recover it.
 //
 // Latching it is the milder of the two failures: the peer sees a project whose
 // container is not there yet, which is the window that exists today anyway.
+//
+// The fixture forces that state directly. It used to reach it through a
+// rejected-config window, and that is no longer a way to produce it: a project
+// created while fleet is requested-but-rejected is now activated AT INSERT
+// (twoPhaseCreateApplies stopped treating rejected as requested), precisely
+// because this test and the insert-time comment used to say opposite things about
+// the same row. Forcing the state keeps the property under test while removing
+// the contradiction that produced it.
 func TestAProjectWithNoFleetJobIsLatchedEvenWhileFleetIsEnabled(t *testing.T) {
 	fleet := newFakeTarget(t)
 	p, r, token := provisioningSetup(t, fleet)
 
-	// Reproduce the rejected window: fleet requested but not live, so create
-	// writes no provisioning row.
-	p.cfg.Provisioning.Targets = nil
-	p.cfg.Provisioning.Misconfigured = []string{TargetFleet}
 	created := createVia(t, r, token, "no-job")
-	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition: gated at insert")
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = NULL WHERE project_id = ?",
+		created.ProjectID).Exec()
+	require.NoError(t, err)
+	_, err = testCtx.DB().DeleteBySql(
+		"DELETE FROM `octo_project_provisioning` WHERE project_id = ?",
+		created.ProjectID).Exec()
+	require.NoError(t, err)
+	require.Nil(t, activatedAtOf(t, created.ProjectID), "precondition: awaiting confirmation")
 	require.Empty(t, readProvisioningRows(t, created.ProjectID),
-		"precondition: the rejection means no fleet job was ever written")
+		"precondition: no fleet job exists for this project")
 
-	// The operator fixes the env; this pod now has a working fleet target.
-	p.cfg.Provisioning.Targets = []provisionTarget{fleetTargetOn(fleet)}
-	p.cfg.Provisioning.Misconfigured = nil
-	require.True(t, p.twoPhaseCreateApplies())
+	require.True(t, p.twoPhaseCreateApplies(), "precondition: fleet is live on this pod")
 
 	p.scanUnlatchedActivations()
 

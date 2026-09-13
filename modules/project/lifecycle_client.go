@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Mininglamp-OSS/octo-server/internal/projectprovision"
 	"io"
 	"net/http"
 	"net/url"
@@ -178,6 +179,25 @@ func validateLifecycleEndpoint(rawURL, secret string) error {
 	if len(secret) < lifecycleEventMinSecretBytes {
 		return fmt.Errorf("project: lifecycle event secret must be at least %d bytes",
 			lifecycleEventMinSecretBytes)
+	}
+	// And the published conformance vectors, which the length floor does not catch:
+	// both are 33 bytes.
+	//
+	// This is the sibling's refusal, called rather than paraphrased. The two keys are
+	// printed in internal/projectprovision/conformance.go, in a public repository, and
+	// this feed signs to the SAME peer with the SAME pkg/octosign scheme — so a
+	// deployment configured with either one lets anyone who can read that file forge
+	// project.member_revoked or project.created for an arbitrary project id. The
+	// conformance suite's own tampered-body vector is literally the forgery such a key
+	// authorizes.
+	//
+	// The predicate deliberately lives in projectprovision next to the literals, so a
+	// fifth vector added there cannot leave this caller behind; re-declaring the strings
+	// here is how the two copies drift. The sibling refusing the same literals against
+	// the same peer is the repository already having decided this is worth refusing.
+	if projectprovision.IsPublishedConformanceSecret(secret) {
+		return errors.New("project: lifecycle event secret is a published conformance vector " +
+			"secret; generate a real one")
 	}
 	return nil
 }

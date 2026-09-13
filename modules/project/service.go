@@ -1972,18 +1972,42 @@ func (p *Project) beginRemovalWithAgentsTx(
 	if err != nil {
 		return false, nil, err
 	}
-	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
-		EventType: LifecycleEventMemberRevoked,
-		ProjectID: projectID,
-		SpaceID:   spaceID,
-		Payload: memberRevokedPayload{
-			SubjectUID:  targetUID,
-			MemberEpoch: epoch,
-			Reason:      reason,
-		},
-		OccurredAt: now,
-	}, now); err != nil {
-		return false, nil, err
+	// ONE event per CLOSED SEAT, the human's and every agent that went with them —
+	// not one event for the human.
+	//
+	// The agents hold octo_project_member seats, so they are members under the
+	// all-member-group invariant, and contract §3 carves out nothing for them. Every
+	// other channel in this transaction already treats these closures as member
+	// removals: each gets its own removal job above, its own audit entry, and its own
+	// role-cache invalidation. Only the peer-facing push skipped them, and nothing
+	// recorded the omission.
+	//
+	// Why that matters more for this event class than for a display update: the
+	// module's own doctrine is that losing a revocation is a security failure rather
+	// than a stale screen, because until it lands the removed principal can still
+	// execute on the consumer's side. An agent is an automated principal that runs as
+	// its owner, so a peer tearing down proactively on subject_uid never learns the
+	// agent has to stop.
+	//
+	// The SAME post-bump epoch on all of them, deliberately. One membership change
+	// moved the counter once; the epoch here is an idempotency key, not a per-event
+	// sequence, so giving the agents a different value would claim changes that did
+	// not happen. The owner's reason for the same reason: the agent's seat closed
+	// because the owner's did.
+	for _, uid := range closingUIDs {
+		if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+			EventType: LifecycleEventMemberRevoked,
+			ProjectID: projectID,
+			SpaceID:   spaceID,
+			Payload: memberRevokedPayload{
+				SubjectUID:  uid,
+				MemberEpoch: epoch,
+				Reason:      reason,
+			},
+			OccurredAt: now,
+		}, now); err != nil {
+			return false, nil, err
+		}
 	}
 	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
 		ProjectID:   projectID,

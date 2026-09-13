@@ -364,7 +364,7 @@ func validateCredential(name, label, value string) error {
 	if len(value) < minSecretBytes {
 		return fmt.Errorf("projectprovision: %s %s must be at least %d bytes", name, label, minSecretBytes)
 	}
-	if isPublishedConformanceSecret(value) {
+	if IsPublishedConformanceSecret(value) {
 		return fmt.Errorf("projectprovision: %s %s is a published conformance vector secret; generate a real one",
 			name, label)
 	}

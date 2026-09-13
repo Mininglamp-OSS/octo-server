@@ -470,9 +470,21 @@ func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs 
 // The predicate comes from spacepkg.ActiveMembers rather than being spelled out
 // again, so it cannot drift from CheckMembership's.
 //
-// MembershipsInSpace is deliberately NOT changed: it answers for the caller's OWN
-// token holder on a route that already ran SpaceMiddleware, so its consumer both
-// has the Space half and has already applied it.
+// MembershipsInSpace is deliberately NOT changed, and the reason it used to give
+// was false. It said the route "already ran SpaceMiddleware", so the consumer held
+// the Space half. It does not: modules/user/api.go registers POST /v1/auth/verify
+// in a group whose only middleware is the rate limiter, and the request carries a
+// caller-supplied space_id.
+//
+// The exemption survives on a different fact, which is the one to check if this is
+// ever revisited: the uid is not caller-supplied. authVerifyToken derives it from
+// the PRESENTED TOKEN (tokenValidator.Validate), so every answer this function can
+// produce is about the token holder themselves, and the seat predicate means a
+// `member: true` can only ever be self-information. A caller naming a Space they
+// hold no seat in learns nothing, because they hold no seat in its projects either.
+//
+// That is why it is exempt from the SPACE conjunction. It is NOT by itself a reason
+// to exempt it from the ACTIVATION gate — see the note on that below.
 //
 // # Already-cached grants: closed elsewhere, not here
 //

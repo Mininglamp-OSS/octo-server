@@ -12,9 +12,30 @@ import (
 //
 // A project row exists from the moment create commits, but the peer control
 // plane must not be able to authorize anyone into it before the subsystem side
-// confirms the project has a container. Until then the two inbound endpoints
-// answer exactly as they answer about a project that does not exist: epoch 0,
-// member false.
+// confirms the project has a container. Until then the two INTERNAL inbound
+// endpoints answer exactly as they answer about a project that does not exist:
+// epoch 0, member false.
+//
+// # A third surface answers about project membership and is NOT gated
+//
+// POST /v1/auth/verify (modules/user, answerProjectMembership) reaches
+// pkg/project.MembershipsInSpace, which carries no activation term. The same
+// database state therefore produces two different answers: the internal epochs
+// endpoint reports the project absent while /v1/auth/verify reports member: true
+// with a role.
+//
+// Stated here rather than left to be discovered, because this preamble used to
+// read as complete peer-facing coverage and is cited as such. The gap is bounded
+// by WHOSE question that endpoint answers: its uid comes from the presented token,
+// never from the request body, so an unactivated project can only ever be revealed
+// to somebody who already holds a seat in it — in practice its own creator, during
+// the provisioning window.
+//
+// Gating it is a product decision rather than a correctness one, which is why it
+// is not done here: the cost is that a creator's own just-created project vanishes
+// from their own client until fleet confirms. Whoever takes that decision should
+// also correct this section, docs/project-lifecycle-contract.md section 7, and the
+// header of migration 20260908000007.
 //
 // The gate is octo_project.activated_at, a one-way latch. It is NOT the
 // provisioning table: that table records jobs, a read path is forbidden to gate
@@ -39,45 +60,59 @@ import (
 // target stayed off, which is exactly the state that strands projects, and
 // there is no operational reason to want the wait without the thing waited on.
 //
-// # A REQUESTED-BUT-REJECTED target still counts as "something will answer"
+// # A REQUESTED-BUT-REJECTED target does NOT count as "something will answer"
 //
-// Absent from cfg.Targets has two causes and they want opposite behaviour:
+// Absent from cfg.Targets has two causes — never configured, and configured but
+// REJECTED at load (ValidateTarget failed, or checkSecretExclusivity found a
+// collision; the target is dropped from Targets, recorded in Misconfigured, and
+// the process boots anyway behind a loud gauge).
 //
-//	never configured  -> nothing will ever confirm    -> latch, or projects are
-//	                                                     invisible forever
-//	configured and REJECTED at load -> one env fix away from confirming
+// This predicate used to treat rejected as requested, so a project created during
+// that window waited. That produced a CONTRADICTION with latchUnconfirmableProjects
+// ~150 lines below, and the contradiction, not the policy, is what shipped:
 //
-// A rejected target — ValidateTarget failed, or checkSecretExclusivity found a
-// collision — is DROPPED from Targets and recorded in Misconfigured, and the
-// process boots anyway (a loud gauge rather than a refusal to start). Asking
-// only TargetByName conflated the two, and the conflation was not academic:
-// the latch is IRREVERSIBLE, so on the next reconcile tick every project
-// genuinely awaiting confirmation — jobs in flight, jobs in backoff — became
-// permanently visible to the peer, and fixing the env afterwards could not undo
-// it. It also contradicted the rule pinned one function below, that the
-// straggler repair must not run while a confirmation is still possible.
+//   - a rejected target never reaches enqueueProvisioningTx, so no fleet job row is
+//     written at create;
+//   - latchUnconfirmableProjects' predicate is per row and reads exactly "no fleet
+//     job exists";
+//   - so the very next reconcile tick latched the project anyway — irreversibly,
+//     with only a count-only Warn, and with the awaiting-activation gauge dropping
+//     back to zero because the census counts activated_at IS NULL.
 //
-// The sharpest path was this module's own fail-closed credential guard:
-// setting OCTO_PROJECT_LIFECYCLE_EVENT_SECRET equal to the fleet provisioning
-// secret makes checkSecretExclusivity drop the fleet target — so a secret-reuse
-// mistake, which that guard exists to REFUSE, converted into a permanent
-// fail-open of the visibility gate.
+// The consolation this comment used to promise — "projects wait, the gauges climb,
+// the operator has a gauge and a boot-time Error" — was therefore false after one
+// tick. Two statements a hundred lines apart disagreed and the suite could not see
+// it, because the pins created their project while fleet was WORKING (so a job row
+// existed and the per-row predicate declined) and never covered a project created
+// while the config was already rejected.
 //
-// Misconfigured therefore counts as requested. The cost of being wrong in this
-// direction is bounded and visible: projects wait, the awaiting-activation
-// gauges climb, and an operator has both a gauge and a boot-time Error naming
-// the rejected target. The cost of being wrong the other way is silent and
-// permanent.
+// Resolved by making the insert agree with the repair rather than the other way
+// round: a rejected target means no confirmation is coming for a project created
+// now, so such a project is activated at insert. The end state is identical to what
+// shipped — visible to the peer, no container — minus the irreversible latch, the
+// misleading Warn and the false paragraph.
+//
+// What that gives up, stated plainly: a secret-reuse mistake, which
+// checkSecretExclusivity exists to REFUSE, now makes new projects peer-visible
+// immediately rather than one tick later. The guard still refuses the credential;
+// what it cannot do is hold the visibility gate shut for projects whose confirmation
+// nothing will deliver.
+//
+// The stronger fix, NOT taken here because it changes octo_project_provisioning's
+// semantics: persist "fleet was requested for this project" PER ROW even when the
+// target is rejected — a job row in a non-claimable blocked status — so the repair
+// can tell never-requested from requested-but-rejected, and so the blocked rows
+// become claimable once the env is fixed. That recovers the window's projects
+// instead of accepting them; it is the right shape if this window is ever judged to
+// matter.
+//
+// Projects already IN FLIGHT when the config is rejected are unaffected by any of
+// this: they have a job row, so the per-row predicate declines to latch them and
+// they keep waiting for the env fix. TestARejectedFleetConfigDoesNotDemolishTheGate
+// pins that, and it is the protection that was actually load-bearing.
 func (p *Project) twoPhaseCreateApplies() bool {
-	if _, ok := p.cfg.Provisioning.TargetByName(TargetFleet); ok {
-		return true
-	}
-	for _, name := range p.cfg.Provisioning.Misconfigured {
-		if name == TargetFleet {
-			return true
-		}
-	}
-	return false
+	_, ok := p.cfg.Provisioning.TargetByName(TargetFleet)
+	return ok
 }
 
 // activateProject sets the latch, once.

@@ -567,18 +567,42 @@ func (p *Project) deactivateSeatForCascadeResult(
 		if err != nil {
 			return cascadeSeatResult{}, err
 		}
-		if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
-			EventType: LifecycleEventMemberRevoked,
-			ProjectID: projectID,
-			SpaceID:   spaceID,
-			Payload: memberRevokedPayload{
-				SubjectUID:  uid,
-				MemberEpoch: epoch,
-				Reason:      reason,
-			},
-			OccurredAt: now,
-		}, now); err != nil {
-			return cascadeSeatResult{}, err
+		// ONE event per CLOSED SEAT — closingUIDs, not uid. It fixes an omission and
+		// an over-emission at once, in opposite directions:
+		//
+		//   - UNDER: the agents that went with the human hold octo_project_member
+		//     seats, so they are members under the all-member-group invariant and
+		//     contract §3 carves out nothing for them. Their seats close in this very
+		//     transaction, each with its own removal job, its own audit entry
+		//     (agent_follows_owner) and its own role-cache invalidation — every
+		//     channel except the peer-facing push already treated them as member
+		//     removals. An agent is an automated principal running as its owner, so a
+		//     peer that tears down on subject_uid never learned it has to stop.
+		//   - OVER: closingUIDs omits `uid` when memberChanged is false, which is the
+		//     preserve-owner case. seatChanged is true there whenever any agent
+		//     closed, so emitting for `uid` announced a revocation for a human whose
+		//     seat is still open — a peer acting on it would tear down access the
+		//     database still grants. closingUIDs is built from what actually changed,
+		//     so it cannot say that.
+		//
+		// The SAME post-bump epoch on every one, deliberately: one membership change
+		// moved the counter once, and the epoch here is an idempotency key rather than
+		// a per-event sequence. Different values would claim changes that never
+		// happened.
+		for _, closed := range closingUIDs {
+			if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+				EventType: LifecycleEventMemberRevoked,
+				ProjectID: projectID,
+				SpaceID:   spaceID,
+				Payload: memberRevokedPayload{
+					SubjectUID:  closed,
+					MemberEpoch: epoch,
+					Reason:      reason,
+				},
+				OccurredAt: now,
+			}, now); err != nil {
+				return cascadeSeatResult{}, err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

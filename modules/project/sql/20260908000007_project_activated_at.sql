@@ -30,8 +30,13 @@
 --
 -- BACKFILL. Existing rows are set to created_at, not left NULL. They were
 -- created before this gate existed, and leaving them NULL would silently remove
--- every existing project from the two peer-facing endpoints the moment this
--- deploys -- a mass revocation dressed up as a migration.
+-- every existing project from the two INTERNAL peer-facing endpoints the moment
+-- this deploys -- a mass revocation dressed up as a migration.
+--
+-- "Two endpoints" is the internal pair (membership/epochs and
+-- project-memberships/_verify). POST /v1/auth/verify answers about project
+-- membership too and is NOT gated on this column; see modules/project/activation.go
+-- for why that is currently a product decision rather than an oversight.
 --
 -- WHEN IT IS SET ON A NEW ROW. At insert, unless the fleet provisioning target
 -- is enabled. That default is the important half: with no target enabled nothing

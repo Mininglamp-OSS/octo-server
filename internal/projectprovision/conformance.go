@@ -173,12 +173,17 @@ func ConformanceVectors() []ConformanceVector {
 	}
 }
 
-// isPublishedConformanceSecret reports whether s is one of the secrets this file publishes.
+// IsPublishedConformanceSecret reports whether s is one of the secrets this file publishes.
 //
 // Kept next to the literals it guards rather than in client.go, so adding a fifth vector
 // with a new secret cannot leave the check behind: whoever adds the constant is editing
 // this file.
-func isPublishedConformanceSecret(s string) bool {
+//
+// Exported because modules/project signs an outbound feed to the SAME peer with the SAME
+// pkg/octosign scheme, so the same published keys are the same forgery risk there. It must
+// call this rather than re-declare the literals: a second copy is how one of them gets a
+// fifth vector and the other does not.
+func IsPublishedConformanceSecret(s string) bool {
 	for _, published := range []string{conformanceSecret, conformanceOtherSecret} {
 		if subtle.ConstantTimeCompare([]byte(s), []byte(published)) == 1 {
 			return true

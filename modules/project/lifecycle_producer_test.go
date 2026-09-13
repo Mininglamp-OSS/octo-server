@@ -378,3 +378,125 @@ func TestANoOpUpdateWritesNoAuditEntry(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.Equal(t, before+1, len(rec.byAction(auditUpdate)), "a real change is still audited")
 }
+
+// revokedSubjects returns the subject_uid of every member_revoked event on a
+// project, in enqueue order, paired with the epoch it carried.
+//
+// A helper rather than an inline loop because the two cases below assert the same
+// shape on two different code paths, and the whole point is that they agree.
+func revokedSubjects(t *testing.T, projectID string) (subjects []string, epochs []int64) {
+	t.Helper()
+	for _, row := range outboxRows(t, projectID) {
+		if row.EventType != LifecycleEventMemberRevoked {
+			continue
+		}
+		var payload memberRevokedPayload
+		require.NoError(t, json.Unmarshal([]byte(row.Payload), &payload))
+		subjects = append(subjects, payload.SubjectUID)
+		epochs = append(epochs, payload.MemberEpoch)
+	}
+	return subjects, epochs
+}
+
+// TestDirectRemovalRevokesTheAgentSeatsToo covers the kick/leave funnel.
+//
+// Before this, the funnel closed the human's seat AND every owned agent seat in one
+// transaction — one removal job each, one audit entry each, one role-cache
+// invalidation each — and enqueued exactly ONE member_revoked, naming the human.
+// The agents' closures reached every channel except the peer-facing push.
+//
+// Why that is a security gap and not a display gap: the module's own doctrine for
+// this event class is that a lost revocation lets the removed principal keep
+// executing on the consumer's side until it lands. An agent is an automated
+// principal running as its owner, so a peer that tears down proactively on
+// subject_uid never learns the agent has to stop. Contract §3 carves out nothing
+// for agents, and they hold octo_project_member seats, so they are members.
+func TestDirectRemovalRevokesTheAgentSeatsToo(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "agRvOwner")
+	seedSpaceMember(t, spaceA, "agRvOwner", 0, 1)
+	seedUser(t, "agRvTarget")
+	seedSpaceMember(t, spaceA, "agRvTarget", 0, 1)
+	seedAgent(t, spaceA, "agRvBot", "agRvTarget", "octo_hosted")
+
+	created := createProjectOn(t, r, spaceA, token, "agent-revoke")
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		token, addMembersPayload("agRvTarget", "agRvBot"))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	w = doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
+		token, map[string]any{"uids": []string{"agRvTarget"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	subjects, epochs := revokedSubjects(t, created.ProjectID)
+	assert.ElementsMatch(t, []string{"agRvTarget", "agRvBot"}, subjects,
+		"one member_revoked per CLOSED SEAT: the human and the agent that went with them. "+
+			"Only the human means a peer acting on subject_uid never learns the agent must stop")
+
+	// One membership change moved the counter once, so every event carries the same
+	// epoch. Distinct values would claim changes that did not happen — the epoch here
+	// is an idempotency key, not a per-event sequence.
+	require.NotEmpty(t, epochs)
+	for _, e := range epochs {
+		assert.Equal(t, epochs[0], e,
+			"all revocations from one seat-close transaction must carry the same post-bump epoch")
+	}
+}
+
+// TestCascadeRevokesTheAgentSeatsAndNotThePreservedOwner covers the Space-removal
+// cascade, and the OTHER direction of the same defect.
+//
+// Under-emission was the agents. Over-emission is the preserved Owner: seatChanged
+// is true whenever any agent closed, so enqueueing for `uid` announced a revocation
+// for a human whose seat is deliberately still open. A peer acting on that would
+// tear down access the database still grants — the inverse failure, and the worse
+// one, because it is wrong rather than late.
+//
+// Asserting both in one case on purpose: a fix that emitted per closed seat but
+// kept the human in the list would pass an agents-only assertion.
+func TestCascadeRevokesTheAgentSeatsAndNotThePreservedOwner(t *testing.T) {
+	_, p := setup(t)
+	enableOutbox(t, p)
+	p.registerSpaceMemberRemovalCleanup()
+	r := mountProject(t, p)
+	seedSpace(t, spaceA, 1)
+	token := seedUser(t, "csRvOwner")
+	seedSpaceMember(t, spaceA, "csRvOwner", 0, 1)
+	seedAgent(t, spaceA, "csRvBot", "csRvOwner", "octo_hosted")
+
+	created := createProjectOn(t, r, spaceA, token, "cascade-agent-revoke")
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		token, addMembersPayload("csRvBot"))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	// The Space seat has to close FIRST, through the real Space entry point: the
+	// cascade's outer gate re-checks Space membership and SKIPS a member who still
+	// holds their seat (that is the rejoin guard), so driving runCascade against a
+	// live seat would pass this test by doing nothing at all.
+	closed, err := spacemod.CloseAllSpaceSeats(
+		testCtx, "csRvOwner", "csRvOperator", spacemod.MemberRemoveReasonForceRemoved)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{spaceA}, closed)
+
+	// The cascade preserves the Owner's PROJECT seat (an ownerless project is
+	// unrecoverable) and closes the rider. Called directly as well, because the
+	// asynchronous worker may or may not have run it already and this case is about
+	// the project-side contract rather than about worker timing.
+	require.NoError(t, runCascade(t, p, spaceA, "csRvOwner", "csRvOperator",
+		spacemod.MemberRemoveReasonForceRemoved))
+
+	subjects, _ := revokedSubjects(t, created.ProjectID)
+	assert.Contains(t, subjects, "csRvBot",
+		"the rider's seat closed in this transaction, so its revocation must be pushed")
+	assert.NotContains(t, subjects, "csRvOwner",
+		"the Owner's project seat is PRESERVED here, so announcing a revocation for them "+
+			"would have a peer tear down access the database still grants")
+
+	owner := memberRow(t, created.ProjectID, "csRvOwner")
+	require.NotNil(t, owner)
+	assert.Equal(t, MemberStatusActive, owner.Status,
+		"fixture check: this case only means something while the Owner's seat is preserved")
+}

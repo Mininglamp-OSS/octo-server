@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"github.com/Mininglamp-OSS/octo-server/internal/projectprovision"
 	"github.com/google/uuid"
 	"net/http"
 	"strings"
@@ -231,6 +232,13 @@ func TestTheGateAndTheClientAgree(t *testing.T) {
 		{"https://peer.invalid/internal/project-events", strings.Repeat("s", 31)},
 		{"https://peer.invalid/internal/project-events", ""},
 		{"", good},
+		// The published conformance vectors. Both are 33 bytes, so the length floor
+		// passes them and only the explicit refusal catches them — which is the gap
+		// this row exists for: the word "conformance" appeared nowhere in this
+		// package's tests, so the sibling refusing them and this gate accepting them
+		// was invisible to the suite.
+		{"https://peer.invalid/internal/project-events", "conformance-secret-0123456789abcd"},
+		{"https://peer.invalid/internal/project-events", "conformance-secret-DIFFERENT-0123"},
 	} {
 		_, clientErr := newLifecycleHTTPClient(tc.url, tc.secret, time.Second)
 		gateOK := newOutboxTestProject(Config{
@@ -532,4 +540,42 @@ func TestTheHeartbeatDoesNotRenewOrphanedRows(t *testing.T) {
 		"the orphan's lease must NOT move: an owner-scoped renewal keeps it alive for the "+
 			"life of the process, and a row that is pending-but-never-expiring is invisible "+
 			"to the sweep AND to the claim, blocking its whole project's queue")
+}
+
+// TestTheLifecycleGateRefusesThePublishedConformanceSecrets pins the refusal
+// directly, not only through the parity table.
+//
+// The parity table asserts the gate and the client AGREE; it would stay green if
+// both accepted a published vector. This asserts the direction that matters, and
+// it asserts it against the exported predicate rather than against copies of the
+// literals — a fifth vector added in internal/projectprovision must make this
+// case cover it without anyone editing this file.
+//
+// Why it is a refusal and not a warning: the two keys are printed in a public
+// repository, this feed signs to the same peer with the same pkg/octosign scheme,
+// and the validator permits plain http — so the HMAC key is the only authenticity
+// layer on the wire. A deployment configured with either one lets anyone who can
+// read that file forge project.member_revoked for an arbitrary project id.
+func TestTheLifecycleGateRefusesThePublishedConformanceSecrets(t *testing.T) {
+	const url = "https://peer.invalid/internal/project-events"
+	for _, secret := range []string{
+		"conformance-secret-0123456789abcd",
+		"conformance-secret-DIFFERENT-0123",
+	} {
+		require.True(t, projectprovision.IsPublishedConformanceSecret(secret),
+			"fixture drift: %q is no longer a published vector, so this case proves nothing", secret)
+		require.GreaterOrEqual(t, len(secret), lifecycleEventMinSecretBytes,
+			"fixture drift: %q now fails the length floor, so the explicit refusal is no longer "+
+				"the thing under test", secret)
+
+		err := validateLifecycleEndpoint(url, secret)
+		require.Error(t, err, "the gate must refuse the published vector %q", secret)
+		assert.Contains(t, err.Error(), "published conformance vector",
+			"and say why, in the shape projectprovision's own refusal uses")
+
+		assert.False(t, newOutboxTestProject(Config{
+			LifecycleEventsEnabled: true, LifecycleEventURL: url, LifecycleEventSecret: secret,
+		}).lifecycleEventsEnabled(),
+			"and the enqueue gate must stay shut, or the outbox fills with events no sender can build")
+	}
 }
