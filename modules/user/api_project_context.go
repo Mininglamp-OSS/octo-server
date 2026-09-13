@@ -74,7 +74,11 @@ func (u *User) answerProjectMembership(uid, spaceID string, projectIDs []string)
 			continue
 		}
 		seen[pid] = true
-		row, ok := rows[pid]
+		// FOLDED lookup: MembershipsInSpace keys its answer by the folded id
+		// because project_id compares case-insensitively in SQL and a byte-exact
+		// Go lookup therefore drops a real member. The ANSWER still carries the
+		// caller's own spelling below — pid, never the map's key.
+		row, ok := rows[projectpkg.FoldID(pid)]
 		if !ok {
 			// Not a member, no such project, or another Space — one answer,
 			// carrying nothing else. The distinguishing reason is not logged per

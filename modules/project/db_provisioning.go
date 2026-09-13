@@ -638,14 +638,51 @@ func (d *DB) repairConfirmedButUnlatched(now time.Time, limit int) ([]string, er
 	// activated_at IS NULL is repeated in the UPDATE rather than trusted from the
 	// SELECT: the reactive path may have latched a row in between, and that
 	// timestamp is the earlier and truer one.
-	if _, err := d.session.UpdateBySql(
+	res, err := d.session.UpdateBySql(
 		"UPDATE `octo_project` SET activated_at = ? "+
 			"WHERE project_id IN ? AND activated_at IS NULL AND status = ?",
 		now, ids, StatusNormal,
-	).Exec(); err != nil {
+	).Exec()
+	if err != nil {
 		return nil, fmt.Errorf("project: repair unlatched activation: %w", err)
 	}
-	return ids, nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("project: repair unlatched activation rows: %w", err)
+	}
+	if affected == 0 {
+		return nil, nil
+	}
+
+	// The CANDIDATES are not the repairs, and the caller logs these ids at Error.
+	//
+	// The predicate above means a row is taken by exactly one writer, but the SELECT
+	// runs on every replica every tick: returning its ids made two pods log the same
+	// Error with the same project list for one repair, and reported a row the
+	// reactive path latched in between as repaired here. An Error whose payload says
+	// "these were invisible to the peer for a reconcile interval" has to name rows
+	// this statement actually changed.
+	//
+	// Recovered by the timestamp this call wrote, which the predicate makes unique
+	// per row among concurrent repairers. Residual: two replicas whose `now` lands
+	// on the same DATETIME(3) millisecond would each claim the other's rows — the
+	// double-reporting this replaces, in a window a thousand times narrower, and
+	// with no effect on what was written.
+	//
+	// Both siblings already do this — latchUnconfirmableProjects returns
+	// RowsAffected, abandonExhaustedLifecycleEvents likewise.
+	var repaired []string
+	if _, err := d.session.SelectBySql(
+		"SELECT project_id FROM `octo_project` "+
+			"WHERE project_id IN ? AND activated_at = ? AND status = ?",
+		ids, now, StatusNormal,
+	).Load(&repaired); err != nil {
+		// The write landed; only the attribution failed. Report the count rather
+		// than losing the fact that a repair happened.
+		return nil, fmt.Errorf("project: identify repaired activations (%d row(s) latched): %w",
+			affected, err)
+	}
+	return repaired, nil
 }
 
 // latchUnconfirmableProjects sets the latch on projects that NOTHING WILL EVER

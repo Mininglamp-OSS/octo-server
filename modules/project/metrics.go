@@ -300,12 +300,31 @@ var removalAbandoned = promauto.NewCounter(prometheus.CounterOpts{
 // error_class are small enums. No project_id, space_id or uid anywhere, for the
 // reason stated at the top of this file.
 
-// lifecycleEventEnqueued counts events written into the outbox, by type.
+// lifecycleEventEnqueued counts INSERTs of outbox rows that returned without
+// error, by type. It is incremented inside the producer's transaction.
 //
-// Paired with lifecycleEventOutcome, the two make the outbox auditable without
-// reading the table: enqueued minus delivered minus abandoned is what is still
-// owed to the peer, and a divergence between that and the backlog gauge means
-// rows are leaving by a path nobody intended.
+// So it is an UPPER BOUND on rows that exist, not a count of them: the insert is
+// pre-commit, and a transaction that rolls back afterwards — a create whose
+// provisioning enqueue failed, or any attempt retried by retryOnLockConflict —
+// leaves the increment behind with no surviving row.
+//
+// That matters for how it is read, and this text used to get it wrong. It said
+// "enqueued minus delivered minus abandoned is what is still owed to the peer,
+// and a divergence between that and the backlog gauge means rows are leaving by
+// a path nobody intended" — which turns every rollback and every deadlock retry
+// into exactly that divergence, i.e. into the alert an operator was told to treat
+// as rows disappearing. The honest relation is an inequality:
+//
+//	enqueued >= delivered + abandoned + backlog
+//
+// A SUSTAINED and GROWING gap is still worth looking at; a small standing one is
+// rollbacks and retries and means nothing.
+//
+// Making the counter exact is possible and was not done here: each producer has
+// exactly one Commit, so the types could be collected locally and incremented
+// after it. That is four call sites' worth of threaded state for a monitoring
+// nicety, and the inequality above is enough to answer the question the metric
+// exists for.
 var lifecycleEventEnqueued = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: metricNamespace,
 	Name:      "lifecycle_event_enqueued_total",

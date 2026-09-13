@@ -120,15 +120,50 @@ func (p *Project) startLifecycleEventWorker() {
 	})
 }
 
-// lifecycleSenderOrDefault returns the injected sender, or builds the real one.
+// lifecycleSenderKey is the configuration a memoised sender was built from.
+//
+// Compared by value so a config change under a running process rebuilds the
+// client instead of signing with a stale secret. The secret is part of the key
+// because it is part of what the client bakes in.
+type lifecycleSenderKey struct {
+	url     string
+	secret  string
+	timeout time.Duration
+}
+
+// lifecycleSenderOrDefault returns the injected sender, or the real one — built
+// once per process and reused.
 //
 // The seam exists so worker behaviour is testable without an HTTP server; see
 // lifecycleSender. Production never sets the field.
+//
+// Reuse is the point, not an optimisation: this used to construct a fresh
+// http.Client and a cloned Transport on every five-second tick, so the transport's
+// connection pool never saw a second request and each event paid a full TCP+TLS
+// handshake, while every superseded transport sat on its idle connections for its
+// whole IdleConnTimeout. See builtLifecycleSender.
 func (p *Project) lifecycleSenderOrDefault() (lifecycleSender, error) {
 	if p.lifecycleEventSender != nil {
 		return p.lifecycleEventSender, nil
 	}
-	return newLifecycleHTTPClient(p.cfg.LifecycleEventURL, p.cfg.LifecycleEventSecret, p.cfg.LifecycleEventTimeout)
+	want := lifecycleSenderKey{
+		url:     p.cfg.LifecycleEventURL,
+		secret:  p.cfg.LifecycleEventSecret,
+		timeout: p.cfg.LifecycleEventTimeout,
+	}
+	p.lifecycleSenderMu.Lock()
+	defer p.lifecycleSenderMu.Unlock()
+	if p.builtLifecycleSender != nil && p.builtLifecycleFrom == want {
+		return p.builtLifecycleSender, nil
+	}
+	built, err := newLifecycleHTTPClient(want.url, want.secret, want.timeout)
+	if err != nil {
+		// Not cached: a later tick must re-validate rather than inherit a refusal,
+		// because the configuration is what changed and it can change back.
+		return nil, err
+	}
+	p.builtLifecycleSender, p.builtLifecycleFrom = built, want
+	return built, nil
 }
 
 // runLifecycleEventDelivery claims a batch and sends it.

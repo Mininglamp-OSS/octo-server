@@ -72,8 +72,25 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 	if err != nil {
 		return nil, err
 	}
+	// FOLDED keys, matching ProjectEpochsInSpace two functions down.
+	//
+	// This used to key by r.ProjectID — the spelling the DATABASE returned — while
+	// its one consumer looked the row up with the id the CALLER sent
+	// (modules/user/api_project_context.go). project_id compares
+	// case-insensitively under either production collation, so a re-cased id
+	// matched in SQL, missed in Go, and /v1/auth/verify answered member:false for
+	// a real member of a real project.
+	//
+	// Fail-closed, but a legitimate member refused — and it is the same defect
+	// FoldID was introduced for and already fixed in the two sibling readers in
+	// this file. Left open here it was the third instance in one file, which is
+	// what a shared helper is supposed to make impossible.
+	//
+	// Callers must fold their needle. They must also keep answering with their own
+	// spelling, not this map's key: an answer keyed on a folded id would hand the
+	// caller back an identifier they never sent.
 	for _, r := range rows {
-		out[r.ProjectID] = r
+		out[FoldID(r.ProjectID)] = r
 	}
 	return out, nil
 }

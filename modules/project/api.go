@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -68,6 +69,27 @@ type Project struct {
 	// seams above: a mutable function pointer shared across the process is not
 	// something to put on a delivery path that carries revocations.
 	lifecycleEventSender lifecycleSender
+
+	// builtLifecycleSender memoises the real HTTP client so it is built once per
+	// process rather than once per delivery tick.
+	//
+	// It has to be memoised for the transport to do its job. http.Client's
+	// keep-alive pooling lives in the Transport, so a fresh client every five
+	// seconds reuses no connection, does a fresh TCP+TLS handshake per event, and
+	// leaves the previous tick's transport holding idle connections for its full
+	// IdleConnTimeout — about eighteen of them coexisting at a 90s timeout, none
+	// of them ever reused, none closed early because nothing calls
+	// CloseIdleConnections. lifecycleSenderOrDefault's own comment already said
+	// "one client, reused"; this is what makes that true, and it is how the
+	// sibling provisionClient has always been built (once, in New).
+	//
+	// Keyed on the configuration it was built from so a process whose config
+	// changed under it rebuilds rather than signing with a stale secret. Guarded
+	// by a mutex rather than relying on the delivery CAS: the heartbeat runs in its
+	// own goroutine and tests reach this directly.
+	lifecycleSenderMu    sync.Mutex
+	builtLifecycleSender lifecycleSender
+	builtLifecycleFrom   lifecycleSenderKey
 
 	// nudgeProvisioningFn is the post-create worker trigger, as an instance seam on the
 	// same terms as the five above: production gets the real goroutine, and a test that
