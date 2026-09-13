@@ -759,6 +759,133 @@ increment_2:
         NULLs are indexed in InnoDB, so the empty case becomes an empty range and
         the age query gets its ORDER BY from the index.
 
+    - id: R-round8-B12-agent-revocations
+      finding: >
+        Both removal funnels — beginRemovalWithAgentsTx (kick and leave) and the
+        Space cascade — close the human's seat AND every agent seat they own in one
+        transaction, but enqueued exactly ONE project.member_revoked naming the
+        human. Agents hold octo_project_member seats and are members under the
+        all-member-group invariant; every other channel (audit trail, role-cache
+        invalidation) treats these closures as member removals. Only the
+        peer-facing push skipped them, and no metric recorded the omission.
+      decision: >
+        One event per CLOSED SEAT on both paths, all sharing the single post-bump
+        member_epoch — so the epoch stays the roster's ordering token and the
+        per-uid events stay idempotency-keyed to it. Working through it surfaced
+        the opposite defect in the cascade, which nobody had named: it also
+        OVER-emitted, announcing a revocation for a preserved Owner whose Space
+        seat survived. revokedSubjects asserts the subject SET rather than a count,
+        so both directions are pinned.
+    - id: R-round8-B11-latch-policy
+      finding: >
+        twoPhaseCreateApplies counted a requested-but-REJECTED fleet target as
+        "something will confirm", so create inserted with activated_at NULL. But a
+        rejected target never reaches enqueueProvisioningTx, and
+        latchUnconfirmableProjects' per-row predicate is exactly "no fleet job
+        exists" — so the very next reconcile tick cancelled the insert-time gate,
+        silently and irreversibly, with no re-enqueue path once the env was fixed.
+      decision: >
+        Reviewer option (b): a rejected target no longer counts, and the paragraph
+        and pins claiming otherwise are replaced by ones stating the contradiction
+        they used to create. What (b) concedes, now stated in code, comments and
+        tests alike: in a secret-collision config new projects are visible to the
+        peer immediately — the credential guard still refuses to USE the colliding
+        secret, but no longer withholds visibility.
+      not_taken: >
+        Option (a) is the better fix: persist "fleet was requested for this row" as
+        a non-claimable blocked provisioning status, so the repair distinguishes
+        never-requested from requested-but-rejected AND RECOVERS the window rows —
+        which (b) structurally cannot, because under (b) those rows were never
+        gated. It needs a status vocabulary change on octo_project_provisioning and
+        a claimability rule, which is its own change.
+    - id: R-round8-B10-conformance-secrets
+      finding: >
+        validateLifecycleEndpoint declared parity with projectprovision.ValidateTarget
+        but omitted its published-conformance-vector refusal, and permits plain
+        http — so a deployment configured with either published key lets anyone
+        holding this public repository forge lifecycle events against the peer.
+      decision: >
+        IsPublishedConformanceSecret exported from internal/projectprovision (the
+        literals stay at their single declaration site) and refused inside
+        validateLifecycleEndpoint. Both vectors added to the gate/client parity
+        table.
+    - id: R-round8-B9-third-surface
+      finding: >
+        MembershipsInSpace — behind POST /v1/auth/verify — carries no activation
+        term, so it answers for a project the gate exists to hide. The exemption
+        rationale claimed SpaceMiddleware; the route's group carries only a rate
+        limiter.
+      decision: >
+        Kept as a deliberate third case. The rationale is CORRECTED to the one that
+        actually holds — authVerifyToken derives the uid from the PRESENTED TOKEN,
+        so a caller cannot ask about anyone but themselves — and contract section 7
+        gains a coverage-boundary subsection naming the endpoint.
+      still_open: >
+        Product sign-off from someone other than the change author, as the review
+        asked. The question is one line: during provisioning, should a creator see
+        their own project? This cannot be self-supplied and is not an engineering
+        call.
+    - id: R-rebase-lifecycle-client-reuse
+      finding: >
+        lifecycleSenderOrDefault built a fresh http.Client and a cloned Transport on
+        every five-second delivery tick. Keep-alive pooling lives in the Transport,
+        so the pool never saw a second request: every event paid a full TCP+TLS
+        handshake while each superseded Transport held its idle connections for its
+        whole IdleConnTimeout with nothing calling CloseIdleConnections. The
+        function's own comment already claimed "one client, reused".
+      decision: >
+        Memoised, keyed on the (url, secret, timeout) it was built from so a config
+        change rebuilds rather than signing with a stale secret. Construction errors
+        are deliberately NOT cached: the configuration is what changed and it can
+        change back.
+    - id: R-rebase-membership-fold-key
+      finding: >
+        MembershipsInSpace keyed its answer by the spelling the DATABASE returned
+        while its only consumer looked up the spelling the CALLER sent. project_id
+        compares case-insensitively under either production collation, so a
+        re-cased id matched in SQL and missed in Go: /v1/auth/verify answered
+        member:false for a real member of a real project. Fail-closed, but a
+        legitimate member refused — and the third instance in one file of the
+        defect FoldID exists to make impossible.
+      decision: >
+        Keyed by FoldID, matching the two sibling readers; the call site folds its
+        needle and the answer still echoes the CALLER's spelling.
+        TestVerifyAnswersARecasedProjectIDForARealMember asserts both halves.
+    - id: R-rebase-enqueue-counter-doc
+      finding: >
+        lifecycleEventEnqueued's help text asserted that enqueued minus delivered
+        minus abandoned equals the backlog, and that divergence means rows are
+        leaving by an unintended path. The increment is pre-commit, so every
+        rollback and every retryOnLockConflict retry produces exactly that
+        divergence — the text turned normal operation into the alert it told
+        operators to read as data loss.
+      decision: >
+        States the honest inequality (enqueued >= delivered + abandoned + backlog).
+        Making the counter exact is possible — each producer has one Commit — and
+        was not done: four call sites' worth of threaded state for a monitoring
+        nicety.
+    - id: R-rebase-repair-reports-candidates
+      finding: >
+        repairConfirmedButUnlatched returned its CANDIDATE ids, which the caller
+        logs at Error. The UPDATE's predicate means one writer takes a row, but the
+        SELECT runs on every replica every tick — so every pod logged the same
+        Error naming the same projects for one repair, and a row the reactive path
+        latched in between was reported as repaired here.
+      decision: >
+        Gates on RowsAffected and re-selects by the timestamp it wrote, as both
+        siblings (latchUnconfirmableProjects, abandonExhaustedLifecycleEvents)
+        already did.
+    - id: R-explain-precondition
+      finding: >
+        Both reviews asked that the recorded ~96x claim-query cost be treated as a
+        hard precondition to enabling the feed rather than as advice.
+      decision: >
+        Stated as one at envLifecycleEventsEnabled — what an operator reads when
+        they flip the switch — alongside the second precondition (a deployment with
+        existing projects needs a backfill). Neither is enforceable in code: this
+        process cannot check whether anyone ran an EXPLAIN, so the change is to put
+        them where they will be seen rather than to pretend they are guarded.
+
   not_fixed_here:
     - id: R-epoch-map-key
       what: >
