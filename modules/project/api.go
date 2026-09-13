@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -53,8 +54,42 @@ type Project struct {
 	// projectMiddleware resolves Space membership with a live uncached read and refuses first,
 	// so only the middleware-to-transaction race window produces it. A seam is the only way to
 	// drive it deterministically.
-	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, error)
+	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error)
 	disbandFn func(projectID, actorUID, spaceID string) ([]string, error)
+
+	// lifecycleEventSender is the delivery seam for the lifecycle outbox.
+	//
+	// Nil in production, where lifecycleSenderOrDefault builds the real HTTP
+	// client from config. A test sets it to drive the outcomes that decide
+	// whether an undelivered event eventually lands or is abandoned — a 409, an
+	// auth failure mid-rotation, a timeout — none of which can be produced
+	// reliably by standing up a server and hoping.
+	//
+	// An instance field, not a package var, for the reason recorded on the batch
+	// seams above: a mutable function pointer shared across the process is not
+	// something to put on a delivery path that carries revocations.
+	lifecycleEventSender lifecycleSender
+
+	// builtLifecycleSender memoises the real HTTP client so it is built once per
+	// process rather than once per delivery tick.
+	//
+	// It has to be memoised for the transport to do its job. http.Client's
+	// keep-alive pooling lives in the Transport, so a fresh client every five
+	// seconds reuses no connection, does a fresh TCP+TLS handshake per event, and
+	// leaves the previous tick's transport holding idle connections for its full
+	// IdleConnTimeout — about eighteen of them coexisting at a 90s timeout, none
+	// of them ever reused, none closed early because nothing calls
+	// CloseIdleConnections. lifecycleSenderOrDefault's own comment already said
+	// "one client, reused"; this is what makes that true, and it is how the
+	// sibling provisionClient has always been built (once, in New).
+	//
+	// Keyed on the configuration it was built from so a process whose config
+	// changed under it rebuilds rather than signing with a stale secret. Guarded
+	// by a mutex rather than relying on the delivery CAS: the heartbeat runs in its
+	// own goroutine and tests reach this directly.
+	lifecycleSenderMu    sync.Mutex
+	builtLifecycleSender lifecycleSender
+	builtLifecycleFrom   lifecycleSenderKey
 
 	// nudgeProvisioningFn is the post-create worker trigger, as an instance seam on the
 	// same terms as the five above: production gets the real goroutine, and a test that
@@ -110,7 +145,7 @@ func New(ctx *config.Context) *Project {
 	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		return p.removeMember(projectID, spaceID, actorUID, targetUID)
 	}
-	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 		return p.updateProject(projectID, actorUID, spaceID, req)
 	}
 	p.disbandFn = func(projectID, actorUID, spaceID string) ([]string, error) {
@@ -124,6 +159,14 @@ func New(ctx *config.Context) *Project {
 	p.nudgeProvisioningFn = p.nudgeProvisioningWorker
 
 	p.registerSpaceMemberRemovalCleanup()
+	// 项目生命周期事件发件箱。自身带 fail-closed 开关：未开启或配置不完整时不注册任何
+	// 定时任务，也就不会对一个该部署根本不关心的表发起扫描——这正是本模块之前在没有
+	// 项目、没有流量的 pod 上仍每 tick 跑三个失败扫描的成因。
+	//
+	// registerAllMemberGroupOwnerFinalizer 不在这里了：main 把那个函数删掉了（全员群
+	// owner 的收尾改由 #887 的 syncAllMemberGroupOwner 在转让路径上同步做），rebase
+	// 时保留调用会编译不过。
+	p.startLifecycleEventWorker()
 	// Publish the provisioning configuration verdict at CONSTRUCTION, not in Route():
 	// a rejected target must be visible even in a crash loop that never reaches Route,
 	// and a startup log line alone is lost within minutes.
@@ -468,7 +511,7 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	}
 
 	uid := c.GetLoginUID()
-	updated, err := p.updateFn(row.ProjectID, uid, row.SpaceID, req)
+	updated, changed, err := p.updateFn(row.ProjectID, uid, row.SpaceID, req)
 	switch {
 	case err == nil:
 	case errors.Is(err, errProjectGone):
@@ -497,7 +540,13 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		return
 	}
 
-	p.audit(auditUpdate, uid, "", row.ProjectID, row.SpaceID, "")
+	// Only when something was written. A request naming fields the project already
+	// matches succeeds with nothing changed, and auditing it would record a change
+	// that never happened — which is the argument errNoFieldsToUpdate above is
+	// made from, and it applies just as well to this branch.
+	if changed {
+		p.audit(auditUpdate, uid, "", row.ProjectID, row.SpaceID, "")
+	}
 	// The count no longer fails the response. It never should have: the update
 	// COMMITTED, and answering 500 because a display aggregate hiccuped tells the
 	// caller their write failed when it did not, which is the one thing a response

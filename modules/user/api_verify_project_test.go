@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -315,4 +316,54 @@ func TestVerifySpacesTruncationIsVisibleOnTheWire(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Len(t, resp.Spaces, userSpacesLimit, "the list is still capped")
 	assert.True(t, resp.SpacesTruncated, "and the caller can now tell that it was capped")
+}
+
+// TestVerifyAnswersARecasedProjectIDForARealMember is the folded-lookup pin.
+//
+// project_id compares case-insensitively under either production collation, so a
+// gateway that upper-cases the id it was handed still matches the row in SQL.
+// pkg/project.MembershipsInSpace used to key its answer by the spelling the
+// DATABASE returned while this handler looked it up with the spelling the CALLER
+// sent, so the SQL hit and the Go map missed: member:false for a real member of a
+// real project, on the endpoint the gateway calls on every request.
+//
+// Fail-closed, but a legitimate member refused — and it is the same defect FoldID
+// exists for and already fixed in the two sibling readers in that file, which is
+// what makes it worth a pin rather than a comment.
+//
+// The assertion is deliberately about BOTH halves: that the answer is member:true
+// (the producer folds its keys) and that it echoes the caller's own spelling (the
+// handler must not hand back the folded key it looked up with).
+func TestVerifyAnswersARecasedProjectIDForARealMember(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedVerifyTokenFixtures(t, ctx)
+
+	spaceID := "sp_verify_fold"
+	stored := util.GenerUUID()
+	seedVerifyProject(t, ctx, stored, spaceID)
+	seedVerifyProjectMember(t, ctx, stored, spaceID, testutil.UID, 1)
+
+	asked := strings.ToUpper(stored)
+	require.NotEqual(t, stored, asked, "fixture drift: the probe needs a different spelling")
+
+	w := doVerifyToken(t, s, map[string]interface{}{
+		"token":       testutil.Token,
+		"space_id":    spaceID,
+		"project_ids": []string{asked},
+	}, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var resp verifyProjectResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Projects, 1)
+	assert.True(t, resp.Projects[0].Member,
+		"a re-cased project_id matches the row in SQL, so it must match in Go too; "+
+			"answering member:false here refuses a real member of a real project")
+	assert.Equal(t, asked, resp.Projects[0].ProjectID,
+		"and the answer must echo the spelling the CALLER sent, not the folded key it "+
+			"was looked up with — a caller keying its own map on what it asked for would "+
+			"otherwise find no entry")
+	require.NotNil(t, resp.Projects[0].Role)
+	assert.Equal(t, 1, *resp.Projects[0].Role)
 }

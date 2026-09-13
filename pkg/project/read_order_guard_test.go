@@ -129,15 +129,36 @@ func TestProjectMembershipsConjoinsTheSpaceHalf(t *testing.T) {
 	}
 }
 
-// funcSourceBody returns the source of one function in membership.go, comments
-// stripped.
+// stripLineComments removes `//` comments, and it is load-bearing in BOTH
+// directions the guards below assert in.
 //
-// The stripping is load-bearing, not cosmetic: the guards below check for the
-// PRESENCE of a table name in code (`space.ActiveMembers(`) and for the ABSENCE of
-// another (`space_member`). A doc comment inside the function mentioning the
-// absent table — which the fold fix's does, and legitimately — would otherwise fail
-// the absence check forever. Comments are prose about the code; the assertions are
-// about the code.
+// Two independent findings arrived at it, which is why the reasoning is kept for
+// each rather than collapsed:
+//
+//   - PRESENCE checks. The two-phase-create guard passed a mutation that deleted
+//     `activated_at IS NOT NULL` from the SQL, because the comment explaining the
+//     filter — three lines above it, inside the function body — still contained
+//     the string. A guard a comment can satisfy reports green for exactly the
+//     thing it was written to catch.
+//   - ABSENCE checks. `ProjectMemberships must not spell out space_member` fails
+//     forever the moment a doc comment inside that function mentions the table —
+//     which the ID-folding fix's comment does, legitimately.
+//
+// Comments are prose ABOUT the code; the assertions are about the code.
+func stripLineComments(src string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(src, "\n") {
+		if at := strings.Index(line, "//"); at >= 0 {
+			line = line[:at]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// funcSourceBody returns the source of one function in membership.go, with line
+// comments stripped: see stripLineComments.
 func funcSourceBody(t *testing.T, name string) string {
 	t.Helper()
 	raw, err := os.ReadFile("membership.go")
@@ -153,15 +174,7 @@ func funcSourceBody(t *testing.T, name string) string {
 	if end := strings.Index(body, "\n}\n"); end > 0 {
 		body = body[:end]
 	}
-	var kept strings.Builder
-	for _, line := range strings.Split(body, "\n") {
-		if idx := strings.Index(line, "//"); idx >= 0 {
-			line = line[:idx]
-		}
-		kept.WriteString(line)
-		kept.WriteByte('\n')
-	}
-	return kept.String()
+	return stripLineComments(body)
 }
 
 // TestProjectEpochsExcludesInactiveProjects pins that the epoch query filters on
@@ -174,21 +187,10 @@ func funcSourceBody(t *testing.T, name string) string {
 // this predicate does NOT fold it in and the statement needs an explicit
 // `archived_at IS NULL` — an earlier version of this comment asserted the free
 // coverage unconditionally, which would have read as "already handled" to
-// whoever adds the column.
+// whoever adds the column. The two-phase create gate below is exactly that
+// shape, and it did need its own predicate.
 func TestProjectEpochsExcludesInactiveProjects(t *testing.T) {
-	raw, err := os.ReadFile("membership.go")
-	if err != nil {
-		t.Fatalf("read membership.go: %v", err)
-	}
-	src := string(raw)
-	start := strings.Index(src, "func ProjectEpochsInSpace(")
-	if start < 0 {
-		t.Fatal("ProjectEpochsInSpace not found")
-	}
-	body := src[start:]
-	if end := strings.Index(body, "\n}\n"); end > 0 {
-		body = body[:end]
-	}
+	body := funcSourceBody(t, "ProjectEpochsInSpace")
 	if !strings.Contains(body, "status = 1") {
 		t.Error("ProjectEpochsInSpace must restrict to status = 1, so a disbanded project " +
 			"reads as epoch 0")
@@ -230,6 +232,19 @@ func TestProjectEpochsExcludesInactiveProjects(t *testing.T) {
 	if !strings.Contains(body, "space_id = ?") {
 		t.Error("ProjectEpochsInSpace must filter by space_id: a project in another " +
 			"Space has to be indistinguishable from one that does not exist")
+	}
+
+	// Two-phase create (O6). A project whose subsystem container has not been
+	// confirmed must read as absent here, or the peer can authorize someone into
+	// a workspace that does not exist yet.
+	//
+	// The predicate lives in THIS function on purpose: ProjectMemberships calls it
+	// as its step 1 and returns early on an absent project, so one filter closes
+	// both inbound endpoints. A copy in each would be two things that can drift.
+	if !strings.Contains(body, "activated_at IS NOT NULL") {
+		t.Error("ProjectEpochsInSpace must exclude projects awaiting subsystem confirmation " +
+			"(activated_at IS NULL). Without it the peer sees a project before its workspace " +
+			"exists and can grant access into it — contract section 7.")
 	}
 }
 

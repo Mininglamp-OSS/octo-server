@@ -315,10 +315,18 @@ func TestModuleLocalRefusalsCoverTheCentralRegistry(t *testing.T) {
 
 // refusedEnvs returns the env NAMES a module's refusal list actually names.
 //
-// It reads the list REGION rather than the whole file, and resolves the
-// identifiers in it through the file's own `ident = "LITERAL"` declarations. A
-// whole-file grep would pass on a file that declares a constant and never uses
-// it — which is precisely the shape a careless edit leaves behind.
+// It reads the list REGION rather than the whole file, so a file that declares a
+// constant and never uses it does not pass — which is precisely the shape a
+// careless edit leaves behind.
+//
+// Identifiers in the region are resolved through `ident = "LITERAL"`
+// declarations anywhere in the file's PACKAGE, not just the file itself. The
+// package is the scope Go actually resolves them in, and the narrower version
+// reported a false failure the first time a refusal list named a constant
+// declared in a sibling file (project's LifecycleEventSecretEnv, which lives in
+// config.go while the list is in config_provisioning.go). The fix a
+// file-scoped resolver invites is to re-declare the literal locally, which is
+// the duplication the exported constant exists to prevent.
 func refusedEnvs(t *testing.T, file, marker string) map[string]bool {
 	t.Helper()
 	raw, err := os.ReadFile(file)
@@ -327,9 +335,23 @@ func refusedEnvs(t *testing.T, file, marker string) map[string]bool {
 	}
 	src := string(raw)
 
+	constDecl := regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*"([^"]+)"`)
 	consts := map[string]string{}
-	for _, m := range regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*"([^"]+)"`).FindAllStringSubmatch(src, -1) {
-		consts[m[1]] = m[2]
+	peers, err := filepath.Glob(filepath.Join(filepath.Dir(file), "*.go"))
+	if err != nil {
+		t.Fatalf("glob %s: %v", filepath.Dir(file), err)
+	}
+	for _, peer := range peers {
+		if strings.HasSuffix(peer, "_test.go") {
+			continue
+		}
+		peerSrc, err := os.ReadFile(peer)
+		if err != nil {
+			t.Fatalf("read %s: %v", peer, err)
+		}
+		for _, m := range constDecl.FindAllStringSubmatch(string(peerSrc), -1) {
+			consts[m[1]] = m[2]
+		}
 	}
 
 	at := strings.Index(src, marker)

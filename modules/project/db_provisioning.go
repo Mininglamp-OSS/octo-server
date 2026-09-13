@@ -587,3 +587,162 @@ func truncateProvisioningError(s string) string {
 	}
 	return truncated
 }
+
+// repairConfirmedButUnlatched latches projects whose fleet job already reached
+// ready while activated_at stayed NULL.
+//
+// The gap it closes: confirmProjectActive runs AFTER finishProvisioning marks the
+// job terminal, and terminal jobs are never re-claimed. So a pod killed between
+// those two statements, or a transient error on the latch UPDATE, left a project
+// whose container demonstrably exists permanently invisible to the peer — with a
+// gauge showing it and nothing able to act on it. Ordering the two the other way
+// would only trade this for the worse failure (a project marked visible against a
+// job that still reads as unfinished), so the answer is a repair, not a reorder.
+//
+// The predicate IS the evidence: status ready on the fleet row means this
+// deployment received a clean ensure for that project. Nothing here consults the
+// provisioning table as a GATE (D12) — it is repairing a latch after the fact,
+// not answering whether a container exists right now.
+//
+// It lives in THIS file rather than beside the rest of the activation code
+// because that is what the provisioning guards require and they are right to:
+// octo_project_provisioning is named in exactly one non-test file, so the DAO
+// stays the single access point and no future edit can quietly turn a read of it
+// into a request-path gate. The query selects project_id only — never
+// container_id, which is the capability the second guard protects.
+//
+// Bounded by limit and driven from the reconcile rotation. Both tables are
+// octo_project*, same pinned collation, so the join is safe on a drifted
+// database.
+func (d *DB) repairConfirmedButUnlatched(now time.Time, limit int) ([]string, error) {
+	// SELECT then UPDATE, in two statements, because MySQL refuses LIMIT on a
+	// multi-table UPDATE (1221) — the single joined statement this started as
+	// failed at runtime, not at build time, and the repair simply never ran. An
+	// unbounded UPDATE was not an acceptable way to satisfy the parser: the row
+	// count here is a backlog, so the one time it matters is the one time it is
+	// large.
+	var ids []string
+	if _, err := d.session.SelectBySql(
+		"SELECT p.project_id FROM `octo_project` p "+
+			"INNER JOIN `octo_project_provisioning` pr "+
+			"  ON pr.project_id = p.project_id AND pr.target = ? AND pr.status = ? "+
+			"WHERE p.activated_at IS NULL AND p.status = ? "+
+			"ORDER BY p.created_at LIMIT ?",
+		TargetFleet, provisionStatusReady, StatusNormal, limit,
+	).Load(&ids); err != nil {
+		return nil, fmt.Errorf("project: find unlatched confirmed projects: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// activated_at IS NULL is repeated in the UPDATE rather than trusted from the
+	// SELECT: the reactive path may have latched a row in between, and that
+	// timestamp is the earlier and truer one.
+	res, err := d.session.UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = ? "+
+			"WHERE project_id IN ? AND activated_at IS NULL AND status = ?",
+		now, ids, StatusNormal,
+	).Exec()
+	if err != nil {
+		return nil, fmt.Errorf("project: repair unlatched activation: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("project: repair unlatched activation rows: %w", err)
+	}
+	if affected == 0 {
+		return nil, nil
+	}
+
+	// The CANDIDATES are not the repairs, and the caller logs these ids at Error.
+	//
+	// The predicate above means a row is taken by exactly one writer, but the SELECT
+	// runs on every replica every tick: returning its ids made two pods log the same
+	// Error with the same project list for one repair, and reported a row the
+	// reactive path latched in between as repaired here. An Error whose payload says
+	// "these were invisible to the peer for a reconcile interval" has to name rows
+	// this statement actually changed.
+	//
+	// Recovered by the timestamp this call wrote, which the predicate makes unique
+	// per row among concurrent repairers. Residual: two replicas whose `now` lands
+	// on the same DATETIME(3) millisecond would each claim the other's rows — the
+	// double-reporting this replaces, in a window a thousand times narrower, and
+	// with no effect on what was written.
+	//
+	// Both siblings already do this — latchUnconfirmableProjects returns
+	// RowsAffected, abandonExhaustedLifecycleEvents likewise.
+	var repaired []string
+	if _, err := d.session.SelectBySql(
+		"SELECT project_id FROM `octo_project` "+
+			"WHERE project_id IN ? AND activated_at = ? AND status = ?",
+		ids, now, StatusNormal,
+	).Load(&repaired); err != nil {
+		// The write landed; only the attribution failed. Report the count rather
+		// than losing the fact that a repair happened.
+		return nil, fmt.Errorf("project: identify repaired activations (%d row(s) latched): %w",
+			affected, err)
+	}
+	return repaired, nil
+}
+
+// latchUnconfirmableProjects sets the latch on projects that NOTHING WILL EVER
+// CONFIRM, decided per project rather than from this pod's configuration.
+//
+// The predicate is "no fleet provisioning job exists for this project". That is
+// a fact about the row, and it is the fact the question actually turns on —
+// where twoPhaseCreateApplies() answers from cfg, which is per PROCESS while the
+// latch is per row and irreversible. Two states broke that, in opposite
+// directions:
+//
+//	ROLLING ENABLEMENT. An operator adds the fleet target; pods restart one at a
+//	time. Pod A (new config) creates a project with activated_at NULL and a
+//	pending fleet job. Pod B still has the old config, so its reconcile tick
+//	answered "nothing will confirm" for EVERY unlatched row and latched Pod A's
+//	project — visible to the peer before its container exists, permanently. The
+//	reconcile interval is five minutes; any rolling restart outlasts it.
+//
+//	THE REJECTED-CONFIG WINDOW. A project created while the fleet target was
+//	rejected at load gets no fleet job at all, because provisioning is enqueued
+//	from cfg.Targets and fleet is not in it. Neither repair could reach such a
+//	row: this one skipped it while fleet was "requested", and the confirmation
+//	repair needs a job in ready state. It was invisible to the peer forever, and
+//	fixing the env did not recover it.
+//
+// The join answers both. Pod B now sees Pod A's job and declines; the
+// rejected-window project has no job and is latched — which is the MILDER
+// failure of the two (the peer sees a project whose container is not there yet,
+// the same window that exists today) rather than the permanent one.
+//
+// It lives in this file for the reason the repair above does: the provisioning
+// table is named in exactly one non-test file, and this query reads project_id
+// only, never container_id.
+func (d *DB) latchUnconfirmableProjects(now time.Time, limit int) (int64, error) {
+	var ids []string
+	if _, err := d.session.SelectBySql(
+		"SELECT p.project_id FROM `octo_project` p "+
+			"WHERE p.activated_at IS NULL AND p.status = ? "+
+			"  AND NOT EXISTS ("+
+			"    SELECT 1 FROM `octo_project_provisioning` pr "+
+			"    WHERE pr.project_id = p.project_id AND pr.target = ?) "+
+			"ORDER BY p.created_at LIMIT ?",
+		StatusNormal, TargetFleet, limit,
+	).Load(&ids); err != nil {
+		return 0, fmt.Errorf("project: find unconfirmable projects: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res, err := d.session.UpdateBySql(
+		"UPDATE `octo_project` SET activated_at = ? "+
+			"WHERE project_id IN ? AND activated_at IS NULL AND status = ?",
+		now, ids, StatusNormal,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: latch unconfirmable projects: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: latch unconfirmable projects rows: %w", err)
+	}
+	return affected, nil
+}

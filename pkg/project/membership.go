@@ -72,8 +72,25 @@ func MembershipsInSpace(session *dbr.Session, spaceID, uid string, projectIDs []
 	if err != nil {
 		return nil, err
 	}
+	// FOLDED keys, matching ProjectEpochsInSpace two functions down.
+	//
+	// This used to key by r.ProjectID — the spelling the DATABASE returned — while
+	// its one consumer looked the row up with the id the CALLER sent
+	// (modules/user/api_project_context.go). project_id compares
+	// case-insensitively under either production collation, so a re-cased id
+	// matched in SQL, missed in Go, and /v1/auth/verify answered member:false for
+	// a real member of a real project.
+	//
+	// Fail-closed, but a legitimate member refused — and it is the same defect
+	// FoldID was introduced for and already fixed in the two sibling readers in
+	// this file. Left open here it was the third instance in one file, which is
+	// what a shared helper is supposed to make impossible.
+	//
+	// Callers must fold their needle. They must also keep answering with their own
+	// spelling, not this map's key: an answer keyed on a folded id would hand the
+	// caller back an identifier they never sent.
 	for _, r := range rows {
-		out[r.ProjectID] = r
+		out[FoldID(r.ProjectID)] = r
 	}
 	return out, nil
 }
@@ -370,9 +387,22 @@ func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs 
 		ProjectID   string `db:"project_id"`
 		MemberEpoch int64  `db:"member_epoch"`
 	}
+	// `activated_at IS NOT NULL` is the two-phase create gate (O6, contract
+	// section 7). A project whose subsystem container has not been confirmed
+	// must be indistinguishable here from one that does not exist, so that
+	// nothing can be authorized into a workspace that is not there yet.
+	//
+	// It belongs in THIS query specifically, not in each endpoint:
+	// ProjectMemberships runs this function as its step 1 and returns early when
+	// the project is absent from the result, so one predicate closes both
+	// inbound endpoints and they cannot drift apart.
+	//
+	// Rows created before the column existed were backfilled to created_at, so
+	// this filter removes nothing that used to be visible.
 	_, err := session.SelectBySql(
 		"SELECT project_id, member_epoch FROM `octo_project` "+
-			"WHERE space_id = ? AND project_id IN ? AND status = 1",
+			"WHERE space_id = ? AND project_id IN ? AND status = 1 "+
+			"  AND activated_at IS NOT NULL",
 		spaceID, lookup,
 	).Load(&rows)
 	if err != nil {
@@ -457,9 +487,21 @@ func ProjectEpochsInSpace(session dbr.SessionRunner, spaceID string, projectIDs 
 // The predicate comes from spacepkg.ActiveMembers rather than being spelled out
 // again, so it cannot drift from CheckMembership's.
 //
-// MembershipsInSpace is deliberately NOT changed: it answers for the caller's OWN
-// token holder on a route that already ran SpaceMiddleware, so its consumer both
-// has the Space half and has already applied it.
+// MembershipsInSpace is deliberately NOT changed, and the reason it used to give
+// was false. It said the route "already ran SpaceMiddleware", so the consumer held
+// the Space half. It does not: modules/user/api.go registers POST /v1/auth/verify
+// in a group whose only middleware is the rate limiter, and the request carries a
+// caller-supplied space_id.
+//
+// The exemption survives on a different fact, which is the one to check if this is
+// ever revisited: the uid is not caller-supplied. authVerifyToken derives it from
+// the PRESENTED TOKEN (tokenValidator.Validate), so every answer this function can
+// produce is about the token holder themselves, and the seat predicate means a
+// `member: true` can only ever be self-information. A caller naming a Space they
+// hold no seat in learns nothing, because they hold no seat in its projects either.
+//
+// That is why it is exempt from the SPACE conjunction. It is NOT by itself a reason
+// to exempt it from the ACTIVATION gate — see the note on that below.
 //
 // # Already-cached grants: closed elsewhere, not here
 //

@@ -749,10 +749,25 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// notify_token_env would pass local checks and authorize both provisioning and
 		// minting that route's card action.
 		//
-		// TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions in
+		// TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions in
 		// modules/project/provisioning_guard_test.go asserts both arguments stay present.
 		os.Getenv(project.ProvisionFleetSecretEnv),
 		os.Getenv(project.DriveInternalTokenEnv),
+		// And the lifecycle event signing secret, for exactly the reason the two
+		// above are here. It was added to fixedInternalTokenEnvs and to both
+		// module-local refusal lists and NOT to this call, which left the one
+		// collision nobody can see locally: modules/project compares it against
+		// the fixed envs, and nothing compares it against the dynamic
+		// route-scoped notify tokens and callback secrets from
+		// OCTO_CARD_ACTION_ROUTES.
+		//
+		// The severity is not symmetric with the fixed-vs-fixed case, which is
+		// why the omission mattered: a fixed-vs-fixed collision is REPORTED and
+		// the server boots, while a fixed-vs-dynamic collision REFUSES to boot.
+		// That refusal is what was missing — one leaked value would have
+		// authorized both signing the lifecycle event feed and minting that
+		// route's card action.
+		os.Getenv(project.LifecycleEventSecretEnv),
 		// Same reasoning for the membership internal token: modules/internal_membership
 		// only sees the fixed internal-token envs and cannot detect a collision with a
 		// route-level credential.
@@ -931,6 +946,13 @@ var fixedInternalTokenEnvs = []string{
 	// ITSELF on every deployment that sets it, turning a real detector into a standing
 	// false ERROR line. One value serving two purposes is a decision main made; this
 	// registry's job is to catch the ones nobody decided.
+	// And the lifecycle event signing secret, outbound to the same peer that
+	// holds the fleet provisioning secret. Two secrets to one peer is not
+	// redundancy: provisioning creates containers, the event feed reports
+	// membership revocations, and a single value would mean a leak from either
+	// path grants both. It is also the reason this one cannot simply reuse
+	// ProvisionFleetSecretEnv.
+	project.LifecycleEventSecretEnv,
 	// Three more inbound capability credentials, each a single env, each missed
 	// until the sweep test above was written: the webhook HMAC secret
 	// (modules/webhook), the mail gateway secret (modules/agentmailgateway), and

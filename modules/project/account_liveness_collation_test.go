@@ -162,9 +162,15 @@ func TestAccountLivenessSurvivesCollationDrift(t *testing.T) {
 				_, e := sess.UpdateBySql(stmt, args...).Exec()
 				require.NoError(t, e, stmt)
 			}
+			// activated_at is set, and it has to be: the two-phase create gate added
+			// `activated_at IS NOT NULL` to ProjectEpochsInSpace, which
+			// ProjectMemberships runs as its step 1. A fixture that omits it builds a
+			// project the peer is supposed to answer about as NONEXISTENT, so every
+			// assertion below would fail for a reason that has nothing to do with
+			// collation or account liveness.
 			exec("INSERT INTO `octo_project` " +
-				"(project_id, space_id, name, creator, member_epoch, status, created_at, updated_at) " +
-				"VALUES ('cp1','cs1','CP1','clive',1,1,NOW(3),NOW(3))")
+				"(project_id, space_id, name, creator, member_epoch, status, activated_at, created_at, updated_at) " +
+				"VALUES ('cp1','cs1','CP1','clive',1,1,NOW(3),NOW(3),NOW(3))")
 			exec("INSERT INTO `octo_project_member` " +
 				"(project_id, uid, space_id, role, status, created_at, updated_at, removing) " +
 				"VALUES ('cp1','clive','cs1',0,1,NOW(3),NOW(3),0), " +

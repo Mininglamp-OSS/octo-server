@@ -293,3 +293,108 @@ var removalAbandoned = promauto.NewCounter(prometheus.CounterOpts{
 	Name:      "removal_abandoned_total",
 	Help:      "Project member-removal cascade jobs abandoned after exhausting their attempts.",
 })
+
+// ---------- project lifecycle outbox (O4) ----------
+//
+// Labels stay low-cardinality: event_type is a closed set of five, result and
+// error_class are small enums. No project_id, space_id or uid anywhere, for the
+// reason stated at the top of this file.
+
+// lifecycleEventEnqueued counts INSERTs of outbox rows that returned without
+// error, by type. It is incremented inside the producer's transaction.
+//
+// So it is an UPPER BOUND on rows that exist, not a count of them: the insert is
+// pre-commit, and a transaction that rolls back afterwards — a create whose
+// provisioning enqueue failed, or any attempt retried by retryOnLockConflict —
+// leaves the increment behind with no surviving row.
+//
+// That matters for how it is read, and this text used to get it wrong. It said
+// "enqueued minus delivered minus abandoned is what is still owed to the peer,
+// and a divergence between that and the backlog gauge means rows are leaving by
+// a path nobody intended" — which turns every rollback and every deadlock retry
+// into exactly that divergence, i.e. into the alert an operator was told to treat
+// as rows disappearing. The honest relation is an inequality:
+//
+//	enqueued >= delivered + abandoned + backlog
+//
+// A SUSTAINED and GROWING gap is still worth looking at; a small standing one is
+// rollbacks and retries and means nothing.
+//
+// Making the counter exact is possible and was not done here: each producer has
+// exactly one Commit, so the types could be collected locally and incremented
+// after it. That is four call sites' worth of threaded state for a monitoring
+// nicety, and the inequality above is enough to answer the question the metric
+// exists for.
+var lifecycleEventEnqueued = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: metricNamespace,
+	Name:      "lifecycle_event_enqueued_total",
+	Help:      "Project lifecycle events written to the outbox, by event type.",
+}, []string{"event_type"})
+
+// lifecycleEventOutcome counts terminal delivery outcomes.
+//
+// result is delivered | abandoned. error_class is the lifecycleErr* enum in
+// lifecycle_client.go, empty on success -- it is what tells an operator whether
+// the peer is down (retryable, transient) or whether this deployment is
+// misconfigured or in conflict (terminal), which need completely different
+// responses.
+//
+// Every value comes from that enum, including the one that is not a response
+// class: `exhausted`, which the sweep records for a row whose budget was spent
+// without any attempt reaching a terminal outcome. It is declared there rather
+// than written as a literal here, because a label value defined outside the enum
+// this help text names is how a closed set stops being closed.
+var lifecycleEventOutcome = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: metricNamespace,
+	Name:      "lifecycle_event_delivery_total",
+	Help:      "Terminal outcomes of project lifecycle event delivery.",
+}, []string{"event_type", "result", "error_class"})
+
+// lifecycleEventAttempts counts every attempt, including the ones that will retry.
+var lifecycleEventAttempts = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: metricNamespace,
+	Name:      "lifecycle_event_attempt_total",
+	Help:      "Project lifecycle event delivery attempts, by outcome class.",
+}, []string{"event_type", "error_class"})
+
+// lifecycleEventBacklog is how many events are still owed to the peer.
+var lifecycleEventBacklog = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "lifecycle_event_backlog",
+	Help:      "Project lifecycle events pending delivery.",
+})
+
+// lifecycleEventOldestAgeSeconds is the age of the oldest undelivered event, and it
+// is the gauge an alert should fire on rather than the backlog count.
+//
+// A count cannot tell a healthy burst from a stuck queue; both read as "many
+// rows". Age can. An undelivered member revocation an hour old is a removed
+// member still executing on the peer, whether it is alone in the queue or has a
+// thousand siblings.
+var lifecycleEventOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "lifecycle_event_oldest_age_seconds",
+	Help:      "Age of the oldest pending project lifecycle event.",
+})
+
+// awaitingActivation is how many projects the peer still cannot see (O6).
+//
+// Every one of these is a project a user created and can use in this
+// application, while the subsystem side has not confirmed a container — so the
+// peer answers about it as if it did not exist. A steady small number is normal
+// (creates in flight); a number that only grows means the confirming step has
+// stopped.
+var awaitingActivation = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "awaiting_activation",
+	Help:      "Active projects whose subsystem container has not been confirmed, so the peer treats them as nonexistent.",
+})
+
+// awaitingActivationOldestAgeSeconds is the one to alert on, for the reason the
+// lifecycle queue's age gauge exists: a count cannot separate a burst of fresh
+// creates from a queue that stopped, and both read as "several rows".
+var awaitingActivationOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: metricNamespace,
+	Name:      "awaiting_activation_oldest_age_seconds",
+	Help:      "Age of the oldest project still awaiting subsystem confirmation.",
+})

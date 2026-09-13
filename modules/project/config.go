@@ -1,6 +1,7 @@
 package project
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -71,6 +72,58 @@ const (
 	// beside the other reconcile knobs rather than in a constant.
 	envAllMemberGroupAdmitGrace = "OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE"
 	envMetricsEvery             = "OCTO_PROJECT_METRICS_INTERVAL"
+
+	// envLifecycleEventsEnabled gates the project lifecycle outbox — BOTH the
+	// enqueue side and the delivery worker, on the same switch.
+	//
+	// One switch for both, deliberately. Queueing while delivery is off produces a
+	// backlog the consumer can never accept: it never saw the project.created that
+	// should have preceded those events, so each one refers to something it does
+	// not know about. Enabling the integration on a deployment that already has
+	// projects therefore needs a deliberate backfill, and making that obvious is
+	// worth more than the events a split switch would have preserved.
+	//
+	// Default OFF, like every other switch in this module.
+	//
+	// # Two preconditions before this is turned on anywhere
+	//
+	// Neither is enforced in code, because neither is a property this process can
+	// check. They are recorded here because this constant is what the person
+	// flipping the switch is looking at.
+	//
+	//  1. EXPLAIN the claim query under a synthetic backlog. claimLifecycleEvents
+	//     measures ~96x the no-antijoin cost and holds ~1000 record locks to claim
+	//     six rows at a 505-row backlog, and those locks reach insertLifecycleEventTx
+	//     inside a user-facing transaction. The numbers and the corrective shape (a
+	//     cheap candidate read, then a narrow FOR UPDATE on those ids) are in
+	//     db_lifecycle_event.go. Confirm the rewrite is not needed BEFORE the feed
+	//     runs hot, not after.
+	//  2. Confirm this deployment has projects the peer can accept. One switch drives
+	//     enqueue and delivery together for the reason above, so enabling it on a
+	//     deployment that already has projects needs the backfill named there.
+	envLifecycleEventsEnabled = "OCTO_PROJECT_LIFECYCLE_EVENTS_ENABLED"
+	// envLifecycleEventURL is the absolute POST endpoint events are delivered to,
+	// path included. Absolute rather than a base URL with a path appended here,
+	// for the reason internal/projectprovision gives: the signature covers the
+	// PATH, so a path this side assembles and a path the peer serves must be the
+	// same string, and the only way to be sure is to configure the whole thing.
+	envLifecycleEventURL = "OCTO_PROJECT_LIFECYCLE_EVENT_URL"
+	// LifecycleEventSecretEnv is the HMAC secret for outbound lifecycle events.
+	//
+	// A shared secret rather than a bearer token, matching the provisioning
+	// channel (pkg/octosign) rather than inventing a second scheme. Two reasons,
+	// and the first is the one main.go's credential registry states: a bearer
+	// token we SEND is a credential the peer could send back to us, while an HMAC
+	// secret proves possession without ever crossing the wire. The second is that
+	// the signature covers method, path, timestamp, event id and body, so it binds
+	// the request; a bearer authenticates the caller and says nothing about what
+	// was sent.
+	//
+	// Exported so main.go can include it in the cross-capability exclusion checks
+	// without a second copy of the literal drifting out of sync.
+	LifecycleEventSecretEnv = "OCTO_PROJECT_LIFECYCLE_EVENT_SECRET"
+	// envLifecycleEventTimeout bounds ONE delivery attempt.
+	envLifecycleEventTimeout = "OCTO_PROJECT_LIFECYCLE_EVENT_TIMEOUT"
 )
 
 // Defaults. The three project/member caps come from the brief; the batch cap and
@@ -113,6 +166,14 @@ const (
 	// whole tables, and those aggregates get slowest exactly when the numbers
 	// matter most (after a backlog).
 	defaultMetricsInterval = 15 * time.Minute
+
+	// defaultLifecycleEventTimeout bounds ONE delivery attempt to the peer.
+	//
+	// Short on purpose. A delivery that hangs holds a worker slot and its lease for
+	// the whole duration, and the queue behind it is where an unsent member
+	// revocation waits. Failing fast and retrying with backoff drains a temporarily
+	// slow peer better than waiting on each attempt does.
+	defaultLifecycleEventTimeout = 10 * time.Second
 )
 
 // Field length caps follow the Project contract. Name is measured in Unicode
@@ -146,6 +207,17 @@ type Config struct {
 	// from I4 scan B, because the admitter runs after the seat transaction commits.
 	AllMemberGroupAdmitGrace time.Duration
 	MetricsInterval          time.Duration
+
+	// Project lifecycle outbox.
+	LifecycleEventsEnabled bool
+	LifecycleEventURL      string
+	LifecycleEventSecret   string
+	LifecycleEventTimeout  time.Duration
+	// LifecycleEventProblem is why the secret was dropped, when it was. Carried
+	// rather than logged at load, for the reason ProvisioningConfig.Problems is:
+	// loadConfig has no logger, and a config loader that logs is a config loader
+	// that cannot be tested without capturing the process-wide one.
+	LifecycleEventProblem error
 	// Provisioning is the eager subsystem-container configuration (brief D2).
 	// Zero value = inert: no outbox row is enqueued and no worker starts, which is
 	// the default until an operator names a target. See config_provisioning.go.
@@ -167,6 +239,7 @@ func loadConfig() Config {
 		}
 	}
 	provisioning, _ := loadProvisioningConfig(os.Getenv)
+	lifecycleSecret, lifecycleProblem := resolveLifecycleEventSecret(os.Getenv)
 	return Config{
 		CreateEnabled:                  envBool(envCreateEnabled, false),
 		CollaborationRoleEnabled:       envBool(envCollaborationRoleEnabled, false),
@@ -185,6 +258,12 @@ func loadConfig() Config {
 		AllMemberGroupAdmitGrace: envDuration(
 			envAllMemberGroupAdmitGrace, defaultAllMemberGroupAdmitGrace),
 		MetricsInterval: envDuration(envMetricsEvery, defaultMetricsInterval),
+
+		LifecycleEventsEnabled: envBool(envLifecycleEventsEnabled, false),
+		LifecycleEventURL:      strings.TrimSpace(envString(envLifecycleEventURL, "")),
+		LifecycleEventSecret:   lifecycleSecret,
+		LifecycleEventProblem:  lifecycleProblem,
+		LifecycleEventTimeout:  envDuration(envLifecycleEventTimeout, defaultLifecycleEventTimeout),
 		// Rejected targets are dropped rather than fatal; the reasons ride along on
 		// ProvisioningConfig.Problems for New() to log. See loadProvisioningConfig.
 		Provisioning: provisioning,
@@ -208,6 +287,95 @@ func (c Config) dayWindow(now time.Time) (time.Time, time.Time) {
 	local := now.In(c.DayBoundary)
 	start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, c.DayBoundary)
 	return start.UTC(), start.AddDate(0, 0, 1).UTC()
+}
+
+// lifecycleEventsEnabled reports whether the outbox may enqueue and deliver.
+//
+// Fail-closed on UNUSABLE configuration, not just on the switch, and "unusable"
+// is decided by validateLifecycleEndpoint — the same function the delivery
+// client calls. That sharing is the whole point of the check.
+//
+// The earlier version tested only that the two strings were non-empty, so a URL
+// with a query string or a secret below the key floor passed the gate and failed
+// at the client. The result was an integration that enqueued on every write and
+// could never build a sender: claimLifecycleEvents increments attempts before
+// delivery is attempted, so every tick burned budget on rows that never reached
+// the abandon check, the table grew without bound (the purge only touches
+// terminal rows), and not one member revocation left the process. An outbox that
+// cannot deliver is strictly worse than one that was never written.
+//
+// Called on the enqueue path, so it re-parses a URL per write. That is a
+// url.Parse beside a database INSERT on a path that runs at project-write
+// frequency; buying it back with a cached flag would put the answer somewhere it
+// could disagree with the config it came from, which is the bug being fixed.
+func (p *Project) lifecycleEventsEnabled() bool {
+	if !p.cfg.LifecycleEventsEnabled {
+		return false
+	}
+	return validateLifecycleEndpoint(p.cfg.LifecycleEventURL, p.cfg.LifecycleEventSecret) == nil
+}
+
+// lifecycleSecretSiblings is the set of fixed capability credentials the
+// lifecycle event secret must not equal.
+//
+// It is main.go's fixedInternalTokenEnvs minus this env, and it exists for the
+// reason that list gives: main.go LOGS a collision, while this refuses one, and
+// a logged collision on a security credential is a collision that ships. The
+// The fleet provisioning secret is in here too — it goes to the same peer, and
+// sharing one value across the two channels means a leak from either grants
+// both. (It used to say "the two provisioning secrets"; #887 collapsed Drive's
+// onto OCTO_DRIVE_INTERNAL_TOKEN, so there is one provisioning secret now.)
+var lifecycleSecretSiblings = []string{
+	"NOTIFY_INTERNAL_TOKEN",
+	"OCTO_DOCS_NOTIFY_TOKEN",
+	"OCTO_DOCS_BOT_MENTION_TOKEN",
+	"OCTO_DRIVE_INTERNAL_TOKEN",
+	"OCTO_MEMBERSHIP_INTERNAL_TOKEN",
+	ProvisionFleetSecretEnv,
+	// Drive's provisioning credential is NOT a separate entry: main's #887 pointed
+	// project provisioning at the existing OCTO_DRIVE_INTERNAL_TOKEN, listed four
+	// lines up, rather than giving Drive its own per-target secret. Naming it twice
+	// in a list whose job is finding duplicates is how such a list fails silently.
+	"TS_WEBHOOK_SECRET_KEY",
+	"OCTO_MAIL_GATEWAY_SECRET",
+	"TS_GRPC_AUTH_TOKEN",
+	// Added when main's #827 landed the Space internal API's token: this list is
+	// defined as main.go's registry minus this module's own env, so an entry missing
+	// here is a collision this module would accept and main.go would only log.
+	"OCTO_MARKETPLACE_INTERNAL_TOKEN",
+}
+
+// resolveLifecycleEventSecret loads the secret, and returns "" plus a reason
+// when it collides with a sibling credential.
+//
+// Dropping the secret rather than returning it with a warning is what makes the
+// refusal load-bearing: lifecycleEventsEnabled() requires a non-empty secret, so
+// an empty one disables BOTH the enqueue and the worker. The feed goes dark and
+// says why, instead of running on a credential that grants a second capability.
+//
+// The refusal is symmetric with checkSecretExclusivity, which carries the
+// reciprocal entry — so a collision between this secret and a provisioning one
+// disables both channels rather than picking a winner. That is the intended
+// outcome: with one value serving two capabilities there is no half that is
+// safe to keep.
+//
+// Messages name ENVs, never values.
+func resolveLifecycleEventSecret(getenv func(string) string) (string, error) {
+	if getenv == nil {
+		return "", nil
+	}
+	secret := strings.TrimSpace(getenv(LifecycleEventSecretEnv))
+	if secret == "" {
+		return "", nil
+	}
+	for _, sibling := range lifecycleSecretSiblings {
+		if v := strings.TrimSpace(getenv(sibling)); v != "" && v == secret {
+			return "", fmt.Errorf(
+				"%s must differ from %s; the lifecycle event feed is disabled until it does",
+				LifecycleEventSecretEnv, sibling)
+		}
+	}
+	return secret, nil
 }
 
 func envString(key, fallback string) string {

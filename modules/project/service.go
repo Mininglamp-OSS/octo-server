@@ -1,12 +1,12 @@
 package project
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
@@ -487,8 +487,32 @@ func (p *Project) createProjectTxWithSeatRefs(
 		return nil, errQuotaDailyCreate
 	}
 
+	// Minted here rather than inline below because it can fail: see newProjectID
+	// for why the canonical hyphenated form, and why a failure refuses one create
+	// instead of panicking the process.
+	projectID, err := newProjectID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Two-phase create (O6, contract section 7). A project is ACTIVE to the peer
+	// only once the subsystem side has confirmed it has a container; until then
+	// the two inbound endpoints answer about it exactly as they answer about a
+	// project that does not exist.
+	//
+	// The latch is set here, at insert, whenever nothing is going to confirm it.
+	// That default is the load-bearing half, not a convenience: with the fleet
+	// target off — which is every deployment today — no confirmation step ever
+	// runs, so leaving it NULL would make every new project permanently invisible
+	// to the peer. Gating on the target rather than on a switch of its own means
+	// the phase that exists is exactly the phase something will finish.
+	var activatedAt sql.NullTime
+	if !p.twoPhaseCreateApplies() {
+		activatedAt = sql.NullTime{Time: now, Valid: true}
+	}
+
 	model := &Model{
-		ProjectID:       util.GenerUUID(),
+		ProjectID:       projectID,
 		SpaceID:         in.SpaceID,
 		Name:            in.Name,
 		Description:     in.Description,
@@ -497,6 +521,7 @@ func (p *Project) createProjectTxWithSeatRefs(
 		Discoverability: in.Discoverability,
 		MaxMembers:      in.MaxMembers,
 		Status:          StatusNormal,
+		ActivatedAt:     activatedAt,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -614,6 +639,42 @@ func (p *Project) createProjectTxWithSeatRefs(
 	}
 	model.MemberEpoch++
 
+	// And the LIFECYCLE version, by the same mechanism and for the same reason:
+	// creation is itself a lifecycle statement, so a consumer must be able to order
+	// it against everything that follows. Bumped rather than seeded in the insert
+	// column list — seeding is an absolute write, the one shape this column's write
+	// discipline forbids, and the epoch above already had to be redone for exactly
+	// that (PR #852 round 1).
+	//
+	// Checked for the same reason too: at version 0 the project is
+	// indistinguishable from a row that predates the column, which a consumer
+	// cannot order at all.
+	versioned, err := p.db.bumpLifecycleVersionTx(tx, model.ProjectID, now)
+	if err != nil {
+		return nil, err
+	}
+	if versioned == 0 {
+		return nil, fmt.Errorf(
+			"project: create bumped no lifecycle_version row for %s; the project would ship "+
+				"at version 0, which a consumer cannot order against anything", model.ProjectID)
+	}
+	model.LifecycleVersion++
+
+	// The lifecycle event, in the SAME transaction as the row it reports. Publishing
+	// after the commit would lose the publication to a crash in between, with
+	// nothing downstream able to notice — the consumer cannot miss what it was
+	// never told about. That is the whole reason the outbox table exists.
+	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+		EventType:      LifecycleEventProjectCreated,
+		ProjectID:      model.ProjectID,
+		SpaceID:        model.SpaceID,
+		ProjectVersion: &model.LifecycleVersion,
+		Payload:        projectCreatedPayload{CreatorUID: in.Creator},
+		OccurredAt:     now,
+	}, now); err != nil {
+		return nil, err
+	}
+
 	// Subsystem provisioning is enqueued in THIS transaction (D2). That is the only
 	// construction under which "the project exists ⟹ its provisioning jobs exist" is
 	// true; a Redis queue or a post-commit call can drop the job or orphan it.
@@ -642,11 +703,18 @@ func (p *Project) createProjectTxWithSeatRefs(
 // The sync is after the retry loop for the same reason the provisioner is: a
 // lock-conflict retry re-runs the transaction, and a rename inside the closure
 // would fire once per attempt.
-func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+//
+// It returns the row plus whether anything was actually WRITTEN. The flag exists
+// for the audit log: a request naming fields the project already matches is a
+// well-formed 200 with nothing written, and auditing it would record a change
+// that never happened — the exact defect the errNoFieldsToUpdate branch was
+// introduced to remove, reintroduced through the other door.
+func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 	var model *Model
+	var changed bool
 	err := retryOnLockConflict(func() error {
 		var e error
-		model, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
+		model, changed, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
 		return e
 	})
 	if err == nil && model != nil && req.Name != nil {
@@ -665,7 +733,7 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 		// The next rename converges them.
 		p.syncAllMemberGroupName(projectID, model.Name)
 	}
-	return model, err
+	return model, changed, err
 }
 
 // updateProject applies a partial profile update under the project row lock.
@@ -673,27 +741,27 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 // The allow-list is built here, not from the request payload: active_name and
 // is_official must never reach a SET clause, and an allow-list is the only form of
 // that guarantee which survives someone later adding a field to updateReq.
-func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 	seatRefs, err := p.db.resolveSpaceSeatIDs(spaceID, []string{actorUID})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	now := time.Now().UTC()
 	tx, err := p.db.session.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("project: begin update: %w", err)
+		return nil, false, fmt.Errorf("project: begin update: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
 	if err := p.requireSpaceSeatsTx(tx, spaceID, actorUID, seatRefs); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if row == nil {
-		return nil, errProjectGone
+		return nil, false, errProjectGone
 	}
 
 	// Re-read the actor's role under the project lock. The handler's check came from the
@@ -702,49 +770,128 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	// this file already did this; update and disband were the two that did not.
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !canUpdateProject(actorRole) {
-		return nil, errPermissionDenied
+		return nil, false, errPermissionDenied
 	}
 
+	// NAMED and DIFFERENT, not merely named.
+	//
+	// `named` decides the 400 below; `set` decides whether anything happens. They
+	// were one map, so a client re-sending the name a project already has counted
+	// as a change: the row was rewritten with identical values, lifecycle_version
+	// advanced, and one outbox row was enqueued. That is an amplifier a project
+	// admin can drive in a loop — the delivery worker sends events SEQUENTIALLY,
+	// ten per five-second tick, one HTTP round trip each, so empty
+	// metadata_updated events queue up in front of the member_revoked events whose
+	// delivery latency this module treats as security-relevant.
+	//
+	// It also disagreed with the rule the rest of the module follows: a no-op does
+	// not move a counter. The cascade is careful about it for member_epoch
+	// precisely so a consumer can trust that a moved counter means something moved.
+	named := 0
 	set := map[string]interface{}{}
 	if req.Name != nil {
-		set["name"] = *req.Name
-		row.Name = *req.Name
+		named++
+		if *req.Name != row.Name {
+			set["name"] = *req.Name
+			row.Name = *req.Name
+		}
 	}
 	if req.Description != nil {
-		set["description"] = *req.Description
-		row.Description = *req.Description
+		named++
+		if *req.Description != row.Description {
+			set["description"] = *req.Description
+			row.Description = *req.Description
+		}
 	}
 	if req.Logo != nil {
-		set["logo"] = *req.Logo
-		row.Logo = *req.Logo
+		named++
+		if *req.Logo != row.Logo {
+			set["logo"] = *req.Logo
+			row.Logo = *req.Logo
+		}
 	}
 	if req.Discoverability != nil {
-		set["discoverability"] = *req.Discoverability
-		row.Discoverability = *req.Discoverability
+		named++
+		if *req.Discoverability != row.Discoverability {
+			set["discoverability"] = *req.Discoverability
+			row.Discoverability = *req.Discoverability
+		}
 	}
 	if req.MaxMembers != nil {
-		set["max_members"] = *req.MaxMembers
-		row.MaxMembers = *req.MaxMembers
+		named++
+		if *req.MaxMembers != row.MaxMembers {
+			set["max_members"] = *req.MaxMembers
+			row.MaxMembers = *req.MaxMembers
+		}
 	}
 	// An update naming no field is rejected rather than quietly succeeding. The previous
 	// behaviour wrote nothing to the database (updateProfileTx returns early on an empty set)
 	// but still reported `updated_at = now` and emitted an update audit entry — so the response
 	// disagreed with the very next GET, and the audit log recorded a change that never
 	// happened. Both are worse than a 400.
+	if named == 0 {
+		return nil, false, errNoFieldsToUpdate
+	}
+	// Named every field, changed none. NOT a 400 — the request was well formed and
+	// the project already holds the requested state, so the honest answer is the
+	// current row. Nothing is written, so updated_at does not move either, which
+	// is the same consistency argument the 400 above is made from.
 	if len(set) == 0 {
-		return nil, errNoFieldsToUpdate
+		return row, false, tx.Commit()
 	}
 	if err := p.db.updateProfileTx(tx, projectID, set, now); err != nil {
-		return nil, err
+		// No duplicate-name mapping here, and its absence is the correct state after
+		// the rebase rather than something lost in it.
+		//
+		// This branch used to translate a 1062 into a "name already used" sentinel,
+		// because `octo_project` carried UNIQUE (space_id, active_name). main's
+		// 20260910000001_project_read_default.sql DROPPED that index on the stated
+		// ground that project names are display labels, not tenant identity, and
+		// that one Space may hold several active projects with the same name. The
+		// only unique key left on this table is uk_octo_project_project_id.
+		//
+		// So the mapping is not merely unreachable, it would be WRONG if it ever
+		// fired: the one 1062 this statement can still raise means a project_id
+		// collision — a crypto/rand failure in newProjectID, not a user naming
+		// mistake — and reporting that as a taken name would send an operator
+		// looking at the wrong thing.
+		return nil, false, err
+	}
+	// Bump on ANY profile change, not only the fields a consumer is told about.
+	// Bumping selectively would let two distinct project states share a version,
+	// and a consumer that discards anything not newer than what it holds would
+	// then drop the second one. Versions must be monotonic; they need not be
+	// gap-free, so an unreported change simply advances the counter.
+	if _, err := p.db.bumpLifecycleVersionTx(tx, projectID, now); err != nil {
+		return nil, false, err
+	}
+	version, err := p.db.readLifecycleVersionTx(tx, projectID)
+	if err != nil {
+		return nil, false, err
+	}
+	row.LifecycleVersion = version
+	// Payload is EMPTY: the event says "this project's profile changed, at
+	// version N" and nothing else. See docs/project-lifecycle-contract.md §5 —
+	// the name is user-supplied free text this repository holds authoritatively
+	// and does not egress, so the event is a change signal, not a sync.
+	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+		EventType:      LifecycleEventMetadataUpdated,
+		ProjectID:      projectID,
+		SpaceID:        spaceID,
+		ProjectVersion: &version,
+		Payload:        metadataUpdatedPayload{},
+		OccurredAt:     now,
+	}, now); err != nil {
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("project: commit update: %w", err)
+		return nil, false, fmt.Errorf("project: commit update: %w", err)
 	}
 	row.UpdatedAt = now
-	return row, nil
+	return row, true, nil
 }
 
 // disbandProject runs disbandProjectOnce through the bounded lock-conflict retry; see retryOnLockConflict.
@@ -824,6 +971,14 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	// keeps a disbanded project's epoch frozen), and disband is exactly the write that must
 	// move the epoch — the brief lists it alongside add/remove/leave/role-change/cascade.
 	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
+		return nil, err
+	}
+	// The lifecycle version too, and for the same ordering reason: disband is a
+	// lifecycle statement, and its guard is the same status = 1 predicate, so it
+	// must also run BEFORE the flip. After it, the bump matches no rows and the
+	// disband statement a consumer receives carries the version of the state
+	// BEFORE it — indistinguishable from a replay it should discard.
+	if _, err := p.db.bumpLifecycleVersionTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
 	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
@@ -1799,6 +1954,60 @@ func (p *Project) beginRemovalWithAgentsTx(
 	// bumpMemberEpochTx returns the affected-row count now; only createProject checks it (a silent no-op there would ship a project on the absent sentinel). Here the seat write above already established the row exists.
 	if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 		return false, nil, err
+	}
+	// Both project-side revocation paths — an admin removing someone, and a member
+	// leaving — funnel through here with their own `reason`, so the event is
+	// enqueued once, in the transaction that revokes, rather than at two call
+	// sites that could drift.
+	//
+	// The epoch is READ rather than taken from the bump: the bump reports rows
+	// affected, and a guessed epoch is worse than none, since the consumer uses it
+	// to recognise a revocation it has already superseded.
+	//
+	// NO project_version. A consumer discards a lifecycle statement not newer than
+	// what it holds — right for statements about the project, catastrophic for a
+	// revocation, which must be applied even when late: dropping it as stale leaves
+	// a removed member executing. Contract §3.
+	epoch, err := p.db.readMemberEpochTx(tx, projectID)
+	if err != nil {
+		return false, nil, err
+	}
+	// ONE event per CLOSED SEAT, the human's and every agent that went with them —
+	// not one event for the human.
+	//
+	// The agents hold octo_project_member seats, so they are members under the
+	// all-member-group invariant, and contract §3 carves out nothing for them. Every
+	// other channel in this transaction already treats these closures as member
+	// removals: each gets its own removal job above, its own audit entry, and its own
+	// role-cache invalidation. Only the peer-facing push skipped them, and nothing
+	// recorded the omission.
+	//
+	// Why that matters more for this event class than for a display update: the
+	// module's own doctrine is that losing a revocation is a security failure rather
+	// than a stale screen, because until it lands the removed principal can still
+	// execute on the consumer's side. An agent is an automated principal that runs as
+	// its owner, so a peer tearing down proactively on subject_uid never learns the
+	// agent has to stop.
+	//
+	// The SAME post-bump epoch on all of them, deliberately. One membership change
+	// moved the counter once; the epoch here is an idempotency key, not a per-event
+	// sequence, so giving the agents a different value would claim changes that did
+	// not happen. The owner's reason for the same reason: the agent's seat closed
+	// because the owner's did.
+	for _, uid := range closingUIDs {
+		if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+			EventType: LifecycleEventMemberRevoked,
+			ProjectID: projectID,
+			SpaceID:   spaceID,
+			Payload: memberRevokedPayload{
+				SubjectUID:  uid,
+				MemberEpoch: epoch,
+				Reason:      reason,
+			},
+			OccurredAt: now,
+		}, now); err != nil {
+			return false, nil, err
+		}
 	}
 	if err := p.db.enqueueRemovalJobTx(tx, RemovalJob{
 		ProjectID:   projectID,

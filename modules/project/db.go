@@ -100,6 +100,12 @@ func NewDB(ctx *config.Context) *DB {
 var projectInsertColumns = []string{
 	"project_id", "space_id", "name", "description", "logo", "creator",
 	"discoverability", "max_members", "status",
+	// activated_at is WRITTEN at insert (unlike member_epoch / lifecycle_version,
+	// which are bumped): it is a latch, not a counter, so there is no monotonicity
+	// discipline to protect and no UPDATE that could race it backwards. The value
+	// is a timestamp when nothing has to confirm the project, and NULL when
+	// something does — see createProjectOnce.
+	"activated_at",
 	"created_at", "updated_at",
 	// join_mode is deliberately absent: the column exists with its DDL default (1) and
 	// nothing above the storage layer touches it until the P2 join path lands. See the
@@ -115,6 +121,7 @@ func (d *DB) insertProjectTx(tx *dbr.Tx, m *Model) error {
 		Columns(projectInsertColumns...).
 		Values(m.ProjectID, m.SpaceID, m.Name, m.Description, m.Logo, m.Creator,
 			m.Discoverability, m.MaxMembers, m.Status,
+			m.ActivatedAt,
 			m.CreatedAt, m.UpdatedAt).
 		Exec()
 	if err != nil {
@@ -135,7 +142,8 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	var models []*Model
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, collaboration_role_epoch, status, all_member_group_no, "+
+			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
+			"lifecycle_version, status, activated_at, all_member_group_no, "+
 			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
@@ -158,7 +166,8 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	var models []*Model
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
-			"discoverability, max_members, member_epoch, collaboration_role_epoch, status, all_member_group_no, "+
+			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
+			"lifecycle_version, status, activated_at, all_member_group_no, "+
 			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
@@ -484,6 +493,80 @@ func (d *DB) bumpMemberEpochForSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) er
 		}
 	}
 	return nil
+}
+
+// bumpLifecycleVersionTx increments lifecycle_version in the caller's transaction.
+//
+// The statement is `lifecycle_version = lifecycle_version + 1` and never an
+// absolute assignment, for the same reason bumpMemberEpochTx is: two writers
+// racing an absolute value can move it BACKWARDS, and a version that goes
+// backwards is worse than none — a consumer discards the NEW state as stale,
+// keeping a superseded one, silently. A source guard greps this package for any
+// other shape of write.
+//
+// Guarded on status = StatusNormal, which means a caller that changes status must
+// bump BEFORE the flip — disband does exactly that, mirroring how it already
+// orders bumpMemberEpochTx.
+//
+// Returns the affected-row count for the same reason bumpMemberEpochTx does: the
+// status guard makes "no error" and "it happened" different facts, and creation
+// is the one call site where a silent no-op would ship a project at version 0 —
+// the value that predates this column and cannot be ordered against anything.
+func (d *DB) bumpLifecycleVersionTx(tx *dbr.Tx, projectID string, now time.Time) (int64, error) {
+	result, err := tx.UpdateBySql(
+		"UPDATE octo_project SET lifecycle_version = lifecycle_version + 1, updated_at = ? "+
+			"WHERE project_id = ? AND status = ?",
+		now, projectID, StatusNormal,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: bump lifecycle version: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: bump lifecycle version rows: %w", err)
+	}
+	return affected, nil
+}
+
+// readMemberEpochTx reads the current member_epoch inside the caller's
+// transaction.
+//
+// Read rather than derived from the bump's return value, because the bump
+// reports rows AFFECTED, not the resulting value — and an event that carried a
+// guessed epoch would be worse than one carrying none: the consumer uses it to
+// recognise a revocation it has already superseded.
+//
+// In the caller's transaction on purpose. Reading after the commit would race
+// another membership write and could report an epoch NEWER than the revocation
+// this event describes, which would let the consumer discard a later, real
+// revocation as already-seen.
+func (d *DB) readMemberEpochTx(tx *dbr.Tx, projectID string) (int64, error) {
+	var epochs []int64
+	if _, err := tx.SelectBySql(
+		"SELECT member_epoch FROM `octo_project` WHERE project_id = ?", projectID,
+	).Load(&epochs); err != nil {
+		return 0, fmt.Errorf("project: read member epoch: %w", err)
+	}
+	if len(epochs) == 0 {
+		return 0, fmt.Errorf("project: read member epoch: no row for %s", projectID)
+	}
+	return epochs[0], nil
+}
+
+// readLifecycleVersionTx is readMemberEpochTx for the lifecycle counter, and it
+// exists for the same reason: an event carrying a guessed version is worse than
+// one carrying none, because the consumer orders on it.
+func (d *DB) readLifecycleVersionTx(tx *dbr.Tx, projectID string) (int64, error) {
+	var versions []int64
+	if _, err := tx.SelectBySql(
+		"SELECT lifecycle_version FROM `octo_project` WHERE project_id = ?", projectID,
+	).Load(&versions); err != nil {
+		return 0, fmt.Errorf("project: read lifecycle version: %w", err)
+	}
+	if len(versions) == 0 {
+		return 0, fmt.Errorf("project: read lifecycle version: no row for %s", projectID)
+	}
+	return versions[0], nil
 }
 
 // countActiveInSpaceTx counts a Space's active projects inside the create transaction.

@@ -134,7 +134,7 @@ import 守卫拿 `"internal/projectprovision"`（带前引号）去匹配，而�
 | 回滚不留行 / 提交后每目标恰好一行且 container_id 已就位 | `TestProvisioningEnqueueFailureRollsBackTheWholeCreate` + `TestCreateEnqueuesExactlyOneRowPerEnabledTarget` |
 | worker 幂等：重放收敛到 ready 且不造第二个容器 | `TestWorkerReachesReadyAndConvergesOnReplay`（假目标按 container_id 记账，所以能区分「调了两次」和「建了两个」） |
 | 无读路径以本表为门 | `TestNoHandlerReachesTheProvisioningTable`（禁用标识符集**从 DAO 源码派生**，改名不会让守卫落空） |
-| 两个 secret 进 exclusions、且与任何内部 token 不同 | `TestMainWiresProvisioningCredentialsIntoValidateNotifyTokenExclusions` + `TestLoadProvisioningConfig` 的四个 sibling 用例 |
+| 两个 secret 进 exclusions、且与任何内部 token 不同 | `TestMainWiresProvisioningSecretsIntoValidateNotifyTokenExclusions` + `TestLoadProvisioningConfig` 的四个 sibling 用例 |
 | 解散移到 `disband_pending` 且不发出网请求 | `TestDisbandMovesRowsToDisbandPendingAndSendsNothing`（解散后再跑一轮 worker，断言假目标计数不变） |
 | 出网客户端只在 worker 包，`modules/project` / `modules/user` 的 handler 都到不了 | `TestProvisioningClientIsConfinedToTheWorker` |
 | 未收窄容器数量有 gauge | `TestUnnarrowedContainerGaugeCountsReadyRowsOnUnnarrowedTargets`（含「条件消失后回落到 0」） |

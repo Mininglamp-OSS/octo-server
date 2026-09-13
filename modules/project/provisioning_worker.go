@@ -456,6 +456,12 @@ func (p *Project) runProvisioningJob(job *provisioningJob, owner string) {
 	// equal the row key, while Drive's remote id is never part of the local
 	// contract. ProjectID remains the only Drive mapping key.
 	p.finishProvisioning(job, owner, provisionStatusReady, "")
+	// And the two-phase create latch (O6). AFTER the job is marked ready, not
+	// before: if the process dies between the two, the job is done and the
+	// project is unlatched — visible in the awaiting-activation gauge and
+	// repairable — whereas latching first and dying would mark the project
+	// visible to the peer against a job that still reads as unfinished.
+	p.confirmProjectActive(job.ProjectID, job.Target)
 }
 
 // provisioningContainerName is the low-information label sent on Fleet's
@@ -482,10 +488,18 @@ func (p *Project) releaseOrAbandon(job *provisioningJob, owner, outcome string, 
 		// Error, and on purpose it fires once per row rather than once per tick:
 		// abandoned has NO automatic re-drive. Once the target's precondition (brief
 		// P-2, a service identity) lands, these rows need a deliberate requeue.
+		//
+		// For the fleet target this is also the point where two-phase create
+		// gives up: activated_at stays NULL, so the peer keeps answering about
+		// the project as if it did not exist. That is the contract behaviour
+		// (section 7: terminal plus alert, no automatic retry) rather than a
+		// second failure, but it is the half an operator will not infer from
+		// "provisioning abandoned", so the line says it.
 		p.Error("project provisioning abandoned; no automatic re-drive, needs a requeue",
 			zap.Uint64("jobId", job.ID), zap.String("target", job.Target),
 			zap.String("projectId", job.ProjectID), zap.String("outcome", outcome),
 			zap.Bool("permanent", permanent),
+			zap.Bool("peerStaysBlind", job.Target == TargetFleet),
 			zap.Uint32("attempts", job.Attempts), zap.Error(cause))
 		// The give-up reason AND the failure detail. finishProvisioningJob SETs last_error
 		// rather than appending, so writing the reason alone would overwrite the detail the

@@ -44,10 +44,10 @@ func TestUpdateRefusalDoesNotFallThroughIntoSuccess(t *testing.T) {
 
 	orig := p.updateFn
 	t.Cleanup(func() { p.updateFn = orig })
-	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, bool, error) {
 		// Exactly what requireSpaceSeatsTx returns when the actor's Space seat has closed:
 		// a nil model with the actor-level sentinel.
-		return nil, errActorNotSpaceMember
+		return nil, false, errActorNotSpaceMember
 	}
 
 	w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, ownerTok,

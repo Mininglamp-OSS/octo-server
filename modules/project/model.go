@@ -1,6 +1,9 @@
 package project
 
-import "time"
+import (
+	"database/sql"
+	"time"
+)
 
 // ---------- enums ----------
 
@@ -87,29 +90,52 @@ const (
 // It likewise has no IsOfficial field: no P0 code path writes that column, and
 // leaving it out of the model is what makes that checkable rather than aspirational.
 type Model struct {
-	ID                     int64  `db:"id"`
-	ProjectID              string `db:"project_id"`
-	SpaceID                string `db:"space_id"`
-	Name                   string `db:"name"`
-	Description            string `db:"description"`
-	Logo                   string `db:"logo"`
-	Creator                string `db:"creator"`
-	Discoverability        int    `db:"discoverability"`
-	MaxMembers             int    `db:"max_members"`
-	MemberEpoch            int64  `db:"member_epoch"`
-	CollaborationRoleEpoch int64  `db:"collaboration_role_epoch"`
-	Status                 int    `db:"status"`
+	ID              int64  `db:"id"`
+	ProjectID       string `db:"project_id"`
+	SpaceID         string `db:"space_id"`
+	Name            string `db:"name"`
+	Description     string `db:"description"`
+	Logo            string `db:"logo"`
+	Creator         string `db:"creator"`
+	Discoverability int    `db:"discoverability"`
+	MaxMembers      int    `db:"max_members"`
+	MemberEpoch     int64  `db:"member_epoch"`
+	// CollaborationRoleEpoch orders statements about the project's collaboration-role
+	// catalog. Third counter on this row, same increment-only discipline (from #871).
+	CollaborationRoleEpoch int64 `db:"collaboration_role_epoch"`
+	// LifecycleVersion orders statements about the PROJECT — its name, its
+	// description, whether it is active. Deliberately separate from MemberEpoch,
+	// which orders statements about the ROSTER: one shared counter would make
+	// every rename invalidate every cached authorization decision downstream, and
+	// every membership change look like a lifecycle statement. They move at
+	// different rates for different reasons.
+	LifecycleVersion int64 `db:"lifecycle_version"`
+	Status           int   `db:"status"`
 	// AllMemberGroupNo is this project's all-member group, or "" when it has
 	// none yet. "" is the sentinel and the column is NOT NULL, so every
 	// predicate in the feature is written `= ''` / `!= ''` (see D5).
 	//
-	// Empty is a reachable state, not an error: provisioning runs after the
-	// create transaction commits (the hook opens its own modules/group
-	// transaction), so a failure leaves the Project alive without a group.
-	// Reconcile scan A reports that missing artifact for operational repair.
-	AllMemberGroupNo string    `db:"all_member_group_no"`
-	CreatedAt        time.Time `db:"created_at"`
-	UpdatedAt        time.Time `db:"updated_at"`
+	// Empty is a REACHABLE state, not an error: the group is provisioned after
+	// the create transaction commits (the hook opens its own transaction in
+	// modules/group), so a provisioning failure leaves the project alive with no
+	// group. D4 makes that recoverable rather than terminal — the next write path
+	// on this project retries under a lease, and reconcile scan A reports it.
+	AllMemberGroupNo string `db:"all_member_group_no"`
+	// ActivatedAt is the two-phase create latch: when the subsystem side
+	// confirmed this project has a container. NULL until it does, and the two
+	// peer-facing endpoints answer about a NULL row exactly as they answer about
+	// a project that does not exist.
+	//
+	// sql.NullTime rather than *time.Time, and the difference is not stylistic:
+	// dbr materializes a NULL column into a NON-NIL *time.Time at the zero time,
+	// so a pointer field would read as "activated in year zero" for every
+	// unconfirmed project and every `if m.ActivatedAt != nil` would be true. A
+	// test helper written the pointer way did exactly that before this comment
+	// existed. NullTime carries the NULL in a field of its own, outside the value
+	// domain — the same reason the epoch sentinel had to leave it.
+	ActivatedAt sql.NullTime `db:"activated_at"`
+	CreatedAt   time.Time    `db:"created_at"`
+	UpdatedAt   time.Time    `db:"updated_at"`
 }
 
 // MemberModel is an octo_project_member row.

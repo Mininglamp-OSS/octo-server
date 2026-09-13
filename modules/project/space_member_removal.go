@@ -547,6 +547,63 @@ func (p *Project) deactivateSeatForCascadeResult(
 		if _, err := p.db.bumpMemberEpochTx(tx, projectID, now); err != nil {
 			return cascadeSeatResult{}, err
 		}
+		// And the revocation event, in this transaction — the one that actually
+		// closes the seat.
+		//
+		// Later than the epoch, and that asymmetry is deliberate. The epoch moved
+		// at Space-removal COMMIT (bumpMemberEpochForSpaceMemberTx), because
+		// authorization must not depend on an asynchronous job that can sit in
+		// backoff for minutes and has a terminal abandoned state. The event is the
+		// notification, and it rides the job because that is where the affected
+		// projects are already enumerated and paged — enqueuing one event per
+		// project inside the Space-removal transaction would put an unbounded
+		// number of inserts on a user-facing write.
+		//
+		// The consequence, stated rather than discovered: if this job is abandoned,
+		// the peer never gets the notification. It is still DENIED correctly,
+		// because the epoch moved at commit and the verify endpoint conjoins the
+		// Space half. What is lost is the push, not the authorization.
+		epoch, err := p.db.readMemberEpochTx(tx, projectID)
+		if err != nil {
+			return cascadeSeatResult{}, err
+		}
+		// ONE event per CLOSED SEAT — closingUIDs, not uid. It fixes an omission and
+		// an over-emission at once, in opposite directions:
+		//
+		//   - UNDER: the agents that went with the human hold octo_project_member
+		//     seats, so they are members under the all-member-group invariant and
+		//     contract §3 carves out nothing for them. Their seats close in this very
+		//     transaction, each with its own removal job, its own audit entry
+		//     (agent_follows_owner) and its own role-cache invalidation — every
+		//     channel except the peer-facing push already treated them as member
+		//     removals. An agent is an automated principal running as its owner, so a
+		//     peer that tears down on subject_uid never learned it has to stop.
+		//   - OVER: closingUIDs omits `uid` when memberChanged is false, which is the
+		//     preserve-owner case. seatChanged is true there whenever any agent
+		//     closed, so emitting for `uid` announced a revocation for a human whose
+		//     seat is still open — a peer acting on it would tear down access the
+		//     database still grants. closingUIDs is built from what actually changed,
+		//     so it cannot say that.
+		//
+		// The SAME post-bump epoch on every one, deliberately: one membership change
+		// moved the counter once, and the epoch here is an idempotency key rather than
+		// a per-event sequence. Different values would claim changes that never
+		// happened.
+		for _, closed := range closingUIDs {
+			if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
+				EventType: LifecycleEventMemberRevoked,
+				ProjectID: projectID,
+				SpaceID:   spaceID,
+				Payload: memberRevokedPayload{
+					SubjectUID:  closed,
+					MemberEpoch: epoch,
+					Reason:      reason,
+				},
+				OccurredAt: now,
+			}, now); err != nil {
+				return cascadeSeatResult{}, err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return cascadeSeatResult{}, fmt.Errorf("project: commit cascade seat close: %w", err)

@@ -550,3 +550,417 @@ increment:
         for the P1 blocker rather than part of O1.
     - id: O4-O7
       reason: outbound event chain — depends on O1.
+
+# ---------------------------------------------------------------------------
+# Increment 2 — the outbound half, on branch
+# claude/loop-project-fleet-integration-dea1yz, built on increment 1 head.
+#
+# REBUILT once: increment 1 was rebased onto newer main (its SHAs all changed),
+# so this branch's base stopped existing in that history. The seven commits were
+# replayed onto the new head with `rebase --onto`. Two conflicts, both from the
+# other lane touching the same code: an import line, and a convergent fix — both
+# lanes independently made the pkg/project source guard strip comments, for
+# opposite reasons (a comment satisfying a PRESENCE check here; a comment
+# breaking an ABSENCE check there). Kept as one named helper carrying both
+# rationales.
+# ---------------------------------------------------------------------------
+
+increment_2:
+  implemented: [O1a, O4, O5, O6, O7, contract]
+  not_implemented:
+    - id: O1b
+      what: archive / restore
+      reason: >
+        Contract frozen (section 8), code deliberately not written, by explicit
+        instruction. Nothing half-wired exists: the `archived_at` column,
+        model field and response field the brief describes as already added were
+        on the discarded local branch and are NOT in this lineage. The brief
+        paragraph calling O1b "half-wired, finish it or roll it back" is
+        therefore stale — there is nothing to roll back.
+    - id: O8
+      what: mock, SLA, alert rules, collation conversion plan
+      reason: not started.
+
+  decisions:
+    - id: D-outbox-table
+      what: >
+        Lifecycle events get their OWN table
+        (octo_project_lifecycle_event), not the provisioning outbox.
+      why: >
+        Reverses landing-order item 3 in the brief, which said to carry the
+        events on octo_project_provisioning. That table is UNIQUE
+        (project_id, target) — one row per project per target, a mapping — and
+        an event stream is append-only with many rows per project. The two
+        shapes are mutually exclusive; the brief item was written before that
+        was checked. The property it wanted carried over IS carried over: the
+        payload is serialized at enqueue and replayed verbatim, pinned by
+        TestPayloadIsFrozenAtEnqueue.
+    - id: D-two-counters
+      what: member_epoch and lifecycle_version stay separate columns.
+      why: >
+        member_epoch answers "has the roster changed" and every consumer keys a
+        cached authorization decision on it; lifecycle_version orders statements
+        about the project itself. One shared counter would make every rename
+        invalidate every cached grant downstream, and every membership change
+        look like a lifecycle statement. Both carry the same increment-only
+        write discipline, enforced by the same parameterized source guard.
+    - id: D-revocation-carries-no-version
+      what: project.member_revoked ships with project_version = null.
+      why: >
+        A consumer discards a lifecycle statement not newer than what it holds.
+        Right for statements about the project; catastrophic for a revocation,
+        which must be applied even when late — dropping it as stale leaves a
+        removed member executing. Contract section 3.
+    - id: D-o6-column-not-status
+      what: >
+        Two-phase create is octo_project.activated_at (a nullable one-way
+        latch), not a third `status` value, even though contract section 7
+        draws it as `status=provisioning`.
+      why: >
+        About twenty predicates read status = 1 and mean different things by it
+        (the seat exists / the name is taken / it counts against quota / it is
+        visible / it is writable). A third value changes all of them at once,
+        and the two ways of getting it wrong are asymmetric: a missed predicate
+        on the status route silently turns members into non-members, which the
+        I2 reconcile then reads as a violation and tears the project group down.
+        Section 8 chose a column for archive on the same argument. The peer
+        cannot observe the difference — the two inbound endpoints answer exactly
+        as the section draws them — and section 7 now records this explicitly.
+    - id: D-o6-gate-follows-the-target
+      what: >
+        A new project waits for confirmation only when the fleet provisioning
+        target is enabled; otherwise the latch is set inside the create
+        transaction.
+      why: >
+        The confirming step IS the fleet ensure. With the target off — every
+        deployment today — nothing would ever set the latch, so a NULL default
+        would make every new project permanently invisible to the peer. Not
+        given a switch of its own, because a switch could be on while the target
+        was off, which is exactly the state that strands projects.
+    - id: D-o6-identity-check
+      what: >
+        Activation is gated on the existing "the target echoed the id we asked
+        it to create" check, not on a literal workspace_id == project_id
+        comparison.
+      why: >
+        They are the SAME check — the id we ask fleet to create is its workspace
+        id — but not yet the same VALUE. The fleet container id is still PR
+        #850's opaque random form, which the brief records as temporary: it
+        becomes project_id once fleet lands the authorization narrowing
+        (V1.1 sections 3.2/3.3). Making them equal BEFORE that narrowing would
+        open the known escalation chain the opaque id currently blocks (list
+        project_id -> use as workspace_id -> fleet admits on Space membership
+        and materializes the caller as a workspace member). So the order is:
+        peer narrows first, we swap the id form second — and this call site does
+        not change when they do.
+
+  deviations:
+    - what: >
+        The lifecycle event secret is refused when it equals any other fixed
+        capability credential, including the two provisioning secrets.
+      why: >
+        main.go's registry sees the pair but only LOGS it, leaving both
+        capabilities live. Provisioning and the event feed both talk to fleet;
+        one value for both means a leak from either grants both. The refusal is
+        symmetric, so a collision disables both channels rather than picking a
+        winner — with one value serving two capabilities there is no half that
+        is safe to keep.
+    - what: >
+        refusedEnvs in main_internaltoken_test.go now resolves identifiers
+        package-wide rather than file-locally.
+      why: >
+        A refusal list naming a constant declared in a sibling file of the same
+        package reported a false failure. The fix the file-scoped resolver
+        invites is re-declaring the literal locally, which is the duplication
+        the exported constant exists to prevent.
+    - what: >
+        The pkg/project source guard now strips line comments before searching.
+      why: >
+        A mutation that deleted `activated_at IS NOT NULL` from the SQL passed,
+        because the comment explaining the filter — inside the function body —
+        still contained the string. A guard a comment can satisfy reports green
+        for exactly the thing it was written to catch.
+
+  review_fixes:
+    - id: R-gate-vs-client
+      finding: >
+        The enqueue gate tested only that the URL and secret were non-empty while
+        the delivery client validated their shape, so a URL with a query string or
+        a secret below the key floor enabled enqueue and could never build a
+        sender. claimLifecycleEvents charges an attempt before delivery is
+        attempted, so every tick burned budget on rows that never reached the
+        abandon check; the table grew without bound (the purge only touches
+        terminal rows) and no revocation ever left the process.
+      decision: >
+        One validateLifecycleEndpoint, called by both. Pinned by a test that
+        asserts the two agree over a table of URL/secret shapes, so a future rule
+        added to only one of them fails.
+    - id: R-per-project-ordering
+      finding: >
+        Delivery was ordered globally but not per project. A project.created
+        hitting a transient 5xx is rescheduled with backoff and drops behind the
+        events queued after it; delivering those first makes the peer answer
+        "unknown project", a plain 4xx, which this client classifies as TERMINAL.
+        One transient failure on the creation event could therefore permanently
+        abandon the member_revoked behind it.
+      decision: >
+        The loop blocks a project on its first failure and skips the rest of that
+        project's rows in the batch, releasing them with the claim attempt
+        REFUNDED. Blocking is per project, so one slow peer response does not
+        stall the queue. Abandoned counts as done: nothing retries it, so holding
+        the project behind it would turn one lost event into a stalled project.
+    - id: R-truncate-runes
+      finding: >
+        truncateError sliced by bytes, so a peer error code containing multi-byte
+        UTF-8 was cut mid-rune. MySQL strict mode rejects the write with 1366 —
+        and the write it fails is the one marking the event delivered or
+        abandoned, so the row stays pending and the same event is redelivered
+        forever.
+      decision: Cut back to a rune boundary; bound stays 255 bytes.
+    - id: R-activation-repair
+      finding: >
+        confirmProjectActive runs after finishProvisioning marks the job terminal,
+        and terminal jobs are never re-claimed. A pod killed between the two, or a
+        transient error on the latch UPDATE, left a project whose container
+        demonstrably exists permanently invisible to the peer.
+      decision: >
+        A reconcile scan latches projects whose fleet job is ready but
+        activated_at is NULL. Reordering the two statements was rejected: it
+        trades this for the worse failure, a project visible to the peer against a
+        job that still reads as unfinished. The query lives in db_provisioning.go
+        because #850's guards require that table to be named in exactly one file,
+        and it selects project_id only, never container_id.
+      note: >
+        The first version was a single joined UPDATE with LIMIT. MySQL refuses
+        LIMIT on a multi-table UPDATE (1221), so it compiled, failed at runtime,
+        logged one Warn, and never repaired anything. Caught by the test. Now
+        SELECT-then-UPDATE; dropping the LIMIT to satisfy the parser was not an
+        option, since the row count here IS the backlog.
+    - id: R-noop-update
+      finding: >
+        updateProjectOnce keyed on whether a field was NAMED, not whether it
+        CHANGED, so re-sending a project its own name bumped lifecycle_version and
+        enqueued an event. Events are delivered sequentially, ten per five-second
+        tick, one round trip each — so a project admin in a loop could queue empty
+        metadata_updated events in front of member_revoked.
+      decision: >
+        Split into `named` (decides the 400) and `set` (decides whether anything
+        happens). Named-but-identical returns the current row with nothing
+        written, which also keeps the module's own rule that a no-op does not move
+        a counter.
+    - id: R-activation-index
+      finding: >
+        The awaiting-activation census and age gauge scanned octo_project with no
+        usable index, on every metrics tick on every pod — and the STEADY STATE is
+        the worst case: with nothing awaiting activation the predicate matches no
+        row, so an unindexed query reads the whole table to return nothing.
+      decision: >
+        Index (activated_at, status, created_at) on the same unreleased migration.
+        NULLs are indexed in InnoDB, so the empty case becomes an empty range and
+        the age query gets its ORDER BY from the index.
+
+    - id: R-round8-B12-agent-revocations
+      finding: >
+        Both removal funnels — beginRemovalWithAgentsTx (kick and leave) and the
+        Space cascade — close the human's seat AND every agent seat they own in one
+        transaction, but enqueued exactly ONE project.member_revoked naming the
+        human. Agents hold octo_project_member seats and are members under the
+        all-member-group invariant; every other channel (audit trail, role-cache
+        invalidation) treats these closures as member removals. Only the
+        peer-facing push skipped them, and no metric recorded the omission.
+      decision: >
+        One event per CLOSED SEAT on both paths, all sharing the single post-bump
+        member_epoch — so the epoch stays the roster's ordering token and the
+        per-uid events stay idempotency-keyed to it. Working through it surfaced
+        the opposite defect in the cascade, which nobody had named: it also
+        OVER-emitted, announcing a revocation for a preserved Owner whose Space
+        seat survived. revokedSubjects asserts the subject SET rather than a count,
+        so both directions are pinned.
+    - id: R-round8-B11-latch-policy
+      finding: >
+        twoPhaseCreateApplies counted a requested-but-REJECTED fleet target as
+        "something will confirm", so create inserted with activated_at NULL. But a
+        rejected target never reaches enqueueProvisioningTx, and
+        latchUnconfirmableProjects' per-row predicate is exactly "no fleet job
+        exists" — so the very next reconcile tick cancelled the insert-time gate,
+        silently and irreversibly, with no re-enqueue path once the env was fixed.
+      decision: >
+        Reviewer option (b): a rejected target no longer counts, and the paragraph
+        and pins claiming otherwise are replaced by ones stating the contradiction
+        they used to create. What (b) concedes, now stated in code, comments and
+        tests alike: in a secret-collision config new projects are visible to the
+        peer immediately — the credential guard still refuses to USE the colliding
+        secret, but no longer withholds visibility.
+      not_taken: >
+        Option (a) is the better fix: persist "fleet was requested for this row" as
+        a non-claimable blocked provisioning status, so the repair distinguishes
+        never-requested from requested-but-rejected AND RECOVERS the window rows —
+        which (b) structurally cannot, because under (b) those rows were never
+        gated. It needs a status vocabulary change on octo_project_provisioning and
+        a claimability rule, which is its own change.
+    - id: R-round8-B10-conformance-secrets
+      finding: >
+        validateLifecycleEndpoint declared parity with projectprovision.ValidateTarget
+        but omitted its published-conformance-vector refusal, and permits plain
+        http — so a deployment configured with either published key lets anyone
+        holding this public repository forge lifecycle events against the peer.
+      decision: >
+        IsPublishedConformanceSecret exported from internal/projectprovision (the
+        literals stay at their single declaration site) and refused inside
+        validateLifecycleEndpoint. Both vectors added to the gate/client parity
+        table.
+    - id: R-round8-B9-third-surface
+      finding: >
+        MembershipsInSpace — behind POST /v1/auth/verify — carries no activation
+        term, so it answers for a project the gate exists to hide. The exemption
+        rationale claimed SpaceMiddleware; the route's group carries only a rate
+        limiter.
+      decision: >
+        Kept as a deliberate third case. The rationale is CORRECTED to the one that
+        actually holds — authVerifyToken derives the uid from the PRESENTED TOKEN,
+        so a caller cannot ask about anyone but themselves — and contract section 7
+        gains a coverage-boundary subsection naming the endpoint.
+      still_open: >
+        Product sign-off from someone other than the change author, as the review
+        asked. The question is one line: during provisioning, should a creator see
+        their own project? This cannot be self-supplied and is not an engineering
+        call.
+    - id: R-rebase-lifecycle-client-reuse
+      finding: >
+        lifecycleSenderOrDefault built a fresh http.Client and a cloned Transport on
+        every five-second delivery tick. Keep-alive pooling lives in the Transport,
+        so the pool never saw a second request: every event paid a full TCP+TLS
+        handshake while each superseded Transport held its idle connections for its
+        whole IdleConnTimeout with nothing calling CloseIdleConnections. The
+        function's own comment already claimed "one client, reused".
+      decision: >
+        Memoised, keyed on the (url, secret, timeout) it was built from so a config
+        change rebuilds rather than signing with a stale secret. Construction errors
+        are deliberately NOT cached: the configuration is what changed and it can
+        change back.
+    - id: R-rebase-membership-fold-key
+      finding: >
+        MembershipsInSpace keyed its answer by the spelling the DATABASE returned
+        while its only consumer looked up the spelling the CALLER sent. project_id
+        compares case-insensitively under either production collation, so a
+        re-cased id matched in SQL and missed in Go: /v1/auth/verify answered
+        member:false for a real member of a real project. Fail-closed, but a
+        legitimate member refused — and the third instance in one file of the
+        defect FoldID exists to make impossible.
+      decision: >
+        Keyed by FoldID, matching the two sibling readers; the call site folds its
+        needle and the answer still echoes the CALLER's spelling.
+        TestVerifyAnswersARecasedProjectIDForARealMember asserts both halves.
+    - id: R-rebase-enqueue-counter-doc
+      finding: >
+        lifecycleEventEnqueued's help text asserted that enqueued minus delivered
+        minus abandoned equals the backlog, and that divergence means rows are
+        leaving by an unintended path. The increment is pre-commit, so every
+        rollback and every retryOnLockConflict retry produces exactly that
+        divergence — the text turned normal operation into the alert it told
+        operators to read as data loss.
+      decision: >
+        States the honest inequality (enqueued >= delivered + abandoned + backlog).
+        Making the counter exact is possible — each producer has one Commit — and
+        was not done: four call sites' worth of threaded state for a monitoring
+        nicety.
+    - id: R-rebase-repair-reports-candidates
+      finding: >
+        repairConfirmedButUnlatched returned its CANDIDATE ids, which the caller
+        logs at Error. The UPDATE's predicate means one writer takes a row, but the
+        SELECT runs on every replica every tick — so every pod logged the same
+        Error naming the same projects for one repair, and a row the reactive path
+        latched in between was reported as repaired here.
+      decision: >
+        Gates on RowsAffected and re-selects by the timestamp it wrote, as both
+        siblings (latchUnconfirmableProjects, abandonExhaustedLifecycleEvents)
+        already did.
+    - id: R-explain-precondition
+      finding: >
+        Both reviews asked that the recorded ~96x claim-query cost be treated as a
+        hard precondition to enabling the feed rather than as advice.
+      decision: >
+        Stated as one at envLifecycleEventsEnabled — what an operator reads when
+        they flip the switch — alongside the second precondition (a deployment with
+        existing projects needs a backfill). Neither is enforceable in code: this
+        process cannot check whether anyone ran an EXPLAIN, so the change is to put
+        them where they will be seen rather than to pretend they are guarded.
+
+  not_fixed_here:
+    - id: R-epoch-map-key
+      what: >
+        ProjectMemberships looks up the epoch with an exact Go map key while
+        ProjectEpochsInSpace keys the map by the DB spelling under a
+        case-INSENSITIVE collation. A case-variant project id matches in SQL and
+        misses in the map, so every real member of a live project is answered
+        member:false and the project reads as nonexistent. Same defect class as
+        the P2h handler-layer fix in the previous increment; this call site was
+        missed.
+      why_not_here: >
+        Inherited from the O2/O3 increment, which another agent is driving.
+        Raised with the owner rather than fixed silently in a branch built on top
+        of it.
+      status: >
+        FIXED UPSTREAM. The O2/O3 branch closed it in ea51fd1c — the lookup is
+        now epochs[FoldID(projectID)] and FoldID is exported from pkg/project so
+        the producing and consuming sides share one definition. Carried in by
+        this branch's rebuild onto that head.
+    - id: R-lock-order
+      what: >
+        bumpMemberEpochForSpaceMemberTx takes octo_project_member locks before
+        octo_project locks, the opposite of every other transaction in
+        modules/project, inside a user-facing Space-removal transaction that has
+        no retryOnLockConflict wrapper.
+      why_not_here: same as above.
+      status: >
+        FIXED UPSTREAM, in the same commit, and the upstream diagnosis is sharper
+        than the finding: the lock order of that joined UPDATE is not a property
+        of the SQL at all, because the OPTIMIZER picks the driving table and the
+        choice flips with cardinality (measured on 8.0.33 against this schema:
+        p driving at 3 projects, pm driving at 200). The Space side also gained
+        pkg/db.RetryOnLockConflict.
+    - id: R-epoch-repair-per-row
+      what: scanEpochSanity repairs the absent-epoch sentinel one UPDATE per row.
+      why_not_here: same as above.
+      status: >
+        STILL OPEN upstream. Performance under a rollback backlog, not
+        correctness — the CAS in each statement is what makes the repair safe, and
+        that property survives batching.
+    - id: R-credential-registry-copies
+      what: >
+        The fixed internal-token registry is hand-copied across main.go,
+        modules/internal_membership and modules/project, re-spelling constants
+        that were exported to prevent the copies.
+      why_not_here: >
+        A cross-module refactor (the registry belongs in one leaf package), not a
+        defect: the copies are held in lockstep by
+        TestModuleLocalRefusalsCoverTheCentralRegistry and
+        TestSiblingListCoversTheCentralRegistry. Worth its own task.
+    - id: R-migration-naming
+      what: >
+        The review read the four new migration filenames as violating CLAUDE.md's
+        documented `<yyyyMMdd>-<seq>_<name>.sql`.
+      why_not_here: >
+        Checked: 212 of 212 migration files in this repository use the
+        concatenated form and none use the hyphenated one. The documentation is
+        what is wrong, and fixing it is a repo-wide doc change rather than
+        something to smuggle into this branch.
+
+  open_questions:
+    - id: Q-409-codes
+      what: >
+        The exact trigger conditions for IDEMPOTENCY_CONFLICT and
+        WORKSPACE_ID_CONFLICT are still owed by the peer. Until they arrive the
+        client treats every non-401/403/408/429 4xx as terminal.
+    - id: Q-ttl
+      what: >
+        The hard TTL asked for in S4-Q1 is now DEFENCE IN DEPTH, not required.
+        Moving the Space-removal epoch bump into the removal transaction (P1g)
+        removed the dependency on a peer commitment. The peer has not been told
+        this yet.
+    - id: Q-event-list
+      what: >
+        The v2 reply to the peer named project.disbanded and omitted
+        project.metadata_updated. The frozen contract supersedes it: disband
+        converges through the epoch predicate, and reclamation goes through
+        provisioning's disband_pending. The peer has not been told this yet.
