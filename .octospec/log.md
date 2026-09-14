@@ -4,6 +4,15 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-14 — ai-team-unread
+
+- **Added** — An optional AI session unread result on the existing conversation
+  sync, with explicit full/delta mode for frontend state and agent aggregation.
+- **Preserved** — Ordinary sync fields, IM request, filters, cursors and read
+  operations; no unread fields on AI metadata APIs or new Redis storage.
+- **Verified** — Response/IM-parameter equivalence, owner/Space isolation and
+  real IM reply/clear/delete behavior. See [journal](journal/shared/ai-team-unread.md).
+
 ## 2026-09-09 — space-directory-octo-hosted-only
 
 - Tightened `GET /v1/space/directory` so `agents` / `agent_count` /

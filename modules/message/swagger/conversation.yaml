@@ -67,6 +67,24 @@ paths:
               uid:
                 type: string
                 description: "请求者uid"
+              ai_team_conversations:
+                type: object
+                description: |
+                  独立的 AI session 未读结果，复用本次 IM 请求，不改变原 conversations。
+                  AI Team 开启、请求限定 Space 且 msg_count > 0 时提供。
+                  只含当前用户有权访问的就绪、未删除 session，包括归档/静音 session，
+                  不含 AI Team 总群或私有父群。查询失败时省略本字段，普通同步不受影响。
+                  前端按 channel_id 维护未读，再按 bot_id 汇总 agent 总数。
+                properties:
+                  mode:
+                    type: string
+                    enum: [full, delta]
+                    description: "依据实际发送给 IM 的 version/last_msg_seqs 判定。full 替换当前 Space 快照；delta 仅更新返回的 channel，遗漏 channel 保留，不能直接把增量求和当作 agent 总数。"
+                  items:
+                    type: array
+                    description: "成功的空结果为 []；整个字段缺失时前端应保留本地状态。"
+                    items:
+                      $ref: "#/definitions/aiTeamConversation"
               conversations:
                 type: array
                 items:
@@ -340,6 +358,36 @@ securityDefinitions:
     description: "用户token"
 
 definitions:
+  aiTeamConversation:
+    type: object
+    required: [bot_id, session_id, space_id, channel_id, channel_type, unread]
+    properties:
+      bot_id:
+        type: string
+        description: "所属 agent 的 bot_id"
+      session_id:
+        type: string
+      space_id:
+        type: string
+      channel_id:
+        type: string
+        description: "session 的 CommunityTopic 频道 ID"
+      channel_type:
+        type: integer
+        enum: [5]
+      unread:
+        type: integer
+        format: int64
+        description: "本次同步的绝对未读数，零也显式返回"
+      version:
+        type: integer
+        format: int64
+      last_msg_seq:
+        type: integer
+        format: int64
+      timestamp:
+        type: integer
+        format: int64
   group:
     type: "object"
     properties:

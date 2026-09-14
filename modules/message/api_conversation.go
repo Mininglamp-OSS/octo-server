@@ -940,6 +940,16 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 	groups = visibleGroups
 
+	// AI sessions stay outside ordinary conversations. This optional sideband
+	// reuses the raw result; its failure must not change existing sync behavior.
+	var aiConversations *AITeamConversationSync
+	if aiteampkg.Enabled() && hasSpaceFilter && req.MsgCount > 0 {
+		var aiErr error
+		aiConversations, aiErr = co.aiTeamConversations(filterSpaceID, loginUID, version <= 0 && lastMsgSeqs == "", conversations, groupMap)
+		if aiErr != nil {
+			co.Warn("build AI conversation unread sideband", zap.Error(aiErr))
+		}
+	}
 	c.Response(SyncUserConversationRespWrap{
 		Conversations:    syncUserConversationResps,
 		UID:              loginUID,
@@ -947,6 +957,8 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		Groups:           groups,
 		ChannelStates:    channelStates,
 		SpaceMemberships: spaceMemberships,
+
+		AITeamConversations: aiConversations,
 	})
 }
 
@@ -1356,6 +1368,8 @@ type SyncUserConversationRespWrap struct {
 	Groups           []*group.GroupResp          `json:"groups"`            // 群
 	ChannelStates    []*ChannelState             `json:"channel_status"`    // 频道状态
 	SpaceMemberships []SpaceMembership           `json:"space_memberships"` // 用户加入的全部群的 Space 归属
+
+	AITeamConversations *AITeamConversationSync `json:"ai_team_conversations,omitempty"`
 }
 
 // SpaceMembership 是 /v1/conversation/sync 的 Space sideband 数据。
