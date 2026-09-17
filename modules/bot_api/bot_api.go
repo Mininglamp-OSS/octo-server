@@ -439,6 +439,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/groups/:group_no/threads/:short_id/members", ba.botListThreadMembers)
 		botAPI.POST("/groups/:group_no/threads/:short_id/join", ba.protectAIContainerMutation, ba.botJoinThread)
 		botAPI.POST("/groups/:group_no/threads/:short_id/leave", ba.protectAIContainerMutation, ba.botLeaveThread)
+		botAPI.POST("/groups/:group_no/threads/:short_id/archive", ba.protectAIContainerMutation, ba.botArchiveThread)
 		botAPI.GET("/groups/:group_no/threads/:short_id/md", ba.botGetThreadMd)
 		botAPI.PUT("/groups/:group_no/threads/:short_id/md", ba.protectAIContainerMutation, ba.botUpdateThreadMd)
 		botAPI.POST("/setCommands", ba.setCommands)

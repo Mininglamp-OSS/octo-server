@@ -169,6 +169,26 @@ func (ba *BotAPI) botDeleteThread(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+// botArchiveThread handles POST /v1/bot/groups/:group_no/threads/:short_id/archive.
+//
+// 与用户 API 的 archiveThread 同语义（复用同一 service：幂等、权限 = 子区创建者
+// 或群管理员且父群活跃成员），失败与 botDeleteThread 同口径映射为 store_failed，
+// 不向调用方区分「无权限 / 不存在 / 已删除」。
+func (ba *BotAPI) botArchiveThread(c *wkhttp.Context) {
+	robotID, groupNo, shortID, ok := ba.validateBotThreadAccess(c)
+	if !ok {
+		return
+	}
+
+	err := ba.threadService.ArchiveThread(groupNo, shortID, robotID)
+	if err != nil {
+		ba.Error("归档子区失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+		return
+	}
+	c.ResponseOK()
+}
+
 // botListThreadMembers handles GET /v1/bot/groups/:group_no/threads/:short_id/members.
 func (ba *BotAPI) botListThreadMembers(c *wkhttp.Context) {
 	_, groupNo, shortID, ok := ba.validateBotThreadAccess(c)
