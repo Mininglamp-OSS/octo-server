@@ -2,6 +2,7 @@ package project
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gocraft/dbr/v2"
@@ -159,6 +160,116 @@ func (d *DB) listProjectsReadTx(tx *dbr.Tx, spaceID, uid, keyword string, page p
 		return nil, fmt.Errorf("project: list readable projects: %w", err)
 	}
 	return &projectReadListResult{Rows: rows, Total: total}, nil
+}
+
+// principalReadSeatClause is the seat dimension of a cross-module principal
+// read: one LEFT JOIN per uid plus the predicate that keeps only Projects where
+// at least one of those seats is active.
+//
+// One join per uid rather than `pm.uid IN (...)`: the reported role follows the
+// caller's priority order (first uid with an active seat wins), and
+// octo_project_member's primary key is (project_id, uid), so each join matches
+// at most one row and the project row is never multiplied.
+type principalReadSeatClause struct {
+	// Join goes directly after the `octo_project` table in the FROM clause.
+	Join string
+	// Predicate is true for exactly the Projects with at least one active seat.
+	Predicate string
+	// RoleExpr yields the first matching seat's role, in seatUIDs order.
+	RoleExpr string
+	// Args are the JOIN placeholders, in statement order (they precede WHERE).
+	Args []interface{}
+}
+
+// buildPrincipalReadSeatClause requires a non-empty seatUIDs; callers reject an
+// empty seat set before reaching the database.
+func buildPrincipalReadSeatClause(seatUIDs []string) principalReadSeatClause {
+	clause := principalReadSeatClause{Args: make([]interface{}, 0, 2*len(seatUIDs))}
+	matched := make([]string, 0, len(seatUIDs))
+	roles := make([]string, 0, len(seatUIDs))
+	for i, uid := range seatUIDs {
+		alias := "pseat" + strconv.Itoa(i)
+		clause.Join += " LEFT JOIN `octo_project_member` " + alias +
+			" ON " + alias + ".project_id = p.project_id" +
+			" AND " + alias + ".space_id = p.space_id" +
+			" AND " + alias + ".uid = ? AND " + alias + ".status = ? AND " + alias + ".removing = 0"
+		clause.Args = append(clause.Args, uid, MemberStatusActive)
+		matched = append(matched, alias+".uid IS NOT NULL")
+		roles = append(roles, alias+".role")
+	}
+	clause.Predicate = "(" + strings.Join(matched, " OR ") + ")"
+	clause.RoleExpr = "COALESCE(" + strings.Join(roles, ", ") + ")"
+	return clause
+}
+
+// listProjectsReadForPrincipalsTx lists the Projects inside spaceID for which
+// at least one uid in seatUIDs holds an active seat, in the same order, page and
+// keyword semantics as listProjectsReadTx. pinUID supplies the caller's own
+// `octo_project_user_setting` row (a Bot has none, so its list is effectively
+// unpinned); it is not a seat and grants nothing.
+func (d *DB) listProjectsReadForPrincipalsTx(
+	tx *dbr.Tx, spaceID, pinUID string, seatUIDs []string, keyword string, page projectReadPage,
+) (*projectReadListResult, error) {
+	if err := d.ensureReadTx(tx); err != nil {
+		return nil, err
+	}
+	if len(seatUIDs) == 0 {
+		return &projectReadListResult{Rows: []*projectReadListRow{}}, nil
+	}
+	seat := buildPrincipalReadSeatClause(seatUIDs)
+	where := "p.space_id = ? AND p.status = ? AND " + seat.Predicate
+	whereArgs := []interface{}{spaceID, StatusNormal}
+	if keyword != "" {
+		where += " AND p.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'"
+		whereArgs = append(whereArgs, projectLikePattern(keyword))
+	}
+
+	countArgs := make([]interface{}, 0, len(seat.Args)+len(whereArgs))
+	countArgs = append(countArgs, seat.Args...)
+	countArgs = append(countArgs, whereArgs...)
+	var total int64
+	if err := tx.SelectBySql(
+		"SELECT COUNT(*) FROM `octo_project` p"+seat.Join+" WHERE "+where,
+		countArgs...,
+	).LoadOne(&total); err != nil {
+		return nil, fmt.Errorf("project: count projects readable by principal seats: %w", err)
+	}
+
+	rowArgs := make([]interface{}, 0, len(seat.Args)+len(whereArgs)+3)
+	rowArgs = append(rowArgs, seat.Args...)
+	rowArgs = append(rowArgs, pinUID)
+	rowArgs = append(rowArgs, whereArgs...)
+	rowArgs = append(rowArgs, page.Limit, page.Offset)
+	var rows []*projectReadListRow
+	if _, err := tx.SelectBySql(
+		"SELECT "+projectReadModelColumns+", "+seat.RoleExpr+" AS my_role, IFNULL(s.pinned, 0) AS pinned"+
+			" FROM `octo_project` p"+seat.Join+
+			" LEFT JOIN `octo_project_user_setting` s ON s.project_id = p.project_id AND s.uid = ?"+
+			" WHERE "+where+
+			" ORDER BY IFNULL(s.pinned, 0) DESC, s.pinned_at DESC, p.id DESC LIMIT ? OFFSET ?",
+		rowArgs...,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("project: list projects readable by principal seats: %w", err)
+	}
+	return &projectReadListResult{Rows: rows, Total: total}, nil
+}
+
+// queryProjectReadMemberRoleAmongTx returns the role of the FIRST uid in uids
+// that holds an active seat in the Project, in the caller's order, so the role
+// reported to a principal read follows its seat priority (a Bot's own seat
+// before its owner's). Point reads on the (project_id, uid) primary key; the
+// seat set is two uids in production.
+func (d *DB) queryProjectReadMemberRoleAmongTx(tx *dbr.Tx, projectID, spaceID string, uids []string) (int, bool, error) {
+	for _, uid := range uids {
+		role, ok, err := d.queryProjectReadMemberRoleTx(tx, projectID, spaceID, uid)
+		if err != nil {
+			return roleNonMember, false, err
+		}
+		if ok {
+			return role, true, nil
+		}
+	}
+	return roleNonMember, false, nil
 }
 
 func (d *DB) queryProjectPinnedReadTx(tx *dbr.Tx, projectID, uid string) (bool, error) {
