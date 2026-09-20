@@ -28,6 +28,10 @@
 // Space, and nothing at all closes them when the holder's account is destroyed.
 // Without that check, visibility derived from the owner would outlive the
 // owner's own access.
+//
+// The set is bounded by principalMaxSeatUIDs, because each uid costs a join and
+// a point read on this path: the exported contract admits a principal and its
+// delegates, not an arbitrary list.
 package project
 
 import (
@@ -39,6 +43,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/gocraft/dbr/v2"
 )
+
+// principalMaxSeatUIDs bounds the seat set the exported functions accept.
+//
+// Every uid costs one `LEFT JOIN octo_project_member` in the list query and one
+// Space-gate point read, so an unbounded set would let a future caller turn an
+// authorization read into a fan-out. The bot surface passes two uids (the Bot
+// and its owner). A larger set is a contract violation and is DENIED, never
+// truncated: silently dropping uids would deny visibility to a principal the
+// caller named, which is a worse failure to debug than an explicit refusal.
+const principalMaxSeatUIDs = 8
 
 // ReadProjectsForPrincipal lists the Projects a non-user principal may read
 // inside spaceID, as the same Resp projection the user-facing list returns.
@@ -57,17 +71,25 @@ import (
 //     `octo_project_member` (status active AND removing = 0), which is also what
 //     closes a seat when its holder leaves the Project.
 //
+// seatUIDs is trimmed and de-duplicated (order preserved: it is the role
+// precedence) and must not exceed principalMaxSeatUIDs after normalization; a
+// larger set is denied, not truncated.
+//
 // page is 1-based; limit <= 0 selects the module default and both are clamped to
 // the module caps, so a hostile page/limit cannot reach the query unclamped.
-// Caller errors: ErrProjectReadForbidden when the caller has no seat in spaceID,
-// ErrProjectReadNotFound for an empty/invalid principal, and wrapped internal
-// errors otherwise.
+// Caller errors: ErrProjectReadForbidden when the caller has no seat in spaceID
+// or the seat set exceeds the bound, ErrProjectReadNotFound for an empty/invalid
+// principal, and wrapped internal errors otherwise.
 func ReadProjectsForPrincipal(
 	ctx *config.Context, spaceID, callerUID, keyword string, seatUIDs []string, page, limit int64,
 ) ([]*Resp, int64, error) {
+	seats := normalizePrincipalSeatUIDs(seatUIDs)
+	if len(seats) > principalMaxSeatUIDs {
+		return nil, 0, ErrProjectReadForbidden
+	}
 	p := principalReadFacade(ctx)
 	result, err := p.readProjectsForPrincipal(
-		spaceID, callerUID, keyword, normalizePrincipalSeatUIDs(seatUIDs), principalReadPage(page, limit),
+		spaceID, callerUID, keyword, seats, principalReadPage(page, limit),
 	)
 	if err != nil {
 		return nil, 0, err
@@ -87,13 +109,18 @@ func ReadProjectsForPrincipal(
 //
 // Every invisible case collapses to ErrProjectReadNotFound — absent, dissolved,
 // another Space, no Space seat for callerUID, a seat uid that no longer clears
-// the Space gate, no seat among seatUIDs — so the endpoint cannot be used to
-// probe Project existence.
+// the Space gate, no seat among seatUIDs, a seat set larger than
+// principalMaxSeatUIDs — so the endpoint cannot be used to probe Project
+// existence.
 func ReadProjectForPrincipal(
 	ctx *config.Context, projectID, callerUID string, seatUIDs []string,
 ) (*Resp, error) {
+	seats := normalizePrincipalSeatUIDs(seatUIDs)
+	if len(seats) > principalMaxSeatUIDs {
+		return nil, ErrProjectReadNotFound
+	}
 	p := principalReadFacade(ctx)
-	result, err := p.readProjectForPrincipal(projectID, callerUID, normalizePrincipalSeatUIDs(seatUIDs))
+	result, err := p.readProjectForPrincipal(projectID, callerUID, seats)
 	if err != nil {
 		return nil, err
 	}

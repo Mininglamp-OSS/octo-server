@@ -11,6 +11,7 @@ package project
 // ONLY uid in the set.
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -81,4 +82,42 @@ func TestReadProjectsForPrincipalRequiresLiveSpaceAccessForSingletonDelegateUID(
 	// entry gate already proved, so a caller with no Project seat reads an empty
 	// list instead of an error.
 	assert.Empty(t, list([]string{principalSeamCaller}))
+}
+
+// TestReadSeamsRejectAnOversizedPrincipalSet pins the exported contract's bound:
+// each uid costs a join and a Space-gate point read, so a set larger than
+// principalMaxSeatUIDs is denied instead of being served (or silently truncated).
+func TestReadSeamsRejectAnOversizedPrincipalSet(t *testing.T) {
+	_, p := setup(t)
+	seedUser(t, principalSeamCaller)
+	seedSpace(t, spaceA, 1)
+	seedSpaceMember(t, spaceA, principalSeamCaller, 0, 1)
+	created, err := p.createProject(createInput{
+		SpaceID: spaceA, Creator: principalSeamCaller, Name: "principal seam beta",
+	})
+	require.NoError(t, err)
+
+	callerFirst := []string{principalSeamCaller}
+	for i := 0; i <= principalMaxSeatUIDs; i++ {
+		callerFirst = append(callerFirst, fmt.Sprintf("principal-seam-extra-%d", i))
+	}
+	require.Greater(t, len(callerFirst), principalMaxSeatUIDs)
+
+	rows, total, err := ReadProjectsForPrincipal(testCtx, spaceA, principalSeamCaller, "", callerFirst, 1, 50)
+	require.ErrorIs(t, err, ErrProjectReadForbidden)
+	assert.Nil(t, rows)
+	assert.Zero(t, total)
+
+	detail, err := ReadProjectForPrincipal(testCtx, created.ProjectID, principalSeamCaller, callerFirst)
+	require.ErrorIs(t, err, ErrProjectReadNotFound)
+	assert.Nil(t, detail)
+
+	// Exactly at the bound is still served: the padding uids simply hold no seat,
+	// so the answer is the caller's own visible set rather than a refusal.
+	atBound := callerFirst[:principalMaxSeatUIDs]
+	rows, total, err = ReadProjectsForPrincipal(testCtx, spaceA, principalSeamCaller, "", atBound, 1, 50)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+	require.Len(t, rows, 1)
+	assert.Equal(t, created.ProjectID, rows[0].ProjectID)
 }

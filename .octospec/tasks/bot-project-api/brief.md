@@ -151,3 +151,10 @@ PR review（@Jerry-Xin，CHANGES_REQUESTED）指出导出 seam 的一处 fail-op
 并在 `modules/project/principal_read_test.go` 增加直接针对 seam 的用例（list + detail：
 live / 移出 Space / 账号注销 / 恢复 / caller 自身单元素集合）。反向验证：恢复捷径时该用例失败。
 
+同轮 review 的非阻塞项：席位集合此前无上界（每个 uid 一次 join + 一次点查），已在导出契约里
+收紧为 `principalMaxSeatUIDs`（超限**拒绝**而非截断，避免静默丢掉调用方点名的 principal），
+并补 `TestReadSeamsRejectAnOversizedPrincipalSet`（超限拒绝、恰好等于上界仍正常服务；
+反向验证：关掉检查该用例失败）。另修掉 brief 末尾多余空行（`git diff --check` 报错）。
+`check-sprint` 失败属流程项：该 job 校验的是 PR 在 Octo Board 上的 Sprint 字段
+（`.github/workflows/check-sprint.yml` → 可复用工作流），与 `Closes #issue` 无关，
+需要 Projects 写权限才能设置，不在本 pr 的代码改动范围内。
