@@ -19,23 +19,45 @@ import (
 )
 
 const (
-	principalSeamCaller   = "principal-seam-caller"
-	principalSeamDelegate = "principal-seam-delegate"
+	principalSeamCaller    = "principal-seam-caller"
+	principalSeamDelegate  = "principal-seam-delegate"
+	principalSeamAlpha     = "principal-seam-alpha"
+	principalSeamBeta      = "principal-seam-beta"
+	principalSeamPaddingID = "principal-seam-padding"
 )
 
+// seedPrincipalSeamProject inserts a Project with one active Owner seat, WITHOUT
+// going through createProject.
+//
+// The create path is asynchronous — it builds the all-member group and enqueues
+// provisioning work that keeps writing to MySQL after the test returns — and a
+// case that only needs a readable Project should not leave work in flight for
+// the next case's CleanAllTables to collide with.
+func seedPrincipalSeamProject(t *testing.T, projectID, ownerUID string) {
+	t.Helper()
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT INTO `octo_project` (project_id, space_id, name, creator, status, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, NOW(3), NOW(3))",
+		projectID, spaceA, "principal seam "+projectID, ownerUID, StatusNormal,
+	).Exec()
+	require.NoError(t, err)
+	_, err = testCtx.DB().InsertBySql(
+		"INSERT INTO `octo_project_member` "+
+			"(project_id, uid, space_id, role, status, invite_uid, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, '', NOW(3), NOW(3))",
+		projectID, ownerUID, spaceA, RoleOwner, MemberStatusActive,
+	).Exec()
+	require.NoError(t, err)
+}
+
 func TestReadProjectsForPrincipalRequiresLiveSpaceAccessForSingletonDelegateUID(t *testing.T) {
-	_, p := setup(t)
+	setup(t)
 	seedUser(t, principalSeamCaller)
 	seedUser(t, principalSeamDelegate)
 	seedSpace(t, spaceA, 1)
 	seedSpaceMember(t, spaceA, principalSeamCaller, 0, 1)
 	seedSpaceMember(t, spaceA, principalSeamDelegate, 0, 1)
-
-	created, err := p.createProject(createInput{
-		SpaceID: spaceA, Creator: principalSeamDelegate, Name: "principal seam alpha",
-	})
-	require.NoError(t, err)
-	require.NotNil(t, created)
+	seedPrincipalSeamProject(t, principalSeamAlpha, principalSeamDelegate)
 
 	list := func(seatUIDs []string) []*Resp {
 		t.Helper()
@@ -47,17 +69,17 @@ func TestReadProjectsForPrincipalRequiresLiveSpaceAccessForSingletonDelegateUID(
 	// A live delegate authorizes through its own active Project seat.
 	live := list([]string{principalSeamDelegate})
 	require.Len(t, live, 1)
-	assert.Equal(t, created.ProjectID, live[0].ProjectID)
+	assert.Equal(t, principalSeamAlpha, live[0].ProjectID)
 
 	// Space removal leaves the Project seat behind: seat closure is an async
 	// cascade, so this window is real state, not a synthetic one.
-	_, err = testCtx.DB().UpdateBySql(
+	_, err := testCtx.DB().UpdateBySql(
 		"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?", spaceA, principalSeamDelegate,
 	).Exec()
 	require.NoError(t, err)
 	assert.Empty(t, list([]string{principalSeamDelegate}),
 		"a singleton delegated uid without a live Space seat must not authorize")
-	detail, err := ReadProjectForPrincipal(testCtx, created.ProjectID, principalSeamCaller, []string{principalSeamDelegate})
+	detail, err := ReadProjectForPrincipal(testCtx, principalSeamAlpha, principalSeamCaller, []string{principalSeamDelegate})
 	require.ErrorIs(t, err, ErrProjectReadNotFound)
 	assert.Nil(t, detail)
 
@@ -74,7 +96,7 @@ func TestReadProjectsForPrincipalRequiresLiveSpaceAccessForSingletonDelegateUID(
 	require.NoError(t, err)
 	assert.Empty(t, list([]string{principalSeamDelegate}),
 		"a singleton delegated uid with a destroyed account must not authorize")
-	detail, err = ReadProjectForPrincipal(testCtx, created.ProjectID, principalSeamCaller, []string{principalSeamDelegate})
+	detail, err = ReadProjectForPrincipal(testCtx, principalSeamAlpha, principalSeamCaller, []string{principalSeamDelegate})
 	require.ErrorIs(t, err, ErrProjectReadNotFound)
 	assert.Nil(t, detail)
 
@@ -88,18 +110,15 @@ func TestReadProjectsForPrincipalRequiresLiveSpaceAccessForSingletonDelegateUID(
 // each uid costs a join and a Space-gate point read, so a set larger than
 // principalMaxSeatUIDs is denied instead of being served (or silently truncated).
 func TestReadSeamsRejectAnOversizedPrincipalSet(t *testing.T) {
-	_, p := setup(t)
+	setup(t)
 	seedUser(t, principalSeamCaller)
 	seedSpace(t, spaceA, 1)
 	seedSpaceMember(t, spaceA, principalSeamCaller, 0, 1)
-	created, err := p.createProject(createInput{
-		SpaceID: spaceA, Creator: principalSeamCaller, Name: "principal seam beta",
-	})
-	require.NoError(t, err)
+	seedPrincipalSeamProject(t, principalSeamBeta, principalSeamCaller)
 
 	callerFirst := []string{principalSeamCaller}
 	for i := 0; i <= principalMaxSeatUIDs; i++ {
-		callerFirst = append(callerFirst, fmt.Sprintf("principal-seam-extra-%d", i))
+		callerFirst = append(callerFirst, fmt.Sprintf("%s-%d", principalSeamPaddingID, i))
 	}
 	require.Greater(t, len(callerFirst), principalMaxSeatUIDs)
 
@@ -108,7 +127,7 @@ func TestReadSeamsRejectAnOversizedPrincipalSet(t *testing.T) {
 	assert.Nil(t, rows)
 	assert.Zero(t, total)
 
-	detail, err := ReadProjectForPrincipal(testCtx, created.ProjectID, principalSeamCaller, callerFirst)
+	detail, err := ReadProjectForPrincipal(testCtx, principalSeamBeta, principalSeamCaller, callerFirst)
 	require.ErrorIs(t, err, ErrProjectReadNotFound)
 	assert.Nil(t, detail)
 
@@ -119,5 +138,5 @@ func TestReadSeamsRejectAnOversizedPrincipalSet(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), total)
 	require.Len(t, rows, 1)
-	assert.Equal(t, created.ProjectID, rows[0].ProjectID)
+	assert.Equal(t, principalSeamBeta, rows[0].ProjectID)
 }
