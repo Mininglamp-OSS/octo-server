@@ -178,7 +178,7 @@ func (c *Category) listCategoryResponses(uid, spaceID string) ([]categoryResp, e
 	categoryGroupMap := make(map[string][]groupInCategoryResp)
 	var uncategorized []groupInCategoryResp
 	for _, group := range groups {
-		resp := groupInCategoryResp{GroupNo: group.GroupNo, Name: group.GroupName, CategorySort: group.CategorySort}
+		resp := groupInCategoryResp{GroupNo: group.GroupNo, Name: group.GroupName, CategorySort: group.CategorySort, ProjectID: group.ProjectID}
 		if group.CategoryID == nil || *group.CategoryID == "" {
 			uncategorized = append(uncategorized, resp)
 			continue

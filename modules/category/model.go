@@ -46,6 +46,7 @@ type groupSettingCategoryRow struct {
 type userGroupInfo struct {
 	GroupNo      string
 	GroupName    string
+	ProjectID    string
 	CategoryID   *string
 	CategorySort int
 }
@@ -120,6 +121,11 @@ type groupInCategoryResp struct {
 	GroupNo      string `json:"group_no"`
 	Name         string `json:"name"`
 	CategorySort int    `json:"category_sort"`
+	// ProjectID 群所属项目（omitempty：普通群不出现该键）。Categorized Project
+	// groups legally appear in both their Project section and a manual category;
+	// this field is what lets a client tell the two apart and de-duplicate across
+	// the two views.
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 type sidebarSectionResp struct {

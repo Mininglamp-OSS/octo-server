@@ -316,7 +316,7 @@ func (s *Service) finishProjectGroupCreate(state *projectGroupCreateState) (*Cre
 		}
 	}
 	// 与普通建群同口径：创建者附带 category_id 时落其 group_setting（best-effort）。
-	s.applyCreatorCategoryBestEffort(state.groupNo, state.req.Creator, strings.TrimSpace(state.req.CategoryID))
+	s.applyCreatorCategoryBestEffort(state.groupNo, state.req.Creator, state.req.CategoryID)
 	s.ctx.SendGroupCreate(&config.MsgGroupCreateReq{
 		Creator: state.req.Creator, CreatorName: state.creatorUser.Name, GroupNo: state.groupNo,
 		Version: state.version, Members: state.memberVos,
@@ -327,8 +327,16 @@ func (s *Service) finishProjectGroupCreate(state *projectGroupCreateState) (*Cre
 // applyCreatorCategoryBestEffort 把建群请求附带的 category_id 落到创建者的
 // group_setting。普通群与 Project 群共用：best-effort，失败不阻断建群（与
 // BotUID 设置同策略）。
+//
+// 已知边界（与普通建群路径同口径）：HTTP 层在建群时已校验 category
+// （存在/活跃/属主/同 Space），但本函数跑在业务事务提交之后，期间分类被软删
+// 会留下指向已删 category 的引用。 dangling category_id 在读取侧一律经 JOIN
+// （见 modules/message/db_group_category.go 的 live 判定）按"未分类"呈现，
+// 不会泄露错误状态；此处不再复制一遍校验。
 func (s *Service) applyCreatorCategoryBestEffort(groupNo, creator, categoryID string) {
-	if categoryID == "" {
+	creator = strings.TrimSpace(creator)
+	categoryID = strings.TrimSpace(categoryID)
+	if categoryID == "" || creator == "" {
 		return
 	}
 	setting, err := s.settingDB.QuerySetting(groupNo, creator)

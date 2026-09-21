@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/gocraft/dbr/v2"
 	migrate "github.com/rubenv/sql-migrate"
 	"github.com/stretchr/testify/require"
 )
@@ -335,8 +336,9 @@ func TestMoveGroupToCategoryAllowsProjectGroup(t *testing.T) {
 
 	c := New(ctx)
 	const (
-		spaceID = "sidebar-project-group-move-space"
-		groupNo = "sidebar-project-group-move-group"
+		spaceID    = "sidebar-project-group-move-space"
+		groupNo    = "sidebar-project-group-move-group"
+		uncatGroup = "sidebar-project-group-uncat"
 	)
 	seedSpaceAndMember(t, c, spaceID, 0)
 	categoryA := seedSidebarCategory(t, ctx, spaceID, "category-a", 0, 1)
@@ -347,8 +349,44 @@ func TestMoveGroupToCategoryAllowsProjectGroup(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, c.db.insertGroupSettingForCategory(groupNo, testutil.UID, &categoryA, 0, 1))
 
+	// 第二个 Project 群：调用方是其原生成员但从未手动分类。它只应住在
+	// Project 分区，绝不能落进分类树/默认分类的 uncategorized 桶 ——
+	// 手动分类视图必须是 opt-in。
+	seedGroup(t, c, uncatGroup, spaceID)
+	_, err = ctx.DB().UpdateBySql("UPDATE `group` SET project_id=? WHERE group_no=?", projectID, uncatGroup).Exec()
+	require.NoError(t, err)
+
+	// 普通群（显式分类到 B）：条目不应出现 project_id 键（omitempty）。
+	plainGroup := "sidebar-plain-group-move"
+	seedGroup(t, c, plainGroup, spaceID)
+	require.NoError(t, c.db.insertGroupSettingForCategory(plainGroup, testutil.UID, &categoryB, 0, 1))
+
+	// Project 群 + 历史空串分类值（`''` 而非 NULL）：Go 侧把它当"未分类"，
+	// 因此同样不得落进默认分类桶。
+	emptyCatGroup := "sidebar-project-group-empty-cat"
+	seedGroup(t, c, emptyCatGroup, spaceID)
+	_, err = ctx.DB().UpdateBySql("UPDATE `group` SET project_id=? WHERE group_no=?", projectID, emptyCatGroup).Exec()
+	require.NoError(t, err)
+	emptyCategory := ""
+	require.NoError(t, c.db.insertGroupSettingForCategory(emptyCatGroup, testutil.UID, &emptyCategory, 0, 1))
+
+	readFollowVersion := func() int64 {
+		var v int64
+		err := ctx.DB().SelectBySql(
+			"SELECT version FROM user_follow_version WHERE uid=? AND space_id=?",
+			testutil.UID, spaceID).LoadOne(&v)
+		if err != nil {
+			require.ErrorIs(t, err, dbr.ErrNotFound)
+			return 0
+		}
+		return v
+	}
+	versionBefore := readFollowVersion()
+
 	w := doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": categoryB})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.Equal(t, versionBefore+1, readFollowVersion(),
+		"moving a Project group into a category must bump follow_version exactly once")
 
 	setting, err := c.db.queryGroupSettingForCategory(groupNo, testutil.UID)
 	require.NoError(t, err)
@@ -357,7 +395,114 @@ func TestMoveGroupToCategoryAllowsProjectGroup(t *testing.T) {
 	require.Equal(t, categoryB, *setting.CategoryID,
 		"a Project group moves between manual categories exactly like any other group")
 
-	// 清除分类同样允许：取消关注对 Project 群与普通群语义一致。
+	// 读回 /categories：已分类的 Project 群落在其手动分类里、不再出现在默认
+	// 分类，且条目携带 project_id；从未分类/空串分类的 Project 群在所有桶里
+	// 都不出现（只属 Project 分区）；普通群条目不带 project_id。
+	w = doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/categories", nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	inCategoryB, inDefaultBucket := false, false
+	uncatInDefault, emptyCatInDefault := false, false
+	projectEntryPID, plainEntryPID := "absent", "absent"
+	for _, item := range parseJSONArray(t, w) {
+		isDefault, _ := item["is_default"].(bool)
+		cid, _ := item["category_id"].(string)
+		groups, _ := item["groups"].([]interface{})
+		for _, g := range groups {
+			entry, _ := g.(map[string]interface{})
+			gno, _ := entry["group_no"].(string)
+			pid, hasPID := entry["project_id"].(string)
+			if !hasPID {
+				pid = ""
+			}
+			if !isDefault && cid == categoryB && gno == groupNo {
+				inCategoryB = true
+				projectEntryPID = pid
+			}
+			if !isDefault && cid == categoryB && gno == plainGroup {
+				plainEntryPID = pid
+			}
+			if isDefault && gno == groupNo {
+				inDefaultBucket = true
+			}
+			if isDefault && gno == uncatGroup {
+				uncatInDefault = true
+			}
+			if isDefault && gno == emptyCatGroup {
+				emptyCatInDefault = true
+			}
+		}
+	}
+	require.True(t, inCategoryB, "categorized Project group must render under its manual category")
+	require.Equal(t, projectID, projectEntryPID,
+		"the category entry of a Project group must carry project_id so clients can reconcile the two views")
+	require.Empty(t, plainEntryPID, "a plain group's category entry must not carry project_id")
+	require.False(t, inDefaultBucket, "categorized Project group must not also render in the default category")
+	require.False(t, uncatInDefault,
+		"uncategorized Project group must not fall into the default-category bucket (opt-in view only)")
+	require.False(t, emptyCatInDefault,
+		"a legacy empty-string category on a Project group must not fall into the default-category bucket")
+
+	// sidebar-sections 回读:同一份 payload 里,已分类的 Project 群既出现在其手动
+	// 分类 section(条目带 project_id),也仍在其 Project section 的 groups[] 里 --
+	// 契约里"两个独立视图"的具体形态。未分类/空串分类的 Project 群在任何分类
+	// section 里都不出现(默认分类是普通群的桶,不是 Project 群的兜底)。
+	w = doRequest(t, s.GetRoute(), http.MethodGet, "/v1/spaces/"+spaceID+"/sidebar-sections", nil)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	inManualSection, inProjectSection, inDefaultCategory := false, false, false
+	uncatInAnyCategory, emptyCatInAnyCategory := false, false
+	projectEntryPID = "absent"
+	for _, section := range parseJSONArray(t, w) {
+		switch section["type"] {
+		case sidebarSectionAPITypeProject:
+			project, _ := section["project"].(map[string]any)
+			groups, _ := project["groups"].([]interface{})
+			for _, g := range groups {
+				if entry, ok := g.(map[string]any); ok && entry["group_no"] == groupNo {
+					inProjectSection = true
+				}
+			}
+		case sidebarSectionAPITypeCategory:
+			category, _ := section["category"].(map[string]any)
+			isDefault, _ := category["is_default"].(bool)
+			groups, _ := category["groups"].([]interface{})
+			for _, g := range groups {
+				entry, _ := g.(map[string]any)
+				gno, _ := entry["group_no"].(string)
+				switch gno {
+				case groupNo:
+					if isDefault {
+						inDefaultCategory = true
+						continue
+					}
+					inManualSection = true
+					pid, _ := entry["project_id"].(string)
+					if pid == "" {
+						projectEntryPID = ""
+					} else {
+						projectEntryPID = pid
+					}
+				case uncatGroup:
+					uncatInAnyCategory = true
+				case emptyCatGroup:
+					emptyCatInAnyCategory = true
+				}
+			}
+		}
+	}
+	require.True(t, inManualSection,
+		"a categorized Project group must render inside its manual category section")
+	require.Equal(t, projectID, projectEntryPID,
+		"the category entry of a Project group must carry project_id so clients can reconcile the two views")
+	require.True(t, inProjectSection,
+		"a categorized Project group must keep rendering under its Project section: two independent views")
+	require.False(t, inDefaultCategory,
+		"a categorized Project group must not also render in the default category section")
+	require.False(t, uncatInAnyCategory,
+		"an uncategorized Project group must not appear in any category section")
+	require.False(t, emptyCatInAnyCategory,
+		"a legacy empty-string category on a Project group must not appear in any category section")
+
+	// 清除分类同样允许：对 Project 群撤销手动分类（它仍在 Project 分区可见）。
 	w = doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": ""})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	setting, err = c.db.queryGroupSettingForCategory(groupNo, testutil.UID)
@@ -366,7 +511,13 @@ func TestMoveGroupToCategoryAllowsProjectGroup(t *testing.T) {
 	require.Nil(t, setting.CategoryID)
 }
 
-func TestSidebarSectionMigrationBackfillsOrderProjectsAndProjectGroupCleanup(t *testing.T) {
+// TestSidebarSectionMigrationBackfillsOrderAndPreservesProjectGroupCategories
+// replays the migration file statement-by-statement against seeded data —
+// exactly the path a down/up cycle or a migration-ledger rebuild takes. The
+// original file also cleared manual-category assignments on Project groups;
+// that statement was retired to a no-op (2026-09-21, mutual exclusion revoked),
+// so a replay must now PRESERVE such assignments rather than destroy them.
+func TestSidebarSectionMigrationBackfillsOrderAndPreservesProjectGroupCategories(t *testing.T) {
 	_, ctx, _ := newToctouTestServer(t)
 	_, err := ctx.DB().UpdateBySql("DROP TABLE octo_sidebar_section").Exec()
 	require.NoError(t, err)
@@ -445,7 +596,9 @@ func TestSidebarSectionMigrationBackfillsOrderProjectsAndProjectGroupCleanup(t *
 		Where("uid=? AND space_id=? AND section_type=?", uid, spaceID, sidebarSectionTypeProject).
 		LoadOne(&projectRows))
 	require.Equal(t, 2, projectRows)
-	assertGroupCategoryAssignment(t, ctx, groupA, uid, "", 0)
+	// The retired cleanup must not run: both assignments survive the replay,
+	// the Project group's included.
+	assertGroupCategoryAssignment(t, ctx, groupA, uid, categoryA, 7)
 	assertGroupCategoryAssignment(t, ctx, groupB, uid, categoryB, 7)
 
 	// INSERT IGNORE plus the typed unique key make the backfill itself safe to

@@ -82,18 +82,30 @@ WHERE pm.status = 1
       AND ss.ref_id = p.project_id
   );
 
--- Project groups cannot also be present in a personal manual category. This is a
--- one-way data repair: the Project entry remains visible, so the group moves rather
--- than disappearing. The join is legacy-to-legacy and deliberately carries no COLLATE.
-UPDATE `group_setting` gs
-INNER JOIN `group` g ON g.group_no = gs.group_no
-SET gs.category_id = NULL,
-    gs.category_sort = 0
-WHERE g.project_id <> ''
-  AND gs.category_id IS NOT NULL;
+-- [RETIRED 2026-09-21 — statement intentionally replaced with a no-op]
+--
+-- This statement once cleared manual-category assignments on Project groups,
+-- enforcing the Project-group <> manual-category mutual exclusion. That rule was
+-- revoked by product decision on 2026-09-21 (Project groups may again be filed
+-- into personal categories, and their category_id is legal user data).
+--
+-- Re-running the original UPDATE is now destructive: a down/up cycle or a
+-- migration-ledger rebuild replays this file against a live database, and the
+-- cleanup would silently delete every valid assignment created since the
+-- revocation — with no error, no audit trail, and no timestamp predicate that
+-- could separate those rows from the historical ones it was written for
+-- (group_setting stores no created/updated time).
+--
+-- Environments that already applied the original statement keep its
+-- (then-correct) result; the ledger row must stay so those environments remain
+-- in sync. Nothing needs the cleanup any more, so it is retired rather than
+-- narrowed. Do not restore this statement.
+SELECT 1;
 
 -- +migrate Down
 
--- The cleanup above intentionally is not reversed: restoring a stale manual
--- assignment for a Project group would reintroduce the invariant this migration fixes.
+-- The (retired) cleanup above is intentionally not reversed. Note for operators
+-- considering a down/up cycle: the Up no longer clears Project-group category
+-- assignments (retired 2026-09-21 — see the note in Up), so a replay preserves
+-- them; this Down still only drops the ordering table.
 DROP TABLE IF EXISTS `octo_sidebar_section`;

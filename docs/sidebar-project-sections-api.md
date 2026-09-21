@@ -316,6 +316,10 @@ interface SidebarItemProjectFields {
 响应结构不变，但分类顺序现在来自统一 Sidebar Sections 顺序。Project 条目不会出现在
 该接口中；Project 群可以进入手动分类，与本接口的群组树形结构一视同仁。
 
+附加字段：`groups[]` 条目携带 `project_id`（`omitempty`，普通群省略）。同一 Project 群
+可能同时出现在其 Project 分区与手动分类两处，客户端可据此识别分类里的 Project 群并按需
+跨视图去重；服务端不做去重。
+
 ### `PUT /v1/spaces/{space_id}/categories/sort`
 
 请求和响应结构不变，但写入目标已切换到统一排序表。服务端只会在分类当前占据的
@@ -331,10 +335,14 @@ interface SidebarItemProjectFields {
 ```
 
 Project 群与普通群一样允许移入或移出分类：成功返回 200。同一群会同时保留在其
-Project 条目的 `groups[]` 关联元数据与用户的手动分类视图（关注 tab）中，客户端按
-两个独立视图渲染即可，不做跨视图去重。
+Project 条目的 `groups[]` 关联元数据与用户的手动分类视图（关注 tab）中；分类条目携带
+`project_id`，客户端按两个独立视图渲染，需要跨视图关联（例如去重）时可据此匹配。服务端
+不做去重。
 
-`{"category_id":""}` 表示移出分类（取消关注）。
+`{"category_id":""}` 表示移出分类。对普通群即"取消关注"（移出关注 tab）；对 Project
+群只是退出该用户的手动分类——它仍展示在其 Project 条目的 `groups[]` 里，但（与普通群同
+语义）移出分类会同步停止该群新子区的自动关注物化（auto_follow_threads 清 0），需要时
+重新移入分类即可恢复。
 
 ### `POST /v1/group/create`
 

@@ -166,6 +166,11 @@ func TestGroupCreateProjectDisabledExplicitTargetReturnsForbidden(t *testing.T) 
 	spaceID := "space-create-disabled-" + util.GenerUUID()[:8]
 	projectID := "project-create-disabled-" + util.GenerUUID()[:8]
 	disabled := "disabled-target-" + util.GenerUUID()[:8]
+	// The actor must be an eligible account for the request to reach the
+	// explicit-target check at all: the lock rejects an ineligible actor first
+	// (same view_forbidden code), which would make this case pass for the
+	// wrong reason.
+	seedGroupCreateUser(t, ctx, creator, 1)
 	seedGroupCreateUser(t, ctx, disabled, 0)
 	seedSpaceSeat(t, ctx, spaceID, creator)
 	seedProject(t, ctx, projectID, spaceID)
@@ -181,6 +186,57 @@ func TestGroupCreateProjectDisabledExplicitTargetReturnsForbidden(t *testing.T) 
 	env := decodeEnvelope(t, w.Body.Bytes())
 	assert.Equal(t, "err.server.group.view_forbidden", env.Error.Code)
 	assert.Equal(t, http.StatusForbidden, env.Error.HTTPStatus)
+}
+
+// TestGroupCreateProjectGroupWithCategoryPersistsCreatorSetting — POST
+// /v1/group/create with project_id + category_id succeeds, and the creator's
+// group_setting.category_id lands on the requested category through the shared
+// post-commit writer (same best-effort semantics as plain group creation).
+func TestGroupCreateProjectGroupWithCategoryPersistsCreatorSetting(t *testing.T) {
+	srv, ctx := newTestServer(t)
+	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	wireI18nRendererForGroupTest(srv)
+	resetGroupUIDRateLimit(t, ctx)
+	enableProjectGroupsForWire(t, ctx)
+
+	creator := testutil.UID
+	spaceID := "space-create-category-" + util.GenerUUID()[:8]
+	projectID := "project-create-category-" + util.GenerUUID()[:8]
+	categoryID := util.GenerUUID()
+	seedGroupCreateUser(t, ctx, creator, 1)
+	seedSpaceSeat(t, ctx, spaceID, creator)
+	seedProject(t, ctx, projectID, spaceID)
+	seedProjectMember(t, ctx, projectID, spaceID, creator, 0)
+	// The category fixture is built by this package (the category module's
+	// migrations are not part of its test baseline); QueryCategoryByID reads
+	// only category_id/uid/space_id/status, so the minimal shape is the
+	// contract this test needs.
+	ensureGroupCategorySchema(t, ctx)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO group_category (category_id, space_id, uid, name, sort, status) "+
+			"VALUES (?, ?, ?, ?, 0, 1)",
+		categoryID, spaceID, creator, "c-"+categoryID[:8],
+	).Exec()
+	require.NoError(t, err)
+
+	w := postGroupCreateWire(t, srv, map[string]any{
+		"name":        "categorized project group",
+		"space_id":    spaceID,
+		"project_id":  projectID,
+		"category_id": categoryID,
+	})
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var stored string
+	err = ctx.DB().SelectBySql(
+		"SELECT gs.category_id FROM group_setting gs "+
+			"JOIN `group` g ON g.group_no = gs.group_no "+
+			"WHERE g.project_id = ? AND gs.uid = ? LIMIT 1",
+		projectID, creator,
+	).LoadOne(&stored)
+	require.NoError(t, err)
+	assert.Equal(t, categoryID, stored,
+		"the project-create path must honor the request's category_id for the creator")
 }
 
 func TestGroupCreateUsesSharedUIDRateLimitAndRejectsOverBurst(t *testing.T) {

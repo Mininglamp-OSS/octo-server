@@ -31,6 +31,15 @@ func (d *categoryDB) updateGroupSettingCategory(id int64, categoryID *string, ca
 // queryUserGroupsInSpace returns the user's groups in the given Space, each
 // annotated with the category_id the user has assigned (NULL if uncategorized).
 //
+// Project groups (non-empty g.project_id) enter the tree only when the caller
+// has explicitly categorized them: the row filter is "project_id is empty, or
+// gs.category_id is set and non-empty". An uncategorized Project group already
+// renders under its auto-managed Project section and must NOT additionally fall
+// into the default-category bucket (where uncategorized plain groups
+// legitimately live); the non-empty arm mirrors the Go-side uncategorized test
+// (`*CategoryID == ""`), so a legacy empty-string assignment cannot slip a
+// Project group into it either.
+//
 // KNOWN ISSUE (issue #151 follow-up, NOT addressed in this PR): the SELECT
 // returns gs.category_id (the persisted field) without joining group_category.
 // If the user soft-deleted the assigned category before category_cleanup ran,
@@ -54,12 +63,13 @@ func (d *categoryDB) updateGroupSettingCategory(id int64, categoryID *string, ca
 func (d *categoryDB) queryUserGroupsInSpace(uid, spaceID string) ([]*userGroupInfo, error) {
 	var results []*userGroupInfo
 	_, err := d.session.SelectBySql(`
-		SELECT g.group_no, g.name as group_name,
+		SELECT g.group_no, g.name as group_name, g.project_id,
 			gs.category_id, IFNULL(gs.category_sort, 0) as category_sort
 		FROM `+"`group`"+` g
 		INNER JOIN group_member gm ON g.group_no = gm.group_no
 		LEFT JOIN group_setting gs ON g.group_no = gs.group_no AND gs.uid = ?
 			WHERE gm.uid = ? AND gm.is_deleted = 0 AND g.space_id = ? AND g.purpose <> ?
+			AND (g.project_id = '' OR (gs.category_id IS NOT NULL AND gs.category_id <> ''))
 		GROUP BY g.group_no
 		ORDER BY gs.category_sort ASC
 	`, uid, uid, spaceID, aiteampkg.GroupPurpose).Load(&results)
