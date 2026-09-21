@@ -1495,31 +1495,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	}
 
 	// 设置创建者的群聊分组（best-effort：失败不阻断建群，与 BotUID 设置同策略）
-	if req.CategoryID != "" {
-		setting, err := s.settingDB.QuerySetting(groupNo, req.Creator)
-		if err != nil {
-			s.Error("query group setting for category failed", zap.Error(err))
-		} else if setting == nil {
-			settingVersion, _ := s.ctx.GenSeq(common.GroupSettingSeqKey)
-			_, err = s.ctx.DB().InsertBySql(
-				"INSERT INTO group_setting (group_no, uid, category_id, category_sort, revoke_remind, screenshot, receipt, version) VALUES (?, ?, ?, 0, 1, 1, 1, ?)",
-				groupNo, req.Creator, req.CategoryID, settingVersion,
-			).Exec()
-			if err != nil {
-				s.Error("insert group setting with category failed", zap.Error(err))
-			}
-		} else {
-			settingVersion, _ := s.ctx.GenSeq(common.GroupSettingSeqKey)
-			_, err = s.ctx.DB().Update("group_setting").
-				Set("category_id", req.CategoryID).
-				Set("category_sort", 0).
-				Set("version", settingVersion).
-				Where("id=?", setting.Id).Exec()
-			if err != nil {
-				s.Error("update group setting category failed", zap.Error(err))
-			}
-		}
-	}
+	s.applyCreatorCategoryBestEffort(groupNo, req.Creator, req.CategoryID)
 
 	// 创建 IM 频道
 	err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{

@@ -26,7 +26,8 @@ source: self
 >
 > | | |
 > |---|---|
-> | **Confirmed** (requester, 2026-09-11) | The prototype mapping (Background §1); Project-group ↔ manual-category **mutual exclusion** (D3); category stays a per-user private view, never shared/admin-managed; Project creation and admission add the Project to the caller's 关注; only an active Project member may pin; explicit unpin removes it even while the caller remains a Project member; every Sidebar-facing `project_id` in this task is paired with `project_name`; relation metadata never grants native chat permissions |
+> | **Confirmed** (requester, 2026-09-11) | The prototype mapping (Background §1); ~~Project-group ↔ manual-category **mutual exclusion** (D3)~~; category stays a per-user private view, never shared/admin-managed; Project creation and admission add the Project to the caller's 关注; only an active Project member may pin; explicit unpin removes it even while the caller remains a Project member; every Sidebar-facing `project_id` in this task is paired with `project_name`; relation metadata never grants native chat permissions |
+> | **Reversed** (owner, 2026-09-21) | D3 (mutual exclusion) revoked by owner decision: Project groups (associated groups and the dedicated all-member group alike) may be filed into the caller's manual categories and appear in the Follow tab alongside their Project section. Implementation and follow-on spec live in `.octospec/tasks/project-group-category/brief.md`; contract doc `docs/sidebar-project-sections-api.md` §3/§7 updated to match. The D3-specific design rationale below is retained as historical decision record and no longer describes live behavior. |
 > | **Implemented in this task** | D1 (new ordering table), D2 (reuse the final Project-group relation projection with SQL per-Project cap), D3 (mutual exclusion), D4 (auto-provision on create+admit and hide on unpin), D5 (old endpoints re-point their sort source), plus paired `project_name` on Sidebar-facing payloads |
 > | **Deferred / unchanged** | D6 (`SidebarItem.ProjectID *string`) remains gated on Q2; D7 (全员群首位) remains a client concern; native group membership synchronization is outside this Sidebar task; ordinary Project-created and associated groups retain their existing independent semantics |
 > | **Open** | Q2–Q4 and coordinated client rollout |
@@ -40,8 +41,10 @@ and Projects in which the caller has an active membership seat. Both are draggab
 against each other in one order. An eligible Project's group contents are the
 Project's live associated groups, regardless of whether the caller has a native
 `group_member` seat, including non-native or blacklisted native relations; these
-groups are metadata only and do not grant chat or subarea access. A group that
-belongs to a Project can never also be filed into one of the caller's own categories.
+groups are metadata only and do not grant chat or subarea access. Project groups may
+also be filed into one of the caller's own categories (D3 revoked 2026-09-21; see
+Reversed row above) — categorization never affects the Project-section placement,
+and neither view grants chat or subarea access beyond the relation metadata.
 
 Creating or joining a Project auto-adds its entry to the caller's list, the way a
 default category is auto-provisioned today. Only an active Project member may use

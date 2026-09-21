@@ -4,6 +4,18 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-21 — project-group-category
+
+- Revoked the sidebar-project-sections D3 mutual exclusion: Project groups —
+  associated and dedicated all-member alike — may be filed into the caller's
+  manual categories and surface in the Follow tab; `POST /v1/group/create`
+  accepts `project_id` + `category_id` together and honors the category in the
+  project-create path through a shared best-effort writer.
+- Removed `err.server.category.project_group_cannot_categorize` and both
+  locale entries; contract doc §3/§7 and the sidebar-project-sections brief
+  updated to the reversed rule; follow-on spec in
+  [tasks/project-group-category](tasks/project-group-category/brief.md).
+
 ## 2026-09-09 — space-directory-octo-hosted-only
 
 - Tightened `GET /v1/space/directory` so `agents` / `agent_count` /

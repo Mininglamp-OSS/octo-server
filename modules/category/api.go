@@ -549,23 +549,17 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		return
 	}
 
-	// Query the server-owned Project attribution together with the group Space.
-	// Membership has already been checked above, so this branch cannot be used to
-	// probe a Project group the caller cannot access.
+	// 只需群的归属 Space：成员身份已在上方校验，此处查询不可被用来探测
+	// 私有群的存在性。Project 群与普通群一样允许进入手动分类。
 	var groupRow struct {
-		SpaceID   string `db:"space_id"`
-		ProjectID string `db:"project_id"`
+		SpaceID string `db:"space_id"`
 	}
-	err = c.db.session.Select("IFNULL(space_id,'') AS space_id", "IFNULL(project_id,'') AS project_id").From("`group`").
+	err = c.db.session.Select("IFNULL(space_id,'') AS space_id").From("`group`").
 		Where("group_no=?", groupNo).
 		LoadOne(&groupRow)
 	if err != nil {
 		c.Error("查询群信息失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
-		return
-	}
-	if groupRow.ProjectID != "" && req.CategoryID != "" {
-		httperr.ResponseErrorL(ctx, errcode.ErrCategoryProjectGroupCannotCategorize, nil, nil)
 		return
 	}
 	groupSpaceID := groupRow.SpaceID

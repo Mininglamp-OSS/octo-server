@@ -249,14 +249,6 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantContains:    "不属于任何空间",
 		},
 		{
-			name:            "ErrCategoryProjectGroupCannotCategorize surfaces conflict zh-CN copy",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrCategoryProjectGroupCannotCategorize) },
-			wantCodeID:      "err.server.category.project_group_cannot_categorize",
-			wantSemStatus:   http.StatusConflict,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "项目群组不能加入手动分类",
-		},
-		{
 			name:            "ErrCategoryQueryFailed (Internal=true) collapses to shared internal copy",
 			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrCategoryQueryFailed) },
 			wantCodeID:      "err.server.category.query_failed",

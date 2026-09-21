@@ -25,9 +25,6 @@ func (s *Service) CreateProjectGroup(req *CreateGroupServiceReq) (*CreateGroupSe
 	if req == nil || strings.TrimSpace(req.Creator) == "" || strings.TrimSpace(req.ProjectID) == "" {
 		return nil, errors.New("creator and project_id are required")
 	}
-	if strings.TrimSpace(req.CategoryID) != "" {
-		return nil, errors.New("project groups cannot be assigned to categories")
-	}
 	creator := strings.TrimSpace(req.Creator)
 	projectID := strings.TrimSpace(req.ProjectID)
 	botUID := strings.TrimSpace(req.BotUID)
@@ -318,11 +315,44 @@ func (s *Service) finishProjectGroupCreate(state *projectGroupCreateState) (*Cre
 				zap.String("groupNo", state.groupNo), zap.String("botUID", botUID))
 		}
 	}
+	// 与普通建群同口径：创建者附带 category_id 时落其 group_setting（best-effort）。
+	s.applyCreatorCategoryBestEffort(state.groupNo, state.req.Creator, strings.TrimSpace(state.req.CategoryID))
 	s.ctx.SendGroupCreate(&config.MsgGroupCreateReq{
 		Creator: state.req.Creator, CreatorName: state.creatorUser.Name, GroupNo: state.groupNo,
 		Version: state.version, Members: state.memberVos,
 	})
 	return &CreateGroupServiceResp{GroupNo: state.groupNo, Name: state.groupName}, nil
+}
+
+// applyCreatorCategoryBestEffort 把建群请求附带的 category_id 落到创建者的
+// group_setting。普通群与 Project 群共用：best-effort，失败不阻断建群（与
+// BotUID 设置同策略）。
+func (s *Service) applyCreatorCategoryBestEffort(groupNo, creator, categoryID string) {
+	if categoryID == "" {
+		return
+	}
+	setting, err := s.settingDB.QuerySetting(groupNo, creator)
+	if err != nil {
+		s.Error("query group setting for category failed", zap.Error(err))
+		return
+	}
+	settingVersion, _ := s.ctx.GenSeq(common.GroupSettingSeqKey)
+	if setting == nil {
+		if _, err := s.ctx.DB().InsertBySql(
+			"INSERT INTO group_setting (group_no, uid, category_id, category_sort, revoke_remind, screenshot, receipt, version) VALUES (?, ?, ?, 0, 1, 1, 1, ?)",
+			groupNo, creator, categoryID, settingVersion,
+		).Exec(); err != nil {
+			s.Error("insert group setting with category failed", zap.Error(err))
+		}
+		return
+	}
+	if _, err := s.ctx.DB().Update("group_setting").
+		Set("category_id", categoryID).
+		Set("category_sort", 0).
+		Set("version", settingVersion).
+		Where("id=?", setting.Id).Exec(); err != nil {
+		s.Error("update group setting category failed", zap.Error(err))
+	}
 }
 
 func (s *Service) compensateProjectGroupCreate(groupNo string) error {

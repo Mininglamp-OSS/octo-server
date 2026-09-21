@@ -12,7 +12,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
-	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	migrate "github.com/rubenv/sql-migrate"
 	"github.com/stretchr/testify/require"
 )
@@ -329,7 +328,7 @@ func TestSidebarSectionProjectContentMatchesProjectGroupsEndpoint(t *testing.T) 
 	require.JSONEq(t, string(endpointJSON), string(sectionJSON))
 }
 
-func TestMoveGroupToCategoryRejectsProjectGroup(t *testing.T) {
+func TestMoveGroupToCategoryAllowsProjectGroup(t *testing.T) {
 	s, ctx := newCategoryTestServer()
 	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
 	resetUIDRateLimit(t, ctx)
@@ -349,18 +348,16 @@ func TestMoveGroupToCategoryRejectsProjectGroup(t *testing.T) {
 	require.NoError(t, c.db.insertGroupSettingForCategory(groupNo, testutil.UID, &categoryA, 0, 1))
 
 	w := doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": categoryB})
-	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
-	assertCategoryErrorCode(t, w, errcode.ErrCategoryProjectGroupCannotCategorize.ID)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	setting, err := c.db.queryGroupSettingForCategory(groupNo, testutil.UID)
 	require.NoError(t, err)
 	require.NotNil(t, setting)
 	require.NotNil(t, setting.CategoryID)
-	require.Equal(t, categoryA, *setting.CategoryID, "rejection must not modify the existing manual assignment")
+	require.Equal(t, categoryB, *setting.CategoryID,
+		"a Project group moves between manual categories exactly like any other group")
 
-	// Historical bad rows (including ones created before the mutual-exclusion
-	// guard existed) must remain repairable through the public API. Clearing a
-	// category does not categorize the Project group and is therefore allowed.
+	// 清除分类同样允许：取消关注对 Project 群与普通群语义一致。
 	w = doRequest(t, s.GetRoute(), http.MethodPut, "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": ""})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	setting, err = c.db.queryGroupSettingForCategory(groupNo, testutil.UID)
