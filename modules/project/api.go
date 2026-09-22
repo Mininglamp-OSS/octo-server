@@ -136,6 +136,7 @@ func New(ctx *config.Context) *Project {
 		// converges here within the reload interval without a restart.
 		settings: common.EnsureSystemSettings(ctx),
 	}
+	p.oboReader = obo.DBSnapshotReader{Session: p.db.session}
 	// nil-conn deployments (Redis-less mode) leave spaceCache nil so the middleware degrades
 	// to the database instead of dereferencing a nil redis.Conn. The other Redis paths already
 	// check GetRedisConn() per call.

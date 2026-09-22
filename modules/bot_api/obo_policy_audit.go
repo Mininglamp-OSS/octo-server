@@ -1,6 +1,7 @@
 package bot_api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,19 +59,22 @@ func (d *botAPIDB) pauseGrantAtomic(id int64) (*oboGrantModel, error) {
 // policy mutation. An audit failure aborts the mutation instead of leaving a
 // successfully changed Grant with no durable record of the change.
 func appendGrantPolicyAudit(tx *dbr.Tx, grantID int64, actorUID, operation string, before, after any) error {
-	var beforeJSON []byte
-	var err error
-	if before != nil {
-		beforeJSON, err = json.Marshal(before)
-		if err != nil {
-			return fmt.Errorf("encode previous Grant state: %w", err)
-		}
+	var committed struct {
+		PolicyVersion int64        `db:"policy_version"`
+		ExpiresAt     sql.NullTime `db:"expires_at"`
+	}
+	if err := tx.SelectBySql("SELECT policy_version,expires_at FROM obo_grants WHERE id=?", grantID).LoadOne(&committed); err != nil {
+		return fmt.Errorf("read committed Grant policy: %w", err)
 	}
 	var beforeValue any
 	if before != nil {
+		beforeJSON, err := encodeGrantAuditState(before, grantID, committed.PolicyVersion-1, committed.ExpiresAt)
+		if err != nil {
+			return fmt.Errorf("encode previous Grant state: %w", err)
+		}
 		beforeValue = string(beforeJSON)
 	}
-	afterJSON, err := json.Marshal(after)
+	afterJSON, err := encodeGrantAuditState(after, grantID, committed.PolicyVersion, committed.ExpiresAt)
 	if err != nil {
 		return fmt.Errorf("encode current Grant state: %w", err)
 	}
@@ -80,4 +84,23 @@ func appendGrantPolicyAudit(tx *dbr.Tx, grantID int64, actorUID, operation strin
 		return fmt.Errorf("record Grant policy audit: %w", err)
 	}
 	return nil
+}
+
+func encodeGrantAuditState(value any, grantID, version int64, expiresAt sql.NullTime) ([]byte, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var state map[string]any
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		return nil, err
+	}
+	state["id"] = grantID
+	state["policy_version"] = version
+	if expiresAt.Valid {
+		state["expires_at"] = expiresAt.Time.UTC()
+	} else {
+		state["expires_at"] = nil
+	}
+	return json.Marshal(state)
 }

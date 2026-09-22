@@ -14,6 +14,11 @@ import (
 // one repeatable-read transaction. It does not consult legacy OBO caches.
 type DBSnapshotReader struct{ Session *dbr.Session }
 
+// The first predicate retains the token index; the binary predicate makes the
+// final credential comparison exact even under a case-insensitive collation.
+const botTokenLookupSQL = "SELECT robot_id, COALESCE(creator_uid,'') AS creator_uid FROM robot " +
+	"WHERE bot_token=? AND BINARY bot_token=BINARY ? AND bot_token<>'' AND status=1 LIMIT 1"
+
 func (r DBSnapshotReader) Read(ctx context.Context, botToken, spaceID string, mode Mode) (Snapshot, error) {
 	if r.Session == nil {
 		return Snapshot{}, errors.New("obo: DB session is nil")
@@ -27,10 +32,7 @@ func (r DBSnapshotReader) Read(ctx context.Context, botToken, spaceID string, mo
 		UID      string `db:"robot_id"`
 		OwnerUID string `db:"creator_uid"`
 	}
-	err = tx.SelectBySql(
-		"SELECT robot_id, COALESCE(creator_uid,'') AS creator_uid FROM robot "+
-			"WHERE bot_token=? AND bot_token<>'' AND status=1 LIMIT 1", botToken,
-	).LoadOne(&bot)
+	err = tx.SelectBySql(botTokenLookupSQL, botToken, botToken).LoadOne(&bot)
 	if errors.Is(err, dbr.ErrNotFound) {
 		return Snapshot{}, deny("invalid_credential", http.StatusUnauthorized)
 	}
@@ -76,6 +78,16 @@ func (r DBSnapshotReader) Read(ctx context.Context, botToken, spaceID string, mo
 		}
 		if activeOwner != 1 {
 			return Snapshot{}, deny("delegation_denied", http.StatusForbidden)
+		}
+		var ownerSeat int
+		err = tx.SelectBySql(
+			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1", spaceID, bot.OwnerUID,
+		).LoadOne(&ownerSeat)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("obo: Human owner Space membership lookup: %w", err)
+		}
+		if ownerSeat != 1 {
+			return Snapshot{}, deny("space_not_allowed", http.StatusForbidden)
 		}
 		state.OwnerUID = bot.OwnerUID
 		var grant struct {

@@ -3,7 +3,8 @@
 Deploy the `bot_api` migration `20260921000001_obo_generic_scope.sql` before
 serving the new endpoints. It adds a separate generic Scope binding table;
 historical Channel grants do **not** gain `ALL` automatically. The old
-`/v1/auth/verify-bot` contract and Channel OBO paths remain unchanged.
+`/v1/auth/verify-bot` contract remains unchanged. Channel OBO also honors a
+Grant's `expires_at` when that field is set by the new management API.
 
 `POST /v1/auth/resolve` accepts the same `bf_` Bot credential as the legacy
 Bot verifier; no additional service token is configured or sent. Its OBO
@@ -41,8 +42,15 @@ authorization decision. Resolve decisions are not cached in this release.
   be enabled safely.
 - `expires_at` uses UTC DATETIME. The one-shot delegation PUT may set it with
   an RFC3339 timestamp or clear it with JSON `null`; omission preserves the
-  current deadline. Existing rows default to `NULL`. The legacy Grant PUT has
-  not been extended with this field.
+  current deadline. Existing rows default to `NULL`, which means the Grant
+  never expires. The deadline also stops legacy Channel sends and fan-out
+  because both paths share the Grant; the
+  legacy Grant PUT has not been extended with this field.
+- The one-shot PUT requires `scope_codes`: `["ALL"]` binds the currently
+  supported generic Scope, while `[]` explicitly unbinds it. Omitted or
+  `null` `scope_codes` is rejected. An active PUT idempotently reauthorizes a
+  revoked Grant; a disable-only PUT retains its revocation timestamp. Generic
+  management does not modify the legacy Channel `persona_prompt` field.
 - `GET /v1/obo/grants/:id/audits` currently returns transactional policy-change
   records; OBO decision records are emitted as structured Actor/Subject logs,
   not stored in this management table.

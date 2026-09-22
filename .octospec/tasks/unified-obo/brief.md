@@ -42,5 +42,5 @@ generic ALL Scope management, and read-only Bot Project access.
 - New service API resolves AS_BOT and OBO with a uniform principal/error contract.
 - Project Bot reads apply existing Human Project permissions after OBO succeeds.
 - Go and TypeScript SDKs expose matching resolver behavior without breaking v1.
-- Focused tests cover invalid Bot tokens, Space mismatch, owner changes,
+- Focused tests cover invalid Bot tokens, Space mismatch, owner-record inconsistency,
   Grant/Scope revocation, unregistered Actions, and legacy regression.

@@ -411,7 +411,8 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 	var m *oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumns+" FROM obo_grants "+
-			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1",
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1 "+
+			"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6))",
 		grantorUID, granteeBotUID,
 	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
@@ -447,7 +448,8 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 	var m *oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumns+" FROM obo_grants "+
-			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1",
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 "+
+			"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6))",
 		grantorUID, granteeBotUID,
 	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
@@ -467,7 +469,7 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 // grantor and there is no grantor to hash on at this call site. The
 // `(grantee_bot_uid, active)` covering index keeps the per-call cost
 // comparable to the cache-miss path of findActiveGrantByGrantorBot.
-// `persona_prompt` arrives wrapped in COALESCE(..., ”) via
+// `persona_prompt` arrives wrapped in COALESCE with an empty-string fallback via
 // oboGrantColumns so NULL columns load as the empty string.
 func (d *botAPIDB) findActiveGrantByBot(botUID string) (*oboGrantModel, error) {
 	if botUID == "" {
@@ -543,6 +545,7 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 		"SELECT "+oboGrantColumnsAliased+" "+
 			"FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
 			"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
+			"AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) "+
 			"AND s.channel_id=? AND s.channel_type=?",
 		channelID, channelType,
 	).Load(&grants)
@@ -617,6 +620,7 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 		"  AND s.channel_type = ? " +
 		"  AND s.enabled = 0 " +
 		"WHERE g.active=1 AND g.global_enabled=1 " +
+		"  AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) " +
 		"  AND s.id IS NULL " +
 		"  AND g.grantor_uid IN (" + strings.Join(placeholders, ",") + ")"
 	var grants []*oboGrantModel
@@ -710,6 +714,7 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(membershipGroupID, channelID str
 			"  AND s.channel_type = ? "+
 			"WHERE g.active = 1 "+
 			"  AND g.global_enabled = 1 "+
+			"  AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) "+
 			"  AND gm_bot.uid IS NULL "+
 			"  AND s.id IS NULL",
 		membershipGroupID, membershipGroupID, channelID, channelType,
@@ -760,6 +765,7 @@ func (d *botAPIDB) findGlobalGrantsForDM(grantorUID, peerChannelID string) ([]*o
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumnsAliased+" FROM obo_grants g "+
 			"WHERE g.active=1 AND g.global_enabled=1 AND g.grantor_uid=? "+
+			"AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) "+
 			"AND NOT EXISTS ("+
 			"  SELECT 1 FROM obo_scopes s "+
 			"  WHERE s.grant_id=g.id AND s.channel_id=? AND s.channel_type=?"+
@@ -1855,7 +1861,8 @@ func (d *botAPIDB) maybeCacheGrantorNegative(grantorUID string) {
 	}
 	var count int
 	err := d.session.SelectBySql(
-		"SELECT COUNT(*) FROM obo_grants WHERE grantor_uid=? AND active=1 AND global_enabled=1",
+		"SELECT COUNT(*) FROM obo_grants WHERE grantor_uid=? AND active=1 AND global_enabled=1 "+
+			"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6))",
 		grantorUID,
 	).LoadOne(&count)
 	if err != nil {

@@ -137,6 +137,11 @@ type genericGrantRow struct {
 	PolicyVersion int64      `db:"policy_version" json:"policy_version"`
 }
 
+const updateGenericGrantSQL = "UPDATE obo_grants SET active=?, global_enabled=?, " +
+	"revoked_at=CASE WHEN ?=1 THEN NULL ELSE revoked_at END, " +
+	"expires_at=CASE WHEN ?=1 THEN ? ELSE expires_at END, " +
+	"policy_version=policy_version+1, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+
 func intBool(value bool) int {
 	if value {
 		return 1
@@ -146,7 +151,7 @@ func intBool(value bool) int {
 
 // putDelegationAtomic locks the Human row first, mirroring the existing
 // single-active-persona lock order. Grant state, ALL binding, sibling demotion,
-// and management audit commit together. The old Channel read path is untouched.
+// and management audit commit together.
 func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID string, active, globalEnabled, all bool, expiry optionalExpiry) (*genericDelegationView, error) {
 	tx, err := d.session.BeginTx(ctx, nil)
 	if err != nil {
@@ -219,7 +224,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 			(old.ExpiresAt != nil && expiry.Value != nil && !old.ExpiresAt.Equal(*expiry.Value))
 		expiresAt = expiry.Value
 	}
-	changed := created || old.Active != intBool(active) || old.GlobalEnabled != intBool(globalEnabled) || old.RevokedAt != nil || (hadALL == 1) != all || expiryChanged
+	changed := created || old.Active != intBool(active) || old.GlobalEnabled != intBool(globalEnabled) || (active && old.RevokedAt != nil) || (hadALL == 1) != all || expiryChanged
 	targetChanged := changed
 	previous := genericDelegationView{
 		GrantID: old.ID, GranteeBotUID: botUID,
@@ -236,12 +241,12 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 		if expiry.Value != nil {
 			expirySQL = expiry.Value.UTC().Format("2006-01-02 15:04:05.999999")
 		}
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE obo_grants SET active=?, global_enabled=?, revoked_at=NULL, "+
-				"persona_prompt=CASE WHEN revoked_at IS NOT NULL THEN '' ELSE persona_prompt END, "+
-				"expires_at=CASE WHEN ?=1 THEN ? ELSE expires_at END, "+
-				"policy_version=policy_version+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-			intBool(active), intBool(globalEnabled), intBool(expiry.Set), expirySQL, old.ID); err != nil {
+		// An active PUT reauthorizes a previously revoked Grant. The generic
+		// API does not own the legacy Channel persona, so leave persona_prompt
+		// unchanged and make repeated writes converge on the same state.
+		reauthorize := active && old.RevokedAt != nil
+		if _, err := tx.ExecContext(ctx, updateGenericGrantSQL,
+			intBool(active), intBool(globalEnabled), intBool(reauthorize), intBool(expiry.Set), expirySQL, old.ID); err != nil {
 			return nil, fmt.Errorf("update Grant: %w", err)
 		}
 		old.PolicyVersion++
@@ -276,20 +281,9 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 				sibling.ID); err != nil {
 				return nil, fmt.Errorf("demote sibling persona %d: %w", sibling.ID, err)
 			}
-			before, err := json.Marshal(sibling)
-			if err != nil {
-				return nil, fmt.Errorf("encode sibling audit before: %w", err)
-			}
-			after, err := json.Marshal(map[string]any{
-				"id": sibling.ID, "active": 0, "global_enabled": 0,
-				"policy_version": sibling.PolicyVersion + 1,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("encode sibling audit after: %w", err)
-			}
-			if _, err := tx.ExecContext(ctx,
-				"INSERT INTO obo_policy_audits (grant_id,actor_uid,operation,previous_json,current_json) VALUES (?,?,'demote_sibling',?,?)",
-				sibling.ID, ownerUID, string(before), string(after)); err != nil {
+			if err := appendGrantPolicyAudit(tx, sibling.ID, ownerUID, "demote_sibling",
+				map[string]any{"active": sibling.Active, "global_enabled": sibling.GlobalEnabled},
+				map[string]any{"active": 0, "global_enabled": 0}); err != nil {
 				return nil, fmt.Errorf("audit sibling persona %d: %w", sibling.ID, err)
 			}
 			changed = true

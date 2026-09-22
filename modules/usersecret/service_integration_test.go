@@ -278,6 +278,12 @@ func TestStore_QueryBotByToken_Integration(t *testing.T) {
 	assert.Equal(t, "bot-1", id.RobotID)
 	assert.Equal(t, "owner-77", id.OwnerUID)
 
+	// Bot tokens are credentials, so case variants must not authenticate even
+	// when the database uses its default case-insensitive collation.
+	id, err = st.queryBotByToken("bf_TOKEN_ABC")
+	require.NoError(t, err)
+	assert.Nil(t, id)
+
 	// 未知 token → nil。
 	id, err = st.queryBotByToken("bf_unknown")
 	require.NoError(t, err)

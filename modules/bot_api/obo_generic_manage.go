@@ -14,12 +14,18 @@ import (
 	"go.uber.org/zap"
 )
 
+const genericGrantForOwnerSQL = "SELECT g.id,g.grantee_bot_uid,g.mode,g.active,g.global_enabled,g.revoked_at,g.expires_at,g.policy_version " +
+	"FROM obo_grants g " +
+	"INNER JOIN robot r ON r.robot_id=g.grantee_bot_uid AND r.status=1 AND r.creator_uid=? " +
+	"INNER JOIN user u ON u.uid=? AND u.robot=0 AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 " +
+	"WHERE g.id=? AND g.grantor_uid=? AND g.grantor_uid<>''"
+
 func (ba *BotAPI) genericGrantForOwner(ownerUID string, id int64) (*genericGrantRow, error) {
+	if ownerUID == "" {
+		return nil, errGenericBotNotOwned
+	}
 	var grant genericGrantRow
-	err := ba.db.session.SelectBySql(
-		"SELECT id,grantee_bot_uid,mode,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants WHERE id=? AND grantor_uid=?",
-		id, ownerUID,
-	).LoadOne(&grant)
+	err := ba.db.session.SelectBySql(genericGrantForOwnerSQL, ownerUID, ownerUID, id, ownerUID).LoadOne(&grant)
 	if errors.Is(err, dbr.ErrNotFound) {
 		return nil, errGenericBotNotOwned
 	}

@@ -127,7 +127,7 @@ func (d *robotDB) queryRobotByBotToken(botToken string) (*robot, error) {
 		return nil, nil
 	}
 	var m *robot
-	_, err := d.session.Select("*").From("robot").Where("bot_token=? and bot_token!='' and status=1", botToken).Load(&m)
+	_, err := d.session.Select("*").From("robot").Where("bot_token=? AND BINARY bot_token=BINARY ? AND bot_token!='' AND status=1", botToken, botToken).Load(&m)
 	return m, err
 }
 

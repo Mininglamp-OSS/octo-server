@@ -48,3 +48,25 @@ func TestResolverRequiresSpaceAndRegisteredAction(t *testing.T) {
 		t.Fatalf("expected Action denial, got %v", err)
 	}
 }
+
+func TestResolverExternalActionRequiresRegistryAndALL(t *testing.T) {
+	registry, err := ParseActionRegistry(`{"task.read":["ALL"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &fakeSnapshotReader{state: Snapshot{BotUID: "bot-1", OwnerUID: "human-1", GrantID: 7}}
+	resolver := Resolver{Reader: reader, Registry: registry}
+	req := Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "task.read"}
+	if _, err := resolver.Resolve(context.Background(), req); DecisionCode(err) != "delegation_denied" {
+		t.Fatalf("missing ALL binding must deny external Action, got %v", err)
+	}
+	reader.state.BoundScopes = []string{"ALL"}
+	principal, err := resolver.Resolve(context.Background(), req)
+	if err != nil || principal.Subject.UID != "human-1" || principal.Delegation.Action != "task.read" {
+		t.Fatalf("external Action resolution failed: principal=%+v err=%v", principal, err)
+	}
+	req.Action = "task.delete"
+	if _, err := resolver.Resolve(context.Background(), req); DecisionCode(err) != "action_not_allowed" {
+		t.Fatalf("unregistered external Action must deny, got %v", err)
+	}
+}

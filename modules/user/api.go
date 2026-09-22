@@ -5162,7 +5162,7 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 	}
 	err := u.db.session.Select("robot_id", "IFNULL(creator_uid,'') as creator_uid").
 		From("robot").
-		Where("bot_token = ? AND bot_token != '' AND status = 1", req.BotToken).
+		Where("bot_token = ? AND BINARY bot_token = BINARY ? AND bot_token != '' AND status = 1", req.BotToken, req.BotToken).
 		LoadOne(&botInfo)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid bot token"})

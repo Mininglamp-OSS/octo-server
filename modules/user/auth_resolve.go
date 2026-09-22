@@ -73,6 +73,9 @@ func (u *User) authResolveBot(c *wkhttp.Context) {
 			fields = append(fields, zap.String("resource_type", req.Resource.Type), zap.String("resource_id", req.Resource.ID))
 		}
 		u.Info("Bot OBO identity resolved", fields...)
+	} else {
+		u.Info("Bot identity resolved", zap.String("mode", string(principal.Mode)),
+			zap.String("actor_uid", principal.Actor.UID), zap.String("space_id", principal.Actor.SpaceID))
 	}
 	c.Response(principal)
 }
