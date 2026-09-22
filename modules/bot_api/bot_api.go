@@ -466,6 +466,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		// different from the user-token /v1/obo/* CRUD which mutates
 		// grants on behalf of a logged-in grantor.
 		botAPI.GET("/obo-grant", ba.oboBotGetGrant)
+		botAPI.GET("/obo-grants/self", ba.oboBotGetGenericGrant)
 	}
 
 	// 由 message 模块贡献的群内单条消息查询（见 pkg/authtree 的 why）。botActorUID 只挂在

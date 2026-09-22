@@ -28,5 +28,6 @@
 0 modules/oidc/api_bind.go  # migrated to httperr.ResponseErrorLWithStatus (#220)
 0 modules/robot/api.go  # migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus (#267)
 7 modules/user/api.go
+1 modules/user/auth_resolve.go  # EXEMPT: Bot identity Resolve protocol uses fixed code/request_id JSON, not localized user-facing errors
 4 modules/webhook/github.go  # EXEMPT: GitHub webhook signature errors — external GH never reads the localized envelope
 4 pkg/space/middleware.go

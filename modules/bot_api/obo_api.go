@@ -32,6 +32,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -115,6 +116,13 @@ func (ba *BotAPI) registerOBORoutes(r *wkhttp.WKHttp) {
 	auth.POST("/scopes", ba.oboCreateScope)
 	auth.DELETE("/scopes/:id", ba.oboDeleteScope)
 	auth.GET("/grants/:id/scopes", ba.oboListScopes)
+	// New generic policy write: Human identity and per-UID throttle are required.
+	auth.PUT("/delegations/:bot_uid", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboPutDelegation)
+	auth.GET("/grants/:id", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboGetGenericGrant)
+	auth.GET("/grants/:id/scope-bindings", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboListGenericBindings)
+	auth.POST("/grants/:id/scope-bindings", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboBindGenericScope)
+	auth.DELETE("/grants/:id/scope-bindings/ALL", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboUnbindGenericScope)
+	auth.GET("/grants/:id/audits", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboListPolicyAudits)
 }
 
 // ==================== Request DTOs ====================

@@ -467,7 +467,7 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 // grantor and there is no grantor to hash on at this call site. The
 // `(grantee_bot_uid, active)` covering index keeps the per-call cost
 // comparable to the cache-miss path of findActiveGrantByGrantorBot.
-// `persona_prompt` arrives wrapped in COALESCE(..., '') via
+// `persona_prompt` arrives wrapped in COALESCE(..., ”) via
 // oboGrantColumns so NULL columns load as the empty string.
 func (d *botAPIDB) findActiveGrantByBot(botUID string) (*oboGrantModel, error) {
 	if botUID == "" {
@@ -660,7 +660,7 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 //
 //   - Group           → caller passes (channelID, channelID, ChannelTypeGroup)
 //   - CommunityTopic  → caller passes (parentGroupID, topicChannelID,
-//                       ChannelTypeCommunityTopic)
+//     ChannelTypeCommunityTopic)
 //
 // Scope anti-join still uses the channel's own (channel_id, channel_type) so
 // a topic's `enabled=0` row suppresses fan-out for that topic only — never
@@ -870,34 +870,70 @@ func (d *botAPIDB) findGrantByID(id int64) (*oboGrantModel, error) {
 // causing fan-out to drop messages on a freshly-enabled grant for the
 // remainder of the TTL window (PR#82 R3 non-blocking finding).
 func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, personaPrompt *string) error {
+	if mode == "" && globalEnabled == nil && personaPrompt == nil {
+		return nil
+	}
+	// Resolve immutable grantor_uid before taking locks. Management writes use
+	// the same user-row → Grant-row order as activation and creation.
+	pre, err := d.findGrantByID(id)
+	if err != nil || pre == nil {
+		return err
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	var lockHit int
+	if err := tx.SelectBySql("SELECT 1 FROM `user` WHERE uid=? FOR UPDATE", pre.GrantorUID).LoadOne(&lockHit); err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return err
+	}
+	var grant *oboGrantModel
+	if _, err := tx.Select(oboGrantColumns).From("obo_grants").Where("id=?", id).Suffix("FOR UPDATE").Load(&grant); err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return err
+	}
+	if grant == nil || grant.GrantorUID != pre.GrantorUID || grant.RevokedAt != nil {
+		return nil
+	}
+	previous := *grant
 	updates := map[string]interface{}{}
-	if mode != "" {
+	if mode != "" && mode != grant.Mode {
 		updates["mode"] = mode
+		grant.Mode = mode
 	}
 	if globalEnabled != nil {
-		// Normalize to 0/1; anything truthy becomes 1.
 		v := 0
 		if *globalEnabled != 0 {
 			v = 1
 		}
-		updates["global_enabled"] = v
+		if v != grant.GlobalEnabled {
+			updates["global_enabled"] = v
+			grant.GlobalEnabled = v
+		}
 	}
-	if personaPrompt != nil {
+	if personaPrompt != nil && *personaPrompt != grant.PersonaPrompt {
 		updates["persona_prompt"] = *personaPrompt
+		grant.PersonaPrompt = *personaPrompt
 	}
 	if len(updates) == 0 {
 		return nil
 	}
-	updates["updated_at"] = time.Now()
-	_, err := d.session.Update("obo_grants").SetMap(updates).Where("id=?", id).Exec()
-	if err != nil {
+	grant.UpdatedAt = time.Now()
+	updates["updated_at"] = grant.UpdatedAt
+	if _, err := tx.Update("obo_grants").SetMap(updates).Where("id=? AND revoked_at IS NULL", id).Exec(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); err != nil {
+		return err
+	}
+	if err := appendGrantPolicyAudit(tx, id, grant.GrantorUID, "update_grant", previous, grant); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	// Cache may be wrong now; force re-read on next access.
-	g, _ := d.findGrantByID(id)
-	if g != nil {
-		d.invalidateGrantorCache(g.GrantorUID)
-	}
+	d.invalidateGrantorCache(grant.GrantorUID)
 	// PR#82 R3 non-blocking — when the global toggle flipped, every
 	// channel this grant covers may now have a different
 	// "any active grant × enabled scope" answer. The per-channel cache
@@ -909,7 +945,7 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 	// to be stale; the only cost is the next message paying the JOIN).
 	// Mode-only updates don't change any cached answer, so the work is
 	// skipped in that branch.
-	if globalEnabled != nil {
+	if _, changedGlobal := updates["global_enabled"]; changedGlobal {
 		scopes, _ := d.listScopesByGrant(id)
 		for _, s := range scopes {
 			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
@@ -922,9 +958,10 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 //
 // Two paths:
 //
-//   - active=0 (pause). Single UPDATE on the target row's `active`
-//     column, scoped to `revoked_at IS NULL` (YUJ-1738 / PR#131 R2
-//     B2 race guard). We intentionally do NOT touch `revoked_at` —
+//   - active=0 (pause). The target `active` UPDATE, policy version bump,
+//     and audit share one transaction. The update remains scoped to
+//     `revoked_at IS NULL` (YUJ-1738 / PR#131 R2 B2 race guard).
+//     We intentionally do NOT touch `revoked_at` —
 //     a paused row is semantically distinct from a revoked row
 //     (the latter went through DELETE /v1/obo/grants/:id and carries
 //     `revoked_at != NULL` for audit). We also leave `global_enabled`
@@ -940,46 +977,46 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 //     createOrReactivateGrantAtomic's mutex semantics AND its lock
 //     order (YUJ-1752 / PR#131 R7 — see the LOCK ORDER INVARIANT
 //     comment in the function body). The order is:
-//       1. Unlocked `SELECT grantor_uid FROM obo_grants WHERE id=?`
-//          so we know which user row to lock first. We deliberately
-//          do NOT take FOR UPDATE on the grant row here — that would
-//          invert the lock order vs createOrReactivateGrantAtomic
-//          and re-introduce the AB-BA deadlock YUJ-1752 was filed for.
-//       2. `SELECT 1 FROM user WHERE uid=? FOR UPDATE` serializes
-//          concurrent activate/create/reactivate flows for the SAME
-//          grantor across bots — without it, two PUTs racing on
-//          different grants under the same grantor could leave the
-//          grantor with TWO active rows (UNIQUE only covers
-//          (grantor, bot)). This is the FIRST lock acquired on any
-//          row in this tx, matching createOrReactivateGrantAtomic.
-//       3. Re-read the target grant row FOR UPDATE inside the tx so
-//          the grantor_uid we demote against is the locked snapshot
-//          (not the step-1 read that may have moved under us).
-//          YUJ-1738 / PR#131 R2 B2: if the re-read shows
-//          `revoked_at != NULL` the activate flow is aborted with a
-//          clean rollback. The handler-level gate already rejects
-//          revoked grants 404 before reaching this method, but a
-//          DELETE that COMMITS between the handler's grant load and
-//          our tx start would slip past that gate; the in-tx re-read
-//          closes the race.
-//       4. Flip target row to active=1, clear revoked_at — UPDATE
-//          itself also carries `AND revoked_at IS NULL` as a
-//          belt-and-braces guard so a tombstoned row is never
-//          resurrected even if step 3 misses (e.g. a future
-//          refactor moves the check).
-//       5. Demote every OTHER active row for the grantor to
-//          active=0 / global_enabled=0. YUJ-1744 / PR#131 R4: the
-//          demote MUST NOT touch `revoked_at`. Siblings demoted by
-//          a persona switch are *paused*, not *revoked* — leaving
-//          `revoked_at=NULL` keeps them eligible for re-activation
-//          via a later PUT {active:1}, which is exactly the toggle
-//          contract this endpoint advertises. If we stamped
-//          `revoked_at=now` here, the next switch back would hit
-//          oboUpdateGrant's `RevokedAt != nil` gate and 404, turning
-//          the selector into a one-way trip. The demote WHERE is
-//          also scoped to `revoked_at IS NULL` so a row a concurrent
-//          DELETE has tombstoned (revoked_at != NULL, active still
-//          racing) keeps its audit-bearing timestamp intact.
+//     1. Unlocked `SELECT grantor_uid FROM obo_grants WHERE id=?`
+//     so we know which user row to lock first. We deliberately
+//     do NOT take FOR UPDATE on the grant row here — that would
+//     invert the lock order vs createOrReactivateGrantAtomic
+//     and re-introduce the AB-BA deadlock YUJ-1752 was filed for.
+//     2. `SELECT 1 FROM user WHERE uid=? FOR UPDATE` serializes
+//     concurrent activate/create/reactivate flows for the SAME
+//     grantor across bots — without it, two PUTs racing on
+//     different grants under the same grantor could leave the
+//     grantor with TWO active rows (UNIQUE only covers
+//     (grantor, bot)). This is the FIRST lock acquired on any
+//     row in this tx, matching createOrReactivateGrantAtomic.
+//     3. Re-read the target grant row FOR UPDATE inside the tx so
+//     the grantor_uid we demote against is the locked snapshot
+//     (not the step-1 read that may have moved under us).
+//     YUJ-1738 / PR#131 R2 B2: if the re-read shows
+//     `revoked_at != NULL` the activate flow is aborted with a
+//     clean rollback. The handler-level gate already rejects
+//     revoked grants 404 before reaching this method, but a
+//     DELETE that COMMITS between the handler's grant load and
+//     our tx start would slip past that gate; the in-tx re-read
+//     closes the race.
+//     4. Flip target row to active=1, clear revoked_at — UPDATE
+//     itself also carries `AND revoked_at IS NULL` as a
+//     belt-and-braces guard so a tombstoned row is never
+//     resurrected even if step 3 misses (e.g. a future
+//     refactor moves the check).
+//     5. Demote every OTHER active row for the grantor to
+//     active=0 / global_enabled=0. YUJ-1744 / PR#131 R4: the
+//     demote MUST NOT touch `revoked_at`. Siblings demoted by
+//     a persona switch are *paused*, not *revoked* — leaving
+//     `revoked_at=NULL` keeps them eligible for re-activation
+//     via a later PUT {active:1}, which is exactly the toggle
+//     contract this endpoint advertises. If we stamped
+//     `revoked_at=now` here, the next switch back would hit
+//     oboUpdateGrant's `RevokedAt != nil` gate and 404, turning
+//     the selector into a one-way trip. The demote WHERE is
+//     also scoped to `revoked_at IS NULL` so a row a concurrent
+//     DELETE has tombstoned (revoked_at != NULL, active still
+//     racing) keeps its audit-bearing timestamp intact.
 //     The entire sequence commits or rolls back together — no
 //     half-applied "target active but siblings still active" state.
 //
@@ -998,26 +1035,14 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	}
 
 	if v == 0 {
-		// Pause path — no transaction needed, no sibling demotion.
-		g, err := d.findGrantByID(id)
+		// Pause needs no sibling demotion, but the mutation, version, and
+		// audit must commit together.
+		g, err := d.pauseGrantAtomic(id)
 		if err != nil {
 			return err
 		}
 		if g == nil {
 			return nil
-		}
-		// YUJ-1738 / PR#131 R2 B2 — race guard. If a concurrent
-		// DELETE has tombstoned the row between handler load and now,
-		// treat as a logical no-op: the row is already active=0 and
-		// the audit-bearing revoked_at must NOT be disturbed.
-		if g.RevokedAt != nil {
-			return nil
-		}
-		if _, err := d.session.Update("obo_grants").SetMap(map[string]interface{}{
-			"active":     0,
-			"updated_at": time.Now(),
-		}).Where("id=? AND revoked_at IS NULL", id).Exec(); err != nil {
-			return err
 		}
 		// "Any active grant exists for grantor" answer may have flipped.
 		d.invalidateGrantorCache(g.GrantorUID)
@@ -1162,22 +1187,34 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	// the primary guard; this WHERE clause is a defensive second
 	// layer so a future refactor that drops the explicit check
 	// can't silently resurrect a tombstoned row.
-	if _, updErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
-		"active":     1,
-		"revoked_at": nil,
-		"updated_at": now,
-	}).Where("id=? AND revoked_at IS NULL", id).Exec(); updErr != nil {
-		return updErr
+	if grant.Active != 1 {
+		previous := *grant
+		if _, updErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
+			"active":     1,
+			"revoked_at": nil,
+			"updated_at": now,
+		}).Where("id=? AND revoked_at IS NULL", id).Exec(); updErr != nil {
+			return updErr
+		}
+		if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); versionErr != nil {
+			return versionErr
+		}
+		grant.Active = 1
+		grant.UpdatedAt = now
+		if auditErr := appendGrantPolicyAudit(tx, id, grant.GrantorUID, "activate_grant", previous, grant); auditErr != nil {
+			return auditErr
+		}
 	}
 
 	// Snapshot demote-set IDs for the post-commit channel-cache bust.
 	// Same struct shape used by createOrReactivateGrantAtomic.
 	type row struct {
-		ID int64 `db:"id"`
+		ID            int64 `db:"id"`
+		GlobalEnabled int   `db:"global_enabled"`
 	}
 	var demoted []*row
 	if _, scanErr := tx.SelectBySql(
-		"SELECT id FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? FOR UPDATE",
+		"SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL FOR UPDATE",
 		grant.GrantorUID, id,
 	).Load(&demoted); scanErr != nil && !errors.Is(scanErr, dbr.ErrNotFound) {
 		return scanErr
@@ -1198,6 +1235,16 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 			"updated_at":     now,
 		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL", grant.GrantorUID, id).Exec(); demErr != nil {
 			return demErr
+		}
+		for _, sibling := range demoted {
+			if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", sibling.ID); versionErr != nil {
+				return versionErr
+			}
+			if auditErr := appendGrantPolicyAudit(tx, sibling.ID, grant.GrantorUID, "demote_sibling",
+				map[string]any{"active": 1, "global_enabled": sibling.GlobalEnabled},
+				map[string]any{"active": 0, "global_enabled": 0}); auditErr != nil {
+				return auditErr
+			}
 		}
 	}
 
@@ -1242,24 +1289,53 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 // ON DELETE CASCADE, which doesn't fire here — scopes remain so reactivation
 // could be implemented in v1 without losing the channel list.
 func (d *botAPIDB) revokeGrant(id int64) error {
-	now := time.Now()
-	g, err := d.findGrantByID(id)
+	pre, err := d.findGrantByID(id)
 	if err != nil {
 		return err
 	}
-	if g == nil {
+	if pre == nil {
 		return nil
 	}
-	_, err = d.session.Update("obo_grants").SetMap(map[string]interface{}{
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	var lockHit int
+	if err := tx.SelectBySql("SELECT 1 FROM `user` WHERE uid=? FOR UPDATE", pre.GrantorUID).LoadOne(&lockHit); err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return err
+	}
+	var grant *oboGrantModel
+	if _, err := tx.Select(oboGrantColumns).From("obo_grants").Where("id=?", id).Suffix("FOR UPDATE").Load(&grant); err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return err
+	}
+	if grant == nil || grant.GrantorUID != pre.GrantorUID || grant.RevokedAt != nil {
+		return nil
+	}
+	previous := *grant
+	now := time.Now()
+	if _, err := tx.Update("obo_grants").SetMap(map[string]interface{}{
 		"active":         0,
 		"global_enabled": 0,
 		"revoked_at":     now,
 		"updated_at":     now,
-	}).Where("id=?", id).Exec()
-	if err != nil {
+	}).Where("id=?", id).Exec(); err != nil {
 		return err
 	}
-	d.invalidateGrantorCache(g.GrantorUID)
+	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); err != nil {
+		return err
+	}
+	grant.Active = 0
+	grant.GlobalEnabled = 0
+	grant.RevokedAt = &now
+	grant.UpdatedAt = now
+	if err := appendGrantPolicyAudit(tx, id, grant.GrantorUID, "revoke_grant", previous, grant); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.invalidateGrantorCache(grant.GrantorUID)
 	return nil
 }
 
@@ -1452,6 +1528,7 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	var (
 		grantID     int64
 		reactivated bool
+		previous    *oboGrantModel
 	)
 
 	res, insErr := tx.InsertInto("obo_grants").
@@ -1493,6 +1570,7 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 			// Live row → genuine duplicate, not a reactivation case.
 			return nil, false, errOBOGrantAlreadyActive
 		}
+		previous = existing
 		if _, updErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
 			"active":         1,
 			"global_enabled": 0,
@@ -1501,6 +1579,9 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 			"updated_at":     now,
 		}).Where("id=?", existing.ID).Exec(); updErr != nil {
 			return nil, false, updErr
+		}
+		if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", existing.ID); versionErr != nil {
+			return nil, false, versionErr
 		}
 		grantID = existing.ID
 		reactivated = true
@@ -1511,11 +1592,12 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	// Snapshot the IDs we are about to demote so the post-commit cache
 	// bust knows which channel-scope caches to drop.
 	type row struct {
-		ID int64 `db:"id"`
+		ID            int64 `db:"id"`
+		GlobalEnabled int   `db:"global_enabled"`
 	}
 	var demoted []*row
 	if _, scanErr := tx.SelectBySql(
-		"SELECT id FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? FOR UPDATE",
+		"SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL FOR UPDATE",
 		grantorUID, grantID,
 	).Load(&demoted); scanErr != nil && !errors.Is(scanErr, dbr.ErrNotFound) {
 		return nil, false, scanErr
@@ -1537,6 +1619,16 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL", grantorUID, grantID).Exec(); demErr != nil {
 			return nil, false, demErr
 		}
+		for _, sibling := range demoted {
+			if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", sibling.ID); versionErr != nil {
+				return nil, false, versionErr
+			}
+			if auditErr := appendGrantPolicyAudit(tx, sibling.ID, grantorUID, "demote_sibling",
+				map[string]any{"active": 1, "global_enabled": sibling.GlobalEnabled},
+				map[string]any{"active": 0, "global_enabled": 0}); auditErr != nil {
+				return nil, false, auditErr
+			}
+		}
 	}
 
 	// Read the canonical post-write row inside the tx so the caller
@@ -1552,6 +1644,9 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	}
 	if grant == nil {
 		return nil, false, errors.New("obo: row vanished between write and read inside tx")
+	}
+	if auditErr := appendGrantPolicyAudit(tx, grantID, grantorUID, "create_or_reactivate_grant", previous, grant); auditErr != nil {
+		return nil, false, auditErr
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {

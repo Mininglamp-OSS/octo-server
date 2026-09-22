@@ -50,6 +50,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/obo"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -121,6 +122,8 @@ type User struct {
 	tokenValidator           *auth.TokenValidator
 	scanLoginAuthorizations  *scanLoginAuthorizationStore
 	revocationWorkerOwner    string
+	oboRegistry              *obo.ActionRegistry
+	oboReader                obo.SnapshotReader
 }
 
 type userSessionStore interface {
@@ -156,6 +159,10 @@ type currentUserTokenInvalidator interface {
 // New New
 func New(ctx *config.Context) *User {
 	sessionStore, loginRedisClient := auth.SessionStoreAndClientForContext(ctx)
+	oboRegistry, err := obo.ParseActionRegistry(os.Getenv("OCTO_OBO_ACTION_SCOPES_JSON"))
+	if err != nil {
+		panic(err) // Invalid Action policy must fail at startup.
+	}
 	u := &User{
 		ctx:                      ctx,
 		db:                       NewDB(ctx),
@@ -190,6 +197,8 @@ func New(ctx *config.Context) *User {
 		tokenValidator:           auth.NewTokenValidator(sessionStore, ctx.GetConfig().Cache.TokenCachePrefix),
 		scanLoginAuthorizations:  newScanLoginAuthorizationStore(loginRedisClient),
 		revocationWorkerOwner:    util.GenerUUID(),
+		oboRegistry:              oboRegistry,
+		oboReader:                obo.DBSnapshotReader{Session: ctx.DB()},
 	}
 	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
 	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
@@ -403,6 +412,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
 		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
 		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
+		v.POST("/auth/resolve", verifyLimit, u.authResolveBot)          // Resolve Bot identity and OBO delegation.
 		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
