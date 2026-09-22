@@ -21,6 +21,7 @@ package group
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -44,8 +45,6 @@ type memberRow struct {
 	IsExternal         int    `db:"is_external"`
 	SourceSpaceID      string `db:"source_space_id"`
 }
-
-const futureForbiddenExpireTime int64 = 4102444800 // 2100-01-01T00:00:00Z
 
 func readMemberRow(t *testing.T, ctx *config.Context, groupNo, uid string) memberRow {
 	t.Helper()
@@ -126,6 +125,7 @@ func TestTheRestoreBranchReproducesRecoverMemberTx(t *testing.T) {
 	groupNo := util.GenerUUID()
 	seedSpaceSeat(t, ctx, spaceID, "c2_back")
 	seedGroupRow(t, ctx, groupNo, spaceID, "")
+	futureForbiddenExpireTime := time.Now().Add(24 * time.Hour).Unix()
 
 	// A departed member carrying a distinctive value in every column, so an
 	// assignment that goes missing cannot be masked by a default.
@@ -184,6 +184,7 @@ func TestReAddingAnActiveMemberChangesNothing(t *testing.T) {
 	groupNo := util.GenerUUID()
 	seedSpaceSeat(t, ctx, spaceID, "c2_active")
 	seedGroupRow(t, ctx, groupNo, spaceID, "")
+	futureForbiddenExpireTime := time.Now().Add(24 * time.Hour).Unix()
 
 	_, err := ctx.DB().InsertBySql(
 		"INSERT INTO group_member (group_no, uid, remark, role, bot_admin, `version`, status, "+
