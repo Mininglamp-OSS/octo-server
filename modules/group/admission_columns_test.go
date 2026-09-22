@@ -45,6 +45,8 @@ type memberRow struct {
 	SourceSpaceID      string `db:"source_space_id"`
 }
 
+const futureForbiddenExpireTime int64 = 4102444800 // 2100-01-01T00:00:00Z
+
 func readMemberRow(t *testing.T, ctx *config.Context, groupNo, uid string) memberRow {
 	t.Helper()
 	var rows []memberRow
@@ -131,9 +133,9 @@ func TestTheRestoreBranchReproducesRecoverMemberTx(t *testing.T) {
 		"INSERT INTO group_member (group_no, uid, remark, role, bot_admin, `version`, status, "+
 			"vercode, is_deleted, invite_uid, robot, forbidden_expir_time, is_external, "+
 			"source_space_id, created_at) "+
-			"VALUES (?, ?, 'old-remark', ?, 1, 7, ?, 'vc-original', 1, 'old-op', 1, 999, 1, "+
+			"VALUES (?, ?, 'old-remark', ?, 1, 7, ?, 'vc-original', 1, 'old-op', 1, ?, 1, "+
 			"'sp_old', NOW())",
-		groupNo, "c2_back", MemberRoleManager, int(common.GroupMemberStatusBlacklist),
+		groupNo, "c2_back", MemberRoleManager, int(common.GroupMemberStatusBlacklist), futureForbiddenExpireTime,
 	).Exec()
 	require.NoError(t, err)
 
@@ -166,7 +168,7 @@ func TestTheRestoreBranchReproducesRecoverMemberTx(t *testing.T) {
 		Vercode:            "vc-original",
 		Status:             int(common.GroupMemberStatusBlacklist),
 		Robot:              1,
-		ForbiddenExpirTime: 999,
+		ForbiddenExpirTime: futureForbiddenExpireTime,
 	}, got)
 }
 
@@ -187,8 +189,8 @@ func TestReAddingAnActiveMemberChangesNothing(t *testing.T) {
 		"INSERT INTO group_member (group_no, uid, remark, role, bot_admin, `version`, status, "+
 			"vercode, is_deleted, invite_uid, robot, forbidden_expir_time, is_external, "+
 			"source_space_id, created_at) "+
-			"VALUES (?, ?, 'keep', ?, 1, 7, ?, 'vc-keep', 0, 'first-op', 0, 5, 0, '', NOW())",
-		groupNo, "c2_active", MemberRoleManager, int(common.GroupMemberStatusNormal),
+			"VALUES (?, ?, 'keep', ?, 1, 7, ?, 'vc-keep', 0, 'first-op', 0, ?, 0, '', NOW())",
+		groupNo, "c2_active", MemberRoleManager, int(common.GroupMemberStatusNormal), futureForbiddenExpireTime,
 	).Exec()
 	require.NoError(t, err)
 	before := readMemberRow(t, ctx, groupNo, "c2_active")

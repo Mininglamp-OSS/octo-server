@@ -61,6 +61,7 @@ func TestGroupInviteAuthorize_NeedSpace_ExternalGroup(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	resetGroupUIDRateLimit(t, ctx)
 
 	// 注意：**不**插入 testutil.UID 的 space_member —— 模拟新注册零 Space 用户。
 
@@ -111,6 +112,7 @@ func TestGroupInviteAuthorize_NeedSpace_PriorityOverExternalBlocked(t *testing.T
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	resetGroupUIDRateLimit(t, ctx)
 
 	spaceID := "space-need-space-priority"
 	// 只给其他用户分配 space_member，当前登录用户（testutil.UID）零 Space。
@@ -169,6 +171,7 @@ func TestGroupInviteAuthorize_HasSpaceGoesNormalPath(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	resetGroupUIDRateLimit(t, ctx)
 
 	// 给 testutil.UID 建一个独立 Space（不与群所属 Space 重合）。
 	seedDefaultSpaceForTestUID(t, ctx)
