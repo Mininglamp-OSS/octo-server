@@ -74,6 +74,8 @@ func (ba *BotAPI) oboBotGetGenericGrant(c *wkhttp.Context) {
 		respondBotAPIAuthCheckFailed(c)
 		return
 	}
+	grant.RevokedAt = oboUTCTimePtrFromColumn(grant.RevokedAt)
+	grant.ExpiresAt = oboUTCTimePtrFromColumn(grant.ExpiresAt)
 	var all int
 	if err := ba.db.session.SelectBySql("SELECT COUNT(*) FROM obo_grant_scope_bindings WHERE grant_id=? AND scope_code='ALL'", grant.ID).LoadOne(&all); err != nil {
 		ba.Error("generic OBO status Scope lookup failed", zap.Error(err))

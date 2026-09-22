@@ -101,6 +101,42 @@ func TestSetGenericBindingIdempotent(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestSetGenericBindingUsesSharedPolicyAudit(t *testing.T) {
+	d, mock, closeDB := newSqlmockBotAPIDB(t)
+	defer closeDB()
+	local := time.FixedZone("UTC+8", 8*60*60)
+	deadline := time.Date(2026, 10, 1, 4, 0, 0, 0, local)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT uid FROM user WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("human-1"))
+	mock.ExpectQuery("SELECT id,grantee_bot_uid,mode,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "grantee_bot_uid", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
+			AddRow(7, "bot-1", "auto", 1, 1, nil, deadline, 3))
+	mock.ExpectQuery("SELECT COALESCE\\(creator_uid").
+		WillReturnRows(sqlmock.NewRows([]string{"COALESCE(creator_uid,'')"}).AddRow("human-1"))
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
+	mock.ExpectExec("INSERT INTO obo_grant_scope_bindings").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE obo_grants SET policy_version").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT policy_version,expires_at FROM obo_grants").
+		WillReturnRows(sqlmock.NewRows([]string{"policy_version", "expires_at"}).AddRow(4, deadline))
+	mock.ExpectExec("INSERT INTO obo_policy_audits").WithArgs(
+		int64(7), "human-1", "set_scope_binding",
+		`{"expires_at":"2026-10-01T04:00:00Z","id":7,"policy_version":3,"scope_codes":[]}`,
+		`{"expires_at":"2026-10-01T04:00:00Z","id":7,"policy_version":4,"scope_codes":["ALL"]}`,
+	).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	view, err := d.setGenericBinding(context.Background(), "human-1", 7, true)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), view.PolicyVersion)
+	require.Equal(t, time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC), *view.ExpiresAt)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestGrantorCannotReadGrantWhenBotOwnerRecordDoesNotMatch(t *testing.T) {
 	d, mock, closeDB := newSqlmockBotAPIDB(t)
 	defer closeDB()
@@ -182,6 +218,51 @@ func TestGrantAuditStateCarriesCommittedPolicyVersion(t *testing.T) {
 	require.NoError(t, json.Unmarshal(state, &decoded))
 	require.Equal(t, float64(4), decoded["policy_version"])
 	require.Equal(t, float64(7), decoded["id"])
+}
+
+func TestGrantAuditStateNormalizesExpiryAsUTCWallClock(t *testing.T) {
+	local := time.FixedZone("UTC+8", 8*60*60)
+	expiresAt := sql.NullTime{
+		Time:  time.Date(2026, 10, 1, 4, 0, 0, 123000000, local),
+		Valid: true,
+	}
+	state, err := encodeGrantAuditState(map[string]any{"active": 1}, 7, 4, expiresAt)
+	require.NoError(t, err)
+	var decoded struct {
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	require.NoError(t, json.Unmarshal(state, &decoded))
+	require.Equal(t, time.Date(2026, 10, 1, 4, 0, 0, 123000000, time.UTC), decoded.ExpiresAt)
+}
+
+func TestPutDelegationAtomicIdempotentWithLocalExpiry(t *testing.T) {
+	d, mock, closeDB := newSqlmockBotAPIDB(t)
+	defer closeDB()
+	local := time.FixedZone("UTC+8", 8*60*60)
+	scannedDeadline := time.Date(2026, 10, 1, 4, 0, 0, 0, local)
+	requestedDeadline := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT uid FROM user WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("human-1"))
+	mock.ExpectQuery("SELECT COALESCE\\(creator_uid").
+		WillReturnRows(sqlmock.NewRows([]string{"COALESCE(creator_uid,'')"}).AddRow("human-1"))
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM user WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT id, mode, active, global_enabled, revoked_at, expires_at, policy_version FROM obo_grants").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
+			AddRow(7, "auto", 1, 1, nil, scannedDeadline, 3))
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT id,active,global_enabled,policy_version FROM obo_grants").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "active", "global_enabled", "policy_version"}))
+	mock.ExpectCommit()
+
+	view, err := d.putDelegationAtomic(context.Background(), "human-1", "bot-1", true, true, true,
+		optionalExpiry{Set: true, Value: &requestedDeadline})
+	require.NoError(t, err)
+	require.Equal(t, int64(3), view.PolicyVersion)
+	require.Equal(t, requestedDeadline, *view.ExpiresAt)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestPolicyAuditReadsVersionInsideMutationTransaction(t *testing.T) {

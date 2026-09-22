@@ -192,6 +192,9 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	if err != nil && !created {
 		return nil, fmt.Errorf("lookup Grant: %w", err)
 	}
+	if !created {
+		normalizeGenericGrantRowTimestamps(&old)
+	}
 	if created {
 		var expiresAt any
 		if expiry.Value != nil {

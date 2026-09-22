@@ -98,7 +98,7 @@ func encodeGrantAuditState(value any, grantID, version int64, expiresAt sql.Null
 	state["id"] = grantID
 	state["policy_version"] = version
 	if expiresAt.Valid {
-		state["expires_at"] = expiresAt.Time.UTC()
+		state["expires_at"] = oboUTCFromColumn(expiresAt.Time)
 	} else {
 		state["expires_at"] = nil
 	}

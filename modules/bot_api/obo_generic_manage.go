@@ -2,7 +2,6 @@ package bot_api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -32,7 +31,7 @@ func (ba *BotAPI) genericGrantForOwner(ownerUID string, id int64) (*genericGrant
 	if err != nil {
 		return nil, err
 	}
-	return &grant, nil
+	return normalizeGenericGrantRowTimestamps(&grant), nil
 }
 
 func (ba *BotAPI) genericViewForOwner(ownerUID string, id int64) (*genericDelegationView, error) {
@@ -150,6 +149,7 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 	if err != nil {
 		return nil, fmt.Errorf("lock Grant: %w", err)
 	}
+	normalizeGenericGrantRowTimestamps(&grant)
 	if grant.RevokedAt != nil {
 		return nil, errGenericBotNotOwned
 	}
@@ -185,21 +185,13 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 		if hadALL == 1 {
 			previousScopes = []string{"ALL"}
 		}
-		previous, err := json.Marshal(map[string]any{"scope_codes": previousScopes, "policy_version": grant.PolicyVersion - 1})
-		if err != nil {
-			return nil, fmt.Errorf("encode previous binding state: %w", err)
-		}
-		current := []string{}
+		currentScopes := []string{}
 		if bind {
-			current = []string{"ALL"}
+			currentScopes = []string{"ALL"}
 		}
-		after, err := json.Marshal(map[string]any{"scope_codes": current, "policy_version": grant.PolicyVersion})
-		if err != nil {
-			return nil, fmt.Errorf("encode current binding state: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO obo_policy_audits (grant_id,actor_uid,operation,previous_json,current_json) VALUES (?,?,?,?,?)",
-			id, ownerUID, "set_scope_binding", string(previous), string(after)); err != nil {
+		if err := appendGrantPolicyAudit(tx, id, ownerUID, "set_scope_binding",
+			map[string]any{"scope_codes": previousScopes},
+			map[string]any{"scope_codes": currentScopes}); err != nil {
 			return nil, fmt.Errorf("audit binding: %w", err)
 		}
 	}
@@ -246,6 +238,9 @@ func (ba *BotAPI) oboListPolicyAudits(c *wkhttp.Context) {
 	}
 	if rows == nil {
 		rows = []genericAuditRow{}
+	}
+	for i := range rows {
+		rows[i].CreatedAt = oboUTCFromColumn(rows[i].CreatedAt)
 	}
 	c.Response(map[string]any{"items": rows})
 }
