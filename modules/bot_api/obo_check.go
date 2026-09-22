@@ -250,9 +250,9 @@ func (ba *BotAPI) oboStoreOrDefault() oboStore {
 }
 
 // botHasActiveGrantFrom reports whether bot `botUID` is currently authorised
-// as a grantee by `grantorUID` — i.e. there is an `active=1` row in
-// obo_grants for (grantor=grantorUID, grantee=botUID), REGARDLESS of the
-// `global_enabled` flag. It is a thin boolean wrapper over the
+// as a grantee by `grantorUID` — i.e. there is an active, non-revoked,
+// unexpired row in obo_grants for (grantor=grantorUID, grantee=botUID),
+// REGARDLESS of the `global_enabled` flag. It is a thin boolean wrapper over the
 // `findGrantByGrantorBotActiveOnly` store call (YUJ-1428 / PR#121 R5 / B3),
 // which deliberately bypasses the global_enabled predicate so the grantor-
 // reply bypass keeps working even when the persona is globally paused
@@ -282,8 +282,8 @@ func (ba *BotAPI) botHasActiveGrantFrom(botUID, grantorUID string) (bool, error)
 	store := ba.oboStoreOrDefault()
 	// YUJ-1428 / PR#121 R5 / B3: must NOT consult the
 	// global_enabled-aware lookup. The grantor-reply bypass is the
-	// "bot may always talk to its OWN grantor in DM as long as the
-	// grant is active" gate; the global switch only governs whether
+	// "bot may always talk to its OWN grantor in DM while the Grant is
+	// usable" gate; the global switch only governs whether
 	// the persona intercepts THIRD-PARTY messages for fan-out. Using
 	// findActiveGrantByGrantorBot (active=1 AND global_enabled=1)
 	// here would falsely return "no grant" the moment a user paused

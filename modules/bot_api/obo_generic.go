@@ -138,6 +138,7 @@ type genericGrantRow struct {
 }
 
 const updateGenericGrantSQL = "UPDATE obo_grants SET active=?, global_enabled=?, " +
+	"persona_prompt=CASE WHEN ?=1 THEN '' ELSE persona_prompt END, " +
 	"revoked_at=CASE WHEN ?=1 THEN NULL ELSE revoked_at END, " +
 	"expires_at=CASE WHEN ?=1 THEN ? ELSE expires_at END, " +
 	"policy_version=policy_version+1, updated_at=CURRENT_TIMESTAMP WHERE id=?"
@@ -241,12 +242,12 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 		if expiry.Value != nil {
 			expirySQL = expiry.Value.UTC().Format("2006-01-02 15:04:05.999999")
 		}
-		// An active PUT reauthorizes a previously revoked Grant. The generic
-		// API does not own the legacy Channel persona, so leave persona_prompt
-		// unchanged and make repeated writes converge on the same state.
+		// An active PUT reauthorizes a previously revoked Grant. Clear the
+		// legacy Channel persona so stale instructions cannot survive revival.
 		reauthorize := active && old.RevokedAt != nil
 		if _, err := tx.ExecContext(ctx, updateGenericGrantSQL,
-			intBool(active), intBool(globalEnabled), intBool(reauthorize), intBool(expiry.Set), expirySQL, old.ID); err != nil {
+			intBool(active), intBool(globalEnabled), intBool(reauthorize), intBool(reauthorize),
+			intBool(expiry.Set), expirySQL, old.ID); err != nil {
 			return nil, fmt.Errorf("update Grant: %w", err)
 		}
 		old.PolicyVersion++

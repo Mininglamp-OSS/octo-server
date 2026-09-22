@@ -124,9 +124,9 @@ type oboScopeModel struct {
 //
 // Method contracts:
 //   - findActiveGrantByGrantorBot: returns (nil, nil) if no row matches OR
-//     the row is soft-deleted / globally disabled; callers MUST treat that as
-//     "not authorized". Returning ErrNotFound was rejected because callers
-//     would have to import dbr and branch on it.
+//     the row is paused, revoked, expired, or globally disabled; callers MUST
+//     treat that as "not authorized". Returning ErrNotFound was rejected
+//     because callers would have to import dbr and branch on it.
 //   - scopeEnabled: returns false (no error) when the scope row is missing,
 //     enabled=0, or the grant_id doesn't exist. The hot path on sendMessage
 //     only needs a boolean.
@@ -137,8 +137,8 @@ type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	// findGrantByGrantorBotActiveOnly — YUJ-1428 / restored after PR#121
 	// R5 / B3 rebase regression. Same shape as
-	// findActiveGrantByGrantorBot but ONLY filters on active=1 (the
-	// `global_enabled` master switch is intentionally NOT consulted).
+	// findActiveGrantByGrantorBot but does not consult the `global_enabled`
+	// master switch. It still rejects paused, revoked, and expired Grants.
 	//
 	// Why a separate method instead of a parameter: the existing
 	// findActiveGrantByGrantorBot is the auth gate for third-party OBO
@@ -148,13 +148,13 @@ type oboStore interface {
 	// path would re-open exactly the class of bug the switch exists to
 	// solve. The grantor-reply bypass is a different concern: a bot
 	// must always be able to reply to its OWN grantor in DM as long
-	// as the grant is not revoked (active=1), independent of the
-	// global fan-out switch. Splitting the methods keeps both call
+	// while the Grant remains active, non-revoked, and unexpired,
+	// independent of the global fan-out switch. Splitting the methods keeps both call
 	// sites locked to the right contract at compile time.
 	//
 	// Also intentionally does NOT consult the `obo:grantor:{uid}`
 	// negative cache: that cache is populated based on
-	// (active=1 AND global_enabled=1) and would falsely return
+	// (usable Grant AND global_enabled=1) and would falsely return
 	// "no grant" for a grantor who has an active grant with the
 	// global switch off. The bypass call is on the DM reply path,
 	// not the system-wide fan-out path, so the per-call MySQL probe
@@ -167,11 +167,10 @@ type oboStore interface {
 	// at runtime without storing a local copy.
 	//
 	// Contract:
-	//   - Filters on `active=1` ONLY (the `global_enabled` master switch
-	//     is intentionally NOT consulted — the response surfaces that
-	//     bit as a separate field so the adapter can decide whether to
-	//     apply the persona). This matches the spec on #135 which expects
-	//     both `active` and `global_enabled` to be returned independently.
+	//   - Requires an active, non-revoked, unexpired Grant. The
+	//     `global_enabled` master switch is intentionally NOT consulted — the
+	//     response surfaces that bit separately so the adapter can decide
+	//     whether to apply the persona. This matches the spec on #135.
 	//   - Returns (nil, nil) when no active row matches; the caller maps
 	//     that to a 404. Returning ErrNotFound was rejected to keep
 	//     callers free of `dbr` imports (mirrors findActiveGrantByGrantorBot).
@@ -193,8 +192,8 @@ type oboStore interface {
 	// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin).
 	// Group-like-only fan-out lookup that filters at the DB layer by the
 	// explicit `mention.uids` set. Returns the subset of grants where
-	// `g.grantor_uid IN (grantorUIDs)` AND `g.active=1 AND
-	// g.global_enabled=1`. An empty / nil grantorUIDs slice returns an
+	// `g.grantor_uid IN (grantorUIDs)` with a usable, globally enabled Grant.
+	// An empty / nil grantorUIDs slice returns an
 	// empty result with no DB round-trip — callers should treat the
 	// "no mentions" case at the fan-out layer instead of asking the DB.
 	// DM (Person) MUST NOT call this method (no mention semantics on DMs).
@@ -391,6 +390,14 @@ const oboGrantColumnsAliased = "g.id, g.grantor_uid, g.grantee_bot_uid, g.mode, 
 	"g.created_at, g.updated_at, g.revoked_at, " +
 	"COALESCE(g.persona_prompt, '') AS persona_prompt"
 
+// usableGrantPredicate is the shared authorization gate for legacy Grant
+// consumers. NULL expires_at is intentionally permanent. The prefix is either
+// empty or a trusted static table alias such as "g.".
+func usableGrantPredicate(prefix string) string {
+	return prefix + "active=1 AND " + prefix + "revoked_at IS NULL AND (" +
+		prefix + "expires_at IS NULL OR " + prefix + "expires_at>UTC_TIMESTAMP(6))"
+}
+
 // findActiveGrantByGrantorBot — see oboStore for the contract.
 //
 // Read path consults `obo:grantor:{uid}` first; "0" short-circuits to nil
@@ -411,8 +418,8 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 	var m *oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumns+" FROM obo_grants "+
-			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1 "+
-			"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6))",
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND global_enabled=1 AND "+
+			usableGrantPredicate(""),
 		grantorUID, granteeBotUID,
 	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
@@ -448,8 +455,7 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 	var m *oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumns+" FROM obo_grants "+
-			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 "+
-			"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6))",
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND "+usableGrantPredicate(""),
 		grantorUID, granteeBotUID,
 	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
@@ -478,7 +484,7 @@ func (d *botAPIDB) findActiveGrantByBot(botUID string) (*oboGrantModel, error) {
 	var m *oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumns+" FROM obo_grants "+
-			"WHERE grantee_bot_uid=? AND active=1 "+
+			"WHERE grantee_bot_uid=? AND "+usableGrantPredicate("")+" "+
 			"ORDER BY id ASC LIMIT 1",
 		botUID,
 	).Load(&m)
@@ -544,8 +550,7 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumnsAliased+" "+
 			"FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
-			"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
-			"AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) "+
+			"WHERE "+usableGrantPredicate("g.")+" AND g.global_enabled=1 AND s.enabled=1 "+
 			"AND s.channel_id=? AND s.channel_type=?",
 		channelID, channelType,
 	).Load(&grants)
@@ -619,8 +624,8 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 		"  AND s.channel_id = ? " +
 		"  AND s.channel_type = ? " +
 		"  AND s.enabled = 0 " +
-		"WHERE g.active=1 AND g.global_enabled=1 " +
-		"  AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) " +
+		"WHERE " + usableGrantPredicate("g.") + " " +
+		"  AND g.global_enabled=1 " +
 		"  AND s.id IS NULL " +
 		"  AND g.grantor_uid IN (" + strings.Join(placeholders, ",") + ")"
 	var grants []*oboGrantModel
@@ -712,9 +717,8 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(membershipGroupID, channelID str
 			"  ON s.grant_id = g.id "+
 			"  AND s.channel_id = ? "+
 			"  AND s.channel_type = ? "+
-			"WHERE g.active = 1 "+
+			"WHERE "+usableGrantPredicate("g.")+" "+
 			"  AND g.global_enabled = 1 "+
-			"  AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) "+
 			"  AND gm_bot.uid IS NULL "+
 			"  AND s.id IS NULL",
 		membershipGroupID, membershipGroupID, channelID, channelType,
@@ -764,8 +768,7 @@ func (d *botAPIDB) findGlobalGrantsForDM(grantorUID, peerChannelID string) ([]*o
 	var grants []*oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumnsAliased+" FROM obo_grants g "+
-			"WHERE g.active=1 AND g.global_enabled=1 AND g.grantor_uid=? "+
-			"AND (g.expires_at IS NULL OR g.expires_at>UTC_TIMESTAMP(6)) "+
+			"WHERE "+usableGrantPredicate("g.")+" AND g.global_enabled=1 AND g.grantor_uid=? "+
 			"AND NOT EXISTS ("+
 			"  SELECT 1 FROM obo_scopes s "+
 			"  WHERE s.grant_id=g.id AND s.channel_id=? AND s.channel_type=?"+
@@ -1861,8 +1864,8 @@ func (d *botAPIDB) maybeCacheGrantorNegative(grantorUID string) {
 	}
 	var count int
 	err := d.session.SelectBySql(
-		"SELECT COUNT(*) FROM obo_grants WHERE grantor_uid=? AND active=1 AND global_enabled=1 "+
-			"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6))",
+		"SELECT COUNT(*) FROM obo_grants WHERE grantor_uid=? AND global_enabled=1 AND "+
+			usableGrantPredicate(""),
 		grantorUID,
 	).LoadOne(&count)
 	if err != nil {

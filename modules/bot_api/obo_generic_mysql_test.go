@@ -9,7 +9,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func TestRevokedGrantReauthorizationPreservesLegacyPersonaMySQL(t *testing.T) {
+func TestRevokedGrantReauthorizationClearsLegacyPersonaMySQL(t *testing.T) {
 	dsn, explicitDSN := os.LookupEnv("OCTO_OBO_TEST_MYSQL_DSN")
 	if !explicitDSN {
 		dsn = "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
@@ -37,7 +37,7 @@ func TestRevokedGrantReauthorizationPreservesLegacyPersonaMySQL(t *testing.T) {
 	if _, err := conn.ExecContext(ctx, "INSERT INTO obo_grants VALUES (1,0,0,'2026-09-21 00:00:00','revoked persona',NULL,3,UTC_TIMESTAMP())"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, 0, 0, 0, 0, nil, 1); err != nil {
+	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, 0, 0, 0, 0, 0, nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	var revoked sql.NullTime
@@ -48,14 +48,68 @@ func TestRevokedGrantReauthorizationPreservesLegacyPersonaMySQL(t *testing.T) {
 	if !revoked.Valid || persona != "revoked persona" {
 		t.Fatalf("disable-only PUT must preserve revocation and persona, revoked=%v persona=%q", revoked.Valid, persona)
 	}
-	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, 1, 1, 1, 0, nil, 1); err != nil {
+	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, 1, 1, 1, 1, 0, nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.QueryRowContext(ctx, "SELECT revoked_at,persona_prompt FROM obo_grants WHERE id=1").Scan(&revoked, &persona); err != nil {
 		t.Fatal(err)
 	}
-	if revoked.Valid || persona != "revoked persona" {
-		t.Fatalf("reauthorization must clear revocation without changing the legacy persona, revoked=%v persona=%q", revoked.Valid, persona)
+	if revoked.Valid || persona != "" {
+		t.Fatalf("reauthorization must clear revocation and the stale legacy persona, revoked=%v persona=%q", revoked.Valid, persona)
+	}
+}
+
+func TestUsableGrantPredicateMySQL(t *testing.T) {
+	dsn, explicitDSN := os.LookupEnv("OCTO_OBO_TEST_MYSQL_DSN")
+	if !explicitDSN {
+		dsn = "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
+		if !explicitDSN {
+			t.Skipf("default MySQL test service is unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, statement := range []string{
+		"CREATE TEMPORARY TABLE obo_grants (id BIGINT PRIMARY KEY, active INT, revoked_at DATETIME(6) NULL, expires_at DATETIME(6) NULL)",
+		"INSERT INTO obo_grants VALUES (1,1,NULL,NULL)",
+		"INSERT INTO obo_grants VALUES (2,1,NULL,UTC_TIMESTAMP(6) + INTERVAL 1 HOUR)",
+		"INSERT INTO obo_grants VALUES (3,1,NULL,UTC_TIMESTAMP(6) - INTERVAL 1 HOUR)",
+		"INSERT INTO obo_grants VALUES (4,1,UTC_TIMESTAMP(6),NULL)",
+	} {
+		if _, err := conn.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := conn.QueryContext(ctx, "SELECT id FROM obo_grants WHERE "+usableGrantPredicate("")+" ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("usable Grant predicate returned ids %v, want [1 2]", ids)
 	}
 }
 

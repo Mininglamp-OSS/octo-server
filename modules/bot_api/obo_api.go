@@ -636,9 +636,9 @@ type oboBotGetGrantResp struct {
 //     on authenticated requests; the defensive empty-uid branch
 //     below 500s because reaching it means the middleware broke
 //     its invariant and a 401 would mask that).
-//   - 404 — no active grant for this bot. Note: "no active grant"
+//   - 404 — no usable grant for this bot. Note: "no usable grant"
 //     covers both "grant never existed" and "grant was paused
-//     or revoked"; the adapter should treat 404 as "do not
+//     or revoked or expired"; the adapter should treat 404 as "do not
 //     apply a persona" without distinguishing the cause.
 //   - 500 — store error.
 //

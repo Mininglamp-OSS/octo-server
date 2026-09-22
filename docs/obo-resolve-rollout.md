@@ -49,8 +49,8 @@ authorization decision. Resolve decisions are not cached in this release.
 - The one-shot PUT requires `scope_codes`: `["ALL"]` binds the currently
   supported generic Scope, while `[]` explicitly unbinds it. Omitted or
   `null` `scope_codes` is rejected. An active PUT idempotently reauthorizes a
-  revoked Grant; a disable-only PUT retains its revocation timestamp. Generic
-  management does not modify the legacy Channel `persona_prompt` field.
+  revoked Grant and clears its legacy Channel `persona_prompt`; a disable-only
+  PUT retains both the revocation timestamp and prompt.
 - `GET /v1/obo/grants/:id/audits` currently returns transactional policy-change
   records; OBO decision records are emitted as structured Actor/Subject logs,
   not stored in this management table.

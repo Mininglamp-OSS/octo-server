@@ -223,7 +223,7 @@ func TestDisableOnlyPutPreservesRevokedGrant(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestRevokedGrantReauthorizationDoesNotChangeLegacyPersona(t *testing.T) {
+func TestRevokedGrantReauthorizationClearsLegacyPersona(t *testing.T) {
 	d, mock, closeDB := newSqlmockBotAPIDB(t)
 	defer closeDB()
 	mock.ExpectBegin()
@@ -238,8 +238,8 @@ func TestRevokedGrantReauthorizationDoesNotChangeLegacyPersona(t *testing.T) {
 			AddRow(7, "auto", 0, 0, fakeTime, nil, 3))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
-	mock.ExpectExec("revoked_at=CASE WHEN \\?=1 THEN NULL ELSE revoked_at END, expires_at=CASE WHEN \\?=1 THEN \\? ELSE expires_at END").
-		WithArgs(1, 1, 1, 0, nil, int64(7)).
+	mock.ExpectExec("persona_prompt=CASE WHEN \\?=1 THEN '' ELSE persona_prompt END, revoked_at=CASE WHEN \\?=1 THEN NULL ELSE revoked_at END, expires_at=CASE WHEN \\?=1 THEN \\? ELSE expires_at END").
+		WithArgs(1, 1, 1, 1, 0, nil, int64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT id,active,global_enabled,policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "active", "global_enabled", "policy_version"}))

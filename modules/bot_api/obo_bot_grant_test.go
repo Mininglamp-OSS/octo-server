@@ -117,7 +117,7 @@ func TestOBO_BotGetGrant_NoGrant(t *testing.T) {
 // TestOBO_BotGetGrant_RevokedGrant — the 404 path must also cover
 // grants that exist but have been revoked. `revokeGrant` flips
 // active=0 / global_enabled=0 / sets revoked_at, and our
-// findActiveGrantByBot SELECT filters on `active=1`, so the row must
+// findActiveGrantByBot SELECT filters to usable Grants, so the row must
 // not surface.
 func TestOBO_BotGetGrant_RevokedGrant(t *testing.T) {
 	const (
@@ -150,7 +150,7 @@ func TestOBO_BotGetGrant_RevokedGrant(t *testing.T) {
 // when the grant was created without a persona_prompt the response
 // must surface an empty string (NOT a null / missing field).
 // `insertGrant` writes "" when called with an empty prompt; the
-// production SQL relies on COALESCE(persona_prompt,'') for legacy NULL
+// production SQL relies on COALESCE(persona_prompt,”) for legacy NULL
 // rows, so the fake's "" matches the prod wire shape.
 func TestOBO_BotGetGrant_EmptyPersonaPrompt(t *testing.T) {
 	const (

@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLegacyAuthorizationQueriesRejectExpiredGrants(t *testing.T) {
+func TestLegacyAuthorizationQueriesUseUsableGrantPredicate(t *testing.T) {
 	groupType := common.ChannelTypeGroup.Uint8()
 	for _, tc := range []struct {
 		name          string
@@ -17,6 +17,7 @@ func TestLegacyAuthorizationQueriesRejectExpiredGrants(t *testing.T) {
 	}{
 		{"send", func(d *botAPIDB) error { _, err := d.findActiveGrantByGrantorBot("human-1", "bot-1"); return err }, true},
 		{"grantor reply", func(d *botAPIDB) error { _, err := d.findGrantByGrantorBotActiveOnly("human-1", "bot-1"); return err }, false},
+		{"bot grant read", func(d *botAPIDB) error { _, err := d.findActiveGrantByBot("bot-1"); return err }, false},
 		{"explicit channel fan-out", func(d *botAPIDB) error { _, err := d.findActiveGrantsForChannel("group-1", groupType); return err }, false},
 		{"mentioned grantor fan-out", func(d *botAPIDB) error {
 			_, err := d.findActiveGrantsForChannelByGrantors("group-1", groupType, []string{"human-1"})
@@ -31,10 +32,10 @@ func TestLegacyAuthorizationQueriesRejectExpiredGrants(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d, mock, closeDB := newSqlmockBotAPIDB(t)
 			defer closeDB()
-			mock.ExpectQuery("SELECT .* FROM obo_grants.*expires_at.*UTC_TIMESTAMP\\(6\\)").
+			mock.ExpectQuery("SELECT .* FROM obo_grants.*active\\s*=\\s*1.*revoked_at IS NULL.*expires_at.*UTC_TIMESTAMP\\(6\\)").
 				WillReturnRows(sqlmock.NewRows(grantRowCols()))
 			if tc.negativeProbe {
-				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grants.*expires_at.*UTC_TIMESTAMP\\(6\\)").
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grants.*active\\s*=\\s*1.*revoked_at IS NULL.*expires_at.*UTC_TIMESTAMP\\(6\\)").
 					WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
 			}
 			require.NoError(t, tc.call(d))
