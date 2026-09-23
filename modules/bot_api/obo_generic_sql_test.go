@@ -37,6 +37,66 @@ func TestPutDelegationAtomicIdempotent(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPutDelegationRejectsLiveLegacyGrant(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		active int
+	}{
+		{name: "active", active: 1},
+		{name: "paused", active: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, mock, closeDB := newSqlmockBotAPIDB(t)
+			defer closeDB()
+			mock.ExpectBegin()
+			mock.ExpectQuery("SELECT uid FROM user WHERE uid=").
+				WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("human-1"))
+			mock.ExpectQuery("SELECT COALESCE\\(creator_uid").
+				WillReturnRows(sqlmock.NewRows([]string{"COALESCE(creator_uid,'')"}).AddRow("human-1"))
+			mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM user WHERE uid=").
+				WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+			mock.ExpectQuery("SELECT id, mode, active, global_enabled, revoked_at, expires_at, policy_version FROM obo_grants").
+				WillReturnRows(sqlmock.NewRows([]string{"id", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
+					AddRow(7, "auto", tc.active, 1, nil, nil, 3))
+			mock.ExpectRollback()
+
+			_, err := d.putDelegationAtomic(context.Background(), "human-1", "bot-1", false, false, false, optionalExpiry{})
+			require.ErrorIs(t, err, errGenericLegacyGrantConflict)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestPolicyDelegationDoesNotDemoteSibling(t *testing.T) {
+	d, mock, closeDB := newSqlmockBotAPIDB(t)
+	defer closeDB()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT uid FROM user WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("human-1"))
+	mock.ExpectQuery("SELECT COALESCE\\(creator_uid").
+		WillReturnRows(sqlmock.NewRows([]string{"COALESCE(creator_uid,'')"}).AddRow("human-1"))
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM user WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT id, mode, active, global_enabled, revoked_at, expires_at, policy_version FROM obo_grants").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
+			AddRow(7, policyGrantMode, 0, 0, nil, nil, 3))
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
+	mock.ExpectExec("UPDATE obo_grants SET mode=").
+		WithArgs(policyGrantMode, 1, 1, 0, 0, 0, nil, int64(7)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO obo_policy_audits").WillReturnResult(sqlmock.NewResult(3, 1))
+	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT .* FROM obo_scopes").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	view, err := d.putDelegationAtomic(context.Background(), "human-1", "bot-1", true, true, false, optionalExpiry{})
+	require.NoError(t, err)
+	require.True(t, view.Active)
+	require.True(t, view.GlobalEnabled)
+	require.Equal(t, int64(4), view.PolicyVersion)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func legacyGrantRows(mode string) *sqlmock.Rows {
 	return sqlmock.NewRows(grantRowCols()).AddRow(
 		int64(7), "human-1", "bot-1", mode, 0, 1,
@@ -301,8 +361,6 @@ func TestPutDelegationAtomicIdempotentWithLocalExpiry(t *testing.T) {
 			AddRow(7, policyGrantMode, 1, 1, nil, scannedDeadline, 3))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
-	mock.ExpectQuery("SELECT id,active,global_enabled,policy_version FROM obo_grants").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "active", "global_enabled", "policy_version"}))
 	mock.ExpectCommit()
 
 	view, err := d.putDelegationAtomic(context.Background(), "human-1", "bot-1", true, true, true,
@@ -370,8 +428,6 @@ func TestRevokedGrantReauthorizationClearsLegacyPersona(t *testing.T) {
 	mock.ExpectExec("persona_prompt=CASE WHEN \\?=1 THEN '' ELSE persona_prompt END, revoked_at=CASE WHEN \\?=1 THEN NULL ELSE revoked_at END, expires_at=CASE WHEN \\?=1 THEN \\? ELSE expires_at END").
 		WithArgs(policyGrantMode, 1, 1, 1, 1, 0, nil, int64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery("SELECT id,active,global_enabled,policy_version FROM obo_grants").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "active", "global_enabled", "policy_version"}))
 	mock.ExpectExec("INSERT INTO obo_policy_audits").WillReturnResult(sqlmock.NewResult(3, 1))
 	mock.ExpectCommit()
 	mock.ExpectQuery("SELECT .* FROM obo_scopes").WillReturnRows(sqlmock.NewRows([]string{"id"}))

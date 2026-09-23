@@ -74,6 +74,12 @@ it does not narrow the stored delegation.
   `null` `scope_codes` is rejected. An active PUT idempotently reauthorizes a
   revoked Grant and clears its legacy Channel `persona_prompt`; a disable-only
   PUT retains both the revocation timestamp and prompt.
+- A non-revoked legacy Channel Grant, including a paused one, cannot be taken
+  over by the generic PUT. The endpoint returns `409 Conflict` instead of
+  changing its mode and disabling the existing Channel Persona lifecycle. A
+  previously revoked legacy row may still be explicitly reauthorized as a
+  policy Grant. Policy Grants for different Bots are independent; activating
+  one does not pause or otherwise mutate another Bot's policy.
 - `GET /v1/obo/grants/:id/audits` currently returns transactional generic
   Grant/`ALL`-binding policy records. Legacy Channel `obo_scopes` changes are
   intentionally outside this timeline and do not change the generic

@@ -17,7 +17,10 @@ import (
 	"go.uber.org/zap"
 )
 
-var errGenericBotNotOwned = errors.New("obo: Bot is not owned by grantor")
+var (
+	errGenericBotNotOwned         = errors.New("obo: Bot is not owned by grantor")
+	errGenericLegacyGrantConflict = errors.New("obo: live legacy Grant cannot be converted to policy mode")
+)
 
 // policyGrantMode marks rows managed by the OBO authorization policy. The
 // value lives in the existing mode column so no new table or schema field is
@@ -146,6 +149,10 @@ func (ba *BotAPI) oboPutDelegation(c *wkhttp.Context) {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotRegistered, nil, nil)
 		return
 	}
+	if errors.Is(err, errGenericLegacyGrantConflict) {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantExists, nil, nil)
+		return
+	}
 	if err != nil {
 		ba.Error("generic OBO delegation write failed", zap.Error(err), zap.String("owner", ownerUID), zap.String("bot", botUID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
@@ -179,8 +186,9 @@ func intBool(value bool) int {
 }
 
 // putDelegationAtomic locks the Human row first, mirroring the existing
-// single-active-persona lock order. Grant state, ALL binding, sibling demotion,
-// and management audit commit together.
+// Channel Grant lock order. Grant state, ALL binding, and management audit
+// commit together. Policy Grants are independent: activating one Bot must not
+// silently disable another Bot's policy.
 func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID string, active, globalEnabled, all bool, expiry optionalExpiry) (*genericDelegationView, error) {
 	tx, err := d.session.BeginTx(ctx, nil)
 	if err != nil {
@@ -222,6 +230,12 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	}
 	if !created {
 		normalizeGenericGrantRowTimestamps(&old)
+		// A non-revoked legacy row still owns the Channel Persona lifecycle,
+		// even while paused. Converting it in place would make every legacy
+		// reader hide the row and leave no public API capable of restoring it.
+		if old.Mode != policyGrantMode && old.RevokedAt == nil {
+			return nil, errGenericLegacyGrantConflict
+		}
 	}
 	if created {
 		var expiresAt any
@@ -257,7 +271,6 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 		expiresAt = expiry.Value
 	}
 	changed := created || old.Mode != policyGrantMode || old.Active != intBool(active) || old.GlobalEnabled != intBool(globalEnabled) || (active && old.RevokedAt != nil) || (hadALL == 1) != all || expiryChanged
-	targetChanged := changed
 	previous := genericDelegationView{
 		GrantID: old.ID, GranteeBotUID: botUID,
 		Mode: old.Mode, ExpiresAt: old.ExpiresAt,
@@ -295,33 +308,6 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 			return nil, fmt.Errorf("unbind ALL: %w", err)
 		}
 	}
-	var siblings []*struct {
-		ID            int64 `db:"id"`
-		Active        int   `db:"active"`
-		GlobalEnabled int   `db:"global_enabled"`
-		PolicyVersion int64 `db:"policy_version"`
-	}
-	if active {
-		if _, err := tx.SelectBySql(
-			"SELECT id,active,global_enabled,policy_version FROM obo_grants "+
-				"WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL AND mode=? FOR UPDATE", ownerUID, old.ID, policyGrantMode,
-		).Load(&siblings); err != nil && !errors.Is(err, dbr.ErrNotFound) {
-			return nil, fmt.Errorf("scan active siblings: %w", err)
-		}
-		for _, sibling := range siblings {
-			if _, err := tx.ExecContext(ctx,
-				"UPDATE obo_grants SET active=0,global_enabled=0,policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?",
-				sibling.ID); err != nil {
-				return nil, fmt.Errorf("demote sibling persona %d: %w", sibling.ID, err)
-			}
-			if err := appendGrantPolicyAudit(tx, sibling.ID, ownerUID, "demote_sibling",
-				map[string]any{"active": sibling.Active, "global_enabled": sibling.GlobalEnabled},
-				map[string]any{"active": 0, "global_enabled": 0}); err != nil {
-				return nil, fmt.Errorf("audit sibling persona %d: %w", sibling.ID, err)
-			}
-			changed = true
-		}
-	}
 	view := &genericDelegationView{
 		GrantID: old.ID, GranteeBotUID: botUID, Active: active,
 		Mode: policyGrantMode, ExpiresAt: expiresAt,
@@ -330,7 +316,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	if all {
 		view.ScopeCodes = []string{"ALL"}
 	}
-	if targetChanged {
+	if changed {
 		var beforeJSON []byte
 		if !created {
 			beforeJSON, err = json.Marshal(previous)
@@ -357,15 +343,9 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	}
 	if changed {
 		d.invalidateGrantorCache(ownerUID)
-		ids := []int64{old.ID}
-		for _, sibling := range siblings {
-			ids = append(ids, sibling.ID)
-		}
-		for _, id := range ids {
-			scopes, _ := d.listScopesByGrant(id)
-			for _, scope := range scopes {
-				d.invalidateChannelCache(scope.ChannelID, scope.ChannelType)
-			}
+		scopes, _ := d.listScopesByGrant(old.ID)
+		for _, scope := range scopes {
+			d.invalidateChannelCache(scope.ChannelID, scope.ChannelType)
 		}
 	}
 	return view, nil

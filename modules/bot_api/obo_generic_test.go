@@ -30,6 +30,12 @@ func (s *denyingGenericStore) listGenericAudits(string, int64) ([]genericAuditRo
 	return nil, errGenericBotNotOwned
 }
 
+type legacyConflictGenericStore struct{ *denyingGenericStore }
+
+func (s *legacyConflictGenericStore) putDelegationAtomic(context.Context, string, string, bool, bool, bool, optionalExpiry) (*genericDelegationView, error) {
+	return nil, errGenericLegacyGrantConflict
+}
+
 func TestOptionalExpiryDistinguishesAbsentNullAndTimestamp(t *testing.T) {
 	for _, tc := range []struct {
 		body     string
@@ -105,6 +111,21 @@ func TestGenericManagementReadUsesStoreAndHidesNonOwner(t *testing.T) {
 	ba.oboGetGenericGrant(c)
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+}
+
+func TestPutDelegationReturnsConflictForLiveLegacyGrant(t *testing.T) {
+	ba := &BotAPI{oboStoreOverride: &legacyConflictGenericStore{
+		denyingGenericStore: &denyingGenericStore{fakeOBOStore: newFakeOBOStore()},
+	}}
+	c, recorder := makeRawCtx(t, "human-1", http.MethodPut, "/v1/obo/delegations/bot-1",
+		[]byte(`{"active":true,"global_enabled":true,"scope_codes":["ALL"]}`),
+		gin.Params{{Key: "bot_uid", Value: "bot-1"}})
+
+	ba.oboPutDelegation(c)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want %d; body=%s", recorder.Code, http.StatusConflict, recorder.Body.String())
 	}
 }
 
