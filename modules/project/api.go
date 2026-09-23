@@ -2,6 +2,7 @@ package project
 
 import (
 	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +36,9 @@ type Project struct {
 	// spaceCache is pkg/space's own membership cache, deliberately reused rather
 	// than reimplemented — see projectMemberCacheKey for why a second copy of that
 	// fact under a project: key would be an isolation hole.
-	spaceCache *spacepkg.RedisMembershipCache
-	oboReader  obo.SnapshotReader
+	spaceCache  *spacepkg.RedisMembershipCache
+	oboReader   obo.SnapshotReader
+	oboRegistry *obo.ActionRegistry
 	// auditSink is nil in production (entries go to the structured log). Tests set it so
 	// the "every write path audits" contract is assertable without capturing the
 	// process-wide logger.
@@ -126,6 +128,10 @@ type Project struct {
 // active rows from the moment this module is loaded, and I1's reverse direction has
 // to already exist by then.
 func New(ctx *config.Context) *Project {
+	oboRegistry, err := obo.ParseActionRegistry(os.Getenv("OCTO_OBO_ACTION_SCOPES_JSON"))
+	if err != nil {
+		panic(err) // Invalid Action policy must fail at startup.
+	}
 	p := &Project{
 		ctx: ctx,
 		Log: log.NewTLog("Project"),
@@ -134,7 +140,8 @@ func New(ctx *config.Context) *Project {
 		// EnsureSystemSettings returns the process-wide instance with its
 		// auto-reload goroutine already running, so an admin-console flip
 		// converges here within the reload interval without a restart.
-		settings: common.EnsureSystemSettings(ctx),
+		settings:    common.EnsureSystemSettings(ctx),
+		oboRegistry: oboRegistry,
 	}
 	p.oboReader = obo.DBSnapshotReader{Session: p.db.session}
 	// nil-conn deployments (Redis-less mode) leave spaceCache nil so the middleware degrades

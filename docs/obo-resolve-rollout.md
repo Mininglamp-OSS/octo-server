@@ -11,24 +11,40 @@ management API.
 
 `POST /v1/auth/resolve` accepts the same `bf_` Bot credential as the legacy
 Bot verifier; no additional service token is configured or sent. Its OBO
-Action is checked against the server's Action registry. Built-in Project
-Actions are registered by code; additional downstream Actions can be
-configured with `OCTO_OBO_ACTION_SCOPES_JSON`:
+Action is checked against the server's Action registry. There are no built-in
+Action-to-Scope mappings: all mappings come from
+`OCTO_OBO_ACTION_SCOPES_JSON`. The current rollout uses one Action and one
+Scope:
 
 ```json
 {
-  "task.read": ["ALL"]
+  "all": ["ALL"]
 }
 ```
 
-The Action registry is loaded at startup; invalid values fail startup. It
-does **not** authenticate which downstream service submitted an Action. The
-calling backend must derive Action from a controlled route, never accept a
-Bot/CLI-provided Action. Adding an Action that accepts `ALL` expands what
-existing `ALL` grants may delegate, so review and test each addition before
-deployment. If service-level Action isolation becomes necessary, add a trusted
-caller identity mechanism rather than reintroducing a token without an
-explicit deployment decision.
+In an environment definition, use:
+
+```sh
+OCTO_OBO_ACTION_SCOPES_JSON='{"all":["ALL"]}'
+```
+
+The Project list, detail, and member-list handlers derive Action `all` from
+their trusted routes. A caller of `/v1/auth/resolve` submits the same registered
+Action through the SDK. Both paths use the same registry rules; neither has a
+hardcoded or `Local` fallback. The CLI never submits an Action to the Project
+business endpoints.
+
+The Action registry is loaded at startup. An absent or blank value creates an
+empty registry: ordinary non-OBO behavior remains available, but every OBO
+Action is denied with `action_not_allowed`. A nonempty malformed value fails
+startup. The registry does **not** authenticate which downstream service
+submitted an Action. The calling backend must derive Action from a controlled
+route, never accept a Bot/CLI-provided Action. Adding an Action that accepts
+`ALL` expands what existing `ALL` grants may delegate, so review and test each
+addition before deployment.
+
+This change does not add or alter cluster-only network access rules. Resolve
+keeps the same deployment boundary as the existing Bot verification routes.
 
 Both `AS_BOT` and `OBO` requests must include the target `space_id`. `OBO`
 also requires a registered Action, an active and globally enabled

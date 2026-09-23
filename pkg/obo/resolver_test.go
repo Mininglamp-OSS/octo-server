@@ -26,14 +26,18 @@ func TestResolverAsBotDoesNotReadDelegation(t *testing.T) {
 }
 
 func TestResolverOBONeverFallsBack(t *testing.T) {
+	registry, err := ParseActionRegistry(`{"all":["ALL"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f := &fakeSnapshotReader{state: Snapshot{BotUID: "bot-1", OwnerUID: "human-1", GrantID: 7}}
-	r := Resolver{Reader: f}
-	_, err := r.Resolve(context.Background(), Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "project.read", Local: true})
+	r := Resolver{Reader: f, Registry: registry}
+	_, err = r.Resolve(context.Background(), Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "all"})
 	if DecisionCode(err) != "delegation_denied" {
 		t.Fatalf("expected delegation denial, got %v", err)
 	}
 	f.state.BoundScopes = []string{"ALL"}
-	p, err := r.Resolve(context.Background(), Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "project.read", Local: true})
+	p, err := r.Resolve(context.Background(), Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "all"})
 	if err != nil || p.Subject.UID != "human-1" || p.Delegation.MatchedScope != "ALL" {
 		t.Fatalf("principal=%+v err=%v", p, err)
 	}
@@ -44,7 +48,7 @@ func TestResolverRequiresSpaceAndRegisteredAction(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), Request{BotToken: "bf_valid", Mode: ModeAsBot}); DecisionCode(err) != "missing_space_id" {
 		t.Fatalf("expected missing Space, got %v", err)
 	}
-	if _, err := r.Resolve(context.Background(), Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "unknown", Local: true}); DecisionCode(err) != "action_not_allowed" {
+	if _, err := r.Resolve(context.Background(), Request{BotToken: "bf_valid", SpaceID: "S", Mode: ModeOBO, Action: "unknown"}); DecisionCode(err) != "action_not_allowed" {
 		t.Fatalf("expected Action denial, got %v", err)
 	}
 }

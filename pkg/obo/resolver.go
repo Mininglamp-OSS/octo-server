@@ -22,7 +22,6 @@ type Request struct {
 	Mode     Mode   `json:"mode"`
 	SpaceID  string `json:"space_id"`
 	Action   string `json:"action,omitempty"`
-	Local    bool   `json:"-"`
 	Resource *struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
@@ -116,11 +115,7 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (*Principal, error)
 		if req.Action == "" {
 			return nil, deny("invalid_request", http.StatusBadRequest)
 		}
-		if req.Local {
-			if _, ok := localActions[req.Action]; !ok {
-				return nil, deny("action_not_allowed", http.StatusForbidden)
-			}
-		} else if !r.Registry.Allows(req.Action) {
+		if !r.Registry.Allows(req.Action) {
 			return nil, deny("action_not_allowed", http.StatusForbidden)
 		}
 	}
@@ -147,8 +142,7 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (*Principal, error)
 	}
 	matched := false
 	for _, scope := range state.BoundScopes {
-		if scope == "ALL" && ((req.Local && MatchALL(req.Action, []string{scope})) ||
-			(!req.Local && r.Registry.AllowsScope(req.Action, scope))) {
+		if r.Registry.AllowsScope(req.Action, scope) {
 			matched = true
 			break
 		}

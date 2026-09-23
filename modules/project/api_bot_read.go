@@ -15,6 +15,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// Project handlers derive this Action from their trusted route. The Registry
+// remains the policy authority that maps it to configured Scopes.
+const botProjectOBOAction = "all"
+
 // Bot Project reads bypass the Human Session middleware by design: they use a
 // bf_ Bot token and the same OBO kernel as /v1/auth/resolve. The existing
 // Project read methods remain the business-permission authority for Subject.
@@ -56,9 +60,9 @@ func (p *Project) botOBOPrincipal(c *wkhttp.Context, action string) (*obo.Princi
 	if reader == nil {
 		reader = obo.DBSnapshotReader{Session: p.db.session}
 	}
-	resolver := obo.Resolver{Reader: reader}
+	resolver := obo.Resolver{Reader: reader, Registry: p.oboRegistry}
 	principal, err := resolver.Resolve(c.Request.Context(), obo.Request{
-		BotToken: token, Mode: obo.ModeOBO, SpaceID: spaceID, Action: action, Local: true,
+		BotToken: token, Mode: obo.ModeOBO, SpaceID: spaceID, Action: action,
 	})
 	if err != nil {
 		var decision *obo.DecisionError
@@ -106,7 +110,7 @@ func botProjectPage(c *wkhttp.Context) (projectReadPage, bool) {
 }
 
 func (p *Project) botListProjects(c *wkhttp.Context) {
-	principal, ok := p.botOBOPrincipal(c, "project.read")
+	principal, ok := p.botOBOPrincipal(c, botProjectOBOAction)
 	if !ok {
 		return
 	}
@@ -129,7 +133,7 @@ func (p *Project) botListProjects(c *wkhttp.Context) {
 }
 
 func (p *Project) botGetProject(c *wkhttp.Context) {
-	principal, ok := p.botOBOPrincipal(c, "project.read")
+	principal, ok := p.botOBOPrincipal(c, botProjectOBOAction)
 	if !ok {
 		return
 	}
@@ -143,7 +147,7 @@ func (p *Project) botGetProject(c *wkhttp.Context) {
 }
 
 func (p *Project) botListProjectMembers(c *wkhttp.Context) {
-	principal, ok := p.botOBOPrincipal(c, "project.member.read")
+	principal, ok := p.botOBOPrincipal(c, botProjectOBOAction)
 	if !ok {
 		return
 	}

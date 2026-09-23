@@ -24,6 +24,8 @@ generic ALL Scope management, and read-only Bot Project access.
 - Resolve uses the existing Bot token. The server checks registered Actions, but
   does not authenticate which downstream service submitted one; SDK consumers
   must derive Action from a controlled route.
+- Action-to-Scope policy has no code defaults. The initial deployment explicitly
+  configures `all -> ALL`; a missing mapping denies OBO without disabling other APIs.
 - An OBO failure never falls back to As Bot, and business permissions remain with each module.
 - Existing Channel OBO behavior and v1 verify endpoints remain unchanged.
 - The approved document reuses `obo_grants`; shared state and single-active-persona
@@ -34,6 +36,7 @@ generic ALL Scope management, and read-only Bot Project access.
 - Changing Fleet, Loop, or CLI code.
 - Migrating legacy Channel OBO checks into the new resolver.
 - Fine-grained Scopes, OBO decision caches, or dynamic Action policy management.
+- Cluster-only routing, ingress policy, or other network-access changes.
 
 ## Acceptance
 

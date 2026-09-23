@@ -59,9 +59,9 @@ func TestAuthResolveBotUsesExternalActionRegistry(t *testing.T) {
 		BotUID: "bot-1", OwnerUID: "human-1", GrantID: 7, PolicyVersion: 4,
 		BoundScopes: []string{"ALL"},
 	}}
-	route := newAuthResolveTestRoute(t, reader, `{"task.read":["ALL"]}`)
+	route := newAuthResolveTestRoute(t, reader, `{"all":["ALL"]}`)
 	recorder := postAuthResolve(t, route,
-		`{"bot_token":"bf_ExactToken","mode":"OBO","space_id":"S","action":"task.read"}`)
+		`{"bot_token":"bf_ExactToken","mode":"OBO","space_id":"S","action":"all"}`)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -76,7 +76,7 @@ func TestAuthResolveBotUsesExternalActionRegistry(t *testing.T) {
 	if principal.Mode != obo.ModeOBO || principal.Actor.UID != "bot-1" || principal.Subject.UID != "human-1" {
 		t.Fatalf("principal=%+v", principal)
 	}
-	if principal.Delegation == nil || principal.Delegation.Action != "task.read" || principal.Delegation.PolicyVersion != 4 {
+	if principal.Delegation == nil || principal.Delegation.Action != "all" || principal.Delegation.PolicyVersion != 4 {
 		t.Fatalf("delegation=%+v", principal.Delegation)
 	}
 	if reader.calls != 1 || reader.botToken != "bf_ExactToken" || reader.spaceID != "S" || reader.mode != obo.ModeOBO {
@@ -86,9 +86,9 @@ func TestAuthResolveBotUsesExternalActionRegistry(t *testing.T) {
 
 func TestAuthResolveBotRejectsUnregisteredActionBeforeSnapshotRead(t *testing.T) {
 	reader := &authResolveSnapshotReader{state: obo.Snapshot{BotUID: "bot-1"}}
-	route := newAuthResolveTestRoute(t, reader, `{"task.read":["ALL"]}`)
+	route := newAuthResolveTestRoute(t, reader, `{"all":["ALL"]}`)
 	recorder := postAuthResolve(t, route,
-		`{"bot_token":"bf_ExactToken","mode":"OBO","space_id":"S","action":"task.delete"}`)
+		`{"bot_token":"bf_ExactToken","mode":"OBO","space_id":"S","action":"project.read"}`)
 
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())

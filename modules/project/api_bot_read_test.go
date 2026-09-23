@@ -15,9 +15,13 @@ import (
 type botProjectSnapshotReader struct {
 	snapshot obo.Snapshot
 	err      error
+	calls    *int
 }
 
 func (r botProjectSnapshotReader) Read(context.Context, string, string, obo.Mode) (obo.Snapshot, error) {
+	if r.calls != nil {
+		(*r.calls)++
+	}
 	return r.snapshot, r.err
 }
 
@@ -27,6 +31,15 @@ func botReadTestRouter(p *Project) *wkhttp.WKHttp {
 	r.GET("/v1/bot/projects/:project_id", p.botGetProject)
 	r.GET("/v1/bot/projects/:project_id/members", p.botListProjectMembers)
 	return r
+}
+
+func botReadTestRegistry(t *testing.T) *obo.ActionRegistry {
+	t.Helper()
+	registry, err := obo.ParseActionRegistry(`{"all":["ALL"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
 }
 
 func TestBotProjectReadsRequireExplicitOBOAndRejectImpersonation(t *testing.T) {
@@ -64,6 +77,27 @@ func TestBotProjectReadsRequireBotBearerCredential(t *testing.T) {
 	}
 }
 
+func TestBotProjectReadsFailClosedWhenActionRegistryIsEmpty(t *testing.T) {
+	registry, err := obo.ParseActionRegistry("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	p := &Project{oboRegistry: registry, oboReader: botProjectSnapshotReader{
+		calls: &calls,
+		snapshot: obo.Snapshot{BotUID: "bot-1", OwnerUID: "human-1", GrantID: 7,
+			BoundScopes: []string{"ALL"}},
+	}}
+	r := botReadTestRouter(p)
+	req := httptest.NewRequest(http.MethodGet, "/v1/bot/projects?obo=true&space_id=space-1", nil)
+	req.Header.Set("Authorization", "Bearer bf_valid")
+	res := httptest.NewRecorder()
+	r.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden || calls != 0 {
+		t.Fatalf("status=%d calls=%d; body=%s", res.Code, calls, res.Body.String())
+	}
+}
+
 func TestBotProjectReadsFailClosedOnDelegationDenials(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -75,7 +109,7 @@ func TestBotProjectReadsFailClosedOnDelegationDenials(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := &Project{oboReader: tc.reader}
+			p := &Project{oboReader: tc.reader, oboRegistry: botReadTestRegistry(t)}
 			r := botReadTestRouter(p)
 			req := httptest.NewRequest(http.MethodGet, "/v1/bot/projects?obo=true&space_id=space-1", nil)
 			req.Header.Set("Authorization", "Bearer bf_valid")
@@ -89,12 +123,12 @@ func TestBotProjectReadsFailClosedOnDelegationDenials(t *testing.T) {
 }
 
 func TestBotProjectPrincipalUsesOwnerAsSubject(t *testing.T) {
-	p := &Project{Log: log.NewTLog("Project"), oboReader: botProjectSnapshotReader{snapshot: obo.Snapshot{
+	p := &Project{Log: log.NewTLog("Project"), oboRegistry: botReadTestRegistry(t), oboReader: botProjectSnapshotReader{snapshot: obo.Snapshot{
 		BotUID: "bot-1", OwnerUID: "human-1", GrantID: 7, PolicyVersion: 3, BoundScopes: []string{"ALL"},
 	}}}
 	r := wkhttp.New()
 	r.GET("/probe", func(c *wkhttp.Context) {
-		principal, ok := p.botOBOPrincipal(c, "project.read")
+		principal, ok := p.botOBOPrincipal(c, "all")
 		if !ok {
 			return
 		}

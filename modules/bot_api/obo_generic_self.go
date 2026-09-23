@@ -36,7 +36,7 @@ func (ba *BotAPI) oboBotGetGenericGrant(c *wkhttp.Context) {
 	}
 	resolver := obo.Resolver{Reader: obo.DBSnapshotReader{Session: ba.db.session}}
 	principal, err := resolver.Resolve(c.Request.Context(), obo.Request{
-		BotToken: extractBotToken(c), Mode: obo.ModeAsBot, SpaceID: spaceID, Local: true,
+		BotToken: extractBotToken(c), Mode: obo.ModeAsBot, SpaceID: spaceID,
 	})
 	if err != nil {
 		ba.Warn("generic OBO status identity refused", zap.String("decision_code", obo.DecisionCode(err)))
