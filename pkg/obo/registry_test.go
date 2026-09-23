@@ -40,3 +40,14 @@ func TestScopeMatcherRequiresExplicitALLOnBothSides(t *testing.T) {
 		t.Fatal("missing Action or binding accepted")
 	}
 }
+
+func TestActionRegistryDoesNotAliasBuiltInScopeMaps(t *testing.T) {
+	r, err := ParseActionRegistry("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.actions["project.read"]["FUTURE"] = struct{}{}
+	if _, present := localActions["project.read"]["FUTURE"]; present {
+		t.Fatal("registry mutation leaked into built-in Action policy")
+	}
+}

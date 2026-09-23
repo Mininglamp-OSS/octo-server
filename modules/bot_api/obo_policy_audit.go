@@ -52,7 +52,7 @@ func (d *botAPIDB) pauseGrantAtomic(id int64) (*oboGrantModel, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return grant, nil
+	return normalizeOBOGrantModelTimestamps(grant), nil
 }
 
 // appendGrantPolicyAudit must be called inside the same transaction as its
@@ -79,7 +79,7 @@ func appendGrantPolicyAudit(tx *dbr.Tx, grantID int64, actorUID, operation strin
 		return fmt.Errorf("encode current Grant state: %w", err)
 	}
 	if _, err := tx.Exec(
-		"INSERT INTO obo_policy_audits (grant_id,actor_uid,operation,previous_json,current_json) VALUES (?,?,?,?,?)",
+		"INSERT INTO obo_policy_audits (grant_id,actor_uid,operation,previous_json,current_json,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))",
 		grantID, actorUID, operation, beforeValue, string(afterJSON)); err != nil {
 		return fmt.Errorf("record Grant policy audit: %w", err)
 	}
@@ -94,6 +94,9 @@ func encodeGrantAuditState(value any, grantID, version int64, expiresAt sql.Null
 	var state map[string]any
 	if err := json.Unmarshal(encoded, &state); err != nil {
 		return nil, err
+	}
+	if state == nil {
+		state = make(map[string]any)
 	}
 	state["id"] = grantID
 	state["policy_version"] = version

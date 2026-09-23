@@ -25,7 +25,11 @@ type ActionRegistry struct {
 func ParseActionRegistry(raw string) (*ActionRegistry, error) {
 	r := &ActionRegistry{actions: make(map[string]map[string]struct{}, len(localActions))}
 	for action, scopes := range localActions {
-		r.actions[action] = scopes
+		copied := make(map[string]struct{}, len(scopes))
+		for scope := range scopes {
+			copied[scope] = struct{}{}
+		}
+		r.actions[action] = copied
 	}
 	if strings.TrimSpace(raw) == "" {
 		return r, nil

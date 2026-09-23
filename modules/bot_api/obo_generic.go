@@ -19,6 +19,19 @@ import (
 
 var errGenericBotNotOwned = errors.New("obo: Bot is not owned by grantor")
 
+type genericManagementStore interface {
+	putDelegationAtomic(ctx context.Context, ownerUID, botUID string, active, globalEnabled, all bool, expiry optionalExpiry) (*genericDelegationView, error)
+	setGenericBinding(ctx context.Context, ownerUID string, id int64, bind bool) (*genericDelegationView, error)
+}
+
+func (ba *BotAPI) genericManagementStoreOrError() (genericManagementStore, error) {
+	store, ok := ba.oboStoreOrDefault().(genericManagementStore)
+	if !ok {
+		return nil, errors.New("obo: generic management store is not configured")
+	}
+	return store, nil
+}
+
 const genericManagementMaxBodyBytes = 4096
 
 func bindGenericManagementJSON(c *wkhttp.Context, dst any) error {
@@ -113,7 +126,12 @@ func (ba *BotAPI) oboPutDelegation(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "scope_codes")
 		return
 	}
-	view, err := ba.db.putDelegationAtomic(c.Request.Context(), ownerUID, botUID, *req.Active, *req.GlobalEnabled, all, req.ExpiresAt)
+	store, err := ba.genericManagementStoreOrError()
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "put_delegation")
+		return
+	}
+	view, err := store.putDelegationAtomic(c.Request.Context(), ownerUID, botUID, *req.Active, *req.GlobalEnabled, all, req.ExpiresAt)
 	if errors.Is(err, errGenericBotNotOwned) {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotRegistered, nil, nil)
 		return
@@ -257,7 +275,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	}
 	if all && hadALL == 0 {
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO obo_grant_scope_bindings (grant_id,scope_code,assigned_by) VALUES (?,'ALL',?)", old.ID, ownerUID); err != nil {
+			"INSERT INTO obo_grant_scope_bindings (grant_id,scope_code,assigned_by,assigned_at) VALUES (?,'ALL',?,UTC_TIMESTAMP(6))", old.ID, ownerUID); err != nil {
 			return nil, fmt.Errorf("bind ALL: %w", err)
 		}
 	} else if !all && hadALL == 1 {
@@ -318,7 +336,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 			previousValue = string(beforeJSON)
 		}
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO obo_policy_audits (grant_id,actor_uid,operation,previous_json,current_json) VALUES (?,?,'put_delegation',?,?)",
+			"INSERT INTO obo_policy_audits (grant_id,actor_uid,operation,previous_json,current_json,created_at) VALUES (?,?,'put_delegation',?,?,UTC_TIMESTAMP(6))",
 			old.ID, ownerUID, previousValue, string(afterJSON)); err != nil {
 			return nil, fmt.Errorf("audit Grant change: %w", err)
 		}

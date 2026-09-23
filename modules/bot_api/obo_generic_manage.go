@@ -103,7 +103,12 @@ func (ba *BotAPI) oboBindGenericScope(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "scope_code")
 		return
 	}
-	view, err := ba.db.setGenericBinding(c.Request.Context(), c.GetLoginUID(), id, true)
+	store, err := ba.genericManagementStoreOrError()
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "bind_scope")
+		return
+	}
+	view, err := store.setGenericBinding(c.Request.Context(), c.GetLoginUID(), id, true)
 	if err != nil {
 		ba.respondGenericManagementError(c, err, "bind_scope")
 		return
@@ -116,7 +121,12 @@ func (ba *BotAPI) oboUnbindGenericScope(c *wkhttp.Context) {
 	if !ok {
 		return
 	}
-	view, err := ba.db.setGenericBinding(c.Request.Context(), c.GetLoginUID(), id, false)
+	store, err := ba.genericManagementStoreOrError()
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "unbind_scope")
+		return
+	}
+	view, err := store.setGenericBinding(c.Request.Context(), c.GetLoginUID(), id, false)
 	if err != nil {
 		ba.respondGenericManagementError(c, err, "unbind_scope")
 		return
@@ -170,7 +180,7 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 	}
 	if (hadALL == 1) != bind {
 		if bind {
-			_, err = tx.ExecContext(ctx, "INSERT INTO obo_grant_scope_bindings (grant_id,scope_code,assigned_by) VALUES (?,'ALL',?)", id, ownerUID)
+			_, err = tx.ExecContext(ctx, "INSERT INTO obo_grant_scope_bindings (grant_id,scope_code,assigned_by,assigned_at) VALUES (?,'ALL',?,UTC_TIMESTAMP(6))", id, ownerUID)
 		} else {
 			_, err = tx.ExecContext(ctx, "DELETE FROM obo_grant_scope_bindings WHERE grant_id=? AND scope_code='ALL'", id)
 		}

@@ -26,3 +26,19 @@ func normalizeGenericGrantRowTimestamps(grant *genericGrantRow) *genericGrantRow
 	grant.ExpiresAt = oboUTCTimePtrFromColumn(grant.ExpiresAt)
 	return grant
 }
+
+func normalizeOBOGrantModelTimestamps(grant *oboGrantModel) *oboGrantModel {
+	if grant == nil {
+		return nil
+	}
+	grant.RevokedAt = oboUTCTimePtrFromColumn(grant.RevokedAt)
+	grant.ExpiresAt = oboUTCTimePtrFromColumn(grant.ExpiresAt)
+	return grant
+}
+
+func normalizeOBOGrantModelsTimestamps(grants []*oboGrantModel) []*oboGrantModel {
+	for _, grant := range grants {
+		normalizeOBOGrantModelTimestamps(grant)
+	}
+	return grants
+}

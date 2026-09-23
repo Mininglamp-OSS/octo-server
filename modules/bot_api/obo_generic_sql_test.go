@@ -40,7 +40,7 @@ func TestPutDelegationAtomicIdempotent(t *testing.T) {
 func legacyGrantRows(mode string) *sqlmock.Rows {
 	return sqlmock.NewRows(grantRowCols()).AddRow(
 		int64(7), "human-1", "bot-1", mode, 0, 1,
-		fakeTime, fakeTime, sql.NullTime{}, "",
+		fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "",
 	)
 }
 
@@ -77,6 +77,36 @@ func TestLegacyGrantRevocationVersionsAndAuditsAtomically(t *testing.T) {
 	mock.ExpectExec("INSERT INTO obo_policy_audits").WillReturnResult(sqlmock.NewResult(3, 1))
 	mock.ExpectCommit()
 	require.NoError(t, d.revokeGrant(7))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestLegacyGrantFreshCreateAuditsWithNoPreviousState(t *testing.T) {
+	d, mock, closeDB := newSqlmockBotAPIDB(t)
+	defer closeDB()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT 1 FROM `user` WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+	mock.ExpectExec("INSERT INTO `obo_grants`").
+		WillReturnResult(sqlmock.NewResult(7, 1))
+	mock.ExpectQuery("SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "global_enabled"}))
+	mock.ExpectQuery("COALESCE\\(persona_prompt").
+		WillReturnRows(sqlmock.NewRows(grantRowCols()).AddRow(
+			int64(7), "human-1", "bot-1", "auto", 0, 1,
+			fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "",
+		))
+	mock.ExpectQuery("SELECT policy_version,expires_at FROM obo_grants").
+		WillReturnRows(sqlmock.NewRows([]string{"policy_version", "expires_at"}).AddRow(1, nil))
+	mock.ExpectExec("INSERT INTO obo_policy_audits").
+		WithArgs(int64(7), "human-1", "create_or_reactivate_grant", nil,
+			`{"active":1,"created_at":"2026-05-21T00:00:00Z","expires_at":null,"global_enabled":0,"grantee_bot_name":"","grantee_bot_uid":"bot-1","grantor_uid":"human-1","id":7,"mode":"auto","policy_version":1,"updated_at":"2026-05-21T00:00:00Z"}`,
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+	grant, reactivated, err := d.createOrReactivateGrantAtomic("human-1", "bot-1", "auto", "")
+	require.NoError(t, err)
+	require.False(t, reactivated)
+	require.Equal(t, int64(7), grant.ID)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

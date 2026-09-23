@@ -20,7 +20,14 @@ import (
 // Project read methods remain the business-permission authority for Subject.
 func (p *Project) registerBotProjectRoutes(r *wkhttp.WKHttp) {
 	rlRedis := octoredis.NewInstrumentedClient(p.ctx.GetConfig(), func(o *redis.Options) { o.PoolSize = 10 })
-	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "bot_project_read", 30.0/60, 20)
+	// Reuse the operator-tunable Bot business rate settings when available.
+	// Keep the historical 30/minute fallback for bare test instances that do
+	// not carry SystemSettings.
+	rps, burst := 30.0/60, 20
+	if p.settings != nil {
+		rps, burst = p.settings.BotRateLimitBusinessRPS(), p.settings.BotRateLimitBusinessBurst()
+	}
+	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "bot_project_read", rps, burst)
 	bot := r.Group("/v1/bot/projects", ipLimit)
 	bot.GET("", p.botListProjects)
 	bot.GET("/:project_id", p.botGetProject)

@@ -103,6 +103,8 @@ type oboGrantModel struct {
 	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
 	RevokedAt      *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	ExpiresAt      *time.Time `db:"expires_at" json:"expires_at,omitempty"`
+	PolicyVersion  int64      `db:"policy_version" json:"policy_version"`
 	PersonaPrompt  string     `db:"persona_prompt" json:"persona_prompt,omitempty"`
 }
 
@@ -381,13 +383,13 @@ const (
 // the column existed (or by call paths that pre-date insertGrant carrying
 // persona_prompt) still load cleanly. (GH#122)
 const oboGrantColumns = "id, grantor_uid, grantee_bot_uid, mode, global_enabled, active, " +
-	"created_at, updated_at, revoked_at, " +
+	"created_at, updated_at, revoked_at, expires_at, policy_version, " +
 	"COALESCE(persona_prompt, '') AS persona_prompt"
 
 // oboGrantColumnsAliased mirrors oboGrantColumns for queries that JOIN the
 // `obo_grants` table aliased as `g` (the fan-out feeders).
 const oboGrantColumnsAliased = "g.id, g.grantor_uid, g.grantee_bot_uid, g.mode, g.global_enabled, g.active, " +
-	"g.created_at, g.updated_at, g.revoked_at, " +
+	"g.created_at, g.updated_at, g.revoked_at, g.expires_at, g.policy_version, " +
 	"COALESCE(g.persona_prompt, '') AS persona_prompt"
 
 // usableGrantPredicate is the shared authorization gate for legacy Grant
@@ -434,7 +436,7 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 		// suppressing other valid grant-bot pairs of the same grantor.
 		d.maybeCacheGrantorNegative(grantorUID)
 	}
-	return m, nil
+	return normalizeOBOGrantModelTimestamps(m), nil
 }
 
 // findGrantByGrantorBotActiveOnly — see oboStore. YUJ-1428 / restored
@@ -461,7 +463,7 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
-	return m, nil
+	return normalizeOBOGrantModelTimestamps(m), nil
 }
 
 // findActiveGrantByBot — see oboStore for the contract.
@@ -491,7 +493,7 @@ func (d *botAPIDB) findActiveGrantByBot(botUID string) (*oboGrantModel, error) {
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
-	return m, nil
+	return normalizeOBOGrantModelTimestamps(m), nil
 }
 
 // scopeEnabled — see oboStore.
@@ -561,7 +563,7 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 		grants = []*oboGrantModel{}
 	}
 	d.writeChannelCache(channelID, channelType, len(grants) > 0)
-	return grants, nil
+	return normalizeOBOGrantModelsTimestamps(grants), nil
 }
 
 // findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin perf
@@ -637,7 +639,7 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 		grants = []*oboGrantModel{}
 	}
 	// Intentionally NO cache write: PR#114 R4.
-	return grants, nil
+	return normalizeOBOGrantModelsTimestamps(grants), nil
 }
 
 // findGlobalGrantsWithoutScope returns active grants with global_enabled=1
@@ -729,7 +731,7 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(membershipGroupID, channelID str
 	if grants == nil {
 		grants = []*oboGrantModel{}
 	}
-	return grants, nil
+	return normalizeOBOGrantModelsTimestamps(grants), nil
 }
 
 // findGlobalGrantsForDM — see oboStore. DM-only implicit-scope feeder for
@@ -781,7 +783,7 @@ func (d *botAPIDB) findGlobalGrantsForDM(grantorUID, peerChannelID string) ([]*o
 	if grants == nil {
 		grants = []*oboGrantModel{}
 	}
-	return grants, nil
+	return normalizeOBOGrantModelsTimestamps(grants), nil
 }
 
 // insertGrant creates a new grant row. Returns the autoincrement ID. Unique
@@ -840,7 +842,7 @@ func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, err
 			"COALESCE(u.name, g.grantee_bot_uid) AS grantee_bot_name, "+
 			"g.mode, g.global_enabled, g.active, "+
 			"COALESCE(g.persona_prompt, '') AS persona_prompt, "+
-			"g.created_at, g.updated_at, g.revoked_at "+
+			"g.created_at, g.updated_at, g.revoked_at, g.expires_at, g.policy_version "+
 			"FROM obo_grants g "+
 			"LEFT JOIN `user` u ON u.uid = g.grantee_bot_uid "+
 			"WHERE g.grantor_uid=? "+
@@ -853,7 +855,7 @@ func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, err
 	if grants == nil {
 		grants = []*oboGrantModel{}
 	}
-	return grants, nil
+	return normalizeOBOGrantModelsTimestamps(grants), nil
 }
 
 // findGrantByID — used by the per-grant PUT/DELETE/scopes endpoints to
@@ -866,7 +868,7 @@ func (d *botAPIDB) findGrantByID(id int64) (*oboGrantModel, error) {
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
-	return m, nil
+	return normalizeOBOGrantModelTimestamps(m), nil
 }
 
 // updateGrant applies optional fields. mode="" leaves mode untouched;
@@ -1439,7 +1441,7 @@ func (d *botAPIDB) findGrantByGrantorBot(grantorUID, granteeBotUID string) (*obo
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
-	return m, nil
+	return normalizeOBOGrantModelTimestamps(m), nil
 }
 
 // reactivateGrant flips a soft-deleted grant back to the same shape
@@ -1537,7 +1539,10 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	var (
 		grantID     int64
 		reactivated bool
-		previous    *oboGrantModel
+		// Keep this as an interface so a fresh Grant passes an actual nil
+		// value to the audit writer. A typed nil *oboGrantModel inside any
+		// is non-nil and would be treated as a previous state.
+		previous any
 	)
 
 	res, insErr := tx.InsertInto("obo_grants").
@@ -1654,6 +1659,7 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	if grant == nil {
 		return nil, false, errors.New("obo: row vanished between write and read inside tx")
 	}
+	normalizeOBOGrantModelTimestamps(grant)
 	if auditErr := appendGrantPolicyAudit(tx, grantID, grantorUID, "create_or_reactivate_grant", previous, grant); auditErr != nil {
 		return nil, false, auditErr
 	}

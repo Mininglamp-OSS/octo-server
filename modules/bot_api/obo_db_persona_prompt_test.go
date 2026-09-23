@@ -44,7 +44,7 @@ func newSqlmockBotAPIDB(t *testing.T) (*botAPIDB, sqlmock.Sqlmock, func()) {
 func grantRowCols() []string {
 	return []string{"id", "grantor_uid", "grantee_bot_uid", "mode",
 		"global_enabled", "active", "created_at", "updated_at",
-		"revoked_at", "persona_prompt"}
+		"revoked_at", "expires_at", "policy_version", "persona_prompt"}
 }
 
 // fakeTime supplies a non-nil time.Time so the dbr scanner does not
@@ -74,10 +74,10 @@ func TestInsertGrant_WritesPersonaPromptColumn(t *testing.T) {
 
 // TestFindGrantByID_NullPersonaPromptDoesNotPanic regresses the GH#122
 // trigger: a row whose persona_prompt column is NULL (legacy rows from
-// before the migration backfilled '' / rows written by code paths that
+// before the migration backfilled ” / rows written by code paths that
 // did not include the column) used to fail loading into the struct because
 // `PersonaPrompt string` cannot scan NULL. The fix wraps the column in
-// `COALESCE(persona_prompt, '')` so the driver hands the scanner an empty
+// `COALESCE(persona_prompt, ”)` so the driver hands the scanner an empty
 // string instead. We assert both that the production SQL contains the
 // COALESCE rewrite and that the load succeeds with PersonaPrompt == "".
 func TestFindGrantByID_NullPersonaPromptDoesNotPanic(t *testing.T) {
@@ -90,7 +90,7 @@ func TestFindGrantByID_NullPersonaPromptDoesNotPanic(t *testing.T) {
 	// scan would still blow up on a NULL column in real MySQL.
 	rows := sqlmock.NewRows(grantRowCols()).
 		AddRow(int64(1), "user_g", "bot_b", "auto", 1, 1,
-			fakeTime, fakeTime, sql.NullTime{}, "")
+			fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "")
 
 	mock.ExpectQuery("COALESCE\\(persona_prompt, ''\\) AS persona_prompt").
 		WillReturnRows(rows)
@@ -110,7 +110,7 @@ func TestFindActiveGrantByGrantorBot_UsesCoalesceOnPersonaPrompt(t *testing.T) {
 
 	rows := sqlmock.NewRows(grantRowCols()).
 		AddRow(int64(7), "g", "b", "auto", 1, 1,
-			fakeTime, fakeTime, sql.NullTime{}, "")
+			fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "")
 
 	mock.ExpectQuery("COALESCE\\(persona_prompt, ''\\) AS persona_prompt").
 		WillReturnRows(rows)
@@ -131,7 +131,7 @@ func TestFindActiveGrantsForChannel_UsesCoalesceOnPersonaPrompt(t *testing.T) {
 
 	rows := sqlmock.NewRows(grantRowCols()).
 		AddRow(int64(9), "g", "b", "auto", 1, 1,
-			fakeTime, fakeTime, sql.NullTime{}, "")
+			fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "")
 
 	mock.ExpectQuery("COALESCE\\(g.persona_prompt, ''\\) AS persona_prompt").
 		WillReturnRows(rows)
@@ -151,7 +151,7 @@ func TestFindGlobalGrantsWithoutScope_UsesCoalesceOnPersonaPrompt(t *testing.T) 
 
 	rows := sqlmock.NewRows(grantRowCols()).
 		AddRow(int64(11), "g", "b", "auto", 1, 1,
-			fakeTime, fakeTime, sql.NullTime{}, "")
+			fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "")
 
 	mock.ExpectQuery("COALESCE\\(g.persona_prompt, ''\\) AS persona_prompt").
 		WillReturnRows(rows)
@@ -171,7 +171,7 @@ func TestFindGrantByGrantorBot_UsesCoalesceOnPersonaPrompt(t *testing.T) {
 
 	rows := sqlmock.NewRows(grantRowCols()).
 		AddRow(int64(13), "g", "b", "auto", 0, 0,
-			fakeTime, fakeTime, sql.NullTime{}, "")
+			fakeTime, fakeTime, sql.NullTime{}, sql.NullTime{}, 1, "")
 
 	mock.ExpectQuery("COALESCE\\(persona_prompt, ''\\) AS persona_prompt").
 		WillReturnRows(rows)
