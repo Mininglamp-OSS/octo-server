@@ -4725,9 +4725,27 @@ type memberDetailResp struct {
 	// /membersync 是按 version 的增量同步，本字段上线前已缓存的成员行在其 version
 	// 变动前不会带上它，降级方向只能是「退回现状」，绝不能误开权限。
 	// 非 bot 成员、他人的 bot 均为 false。
-	BotOwnedByMe bool   `json:"bot_owned_by_me"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	BotOwnedByMe bool `json:"bot_owned_by_me"`
+	// BotCreatedByMe 表示「该 bot 由当前请求方创建」—— 纯归属，不含权限语义。
+	//
+	// 与上面那个字段只差一个词，务必记住这条对照：
+	//   bot_owned_by_me   = 我**能撤**它（归属 AND 目标是普通角色）
+	//   bot_created_by_me = 我**建**了它（只看 robot.creator_uid）
+	//
+	// 拆出来是给「移出成员」页做分类用的（我的 BOT / 其他成员）：群主拥有、但被
+	// 提为管理员的 bot，owned 为 false（自助分支不放行），可群主本人确实能移除它，
+	// 于是它会带着可点的移除按钮出现在「其他成员」组里 —— 分类看起来是乱的。
+	// 归属和权限是两件事，就该用两个字段表达。
+	//
+	// 注意它仍在 fillBotOwnedByMe 的活跃成员门之后回填，所以严格说是「活跃成员
+	// 视角的归属」：被拉黑的所有者拿到的是 false。这是有意的 —— 被拉黑的人本来
+	// 就进不了移出页，多一道门零风险。
+	//
+	// 同样 **缺失必须按 false 处理**（/membersync 增量下发）。前端分类时应回落到
+	// bot_owned_by_me，降级方向 = 退回本字段上线前的分类结果。
+	BotCreatedByMe bool   `json:"bot_created_by_me"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
@@ -4830,7 +4848,11 @@ func (g *Group) fillRealnameFields(resps []memberDetailResp) {
 
 // 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
 // 函数不会改写 is_external / source_space_id 字段。
-// fillBotOwnedByMe 批量回填 memberDetailResp.BotOwnedByMe（octo-web#1511）。
+// fillBotOwnedByMe 批量回填 memberDetailResp 的两个 per-viewer bot 字段
+// （octo-web#1511 / #1553）：BotOwnedByMe（能不能撤）与 BotCreatedByMe（是不是我建的）。
+//
+// 函数名保留 fillBotOwnedByMe 未改：它是三处调用点（membersGet / memberGet /
+// syncMembers）的既有契约，改名的 diff 噪音远大于收益。
 //
 // 复用 memberRemove 自助路径的同一判据 QueryBotUIDsOwnedByUIDs —— 一次
 // `group_member INNER JOIN robot` 批量查出「本群内属于 loginUID 的 bot」，零 N+1，
@@ -4889,12 +4911,16 @@ func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailR
 		if resps[i].Robot != 1 {
 			continue
 		}
-		// 被授予了群角色（Creator / Manager）的 bot 由 memberRemove 的自助分支拒绝，
-		// 处置权留给群主/管理员；这里同步排除，避免下发一个点了必报错的按钮。
-		if resps[i].Role != MemberRoleCommon {
+		if _, ok := owned[resps[i].UID]; !ok {
 			continue
 		}
-		if _, ok := owned[resps[i].UID]; ok {
+		// 纯归属：QueryBotUIDsOwnedByUIDs 的 SQL 本来就不看 role，这里只是别把这个
+		// 信息丢掉。给前端分类（我的 BOT / 其他成员）用。
+		resps[i].BotCreatedByMe = true
+		// 权限语义保持一字不变：被授予了群角色（Creator / Manager）的 bot 由
+		// memberRemove 的自助分支拒绝，处置权留给群主/管理员；这里同步排除，
+		// 避免下发一个点了必报错的按钮。
+		if resps[i].Role == MemberRoleCommon {
 			resps[i].BotOwnedByMe = true
 		}
 	}
