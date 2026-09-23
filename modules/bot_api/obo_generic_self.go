@@ -24,6 +24,7 @@ type genericGrantStatus struct {
 // arbitrary Grant by Bot UID: the current owner is read first, then the exact
 // (owner, Bot) pair is queried. Resolve remains the authority for decisions.
 func (ba *BotAPI) oboBotGetGenericGrant(c *wkhttp.Context) {
+	c.Writer.Header().Set("Cache-Control", "private, no-store")
 	if getBotKindFromContext(c) != BotKindUser {
 		respondBotAPIAuthFailed(c)
 		return
@@ -62,7 +63,7 @@ func (ba *BotAPI) oboBotGetGenericGrant(c *wkhttp.Context) {
 		PolicyVersion int64      `db:"policy_version"`
 	}
 	err = ba.db.session.SelectBySql(
-		"SELECT id,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants WHERE grantor_uid=? AND grantee_bot_uid=?",
+		"SELECT id,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants WHERE grantor_uid=? AND grantee_bot_uid=? AND mode='"+policyGrantMode+"'",
 		owner, principal.Actor.UID,
 	).LoadOne(&grant)
 	if errors.Is(err, dbr.ErrNotFound) {

@@ -31,6 +31,8 @@ func normalizeOBOGrantModelTimestamps(grant *oboGrantModel) *oboGrantModel {
 	if grant == nil {
 		return nil
 	}
+	grant.CreatedAt = oboUTCFromColumn(grant.CreatedAt)
+	grant.UpdatedAt = oboUTCFromColumn(grant.UpdatedAt)
 	grant.RevokedAt = oboUTCTimePtrFromColumn(grant.RevokedAt)
 	grant.ExpiresAt = oboUTCTimePtrFromColumn(grant.ExpiresAt)
 	return grant

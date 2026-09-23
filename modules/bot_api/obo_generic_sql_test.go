@@ -26,7 +26,7 @@ func TestPutDelegationAtomicIdempotent(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	mock.ExpectQuery("SELECT id, mode, active, global_enabled, revoked_at, expires_at, policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
-			AddRow(7, "auto", 0, 0, nil, nil, 3))
+			AddRow(7, policyGrantMode, 0, 0, nil, nil, 3))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
 	mock.ExpectCommit()
@@ -110,6 +110,26 @@ func TestLegacyGrantFreshCreateAuditsWithNoPreviousState(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestLegacyGrantCannotReactivatePolicyRow(t *testing.T) {
+	d, mock, closeDB := newSqlmockBotAPIDB(t)
+	defer closeDB()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT 1 FROM `user` WHERE uid=").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+	mock.ExpectExec("INSERT INTO `obo_grants`").
+		WillReturnError(errors.New("Error 1062: Duplicate entry for uk_grantor_grantee"))
+	mock.ExpectQuery("COALESCE\\(persona_prompt").
+		WillReturnRows(sqlmock.NewRows(grantRowCols()).AddRow(
+			int64(7), "human-1", "bot-1", policyGrantMode, 0, 0,
+			fakeTime, fakeTime, sql.NullTime{Time: fakeTime, Valid: true}, sql.NullTime{}, 3, "",
+		))
+	mock.ExpectRollback()
+
+	_, _, err := d.createOrReactivateGrantAtomic("human-1", "bot-1", "auto", "")
+	require.ErrorIs(t, err, errOBOGrantAlreadyActive)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestSetGenericBindingIdempotent(t *testing.T) {
 	d, mock, closeDB := newSqlmockBotAPIDB(t)
 	defer closeDB()
@@ -118,7 +138,7 @@ func TestSetGenericBindingIdempotent(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("human-1"))
 	mock.ExpectQuery("SELECT id,grantee_bot_uid,mode,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "grantee_bot_uid", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
-			AddRow(7, "bot-1", "auto", 1, 1, nil, nil, 3))
+			AddRow(7, "bot-1", policyGrantMode, 1, 1, nil, nil, 3))
 	mock.ExpectQuery("SELECT COALESCE\\(creator_uid").
 		WillReturnRows(sqlmock.NewRows([]string{"COALESCE(creator_uid,'')"}).AddRow("human-1"))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
@@ -141,7 +161,7 @@ func TestSetGenericBindingUsesSharedPolicyAudit(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("human-1"))
 	mock.ExpectQuery("SELECT id,grantee_bot_uid,mode,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "grantee_bot_uid", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
-			AddRow(7, "bot-1", "auto", 1, 1, nil, deadline, 3))
+			AddRow(7, "bot-1", policyGrantMode, 1, 1, nil, deadline, 3))
 	mock.ExpectQuery("SELECT COALESCE\\(creator_uid").
 		WillReturnRows(sqlmock.NewRows([]string{"COALESCE(creator_uid,'')"}).AddRow("human-1"))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
@@ -172,8 +192,7 @@ func TestGrantorCannotReadGrantWhenBotOwnerRecordDoesNotMatch(t *testing.T) {
 	defer closeDB()
 	mock.ExpectQuery("SELECT g.id,g.grantee_bot_uid").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "grantee_bot_uid", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}))
-	ba := &BotAPI{db: d}
-	_, err := ba.genericGrantForOwner("human-1", 7)
+	_, err := d.genericGrantForOwner("human-1", 7)
 	require.ErrorIs(t, err, errGenericBotNotOwned)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -181,8 +200,7 @@ func TestGrantorCannotReadGrantWhenBotOwnerRecordDoesNotMatch(t *testing.T) {
 func TestEmptyOwnerCannotReadGrant(t *testing.T) {
 	d, mock, closeDB := newSqlmockBotAPIDB(t)
 	defer closeDB()
-	ba := &BotAPI{db: d}
-	_, err := ba.genericGrantForOwner("", 7)
+	_, err := d.genericGrantForOwner("", 7)
 	require.ErrorIs(t, err, errGenericBotNotOwned)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -280,7 +298,7 @@ func TestPutDelegationAtomicIdempotentWithLocalExpiry(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	mock.ExpectQuery("SELECT id, mode, active, global_enabled, revoked_at, expires_at, policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
-			AddRow(7, "auto", 1, 1, nil, scannedDeadline, 3))
+			AddRow(7, policyGrantMode, 1, 1, nil, scannedDeadline, 3))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	mock.ExpectQuery("SELECT id,active,global_enabled,policy_version FROM obo_grants").
@@ -323,7 +341,7 @@ func TestDisableOnlyPutPreservesRevokedGrant(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	mock.ExpectQuery("SELECT id, mode, active, global_enabled, revoked_at, expires_at, policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "mode", "active", "global_enabled", "revoked_at", "expires_at", "policy_version"}).
-			AddRow(7, "auto", 0, 0, fakeTime, nil, 3))
+			AddRow(7, policyGrantMode, 0, 0, fakeTime, nil, 3))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
 	mock.ExpectCommit()
@@ -350,7 +368,7 @@ func TestRevokedGrantReauthorizationClearsLegacyPersona(t *testing.T) {
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
 	mock.ExpectExec("persona_prompt=CASE WHEN \\?=1 THEN '' ELSE persona_prompt END, revoked_at=CASE WHEN \\?=1 THEN NULL ELSE revoked_at END, expires_at=CASE WHEN \\?=1 THEN \\? ELSE expires_at END").
-		WithArgs(1, 1, 1, 1, 0, nil, int64(7)).
+		WithArgs(policyGrantMode, 1, 1, 1, 1, 0, nil, int64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT id,active,global_enabled,policy_version FROM obo_grants").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "active", "global_enabled", "policy_version"}))

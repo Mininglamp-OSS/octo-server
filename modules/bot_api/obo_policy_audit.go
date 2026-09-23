@@ -41,7 +41,7 @@ func (d *botAPIDB) pauseGrantAtomic(id int64) (*oboGrantModel, error) {
 	}).Where("id=? AND revoked_at IS NULL", id).Exec(); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); err != nil {
+	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", id); err != nil {
 		return nil, err
 	}
 	grant.Active = 0

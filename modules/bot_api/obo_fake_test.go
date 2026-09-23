@@ -765,6 +765,7 @@ func (f *fakeOBOStore) reactivateGrant(id int64) error {
 	g.Active = 1
 	g.GlobalEnabled = 0
 	g.RevokedAt = nil
+	g.ExpiresAt = nil
 	return nil
 }
 
@@ -822,7 +823,7 @@ func (f *fakeOBOStore) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, 
 			PersonaPrompt: personaPrompt,
 		}
 		f.grants[id] = target
-	} else if existing.Active == 1 {
+	} else if existing.Mode == policyGrantMode || existing.Active == 1 {
 		// Live duplicate — surface the same 409 sentinel prod returns.
 		return nil, false, errOBOGrantAlreadyActive
 	} else {
@@ -831,6 +832,7 @@ func (f *fakeOBOStore) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, 
 		existing.Active = 1
 		existing.GlobalEnabled = 0
 		existing.RevokedAt = nil
+		existing.ExpiresAt = nil
 		existing.PersonaPrompt = personaPrompt
 		target = existing
 		reactivated = true
@@ -841,7 +843,7 @@ func (f *fakeOBOStore) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, 
 	// PAUSED, not REVOKED. Leave revoked_at untouched (and skip rows a
 	// prior DELETE already tombstoned, defensive).
 	for _, g := range f.grants {
-		if g.GrantorUID != grantorUID || g.ID == target.ID || g.Active != 1 {
+		if g.GrantorUID != grantorUID || g.ID == target.ID || g.Active != 1 || g.Mode == policyGrantMode {
 			continue
 		}
 		if g.RevokedAt != nil {

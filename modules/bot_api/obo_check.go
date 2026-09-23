@@ -26,6 +26,10 @@ var (
 	ErrOBONotAuthorized = errors.New("obo not authorized")
 )
 
+// Deprecated: this checker belongs to the Persona message runtime and will be
+// removed with fan-out/on_behalf_of. policyGrantMode rows are excluded by the
+// shared usableGrantPredicate and can never reach this path.
+//
 // checkOBO validates that grantee bot `botUID` may send a message in
 // (channelID, channelType) as `grantor`. Returns nil on success and
 // ErrOBONotAuthorized when any check fails. Unexpected DB errors are

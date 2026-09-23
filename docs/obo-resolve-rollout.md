@@ -37,6 +37,10 @@ caller still checks the Subject's current business permissions. The new Bot
 Project routes do that check in the existing Project read service. The status
 endpoint `/v1/bot/obo-grants/self` is advisory and must not be used as an
 authorization decision. Resolve decisions are not cached in this release.
+The Grant and its `ALL` binding are owner-to-Bot policy, not Space-scoped
+policy: they apply in every Space where both identities currently have an
+active seat. The required `space_id` selects and validates the target Space;
+it does not narrow the stored delegation.
 
 ## Release gates still open
 

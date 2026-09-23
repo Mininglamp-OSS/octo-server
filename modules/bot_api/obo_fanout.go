@@ -558,10 +558,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// messages directly via the WuKongIM subscriber pipeline, so a
 		// fan-out copy would cause duplicate processing (double typing,
 		// double reply, identity confusion on @AI/@bot). The adapter-
-		// side mention logic handles identity switching (“@所有人 →
-		// respond as grantor”) for the direct-receipt path.
+		// side mention logic handles identity switching ("@所有人 ->
+		// respond as grantor") for the direct-receipt path.
 		// Applies to GROUP and CommunityTopic channels; DM fan-out is
-		// the sole delivery path (bot is never a “member” of the peer’s
+		// the sole delivery path (bot is never a "member" of the peer's
 		// DM). For CommunityTopic the membership we care about is the
 		// PARENT group: a topic message is delivered to every parent-
 		// group member, so a bot that is already in the parent group

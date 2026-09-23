@@ -109,6 +109,8 @@ func (ba *BotAPI) registerOBORoutes(r *wkhttp.WKHttp) {
 		return
 	}
 	auth := r.Group("/v1/obo", ba.ctx.AuthMiddleware(r))
+	// Deprecated: Persona Grant/Channel Scope management remains available
+	// during migration, but new callers must use the policy endpoints below.
 	auth.POST("/grants", ba.oboCreateGrant)
 	auth.GET("/grants", ba.oboListGrants)
 	auth.DELETE("/grants/:id", ba.oboDeleteGrant)
@@ -691,7 +693,7 @@ func (ba *BotAPI) requireOwnedGrant(c *wkhttp.Context, uid string, id int64) (*o
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return nil, err
 	}
-	if grant == nil {
+	if grant == nil || grant.Mode == policyGrantMode {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return nil, nil
 	}

@@ -31,13 +31,13 @@ func TestRevokedGrantReauthorizationClearsLegacyPersonaMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "CREATE TEMPORARY TABLE obo_grants (id BIGINT PRIMARY KEY, active INT, global_enabled INT, revoked_at DATETIME NULL, persona_prompt TEXT, expires_at DATETIME NULL, policy_version BIGINT, updated_at DATETIME)"); err != nil {
+	if _, err := conn.ExecContext(ctx, "CREATE TEMPORARY TABLE obo_grants (id BIGINT PRIMARY KEY, mode VARCHAR(16), active INT, global_enabled INT, revoked_at DATETIME NULL, persona_prompt TEXT, expires_at DATETIME NULL, policy_version BIGINT, updated_at DATETIME)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.ExecContext(ctx, "INSERT INTO obo_grants VALUES (1,0,0,'2026-09-21 00:00:00','revoked persona',NULL,3,UTC_TIMESTAMP())"); err != nil {
+	if _, err := conn.ExecContext(ctx, "INSERT INTO obo_grants VALUES (1,'auto',0,0,'2026-09-21 00:00:00','revoked persona',NULL,3,UTC_TIMESTAMP())"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, 0, 0, 0, 0, 0, nil, 1); err != nil {
+	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, policyGrantMode, 0, 0, 0, 0, 0, nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	var revoked sql.NullTime
@@ -48,7 +48,7 @@ func TestRevokedGrantReauthorizationClearsLegacyPersonaMySQL(t *testing.T) {
 	if !revoked.Valid || persona != "revoked persona" {
 		t.Fatalf("disable-only PUT must preserve revocation and persona, revoked=%v persona=%q", revoked.Valid, persona)
 	}
-	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, 1, 1, 1, 1, 0, nil, 1); err != nil {
+	if _, err := conn.ExecContext(ctx, updateGenericGrantSQL, policyGrantMode, 1, 1, 1, 1, 0, nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.QueryRowContext(ctx, "SELECT revoked_at,persona_prompt FROM obo_grants WHERE id=1").Scan(&revoked, &persona); err != nil {
@@ -82,11 +82,12 @@ func TestUsableGrantPredicateMySQL(t *testing.T) {
 	}
 	defer conn.Close()
 	for _, statement := range []string{
-		"CREATE TEMPORARY TABLE obo_grants (id BIGINT PRIMARY KEY, active INT, revoked_at DATETIME(6) NULL, expires_at DATETIME(6) NULL)",
-		"INSERT INTO obo_grants VALUES (1,1,NULL,NULL)",
-		"INSERT INTO obo_grants VALUES (2,1,NULL,UTC_TIMESTAMP(6) + INTERVAL 1 HOUR)",
-		"INSERT INTO obo_grants VALUES (3,1,NULL,UTC_TIMESTAMP(6) - INTERVAL 1 HOUR)",
-		"INSERT INTO obo_grants VALUES (4,1,UTC_TIMESTAMP(6),NULL)",
+		"CREATE TEMPORARY TABLE obo_grants (id BIGINT PRIMARY KEY, mode VARCHAR(16), active INT, revoked_at DATETIME(6) NULL, expires_at DATETIME(6) NULL)",
+		"INSERT INTO obo_grants VALUES (1,'auto',1,NULL,NULL)",
+		"INSERT INTO obo_grants VALUES (2,'auto',1,NULL,UTC_TIMESTAMP(6) + INTERVAL 1 HOUR)",
+		"INSERT INTO obo_grants VALUES (3,'auto',1,NULL,UTC_TIMESTAMP(6) - INTERVAL 1 HOUR)",
+		"INSERT INTO obo_grants VALUES (4,'auto',1,UTC_TIMESTAMP(6),NULL)",
+		"INSERT INTO obo_grants VALUES (5,'policy',1,NULL,NULL)",
 	} {
 		if _, err := conn.ExecContext(ctx, statement); err != nil {
 			t.Fatal(err)
@@ -139,7 +140,7 @@ func TestManagementReadRejectsInconsistentBotOwnerRecordMySQL(t *testing.T) {
 		"CREATE TEMPORARY TABLE obo_grants (id BIGINT PRIMARY KEY, grantor_uid VARCHAR(64), grantee_bot_uid VARCHAR(64), mode VARCHAR(16), active INT, global_enabled INT, revoked_at DATETIME NULL, expires_at DATETIME NULL, policy_version BIGINT)",
 		"CREATE TEMPORARY TABLE robot (robot_id VARCHAR(64) PRIMARY KEY, creator_uid VARCHAR(64), status INT)",
 		"CREATE TEMPORARY TABLE user (uid VARCHAR(64) PRIMARY KEY, robot INT, status INT, is_destroy INT)",
-		"INSERT INTO obo_grants VALUES (7,'human-1','bot-1','auto',1,1,NULL,NULL,3)",
+		"INSERT INTO obo_grants VALUES (7,'human-1','bot-1','policy',1,1,NULL,NULL,3)",
 		"INSERT INTO robot VALUES ('bot-1','human-1',1)",
 		"INSERT INTO user VALUES ('human-1',0,1,0)",
 	} {

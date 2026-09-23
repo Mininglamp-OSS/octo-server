@@ -14,10 +14,16 @@ import (
 // one repeatable-read transaction. It does not consult legacy OBO caches.
 type DBSnapshotReader struct{ Session *dbr.Session }
 
-// The first predicate retains the token index; the binary predicate makes the
-// final credential comparison exact even under a case-insensitive collation.
+// policyGrantMode is stored in obo_grants.mode to separate the OBO
+// authorization policy from the deprecated Persona runtime without another
+// table.
+const policyGrantMode = "policy"
+
+// The first predicate names robot's functional token index; the binary
+// predicate keeps the final comparison byte-exact under case-insensitive
+// collations.
 const botTokenLookupSQL = "SELECT robot_id, COALESCE(creator_uid,'') AS creator_uid FROM robot " +
-	"WHERE bot_token=? AND BINARY bot_token=BINARY ? AND bot_token<>'' AND status=1 LIMIT 1"
+	"WHERE NULLIF(bot_token,'')=? AND BINARY bot_token=BINARY ? AND status=1 LIMIT 1"
 
 func (r DBSnapshotReader) Read(ctx context.Context, botToken, spaceID string, mode Mode) (Snapshot, error) {
 	if r.Session == nil {
@@ -96,7 +102,7 @@ func (r DBSnapshotReader) Read(ctx context.Context, botToken, spaceID string, mo
 		}
 		err = tx.SelectBySql(
 			"SELECT id, policy_version FROM obo_grants WHERE grantor_uid=? AND grantee_bot_uid=? "+
-				"AND active=1 AND global_enabled=1 AND revoked_at IS NULL "+
+				"AND mode='"+policyGrantMode+"' AND active=1 AND global_enabled=1 AND revoked_at IS NULL "+
 				"AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP(6)) LIMIT 1",
 			bot.OwnerUID, bot.UID,
 		).LoadOne(&grant)

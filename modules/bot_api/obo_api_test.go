@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -414,6 +415,10 @@ func TestOBO_CreateGrant_Reactivates_SoftDeletedRow(t *testing.T) {
 	originalID := rows[0].ID
 	enable := 1
 	_ = s.updateGrant(originalID, "", &enable, nil)
+	expired := time.Now().Add(-time.Hour)
+	s.mu.Lock()
+	s.grants[originalID].ExpiresAt = &expired
+	s.mu.Unlock()
 
 	// Step 2: soft-delete the grant.
 	_ = s.revokeGrant(originalID)
@@ -433,7 +438,7 @@ func TestOBO_CreateGrant_Reactivates_SoftDeletedRow(t *testing.T) {
 
 	// Step 4: row is back to active=1 / global_enabled=0 with same ID.
 	g, _ = s.findGrantByID(originalID)
-	if g == nil || g.Active != 1 || g.GlobalEnabled != 0 {
+	if g == nil || g.Active != 1 || g.GlobalEnabled != 0 || g.ExpiresAt != nil {
 		t.Fatalf("reactivated row should be active=1 global_enabled=0, got %+v", g)
 	}
 	rows, _ = s.listGrantsByGrantor(tRESTOwner)

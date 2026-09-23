@@ -2,12 +2,22 @@ package obo
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
 )
+
+func TestBotTokenLookupUsesFunctionalIndexExpression(t *testing.T) {
+	if !strings.Contains(botTokenLookupSQL, "NULLIF(bot_token,'')=?") {
+		t.Fatalf("Bot token lookup must name the indexed expression: %s", botTokenLookupSQL)
+	}
+	if !strings.Contains(botTokenLookupSQL, "BINARY bot_token=BINARY ?") {
+		t.Fatalf("Bot token lookup must retain byte-exact comparison: %s", botTokenLookupSQL)
+	}
+}
 
 func snapshotMock(t *testing.T) (DBSnapshotReader, sqlmock.Sqlmock) {
 	t.Helper()
@@ -52,7 +62,7 @@ func TestDBSnapshotOBORequiresOwnerGrantAndALL(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM space_member WHERE space_id=").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
-	mock.ExpectQuery("SELECT id, policy_version FROM obo_grants.*UTC_TIMESTAMP\\(6\\)").
+	mock.ExpectQuery("SELECT id, policy_version FROM obo_grants.*mode='policy'.*UTC_TIMESTAMP\\(6\\)").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "policy_version"}).AddRow(23, 4))
 	mock.ExpectQuery("SELECT scope_code FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"scope_code"}).AddRow("ALL"))
@@ -96,7 +106,7 @@ func TestDBSnapshotOBOGrantRevocationDenies(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	// The SQL filters out inactive, revoked and expired Grants; a missing row
 	// must be a denial, not a fallback to the Bot identity.
-	mock.ExpectQuery("SELECT id, policy_version FROM obo_grants.*UTC_TIMESTAMP\\(6\\)").
+	mock.ExpectQuery("SELECT id, policy_version FROM obo_grants.*mode='policy'.*UTC_TIMESTAMP\\(6\\)").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "policy_version"}))
 	mock.ExpectRollback()
 	_, err := reader.Read(context.Background(), "bf_token", "S", ModeOBO)
@@ -115,7 +125,7 @@ func TestDBSnapshotOBOWithoutALLDoesNotAuthorize(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM space_member WHERE space_id=").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
-	mock.ExpectQuery("SELECT id, policy_version FROM obo_grants.*UTC_TIMESTAMP\\(6\\)").
+	mock.ExpectQuery("SELECT id, policy_version FROM obo_grants.*mode='policy'.*UTC_TIMESTAMP\\(6\\)").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "policy_version"}).AddRow(23, 4))
 	mock.ExpectQuery("SELECT scope_code FROM obo_grant_scope_bindings").
 		WillReturnRows(sqlmock.NewRows([]string{"scope_code"}))

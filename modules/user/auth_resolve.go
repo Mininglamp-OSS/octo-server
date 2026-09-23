@@ -52,12 +52,12 @@ func (u *User) authResolveBot(c *wkhttp.Context) {
 	if err != nil {
 		var decision *obo.DecisionError
 		if !errors.As(err, &decision) {
-			u.Error("Bot Resolve failed", zap.String("decision_code", "infra_failure"))
+			u.Error("Bot Resolve failed", zap.String("decision_code", "infra_failure"), zap.Error(err))
 			resolveError(c, "infra_failure", http.StatusServiceUnavailable)
 			return
 		}
 		if decision.Status >= 500 {
-			u.Error("Bot Resolve failed", zap.String("decision_code", decision.Code))
+			u.Error("Bot Resolve failed", zap.String("decision_code", decision.Code), zap.Error(err))
 		}
 		resolveError(c, decision.Code, decision.Status)
 		return

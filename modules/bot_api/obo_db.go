@@ -392,11 +392,13 @@ const oboGrantColumnsAliased = "g.id, g.grantor_uid, g.grantee_bot_uid, g.mode, 
 	"g.created_at, g.updated_at, g.revoked_at, g.expires_at, g.policy_version, " +
 	"COALESCE(g.persona_prompt, '') AS persona_prompt"
 
-// usableGrantPredicate is the shared authorization gate for legacy Grant
-// consumers. NULL expires_at is intentionally permanent. The prefix is either
-// empty or a trusted static table alias such as "g.".
+// usableGrantPredicate is the shared authorization gate for the deprecated
+// Persona runtime. Policy rows remain in obo_grants but are excluded by the
+// reserved mode marker, so enabling Resolve cannot activate fan-out,
+// on_behalf_of send, typing, or legacy search. NULL expires_at is permanent.
+// The prefix is either empty or a trusted static table alias such as "g.".
 func usableGrantPredicate(prefix string) string {
-	return prefix + "active=1 AND " + prefix + "revoked_at IS NULL AND (" +
+	return prefix + "mode<>'" + policyGrantMode + "' AND " + prefix + "active=1 AND " + prefix + "revoked_at IS NULL AND (" +
 		prefix + "expires_at IS NULL OR " + prefix + "expires_at>UTC_TIMESTAMP(6))"
 }
 
@@ -819,8 +821,9 @@ func (d *botAPIDB) insertGrant(grantorUID, granteeBotUID, mode, personaPrompt st
 	return id, nil
 }
 
-// listGrantsByGrantor returns ALL rows (active + revoked) so the UI can
-// surface history. Callers that only want active rows must filter.
+// listGrantsByGrantor returns deprecated Persona rows (active + revoked) so
+// the legacy UI can surface history. Policy rows share the table but are
+// intentionally hidden from this legacy endpoint.
 //
 // LEFT JOIN `user` enriches each row with the grantee bot's display name
 // (user.name on the row whose uid == grantee_bot_uid). The bot's display
@@ -845,9 +848,9 @@ func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, err
 			"g.created_at, g.updated_at, g.revoked_at, g.expires_at, g.policy_version "+
 			"FROM obo_grants g "+
 			"LEFT JOIN `user` u ON u.uid = g.grantee_bot_uid "+
-			"WHERE g.grantor_uid=? "+
+			"WHERE g.grantor_uid=? AND g.mode<>? "+
 			"ORDER BY g.created_at DESC",
-		grantorUID,
+		grantorUID, policyGrantMode,
 	).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
@@ -934,7 +937,7 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 	if _, err := tx.Update("obo_grants").SetMap(updates).Where("id=? AND revoked_at IS NULL", id).Exec(); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); err != nil {
+	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", id); err != nil {
 		return err
 	}
 	if err := appendGrantPolicyAudit(tx, id, grant.GrantorUID, "update_grant", previous, grant); err != nil {
@@ -1207,7 +1210,7 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 		}).Where("id=? AND revoked_at IS NULL", id).Exec(); updErr != nil {
 			return updErr
 		}
-		if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); versionErr != nil {
+		if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", id); versionErr != nil {
 			return versionErr
 		}
 		grant.Active = 1
@@ -1225,8 +1228,8 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	}
 	var demoted []*row
 	if _, scanErr := tx.SelectBySql(
-		"SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL FOR UPDATE",
-		grant.GrantorUID, id,
+		"SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL AND mode<>? FOR UPDATE",
+		grant.GrantorUID, id, policyGrantMode,
 	).Load(&demoted); scanErr != nil && !errors.Is(scanErr, dbr.ErrNotFound) {
 		return scanErr
 	}
@@ -1244,11 +1247,11 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 			"active":         0,
 			"global_enabled": 0,
 			"updated_at":     now,
-		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL", grant.GrantorUID, id).Exec(); demErr != nil {
+		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL AND mode<>?", grant.GrantorUID, id, policyGrantMode).Exec(); demErr != nil {
 			return demErr
 		}
 		for _, sibling := range demoted {
-			if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", sibling.ID); versionErr != nil {
+			if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", sibling.ID); versionErr != nil {
 				return versionErr
 			}
 			if auditErr := appendGrantPolicyAudit(tx, sibling.ID, grant.GrantorUID, "demote_sibling",
@@ -1333,7 +1336,7 @@ func (d *botAPIDB) revokeGrant(id int64) error {
 	}).Where("id=?", id).Exec(); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", id); err != nil {
+	if _, err := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", id); err != nil {
 		return err
 	}
 	grant.Active = 0
@@ -1458,6 +1461,7 @@ func (d *botAPIDB) reactivateGrant(id int64) error {
 		"active":         1,
 		"global_enabled": 0,
 		"revoked_at":     nil,
+		"expires_at":     nil,
 		"updated_at":     time.Now(),
 	}).Where("id=?", id).Exec()
 	if err != nil {
@@ -1580,6 +1584,12 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 			// the duplicate must be ours. If somehow it isn't, refuse.
 			return nil, false, errOBOGrantAlreadyActive
 		}
+		// The deprecated Persona endpoint must not reclaim a row managed by
+		// the OBO authorization policy. Both schemes intentionally share the
+		// existing table and unique key; mode is their isolation boundary.
+		if existing.Mode == policyGrantMode {
+			return nil, false, errOBOGrantAlreadyActive
+		}
 		if existing.Active == 1 {
 			// Live row → genuine duplicate, not a reactivation case.
 			return nil, false, errOBOGrantAlreadyActive
@@ -1589,12 +1599,13 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 			"active":         1,
 			"global_enabled": 0,
 			"revoked_at":     nil,
+			"expires_at":     nil,
 			"persona_prompt": personaPrompt,
 			"updated_at":     now,
 		}).Where("id=?", existing.ID).Exec(); updErr != nil {
 			return nil, false, updErr
 		}
-		if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", existing.ID); versionErr != nil {
+		if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", existing.ID); versionErr != nil {
 			return nil, false, versionErr
 		}
 		grantID = existing.ID
@@ -1611,8 +1622,8 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	}
 	var demoted []*row
 	if _, scanErr := tx.SelectBySql(
-		"SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL FOR UPDATE",
-		grantorUID, grantID,
+		"SELECT id,global_enabled FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL AND mode<>? FOR UPDATE",
+		grantorUID, grantID, policyGrantMode,
 	).Load(&demoted); scanErr != nil && !errors.Is(scanErr, dbr.ErrNotFound) {
 		return nil, false, scanErr
 	}
@@ -1630,11 +1641,11 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 			"active":         0,
 			"global_enabled": 0,
 			"updated_at":     now,
-		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL", grantorUID, grantID).Exec(); demErr != nil {
+		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL AND mode<>?", grantorUID, grantID, policyGrantMode).Exec(); demErr != nil {
 			return nil, false, demErr
 		}
 		for _, sibling := range demoted {
-			if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1 WHERE id=?", sibling.ID); versionErr != nil {
+			if _, versionErr := tx.Exec("UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", sibling.ID); versionErr != nil {
 				return nil, false, versionErr
 			}
 			if auditErr := appendGrantPolicyAudit(tx, sibling.ID, grantorUID, "demote_sibling",

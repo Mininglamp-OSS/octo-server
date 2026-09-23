@@ -19,12 +19,22 @@ import (
 
 var errGenericBotNotOwned = errors.New("obo: Bot is not owned by grantor")
 
+// policyGrantMode marks rows managed by the OBO authorization policy. The
+// value lives in the existing mode column so no new table or schema field is
+// needed. Deprecated Persona runtime reads exclude this reserved value.
+const policyGrantMode = "policy"
+
 type genericManagementStore interface {
 	putDelegationAtomic(ctx context.Context, ownerUID, botUID string, active, globalEnabled, all bool, expiry optionalExpiry) (*genericDelegationView, error)
 	setGenericBinding(ctx context.Context, ownerUID string, id int64, bind bool) (*genericDelegationView, error)
+	genericViewForOwner(ownerUID string, id int64) (*genericDelegationView, error)
+	listGenericAudits(ownerUID string, id int64) ([]genericAuditRow, error)
 }
 
 func (ba *BotAPI) genericManagementStoreOrError() (genericManagementStore, error) {
+	if ba.oboStoreOverride == nil && ba.db == nil {
+		return nil, errors.New("obo: generic management store is not configured")
+	}
 	store, ok := ba.oboStoreOrDefault().(genericManagementStore)
 	if !ok {
 		return nil, errors.New("obo: generic management store is not configured")
@@ -155,11 +165,11 @@ type genericGrantRow struct {
 	PolicyVersion int64      `db:"policy_version" json:"policy_version"`
 }
 
-const updateGenericGrantSQL = "UPDATE obo_grants SET active=?, global_enabled=?, " +
+const updateGenericGrantSQL = "UPDATE obo_grants SET mode=?, active=?, global_enabled=?, " +
 	"persona_prompt=CASE WHEN ?=1 THEN '' ELSE persona_prompt END, " +
 	"revoked_at=CASE WHEN ?=1 THEN NULL ELSE revoked_at END, " +
 	"expires_at=CASE WHEN ?=1 THEN ? ELSE expires_at END, " +
-	"policy_version=policy_version+1, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+	"policy_version=policy_version+1, updated_at=UTC_TIMESTAMP(6) WHERE id=?"
 
 func intBool(value bool) int {
 	if value {
@@ -219,7 +229,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 			expiresAt = expiry.Value.UTC().Format("2006-01-02 15:04:05.999999")
 		}
 		result, err := tx.ExecContext(ctx,
-			"INSERT INTO obo_grants (grantor_uid,grantee_bot_uid,mode,global_enabled,active,policy_version,persona_prompt,expires_at) VALUES (?,?,'auto',?,?,1,'',?)",
+			"INSERT INTO obo_grants (grantor_uid,grantee_bot_uid,mode,global_enabled,active,policy_version,persona_prompt,expires_at) VALUES (?,?,'"+policyGrantMode+"',?,?,1,'',?)",
 			ownerUID, botUID, intBool(globalEnabled), intBool(active), expiresAt)
 		if err != nil {
 			return nil, fmt.Errorf("insert Grant: %w", err)
@@ -229,7 +239,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 			return nil, err
 		}
 		old.PolicyVersion = 1
-		old.Mode = "auto"
+		old.Mode = policyGrantMode
 		old.Active = intBool(active)
 		old.GlobalEnabled = intBool(globalEnabled)
 		old.ExpiresAt = expiry.Value
@@ -246,7 +256,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 			(old.ExpiresAt != nil && expiry.Value != nil && !old.ExpiresAt.Equal(*expiry.Value))
 		expiresAt = expiry.Value
 	}
-	changed := created || old.Active != intBool(active) || old.GlobalEnabled != intBool(globalEnabled) || (active && old.RevokedAt != nil) || (hadALL == 1) != all || expiryChanged
+	changed := created || old.Mode != policyGrantMode || old.Active != intBool(active) || old.GlobalEnabled != intBool(globalEnabled) || (active && old.RevokedAt != nil) || (hadALL == 1) != all || expiryChanged
 	targetChanged := changed
 	previous := genericDelegationView{
 		GrantID: old.ID, GranteeBotUID: botUID,
@@ -267,10 +277,11 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 		// legacy Channel persona so stale instructions cannot survive revival.
 		reauthorize := active && old.RevokedAt != nil
 		if _, err := tx.ExecContext(ctx, updateGenericGrantSQL,
-			intBool(active), intBool(globalEnabled), intBool(reauthorize), intBool(reauthorize),
+			policyGrantMode, intBool(active), intBool(globalEnabled), intBool(reauthorize), intBool(reauthorize),
 			intBool(expiry.Set), expirySQL, old.ID); err != nil {
 			return nil, fmt.Errorf("update Grant: %w", err)
 		}
+		old.Mode = policyGrantMode
 		old.PolicyVersion++
 	}
 	if all && hadALL == 0 {
@@ -293,13 +304,13 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	if active {
 		if _, err := tx.SelectBySql(
 			"SELECT id,active,global_enabled,policy_version FROM obo_grants "+
-				"WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL FOR UPDATE", ownerUID, old.ID,
+				"WHERE grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL AND mode=? FOR UPDATE", ownerUID, old.ID, policyGrantMode,
 		).Load(&siblings); err != nil && !errors.Is(err, dbr.ErrNotFound) {
 			return nil, fmt.Errorf("scan active siblings: %w", err)
 		}
 		for _, sibling := range siblings {
 			if _, err := tx.ExecContext(ctx,
-				"UPDATE obo_grants SET active=0,global_enabled=0,policy_version=policy_version+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+				"UPDATE obo_grants SET active=0,global_enabled=0,policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?",
 				sibling.ID); err != nil {
 				return nil, fmt.Errorf("demote sibling persona %d: %w", sibling.ID, err)
 			}
@@ -313,7 +324,7 @@ func (d *botAPIDB) putDelegationAtomic(ctx context.Context, ownerUID, botUID str
 	}
 	view := &genericDelegationView{
 		GrantID: old.ID, GranteeBotUID: botUID, Active: active,
-		Mode: old.Mode, ExpiresAt: expiresAt,
+		Mode: policyGrantMode, ExpiresAt: expiresAt,
 		GlobalEnabled: globalEnabled, ScopeCodes: []string{}, PolicyVersion: old.PolicyVersion,
 	}
 	if all {

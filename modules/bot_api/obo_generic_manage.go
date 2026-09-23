@@ -17,14 +17,14 @@ const genericGrantForOwnerSQL = "SELECT g.id,g.grantee_bot_uid,g.mode,g.active,g
 	"FROM obo_grants g " +
 	"INNER JOIN robot r ON r.robot_id=g.grantee_bot_uid AND r.status=1 AND r.creator_uid=? " +
 	"INNER JOIN user u ON u.uid=? AND u.robot=0 AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 " +
-	"WHERE g.id=? AND g.grantor_uid=? AND g.grantor_uid<>''"
+	"WHERE g.id=? AND g.grantor_uid=? AND g.grantor_uid<>'' AND g.mode='" + policyGrantMode + "'"
 
-func (ba *BotAPI) genericGrantForOwner(ownerUID string, id int64) (*genericGrantRow, error) {
+func (d *botAPIDB) genericGrantForOwner(ownerUID string, id int64) (*genericGrantRow, error) {
 	if ownerUID == "" {
 		return nil, errGenericBotNotOwned
 	}
 	var grant genericGrantRow
-	err := ba.db.session.SelectBySql(genericGrantForOwnerSQL, ownerUID, ownerUID, id, ownerUID).LoadOne(&grant)
+	err := d.session.SelectBySql(genericGrantForOwnerSQL, ownerUID, ownerUID, id, ownerUID).LoadOne(&grant)
 	if errors.Is(err, dbr.ErrNotFound) {
 		return nil, errGenericBotNotOwned
 	}
@@ -34,26 +34,31 @@ func (ba *BotAPI) genericGrantForOwner(ownerUID string, id int64) (*genericGrant
 	return normalizeGenericGrantRowTimestamps(&grant), nil
 }
 
-func (ba *BotAPI) genericViewForOwner(ownerUID string, id int64) (*genericDelegationView, error) {
-	grant, err := ba.genericGrantForOwner(ownerUID, id)
+func (d *botAPIDB) genericViewForOwner(ownerUID string, id int64) (*genericDelegationView, error) {
+	grant, err := d.genericGrantForOwner(ownerUID, id)
 	if err != nil {
 		return nil, err
 	}
 	var all int
-	if err := ba.db.session.SelectBySql(
+	if err := d.session.SelectBySql(
 		"SELECT COUNT(*) FROM obo_grant_scope_bindings WHERE grant_id=? AND scope_code='ALL'", id,
 	).LoadOne(&all); err != nil {
 		return nil, err
 	}
 	view := &genericDelegationView{GrantID: id, GranteeBotUID: grant.BotUID,
 		Mode: grant.Mode, ExpiresAt: grant.ExpiresAt,
-		Active:        grant.Active == 1 && grant.RevokedAt == nil,
+		Active:        genericGrantActiveAt(grant, time.Now()),
 		GlobalEnabled: grant.GlobalEnabled == 1, PolicyVersion: grant.PolicyVersion,
 		ScopeCodes: []string{}}
 	if all == 1 {
 		view.ScopeCodes = []string{"ALL"}
 	}
 	return view, nil
+}
+
+func genericGrantActiveAt(grant *genericGrantRow, now time.Time) bool {
+	return grant != nil && grant.Active == 1 && grant.RevokedAt == nil &&
+		(grant.ExpiresAt == nil || grant.ExpiresAt.After(now))
 }
 
 func (ba *BotAPI) respondGenericManagementError(c *wkhttp.Context, err error, operation string) {
@@ -66,11 +71,17 @@ func (ba *BotAPI) respondGenericManagementError(c *wkhttp.Context, err error, op
 }
 
 func (ba *BotAPI) oboGetGenericGrant(c *wkhttp.Context) {
+	c.Writer.Header().Set("Cache-Control", "private, no-store")
 	id, ok := parseIDParam(c, "id")
 	if !ok {
 		return
 	}
-	view, err := ba.genericViewForOwner(c.GetLoginUID(), id)
+	store, err := ba.genericManagementStoreOrError()
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "get_grant")
+		return
+	}
+	view, err := store.genericViewForOwner(c.GetLoginUID(), id)
 	if err != nil {
 		ba.respondGenericManagementError(c, err, "get_grant")
 		return
@@ -79,11 +90,17 @@ func (ba *BotAPI) oboGetGenericGrant(c *wkhttp.Context) {
 }
 
 func (ba *BotAPI) oboListGenericBindings(c *wkhttp.Context) {
+	c.Writer.Header().Set("Cache-Control", "private, no-store")
 	id, ok := parseIDParam(c, "id")
 	if !ok {
 		return
 	}
-	view, err := ba.genericViewForOwner(c.GetLoginUID(), id)
+	store, err := ba.genericManagementStoreOrError()
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "list_bindings")
+		return
+	}
+	view, err := store.genericViewForOwner(c.GetLoginUID(), id)
 	if err != nil {
 		ba.respondGenericManagementError(c, err, "list_bindings")
 		return
@@ -150,7 +167,7 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 	}
 	var grant genericGrantRow
 	err = tx.SelectBySql(
-		"SELECT id,grantee_bot_uid,mode,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants WHERE id=? AND grantor_uid=? FOR UPDATE",
+		"SELECT id,grantee_bot_uid,mode,active,global_enabled,revoked_at,expires_at,policy_version FROM obo_grants WHERE id=? AND grantor_uid=? AND mode='"+policyGrantMode+"' FOR UPDATE",
 		id, ownerUID,
 	).LoadOne(&grant)
 	if errors.Is(err, dbr.ErrNotFound) {
@@ -164,7 +181,7 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 		return nil, errGenericBotNotOwned
 	}
 	var currentOwner string
-	err = tx.SelectBySql("SELECT COALESCE(creator_uid,'') FROM robot WHERE robot_id=? AND status=1", grant.BotUID).LoadOne(&currentOwner)
+	err = tx.SelectBySql("SELECT COALESCE(creator_uid,'') FROM robot WHERE robot_id=? AND status=1 FOR UPDATE", grant.BotUID).LoadOne(&currentOwner)
 	if errors.Is(err, dbr.ErrNotFound) {
 		return nil, errGenericBotNotOwned
 	}
@@ -187,7 +204,7 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 		if err != nil {
 			return nil, fmt.Errorf("update binding: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE obo_grants SET policy_version=policy_version+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE obo_grants SET policy_version=policy_version+1,updated_at=UTC_TIMESTAMP(6) WHERE id=?", id); err != nil {
 			return nil, fmt.Errorf("increment policy version: %w", err)
 		}
 		grant.PolicyVersion++
@@ -210,7 +227,7 @@ func (d *botAPIDB) setGenericBinding(ctx context.Context, ownerUID string, id in
 	}
 	view := &genericDelegationView{GrantID: id, GranteeBotUID: grant.BotUID,
 		Mode: grant.Mode, ExpiresAt: grant.ExpiresAt,
-		Active: grant.Active == 1, GlobalEnabled: grant.GlobalEnabled == 1,
+		Active: genericGrantActiveAt(&grant, time.Now()), GlobalEnabled: grant.GlobalEnabled == 1,
 		PolicyVersion: grant.PolicyVersion, ScopeCodes: []string{}}
 	if bind {
 		view.ScopeCodes = []string{"ALL"}
@@ -228,29 +245,42 @@ type genericAuditRow struct {
 	CreatedAt    time.Time `db:"created_at" json:"created_at"`
 }
 
-func (ba *BotAPI) oboListPolicyAudits(c *wkhttp.Context) {
-	id, ok := parseIDParam(c, "id")
-	if !ok {
-		return
-	}
-	if _, err := ba.genericGrantForOwner(c.GetLoginUID(), id); err != nil {
-		ba.respondGenericManagementError(c, err, "audit_access")
-		return
+func (d *botAPIDB) listGenericAudits(ownerUID string, id int64) ([]genericAuditRow, error) {
+	if _, err := d.genericGrantForOwner(ownerUID, id); err != nil {
+		return nil, err
 	}
 	var rows []genericAuditRow
-	_, err := ba.db.session.SelectBySql(
+	_, err := d.session.SelectBySql(
 		"SELECT id,grant_id,actor_uid,operation,COALESCE(previous_json,'') AS previous_json,current_json,created_at "+
 			"FROM obo_policy_audits WHERE grant_id=? ORDER BY id DESC LIMIT 100", id,
 	).Load(&rows)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
-		ba.respondGenericManagementError(c, err, "audit_list")
-		return
+		return nil, err
 	}
 	if rows == nil {
 		rows = []genericAuditRow{}
 	}
 	for i := range rows {
 		rows[i].CreatedAt = oboUTCFromColumn(rows[i].CreatedAt)
+	}
+	return rows, nil
+}
+
+func (ba *BotAPI) oboListPolicyAudits(c *wkhttp.Context) {
+	c.Writer.Header().Set("Cache-Control", "private, no-store")
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	store, err := ba.genericManagementStoreOrError()
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "audit_list")
+		return
+	}
+	rows, err := store.listGenericAudits(c.GetLoginUID(), id)
+	if err != nil {
+		ba.respondGenericManagementError(c, err, "audit_list")
+		return
 	}
 	c.Response(map[string]any{"items": rows})
 }

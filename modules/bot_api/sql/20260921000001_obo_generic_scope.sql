@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS obo_grant_scope_bindings (
   grant_id BIGINT NOT NULL,
   scope_code VARCHAR(32) NOT NULL,
   assigned_by VARCHAR(64) NOT NULL,
-  assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  assigned_at DATETIME(6) NOT NULL COMMENT 'UTC; written explicitly by the application',
   PRIMARY KEY (grant_id, scope_code),
   CONSTRAINT fk_obo_scope_binding_grant FOREIGN KEY (grant_id)
     REFERENCES obo_grants(id) ON DELETE CASCADE
@@ -39,13 +39,39 @@ CREATE TABLE IF NOT EXISTS obo_policy_audits (
   operation VARCHAR(32) NOT NULL,
   previous_json TEXT NULL,
   current_json TEXT NOT NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at DATETIME(6) NOT NULL COMMENT 'UTC; written explicitly by the application',
   KEY idx_obo_policy_audits_grant (grant_id, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- +migrate Down
+-- MySQL 8 does not support the conditional column-drop syntax. Guard both drops before
+-- removing policy data so a failed rollback cannot leave the migration ledger
+-- applied after its tables have already been destroyed.
+-- +migrate StatementBegin
+DROP PROCEDURE IF EXISTS __obo_generic_scope_down;
+-- +migrate StatementEnd
+
+-- +migrate StatementBegin
+CREATE PROCEDURE __obo_generic_scope_down()
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'obo_grants'
+         AND COLUMN_NAME = 'expires_at') THEN
+    ALTER TABLE `obo_grants` DROP COLUMN `expires_at`;
+  END IF;
+  IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'obo_grants'
+         AND COLUMN_NAME = 'policy_version') THEN
+    ALTER TABLE `obo_grants` DROP COLUMN `policy_version`;
+  END IF;
+END;
+-- +migrate StatementEnd
+
+CALL __obo_generic_scope_down();
+
+-- +migrate StatementBegin
+DROP PROCEDURE IF EXISTS __obo_generic_scope_down;
+-- +migrate StatementEnd
+
 DROP TABLE IF EXISTS obo_policy_audits;
 DROP TABLE IF EXISTS obo_grant_scope_bindings;
-ALTER TABLE obo_grants
-  DROP COLUMN IF EXISTS expires_at,
-  DROP COLUMN IF EXISTS policy_version;
