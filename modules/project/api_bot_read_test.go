@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/obo"
 )
@@ -88,7 +89,7 @@ func TestBotProjectReadsFailClosedOnDelegationDenials(t *testing.T) {
 }
 
 func TestBotProjectPrincipalUsesOwnerAsSubject(t *testing.T) {
-	p := &Project{oboReader: botProjectSnapshotReader{snapshot: obo.Snapshot{
+	p := &Project{Log: log.NewTLog("Project"), oboReader: botProjectSnapshotReader{snapshot: obo.Snapshot{
 		BotUID: "bot-1", OwnerUID: "human-1", GrantID: 7, PolicyVersion: 3, BoundScopes: []string{"ALL"},
 	}}}
 	r := wkhttp.New()
