@@ -11,8 +11,20 @@ import (
 )
 
 var (
-	errProjectReadNotFound  = errors.New("project: project is not readable")
-	errProjectReadForbidden = errors.New("project: project read requires an active space member")
+	// ErrProjectReadNotFound is the single anti-enumeration read outcome for
+	// "does not exist", "is inactive", "lives in another Space" and "no active
+	// seat is visible to this caller". The distinguishing reason belongs in logs.
+	//
+	// Exported because the cross-module principal read (principal_read.go) hands
+	// it to modules/bot_api, which maps it with errors.Is onto the bot dialect.
+	ErrProjectReadNotFound = errors.New("project: project is not readable")
+	// ErrProjectReadForbidden is the read outcome for "the CALLER is not an
+	// active, eligible member of the target Space". It is deliberately distinct
+	// from ErrProjectReadNotFound only where the caller names the Space itself
+	// (the list entry point): there is no resource identity to hide, and the
+	// caller needs "you are not in this Space" separated from "you are in it and
+	// have no Projects". The detail entry point collapses it into NotFound.
+	ErrProjectReadForbidden = errors.New("project: project read requires an active space member")
 )
 
 func (p *Project) beginProjectReadTx() (*dbr.Tx, error) {
@@ -70,28 +82,28 @@ func (p *Project) readProjectAccessTx(tx *dbr.Tx, projectID, uid, expectedSpaceI
 	projectID = strings.TrimSpace(projectID)
 	expectedSpaceID = strings.TrimSpace(expectedSpaceID)
 	if projectID == "" || uid == "" {
-		return nil, errProjectReadNotFound
+		return nil, ErrProjectReadNotFound
 	}
 	spaceRole, ok, err := p.projectReadSpaceAccessTx(tx, expectedSpaceID, uid)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, errProjectReadNotFound
+		return nil, ErrProjectReadNotFound
 	}
 	project, err := p.db.queryProjectReadTx(tx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	if project == nil || project.Status != StatusNormal || project.SpaceID != expectedSpaceID {
-		return nil, errProjectReadNotFound
+		return nil, ErrProjectReadNotFound
 	}
 	projectRole, member, err := p.db.queryProjectReadMemberRoleTx(tx, projectID, project.SpaceID, uid)
 	if err != nil {
 		return nil, err
 	}
 	if !member {
-		return nil, errProjectReadNotFound
+		return nil, ErrProjectReadNotFound
 	}
 	return &projectReadAccess{
 		Project:     project,
@@ -118,7 +130,7 @@ func (p *Project) readProjects(spaceID, uid, keyword string, page projectReadPag
 	if _, ok, err := p.projectReadSpaceAccessTx(tx, spaceID, uid); err != nil {
 		return nil, err
 	} else if !ok {
-		return nil, errProjectReadForbidden
+		return nil, ErrProjectReadForbidden
 	}
 	result, err := p.db.listProjectsReadTx(tx, spaceID, uid, keyword, page)
 	if err != nil {
@@ -184,7 +196,7 @@ func (p *Project) readProjectMember(spaceID, projectID, actorUID, targetUID stri
 	actorUID = strings.TrimSpace(actorUID)
 	targetUID = strings.TrimSpace(targetUID)
 	if targetUID == "" {
-		return nil, errProjectReadNotFound
+		return nil, ErrProjectReadNotFound
 	}
 	tx, err := p.beginProjectReadTx()
 	if err != nil {
@@ -199,7 +211,7 @@ func (p *Project) readProjectMember(spaceID, projectID, actorUID, targetUID stri
 		return nil, err
 	}
 	if member == nil {
-		return nil, errProjectReadNotFound
+		return nil, ErrProjectReadNotFound
 	}
 	if err := p.readProjectMemberRolesTx(tx, projectID, []*projectReadMemberRow{member}); err != nil {
 		return nil, err
