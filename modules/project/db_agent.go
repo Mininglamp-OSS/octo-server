@@ -214,13 +214,11 @@ const sqlOwnedAgentSeats = "SELECT pm.uid FROM `octo_project_member` pm " +
 // role.
 //
 // 判定字段是 robot.creator_uid，与群侧 QueryBotsInvitedByUIDTx 同源
-// （modules/group/db.go，#354「bot 永远跟随其主人，无角色例外」）。同源不是巧合而是
-// 要求：群侧已经在移除一个人时按这个字段带走他的 bot，项目侧若按别的字段判断
-// （比如 invite_uid），就会对"谁的分身"给出不同答案，于是出现"群里被带走了、
-// 项目席位还在"的行——正是 I4 要防的那个终局。
+// （modules/group/db.go，#354「bot 永远跟随其主人，无角色例外」）。
+// 两侧按同一归属关闭席位，避免群成员已清理、Project 席位仍活跃。
 //
-// r.status = 1：没有活跃 robot 行的 bot（孤儿 / 已禁用）不算任何人的分身，与群侧
-// 那条 INNER JOIN 的口径一致。它的席位由 I1 / I4 对账报出，不在这里静默处理。
+// r.status = 1：孤儿或已禁用的 bot 不算任何人的分身，与群侧
+// INNER JOIN 口径一致；遗留席位由 I1 对账报告，不在此处静默处理。
 func (d *DB) queryOwnedAgentSeatsTx(tx *dbr.Tx, projectID, ownerUID string) ([]string, error) {
 	if projectID == "" || ownerUID == "" {
 		return nil, nil

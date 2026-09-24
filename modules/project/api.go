@@ -172,10 +172,6 @@ func New(ctx *config.Context) *Project {
 	// 项目生命周期事件发件箱。自身带 fail-closed 开关：未开启或配置不完整时不注册任何
 	// 定时任务，也就不会对一个该部署根本不关心的表发起扫描——这正是本模块之前在没有
 	// 项目、没有流量的 pod 上仍每 tick 跑三个失败扫描的成因。
-	//
-	// registerAllMemberGroupOwnerFinalizer 不在这里了：main 把那个函数删掉了（全员群
-	// owner 的收尾改由 #887 的 syncAllMemberGroupOwner 在转让路径上同步做），rebase
-	// 时保留调用会编译不过。
 	p.startLifecycleEventWorker()
 	// Publish the provisioning configuration verdict at CONSTRUCTION, not in Route():
 	// a rejected target must be visible even in a crash loop that never reaches Route,
@@ -663,7 +659,6 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, humans, agents int, pinned
 		MemberEpoch:            m.MemberEpoch,
 		CollaborationRoleEpoch: m.CollaborationRoleEpoch,
 		Status:                 m.Status,
-		AllMemberGroupNo:       m.AllMemberGroupNo,
 		Pinned:                 pinned,
 		MyRole:                 myRole,
 		Capabilities:           capabilitiesFor(myRole, spaceRole),

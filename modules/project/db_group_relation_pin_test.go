@@ -61,15 +61,16 @@ func projectRelationNosForPinTest(items []ProjectGroupRelation) []string {
 
 func TestListProjectGroupsPinsBeforePaginationForActor(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	token := seedUser(t, "pin-owner")
 	seedSpaceMember(t, spaceA, "pin-owner", 0, 1)
 	created := createProjectVia(t, srv, spaceA, token, "groups-pin-page")
 
+	base0 := util.GenerUUID()
 	first := util.GenerUUID()
 	second := util.GenerUUID()
 	last := util.GenerUUID()
+	seedProjectGroup(t, base0, spaceA, created.ProjectID)
 	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, second, spaceA, created.ProjectID)
 	seedProjectGroup(t, last, spaceA, created.ProjectID)
@@ -78,7 +79,7 @@ func TestListProjectGroupsPinsBeforePaginationForActor(t *testing.T) {
 	seedProjectGroupUserSettingForList(t, spaceA, created.ProjectID, second, "pin-owner", true, timePtr(now))
 
 	base := "/v1/projects/" + created.ProjectID + "/groups"
-	want := []string{second, first, allMember.groupNo, last}
+	want := []string{second, first, base0, last}
 	var seen []string
 	for page := 1; page <= len(want); page++ {
 		w := doJSON(t, srv, http.MethodGet, fmt.Sprintf("%s?page=%d&limit=1", base, page), token, nil)
@@ -128,7 +129,6 @@ func TestListProjectGroupsPinsArePrivateToActor(t *testing.T) {
 
 func TestListProjectGroupsUnpinRestoresLegacyOrder(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	token := seedUser(t, "pin-unpin")
 	seedSpaceMember(t, spaceA, "pin-unpin", 0, 1)
@@ -163,7 +163,6 @@ func TestListProjectGroupsUnpinRestoresLegacyOrder(t *testing.T) {
 
 func TestListProjectGroupsPinnedTimeTieUsesGroupIDOrder(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	token := seedUser(t, "pin-tie")
 	seedSpaceMember(t, spaceA, "pin-tie", 0, 1)
@@ -196,7 +195,6 @@ func TestListProjectGroupsPinnedTimeTieUsesGroupIDOrder(t *testing.T) {
 
 func TestListProjectGroupsPinSettingDoesNotWidenRelationScope(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	seedSpace(t, spaceB, 1)
 	token := seedUser(t, "pin-scope")

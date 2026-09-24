@@ -1,24 +1,7 @@
 package robot
 
-// D14 on the THIRD bot-deletion path.
-//
-// PR #855 routed the chat-command deletion and then, one round later, the REST
-// deletion through the Space removal outbox. Both times the reasoning was a census —
-// "which entry points can delete a bot" — and both times the census was run as "who
-// WRITES space_member". That question structurally cannot find this door, whose whole
-// defect is that it deletes a bot WITHOUT writing space_member. The tenth review ran
-// the right question and found DELETE /v1/manager/robots/:robot_id.
-//
-// What it left behind is worse than the other two doors' bare UPDATE, because the
-// shape is different: the Space seat stays ACTIVE, so the project seat stays active
-// too — while RemoveUserFromGroupsForLifecycleCleanup has already taken the bot out of
-// every group, the all-member group included. That is exactly I4 scan B's violating
-// state (an active project member missing from their all-member group), it is exempt
-// from none of the five exemptions, and scan B is report-only by design. D13 cannot
-// reclaim the seat (it requires an active robot row, and this deletion just disabled
-// it) and an operator cannot repair it by re-adding, because addOneMemberOnce refuses
-// a disabled robot row. A reachable admin action, a permanent violation, no repair.
-//
+// Manager Bot deletion closes Space seats before disabling the Bot. The
+// cleanup outbox then removes Project seats and native group membership.
 // The set-level guard is bot_deletion_census_test.go in modules/space; this file is
 // the endpoint-level half for this door, the same pair the other two doors have.
 
@@ -94,10 +77,7 @@ func TestManagerBotDeleteClosesSeatsThroughTheOutbox(t *testing.T) {
 
 	assert.Zero(t, seatCountForRobot(t, manager, botUID, 1), "every Space seat must be closed")
 	assert.Equal(t, 2, cleanupJobsForRobot(t, manager, botUID),
-		"and each closed seat must leave a cleanup job — that job is what drives P0's "+
-			"project-seat cascade and P1's group detach. Deleting the bot without one leaves "+
-			"an ACTIVE project seat on an account that no longer exists, which is I4 scan B's "+
-			"violating state, and scan B is report-only")
+		"each closed Space seat must enqueue Project and native group cleanup")
 
 	robot, err := manager.db.queryRobotWithRobtID(botUID)
 	require.NoError(t, err)

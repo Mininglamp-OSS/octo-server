@@ -87,6 +87,7 @@ func TestSidebarSectionsListsJoinedProjectsAndOwnCategories(t *testing.T) {
 		require.True(t, ok)
 		require.NotEmpty(t, project["project_id"])
 		require.NotEmpty(t, project["project_name"], "every sidebar Project payload pairs project_id with project_name")
+		require.NotContains(t, project, "all_member_group_no", "the sidebar Project payload exposes only ordinary linked groups")
 	}
 }
 

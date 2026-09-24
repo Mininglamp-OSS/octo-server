@@ -22,9 +22,9 @@ import (
 const (
 	// removalPollInterval matches the Space cleanup poll. This queue is latency
 	// sensitive in a way the reconcile scan is not: until the cascade finishes,
-	// a removed member still holds group_member rows, and the reconcile scan
-	// exempts them for exactly that reason. A slow poll widens the window the
-	// exemption has to cover.
+	// the seat sits at removing = 1, which every authorization read already
+	// treats as a non-member but which is still a half-finished write. A slow
+	// poll widens the window the stall scan reports on.
 	removalPollInterval = 10 * time.Second
 	// removalLease is how long a claimed job is reserved. The worker HEARTBEATS
 	// it (see below), so this is the "worker died" timeout rather than a bet on
@@ -104,8 +104,8 @@ func (p *Project) runRemovalCascade() {
 	// currently in flight — which is what the first version did — leaves the queued
 	// remainder on the lease they were claimed with, and the tail of a slow batch
 	// expires while this worker still intends to work it. Another pod then claims
-	// those rows and runs the same cascade concurrently, and the two take group
-	// locks in whatever order their group lists happen to produce.
+	// those rows and runs the same closes concurrently, so the two workers can
+	// race the same seat.
 	//
 	// Renewing a job that has already finished is harmless: the statement is
 	// guarded on status = pending, so a terminal row is not touched.
@@ -171,9 +171,9 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 	// Re-read the member row UNDER LOCK before doing anything (D4).
 	//
 	// The job was enqueued when removal began and may have waited in the queue.
-	// A member re-admitted in that window has removing = 0, and tearing their
-	// groups down now would destroy a membership that is legitimate again. Same
-	// shape as P0's checkSpaceSeatForCleanupTx re-check.
+	// A member re-admitted in that window has removing = 0, and closing on top of
+	// that would destroy a membership that is legitimate again. Same shape as
+	// P0's checkSpaceSeatForCleanupTx re-check.
 	cancelled, err := p.removalCancelled(job, owner)
 	if err != nil {
 		p.rescheduleAfterFailure(job, owner, err)
@@ -184,51 +184,16 @@ func (p *Project) workRemovalJob(job RemovalJob, owner string) {
 		return
 	}
 
-	// Run every registered step. A step failing does NOT stop the others: partial
-	// progress is durable (a group already left does not come back), and the job
-	// retries what remains. The first error decides the job's fate.
-	steps := snapshotMemberRemovalSteps()
-	removal := MemberRemoval{
-		ProjectID:   job.ProjectID,
-		UID:         job.UID,
-		SpaceID:     job.SpaceID,
-		OperatorUID: job.OperatorUID,
-		Reason:      job.Reason,
-	}
-	var firstErr error
-	for _, step := range steps {
-		if err := step.fn(p.ctx, removal); err != nil {
-			p.Error("项目移除级联步骤失败",
-				zap.String("step", step.name),
-				zap.Int64("job_id", job.ID),
-				zap.String("project_id", job.ProjectID),
-				zap.String("uid", job.UID),
-				zap.Error(err))
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s: %w", step.name, err)
-			}
-		}
-	}
-	if firstErr != nil {
-		p.rescheduleAfterFailure(job, owner, firstErr)
-		return
-	}
-
-	// Every step succeeded: close the seat for good.
-	//
-	// Re-checked under lock a second time, because the steps take time and a
-	// re-admission can land while they run. finishMemberRemovalTx is guarded on
-	// removing = 1, so a cancelled removal affects zero rows and the job is
-	// retired as cancelled rather than closing a seat somebody just restored.
+	// Recheck cancellation before closing the seat: re-admission may have
+	// committed since the first check. finishMemberRemovalTx requires
+	// removing = 1 and cannot close a newly restored seat.
 	closed, err := p.finishRemoval(job, owner)
 	if err != nil {
 		p.rescheduleAfterFailure(job, owner, err)
 		return
 	}
 	if !closed {
-		// The seat was not ours to close. Retiring the job is still right — its
-		// own work is done — but say so, because "cascade finished and the seat
-		// is still open" is the one shape that used to be invisible.
+		// Another job may now own the removal after this one was superseded.
 		p.Info("项目移除工单：席位不归本工单关闭，保持 removing 由后续工单接手",
 			zap.Int64("job_id", job.ID),
 			zap.String("project_id", job.ProjectID),
@@ -345,11 +310,9 @@ func (p *Project) finishRemoval(job RemovalJob, owner string) (bool, error) {
 	}
 	if member == nil || member.Removing == 0 {
 		// Cancelled while the steps ran. Commit the (empty) transaction and let
-		// the caller mark the job done: the steps that did run left the member
-		// out of some groups but still in the project, which is NOT an invariant
-		// violation — the subset relation still holds — it is visible in the
-		// member lists, and an admin can re-add. Do not "fix" this by re-adding
-		// them to those groups: that would race the very admission the
+		// the caller mark the job done: the member is back, and their seat is
+		// authoritative. Whatever a partially-run step did is not this job's to
+		// undo — re-running it in reverse would race the very admission the
 		// cancellation represents.
 		return false, tx.Commit()
 	}
@@ -357,20 +320,17 @@ func (p *Project) finishRemoval(job RemovalJob, owner string) (bool, error) {
 	// The seat says A removal is in flight. Whose?
 	//
 	// Without this the answer was assumed to be "mine", and the assumption is
-	// wrong exactly once per remove → re-add → join → re-remove sequence: this
-	// job would close cycle 2's seat, cycle 2's job would then find removing = 0
-	// and retire without running a step, and the group joined between the cycles
-	// would keep an active member row for a uid the project says is gone. I2 has
-	// no read-path filter, so that uid keeps full access to it — the leak the
-	// whole change exists to prevent, produced by the close itself.
+	// wrong exactly once per remove → re-add → remove sequence: this job would
+	// close cycle 2's seat, cycle 2's job would then find removing = 0 and retire
+	// without running its steps, and the removal would be recorded as complete
+	// although its own cleanup never ran. Nothing re-drives a terminal job.
 	mine, err := p.db.jobStillOwnsRemovalTx(tx, job.ID, owner)
 	if err != nil {
 		return false, err
 	}
 	if !mine {
 		// Leave `removing = 1` alone. The job that owns it is claimed on a later
-		// tick and re-snapshots the group list, which is what picks up the group
-		// joined in between.
+		// tick and closes the seat itself.
 		return false, tx.Commit()
 	}
 
@@ -403,7 +363,7 @@ func (p *Project) rescheduleAfterFailure(job RemovalJob, owner string, cause err
 			return
 		}
 		// Abandoned is terminal and means a member's project seat is stuck at
-		// removing = 1 with group rows still in place. The counter is what an
+		// removing = 1. The counter is what an
 		// alert hangs off — the brief asks for backlog AND abandoned counts, and
 		// the stall scan only notices the symptom half an hour later. This log is
 		// the breadcrumb beside it.

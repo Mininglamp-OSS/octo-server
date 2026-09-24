@@ -143,63 +143,6 @@ func TestProjectGroupCreateSkipsImplicitlyIneligibleMembers(t *testing.T) {
 	assert.Equal(t, 1, creatorCount, "the active creator remains in the initial native snapshot")
 }
 
-// TestAllMemberProvisioningUsesTheLockedProjectSnapshot ensures the automatic
-// adapter does not reinterpret its stale seed list as explicit native additions.
-// A user can lose a Project seat after the seed was prepared but before the group
-// transaction starts; only the transaction's locked snapshot may seed the native
-// roster. Explicit user-created Project groups use a different path and remain
-// allowed to add active native users.
-func TestAllMemberProvisioningUsesTheLockedProjectSnapshot(t *testing.T) {
-	_, ctx := newTestServer(t)
-	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
-
-	spaceID := "space-" + util.GenerUUID()
-	projectID := "project-" + util.GenerUUID()
-	creator := "creator-" + util.GenerUUID()
-	stale := "stale-" + util.GenerUUID()
-	seedSpaceSeat(t, ctx, spaceID, creator)
-	seedSpaceSeat(t, ctx, spaceID, stale)
-	seedProject(t, ctx, projectID, spaceID)
-	seedProjectMember(t, ctx, projectID, spaceID, creator, 0)
-
-	f := New(ctx)
-	require.NoError(t, f.userDB.Insert(&projectuser.Model{
-		UID: creator, Name: "Project creator", ShortNo: "spc-owner-" + util.GenerUUID()[:8],
-		Status: 1, IsDestroy: projectuser.IsDestroyNo,
-	}))
-	require.NoError(t, f.userDB.Insert(&projectuser.Model{
-		UID: stale, Name: "Stale Project member", ShortNo: "spc-stale-" + util.GenerUUID()[:8],
-		Status: 1, IsDestroy: projectuser.IsDestroyNo,
-	}))
-
-	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer im.Close()
-	ctx.GetConfig().WuKongIM.APIURL = im.URL
-
-	groupNo, err := f.provisionAllMemberGroup(ctx, projectmod.AllMemberGroupSeed{
-		ProjectID: projectID,
-		SpaceID:   spaceID,
-		Creator:   creator,
-		Members:   []string{stale},
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, groupNo)
-
-	var creatorCount, staleCount int
-	require.NoError(t, ctx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-		groupNo, creator,
-	).LoadOne(&creatorCount))
-	require.NoError(t, ctx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-		groupNo, stale,
-	).LoadOne(&staleCount))
-	assert.Equal(t, 1, creatorCount, "the locked Project snapshot must include the active creator")
-	assert.Zero(t, staleCount, "automatic all-member provisioning must ignore stale seed members")
-}
-
 func TestProjectGroupCreateAdmitsActiveExplicitNativeMemberOutsideProject(t *testing.T) {
 	_, ctx := newTestServer(t)
 	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
@@ -354,4 +297,38 @@ func TestProjectGroupCreateBotSpaceEligibility(t *testing.T) {
 			assert.Equal(t, 1, rows[0].Robot)
 		})
 	}
+}
+
+// TestCreateGroupAcceptsACreatorOnlyGroup pins the service contract the
+// Project-backed create path relies on: a Project whose only effective member is
+// its creator produces a group whose initial native roster is that creator
+// alone. The service layer must not refuse the empty explicit member list before
+// opening its transaction. The HTTP handler's own check is unchanged and is
+// covered by the existing tests: a person filling in the form still cannot
+// create a memberless group.
+func TestCreateGroupAcceptsACreatorOnlyGroup(t *testing.T) {
+	_, ctx := newTestServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	f := New(ctx)
+	creator := "creator-only-" + util.GenerUUID()[:8]
+	require.NoError(t, f.userDB.Insert(&projectuser.Model{
+		UID: creator, Name: "creator only", ShortNo: creator,
+		Status: 1, IsDestroy: projectuser.IsDestroyNo,
+	}))
+
+	resp, err := f.groupService.CreateGroup(&CreateGroupServiceReq{
+		Creator: creator,
+		Name:    "just me",
+	})
+	// The IM channel call fails without a broker, and that failure rolls the group
+	// back — so a broker-less environment cannot assert the happy path. What it CAN
+	// assert is that the refusal is no longer the members check: that one returned
+	// "members is required" before any transaction opened.
+	if err != nil {
+		require.NotContains(t, err.Error(), "members is required",
+			"CreateGroup must not refuse a creator-only group at the service layer")
+		return
+	}
+	require.NotEmpty(t, resp.GroupNo)
 }

@@ -35,49 +35,25 @@ const (
 	// 「X 被 Y 移出群聊」。对一个整体消失的账号，那句话是错的——没有人把它
 	// 移出这个群。复用 force_removed 会让这句话出现在它待过的每个群里。
 	MemberRemoveReasonBotDeleted = "bot_deleted"
-	// MemberRemoveReasonRejoined records a durable 0→1 membership transition.
-	// It is consumed by the same cleanup worker as an internal projection
-	// intent, but must never execute destructive removal steps.
+	// MemberRemoveReasonRejoined recognizes persisted projection jobs so the
+	// worker can retire them without running Space removal steps.
 	MemberRemoveReasonRejoined = "rejoined"
 )
 
+// memberRemoveReasons 是**允许新入队**的原因取值。rejoined 刻意不在其中：那条
+// 生产链路已停用，本二进制不该再写出任何一条该类工单；升级前遗留的行由 worker
+// 安全终结，读路径不看这张表。
 var memberRemoveReasons = map[string]bool{
 	MemberRemoveReasonKicked:         true,
 	MemberRemoveReasonLeft:           true,
 	MemberRemoveReasonForceRemoved:   true,
 	MemberRemoveReasonSpaceDisbanded: true,
 	MemberRemoveReasonBotDeleted:     true,
-	MemberRemoveReasonRejoined:       true,
 }
 
 // IsMemberRemoveReason 校验原因取值。写库前拦住拼错的字面量，避免出现
 // 永远匹配不到的工单原因。
 func IsMemberRemoveReason(reason string) bool { return memberRemoveReasons[reason] }
-
-// EnqueueMemberRejoinIntent records a projection-only rejoin responsibility
-// using the existing Space cleanup outbox. It is used after a native
-// all-member admission has committed but its WuKongIM subscription failed.
-// Terminal intents are not reused, so a later stale IMRemove always gets a
-// fresh durable retry.
-func EnqueueMemberRejoinIntent(
-	ctx *config.Context, spaceID, uid, operatorUID string,
-) error {
-	if ctx == nil {
-		return errors.New("space: enqueue rejoin intent requires context")
-	}
-	tx, err := ctx.DB().Begin()
-	if err != nil {
-		return fmt.Errorf("space: begin rejoin intent: %w", err)
-	}
-	defer tx.RollbackUnlessCommitted()
-	if err := EnqueueMemberRejoinIntentTx(tx, spaceID, uid, operatorUID); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("space: commit rejoin intent: %w", err)
-	}
-	return nil
-}
 
 // MemberRemoval 描述一次已提交的成员移除，传给每个清理步骤。
 type MemberRemoval struct {
@@ -88,39 +64,6 @@ type MemberRemoval struct {
 	OperatorUID string
 	// Reason 取 MemberRemoveReason* 之一。
 	Reason string
-	// RejoinCursor is populated only for the internal rejoin projection hook;
-	// it is persisted in the existing outbox's last_error column between pages.
-	RejoinCursor string
-}
-
-const rejoinCursorPrefix = "rejoin_cursor:"
-
-// MemberRejoinPageIncompleteError asks the shared worker to persist the stable
-// project cursor before releasing the lease. It is an internal continuation
-// signal, not a failed projection.
-type MemberRejoinPageIncompleteError struct {
-	Cursor string
-}
-
-func (e *MemberRejoinPageIncompleteError) Error() string {
-	if e == nil || e.Cursor == "" {
-		return "rejoin projection page incomplete"
-	}
-	return "rejoin projection page incomplete after " + e.Cursor
-}
-
-func rejoinCursorFromLastError(lastError string) string {
-	if len(lastError) <= len(rejoinCursorPrefix) ||
-		lastError[:len(rejoinCursorPrefix)] != rejoinCursorPrefix {
-		return ""
-	}
-	cursor := lastError[len(rejoinCursorPrefix):]
-	for i, ch := range cursor {
-		if ch == '\n' {
-			return cursor[:i]
-		}
-	}
-	return cursor
 }
 
 // MemberRemovalCleanupStep 是一次「把被移除成员从会话面清出去」的可重试步骤。
@@ -272,83 +215,6 @@ func snapshotCleanupSteps() []namedCleanupStep {
 	defer cleanupStepsMu.RUnlock()
 	out := make([]namedCleanupStep, len(cleanupSteps))
 	copy(out, cleanupSteps)
-	return out
-}
-
-var (
-	rejoinCleanupStepsMu sync.RWMutex
-	rejoinCleanupSteps   []namedCleanupStep
-)
-
-// RegisterMemberRejoinCleanupStep registers a projection-only convergence hook
-// for a durable 0→1 membership intent. Rejoin jobs never invoke ordinary
-// removal steps or removal finalizers.
-//
-// The rejoin registry currently supports one paged projection step. Its cursor
-// is persisted on the shared durable job row. Adding another paged step
-// requires an explicit independent-cursor protocol; this shared cursor cannot
-// represent two independent walks.
-func RegisterMemberRejoinCleanupStep(name string, fn MemberRemovalCleanupStep) {
-	if name == "" || fn == nil {
-		return
-	}
-	rejoinCleanupStepsMu.Lock()
-	defer rejoinCleanupStepsMu.Unlock()
-	for i := range rejoinCleanupSteps {
-		if rejoinCleanupSteps[i].name == name {
-			rejoinCleanupSteps[i].fn = fn
-			return
-		}
-	}
-	rejoinCleanupSteps = append(rejoinCleanupSteps, namedCleanupStep{name: name, fn: fn})
-}
-
-func snapshotRejoinCleanupSteps() []namedCleanupStep {
-	rejoinCleanupStepsMu.RLock()
-	defer rejoinCleanupStepsMu.RUnlock()
-	out := make([]namedCleanupStep, len(rejoinCleanupSteps))
-	copy(out, rejoinCleanupSteps)
-	return out
-}
-
-var (
-	cleanupFinalizersMu sync.RWMutex
-	cleanupFinalizers   []namedCleanupStep
-)
-
-// RegisterMemberRemovalCleanupFinalizer 注册一个**在全部清理步骤成功之后**才跑的
-// 收敛动作。签名与契约与 MemberRemovalCleanupStep 完全相同（幂等、自决、失败即重试），
-// 差别只有一条：它读到的是所有步骤都已完成的那个状态。
-//
-// 为什么需要它，而不是再注册一个步骤：步骤的执行顺序就是注册顺序，而注册顺序由
-// import 方向决定，没有任何地方声明过（见 runMemberRemovalCleanupJob 里那段注释）。
-// 有些收敛必须看见**别的步骤已经做完**的结果才能算对——例如「全员群的群主必须是
-// 项目的活跃 owner」：群侧的级联在离开时会按群资历交接群主，项目侧的级联在关席位，
-// 两者谁先谁后不确定，而正确答案只有在两件都发生之后才成立。把这样的动作写成步骤，
-// 它在一半的注册顺序下会跑在前面，算出的答案是对另一个中间态的。
-//
-// 与步骤一样：同名重复注册覆盖（latest wins），方便测试替身。
-func RegisterMemberRemovalCleanupFinalizer(name string, fn MemberRemovalCleanupStep) {
-	if name == "" || fn == nil {
-		return
-	}
-	cleanupFinalizersMu.Lock()
-	defer cleanupFinalizersMu.Unlock()
-	for i := range cleanupFinalizers {
-		if cleanupFinalizers[i].name == name {
-			cleanupFinalizers[i].fn = fn
-			return
-		}
-	}
-	cleanupFinalizers = append(cleanupFinalizers, namedCleanupStep{name: name, fn: fn})
-}
-
-// snapshotCleanupFinalizers 取注册表快照，避免执行期间持锁。
-func snapshotCleanupFinalizers() []namedCleanupStep {
-	cleanupFinalizersMu.RLock()
-	defer cleanupFinalizersMu.RUnlock()
-	out := make([]namedCleanupStep, len(cleanupFinalizers))
-	copy(out, cleanupFinalizers)
 	return out
 }
 
@@ -670,6 +536,12 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 			s.releaseCleanupJob(job, owner, "panic", fmt.Errorf("cleanup step panicked: %v", r))
 		}
 	}()
+	if job.Reason == MemberRemoveReasonRejoined {
+		// 已持久化的投影工单只写终态，不进入原生 Space 撤权步骤；
+		// 当前席位状态不影响该非破坏性处理。
+		s.finishCleanupJob(job, owner, removalCleanupDone, "rejoin_projection_retired")
+		return
+	}
 	// 先对齐当前真实成员身份再动手。工单可能在退避期间变陈旧：成员被移除后又重新
 	// 加入，这时把他的群拆掉才是真正的故障。仍持有席位 → 工单直接作废。
 	//
@@ -682,34 +554,6 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 	stillMember, err := spacepkg.CheckMembershipForCleanup(s.ctx.DB(), job.SpaceID, job.UID)
 	if err != nil {
 		s.releaseCleanupJob(job, owner, "membership_recheck_failed", err)
-		return
-	}
-	if job.Reason == MemberRemoveReasonRejoined {
-		// Dispatch asks whether the seat still exists (including a banned Space).
-		// Projection hooks separately require active Space/account authorization.
-		if !stillMember {
-			s.finishCleanupJob(job, owner, removalCleanupDone, "rejoin_not_current")
-			return
-		}
-		canonicalSpaceID, found, err := spacepkg.ResolveSpaceID(s.ctx.DB(), job.SpaceID)
-		if err != nil {
-			s.releaseCleanupJob(job, owner, "space_identity_resolve_failed", err)
-			return
-		}
-		if !found {
-			// A rejoin intent without a Space row has no authoritative projection
-			// target. Do not pass a guessed/trimmed identity to recovery hooks.
-			s.finishCleanupJob(job, owner, removalCleanupDone, "rejoin_space_not_found")
-			return
-		}
-		removal := MemberRemoval{
-			SpaceID:      canonicalSpaceID,
-			UID:          job.UID,
-			OperatorUID:  job.OperatorUID,
-			Reason:       job.Reason,
-			RejoinCursor: rejoinCursorFromLastError(job.LastError),
-		}
-		s.runMemberRejoinCleanupJob(job, owner, removal)
 		return
 	}
 	if stillMember {
@@ -725,10 +569,7 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		OperatorUID: job.OperatorUID,
 		Reason:      job.Reason,
 	}
-	// 一个步骤失败**不中断**其余步骤。
-	//
-	// 今天只注册了 group_cascade 一个步骤，所以这一层是**防御性**的：它保护的是
-	// 注册表这个扩展点，而不是当前的某个具体失败。
+	// 一个步骤失败不阻断其他模块的清理步骤；记录首个错误并重试整张工单。
 	//
 	// 之所以一开始就这么写，是因为 fail-fast 的版本在两个步骤并存时真的出过问题：
 	// 步骤顺序就是注册顺序，而注册顺序由 import 方向决定，没有任何地方声明过。
@@ -787,130 +628,6 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		return
 	}
 
-	// 收敛动作跑在**全部步骤都成功之后**，这正是它与步骤的唯一区别：它看见的是一个
-	// 已经安定的状态，而不是某个注册顺序下的中间态。
-	//
-	// 有步骤失败就不跑：那一轮里"别的步骤已经做完"这个前提不成立，而工单会被重排，
-	// 下一轮全部成功时它自然会跑到。收敛动作自己失败也走同一条重试路径——它和步骤
-	// 一样要求幂等，所以整条工单重跑是安全的。
-	//
-	// panic 与步骤同样在**每一个**收敛动作上单独兜住，理由也一样：函数级的那个
-	// recover 会直接跳出循环，让排在后面的收敛动作本轮一次都跑不到。
-	for _, fin := range snapshotCleanupFinalizers() {
-		err := func() (err error) {
-			defer func() {
-				if r := recover(); r != nil {
-					s.Error("成员移除收敛动作 panic",
-						zap.Any("recover", r), zap.Uint64("jobId", job.ID),
-						zap.String("finalizer", fin.name),
-						zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
-					err = fmt.Errorf("cleanup finalizer panicked: %v", r)
-				}
-			}()
-			return fin.fn(s.ctx, removal)
-		}()
-		if err == nil {
-			continue
-		}
-		failedSteps++
-		s.Warn("成员移除收敛动作失败，继续执行其余收敛动作",
-			zap.Uint64("jobId", job.ID), zap.String("finalizer", fin.name),
-			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID),
-			zap.Error(err))
-		if firstErr == nil {
-			firstFailedStep, firstErr = fin.name, err
-		}
-	}
-	if firstErr != nil {
-		if failedSteps > 1 {
-			firstFailedStep = fmt.Sprintf("%s(+%d)", firstFailedStep, failedSteps-1)
-		}
-		s.releaseCleanupJob(job, owner, firstFailedStep, firstErr)
-		return
-	}
-	s.finishCleanupJob(job, owner, removalCleanupDone, "")
-}
-
-// runMemberRejoinCleanupJob executes only projection hooks for a rejoin intent.
-// It deliberately does not call ordinary removal steps or removal finalizers:
-// a 0→1 transition must never close a valid Project seat or remove an
-// unrelated group member.
-func (s *Space) runMemberRejoinCleanupJob(
-	job *memberRemovalCleanupJob, owner string, rejoin MemberRemoval,
-) {
-	steps := snapshotRejoinCleanupSteps()
-	if len(steps) == 0 {
-		s.releaseCleanupJob(job, owner, "rejoin_projection_unavailable",
-			errors.New("no rejoin projection hook is registered"))
-		return
-	}
-	var (
-		firstFailedStep string
-		firstErr        error
-		failedSteps     int
-		resumeCursor    string
-		pageIncomplete  int
-		pageOnly        = true
-	)
-	for _, step := range steps {
-		err := func() (err error) {
-			defer func() {
-				if r := recover(); r != nil {
-					s.Error("成员重入投影步骤 panic",
-						zap.Any("recover", r), zap.Uint64("jobId", job.ID),
-						zap.String("step", step.name),
-						zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
-					err = fmt.Errorf("rejoin projection step panicked: %v", r)
-				}
-			}()
-			return step.fn(s.ctx, rejoin)
-		}()
-		if err == nil {
-			continue
-		}
-
-		var incomplete *MemberRejoinPageIncompleteError
-		if errors.As(err, &incomplete) && incomplete != nil && incomplete.Cursor != "" {
-			if resumeCursor == "" {
-				resumeCursor = incomplete.Cursor
-			} else if resumeCursor != incomplete.Cursor {
-				pageOnly = false
-				failedSteps++
-				if firstErr == nil {
-					firstFailedStep = step.name
-					firstErr = errors.New("rejoin projection cursors conflict")
-				}
-			}
-			pageIncomplete++
-			continue
-		}
-
-		pageOnly = false
-		failedSteps++
-		s.Warn("成员重入投影步骤失败，稍后重试",
-			zap.Uint64("jobId", job.ID), zap.String("step", step.name),
-			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID),
-			zap.Error(err))
-		if firstErr == nil {
-			firstFailedStep, firstErr = step.name, err
-		}
-	}
-	if pageOnly && pageIncomplete > 0 && resumeCursor != "" {
-		if err := s.db.releaseMemberRejoinCleanup(
-			job.ID, owner, job.Attempts, resumeCursor,
-		); err != nil {
-			s.Warn("释放成员重入投影工单失败",
-				zap.Uint64("jobId", job.ID), zap.Error(err))
-		}
-		return
-	}
-	if firstErr != nil {
-		if failedSteps > 1 {
-			firstFailedStep = fmt.Sprintf("%s(+%d)", firstFailedStep, failedSteps-1)
-		}
-		s.releaseCleanupJob(job, owner, firstFailedStep, firstErr)
-		return
-	}
 	s.finishCleanupJob(job, owner, removalCleanupDone, "")
 }
 
@@ -929,13 +646,6 @@ func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, owner, stepName 
 		zap.String("uid", job.UID), zap.String("step", stepName),
 		zap.Uint32("attempts", job.Attempts), zap.Error(cause))
 	lastError := fmt.Sprintf("%s: %v", stepName, cause)
-	if job.Reason == MemberRemoveReasonRejoined {
-		if cursor := rejoinCursorFromLastError(job.LastError); cursor != "" {
-			// Retry the failed page from its input cursor, never past a failed
-			// project. Keep the failure summary after the continuation header.
-			lastError = rejoinCursorPrefix + cursor + "\n" + lastError
-		}
-	}
 	if err := s.db.releaseMemberRemovalCleanup(job.ID, owner, job.Attempts, lastError); err != nil {
 		s.Warn("释放成员移除清理工单失败", zap.Uint64("jobId", job.ID), zap.Error(err))
 	}

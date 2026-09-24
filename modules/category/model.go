@@ -73,11 +73,10 @@ type sidebarSectionOrderRow struct {
 }
 
 type sidebarProjectSectionModel struct {
-	ProjectID        string `db:"project_id"`
-	Name             string `db:"name"`
-	Logo             string `db:"logo"`
-	AllMemberGroupNo string `db:"all_member_group_no"`
-	Sort             int    `db:"sort"`
+	ProjectID string `db:"project_id"`
+	Name      string `db:"name"`
+	Logo      string `db:"logo"`
+	Sort      int    `db:"sort"`
 }
 
 // ---------- Request ----------
@@ -137,9 +136,8 @@ type sidebarSectionResp struct {
 }
 
 type sidebarProjectSectionResp struct {
-	ProjectID        string                         `json:"project_id"`
-	ProjectName      string                         `json:"project_name"`
-	Logo             string                         `json:"logo"`
-	AllMemberGroupNo string                         `json:"all_member_group_no"`
-	Groups           []project.ProjectGroupRelation `json:"groups"`
+	ProjectID   string                         `json:"project_id"`
+	ProjectName string                         `json:"project_name"`
+	Logo        string                         `json:"logo"`
+	Groups      []project.ProjectGroupRelation `json:"groups"`
 }

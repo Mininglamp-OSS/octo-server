@@ -74,7 +74,7 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 			continue
 		}
 		if err := g.exitSpaceMemberFromGroup(
-			groupModel.GroupNo, removal, operatorName, groupModel.ProjectID,
+			groupModel.GroupNo, removal, operatorName,
 		); err != nil {
 			g.Error("被移出 Space 的成员退群失败",
 				zap.Error(err),
@@ -95,8 +95,8 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // CMDGroupMemberUpdate、邀请人名下 bot 级联（#354 / #1186）、子区成员与订阅清理、
 // 按 Space 隔离的置顶与会话扩展清理、外部群标记回收。自己写一遍必然漏项。
 //
-// 普通群的群主必须先交接、再走移除；当前 Project 专属群不做 handover，
-// 而是在同一事务内把失去 Space 资格的 creator 降为 common 后删除。
+// 群主必须先交接、再走移除——包括 Project 关联群：它们的原生成员、群主和 IM 订阅
+// 都是普通群自己的状态，Space 撤权按普通群规则处理群主继任。
 // ⚠️ 已知缺口：IM 退订失败会永久泄漏，且**没有**任何东西兜底。
 //
 // RemoveGroupMembers 内部那次 IMRemoveSubscriber（service.go）失败时只记日志。
@@ -127,7 +127,7 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // 上面那次 CheckMembershipForCleanup 覆盖的是「重新加入发生在读之前」，也就是真正
 // 宽的那个窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 #797。
 func (g *Group) exitSpaceMemberFromGroup(
-	groupNo string, removal spacemod.MemberRemoval, operatorName, projectID string,
+	groupNo string, removal spacemod.MemberRemoval, operatorName string,
 ) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
@@ -177,7 +177,6 @@ func (g *Group) exitSpaceMemberFromGroup(
 		AllowProtected:        true,
 		SpaceMemberRemoval:    true,
 		SpaceID:               removal.SpaceID,
-		ProjectID:             projectID,
 	})
 	if err != nil {
 		if errors.Is(err, errGroupMemberNotInGroup) {

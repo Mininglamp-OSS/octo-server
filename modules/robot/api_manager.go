@@ -375,14 +375,9 @@ func (m *Manager) robotDelete(c *wkhttp.Context) {
 	// space_member」的入口，于是这一条又漏了一轮。正确的问法是「什么能删 Bot」，
 	// 答案是三处，普查现在钉在 bot_deletion_census_test.go 上。
 	//
-	// 不关席位留下的终态，与另外两个入口的裸 UPDATE 不同、而且更糟：
-	// space_member.status 仍是 1 → octo_project_member.status 仍是 1，可上面
-	// RemoveUserFromGroupsForLifecycleCleanup 已经把它从**每一个**群里摘掉了，
-	// 包括全员群。这正好是 I4 扫描 B 的违规形态（有项目席位、不在全员群里），
-	// 而扫描 B 只报不修；D13 也回收不了它（要求 robot.status=1，这里马上变 0）；
-	// 管理员想靠重新添加来修复也不行——addOneMemberOnce 会以 agent_not_eligible
-	// 拒绝一个已停用的 robot 行。一个可达的管理动作造出一个永久且修不了的
-	// 不变量违规。
+	// 群清理已摘掉原生成员；Space 席位也必须关闭，才能驱动 Project 的
+	// 成员席位清理和权限失效。若先停用 robot 而保留活跃 Project 席位，
+	// 已停用的 Bot 无法再次通过成员资格检查，后续清理也失去入口。
 	//
 	// operatorUID 传**发起删除的超管**，不是 Bot 自己：它会流进
 	// deactivateSeatForCascade 的审计与日志归因，传 botID 会让审计记录读作

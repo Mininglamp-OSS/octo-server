@@ -60,32 +60,18 @@ func (g *Group) admitToPresetGroup(ctx *config.Context, spaceID, groupNo, uid st
 	var groupRow struct {
 		GroupNo string `db:"group_no"`
 	}
+	// The caller (modules/space) has already checked the group belongs to this
+	// Space; repeating it here under the share lock keeps the admission's own
+	// precondition explicit rather than inheriting a stale read.
 	count, err := tx.SelectBySql(
-		"SELECT group_no FROM `group` WHERE group_no=? FOR SHARE",
-		groupNo,
+		"SELECT group_no FROM `group` WHERE group_no=? AND space_id=? FOR SHARE",
+		groupNo, spaceID,
 	).Load(&groupRow)
 	if err != nil {
 		return fmt.Errorf("group: preset admission query group: %w", err)
 	}
 	if count != 1 {
 		return fmt.Errorf("group: preset admission: group %s not found", groupNo)
-	}
-	var dedicated []int
-	if _, err := tx.SelectBySql(
-		"SELECT 1 FROM `octo_project` p "+
-			"INNER JOIN `group` g ON g.group_no = p.all_member_group_no "+
-			"  AND g.project_id = p.project_id "+
-			"WHERE p.space_id = ? AND p.status = 1 "+
-			"  AND p.all_member_group_no = ? AND g.status <> 2 LIMIT 1",
-		spaceID, groupNo,
-	).Load(&dedicated); err != nil {
-		return fmt.Errorf("group: preset admission check dedicated group: %w", err)
-	}
-	if len(dedicated) > 0 {
-		// The Project pointer, not the native project_id relation by itself,
-		// makes this group a live all-member projection. Preset admission must
-		// not create a native member outside the Project seat set.
-		return nil
 	}
 
 	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, []MemberAdmission{{

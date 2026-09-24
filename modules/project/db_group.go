@@ -11,6 +11,10 @@ import (
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 )
 
+// groupStatusDisband mirrors modules/group.GroupStatusDisband. Project keeps the
+// literal locally because importing modules/group would create a dependency cycle.
+const groupStatusDisband = 2
+
 // sqlListProjectGroupRelationsByProjectIDs is the single batched relation query
 // used by the unified sidebar. The window row number applies the 50-row
 // per-Project cap before rows are returned to Go, while retaining the endpoint's

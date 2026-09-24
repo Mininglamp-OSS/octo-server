@@ -60,9 +60,9 @@ func seedPlanProbeRows(t *testing.T, sess *dbr.Session, projectID, spaceID, grou
 	}
 	_, err := sess.InsertBySql(
 		"INSERT INTO `octo_project` (project_id, space_id, name, creator, status, "+
-			"all_member_group_no, created_at, updated_at) "+
-			"VALUES (?, ?, 'plan probe', 'u_owner', 1, ?, NOW(3), NOW(3))",
-		projectID, spaceID, groupNo).Exec()
+			"created_at, updated_at) "+
+			"VALUES (?, ?, 'plan probe', 'u_owner', 1, NOW(3), NOW(3))",
+		projectID, spaceID).Exec()
 	require.NoError(t, err)
 
 	_, err = sess.InsertBySql(

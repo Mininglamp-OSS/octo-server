@@ -41,31 +41,6 @@ func ensureProjectRelationMutationAllowed(row *groupProjectRelationRow) error {
 	return nil
 }
 
-// ensureDedicatedRelationMutationAllowed refuses relation writes that would
-// change a group named by any active Project's all_member_group_no pointer.
-// A no-op bind to the same Project is safe; every actual rebind or unbind is
-// rejected so the pointer cannot silently outlive a user mutation.
-func ensureDedicatedRelationMutationAllowed(
-	session dbr.SessionRunner, groupNo, currentProjectID, targetProjectID string,
-) error {
-	if groupNo == "" || currentProjectID == targetProjectID {
-		return nil
-	}
-	var projects []string
-	if _, err := session.SelectBySql(
-		"SELECT project_id FROM `octo_project` "+
-			"WHERE status = 1 AND all_member_group_no = ? LIMIT 1",
-		groupNo,
-	).Load(&projects); err != nil {
-		return fmt.Errorf("%w: check dedicated-group relation: %w",
-			errProjectRelationDependency, err)
-	}
-	if len(projects) > 0 {
-		return errProjectRelationConflict
-	}
-	return nil
-}
-
 func (g *Group) readGroupProject(ctx context.Context, groupNo, actorUID string) (GroupProjectRelation, error) {
 	if strings.TrimSpace(groupNo) == "" || strings.TrimSpace(actorUID) == "" {
 		return GroupProjectRelation{}, errProjectRelationInvalid
@@ -136,11 +111,6 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 		return GroupProjectRelation{}, err
 	}
 	initialSource := strings.TrimSpace(before.ProjectID)
-	if err := ensureDedicatedRelationMutationAllowed(
-		g.ctx.DB(), groupNo, initialSource, targetID,
-	); err != nil {
-		return GroupProjectRelation{}, err
-	}
 
 	var pendingTx *dbr.Tx
 	var pendingRow *groupProjectRelationRow
@@ -187,12 +157,6 @@ func (g *Group) bindGroupProject(actorUID, groupNo, targetID string) (GroupProje
 		if !changedProjectSourceAllowed(initialSource, currentSource, targetID) {
 			_ = tx.Rollback()
 			return errProjectRelationConflict
-		}
-		if err := ensureDedicatedRelationMutationAllowed(
-			tx, groupNo, currentSource, targetID,
-		); err != nil {
-			_ = tx.Rollback()
-			return err
 		}
 		if targetAccess, ok := accesses[targetID]; !ok || targetAccess.SpaceID != locked.SpaceID {
 			_ = tx.Rollback()
@@ -269,11 +233,6 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 		return GroupProjectRelation{}, err
 	}
 	initialSource := strings.TrimSpace(before.ProjectID)
-	if err := ensureDedicatedRelationMutationAllowed(
-		g.ctx.DB(), groupNo, initialSource, "",
-	); err != nil {
-		return GroupProjectRelation{}, err
-	}
 
 	var pendingTx *dbr.Tx
 	var pendingRow *groupProjectRelationRow
@@ -333,12 +292,6 @@ func (g *Group) unbindGroupProject(actorUID, groupNo string) (GroupProjectRelati
 		if !changedProjectSourceAllowed(initialSource, currentSource, "") {
 			_ = tx.Rollback()
 			return errProjectRelationConflict
-		}
-		if err := ensureDedicatedRelationMutationAllowed(
-			tx, groupNo, currentSource, "",
-		); err != nil {
-			_ = tx.Rollback()
-			return err
 		}
 		manager, lockErr := g.db.lockGroupManagerTx(tx, groupNo, actorUID)
 		if lockErr != nil {

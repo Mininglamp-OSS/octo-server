@@ -2,13 +2,13 @@
 
 日期：2026-09-10
 
-状态：设计已确认；在 `feat/project-prd-alignment` 当前实现上修复，并以 main 为专属全员群机制的保留基线。现有实现与修复后版本分别验收；外部客户端契约切换及部署由对应维护者负责。
+状态：设计已确认；普通关联群服务端实现待审查，客户端切换与发布待联合验收。
 
 ## 背景与目标
 
-基于最新 main 改造现有 Project，使其满足 `.local/assets/prd.md` 第 3.1.5、3.3.2、3.4.1–3.4.4 节的协作单元要求。产品、接口、数据模型和本文统一使用 Project 名称。PRD 是行为与权限依据，当前实现只提供可复用的工程基础；与目标冲突的现有规则需要修改。
+现有 Project 作为 Space 内协作单元，遵循 `.local/assets/prd.md` 第 3.1.5、3.3.2、3.4.1–3.4.4 节的行为与权限约束；产品、接口、数据模型统一使用 Project 名称。2026-09-24 确认创建 Project 不附带群，历史自动创建的群按普通关联群管理。
 
-现有 Project 有唯一真人 Owner，沿用所有权和 ID。实施前保全当前工作区并记录本地及远端 head；当前分支持续承载本设计，main 用于逐项比对原有机制与必要差异。
+Project 沿用现有 ID、业务数据与唯一真人 Owner。实施前保全工作区并盘点服务、客户端和历史群的受影响契约。
 
 ## 范围
 
@@ -21,7 +21,7 @@
 
 ### 不包含
 
-- 除下文明确的 Drive provisioning boundary 和专属群生命周期恢复所需的最小持久化任务适配外，不扩展其他 Internal API、outbox 或 Redis 事件队列。
+- 除下文明确的 Drive provisioning boundary 外，不扩展其他 Internal API、outbox 或 Redis 事件队列。
 - 资源侧授权引擎、权限同步和撤销通知。资源侧实时查询关系判权，关联变化自然改变授权依据。
 - Drive 资源内容、文件权限、ACL 和资源侧授权不在本设计范围；Project→Drive provisioning boundary 见下文，Drive ID 不作为 Project 响应事实。
 - 扩展 Project 删除、归档产品能力。既有生命周期执行链是否与目标发生冲突，应在实施时按本文件权限不变量核对；不借本次添加新的生命周期机制。
@@ -36,8 +36,8 @@
 | 管理员 | 可以管理非 Owner 成员，包括其他管理员；最高授予管理员 |
 | 组织与 Project | 组织身份是访问前提，不自动授予 Project 管理权限 |
 | Project 创建方式 | Project 必须显式创建；列表是纯读，不因首次进入或读取自动创建默认 Project |
-| 群关联 | 原生群管理权限与 Project 成员资格独立校验；仅 `all_member_group_no` 指向的群是 Project 专属全员群 |
-| 全员群 | 专属群实时投影有效 Project 成员和真人 Owner；普通 Project 关联群保持原生快照 |
+| 群关联 | 原生群管理权限与 Project 成员资格独立校验；Project 不指定或管理专属群 |
+| 原生群成员 | 从 Project 发起创建时仅初始化一次成员快照；之后与 Project 成员、Owner 和名称变更独立 |
 | 资源判权 | 消费当前关系，不增加异步授权同步体系 |
 | Project 与 Drive | 以 `project_id` 管理 provisioning；不要求 Project 响应返回 Drive ID |
 
@@ -88,18 +88,17 @@
 - 资源侧以当前有效关联和成员资格实时判断 Project 派生权限；解除关联后该授权依据消失。原生群成员资格属于独立权限来源，不与派生权限混为一体。本规格只约定关系事实，不实施资源侧判断逻辑。
 - 预设群组的原生群成员模型与 Project 关系是两个独立维度；预设群可以同时保留自身成员并关联 Project，既不自动同步成员，也不因并存关系增加警告或限制。
 
-### Project 专属全员群
+### Project 关联群的统一语义（2026-09-24 确认）
 
-- 只有 `octo_project.all_member_group_no` 指向且仍关联该 Project 的原生群属于专属全员群；普通 `group.project_id` 关联群、预设群和历史快照群均不进入本节同步。
-- 专属全员群的有效原生成员集合跟随 Project 当前有效席位（`status=active` 且 `removing=0`）收敛；Project 添加、重新加入、Space 成员恢复后补入，Project 移除、退出或 Space 撤权时先从专属群移除再清理 Project 席位。重试必须幂等，并以 Project 行锁和成员锁防止旧清理任务删除新资格。
-- 专属全员群的群主由当前有效真人 Project Owner 投影；机器人/Agent 不得成为群主。Owner 转让时原群主降为普通成员，目标真人 Owner 升为群主；没有合格 Owner 时允许暂时无有效群主，不提升其他成员。Owner恢复资格时先恢复其有效原生成员关系，再同步群主；`group.creator` 的历史创建归属不作为当前群主权威。
-- 专属群的群面 disband、退出、移除成员、手动转让群主、blacklist-add，以及手动 add/invite/scan-join（含 Bot API add/remove）均返回 `all_member_group_protected`，必须改走 Project 成员/Owner 入口；blacklist-remove 允许。Project/Space/BotFather 的系统级级联和同步钩子使用服务层原语，不受 HTTP 守卫阻断。
-- 专属群判定以 Project 指针为权威，并同时校验群的 `project_id` 与有效状态；普通关联群不得因 `project_id` 字段而获得上述保护或同步。
+- Project 创建不自动创建群；群只通过显式建群或关联操作产生 `group.project_id` 关系。所有关联群使用同一套普通群规则。
+- 存量由 Project 自动创建的群保留原生群、消息、成员、群主和 `group.project_id` 关联，直接作为普通关联群继续出现在关系列表。数据库删去 Project 上的专属指针不会删除或重建原生群，也不改写群名、关联人或原生群角色。
+- Project 添加、移除、退出、重新加入成员或转让 Owner、改名时，不自动更改任何普通关联群的原生成员、群主、名称和 IM 订阅。退出 Project 不等于退出群；群成员资格与聊天权限仍由原生群及 Space 资格决定。Space 撤权或 Project 解散仍执行各自已有的原生群清理或关联回落，不以 Project 成员变动取代 Space 安全清理。
+- Web 和 Bot 的原生群操作不再受专属群保护；继续执行普通群原有的身份、权限、Space 和 AI 容器约束。Project 关系元数据的可见性仍不授予群聊天或子区权限。
 
 ### 从 Project 创建群
 
 - Project 有效成员可以发起；创建时自动关联当前 Project。
-- 普通 Project 发起群复用原开发设计中已明确的建群成员快照：将创建事务确认的有效 Project 成员作为初始群成员一次性写入，后续成员变化不自动同步原生群成员表。专属全员群只通过 `all_member_group_no` 指针进入上一节的实时投影语义。
+- 从 Project 发起创建群时，将创建事务确认的有效 Project 成员作为初始原生成员一次性写入；后续 Project 成员变化不自动同步群成员。
 - 快照仅初始化普通关联群的原生成员，不是后续 Project 成员或关联的权威来源，也不替代资源侧实时关系查询。
 - 群、关联字段和初始成员在同一业务事务内写入；实际 IM 创建位于提交后，使用现有补偿机制。
 - 所需序列及配置在持锁前准备；事务内重新验证当前资格。候选成员扩展导致不能安全复核时，释放锁重新准备，有界失败不留下部分本地数据。
@@ -145,6 +144,8 @@
 - 写事务只使用当前连接；按相关组织成员、组织、Project、成员/群业务行顺序加锁。多个 Project 按确定顺序锁定，防止并发换绑反向取锁。
 - 数据库失败不能降级为无权限、无成员或成功；提交结果不确定时不自动重做创建操作。
 
+Project 创建、列表、详情及 Sidebar 的 Project 条目不再返回 `all_member_group_no`；关联群仍经原有 `groups[]` / 关系接口展示，不添加替代指针或固定首项。调用方同步移除依赖该字段的入口、排序及“全员群”标识；服务端不保留空串字段或兼容别名。
+
 ### Project 成员单查与 Drive 用户态判权（2026-09-11）
 
 - `GET /v1/projects/:project_id/members/:uid` 是成员列表同一 `MemberResp` 投影的单对象版本。成功时直接返回一个成员对象，不返回数组、分页参数或 `X-Total-Count`；`role` 继续使用 Project 角色数字 `0=member`、`1=admin`、`2=owner`，`robot`、`owner_uid` 和 `collaboration_roles` 与列表保持一致。
@@ -171,6 +172,8 @@
 - 用户角色和添加批次语义是同端点的不兼容行为变更，采用协调切换：发布前完成所有受影响调用方适配与联合验收，切换期间暂停相关写入口，排空旧服务实例后统一启用新契约。无法协调时阻止该契约上线，不静默混用两种批次语义。实施交付列出实际受影响调用方；不能以本仓库测试替代外部客户端验收。
 - 存量群缺失关联人时返回空值，不推测或伪造历史操作者；管理权限仍取实时资格，后续实际换绑时记录操作者。
 - 应用回滚不等于业务数据回滚。允许重名后，旧唯一约束可能无法重建；发布前明确回滚包兼容性，不删除重名数据以强行回滚。
+- 专属指针与建群租约列由 `scripts/project-native-groups.sql` 在发布后的独立运维阶段手动删除，不放入模块启动时自动执行的迁移目录；已应用的迁移保持原样。新版本先在保留旧列的 schema 上滚动部署，暂停受影响写入口并排空旧服务实例及在途建群/投影/清理任务的执行。确认所有流量由新版本承接、旧版本无法再次启动，备份 schema 后，由运维对目标库执行 `mysql --host=<host> --user=<user> --database=<database> < scripts/project-native-groups.sql`，然后核对列已移除、旧群原生记录与关联未变。切换后的未完成 Project 成员移除工单只关闭 Project 席位，不处理普通群成员；Space 原生清理仍处理失去 Space 资格的群成员。删列后旧二进制不可作为原样回滚包；回滚方案需使用兼容新模式的版本，不靠恢复指针重建专属语义。
+- 停用仅为专属投影服务的 Space `reason=rejoined` 生产与消费钩子；已有待处理的该类工单应安全终结而非运行旧群投影，不阻断普通 Space 撤权清理。保留 Space 席位变化需要的 Project epoch 失效和 Project 成员清理任务的重入防护。
 
 - Sidebar Project 条目与关系群 `groups[]` 的客户端字段变更采用独立协调切换；服务端
   membership-only 读门和 SQL 分组上限先行，历史非成员 pin 行只读忽略，不以清理旧偏好
@@ -193,68 +196,39 @@
 12. Sidebar Project 条目仅对有效 Project 成员可见；非成员历史 pin 不回填，关联
     `groups[]` 最多按每 Project 50 条 SQL 限制且不附带原生群权限；客户端完成字段
     切换后再联合验收。
+13. 创建 Project 后没有自动产生的群，创建、列表、详情和 Sidebar 不含 `all_member_group_no`，普通关联群没有特殊排序或专属标识。
+14. 切换前已有群仍在 Project 关联列表和原生聊天中；Project 改名、成员增删/重新加入/退出及 Owner 转让后，其群名、群主、成员和 IM 订阅均不随之改变；具备原生群权限的 Web/Bot 操作按普通群规则执行。
+15. Project 成员退出后，其原生群资格不因退出自动消失；Space 撤权仍清理其原生群资格，Project 解散仍使群回落 Space 且保留群成员。停用投影后旧待处理工单、并发写入及跨重启重试不得再次修改普通群成员或订阅。
 
-## 当前分支修复与完整保留方案（2026-09-11）
+## Project 关联群契约切换（2026-09-24）
 
-### 本轮具体事项与范围门禁
+### 实施边界
 
-本节是本轮执行清单；全文其他API、PRD和发布清单用于保留既有契约，不代表重新实现或新增功能授权。
+本轮切换 Project 自动建群与专属投影契约，同时保持既有 Project 管理、普通关联群、Space 撤权、解散和资源判权能力。调用方及文档中的专属群入口与字段一起切换；迁移不批量改写历史群消息、成员或关联记录，后续原生群操作仍按各自权限生效。
 
-| 编号 | 分类 | 本轮事项 | 完成标准 |
-| --- | --- | --- | --- |
-| F1 | 必修 | 专属群判定恢复main分表读取，修复混合collation错误 | 同构与混合库Web/Bot判定正确，无1267，普通群行为不变 |
-| F2 | 必修 | 恢复main专属缺员I4-B扫描、游标、指标及有效测试 | 缺员可发现，恢复后归零，分页/宽限期正确，扫描只检测 |
-| F3 | 必修 | 补齐保留Project Owner身份后的Space撤权与恢复投影 | 仅 active account、active Space、active Project 且当前 dedicated pointer 匹配时恢复；恢复以最新合格真人 Owner 收敛；撤权同事务将专属群 creator 降级并删除其成员记录，不 handover，保留 Project Owner 身份 |
-| F4 | 必修 | 修复专属移除旧任务覆盖新加入订阅的竞态 | Space seat `0→1` 及既有 Project seat 重新准入，同事务写入 Space removal outbox 的 `reason=rejoined`。仅复用 pending、空 lease、`attempts=0`、`last_error=''` 的初始任务；已执行任务不能吸收新请求。独立 projection registry 只执行专属投影，持久化游标续跑；成功分页归还 attempt，真实失败由原任务重试。迟到 `IMRemove` 的补订阅失败由清理回调补写持久任务，通用 admission 不派生任务。D4 原子取消全部旧 Project pending 任务（含 claimed），独立投影任务承担补偿；所有早退分支复核当前指针及有效资格，普通关联群不进入此链路 |
-| R1 | 保留/回归 | main中仍适用的创建、改名、补建租约/CAS、守卫、清理任务及测试 | 仅恢复与F1–F4直接相关的删除或必要适配；当前已正确的部分不改 |
-| R2 | 保留/回归 | 下文API全清单、PRD核心行为、四份迁移、Drive及普通群独立性 | 检查路由/契约完整性并运行受影响回归；不逐项重写、不顺带扩展接口 |
-| R3 | 保留/回归 | 显式Project/Space解散、指针转换、普通群关系回落 | 本轮不得引入回归；仅调整F3/F4必需的边界，不把既有解散失败恢复另立为本轮改造 |
-范围控制：
+| 边界 | 目标 |
+| --- | --- |
+| 创建与读取 | 显式创建 Project 不附带建群；Project DTO 和 Sidebar 移除专属字段，关系群列表继续反映 `group.project_id` |
+| Project 成员与 Owner | 保留唯一真人 Owner、席位状态/轮次、成员权限和重入防护；撤下群成员、群主及 IM 的专属投影 |
+| 群操作 | Web/Bot 使用普通群权限；关联/换绑/解除和原生 Space 清理仍按各自规则执行 |
+| 后台任务 | Project 成员移除工单只负责关闭席位，保留仍承载该责任的幂等、租约和取消机制；停用专属补建、改名、rejoin 投影与缺群/缺员扫描和指标 |
+| 数据与发布 | 新版与旧列共存完成滚动部署；旧实例及在途任务排空后，手动运行 `scripts/project-native-groups.sql` 删除 Project 专属指针和租约列；保留历史群及群关系 |
 
-- 实现改动必须归属于F1–F4、下节明确接受的review事项，或能指出其直接依赖；测试、配置和文档只随对应行为调整。main对照不是全模块清理授权。
-- 优先使用现有持久任务设施。若完成F3/F4确需新表、新worker、新事件协议或一般化任务框架，先说明现有设施不足与最小方案，取得单独确认后再实现；本规格不预先授权这些新增架构。
-- 回归检查发现与F1–F4及明确接受review事项无关的既有缺陷，单独报告，不自动修复。尤其不扩展一般IM订阅可靠性、解散清理系统、资源ACL、部门/邮箱搜索或Drive远端部署。
-- 不要求所有接口新增测试或文档重写；复用有效现有测试，新增测试仅覆盖本轮真实故障与不确定边界。
-- 分支重建、提交整理、squash和远端强推不属于本轮代码修复，另按用户明确指令执行。
+实施时核对每个专属钩子、Web/Bot 守卫、Space rejoin 生产/消费、Project/Group/Category DTO、错误码/翻译、配置/指标和测试的唯一消费者；清除仅供专属群使用的路径，保留共享的 Space 撤权、Project epoch 失效和普通群能力。历史排队任务不能在新版本重放出群成员或 IM 变化。
 
-### 最新 review 事项与处置（2026-09-11）
-
-证据基于当前代码head `e4670dac0d49b41368b45eb4ae701eff71956736`：
-
-- [yujiawei，2026-09-11 11:08 UTC](https://github.com/Mininglamp-OSS/octo-server/pull/887#pullrequestreview-5177970066)。
-- [Jerry-Xin，2026-09-11 11:26 UTC](https://github.com/Mininglamp-OSS/octo-server/pull/887#pullrequestreview-5178110117)。
-
-两份review的重复问题合并为一个执行项；review结论是待核实输入，不覆盖当前代码证据或已确认产品约束。
-
-| 编号 | review事项 | 当前核实与执行边界 |
-| --- | --- | --- |
-| C1 | P2：关联写入的专属指针检查边界核实 | `modules/group/project.go:48-66` 沿既有 Project 锁→group 锁序执行；fresh UUID 群创建提交后，以 Project 空指针+lease CAS 发布，正常 API 无法把既有任意 `groupNo` 认领为其他 Project 专属。空指针查询不加 `FOR SHARE`；本轮不新增锁或改代码 |
-| C2 | 非阻塞：MemberRole/PickActiveOwner无生产调用 | 当前 `pkg/project/all_member_group.go` 两函数仅发现定义。F3/F4及main恢复完成后重新查引用；仍无调用且为本PR新引入的辅助代码则删除，有真实消费者则保留。不要为保留函数造调用，不做全库死代码清理 |
-| V1 | 非阻塞：pinned_at=NULL重复置顶不修复 | 当前 `modules/project/db_group_pin.go:82-85` 已包含 `pinned_at IS NULL` 分支；不新增修复，保留现有行为并在相关回归验证，回复review时引用当前证据 |
-| V2 | 非阻塞：已应用project_user_setting迁移被改 | 当前指定文件 `modules/project/sql/20260908000001_project_user_setting.sql` 与main无diff；不新增修改，交付前保持与main一致 |
-| V3 | 旧阻塞joined_at与Owner rider清理 | 两位最新review已确认修复；作为R2回归保留，不重新实现、不改成旧契约 |
-
-review关闭条件：实施后逐项附代码/行为证据回复来源review；C1记录既有锁序与不可达边界，C2完成最终引用判定；V1–V3给已满足证据而非重复提交。回复、commit及push在用户授权实施交付时执行，本次仅更新事项文档。
-
-### 执行边界
-
-- 在 `feat/project-prd-alignment` 上修复；当前已确认的 PRD 行为和 API 是保留集合，main 的专属群实现与测试是恢复比对基线。
-- 开始实施时记录当前 head、远端 PR head 和最新 main SHA；保全用户未提交改动。按行为选择改动，不整体覆盖共享文件。
-- 对每个受影响 main 机制记录“原有保证、当前替代、必要差异、验证场景”。未改变语义的代码和有效测试尽量与 main 字节一致，不额外重命名、改注释或重排文件。
-- 当前设计不自动提交或重写远端历史。后续若整理提交，先备份原提交链，保证整理前后最终文件树一致；更新已发布历史必须使用绑定预期远端 head 的 force-with-lease，远端发生变化时停止而非覆盖。
-- PR 最终差异由文件树决定，squash 只整理历史。恢复成 main 原样的内容自然退出最终 diff；必要的产品契约差异仍保留。
+不扩展一般 IM 订阅可靠性、解散清理、资源 ACL、目录搜索或 Drive 远端部署；不因切换而改写其他用户接口、路由、权限和群成员快照语义。
 
 ### API 完整保留清单
 
-以下清单同时覆盖新增、修改与必须继续存在的入口。保留入口不等于所有入口都需要改实现；禁止因恢复 main 丢失路由、请求字段、响应形状或中间件。
+以下清单覆盖需要保留的入口及本次调整的响应字段；不改变未列明的请求、路由和中间件。
 
 | 方法与路径 | 必须保留的契约 |
 | --- | --- |
-| POST `/v1/space/:space_id/projects` | 显式创建；名称必填、30 Unicode 字符、允许重名；有效组织真人创建者成为唯一 Owner；现有头像/描述及配置配额保留；创建触发专属群和启用的 provisioning |
-| GET `/v1/space/:space_id/projects` | 当前有效 Project 成员范围；名称字面搜索、page/limit、数组与 X-Total-Count；纯读，无默认创建 |
-| GET `/v1/projects/:project_id` | 有效账号/Space/Project 成员读取；名称、描述、头像、成员数、本人角色与 capabilities 使用一致快照 |
-| PUT `/v1/projects/:project_id` | Owner/Admin 设置；新名称30字符，未修改名称时兼容历史长名称；专属群改名钩子保留 |
-| DELETE `/v1/projects/:project_id` | 保留既有解散入口及 Owner 权限，清理指针、关系、任务与缓存按当前生命周期执行；不新增归档能力 |
+| POST `/v1/space/:space_id/projects` | 显式创建；名称必填、30 Unicode 字符、允许重名；有效组织真人创建者成为唯一 Owner；现有头像/描述及配置配额保留；启用的 provisioning 照常执行，不自动建群 |
+| GET `/v1/space/:space_id/projects` | 当前有效 Project 成员范围；名称字面搜索、page/limit、数组与 X-Total-Count；纯读，不含专属群字段 |
+| GET `/v1/projects/:project_id` | 有效账号/Space/Project 成员读取；名称、描述、头像、成员数、本人角色与 capabilities 使用一致快照，不含专属群字段 |
+| PUT `/v1/projects/:project_id` | Owner/Admin 设置；新名称30字符，未修改名称时兼容历史长名称；不联动群名 |
+| DELETE `/v1/projects/:project_id` | 保留既有解散入口及 Owner 权限；普通关联群回落 Space 直属，原生成员不因 Project 解散而删除 |
 | PUT `/v1/projects/:project_id/setting` | 本人 Project 偏好；有效成员可见性、Project 置顶配额及重复请求语义；保留既有设置字段 |
 | GET `/v1/projects/:project_id/members` | 成员数组、分页和计数；角色、robot、owner_uid、collaboration_roles、created_at、joined_at |
 | GET `/v1/projects/:project_id/members/:uid` | 单个 MemberResp；同一 RR 权限边界，有界点查；关系事实不替代资源 ACL；目标不存在与数据库失败分开 |
@@ -262,7 +236,7 @@ review关闭条件：实施后逐项附代码/行为证据回复来源review；C
 | POST `/v1/projects/:project_id/members/add` | `members:[{uid,role}]`，role为0或1，缺省成员；整批原子；同角色幂等、异角色冲突；不接受 Owner 授予 |
 | POST `/v1/projects/:project_id/members/remove` | 保留 `uids` 请求及逐人结果数组，不擅自改为添加接口的原子契约；Owner/Admin可管理非Owner，自身退出走leave；移除任务及轮次保护保留 |
 | POST `/v1/projects/:project_id/leave` | 成员/Admin可退出；Owner必须先专门转让；保留清理任务 |
-| PUT `/v1/projects/:project_id/owner` | `uid`；仅当前Owner，目标为有效真人成员；原Owner降Admin；事务内唯一性和专属群Owner投影 |
+| PUT `/v1/projects/:project_id/owner` | `uid`；仅当前Owner，目标为有效真人成员；原Owner降Admin；事务内唯一性，不联动群主 |
 | PUT `/v1/projects/:project_id/members/:uid/role` | `role`为0或1；Owner/Admin管理非Owner；不承担Owner转让 |
 | GET、POST `/v1/projects/:project_id/collaboration-roles` | 保留既有协作角色读取/创建、配额与维护逻辑；协作标签不授予管理权限 |
 | PUT、DELETE `/v1/projects/:project_id/collaboration-roles/:role_id` | 保留既有协作角色改名/删除及权限检查 |
@@ -270,11 +244,11 @@ review关闭条件：实施后逐项附代码/行为证据回复来源review；C
 | GET `/v1/projects/:project_id/groups` | 群关系DTO、linked_by、pinned、搜索、分页及计数；置顶先于分页；排除AI容器；不按原生群席位或黑名单过滤元数据 |
 | PUT `/v1/projects/:project_id/groups/:group_no/setting` | 必填布尔pinned；个人Space/Project/群维度；不使用消息置顶配额；幂等及历史NULL排序时间修复 |
 | GET `/v1/groups/:group_no/project` | 当前关系及关联人事实，为标题/管理关联使用；保持已确认读取授权，不泄漏聊天内容 |
-| PUT `/v1/groups/:group_no/project` | project_id目标；原生群Owner/Admin且具备源/目标Project资格；同Space；关联人原子更新，幂等保留；专属群及AI容器保护 |
-| DELETE `/v1/groups/:group_no/project` | 源Project资格与原生群管理权；只解除关系，不清理普通群成员；专属群及AI容器保护 |
+| PUT `/v1/groups/:group_no/project` | project_id目标；原生群Owner/Admin且具备源/目标Project资格；同Space；关联人原子更新，幂等保留；AI容器保护 |
+| DELETE `/v1/groups/:group_no/project` | 源Project资格与原生群管理权；只解除关系，不清理原生群成员；AI容器保护 |
 | POST `/v1/group/create` | 保留原生建群请求，project_id可选；Project普通群初始化当前成员快照；本地群/关系/成员原子提交，IM提交后处理；UID限流及通用建群配额保留 |
 | GET `/v1/group/my` | 直接GroupResp数组、不分页；role=owner/admin/owner,admin及space_id组合；原生角色编码不同于Project；旧无role查询兼容，计数/外部归属查询失败返回错误 |
-| GET `/v1/space/:space_id/sidebar-sections` | 保留Category等既有条目；Project仅有效成员可见；groups为关系DTO，SQL按每Project最多50条，个人置顶排序 |
+| GET `/v1/space/:space_id/sidebar-sections` | 保留Category等既有条目；Project仅有效成员可见；groups为关系DTO，SQL按每Project最多50条，个人置顶排序，不含专属群字段 |
 | PUT `/v1/space/:space_id/sidebar-sections/sort` | 保留统一排序入口、偏好和隐藏语义，排序记录不能制造Project访问资格 |
 | POST `/v1/auth/verify` | 保留现有认证及Project关系/capabilities消费者；按新权限矩阵返回事实，不将原生群角色当Project角色 |
 | GET `/v1/common/appconfig` | 保留project_on与服务端写开关同源；开关关闭保留读取和必要安全清理 |
@@ -285,7 +259,7 @@ review关闭条件：实施后逐项附代码/行为证据回复来源review；C
 ### PRD 行为与工程保留项
 
 1. PRD 3.1.5：组织隔离；账号和Space资格是Project访问前提，Space管理员不绕过Project成员边界。
-2. PRD 3.3.2、3.4.4：关联仅入口，解绑不改变原生访问；普通发起群只初始化当时的成员；非原生成员可以看关系但不能看聊天或子区；只关联群、不单独关联子区。
+2. PRD 3.3.2、3.4.4：关联仅入口，解绑不改变原生访问；从Project发起建群只初始化当时的成员；非原生成员可以看关系但不能看聊天或子区；只关联群、不单独关联子区。
 3. PRD 3.4.1–3.4.3：30字符名称、同组织重名、显式创建、成员数/角色、Owner/Admin设置权限、批量人员管理、唯一真人Owner及专用转让。
 4. 人员添加对象资格复核、Agent owner_uid/rider生命周期继续保留；Owner/Admin可以添加符合目录资格的bot，不限定必须为操作者自己的bot；普通成员不能通过own-agent路径绕过人员管理权限。创建与转让都不得产生机器人Owner。
 5. joined_at表示本轮加入：首次/重新加入更新，有效幂等添加和角色调整不更新；created_at保留首次记录。Owner-only Space撤权保留身份，nonOwner riders正常关闭，轮次和缓存失效幂等。
@@ -297,46 +271,19 @@ review关闭条件：实施后逐项附代码/行为证据回复来源review；C
 
 候选搜索当前确认契约为组织目录显示名的字面搜索。PRD 3.4.2 的“姓名、部门或邮箱”完整搜索不在当前已实现契约中，不能声明此条已全部覆盖；客户端应使用准确提示，部门/邮箱检索需对应目录数据与授权契约后另行对齐。任务移除影响计数、Loop任务/自动化/项目、文件及文档ACL、能力市场和客户端七Tab渲染由对应系统负责，不属于本次octo-server后端修复；Drive角色映射由Drive消费Project事实实现，不新增角色推送。
 
-### main 机制保留与必要适配
+### 群与生命周期实现边界
 
-| main机制 | 处理 |
-| --- | --- |
-| 专属指针识别及分表读取 | 原样复用兼容性设计，保持有效Project/群/关联共同判定；提交时仍做事务内权威检查 |
-| 专属创建、改名、补建claim、deadline CAS、释放及写回fence | 保留原有机制与有效行为测试；只适配当前真人Owner和有效成员定义 |
-| Web/Bot专属群守卫及安全失败处理 | 保留有效保护与监控；普通关联群不获得专属保护；blacklist-remove允许恢复 |
-| Project清理outbox、worker租约/心跳/取消和重入保护 | 保留；清理范围缩到专属指针；所有IM分支满足下述重新加入保证 |
-| I4-A缺群和I4-B专属缺员对账 | 保留扫描、游标、宽限期、指标与有效测试；不将普通群成员差异当缺员 |
-| 普通关联群（`group.project_id`）成员 | 保持与Project席位独立的成员快照；不纳入I4-B专属缺员监控；Space原生清理仍覆盖其应清理的群，不能误删组织撤权安全链 |
-| Space最终专属Owner收敛 | 保留其目的并适配Owner身份保留/恢复；不能以普通群自动交接代替 |
-| 错误码、配置、指标及有效测试 | 未改变语义者原样保留；仅删除已不适用普通群约束的项；每个删除项说明替代或失效原因 |
-
-### 必须闭合的修复
-
-**Space Owner撤权/恢复。** 唯一真人 Project Owner 记录保留；Space 撤权时在同一事务中将专属群 creator 角色降为普通成员并删除该成员记录，不执行 handover，专属群可暂时无有效群主，但 Project Owner 身份仍保留。恢复仅处理 active account、active Space、active Project 且当前 dedicated pointer 仍匹配的席位，补入当前专属群后以最新合格真人 Owner 收敛；不自动提升其他成员或解散 Project，已关闭普通成员席位不自动恢复。覆盖管理员添加、邀请/审批等所有现有 Space 重新加入路径；工作持久化并可跨重启重试，提交资格变化时即保证任务可恢复，不能只依赖内存事件回调。优先复用现有任务设施，不扩展一般资源授权。
-
-撤权、重新加入和群主投影统一以当前有效账号、Space成员资格、有效Project及其当前成员席位共同判定；保留的 Owner 身份行不等于已重新加入，不能仅凭 Project status=active 跳过 Space 撤权退订。投影只能落到当前有效 dedicated pointer，并以最新合格真人 Owner 收敛；Owner 暂时失去资格、恢复任务重试或耗尽不得触发无继任者自动解散 Project，也不得解除普通关联群关系。只有现有显式 Project/Space 解散等真实终态才终止对应恢复责任；终态后的旧恢复任务不能重建或重新订阅。
-
-恢复工作按稳定游标覆盖该用户全部仍有效 Project 席位，达到单次预算时持久化 `project_id` cursor 续跑点；纯成功分页归还本次 claim 的 attempt 并尽快继续，真实失败记录错误和 attempt 后重试。立即入队与分页续跑的到期时间按 UTC 毫秒精度截断，避免数据库舍入后晚于当前认领时刻；真实退避仍保留原有延迟。补群与群主写入事务复核当前 Project Owner、有效成员和 dedicated pointer；并发转让后旧恢复任务不得把群主写回原 Owner。显式解散只作为本轮恢复任务的终态边界与回归场景。
-
-分页中的真实失败保留该页的输入游标，下一次从失败页起重试，不能越过失败 Project。复用 `last_error` 的首行 `rejoin_cursor:<project_id>` 保存续跑位置，后续行记录错误摘要；成功续页仅保留游标，终态按既有规则记录完成/耗尽原因。重试次数和指数退避保持不变。
-
-**成员重新加入与IM订阅。** Space 成员席位 `0→1` 及既有 Project seat `status!=active` 或 `removing=1` 的重新准入，在成员事务中写入 Space removal outbox 的 `reason=rejoined`。`EnqueueMemberRejoinIntentTx` 仅复用 `status=pending`、`lease_owner=''`、`lease_until IS NULL`、`attempts=0` 且 `last_error=''` 的初始任务；已分页任务可能已经越过新请求对应的 Project，已失败任务可能耗尽预算，二者均不可吸收新请求，claimed 和终态任务同样建立新责任。迟到旧 `IMRemove` 的补订阅失败由 `reconcileDedicatedGroupProjection` 清理回调写入持久任务并返回 `ErrAdmittedButNotSubscribed`；通用 admission 将错误交给调用方，投影 worker 使用原任务重试，不递归派生新任务。独立 projection registry 不运行普通 removal steps 或 finalizers；普通关联群保持原生成员快照。原生成员行存在、不存在、已删除、并发删除及已重新准入等分支统一复核当前专属指针与有效 Project、Space 资格，`IMRemove` 返回后再次复核并补偿并发重新加入。测试必须把 IMAdd 故障放在迟到退订后的补偿调用上，验证持久责任和后续恢复。
-
-专属指针变化必须触发任务作用域复核。旧群已经解除关联成为普通群时，旧专属任务不得再修改其原生成员或订阅；成员写入和关系变更共用事务栅栏，提交后IM操作与专属身份转换必须有顺序及补偿保证，不能只做一次无锁预查。旧群仍处于有效专属清理范围时，其退订责任不能因读到新指针而被遗忘；当前专属群补订阅按自己的资格和轮次执行。Project 重新准入按既有 D4 在同一事务原子取消所有 pending 的旧 Project removal job（含 claimed）并清 lease；独立 durable Space rejoin intent 负责迟到 `IMRemove` 的补偿，不能覆盖新的投影责任。任务被取消、替换或达到重试上限时，尚未完成的订阅责任仍可发现、告警并由既有运维重试机制重驱，不能将失败标为成功。验证需覆盖Space撤权与Project重入相交、连续两次重入、指针更换、解除关联成为普通群、显式解散和重试耗尽。
-
-上述旧专属任务的作用域限制针对 **Project 成员清理**。**Space 撤权清理**仍覆盖该 Space 的所有原生群：锁内发现专属指针已清除、移动或 Project 已解散时，对仍存活的旧群按普通群规则移除已撤权成员，并保留普通群的群主继任语义；只有 Space 席位恢复时才跳过该成员的清理。专属身份在写事务内读取，不由调用方传入历史专属标志。
-
-**数据库排序规则与 Space selector。** 恢复分表专属判定，不引入全库 collation 迁移；跨 Project、Space、成员及用户表的 JOIN 显式使用兼容 collation，并以隔离混合库验证实际角色更新。Space ID 不用 Go 的 `ToLower`/`TrimSpace` 或字节比较猜测规范值，而由数据库按 `space` 表实际 collation 解析请求 selector，并返回数据库存储值。旧 `rejoined` durable 任务在 worker 边界按该规则解析原始 selector；解析/查询错误沿原租约退避重试，Space 缺失或已解散时终止该 `rejoined` 恢复责任。普通 Space removal 保留原始 selector，即使 Space 缺失或已解散也继续按 fail-safe 清理语义执行，不因规范值解析无结果静默 no-op。Project 恢复先前置复核 `Project.space_id` 归属，投影写事务再次校验 Space、Project 和当前专属群绑定；Group 绑定在锁内以 Project 权威列做 SQL 判等，兼容历史大小写/PAD SPACE 跨表值，不能改为 Go byte comparison。数据状态查询失败保持安全拒绝，不伪装普通群。
-
-Bot HTTP 守卫先按数据库排序规则解析请求群号，再使用查得的规范 `group_no` 判断专属身份。因此大小写变体及 PAD SPACE 排序规则下的尾空格不能绕过保护；普通关联群的可变更规则保持不变。
-
-**专属缺员监控。** I4-B只检测有效专属群缺员；宽限期、正在移除、组织资格、系统bot和缺群去重规则与当前契约一致。保留跨页游标、完整轮转后发布及失败续扫。扫描只检测，写侧恢复不能依赖扫描自动修复；查询语义正确与生产排序形态下扫描开销分别验证，保留原有昂贵扫描开关和真实运行限制。
+- Project 自动建群和补建租约/CAS、成员/Owner/名称投影、专属判定与 Web/Bot 守卫、缺群/缺员对账不再运行。用户显式从 Project 建群继续可用；普通关联群可按原生权限添加、移除成员、转让群主、退出、解散、邀请和更改黑名单；Project 关系变更仍要求原生群权限和 Project 资格。
+- Project 成员移除工单保留对 `removing`、重入取消、最终关闭席位和已有安全重试的职责；去掉仅服务于专属群的 Group 清理步骤，不能把旧工单视为对历史群的移除命令。Space 撤权的群面步骤仍遍历所有应清理的原生群，包括由旧自动建群留下的普通关联群；Space 席位恢复不自动把成员加回普通群。
+- Space 席位变更造成的 Project epoch 失效、有效 Project Owner 身份保留、普通成员席位关闭仍按既有边界执行。停用仅为专属群服务的 `rejoined` 投影工单与其游标、重试钩子；对升级前已有工单只做安全终结，不执行旧 IM add/remove 或群主写入，也不误调用普通 Space removal 的破坏性步骤。
+- Project 解散保留将所有关联群回落为 Space 直属的既有处理，群原生成员与消息保留；Space 撤权仍按普通群自身规则处理群主继任。Project Owner 不再决定任何群的群主；群现任群主失去 Space 资格时按原生群规则处理。
+- 混合 collation 下的普通 Project/Space/群权限和关联查询继续使用数据库判等及既有空间隔离；专属指针判定与专属任务不再参与这些查询。Project/Space 资格或数据库查询失败不能放宽普通群原有的安全校验。
 
 **I1 与 abandoned-cleanup 监控。** 两类扫描均以写侧的 Space 席位和 Project 生命周期语义为准；Owner 豁免仅适用于 `Project.status=normal`。Space 撤权或 Space 解散后，若 Project 仍正常，写侧保留的 Owner 身份不算席位泄漏；若 Project 已解散或不存在，仍为 active 且无有效 Space 席位的 Owner 是 stale active seat，I1 与 abandoned 扫描均须报告。普通成员缺失有效 Space 席位且没有待执行清理任务时仍须报告。两类查询在 `LIMIT` 限制的 inspected base page 上以 SELECT flag 计算，不把生命周期或席位状态放进过滤返回行的 `WHERE`；该豁免只影响只读监控，不授予访问资格；已应用 core migration 中的 I1 注释是历史口径，现行口径以本节和扫描实现为准。
 
-**清理任务运维口径。** `space_member_removal_cleanup.reason=rejoined` 表示恢复投影，只运行 rejoin hooks，不运行破坏性 removal steps/finalizers；`bot_deleted` 表示账号删除级联。已应用 migration 的列注释保持原始版本，当前原因枚举以 `modules/space/member_removal.go` 为准。
+**Space 清理任务。** 升级前已持久化的 `reason=rejoined` 任务不再投影 Project 群；在新版本按非破坏性终态处理，不能转交普通 removal steps/finalizers。`bot_deleted` 仍执行账号删除级联；普通 Space 撤权仍由原有工单处理。旧迁移注释保留历史原文，运行期原因处理以新实现为准。
 
-**投递与并发边界。** Owner 角色提交后的 CMD/channel 通知维持 best-effort；角色已正确时重试不重发通知。IM 跨服务 add/remove 顺序及通用持久投递仍属于既有 #797 可靠性范围。Space 清理当前每次处理一个 UID；新增批量调用前须实现逐 UID 资格筛选和继任者排除。Space-seat 锁查询也锁住共享 Space 行，普通群继任者按创建时间锁定，可能串行或由数据库裁决死锁并交由现有工单重试；本次保留锁范围和选主规则。
+**投递与并发边界。** 普通群 IM add/remove 的原生流程和通知语义保持不变；不将旧专属投影重试改造成通用 IM 投递系统。Space 清理当前逐 UID 执行，原生群群主继任及死锁重试保持既有行为；原有 Project/Space 席位锁与重入栅栏不能因群投影移除而放宽。
 
 ### 数据迁移与发布清单
 
@@ -344,23 +291,17 @@ Bot HTTP 守卫先按数据库排序规则解析请求群号，再使用查得�
 - 保留 `modules/space/sql/20260910000002_group_project_linked_by.sql`：可空关联人，历史不伪造。
 - 保留 `modules/project/sql/20260911000001_project_group_user_setting.sql`：个人Project关联群置顶存储及唯一键。
 - 保留 `modules/project/sql/20260911000002_project_member_joined_at.sql`：单条可空ADD COLUMN，读侧COALESCE，旧写入可省略，不做回填/NOT NULL收缩。
-- main已应用迁移保持原样，不改历史DDL和迁移编号。四份现有新增迁移仅保留与回归验证；若F3/F4确需新增存储，按本轮范围门禁另行确认，不直接新增迁移。
-- 同步本规格及实际受影响的现有任务brief、changelog、错误注册/翻译/提取标记和运维说明；sidebar等API文档仅在对应契约确实改变时调整。原有专属监控继续提供时不得提示运维删除。
+- 已应用迁移保持原样。追加 Project 前向迁移删除 `octo_project.all_member_group_no` 与 `all_member_group_lease_until`；升级前记录存量关联群及消息/成员抽样，升级后核对原生群与 `group.project_id` 均未变。若数据库不支持预期在线 DDL 算法，迁移失败关闭，不接受隐式大表重建。
+- 同步 Project/Sidebar API 文档及真实客户端消费方，撤去仅供专属群使用的错误码、翻译、配置、对账指标和运维告警；保留 Project/Space 共用的清理、epoch 与相关监控。其他已确认的用户 API、Drive 前提及字段切换责任不变。
 - 用户API批量添加/Owner权限和sidebar DTO切换需调用方联合验收；列出仓库内真实调用点及外部责任系统，不假设前端已发布。Drive接口与30字符支持仍是外部部署前提。
 
 ### 实施顺序与验收门禁
 
-1. 冻结接口/行为清单和工作区快照，以main差异逐项标记保留/恢复/最小适配，不改分支身份。
-2. 恢复专属分表判定、对账/指标、租约/守卫及对应有效测试；共享文件仅应用必要变更块。
-3. 完成Space Owner恢复和IM重新加入的持久化责任闭环，覆盖原有生命周期及所有提前返回分支。
-4. 对本节API逐项记录route→handler→service→DB→DTO/错误→调用方→验证证据；既有协作角色、设置、解散和配置入口同样检查，不能只验新增路由。
-5. 使用真实MySQL/Redis/WuKongIM串行验证相关模块。数据库测试持共享锁，按包恢复干净测试库；不清空无关Redis数据。
-6. 确定性并发测试覆盖“旧回调读到移除→重新加入完成→旧退订”及退订/补订阅失败、取消、重复、跨重启；实际验证最终有效者能收发、最终无效者不能因残留订阅继续访问。
-7. Space真人Owner撤权→恢复、转让并发、bot rider关闭、专属无合格Owner、缺群补建/失效租约必须验证；普通关联群成员独立性和Space原生撤权同时验证。
-8. 真实混合collation守卫、I4-B缺员/宽限期/分页/恢复归零；joined_at旧二进制写兼容；关系/个人置顶/候选/单查/读快照及数据库失败传播全部验收。
-9. 窄用例先行，再跑Project/Group/Space/Category和受影响Bot路径；Project及并发相关包使用-race，完成build/vet/i18n检查。实际HTTP调用证明响应形状、X-Total-Count及允许origin的CORS暴露；拒绝origin不增加暴露头。
-10. 审查最终删除与替代矩阵、接口清单、配置与监控差异；每处仍有差异均有产品或正确性理由。CI通过只能证明现有测试，不替代main行为对照。
+1. 枚举受影响的服务实例、客户端字段消费者、Project/Group/Space/Bot/Category 写读路径及尚未完成的 Project removal、Space `rejoined` 工单；确认原生 Space 清理和 Project 席位关闭仍可独立完成。
+2. 适配客户端并联合验收新 DTO；冻结受影响写入口，排空旧服务与在途专属群外部调用。部署不再访问专属列的新服务，确认它不会发起投影或由旧工单修改群；保留旧列直至所有旧实例退出。
+3. 使用新前向迁移删除专属列，核对存量群、群成员、消息和 Project 关联记录。此后只允许使用兼容新模式的应用回滚包，不回放旧专属群任务。
+4. 实际验证创建 Project 无群、历史群正常聊天和群面操作、Project 成员/Owner/名称独立、普通群创建快照、Space 撤权清理、Project 解散回落、旧工单及跨重启边界。窄用例先行，再验证 Project/Group/Space/Category 和受影响 Bot 路径；API 响应形状、错误与数据库失败需实测。
 
 ## 未决事项
 
-方案已确认。实施交付必须重新提供修复后证据，当前分支历史验证不代表上述恢复路径已通过。外部客户端字段切换、目录部门/邮箱检索与Drive部署仍由相应系统维护者完成；未完成前只声明本规格明确范围内的后端能力。
+设计已确认。外部客户端字段消费方需配合上线；未完成联合验收和旧实例排空前，不删除专属列。Drive 部署及目录部门/邮箱检索仍由对应系统负责。
