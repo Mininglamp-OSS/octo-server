@@ -20,7 +20,7 @@ import (
 const botProjectOBOAction = "all"
 
 // Bot Project reads bypass the Human Session middleware by design: they use a
-// bf_ Bot token and the same OBO kernel as /v1/auth/resolve. The existing
+// bf_ Bot token and the same OBO kernel as /v1/internal/auth/resolve. The existing
 // Project read methods remain the business-permission authority for Subject.
 func (p *Project) registerBotProjectRoutes(r *wkhttp.WKHttp) {
 	rlRedis := octoredis.NewInstrumentedClient(p.ctx.GetConfig(), func(o *redis.Options) { o.PoolSize = 10 })

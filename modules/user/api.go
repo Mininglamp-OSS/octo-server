@@ -413,7 +413,6 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
 		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
 		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
-		v.POST("/auth/resolve", resolveLimit, u.authResolveBot)         // Resolve Bot identity and OBO delegation.
 		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
@@ -430,6 +429,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		v.GET("/user/oauth/gitee", u.giteeOAuth) // gitee登录
 
 	}
+
+	// Internal Bot identity and OBO delegation resolution.
+	internalAuth := r.Group("/v1/internal/auth")
+	internalAuth.POST("/resolve", resolveLimit, u.authResolveBot)
 
 	// /v1/internal/verify-token —— Aegis OIDC Phase 2d 翻译层 (YUJ-394)
 	//
