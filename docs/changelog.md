@@ -24,6 +24,7 @@
 - Project 显式创建仅建立 Project 与 Owner 席位；历史关联群和显式创建的普通群保持 `group.project_id`、成员、群主与消息。Project 成员、Owner 和名称变更独立于原生群操作；Web/Bot 群操作沿用原生权限。Project 创建、详情、列表和 Sidebar 响应使用普通关联群结构。
 - Project 成员移除任务继续关闭席位并保留重入取消和租约保护。Space 撤权继续清理关联群的原生成员，并按普通群规则继任群主；恢复席位保持 Project epoch 失效机制。升级前的 Space `reason=rejoined` 工单安全终结，不进入普通撤权步骤。
 - `scripts/project-native-groups.sql` 提供排空旧实例和在途任务后由运维手动执行的在线删列 SQL；新实例启动时保留旧列以支持滚动部署。历史群、成员及关系不迁移；执行脚本后旧二进制不能回滚使用。专属群 I4 扫描与指标退出运维面板。
+- Project 关联群群主转让的 HTTP 回归使用独立路由绑定当前测试的 Group 与事件上下文，并核对原生群主角色及 Project 关系在完整包顺序下保持一致。
 - Space 清理工单的立即入队时间按数据库毫秒精度截断，保证提交后可认领；事件回归测试隔离进程级监听器，支持重复运行。
 - 运维注意：`project_i2_violations_total` 与 `group_admission_rejected_total` 指标已移除，旧面板/告警应删除或允许序列缺失。Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。

@@ -6,8 +6,10 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,15 +23,17 @@ import (
 // Project relation untouched; no Project seat is required to hold or transfer
 // the native creator role.
 func TestLegacyProjectGroupNativeOwnerTransferFollowsOrdinaryRules(t *testing.T) {
-	s, ctx := newTestServer(t)
-	// The transfer opens an event before writing the roles, and this test
-	// server leaves ctx.Event nil. Stub only that dispatcher: the HTTP route,
-	// its authorization, and every database write stay real.
+	_, ctx := newTestServer(t)
+	// The module router may belong to the first Context created by this test
+	// binary. Register this Group on its own router so the handler and event
+	// dispatcher use the same Context regardless of test order.
 	ctx.Event = noopGroupEvent{}
-	wireI18nRendererForGroupTest(s)
 	defer testutil.CleanAllTables(ctx)
 
 	f := New(ctx)
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	f.Route(r)
 
 	suffix := util.GenerUUID()[:12]
 	spaceID := "space-legacy-transfer-" + suffix
@@ -59,7 +63,7 @@ func TestLegacyProjectGroupNativeOwnerTransferFollowsOrdinaryRules(t *testing.T)
 	req, err := http.NewRequest(http.MethodPost, "/v1/groups/"+groupNo+"/transfer/"+target, nil)
 	require.NoError(t, err)
 	req.Header.Set("token", testutil.Token)
-	s.GetRoute().ServeHTTP(w, req)
+	r.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code,
 		"a native owner transfer on a historical Project group follows ordinary group rules; "+
