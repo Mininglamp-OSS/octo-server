@@ -23,6 +23,8 @@ worker cannot clear a new mutation.
    Keep `DM_IM_RECONCILE_ENABLED` disabled during this preparation.
 3. Enable `DM_IM_RECONCILE_ENABLED=true` for all writers together. Stop or drain
    old writers first: old backend binaries cannot record the new SQL intent.
+   Drain their in-flight IM requests and legacy cleanup before activation;
+   do not mix legacy cleanup with the new authority stream.
    Existing groups are adopted in bounded batches, without resetting already
    recorded revisions. New changes capture their own intent immediately.
 4. Check pending age and errors using the queries below. Foreground HTTP success
@@ -87,15 +89,31 @@ A source-built isolated backend and IM passed 437 core business assertions with
 three actual Chromium/WKSDK clients: group/child creation, concurrent messaging
 and membership churn, mute/blacklist restoration, voluntary/repeated exit,
 rejoin, historical disband behavior and 96 persisted message identities.
-Four actual business fault scenarios passed: lost successful create replies
+Four actual business fault scenarios passed on the earlier companion binary: lost successful create replies
 through the foreground deadline; never-forwarded child requests; backend
 SIGKILL after SQL commit; and failed removal followed by rejoin and late old
-snapshots. The larger run also passed: 25 real SDK clients, 126 groups, 252 children,
+snapshots. The earlier single-creator larger run also passed: 25 real SDK clients, 126 groups, 252 children,
 6,379 core assertions and 917 persisted message identities. All 709 business
 HTTP requests returned 200 (p99 120.673 ms, maximum 156.195 ms), and every SQL
 revision completed. IM sampled memory peaked at 186,806,272 bytes with no OOM
 or CPU throttling. The create/churn duration is reported separately from setup;
-this business run is not a one-hour saturation test.
+this business run is not a one-hour saturation test. Final validation adds
+16 concurrent creators while keeping the normal per-account rate limit, and
+uses the final IM binary with the adoption deletion-boundary fix. Its separate
+acceptance record includes exact hashes and measured results.
+
+Final-binary business acceptance (`988a5a80` IM + `fea9536` backend) passed:
+25 fresh actual SDK clients, 126 groups, 252 children, 16 parallel creator workers,
+three active groups with ten kick/rejoin rounds each, 4,886 core assertions and
+419 persisted message identities. All 710 business HTTP requests returned 200;
+p99 was 1,691.190 ms and maximum 1,969.815 ms. The creation/churn phase lasted
+44.174 seconds; registration, friendship setup and audits were separate.
+The normal 550 ms per-account pacing and registration limit were retained.
+All 265 authority rows completed, with zero pending/incomplete revisions.
+Sampled IM memory peaked at 200,306,688 bytes and MySQL at 518,787,072 bytes;
+no container hit memory limits, OOM or CPU throttling. This stronger concurrency
+case has different latency and message counts from the earlier single-creator
+run; the earlier 120 ms p99 is not substituted for it.
 
 A pre-existing removal-tip defect remains: the pinned octo-lib sends both
 `channel_id` and `subscribers`, which the existing IM message API rejects. This
@@ -114,3 +132,23 @@ The tests use fresh random database names. Existing module TestMain helpers
 hard-code `root:demo@tcp(127.0.0.1:3306)/test` and can clear that database; run
 those only in their dedicated test environment. Source-built business tests
 use a separately configured stack and do not use those helpers.
+
+Final-binary business fault validation also passed all four cases with the new
+25-user fixture: lost successful replies through the foreground deadline;
+never-forwarded child creation; backend SIGKILL after SQL commit; failed kick,
+rejoin and five delayed old snapshots (all 409, latest membership preserved).
+All 266 authority rows completed afterward. Business failure responses remain
+the existing HTTP400 envelope; injected IM503 responses are not reported as
+normal-load successes. Configuration was restored after the fault run.
+
+Final IM binary `988a5a80` (`60931515d80a7f7c5ce800f9c317870d6199d4e1153e5e680fcd4a389f246c88`) additionally passed
+603.452 seconds of the same controlled mixed workload:
+8,121,536 HTTP attempts, zero failures and zero Raft
+timeouts. Churn sustained 112.650/s,
+maximum 1.591 s. Quiet observation, all membership and
+witness checks, 448 sampled message identities,
+all 378 persisted message tails (7,977,210 messages)
+and restart checks passed. This final-binary short regression complements the
+explicitly identified earlier hour; it does not relabel that hour's binary.
+
+Machine-readable evidence: [validation record](im-reconciliation-validation-20260925.json).
