@@ -26,7 +26,10 @@
 - `scripts/project-native-groups.sql` 提供排空旧实例和在途任务后由运维手动执行的在线删列 SQL；新实例启动时保留旧列以支持滚动部署。历史群、成员及关系不迁移；执行脚本后旧二进制不能回滚使用。专属群 I4 扫描与指标退出运维面板。
 - Project 关联群群主转让的 HTTP 回归使用独立路由绑定当前测试的 Group 与事件上下文，并核对原生群主角色及 Project 关系在完整包顺序下保持一致。
 - Space 清理工单的立即入队时间按数据库毫秒精度截断，保证提交后可认领；事件回归测试隔离进程级监听器，支持重复运行。
-- 运维注意：`project_i2_violations_total` 与 `group_admission_rejected_total` 指标已移除，旧面板/告警应删除或允许序列缺失。Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
+- 运维注意：`project_i2_violations_total` 与 `group_admission_rejected_total` 指标已移除，旧面板/告警应删除或允许序列缺失。
+  本次专属群切换停止发布 `project_all_member_group_missing`、`project_all_member_group_member_gaps`、
+  `project_all_member_group_provision_failures_total`、`project_all_member_group_sync_failures_total`；更新引用这些序列的面板与告警。
+  Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
 

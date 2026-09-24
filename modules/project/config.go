@@ -175,8 +175,8 @@ const (
 type Config struct {
 	CreateEnabled            bool
 	CollaborationRoleEnabled bool
-	// ReconcileEnabled gates the five scans that JOIN legacy Space tables, in two
-	// blocks — see envReconcileEnabled for the list, for why it is separate from
+	// ReconcileEnabled gates the three scans that JOIN legacy Space tables in one
+	// block — see envReconcileEnabled for the list, for why it is separate from
 	// CreateEnabled, and for why its scope is narrow.
 	ReconcileEnabled               bool
 	MaxPerSpace                    int
