@@ -17,7 +17,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
-	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/gin-gonic/gin"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -616,9 +615,6 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 		return
 	}
-	if ba.refuseIfAllMemberGroup(c, groupNo) {
-		return
-	}
 
 	botName := ba.resolveBotDisplayName(robotID)
 
@@ -701,10 +697,9 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	// 解散守卫（企业微信式只读）：群解散后禁止 bot 移除成员。
 	groupStatus, err := ba.queryGroupStatus(groupNo)
 	if err != nil {
-		// A missing group row arrives as dbr.ErrNotFound and is refused here, the
-		// same as before this handler read the two columns together. Answering
-		// "not disbanded, no project" for a group that does not exist would let the
-		// request walk past both guards to be refused later by ExistMember — a
+		// A missing group row arrives as dbr.ErrNotFound and is refused here.
+		// Answering "not disbanded" for a group that does not exist would let the
+		// request walk past the guard to be refused later by ExistMember — a
 		// different code, a later stage, and one fewer signal.
 		ba.Error("查询群状态失败", zap.Error(err), zap.String("groupNo", groupNo))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
@@ -712,9 +707,6 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	}
 	if groupStatus == group.GroupStatusDisband {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
-		return
-	}
-	if ba.refuseIfAllMemberGroup(c, groupNo) {
 		return
 	}
 
@@ -818,40 +810,6 @@ func (ba *BotAPI) rejectAIContainerMutation(c *wkhttp.Context, groupNo string) b
 	}
 	return false
 }
-func (ba *BotAPI) refuseIfAllMemberGroup(c *wkhttp.Context, groupNo string) bool {
-	if groupNo == "" || ba.db == nil || ba.db.session == nil {
-		return false
-	}
-	var row struct {
-		ProjectID string `db:"project_id"`
-		GroupNo   string `db:"group_no"`
-	}
-	err := ba.db.session.Select("project_id", "group_no").From("`group`").
-		Where("group_no=?", groupNo).LoadOne(&row)
-	if err != nil {
-		if errors.Is(err, dbr.ErrNotFound) {
-			return false
-		}
-		ba.Error("query group project failed", zap.Error(err), zap.String("groupNo", groupNo))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
-		return true
-	}
-	if row.ProjectID == "" {
-		return false
-	}
-	protected, err := projectpkg.IsAllMemberGroup(ba.ctx.DB(), row.ProjectID, row.GroupNo)
-	if err != nil {
-		ba.Error("query all-member group predicate failed; refusing mutation", zap.Error(err), zap.String("groupNo", groupNo))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
-		return true
-	}
-	if !protected {
-		return false
-	}
-	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIAllMemberGroupProtected, nil, nil)
-	return true
-}
-
 func (ba *BotAPI) protectAIContainerMutation(c *wkhttp.Context) {
 	if ba.rejectAIContainerMutation(c, c.Param("group_no")) {
 		c.Abort()

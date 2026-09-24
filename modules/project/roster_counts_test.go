@@ -23,7 +23,6 @@ import (
 
 func TestListRouteSplitsTheRosterAndTheThreeCountsAddUp(t *testing.T) {
 	srv, p := setup(t)
-	stubAllMemberGroup(t, "grp_counts_1") // registers its own t.Cleanup restore
 	r := mountProject(t, p)
 	_ = srv
 

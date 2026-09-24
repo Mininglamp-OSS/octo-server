@@ -71,16 +71,6 @@ type reconcileCursors struct {
 	// P1's I3 scan rotates over `group`.id and reuses the idResume/idSave pair.
 	i3Group int64
 	i3Run   int
-	// P2 scans (invariant I4). i4Missing rotates over octo_project.id alone;
-	// i4Gap needs the composite (project id, member uid) for the same reason
-	// member scans need it — its page is bounded on MEMBER rows and therefore
-	// cuts projects in half, so a project-only cursor would skip members past
-	// the boundary on every rotation.
-	i4Missing    int64
-	i4MissingRun int
-	i4GapProject int64
-	i4GapUID     string
-	i4GapRun     int
 }
 
 var cursors reconcileCursors
@@ -122,24 +112,6 @@ func (c *reconcileCursors) abandonedSave(project, uid string, running int, done 
 	c.abandonedProject, c.abandonedUID, c.abandonRun = project, uid, running
 }
 
-// i4GapResume / i4GapSave are the mixed (int64, string) composite cursor the
-// I4 gap rotation needs. Same contract as i1Resume/i1Save.
-func (c *reconcileCursors) i4GapResume() (int64, string, int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.i4GapProject, c.i4GapUID, c.i4GapRun
-}
-
-func (c *reconcileCursors) i4GapSave(project int64, uid string, running int, done bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if done {
-		c.i4GapProject, c.i4GapUID, c.i4GapRun = 0, "", 0
-		return
-	}
-	c.i4GapProject, c.i4GapUID, c.i4GapRun = project, uid, running
-}
-
 // idResume / idSave are the same contract for the single-int64-cursor rotations.
 func (c *reconcileCursors) idResume(cursor *int64, running *int) (int64, int) {
 	c.mu.Lock()
@@ -179,8 +151,6 @@ func resetCursorsForTest() {
 	cursors.ownerless, cursors.ownerlessRun = 0, 0
 	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
 	cursors.i3Group, cursors.i3Run = 0, 0
-	cursors.i4Missing, cursors.i4MissingRun = 0, 0
-	cursors.i4GapProject, cursors.i4GapUID, cursors.i4GapRun = 0, "", 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly
@@ -205,8 +175,8 @@ func (p *Project) startReconcileWorker() {
 		// announced is worse than a broken one: the gauges sit at zero and read as "no
 		// violations". This line is what makes "we never turned it on" findable.
 		if !p.cfg.ReconcileEnabled {
-			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目 / I4 缺群 / I4 缺员"+
-				"五项无监控，五个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
+			p.Warn("项目对账的受控扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目"+
+				"三项无监控，三个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
 				zap.String("env", envReconcileEnabled))
 		}
 		p.ctx.Schedule(jitter(p.cfg.ReconcileInterval), p.runReconcile)
@@ -272,13 +242,6 @@ func (p *Project) runReconcile() {
 	// reports cleanup machinery that stopped. Both remain report-only.
 	p.scanI3Violations()
 	p.scanRemovingStalls()
-	// The I4 missing-pointer and dedicated missing-member scans are gated because
-	// their joins against legacy group tables can be expensive under the
-	// production collation shape. Both are report-only.
-	if p.cfg.ReconcileEnabled {
-		p.scanMissingAllMemberGroups()
-		p.scanAllMemberGroupGaps()
-	}
 }
 
 // reconcileLogCap bounds the per-row Error lines ONE scan emits in ONE tick.

@@ -115,15 +115,3 @@ func swapCleanupStepsForTest(steps []namedCleanupStep) func() {
 		cleanupStepsMu.Unlock()
 	}
 }
-
-func swapRejoinCleanupStepsForTest(steps []namedCleanupStep) func() {
-	rejoinCleanupStepsMu.Lock()
-	prev := rejoinCleanupSteps
-	rejoinCleanupSteps = steps
-	rejoinCleanupStepsMu.Unlock()
-	return func() {
-		rejoinCleanupStepsMu.Lock()
-		rejoinCleanupSteps = prev
-		rejoinCleanupStepsMu.Unlock()
-	}
-}

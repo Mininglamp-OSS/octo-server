@@ -9,7 +9,7 @@ import (
 
 const projectReadModelColumns = "p.id, p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, " +
 	"p.discoverability, p.max_members, p.member_epoch, p.collaboration_role_epoch, p.status, " +
-	"p.all_member_group_no, p.created_at, p.updated_at"
+	"p.created_at, p.updated_at"
 const projectReadMemberColumns = "pm.project_id, pm.uid, pm.space_id, pm.role, pm.status, pm.removing, " +
 	"pm.invite_uid, pm.created_at, COALESCE(pm.joined_at, pm.created_at) AS joined_at, pm.updated_at"
 

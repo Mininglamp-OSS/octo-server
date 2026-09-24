@@ -26,11 +26,9 @@ const (
 	envCollaborationRoleEnabled = "OCTO_PROJECT_COLLABORATION_ROLE_ENABLED"
 
 	// envReconcileEnabled gates ONLY the reconcile scans that JOIN the legacy Space tables
-	// (`space`, `space_member`, `space_member_removal_cleanup`) — FIVE of them, in two
-	// blocks: I1 violations, abandoned cleanup leak and orphan projects
-	// (reconcile.go, the first gated block), plus the two I4 all-member-group scans
-	// (the second). The startup Warn names all five; comments that say "three" are
-	// counting one block and are the reason this sentence now says where to look.
+	// (`space`, `space_member`, `space_member_removal_cleanup`) — THREE of them, in one
+	// block: I1 violations, abandoned cleanup leak and orphan projects (reconcile.go). The
+	// startup Warn names all three.
 	//
 	// It exists because those three fail with MySQL 1267 on any database where the legacy
 	// tables have drifted to utf8mb4_0900_ai_ci while this module's tables are pinned to
@@ -65,13 +63,7 @@ const (
 	envDayBoundaryTZ                  = "OCTO_PROJECT_DAY_BOUNDARY_TZ"
 	envReconcileEvery                 = "OCTO_PROJECT_RECONCILE_INTERVAL"
 	envReconcileLimit                 = "OCTO_PROJECT_RECONCILE_LIMIT"
-	// envAllMemberGroupAdmitGrace tunes how long a freshly written project seat is
-	// exempt from I4 scan B. The brief calls the window configurable and the first
-	// implementation hard-coded it; the value that matters is deployment-shaped
-	// (how slow the admitter's IM call is under load), so it belongs in an env var
-	// beside the other reconcile knobs rather than in a constant.
-	envAllMemberGroupAdmitGrace = "OCTO_PROJECT_ALL_MEMBER_GROUP_ADMIT_GRACE"
-	envMetricsEvery             = "OCTO_PROJECT_METRICS_INTERVAL"
+	envMetricsEvery                   = "OCTO_PROJECT_METRICS_INTERVAL"
 
 	// envLifecycleEventsEnabled gates the project lifecycle outbox — BOTH the
 	// enqueue side and the delivery worker, on the same switch.
@@ -157,11 +149,6 @@ const (
 	// gain (modules/space/member_removal.go:281-284 makes the same call).
 	defaultReconcileInterval = 5 * time.Minute
 	defaultReconcileLimit    = 500
-	// defaultAllMemberGroupAdmitGrace: generous against a path measured in
-	// hundreds of milliseconds, short relative to how long a real gap persists
-	// (nothing retries the admission, so a genuine failure stays until an admin
-	// re-adds the member). See (*Project).admitGrace's own comment.
-	defaultAllMemberGroupAdmitGrace = 5 * time.Minute
 	// defaultMetricsInterval is sparser still: the distribution gauges aggregate
 	// whole tables, and those aggregates get slowest exactly when the numbers
 	// matter most (after a backlog).
@@ -188,8 +175,8 @@ const (
 type Config struct {
 	CreateEnabled            bool
 	CollaborationRoleEnabled bool
-	// ReconcileEnabled gates the five scans that JOIN legacy Space tables, in two
-	// blocks — see envReconcileEnabled for the list, for why it is separate from
+	// ReconcileEnabled gates the three scans that JOIN legacy Space tables in one
+	// block — see envReconcileEnabled for the list, for why it is separate from
 	// CreateEnabled, and for why its scope is narrow.
 	ReconcileEnabled               bool
 	MaxPerSpace                    int
@@ -203,10 +190,7 @@ type Config struct {
 	DayBoundary                    *time.Location
 	ReconcileInterval              time.Duration
 	ReconcileLimit                 int
-	// AllMemberGroupAdmitGrace exempts a project seat written within this window
-	// from I4 scan B, because the admitter runs after the seat transaction commits.
-	AllMemberGroupAdmitGrace time.Duration
-	MetricsInterval          time.Duration
+	MetricsInterval                time.Duration
 
 	// Project lifecycle outbox.
 	LifecycleEventsEnabled bool
@@ -255,9 +239,7 @@ func loadConfig() Config {
 		DayBoundary:                    loc,
 		ReconcileInterval:              envDuration(envReconcileEvery, defaultReconcileInterval),
 		ReconcileLimit:                 envPositiveInt(envReconcileLimit, defaultReconcileLimit),
-		AllMemberGroupAdmitGrace: envDuration(
-			envAllMemberGroupAdmitGrace, defaultAllMemberGroupAdmitGrace),
-		MetricsInterval: envDuration(envMetricsEvery, defaultMetricsInterval),
+		MetricsInterval:                envDuration(envMetricsEvery, defaultMetricsInterval),
 
 		LifecycleEventsEnabled: envBool(envLifecycleEventsEnabled, false),
 		LifecycleEventURL:      strings.TrimSpace(envString(envLifecycleEventURL, "")),

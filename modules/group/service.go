@@ -1171,12 +1171,6 @@ type RemoveGroupMembersServiceReq struct {
 	// per-UID eligibility and successor exclusion before adding a batch caller.
 	SpaceMemberRemoval bool
 	SpaceID            string
-
-	// ProjectRemoval/ProjectID mark authoritative Project-seat cleanup. In the
-	// Space lifecycle path ProjectID is also the candidate group's Project
-	// association, used to lock and recheck the dedicated pointer.
-	ProjectRemoval bool
-	ProjectID      string
 }
 
 // RemoveGroupMembersServiceResp 移除群成员响应。
@@ -1200,9 +1194,6 @@ type UpdateGroupInfoServiceReq struct {
 	OperatorName string  // 操作者名称
 	Name         *string // 新群名（nil 表示不更新）
 	Notice       *string // 新公告（nil 表示不更新）
-	// ExpectProjectID 可选的归属栅栏：非空时，只有当这个群仍属于该项目才写。
-	// 只有 D8 的全员群改名会设置它；人手改名留空。见 UpdateNameNoticeTx。
-	ExpectProjectID string
 }
 
 // UpdateGroupAvatarCustomServiceReq 更新自定义群头像文字/颜色（二次弹窗保存）。
@@ -1235,10 +1226,9 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	}
 	// Members MAY be empty — a group of just its creator is a legitimate group.
 	//
-	// This used to be rejected here, and the rejection has to go for P2: a project
-	// created with no agents picked needs an all-member group whose only initial
-	// member is the project owner. Refusing that would make "create a project"
-	// silently produce a project with no group in the most common case there is.
+	// A Project created with no other effective members still creates a group
+	// whose initial native roster is the creator alone; refusing an empty
+	// explicit list would make that common case produce no group at all.
 	//
 	// Project-backed HTTP creation also permits an empty request member list:
 	// CreateProjectGroup replaces it with the locked active Project-member snapshot.
@@ -1280,9 +1270,8 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		//
 		// 一条批量查询，不是逐个 CheckMembership。ActiveMembers 的谓词与
 		// CheckMembership 逐字节相同，它的文档写明存在的理由就是"别让一个拿着很多
-		// uid 的调用方发 N 次往返"。P2 的补建把整份项目名册当作建群初始成员，于是
-		// 这个循环第一次真的会拿到几百个 uid——PR #855 第二轮 review 的 Q1 量到的
-		// 就是这里。
+		// uid 的调用方发 N 次往返"——显式建群请求可以一次带上整份名单，逐个查会把
+		// 一次建群变成几百次往返。
 		spaceActive, err := spacepkg.ActiveMembers(s.ctx.DB(), req.SpaceID, req.Members)
 		if err != nil {
 			s.Error("check member space membership failed", zap.Error(err))
@@ -1863,9 +1852,6 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	if req.SpaceMemberRemoval && !req.AllowProtected {
 		return nil, errors.New("Space member removal requires lifecycle authorization")
 	}
-	if req.SpaceMemberRemoval && req.ProjectRemoval {
-		return nil, errors.New("Space and Project removal modes are mutually exclusive")
-	}
 
 	// 群存在性检查
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
@@ -1899,7 +1885,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	var removableMembers []*MemberModel
 	for _, m := range targetMembers {
 		if m.IsDeleted == 1 ||
-			(m.Role == MemberRoleCreator && !req.ProjectRemoval && !req.SpaceMemberRemoval) {
+			(m.Role == MemberRoleCreator && !req.SpaceMemberRemoval) {
 			continue
 		}
 		removableMembers = append(removableMembers, m)
@@ -1915,73 +1901,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		return nil, errors.New("failed to begin transaction")
 	}
 	defer tx.RollbackUnlessCommitted()
-	if req.ProjectRemoval {
-		projectID := strings.TrimSpace(req.ProjectID)
-		if projectID == "" {
-			return nil, errors.New("project removal requires project_id")
-		}
-		var projects []struct {
-			ProjectID string `db:"project_id"`
-			GroupNo   string `db:"group_no"`
-		}
-		if _, err := tx.SelectBySql(
-			"SELECT project_id, all_member_group_no AS group_no "+
-				"FROM `octo_project` WHERE project_id = ? AND status = 1 "+
-				"AND all_member_group_no = ? LIMIT 1 FOR UPDATE",
-			projectID, req.GroupNo,
-		).Load(&projects); err != nil {
-			return nil, fmt.Errorf("lock Project for dedicated-group removal: %w", err)
-		}
-		if len(projects) == 0 {
-			if err := tx.Commit(); err != nil {
-				return nil, fmt.Errorf("commit stale dedicated-group removal: %w", err)
-			}
-			return &RemoveGroupMembersServiceResp{Removed: 0}, nil
-		}
-		// Lock every target Project seat before the group row. This matches the
-		// shared lifecycle order (Project → Project member → group →
-		// group_member): re-admission cannot commit between this decision and
-		// the native group-member delete.
-		var projectMembers []struct {
-			UID      string `db:"uid"`
-			Status   int    `db:"status"`
-			Removing int    `db:"removing"`
-		}
-		if _, err := tx.SelectBySql(
-			"SELECT uid, status, removing FROM `octo_project_member` "+
-				"WHERE project_id = ? AND uid IN ? FOR UPDATE",
-			projectID, req.Members,
-		).Load(&projectMembers); err != nil {
-			return nil, fmt.Errorf("lock Project membership for group removal: %w", err)
-		}
-		for _, member := range projectMembers {
-			if member.Status == 1 && member.Removing == 0 {
-				if err := tx.Commit(); err != nil {
-					return nil, fmt.Errorf("commit cancelled dedicated-group removal: %w", err)
-				}
-				return &RemoveGroupMembersServiceResp{Removed: 0}, nil
-			}
-		}
-		var groups []struct {
-			ProjectID string `db:"project_id"`
-			Status    int    `db:"status"`
-		}
-		if _, err := tx.SelectBySql(
-			"SELECT project_id, status FROM `group` "+
-				"WHERE group_no = ? LIMIT 1 FOR UPDATE",
-			req.GroupNo,
-		).Load(&groups); err != nil {
-			return nil, fmt.Errorf("lock dedicated group for removal: %w", err)
-		}
-		if len(groups) == 0 || groups[0].Status == GroupStatusDisband ||
-			groups[0].ProjectID != projectID {
-			if err := tx.Commit(); err != nil {
-				return nil, fmt.Errorf("commit detached dedicated-group removal: %w", err)
-			}
-			return &RemoveGroupMembersServiceResp{Removed: 0}, nil
-		}
-	}
-	var dedicatedLifecycle bool
+	// Space lifecycle fence: the caller's ticket was claimed on an earlier read,
+	// so the seat is rechecked under lock before any native row is touched. A
+	// rejoin that committed before this point makes the removal unnecessary;
+	// committing the emptied transaction and reporting LifecycleNoop keeps the
+	// caller from deleting a restored seat's native group membership.
 	if req.SpaceMemberRemoval {
 		if strings.TrimSpace(req.SpaceID) == "" {
 			return nil, errors.New("Space member removal requires space_id")
@@ -1998,40 +1922,28 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 				"WHERE sm.space_id = ? AND sm.uid IN ? ORDER BY sm.uid FOR UPDATE",
 			req.SpaceID, req.Members,
 		).Load(&seats); err != nil {
-			return nil, fmt.Errorf("lock Space seat for dedicated-group removal: %w", err)
+			return nil, fmt.Errorf("lock Space seat for Space member removal: %w", err)
 		}
 		for _, seat := range seats {
 			if seat.MemberStatus == 1 && seat.SpaceStatus != 0 {
 				if err := tx.Commit(); err != nil {
-					return nil, fmt.Errorf("commit cancelled Space dedicated-group removal: %w", err)
+					return nil, fmt.Errorf("commit cancelled Space member removal: %w", err)
 				}
 				return &RemoveGroupMembersServiceResp{
 					LifecycleNoop: true,
 				}, nil
 			}
 		}
-		if strings.TrimSpace(req.ProjectID) != "" {
-			binding, isDedicated, err := lockProjectGroupBindingTx(
-				tx, req.ProjectID, req.GroupNo,
-			)
-			if err != nil {
-				return nil, err
-			}
-			if isDedicated {
-				flags, err := projectBindingMatchFlagsTx(
-					tx, binding.ProjectID, "", binding.ProjectID, req.SpaceID,
-				)
-				if err != nil {
-					return nil, err
-				}
-				dedicatedLifecycle = flags.SpaceIDMatch != 0
-			}
-		}
 	}
 
-	var dedicatedVersion int64
-	dedicatedVersionReady := false
-	if dedicatedLifecycle {
+	// Space revocation always follows the native group's own rule: hand the
+	// creator role to the second oldest non-bot member (if any), then remove the
+	// leaving creator like any other member. Losing Space eligibility clears the
+	// native membership no matter which Project relation the group carries —
+	// a Project-linked group is an ordinary group here
+	// (docs/specs/2026-09-10-project-prd-alignment-design.md「Project 关联群的统一语义」:
+	// 「Space 撤权仍按普通群自身规则处理群主继任」).
+	if req.SpaceMemberRemoval {
 		for _, member := range removableMembers {
 			if member.Role != MemberRoleCreator {
 				continue
@@ -2042,65 +1954,34 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 					"AND is_deleted = 0 FOR UPDATE",
 				req.GroupNo, member.UID,
 			).Load(&roles); err != nil {
-				return nil, fmt.Errorf("lock dedicated-group creator for removal: %w", err)
-			}
-			if len(roles) == 0 || roles[0] != MemberRoleCreator {
-				continue
-			}
-			if !dedicatedVersionReady {
-				dedicatedVersion, err = s.ctx.GenSeq(common.GroupMemberSeqKey)
-				if err != nil {
-					return nil, fmt.Errorf("generate dedicated-group removal version: %w", err)
-				}
-				dedicatedVersionReady = true
-			}
-			if err := s.db.UpdateMemberRoleTx(
-				req.GroupNo, member.UID, MemberRoleCommon, dedicatedVersion, tx,
-			); err != nil {
-				return nil, fmt.Errorf("demote dedicated-group owner before removal: %w", err)
-			}
-			member.Role = MemberRoleCommon
-		}
-	}
-	if req.SpaceMemberRemoval && !dedicatedLifecycle {
-		for _, member := range removableMembers {
-			if member.Role != MemberRoleCreator {
-				continue
-			}
-			var roles []int
-			if _, err := tx.SelectBySql(
-				"SELECT role FROM group_member WHERE group_no = ? AND uid = ? "+
-					"AND is_deleted = 0 FOR UPDATE",
-				req.GroupNo, member.UID,
-			).Load(&roles); err != nil {
-				return nil, fmt.Errorf("lock ordinary-group creator for removal: %w", err)
+				return nil, fmt.Errorf("lock Space-removed creator for removal: %w", err)
 			}
 			if len(roles) == 0 || roles[0] != MemberRoleCreator {
 				continue
 			}
 			successor, err := querySecondOldestNonBotMemberTx(tx, req.GroupNo, member.UID)
 			if err != nil {
-				return nil, fmt.Errorf("query ordinary-group successor: %w", err)
+				return nil, fmt.Errorf("query Space-removed creator successor: %w", err)
 			}
 			if successor != nil {
 				version, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
 				if err != nil {
-					return nil, fmt.Errorf("generate ordinary-group successor version: %w", err)
+					return nil, fmt.Errorf("generate Space-removed successor version: %w", err)
 				}
 				if err := s.db.UpdateMemberRoleTx(
 					req.GroupNo, successor.UID, MemberRoleCreator, version, tx,
 				); err != nil {
-					return nil, fmt.Errorf("promote ordinary-group successor: %w", err)
+					return nil, fmt.Errorf("promote Space-removed creator successor: %w", err)
 				}
 			}
 			version, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
 			if err != nil {
-				return nil, fmt.Errorf("generate ordinary-group removal version: %w", err)
+				return nil, fmt.Errorf("generate Space-removed creator removal version: %w", err)
 			}
 			if err := s.db.UpdateMemberRoleTx(
 				req.GroupNo, member.UID, MemberRoleCommon, version, tx,
 			); err != nil {
-				return nil, fmt.Errorf("demote ordinary-group creator: %w", err)
+				return nil, fmt.Errorf("demote Space-removed creator: %w", err)
 			}
 			member.Role = MemberRoleCommon
 		}
@@ -2115,10 +1996,10 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		LeaverName string
 		Bots       []*user.Model
 	}
-	// Space lifecycle creator handover/demotion above and the member deletion
-	// below share this transaction, so the pointer/seat decision cannot be
+	// The Space lifecycle creator handover/demotion above and the member
+	// deletion below share this transaction, so the seat decision cannot be
 	// separated from the native role transition.
-	// Sort the deletion pass by UID. The ordinary creator/successor locks above
+	// Sort the deletion pass by UID. The creator/successor locks above
 	// precede this pass and use created_at order; competing removal transactions
 	// can still deadlock, in which case the cleanup job retries the rolled-back work.
 	//
@@ -2141,12 +2022,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		// 自助路径（bot 所有者）在事务外只放行普通角色目标，锁内必须用同一口径：
 		// 否则窗口内 Common→Manager 的提升会通过重查、行真的被删，且 removedUIDs
 		// 里有它，连调用方的集合比对都发现不了。其余路径沿用「只排除 Creator」。
-		var stillRemovable bool
-		if req.ProjectRemoval {
-			stillRemovable, err = s.db.LockProjectRemovalMemberTx(req.GroupNo, m.UID, tx)
-		} else {
-			stillRemovable, err = s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
-		}
+		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
 		if err != nil {
 			s.Error("re-read member role failed", zap.Error(err), zap.String("uid", m.UID))
 			return nil, errors.New("failed to re-read member role")
@@ -2233,7 +2109,6 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	}
 
 	// IM 操作（事务提交之后）
-	var imRemoveErr error
 	if len(removedUIDs) > 0 {
 		// 移除 IM 订阅
 		if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
@@ -2242,13 +2117,6 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 			Subscribers: removedUIDs,
 		}); err != nil {
 			s.Error("remove IM subscriber failed", zap.Error(err))
-			if req.ProjectRemoval {
-				// Project removal is an outbox step. Return the transport
-				// failure after all post-commit cleanup below has run so the
-				// callback retries the broker operation without changing the
-				// user-facing best-effort semantics of native removals.
-				imRemoveErr = err
-			}
 		}
 
 		// 发送被踢消息
@@ -2311,9 +2179,6 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	resp := &RemoveGroupMembersServiceResp{
 		Removed:     len(removedUIDs),
 		RemovedUIDs: removedUIDs,
-	}
-	if imRemoveErr != nil {
-		return resp, fmt.Errorf("remove project-member IM subscriber: %w", imRemoveErr)
 	}
 	return resp, nil
 }
@@ -2378,7 +2243,7 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	// 之前别人改掉的 status / forbidden / invite 用旧快照盖回去——其中 status 那一
 	// 项意味着一次改名可以撤销一次解散。见 UpdateNameNoticeTx 上的说明。
 	affected, err := s.db.UpdateNameNoticeTx(
-		req.GroupNo, req.Name, req.Notice, groupModel.Version, req.ExpectProjectID, tx)
+		req.GroupNo, req.Name, req.Notice, groupModel.Version, tx)
 	if err != nil {
 		s.Error("update group failed", zap.Error(err))
 		return errors.New("failed to update group")
@@ -2389,11 +2254,10 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 		return errors.New("failed to commit transaction")
 	}
 
-	// 0 行 = 上面那条谓词把写挡住了，也就是 status 检查（无锁读）之后、这次写之前
-	// 群被解散了。数据库这时是干净的，但下面三步不是数据库：失效推送缓存、给群里
-	// 发 GroupUpdate、通知客户端刷频道。照发就等于给一个已经不存在的群推一条改名，
-	// 而接口还报成功。返回 nil 而不是错误——什么都没发生不是失败，调用方（D8 的
-	// 项目改名同步）该做的也只是安静地跳过。PR #855 第七轮 review 的 P2-1。
+	// affected == 0 表示上面那条 status 谓词把写挡住了：status 检查（无锁读）之后、
+	// 这次写之前群被解散了。数据库这时是干净的，但下面三步不是数据库：失效推送缓存、
+	// 给群里发 GroupUpdate、通知客户端刷频道。照发就等于给一个已经不存在的群推一条
+	// 改名，而接口还报成功。见 UpdateNameNoticeTx 上的说明。
 	if affected == 0 {
 		// 0 行 = 状态检查（无锁读）之后、这次写之前群被解散了。
 		//
@@ -2402,10 +2266,6 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 		// 而同一个文件里 updateAvatarCustom 对**同一个** TOCTOU 明确返回
 		// "group not found or disbanded"，理由就写在它旁边——不要对一行已经死掉的
 		// 数据报成功。一个文件里两套约定，新的那套更松。第八轮 review。
-		//
-		// D8 的项目改名同步不需要这个错误：它由 renameAllMemberGroup 吞掉
-		// （errors.Is），保持"安静跳过"。人工入口与机器入口的处置不同，而这个
-		// 差别属于调用方，不属于这里。
 		s.Warn("群信息更新未落库（群已解散），跳过全部通知",
 			zap.String("group_no", req.GroupNo))
 		return errGroupGoneOrDisbanded

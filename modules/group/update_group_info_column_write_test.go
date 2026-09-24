@@ -20,10 +20,6 @@ import (
 // is `status`: a rename could undo a disband. The repo already had this lesson
 // twice; UpdateInviteTx and UpdateStatusTx both carry the comment.
 //
-// What made it worth fixing now is D8: before P2 this window only opened when a
-// person clicked "rename group", and now every project rename drives it
-// automatically. PR #855s fifth review, Q9.
-//
 // The window itself is not what this test asserts — reproducing it needs a hook
 // between the service's read and its write. It asserts the property that closes
 // it: the statement names the columns it changes.
@@ -47,7 +43,7 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 	name := "after"
 	tx, err := ctx.DB().Begin()
 	require.NoError(t, err)
-	affected, err := g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, "", tx)
+	affected, err := g.db.UpdateNameNoticeTx(disbanded, &name, nil, 99, tx)
 	require.NoError(t, err)
 	require.Zero(t, affected,
 		"the write must report that it changed nothing, so the caller can skip the "+
@@ -79,7 +75,7 @@ func TestUpdateGroupInfoWritesColumnsNotTheWholeRow(t *testing.T) {
 
 	tx, err = ctx.DB().Begin()
 	require.NoError(t, err)
-	affected, err = g.db.UpdateNameNoticeTx(live, &name, nil, 42, "", tx)
+	affected, err = g.db.UpdateNameNoticeTx(live, &name, nil, 42, tx)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, affected, "a live group's rename lands, so the notifications go out")
 	require.NoError(t, tx.Commit())

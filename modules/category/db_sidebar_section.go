@@ -105,7 +105,7 @@ func (d *categoryDB) queryRawCategoryModels(uid, spaceID string) ([]*CategoryMod
 func (d *categoryDB) querySidebarProjectSections(uid, spaceID string) ([]*sidebarProjectSectionModel, error) {
 	var models []*sidebarProjectSectionModel
 	_, err := d.session.Select(
-		"p.project_id", "p.name", "p.logo", "p.all_member_group_no", "ss.sort",
+		"p.project_id", "p.name", "p.logo", "ss.sort",
 	).
 		From(dbr.I("octo_sidebar_section").As("ss")).
 		Join(dbr.I("octo_project").As("p"),

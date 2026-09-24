@@ -3,7 +3,6 @@ package project
 import (
 	"encoding/json"
 	"github.com/Mininglamp-OSS/octo-lib/server"
-	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"net/http"
@@ -584,14 +583,6 @@ func TestReactivationResetsRoleAndTimestamps(t *testing.T) {
 	// Re-add.
 	w = doJSON(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
 		ownerTok, addMembersPayload("m1"))
-	var rejoinIntentCount int
-	require.NoError(t, testCtx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM space_member_removal_cleanup "+
-			"WHERE space_id=? AND uid=? AND reason=? AND status=0",
-		spaceA, "m1", spacemod.MemberRemoveReasonRejoined,
-	).LoadOne(&rejoinIntentCount))
-	assert.Equal(t, 1, rejoinIntentCount,
-		"Project re-admission must persist a Space projection intent in the same lifecycle")
 
 	back, err := p.db.queryMember(created.ProjectID, "m1")
 	require.NoError(t, err)

@@ -153,11 +153,10 @@ func (c *Category) sidebarSections(uid, spaceID string) ([]sidebarSectionResp, e
 	}
 	for _, section := range projects {
 		projectByID[section.ProjectID] = &sidebarProjectSectionResp{
-			ProjectID:        section.ProjectID,
-			ProjectName:      section.Name,
-			Logo:             section.Logo,
-			AllMemberGroupNo: section.AllMemberGroupNo,
-			Groups:           groupsByProject[section.ProjectID],
+			ProjectID:   section.ProjectID,
+			ProjectName: section.Name,
+			Logo:        section.Logo,
+			Groups:      groupsByProject[section.ProjectID],
 		}
 	}
 

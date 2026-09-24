@@ -117,12 +117,12 @@ func (d *DB) finishMemberRemovalTx(tx *dbr.Tx, projectID, uid string, now time.T
 //
 // The worker calls this before EVERY batch, not once per job. The job was
 // enqueued at removal time and may sit in the queue for minutes; a member
-// re-added in that window has removing = 0, and continuing to tear their groups
-// down would destroy a membership that is legitimate again. Same shape as P0's
+// re-added in that window has removing = 0, and continuing to run cleanup steps
+// would tear down a membership that is legitimate again. Same shape as P0's
 // checkSpaceSeatForCleanupTx re-check inside deactivateSeatForCascade, and as
 // cleanupSpaceMemberGroups's.
 //
-// A cancellation landing mid-batch can leave an external cleanup step partially
+// A cancellation landing mid-batch can leave a registered cleanup step partially
 // complete. That is not a Project membership invariant violation: native group
 // membership and Project membership are independent facts, and the worker
 // re-checks the seat before any subsequent step.
@@ -279,16 +279,17 @@ func (d *DB) claimRemovalJobs(owner string, limit int, now time.Time, lease time
 // #797's open P1 on the Space outbox is the absence of a heartbeat at all:
 // without one, the abandon sweep marks a still-running FINAL attempt as
 // abandoned, and the work is then never retried because the row is terminal. A
-// project removal fans out over every group in the project, so it is more likely
-// to outrun a lease than the Space job that already does.
+// project removal closes seats across every project the member was in, so a slow
+// batch is normal rather than exceptional and the sweep would eventually catch a
+// running worker.
 //
 // It takes the WHOLE BATCH rather than one id, because one claim leases up to
 // removalBatch jobs at once and the worker then processes them in sequence.
 // Heartbeating only the in-flight one leaves the queued remainder on the lease
 // they were claimed with, so the tail of a slow batch expires while this worker
 // still intends to work it — and another pod picks those rows up and runs the
-// same cascade concurrently. The two then take group locks in whatever order
-// their group lists happen to produce.
+// same closes concurrently, closing seats out from under the first worker's
+// in-flight decisions.
 func (d *DB) heartbeatRemovalLeases(ids []int64, owner string, until time.Time) error {
 	if len(ids) == 0 {
 		return nil
@@ -390,19 +391,17 @@ type removalJobOwnership struct {
 // The seat carries no removal generation: `removing = 1` says a removal is in
 // progress, not WHICH one. So a worker that has been running a fan-out while
 // the member was re-admitted and then removed AGAIN comes back to a seat that
-// reads `removing = 1` — cycle 2's flag — and, without this, closes it. The
-// second cycle's job then finds `removing = 0`, concludes it has no work, and
-// retires without running a step: the groups the member joined between the two
-// cycles keep their rows, the seat says not-a-member, and because I2 has no
-// read-path filter that uid keeps full access to those groups. The I2 scan
-// reports it and nothing repairs it — both jobs are terminal and there is no
-// endpoint that re-drives a cascade.
+// reads `removing = 1` — cycle 2's flag — and, without this, closes it. Cycle
+// 2's own job then finds `removing = 0`, concludes it has no work, and retires
+// without running its steps: the membership change cycle 2 represents is
+// recorded as complete although its cleanup never ran, and no endpoint re-drives
+// a terminal job. The stall scan can only report the symptom.
 //
 // Fencing on the job turns "a removal is in progress" into "MY removal is still
 // in progress", which is the fact the close actually depends on. In the
 // interleaving above the first job reads `cancelled` here, declines, leaves
-// `removing = 1` alone, and the second job — claimed next tick — re-snapshots
-// the group list and does the right thing.
+// `removing = 1` alone, and the second job — claimed next tick — re-checks the
+// seat and does the right thing.
 //
 // # Lock order
 //

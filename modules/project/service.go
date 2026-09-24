@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -335,15 +334,6 @@ func (p *Project) finishProjectCreate(model *Model, in createInput) {
 	for _, uid := range agentUIDs {
 		p.invalidateProjectMemberCache(model.ProjectID, uid)
 		p.provisionSidebarSection(model.ProjectID, model.SpaceID, uid)
-	}
-	p.provisionAllMemberGroup(model.ProjectID, model.SpaceID, model.Creator, model.Name, agentUIDs)
-	if groupNo, err := p.db.queryAllMemberGroupNo(model.ProjectID); err != nil {
-		p.Error("查询刚创建项目的全员群失败", zap.Error(err),
-			zap.String("projectId", model.ProjectID))
-	} else {
-		// Provisioning is a post-commit best-effort effect, but when it succeeds
-		// synchronously the create response should expose the pointer it just wrote.
-		model.AllMemberGroupNo = groupNo
 	}
 	if p.nudgeProvisioningFn != nil {
 		p.nudgeProvisioningFn()
@@ -698,11 +688,7 @@ func (p *Project) createProjectTxWithSeatRefs(
 // ---------- update / disband ----------
 
 // updateProject runs updateProjectOnce through the bounded lock-conflict retry
-// (see retryOnLockConflict), then syncs the all-member group's name (D8).
-//
-// The sync is after the retry loop for the same reason the provisioner is: a
-// lock-conflict retry re-runs the transaction, and a rename inside the closure
-// would fire once per attempt.
+// (see retryOnLockConflict).
 //
 // It returns the row plus whether anything was actually WRITTEN. The flag exists
 // for the audit log: a request naming fields the project already matches is a
@@ -717,22 +703,6 @@ func (p *Project) updateProject(projectID, actorUID, spaceID string, req updateR
 		model, changed, e = p.updateProjectOnce(projectID, actorUID, spaceID, req)
 		return e
 	})
-	if err == nil && model != nil && req.Name != nil {
-		// D8 — the all-member group's name follows the project's.
-		//
-		// The name is how a user recognises which group belongs to which project;
-		// letting it drift means the group quietly stops being findable as "the
-		// project's group". Truncation to the group's own limit is the group
-		// side's job — that rule belongs to groups, not to projects.
-		//
-		// Only when the name actually changed: an update touching only the
-		// description has no business bumping the group's version and pushing a
-		// member-list refresh to every client.
-		//
-		// Failure leaves the two names out of step and is logged, not retried.
-		// The next rename converges them.
-		p.syncAllMemberGroupName(projectID, model.Name)
-	}
 	return model, changed, err
 }
 
@@ -984,31 +954,6 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	if _, err := p.db.disbandProjectTx(tx, projectID, now); err != nil {
 		return nil, err
 	}
-	// D10 — the all-member group stops being one, in the SAME transaction as the
-	// status flip.
-	//
-	// The group itself is untouched here: P1's disband step reverts it to
-	// Space-direct with its members intact, along with every other group of the
-	// project. What is cleared is only the FACT that it was the all-member group,
-	// and that fact stops being true the moment the project does.
-	//
-	// In the transaction rather than in the disband step, because the step is
-	// allowed to fail and P1 deliberately does not roll disband back for it. A
-	// disbanded project still pointing at a group would be a state that both the
-	// D7 protection predicate and the rebuild predicate would have to reason
-	// about; clearing it here means that state does not exist.
-	//
-	// LOCK ORDER: this runs AFTER disbandProjectTx, whose last statement writes
-	// octo_project_provisioning — the final lock in the declared order. Writing
-	// octo_project after that would normally be an inversion; it is not one here
-	// because disbandProjectTx's FIRST statement already took the X lock on this
-	// exact octo_project row, so this UPDATE acquires nothing new. That is a real
-	// dependency on a statement in another function, so it is written down: if the
-	// status flip ever moves out of disbandProjectTx, this call has to move above
-	// it rather than stay where it reads naturally.
-	if err := p.db.clearAllMemberGroupNoTx(tx, projectID); err != nil {
-		return nil, err
-	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit disband: %w", err)
 	}
@@ -1105,13 +1050,6 @@ func (p *Project) addMembers(projectID, spaceID, actorUID string, input []member
 		changed, e = p.addMembersOnce(projectID, spaceID, actorUID, members)
 		return e
 	})
-	if err == nil {
-		uids := make([]string, 0, len(members))
-		for _, item := range members {
-			uids = append(uids, item.UID)
-		}
-		p.syncAllMemberGroupMembers(projectID, spaceID, uids)
-	}
 	return changed, err
 }
 
@@ -1240,7 +1178,7 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	// in modules/space/seatref.go.
 	//
 	// Done once, right after the lock and before anything reads a uid again, so the
-	// member lookup, the rejoin intent, the outbox cancel and the seat insert all agree
+	// member lookup, the pending-removal cancel and the seat insert all agree
 	// on one spelling. lockSeatsTx has already refused any target that is not seated,
 	// so a miss here is impossible for a required uid; the loop leaves such an item
 	// untouched rather than silently dropping it.
@@ -1268,7 +1206,6 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	}
 
 	toAdmit := make([]memberAdd, 0, len(members))
-	rejoinIntents := make(map[string]struct{}, len(members))
 	newSeats := 0
 	for _, item := range members {
 		existing, qerr := p.db.queryMemberTx(tx, projectID, item.UID)
@@ -1282,9 +1219,6 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 			continue
 		}
 		toAdmit = append(toAdmit, item)
-		if existing != nil && (existing.Status != MemberStatusActive || existing.Removing != 0) {
-			rejoinIntents[item.UID] = struct{}{}
-		}
 		// A closing seat is not counted by countActiveMembersTx, but this admission
 		// clears removing and makes it effective again. Count it exactly like a
 		// removed seat so a pending removal cannot be used as a quota slot.
@@ -1317,15 +1251,6 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 		})
 		if aerr != nil {
 			return nil, aerr
-		}
-		if didChange {
-			if _, ok := rejoinIntents[item.UID]; ok {
-				if err := spacemod.EnqueueMemberRejoinIntentTx(
-					tx, row.SpaceID, item.UID, actorUID,
-				); err != nil {
-					return nil, err
-				}
-			}
 		}
 		if _, cerr := p.db.cancelPendingRemovalJobsTx(tx, projectID, item.UID, now); cerr != nil {
 			return nil, cerr
@@ -1364,7 +1289,6 @@ func (p *Project) addOneMember(projectID, spaceID, actorUID, uid string) (bool, 
 	if err != nil {
 		return false, err
 	}
-	p.syncAllMemberGroupMembers(projectID, spaceID, []string{uid})
 	return changed, nil
 }
 
@@ -1376,9 +1300,6 @@ func (p *Project) removeMember(projectID, spaceID, actorUID, targetUID string) (
 		removed, e = p.removeMemberOnce(projectID, spaceID, actorUID, targetUID)
 		return e
 	})
-	if err == nil {
-		p.syncAllMemberGroupOwner(projectID)
-	}
 	return removed, err
 }
 
@@ -1504,9 +1425,6 @@ func (p *Project) leaveProject(projectID, spaceID, uid string) error {
 	err := retryOnLockConflict(func() error {
 		return p.leaveProjectOnce(projectID, spaceID, uid)
 	})
-	if err == nil {
-		p.syncAllMemberGroupOwner(projectID)
-	}
 	return err
 }
 
@@ -1578,9 +1496,6 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 		changed, e = p.changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID, role)
 		return e
 	})
-	if err == nil {
-		p.syncAllMemberGroupOwner(projectID)
-	}
 	return changed, err
 }
 
@@ -1647,11 +1562,7 @@ func (p *Project) transferProjectOwner(projectID, spaceID, actorUID, successorUI
 	err := retryOnLockConflict(func() error {
 		return p.transferProjectOwnerOnce(projectID, spaceID, actorUID, successorUID)
 	})
-	if err == nil {
-		p.syncAllMemberGroupOwner(projectID)
-	}
 	return err
-
 }
 func (p *Project) transferProjectOwnerOnce(projectID, spaceID, actorUID, successorUID string) error {
 	if strings.TrimSpace(successorUID) == "" || successorUID == actorUID {
@@ -1850,24 +1761,24 @@ func (p *Project) beginRemovalWithCascadeTx(
 //
 // # Why the agents have to go
 //
-// This is not a policy invented here, it is the project-side half of a rule the
-// group side has enforced since #354: RemoveGroupMembers takes the leaver's bots
-// out of the group with them, matched on robot.creator_uid, with no exception for
-// role. P1's detach reuses RemoveGroupMembers, so the moment a person's project
-// seat closes, their agents are already being pulled out of that project's groups.
+// An agent runs AS its owner (modules/bot_api/obo_fanout.go renders it that way
+// to the model itself), and its Project seat is that owner's access by proxy. An
+// owner who has left the project must not still have an automated principal
+// reading it, so the seat closes in the same transaction as the owner's — a
+// separate removal job per uid, because the worker re-reads each row under lock
+// and re-admission cancels per uid.
 //
-// Without this, the agent keeps an ACTIVE project seat while sitting in none of
-// the project's groups. That is I4 broken — the all-member group's roster no
-// longer equals the project's roster — and nothing repairs it: the seat is
-// active, so no cascade will ever look at it again, and the admitter only runs on
-// a fresh add. The first member to leave any project would break the invariant
+// Nothing else repairs it: the seat is active, so no cascade would ever look at
+// it again. The first member to leave any project would leave a live proxy behind
 // permanently.
 //
-// It is also what the word means. An agent runs AS its owner
-// (modules/bot_api/obo_fanout.go renders it that way to the model itself); an
-// owner who has left the project should not still have a proxy reading it.
+// # Project membership only
 //
-// # Matched on robot.creator_uid, deliberately the same field as the group side
+// This is a Project-side seat rule and nothing more. Native group membership is
+// an independent fact: closing the seat does not remove the member or their
+// agents from any ordinary associated group, and no projection re-adds them.
+//
+// # Matched on robot.creator_uid
 //
 // queryOwnedAgentSeatsTx joins `robot` on creator_uid, exactly as
 // QueryBotsInvitedByUIDTx does. Matching on invite_uid instead would be the
@@ -1975,12 +1886,12 @@ func (p *Project) beginRemovalWithAgentsTx(
 	// ONE event per CLOSED SEAT, the human's and every agent that went with them —
 	// not one event for the human.
 	//
-	// The agents hold octo_project_member seats, so they are members under the
-	// all-member-group invariant, and contract §3 carves out nothing for them. Every
-	// other channel in this transaction already treats these closures as member
-	// removals: each gets its own removal job above, its own audit entry, and its own
-	// role-cache invalidation. Only the peer-facing push skipped them, and nothing
-	// recorded the omission.
+	// The agents hold octo_project_member seats and drop out with their owner, so
+	// they are Project member revocations like any other. Every other channel in
+	// this transaction already treats these closures as member removals: each gets
+	// its own removal job above, its own audit entry, and its own role-cache
+	// invalidation. Only the peer-facing push skipped them, and nothing recorded the
+	// omission.
 	//
 	// Why that matters more for this event class than for a display update: the
 	// module's own doctrine is that losing a revocation is a security failure rather

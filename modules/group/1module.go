@@ -46,11 +46,9 @@ func init() {
 		api.registerPresetGroupAdmitter()
 		// 项目解散后把关联群回落为 Space 直属，保留原生群成员；这是反向注册，
 		// modules/project 不能 import 本模块。
+		// Project 不再拥有任何群：成员/Owner/改名投影已随 2026-09-24 切换移除，
+		// 关联群按普通原生群各自管理。
 		api.registerProjectCascadeSteps()
-
-		// P2：全员群的四个钩子（建群、Project 准入、群主同步、项目改名），同样
-		// 反向注册进 modules/project。普通 Project 关联群和预设群不进入这些钩子。
-		api.registerAllMemberGroupHooks()
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {

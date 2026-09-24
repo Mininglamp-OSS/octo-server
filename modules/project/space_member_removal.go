@@ -14,7 +14,6 @@ import (
 
 const (
 	spaceMemberRemovalStepName = "project_member"
-	spaceMemberRejoinStepName  = "project_rejoin"
 )
 
 // cascadePageSize bounds ONE QUERY over a removed member's projects; cascadeMaxPages bounds
@@ -69,8 +68,11 @@ func (p *Project) registerSpaceMemberRemovalCleanup() {
 	// removal side wired and the rejoin side not, round 9 had two of the four rejoin
 	// doors wired. Neither was a missed scenario; both were a hand-maintained pair
 	// with one half missing. With one registry there is no other half to miss.
+	//
+	// Space reactivation no longer has a Project-side projection step: native group
+	// membership is not restored by a Space seat reopening. The epoch bump above is
+	// the only Project-side reaction, and it must move in BOTH directions.
 	spacemod.RegisterSeatTransitionTxStep(spaceMemberRemovalStepName, p.bumpEpochsOnSeatTransition)
-	spacemod.RegisterMemberRejoinCleanupStep(spaceMemberRejoinStepName, p.restoreSpaceMemberProjects)
 }
 
 // bumpEpochsOnSeatTransition moves member_epoch for every project the member still
@@ -102,135 +104,6 @@ func (p *Project) bumpEpochsOnSeatTransition(tx *dbr.Tx, t spacemod.SeatTransiti
 	return p.db.bumpMemberEpochForSpaceMemberTx(tx, t.Seat.SpaceID(), t.Seat.UID())
 }
 
-// restoreSpaceMemberProjects is the projection-only half of a Space rejoin.
-// It walks active Project seats with a stable project_id cursor, restores only
-// the current dedicated-group pointer, and retries broker/owner convergence
-// failures through the same durable Space outbox row.
-func (p *Project) restoreSpaceMemberProjects(ctx *config.Context, rejoin spacemod.MemberRemoval) error {
-	if ctx == nil || rejoin.SpaceID == "" || rejoin.UID == "" {
-		return nil
-	}
-	spaceActive, err := spacepkg.CheckMembership(ctx.DB(), rejoin.SpaceID, rejoin.UID)
-	if err != nil {
-		return fmt.Errorf("project: re-check Space membership before rejoin projection: %w", err)
-	}
-	if !spaceActive {
-		return nil
-	}
-	canonicalSpaceID, found, err := spacepkg.ResolveSpaceID(ctx.DB(), rejoin.SpaceID)
-	if err != nil {
-		return fmt.Errorf("project: resolve Space identity before rejoin projection: %w", err)
-	}
-	if !found {
-		// CheckMembership above can only authorize a real active Space. If the
-		// row disappears between the two reads, fail closed instead of passing
-		// the raw selector to a projection hook.
-		return nil
-	}
-	accountUsable, err := p.rejoinAccountUsable(rejoin.UID)
-	if err != nil {
-		return err
-	}
-	if !accountUsable {
-		return nil
-	}
-
-	cursor := rejoin.RejoinCursor
-	projectIDs, err := p.db.queryActiveProjectIDsForSpaceMemberRejoin(
-		canonicalSpaceID, rejoin.UID, cursor, cascadePageSize,
-	)
-	if err != nil {
-		return err
-	}
-	if len(projectIDs) == 0 {
-		return nil
-	}
-	var firstErr error
-	for _, projectID := range projectIDs {
-		if err := p.restoreSpaceMemberProject(
-			ctx, canonicalSpaceID, rejoin.UID, projectID,
-		); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	if len(projectIDs) == cascadePageSize {
-		return &spacemod.MemberRejoinPageIncompleteError{
-			Cursor: projectIDs[len(projectIDs)-1],
-		}
-	}
-	return nil
-}
-
-func (p *Project) rejoinAccountUsable(uid string) (bool, error) {
-	var found []int
-	if _, err := p.db.session.SelectBySql(
-		"SELECT 1 FROM `user` WHERE uid = ? AND status = 1 "+
-			"AND COALESCE(is_destroy, 0) <> 2 LIMIT 1",
-		uid,
-	).Load(&found); err != nil {
-		return false, fmt.Errorf("project: query rejoin account: %w", err)
-	}
-	return len(found) > 0, nil
-}
-
-func (p *Project) restoreSpaceMemberProject(
-	ctx *config.Context, spaceID, uid, projectID string,
-) error {
-	spaceActive, err := spacepkg.CheckMembership(ctx.DB(), spaceID, uid)
-	if err != nil {
-		return fmt.Errorf("project: re-check Space membership for project: %w", err)
-	}
-	if !spaceActive {
-		return nil
-	}
-	member, err := p.db.queryMember(projectID, uid)
-	if err != nil {
-		return err
-	}
-	if member == nil || member.Status != MemberStatusActive || member.Removing != 0 {
-		return nil
-	}
-	project, err := p.db.queryByProjectID(projectID)
-	if err != nil {
-		return err
-	}
-	if project == nil || project.Status != StatusNormal {
-		return nil
-	}
-	projectSpaceID, found, err := spacepkg.ResolveSpaceID(ctx.DB(), project.SpaceID)
-	if err != nil {
-		return fmt.Errorf("project: resolve Project Space identity for restore: %w", err)
-	}
-	if !found || projectSpaceID != spaceID {
-		return nil
-	}
-	groupNo := p.ensureAllMemberGroup(projectID, spaceID)
-	if groupNo == "" {
-		if allMemberGroupProvisioner() == nil {
-			return errors.New("project: all-member provisioner is not registered")
-		}
-		return errors.New("project: dedicated-group pointer is not converged")
-	}
-	admit := allMemberGroupAdmitter()
-	if admit == nil {
-		return errors.New("project: all-member admission hook is not registered")
-	}
-	if err := admit(ctx, spaceID, groupNo, uid); err != nil {
-		return fmt.Errorf("project: restore dedicated-group member: %w", err)
-	}
-	transfer := allMemberGroupOwnerTransfer()
-	if transfer == nil {
-		return errors.New("project: all-member owner hook is not registered")
-	}
-	if err := transfer(ctx, projectID, groupNo); err != nil {
-		return fmt.Errorf("project: restore dedicated-group owner: %w", err)
-	}
-	return nil
-}
-
 // cleanupSpaceMemberProjects closes every project seat a removed Space member still
 // holds in that Space.
 //
@@ -239,9 +112,13 @@ func (p *Project) restoreSpaceMemberProject(
 // transaction but executed by a poller with a lease, exponential backoff and a
 // terminal abandoned state. Between the Space removal committing and this step
 // running, octo_project_member rows exist with status=1 and no active Space seat.
-// P0 tolerates that window because a project seat grants nothing yet: no group, no
-// channel, no message. The tolerance expires in P1, where the same row gates group
-// admission.
+// That window is tolerated because the Space gate already denies access at commit:
+// the seat grants nothing on its own, and the epoch moved synchronously.
+//
+// The step closes Project seats ONLY. Native group membership is an independent
+// fact — Space revocation still removes the member from the Space's groups through
+// its own cascade, and closing a Project seat neither removes nor restores any
+// group row.
 //
 // Contract compliance (modules/space/member_removal.go:56-64):
 //
@@ -571,8 +448,9 @@ func (p *Project) deactivateSeatForCascadeResult(
 		// an over-emission at once, in opposite directions:
 		//
 		//   - UNDER: the agents that went with the human hold octo_project_member
-		//     seats, so they are members under the all-member-group invariant and
-		//     contract §3 carves out nothing for them. Their seats close in this very
+		//     seats and drop out with their owner, so they are Project member
+		//     revocations like any other, and contract §3 carves out nothing for
+		//     them. Their seats close in this very
 		//     transaction, each with its own removal job, its own audit entry
 		//     (agent_follows_owner) and its own role-cache invalidation — every
 		//     channel except the peer-facing push already treated them as member

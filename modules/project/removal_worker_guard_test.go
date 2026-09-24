@@ -1,13 +1,5 @@
 package project
 
-// The removal worker's two fail-closed guards, and the counter an operator
-// pages off.
-//
-// PR #846's review measured that three of round 2's fixes were pinned by
-// nothing: disabling the empty-registry guard kept the whole modules/project
-// suite green. A fix this repo's own doctrine calls "guards over intent" is not
-// finished while a mutation of it passes.
-
 import (
 	"errors"
 	"testing"
@@ -17,53 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// withNoRemovalSteps empties the reverse-registration registry for the duration
-// of one case and restores it afterwards. The project worker owns this registry
-// even when no optional project-side cleanup callback is installed.
-func withNoRemovalSteps(t *testing.T) {
-	t.Helper()
-	cascadeMu.Lock()
-	saved := memberRemovalSteps
-	memberRemovalSteps = nil
-	cascadeMu.Unlock()
-	t.Cleanup(func() {
-		cascadeMu.Lock()
-		memberRemovalSteps = saved
-		cascadeMu.Unlock()
-	})
-}
-
-// TestAnEmptyStepRegistryClosesTheProjectSeat.
-//
-// Group-owned native membership cleanup is no longer registered here: Project removal must
-// still complete its own seat closure rather than retrying forever on an intentionally empty
-// registry. The absence of project cleanup steps means there is no local side effect to wait
-// for; native group membership remains owned by the group module.
-func TestAnEmptyStepRegistryClosesTheProjectSeat(t *testing.T) {
-	p, job := claimedJob(t, "worker-a")
-	withNoRemovalSteps(t)
-
-	p.workRemovalJob(job, "worker-a")
-
-	status, removing := seatState(t, job.ProjectID, job.UID)
-	require.Equal(t, MemberStatusRemoved, status,
-		"with no project-side cleanup steps, the Project seat must still close")
-	require.Zero(t, removing)
-
-	jobStatus, _ := jobRow(t, job.ID)
-	require.Equal(t, removalJobDone, jobStatus,
-		"an intentionally empty cleanup registry must not leave the job pending")
-}
-
-// TestAFullyRegisteredCascadeDoesCloseTheSeat is the control. Without it,
-// breaking the worker outright would satisfy the empty-registry case above.
-func TestAFullyRegisteredCascadeDoesCloseTheSeat(t *testing.T) {
+// TestRemovalWorkerClosesProjectSeat checks the worker's own seat transition.
+func TestRemovalWorkerClosesProjectSeat(t *testing.T) {
 	p, job := claimedJob(t, "worker-a")
 
 	p.workRemovalJob(job, "worker-a")
 
 	status, removing := seatState(t, job.ProjectID, job.UID)
-	require.Equal(t, MemberStatusRemoved, status, "the real registry must close the seat")
+	require.Equal(t, MemberStatusRemoved, status, "the worker must close the Project seat")
 	require.Zero(t, removing)
 
 	jobStatus, _ := jobRow(t, job.ID)

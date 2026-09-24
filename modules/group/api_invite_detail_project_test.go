@@ -40,8 +40,7 @@ func TestGroupInviteDetailNeverLeaksProjectID(t *testing.T) {
 	// And again on the way out. Several cases in this package seed
 	// user.Model{UID: testutil.UID} under require.NoError and create groups
 	// against a per-user quota, so they only pass on a table this case has not
-	// left rows in — the sibling all_member_group cases carry the same defer for
-	// the same reason. Cleaning only on entry protects this case and nothing that
+	// left rows in. Cleaning only on entry protects this case and nothing that
 	// runs after it, and -shuffle=on decides what that is.
 	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
 

@@ -4,17 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
-	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// P2 behavioural tests: agents at create time (D2/D3/D11/D16), initial
-// all-member-group provisioning, agent-seat cleanup, and agent eligibility.
-// The stand-in provisioner exercises the project-side registry contract;
-// native group membership is intentionally independent after creation.
+// Agent seats at create time (D2/D3/D11/D16), agent-seat cleanup, and agent
+// eligibility. Native group membership is intentionally independent: nothing
+// here provisions, renames, or admits to a group.
 
 // ---------- fixtures ----------
 
@@ -35,107 +32,6 @@ func seedAgent(t *testing.T, spaceID, agentUID, ownerUID, hosting string) {
 	seedSpaceMember(t, spaceID, agentUID, 0, 1)
 }
 
-// stubAllMemberGroup installs stand-in hooks and returns a recorder.
-//
-// Every test that touches the create path installs the provisioner stand-in,
-// because the real one is registered by modules/group in binaries that include it.
-// The rename stand-in is installed as well for metadata-sync coverage.
-type allMemberGroupStub struct {
-	provisionCalls int
-	groupNo        string
-	groupNos       map[string]string
-	provisionErr   error
-	seeds          []AllMemberGroupSeed
-	renames        []string
-	// provisionedInsideTx records that the provisioner saw NO committed project
-	// row -- i.e. it was called from inside the create transaction, which is the
-	// lock-order inversion the registry contract exists to prevent.
-	provisionedInsideTx bool
-	provisionOrderErr   error
-}
-
-// assertProvisionedAfterCommit fails the case if any provisioning ran before the
-// project transaction committed. Registered as a cleanup by stubAllMemberGroup so
-// every stubbed case carries the check without restating it.
-func (s *allMemberGroupStub) assertProvisionedAfterCommit(t *testing.T) {
-	t.Helper()
-	require.NoError(t, s.provisionOrderErr, "the ordering probe itself failed")
-	require.False(t, s.provisionedInsideTx,
-		"the provisioner ran while the create transaction was still open: it would take "+
-			"`group` / `group_member` locks under the project row lock and invert the "+
-			"declared lock order")
-}
-
-func stubAllMemberGroup(t *testing.T, groupNo string) *allMemberGroupStub {
-	t.Helper()
-	// Put the REAL hooks back when this case ends.
-	//
-	// The registry is process-wide and latest-wins, and this binary may contain
-	// modules/group. Leaving a stand-in behind would silently disable the real
-	// provisioner or rename hook for later cases, so restore both at cleanup.
-	//
-	// modules/space's removal-step registry carries the same warning about the
-	// same hazard.
-	restore := SnapshotAllMemberGroupHooksForTest()
-	t.Cleanup(func() { RestoreAllMemberGroupHooksForTest(restore) })
-
-	s := &allMemberGroupStub{groupNo: groupNo, groupNos: make(map[string]string)}
-	RegisterAllMemberGroupProvisioner(func(_ *config.Context, seed AllMemberGroupSeed) (string, error) {
-		s.provisionCalls++
-		s.seeds = append(s.seeds, seed)
-		// The registry contract's first clause, checked on EVERY stubbed
-		// provisioning rather than in one dedicated case: the hook runs after the
-		// project transaction has COMMITTED.
-		//
-		// This read goes out on a pooled connection that is not the create's
-		// transaction, so the project row is visible here only if that transaction
-		// is already committed. That ordering is not a nicety -- it is what keeps
-		// the declared lock order (space_member -> space -> project -> group ->
-		// group_member -> octo_project_member) intact, because everything this hook
-		// goes on to do touches `group` and `group_member`. A hook called from
-		// inside the project transaction would take those locks under the project
-		// row lock and invert the order for every concurrent group write.
-		var seen int
-		if qerr := testCtx.DB().SelectBySql(
-			"SELECT COUNT(*) FROM `octo_project` WHERE project_id = ?", seed.ProjectID,
-		).LoadOne(&seen); qerr != nil {
-			s.provisionOrderErr = qerr
-		} else if seen == 0 {
-			s.provisionedInsideTx = true
-		}
-		if s.provisionErr != nil {
-			return "", s.provisionErr
-		}
-		// Insert a REAL `group` row, because the real provisioner does. Keeping the
-		// row behind the stand-in lets rename and disband tests exercise the same
-		// project/group relation as production.
-		groupNoForProject, ok := s.groupNos[seed.ProjectID]
-		if !ok {
-			groupNoForProject = s.groupNo
-			if len(s.groupNos) > 0 {
-				groupNoForProject += "-" + seed.ProjectID
-			}
-			s.groupNos[seed.ProjectID] = groupNoForProject
-		}
-		_, err := testCtx.DB().InsertBySql(
-			"INSERT INTO `group` (group_no, name, creator, status, space_id, project_id) "+
-				"VALUES (?, ?, ?, 1, ?, ?) "+
-				"ON DUPLICATE KEY UPDATE project_id = VALUES(project_id), status = 1",
-			groupNoForProject, seed.Name, seed.Creator, seed.SpaceID, seed.ProjectID,
-		).Exec()
-		if err != nil {
-			return "", err
-		}
-		return groupNoForProject, nil
-	})
-	RegisterAllMemberGroupRename(func(_ *config.Context, _, _, name string) error {
-		s.renames = append(s.renames, name)
-		return nil
-	})
-	t.Cleanup(func() { s.assertProvisionedAfterCommit(t) })
-	return s
-}
-
 // memberRow reads one seat straight from the table.
 func memberRow(t *testing.T, projectID, uid string) *MemberModel {
 	t.Helper()
@@ -152,18 +48,10 @@ func memberRow(t *testing.T, projectID, uid string) *MemberModel {
 	return rows[0]
 }
 
-func allMemberGroupNoOf(t *testing.T, projectID string) string {
-	t.Helper()
-	no, err := testDB.queryAllMemberGroupNo(projectID)
-	require.NoError(t, err)
-	return no
-}
-
 // ---------- D2 / D3 / D11 / D16: agents at create time ----------
 
 func TestCreateProjectSeatsTheCreatorsAgents(t *testing.T) {
 	srv, p := setup(t)
-	stub := stubAllMemberGroup(t, "grp_all_1")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -230,21 +118,12 @@ func TestCreateProjectSeatsTheCreatorsAgents(t *testing.T) {
 	require.Equal(t, resp.HumanMemberCount+resp.AgentMemberCount, resp.MemberCount,
 		"and the three must add up, which is why toResp derives the total from the two "+
 			"halves instead of reading a third count under a third read view")
-
-	// The provisioner was seeded with the agents and NOT with the creator (the
-	// group side adds its own creator).
-	require.Equal(t, 1, stub.provisionCalls)
-	require.Equal(t, []string{"bot_mine_1", "bot_mine_2"}, stub.seeds[0].Members)
-	require.Equal(t, "u_owner", stub.seeds[0].Creator)
-	require.Equal(t, "供应链运营协同", stub.seeds[0].Name)
-	require.Equal(t, "grp_all_1", resp.AllMemberGroupNo)
 }
 
 // TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent pins D3: no partial
 // success, and every reason renders identically.
 func TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_all_2")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -328,7 +207,6 @@ func TestCreateProjectRejectsTheWholeRequestOnOneIneligibleAgent(t *testing.T) {
 
 func TestCreateProjectRejectsAnOverLongAgentBatch(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_all_3")
 	p.cfg.MemberBatchMax = 2
 	r := mountProject(t, p)
 
@@ -349,7 +227,6 @@ func TestCreateProjectRejectsAnOverLongAgentBatch(t *testing.T) {
 // Internal store_failed it fell through to before P2 registered one.
 func TestCreateProjectRefusesWhenAgentsExceedTheMemberQuota(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_all_4")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -368,32 +245,6 @@ func TestCreateProjectRefusesWhenAgentsExceedTheMemberQuota(t *testing.T) {
 	require.Contains(t, w.Body.String(), "err.server.project.quota_members")
 }
 
-// ---------- initial provisioning ----------
-
-// TestAllMemberGroupProvisioningIsSkippedWhenUnregistered pins the binary that
-// contains modules/project but not modules/group: the create succeeds, the group
-// is absent, and nothing panics.
-func TestAllMemberGroupProvisioningIsSkippedWhenUnregistered(t *testing.T) {
-	_, p := setup(t)
-	restore := SnapshotAllMemberGroupHooksForTest()
-	t.Cleanup(func() { RestoreAllMemberGroupHooksForTest(restore) })
-	RegisterAllMemberGroupProvisioner(nil)
-
-	seedSpace(t, spaceA, 1)
-	seedUser(t, "u_owner")
-	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
-
-	model, err := p.createProjectOnce(createInput{
-		SpaceID: spaceA, Creator: "u_owner", Name: "no hooks",
-		Discoverability: DiscoverabilitySpaceListed,
-	})
-	require.NoError(t, err)
-	require.NotNil(t, model)
-
-	p.provisionAllMemberGroup(model.ProjectID, spaceA, "u_owner", "no hooks", nil)
-	require.Empty(t, allMemberGroupNoOf(t, model.ProjectID))
-}
-
 // ---------- D13: agents follow their owner out ----------
 
 // TestRemovingAMemberClosesTheirAgentsSeatsInTheSameTransaction is the core D13
@@ -401,7 +252,6 @@ func TestAllMemberGroupProvisioningIsSkippedWhenUnregistered(t *testing.T) {
 // so those seats cannot outlive the member's Project qualification.
 func TestRemovingAMemberClosesTheirAgentsSeatsInTheSameTransaction(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_d13")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -469,7 +319,6 @@ func TestRemovingAMemberClosesTheirAgentsSeatsInTheSameTransaction(t *testing.T)
 // TestLeavingAProjectTakesTheLeaversAgents covers the self-service half of D13.
 func TestLeavingAProjectTakesTheLeaversAgents(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_d13_leave")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -499,40 +348,10 @@ func TestLeavingAProjectTakesTheLeaversAgents(t *testing.T) {
 	require.Equal(t, 1, agentSeat.Removing, "an agent follows its owner out on leave too")
 }
 
-// ---------- D8: rename sync ----------
-
-func TestRenamingAProjectSyncsTheGroupNameOnlyWhenTheNameChanges(t *testing.T) {
-	_, p := setup(t)
-	stub := stubAllMemberGroup(t, "grp_rename")
-	r := mountProject(t, p)
-
-	seedSpace(t, spaceA, 1)
-	owner := seedUser(t, "u_owner")
-	seedSpaceMember(t, spaceA, "u_owner", 0, 1)
-
-	w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", owner,
-		map[string]any{"name": "before"})
-	require.Equal(t, http.StatusOK, w.Code)
-	resp := decodeResp(t, w)
-
-	w = doOn(t, r, http.MethodPut, "/v1/projects/"+resp.ProjectID, owner,
-		map[string]any{"name": "after"})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	require.Equal(t, []string{"after"}, stub.renames)
-
-	// An update that touches only the description must NOT push a group rename:
-	// it would bump the group's version and refresh every client for nothing.
-	w = doOn(t, r, http.MethodPut, "/v1/projects/"+resp.ProjectID, owner,
-		map[string]any{"description": "new goal"})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	require.Equal(t, []string{"after"}, stub.renames, "description-only update must not rename")
-}
-
 // ---------- D16: the roster distinguishes agents ----------
 
 func TestMemberRosterFlagsAgentsAndNamesTheirOwner(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_roster")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -570,7 +389,6 @@ func TestMemberRosterFlagsAgentsAndNamesTheirOwner(t *testing.T) {
 // an ordinary member gets the same response for an ineligible bot and a human.
 func TestAnOrdinaryMemberCannotTellAnAgentFromAHuman(t *testing.T) {
 	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_oracle")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -629,7 +447,6 @@ func TestAgentSeatsAreAudited(t *testing.T) {
 	_, p := setup(t)
 	rec := &auditRecorder{}
 	p.auditSink = rec.sink
-	stubAllMemberGroup(t, "grp_audit")
 	r := mountProject(t, p)
 
 	seedSpace(t, spaceA, 1)
@@ -683,47 +500,4 @@ func TestAgentSeatsAreAudited(t *testing.T) {
 		"the leaver is the actor: they closed their own seat and the agent followed")
 	require.Equal(t, resp.ProjectID, followed.ProjectID)
 	require.Equal(t, spaceA, followed.SpaceID)
-}
-
-// TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease is PR #855's review, Q1.
-//
-// The release used to key on the project alone, so ANY claimant's lease was
-// cleared. A provisioning attempt that outlives allMemberGroupLease then wipes,
-// on its way out, the lease a successor is actively holding — and a third writer
-// claims immediately, so two rebuilds run concurrently. That is the one thing the
-// lease exists to prevent, defeated by the failure path of the attempt it was
-// meant to fence.
-func TestReleasingAStaleClaimDoesNotClearTheSuccessorsLease(t *testing.T) {
-	_, p := setup(t)
-	stubAllMemberGroup(t, "grp_lease_fence")
-
-	model := leaseTestProject(t, p, "lease-fence")
-
-	now := time.Now().UTC()
-	stale, staleLease, err := p.db.claimAllMemberGroupProvision(model.ProjectID, now)
-	require.NoError(t, err)
-	require.True(t, stale)
-
-	// The stale attempt runs past its lease; a successor claims.
-	after := now.Add(allMemberGroupLease + time.Minute)
-	successor, successorLease, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
-	require.NoError(t, err)
-	require.True(t, successor, "an expired lease must be re-claimable")
-	require.NotEqual(t, staleLease, successorLease)
-
-	// Now the stale attempt fails and releases. It must not touch the successor's lease.
-	require.NoError(t, p.db.releaseAllMemberGroupProvision(model.ProjectID, staleLease))
-
-	third, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
-	require.NoError(t, err)
-	require.False(t, third,
-		"the successor still holds the lease, so nobody else may claim. Without the "+
-			"deadline fence the stale release cleared it and this claim succeeded — two "+
-			"rebuilds running at once, which is exactly what the lease is for")
-
-	// And the successor's own release still works.
-	require.NoError(t, p.db.releaseAllMemberGroupProvision(model.ProjectID, successorLease))
-	fourth, _, err := p.db.claimAllMemberGroupProvision(model.ProjectID, after)
-	require.NoError(t, err)
-	require.True(t, fourth, "a released lease must be immediately re-claimable")
 }

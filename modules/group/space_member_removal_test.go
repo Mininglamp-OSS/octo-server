@@ -338,166 +338,12 @@ func TestGroupCascadeRemovesLoneCreator(t *testing.T) {
 	assert.False(t, stillIn, "无继任者也必须把群主清出去，群成为无主空群")
 }
 
-// TestGroupCascadeDedicatedOwnerRemovalDoesNotHandOver verifies the distinct
-// lifecycle contract for the live Project projection: losing the Space seat
-// removes the native creator without promoting a second member, while the
-// Project Owner seat and dedicated pointer remain for a later rejoin.
-func TestGroupCascadeDedicatedOwnerRemovalDoesNotHandOver(t *testing.T) {
-	ctx, g := cascadeSetup(t)
-	stub := newGroupIMStub(t, ctx)
-	const (
-		spaceID   = "sp-dedicated-owner"
-		projectID = "project-dedicated-owner"
-		groupNo   = "g-dedicated-owner"
-		owner     = "u-dedicated-owner"
-		member    = "u-dedicated-member"
-	)
-
-	seedActiveSpaceMember(t, ctx, spaceID, owner)
-	_, err := ctx.DB().Exec(
-		"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?",
-		spaceID, owner,
-	)
-	require.NoError(t, err)
-	seedGroupInSpace(t, ctx, groupNo, spaceID, owner)
-	_, err = ctx.DB().Exec(
-		"UPDATE `group` SET project_id = ? WHERE group_no = ?",
-		projectID, groupNo,
-	)
-	require.NoError(t, err)
-	_, err = ctx.DB().Exec(
-		"INSERT INTO `octo_project` "+
-			"(project_id, space_id, name, creator, status, all_member_group_no, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())",
-		projectID, spaceID, projectID, owner, groupNo,
-	)
-	require.NoError(t, err)
-	_, err = ctx.DB().Exec(
-		"INSERT INTO `octo_project_member` "+
-			"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
-			"VALUES (?, ?, ?, 2, 1, 0, ?, NOW(), NOW())",
-		projectID, owner, spaceID, owner,
-	)
-	require.NoError(t, err)
-	seedGroupMember(t, ctx, groupNo, owner, MemberRoleCreator)
-	seedGroupMember(t, ctx, groupNo, member, MemberRoleCommon)
-
-	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
-		SpaceID: spaceID, UID: owner, OperatorUID: "space-admin",
-		Reason: spacemod.MemberRemoveReasonKicked,
-	}))
-
-	_, ownerInGroup := liveMemberRole(t, ctx, groupNo, owner)
-	assert.False(t, ownerInGroup, "失去 Space 资格的专属群 Owner 必须被移除")
-	role, memberInGroup := liveMemberRole(t, ctx, groupNo, member)
-	require.True(t, memberInGroup, "普通成员仍应留在专属群")
-	assert.Equal(t, MemberRoleCommon, role, "专属群不得 handover 给第二成员")
-	assert.Contains(t, stub.unsubscribed(groupNo), owner)
-
-	var projectRows []struct {
-		Role   int `db:"role"`
-		Status int `db:"status"`
-	}
-	_, err = ctx.DB().SelectBySql(
-		"SELECT role, status FROM `octo_project_member` WHERE project_id = ? AND uid = ?",
-		projectID, owner,
-	).Load(&projectRows)
-	require.NoError(t, err)
-	require.Len(t, projectRows, 1)
-	assert.Equal(t, 2, projectRows[0].Role, "Project Owner identity must remain")
-	assert.Equal(t, 1, projectRows[0].Status, "Project Owner seat remains rejoinable")
-
-	var pointer string
-	_, err = ctx.DB().SelectBySql(
-		"SELECT all_member_group_no FROM `octo_project` WHERE project_id = ?",
-		projectID,
-	).Load(&pointer)
-	require.NoError(t, err)
-	require.Equal(t, groupNo, pointer, "dedicated pointer must remain for restoration")
-}
-
-// TestGroupCascadeDedicatedOwnerRemovalCanonicalizesSpaceID keeps the
-// dedicated-vs-ordinary lifecycle decision on the database's collation
-// semantics. The Space-removal outbox carries the raw request selector, while
-// historical Project/group rows may retain a differently cased or padded
-// value. Either variant must still remove the native Owner without promoting
-// an ordinary member.
-func TestGroupCascadeDedicatedOwnerRemovalCanonicalizesSpaceID(t *testing.T) {
-	cases := []struct {
-		name           string
-		storedSpaceID  func(string) string
-		removalSpaceID func(string) string
-	}{
-		{
-			name:           "case_variant",
-			storedSpaceID:  func(base string) string { return strings.ToUpper(base) },
-			removalSpaceID: func(base string) string { return base },
-		},
-		{
-			name:           "pad_space",
-			storedSpaceID:  func(base string) string { return base + " " },
-			removalSpaceID: func(base string) string { return base },
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, g := cascadeSetup(t)
-			stub := newGroupIMStub(t, ctx)
-
-			baseSpaceID := "sp-dedicated-variant-" + tc.name
-			storedSpaceID := tc.storedSpaceID(baseSpaceID)
-			removalSpaceID := tc.removalSpaceID(baseSpaceID)
-			projectID := "project-dedicated-variant-" + tc.name
-			groupNo := "g-dedicated-variant-" + tc.name
-			owner := "u-dedicated-variant-owner-" + tc.name
-			member := "u-dedicated-variant-member-" + tc.name
-
-			seedActiveSpaceMember(t, ctx, storedSpaceID, owner)
-			_, err := ctx.DB().Exec(
-				"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?",
-				storedSpaceID, owner,
-			)
-			require.NoError(t, err)
-			seedGroupInSpace(t, ctx, groupNo, storedSpaceID, owner)
-			_, err = ctx.DB().Exec(
-				"UPDATE `group` SET project_id = ? WHERE group_no = ?",
-				projectID, groupNo,
-			)
-			require.NoError(t, err)
-			_, err = ctx.DB().Exec(
-				"INSERT INTO `octo_project` "+
-					"(project_id, space_id, name, creator, status, all_member_group_no, created_at, updated_at) "+
-					"VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())",
-				projectID, storedSpaceID, projectID, owner, groupNo,
-			)
-			require.NoError(t, err)
-			_, err = ctx.DB().Exec(
-				"INSERT INTO `octo_project_member` "+
-					"(project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at) "+
-					"VALUES (?, ?, ?, 2, 1, 0, ?, NOW(), NOW())",
-				projectID, owner, storedSpaceID, owner,
-			)
-			require.NoError(t, err)
-			seedGroupMember(t, ctx, groupNo, owner, MemberRoleCreator)
-			seedGroupMember(t, ctx, groupNo, member, MemberRoleCommon)
-
-			require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
-				SpaceID: removalSpaceID, UID: owner, OperatorUID: "space-admin",
-				Reason: spacemod.MemberRemoveReasonKicked,
-			}))
-
-			_, ownerInGroup := liveMemberRole(t, ctx, groupNo, owner)
-			assert.False(t, ownerInGroup, "失去 Space 资格的专属群 Owner 必须被移除")
-			role, memberInGroup := liveMemberRole(t, ctx, groupNo, member)
-			require.True(t, memberInGroup, "普通成员仍应留在专属群")
-			assert.Equal(t, MemberRoleCommon, role, "Space ID 变体不得触发专属群 handover")
-			assert.Contains(t, stub.unsubscribed(groupNo), owner)
-		})
-	}
-}
-
-func TestSpaceRemovalAfterDedicatedPointerCleared(t *testing.T) {
+// TestSpaceRemovalCleansAProjectLinkedGroup verifies that Space revocation
+// still removes a member from a group that carries a Project relation, using the
+// native group's own creator handover. A Project-linked group keeps its native
+// members and roles independent of the Project roster, so the Space cleanup must
+// treat it as an ordinary group.
+func TestSpaceRemovalCleansAProjectLinkedGroup(t *testing.T) {
 	ctx, g := cascadeSetup(t)
 	stub := newGroupIMStub(t, ctx)
 	const spaceID, projectID, groupNo = "sp-pointer-clear", "p-pointer-clear", "g-pointer-clear"
@@ -505,23 +351,21 @@ func TestSpaceRemovalAfterDedicatedPointerCleared(t *testing.T) {
 	seedGroupInSpace(t, ctx, groupNo, spaceID, owner)
 	seedGroupMember(t, ctx, groupNo, owner, MemberRoleCreator)
 	seedGroupMember(t, ctx, groupNo, successor, MemberRoleCommon)
+	// The group is linked to a Project. The cleanup carries no Project selector,
+	// so the relation must not influence the native removal decision.
 	_, err := ctx.DB().Exec(
-		"INSERT INTO octo_project (project_id, space_id, name, creator, status, all_member_group_no, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, 0, '', NOW(), NOW())",
-		projectID, spaceID, projectID, owner,
+		"UPDATE `group` SET project_id = ? WHERE group_no = ?", projectID, groupNo,
 	)
 	require.NoError(t, err)
-	// The cleanup captured the dedicated binding before Project disband
-	// cleared the pointer and returned the surviving group to Space scope.
 	require.NoError(t, g.exitSpaceMemberFromGroup(groupNo, spacemod.MemberRemoval{
 		SpaceID: spaceID, UID: owner, OperatorUID: "space-admin",
 		Reason: spacemod.MemberRemoveReasonKicked,
-	}, "Space admin", projectID))
+	}, "Space admin"))
 	_, present := liveMemberRole(t, ctx, groupNo, owner)
-	assert.False(t, present, "Space revocation must remove the member from the surviving group")
+	assert.False(t, present, "Space revocation must remove the member from the linked group")
 	role, present := liveMemberRole(t, ctx, groupNo, successor)
 	require.True(t, present)
-	assert.Equal(t, MemberRoleCreator, role, "the surviving ordinary group retains successor handover")
+	assert.Equal(t, MemberRoleCreator, role, "the linked group keeps native successor handover")
 	assert.Contains(t, stub.unsubscribed(groupNo), owner)
 }
 

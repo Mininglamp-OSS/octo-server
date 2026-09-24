@@ -74,7 +74,6 @@ func pinnedFlags(t *testing.T, srv *server.Server, spaceID, token string) map[st
 // nobody asked for riding along with a feature.
 func TestPinnedProjectSortsFirstAndLeavesTheRestAlone(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -104,7 +103,6 @@ func TestPinnedProjectSortsFirstAndLeavesTheRestAlone(t *testing.T) {
 // same project row reads pinned for one caller and not for the next.
 func TestPinIsPerUser(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	mateTok := seedUser(t, "mate")
@@ -134,7 +132,6 @@ func TestPinIsPerUser(t *testing.T) {
 // path this module keeps free of them.
 func TestPinDoesNotMoveMemberEpoch(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -154,7 +151,6 @@ func TestPinDoesNotMoveMemberEpoch(t *testing.T) {
 // upsert relies on.
 func TestPinIsIdempotent(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -179,7 +175,6 @@ func TestPinIsIdempotent(t *testing.T) {
 // just re-pinned would not come back to the front.
 func TestUnpinRestoresTheOriginalOrder(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -220,7 +215,6 @@ func TestUnpinRestoresTheOriginalOrder(t *testing.T) {
 // through the API rather than through the column.
 func TestRepinMovesToTheFront(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -247,12 +241,11 @@ func TestRepinMovesToTheFront(t *testing.T) {
 			"unpin it would still sort by the original pin time")
 }
 
-// TestPinnedIsReportedByEveryRouteThatReturnsAProject pins the contract
-// all_member_group_no already had to be fixed for once: a field on the list route
-// and absent from the detail route makes the two disagree about the same project.
+// TestPinnedIsReportedByEveryRouteThatReturnsAProject pins the parity rule a
+// removed field once had to be fixed for: a field present on the list route and
+// absent from the detail route makes the two disagree about the same project.
 func TestPinnedIsReportedByEveryRouteThatReturnsAProject(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -285,7 +278,6 @@ func TestPinnedIsReportedByEveryRouteThatReturnsAProject(t *testing.T) {
 // boundary on the settings write: Space visibility alone does not grant pin access.
 func TestASpaceMemberCannotPinAProjectTheyNeverJoined(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	adminTok := seedUser(t, "spaceadmin")
@@ -310,7 +302,6 @@ func TestASpaceMemberCannotPinAProjectTheyNeverJoined(t *testing.T) {
 // rather than against a status code.
 func TestSettingRefusalsAreIndistinguishable(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	seedSpace(t, spaceB, 1)
 	ownerTok := seedUser(t, "owner1")
@@ -344,7 +335,6 @@ func TestSettingRefusalsAreIndistinguishable(t *testing.T) {
 // is invisible; it stops being invisible at the second.
 func TestEmptySettingBodyIsANoOp(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -401,7 +391,6 @@ func TestSettingIsOnTheAuthenticatedGroup(t *testing.T) {
 // make that make sense.
 func TestPinQuotaIsEnforcedPerSpace(t *testing.T) {
 	srv, p := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	seedSpace(t, spaceB, 1)
 	tok := seedUser(t, "owner1")
@@ -439,7 +428,6 @@ func TestPinQuotaIsEnforcedPerSpace(t *testing.T) {
 // LOWERS the count must work at the cap, or a user who reaches it is stuck.
 func TestUnpinIsNeverRefusedAtTheCap(t *testing.T) {
 	srv, p := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -471,7 +459,6 @@ func TestUnpinIsNeverRefusedAtTheCap(t *testing.T) {
 // turning a toggle on twice fails the second time.
 func TestRepinningAtTheCapIsNotRefused(t *testing.T) {
 	srv, p := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -494,7 +481,6 @@ func TestRepinningAtTheCapIsNotRefused(t *testing.T) {
 // slot poorer with nothing to point at.
 func TestDisbandedProjectsDoNotSpendThePinBudget(t *testing.T) {
 	srv, p := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -523,7 +509,6 @@ func TestDisbandedProjectsDoNotSpendThePinBudget(t *testing.T) {
 // their seat makes an unlisted project invisible to them without touching the row.
 func TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	mateTok := seedUser(t, "mate")
@@ -558,7 +543,6 @@ func TestRemovedMemberPinOnUnlistedProjectDoesNotSpendTheBudget(t *testing.T) {
 // instead of manufacturing an inactive member row with a direct SQL fixture.
 func TestRemovedMemberAtPinCapCanPinVisibleProject(t *testing.T) {
 	srv, p := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	memberTok := seedUser(t, "mate")
@@ -620,7 +604,6 @@ func countPinnedForTest(t *testing.T, spaceID, uid string) int {
 // explicit opt-out from the default unpinned state.
 func TestUnpinningSomethingNeverPinnedPersistsOptOut(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -641,7 +624,6 @@ func TestUnpinningSomethingNeverPinnedPersistsOptOut(t *testing.T) {
 // query error instead of being silently converted to pinned=false.
 func TestCommittedPinAndSettingsReadFailureAreReportedSeparately(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	tok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -695,7 +677,6 @@ func TestCommittedPinAndSettingsReadFailureAreReportedSeparately(t *testing.T) {
 // handing members of unlisted projects an unbounded pin budget.
 func TestAMemberOfAnUnlistedProjectStillSpendsAPinSlot(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)

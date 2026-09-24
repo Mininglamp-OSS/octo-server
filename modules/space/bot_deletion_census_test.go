@@ -715,13 +715,12 @@ func TestEveryBotDeletionEntryPointRoutesThroughD14(t *testing.T) {
 			}
 		}
 		assert.True(t, routed,
-			"%s deletes a bot without going through CloseAllSpaceSeats. D14 exists because the "+
-				"alternatives all leave residue nothing repairs: a bare `UPDATE space_member SET "+
-				"status=0` skips the project-seat cascade and the group detach, and closing no "+
-				"seat at all leaves an ACTIVE project seat on an account that no longer exists — "+
-				"I4 scan B's violating state, and that scan is report-only. If this door is "+
-				"deliberately exempt, record the primitive it calls in d14ExemptPrimitives with "+
-				"the reason, so the exemption is a decision rather than an omission", d)
+			"%s deletes a bot without going through CloseAllSpaceSeats. A bare "+
+				"space_member UPDATE skips the Project-seat and native group cleanup; "+
+				"disabling the account before closing its Space seat can leave "+
+				"an active Project seat that an ineligible Bot cannot re-enter to repair. "+
+				"If this door is deliberately exempt, record the primitive it calls "+
+				"in d14ExemptPrimitives with the reason", d)
 		assert.True(t, d.idents["MemberRemoveReasonBotDeleted"],
 			"%s must close its seats with reason bot_deleted. The group cascade reads the reason "+
 				"to decide whether to post \"X was removed by Y\" in every group the account was "+

@@ -16,19 +16,21 @@
   `group_member` 席位过滤，同时保留 Project 成员授权、置顶排序和默认 50 条上限。
 - Project-backed 建群将非成员、禁用目标和跨 Space 等预期拒绝返回本地化 D14 4xx envelope（legacy wire status 仍为 400），`POST /v1/group/create` 同时接入共享 UID 限流；原生群管理门和 active 角色冲突的整批原子拒绝补齐回归覆盖。
 - Project 建群服务补齐 `BotUID` 的目标 Space 席位校验，与建群写入共用事务及既有锁顺序。跨 Space Bot 会拒绝整次建群；Space 内 Bot 无需先加入 Project，已有 Project Bot 成员保持单条原生记录及 `bot_admin`。
-- 统一 Sidebar 的 Project 条目仅对有效 Project 成员可见；Space-listed 非成员的历史
-  pin 不回填入口。`groups[]` 是不授予原生聊天权限的关系元数据，客户端字段切换需
-  协调上线且本版本不声称已部署；原生群成员同步不属于本 Sidebar 契约，普通发起群和
-  关联已有群保持既有独立行为。
+- 统一 Sidebar 的 Project 条目仅对有效 Project 成员可见；Space-listed 非成员的历史 pin 不回填入口。`groups[]` 展示关联群元数据，不授予原生聊天权限；客户端字段切换需协调上线，当前版本不声称已部署。
 - PR887 最新 review 收口：AI session container 关系 PUT/DELETE 在路由和 service 层均拒绝；实际 Group↔Project 关系变更推进 `group.version`，重复绑定/解绑不产生版本噪音；Project 关系列表、分页计数与 Sidebar 批量投影排除历史绑定的 AI 容器，普通群关系不受影响。预设群的原生成员模型与 Project 关系保持独立，允许并存且不增加警告或限制。
 - 置顶 upsert 保留 `%w` 错误链，并在重复置顶时修复 `pinned=1,pinned_at=NULL` 的历史偏好；`GET /v1/group/my` 角色列表的成员计数查询失败返回 `query_failed`，不再以成功的 0 掩盖数据库错误。无引用关系辅助函数已删除。
 - `joined_at` 采用 rolling expand：仅新增可空 `DATETIME(3)`，旧二进制可省略，读侧统一 `COALESCE(joined_at,created_at)`，新加入/重新加入写 UTC 时间；本版本不做回填或收缩为非空。Space cascade 保留 active human Owner，只有存在 active non-Owner agent rider 时才处理 rider，Owner-only 行不进入分页。
 - 经授权的 Drive provisioning 以 `project_id` 管理且不要求 Project 返回 Drive ID：远端支持后使用 `POST /v1/internal/drive/spaces`、`X-Internal-Token` 及 Project 名称、`octo_space_id`、当前 Owner `super_admin_uid`、`project_id`；仅 exact same project 重复请求幂等成功，其他 `409/401/500` 按重试/失败策略处理。`OCTO_DRIVE_INTERNAL_TOKEN` 与 Fleet HMAC 分离，功能关闭时不出站；远端接口及 30 字符名称支持是部署前提。
-- Project 对账恢复专属全员群 I4-A 缺群与 I4-B 缺员扫描，保留 `ReconcileEnabled` 昂贵扫描门禁，使用游标分页、宽限期、Space 撤权/移除/封禁/系统 bot 豁免并在完整轮转后发布 gauge；普通 `group.project_id` 关联群保持独立成员快照且不触发该缺员监控。
-- Space 撤权时，在同一事务中降级并移除专属群的原生 Owner 成员，保留 Project Owner 身份；恢复按有效账号、Space、Project 和当前专属指针投影最新真人 Owner，兼容跨表混合 collation。Space 和 Project 重新加入在成员事务内写入 `reason=rejoined` 投影任务；迟到退订的补订阅失败由清理回调补写持久任务，投影 worker 的失败由原任务重试。仅合并尚未执行、无租约、无游标且零次尝试的 pending 任务，避免越过新请求对应的 Project；成功分页持久化游标并归还 attempt。普通关联群保持原生成员快照。
-- Space 清理工单的立即入队与分页续跑时间按数据库毫秒精度截断，保证提交后的工单可立即认领；事件回归测试隔离进程级监听器，支持重复运行。
-- 运维注意：`project_i2_violations_total`、`group_admission_rejected_total` 及全员群 guard failure 计数器已移除，旧面板/告警应删除或允许序列缺失。Bot/IM 提示、订阅及其他提交后通知均按 best-effort 处理，数据库提交事实权威，失败只记录并走既有补偿/重试路径；缺失上述指标本身不是服务故障。
-- Space ID 解析改由数据库按 `space` 表实际 collation 返回存储值，旧 `rejoined` 任务在 worker 边界解析原始 selector；解析/查询失败沿原 lease 重试，`rejoined` 遇 Space 缺失或解散终止恢复，普通 Space removal 仍按原始 selector fail-safe 清理，避免大小写/PAD SPACE 或缺失 Space 导致错误跳过。
+- Project 显式创建仅建立 Project 与 Owner 席位；历史关联群和显式创建的普通群保持 `group.project_id`、成员、群主与消息。Project 成员、Owner 和名称变更独立于原生群操作；Web/Bot 群操作沿用原生权限。Project 创建、详情、列表和 Sidebar 响应使用普通关联群结构。
+- Project 成员移除任务继续关闭席位并保留重入取消和租约保护。Space 撤权继续清理关联群的原生成员，并按普通群规则继任群主；恢复席位保持 Project epoch 失效机制。升级前的 Space `reason=rejoined` 工单安全终结，不进入普通撤权步骤。
+- `scripts/project-native-groups.sql` 提供排空旧实例和在途任务后由运维手动执行的在线删列 SQL；新实例启动时保留旧列以支持滚动部署。历史群、成员及关系不迁移；执行脚本后旧二进制不能回滚使用。专属群 I4 扫描与指标退出运维面板。
+- Project 关联群群主转让的 HTTP 回归使用独立路由绑定当前测试的 Group 与事件上下文，并核对原生群主角色及 Project 关系在完整包顺序下保持一致。
+- Space 清理工单的立即入队时间按数据库毫秒精度截断，保证提交后可认领；事件回归测试隔离进程级监听器，支持重复运行。
+- 运维注意：`project_i2_violations_total` 与 `group_admission_rejected_total` 指标已移除，旧面板/告警应删除或允许序列缺失。
+  本次专属群切换停止发布 `project_all_member_group_missing`、`project_all_member_group_member_gaps`、
+  `project_all_member_group_provision_failures_total`、`project_all_member_group_sync_failures_total`；更新引用这些序列的面板与告警。
+  Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
+- 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
 
 ## [v1.1.2] - 2026-03-05

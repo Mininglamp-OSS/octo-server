@@ -288,85 +288,15 @@ func TestCleanupWorkerSkipsRejoinedMember(t *testing.T) {
 		},
 	}})
 	defer restore()
-	rejoinCalled := 0
-	restoreRejoin := swapRejoinCleanupStepsForTest([]namedCleanupStep{{
-		name: "projection",
-		fn: func(*config.Context, MemberRemoval) error {
-			rejoinCalled++
-			return nil
-		},
-	}})
-	defer restoreRejoin()
 
 	f.processMemberRemovalCleanups()
 
 	assert.Zero(t, called, "已重新加入的成员不得触发任何清理步骤")
 	jobs := cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 2)
+	require.Len(t, jobs, 1)
 	assert.Equal(t, MemberRemoveReasonKicked, jobs[0].Reason)
 	assert.Equal(t, removalCleanupDone, jobs[0].Status)
 	assert.Equal(t, "skipped_rejoined", jobs[0].LastError)
-	assert.Equal(t, MemberRemoveReasonRejoined, jobs[1].Reason)
-	assert.Equal(t, removalCleanupDone, jobs[1].Status)
-}
-
-// TestRejoinIntentDoesNotReuseClaimedProjection keeps a claimed projection
-// attempt separate from a later compensation. Once a worker owns the row, it
-// may already have crossed the IM side-effect boundary; reusing that row would
-// let the old worker mark done after a new IMRemove has invalidated the result.
-func TestRejoinIntentDoesNotReuseClaimedProjection(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
-	const spaceID = "wk-rejoin-claimed"
-	const uid = "claimed-user"
-	seedMember(t, f, spaceID, "owner-claimed", 2)
-
-	enqueue := func(operator string) {
-		tx, txErr := f.db.session.Begin()
-		require.NoError(t, txErr)
-		defer tx.RollbackUnlessCommitted()
-		require.NoError(t, EnqueueMemberRejoinIntentTx(tx, spaceID, uid, operator))
-		require.NoError(t, tx.Commit())
-	}
-
-	enqueue("first")
-	enqueue("duplicate-before-claim")
-	jobs := cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 1, "an unclaimed pending intent should be reused")
-
-	claimed, err := f.db.claimMemberRemovalCleanup("projection-worker", time.Now().UTC())
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	enqueue("after-claim")
-
-	jobs = cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 2, "a claimed intent must not absorb a fresh compensation")
-	assert.Equal(t, "projection-worker", jobs[0].LeaseOwner)
-	assert.Equal(t, "first", jobs[0].OperatorUID)
-	assert.Equal(t, "after-claim", jobs[1].OperatorUID)
-	assert.Equal(t, removalCleanupPending, jobs[1].Status)
-	assert.Empty(t, jobs[1].LeaseOwner)
-}
-
-func TestRejoinIntentDoesNotReuseResumedProjection(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-	const spaceID, uid = "wk-rejoin-resume", "resume-user"
-	require.NoError(t, EnqueueMemberRejoinIntent(f.ctx, spaceID, uid, uid))
-	claimed, err := f.db.claimMemberRemovalCleanup("page-worker", time.Now().UTC())
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	require.NoError(t, f.db.releaseMemberRejoinCleanup(
-		claimed.ID, "page-worker", claimed.Attempts, "project-midpoint",
-	))
-
-	require.NoError(t, EnqueueMemberRejoinIntent(f.ctx, spaceID, uid, uid))
-	jobs := cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 2,
-		"a later restoration must revisit projects before an existing continuation cursor")
-	require.Equal(t, "rejoin_cursor:project-midpoint", jobs[0].LastError)
-	require.Empty(t, jobs[1].LastError)
 }
 
 // TestCleanupWorkerRetriesFailedStep 步骤失败 → 计数 +1、推迟下次尝试、保持 pending。
@@ -464,8 +394,9 @@ func TestClaimCleanupRespectsLeaseAndSchedule(t *testing.T) {
 	assert.False(t, ok, "租约已易主，旧 owner 不得写终态")
 }
 
-// TestCleanupJobSurvivesRemoveRejoinRemove 移除 → 重新加入 → 再移除要保留
-// 两条移除工单和一条独立的重入投影工单；表上刻意不做 (space_id, uid) 唯一约束。
+// TestCleanupJobSurvivesRemoveRejoinRemove 移除 → 重新加入 → 再移除必须留下
+// 两条独立的移除工单：表上刻意不做 (space_id, uid) 唯一约束，迟到的重试不会
+// 互相覆盖，第二次移除也不会被当成重复而丢掉。
 func TestCleanupJobSurvivesRemoveRejoinRemove(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -478,7 +409,7 @@ func TestCleanupJobSurvivesRemoveRejoinRemove(t *testing.T) {
 	require.NoError(t, f.db.reactivateMember(spaceID, "victim-10", 0))
 	mustRemoveMember(t, f, spaceID, "victim-10", 1, "owner-10", MemberRemoveReasonKicked)
 
-	assert.Len(t, cleanupJobs(t, spaceID), 3, "第二次移除和重入投影都必须能入队")
+	assert.Len(t, cleanupJobs(t, spaceID), 2, "两次移除必须各自入队")
 }
 
 var _ = testutil.CleanAllTables
@@ -1133,11 +1064,9 @@ func TestCleanupRunsWhenSpaceDisbandedDespiteActiveMemberRow(t *testing.T) {
 
 	assert.Equal(t, 1, called, "Space 已解散，成员行只是 join-vs-disband 孤儿，清理必须照常执行")
 	jobs := cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 2)
+	require.Len(t, jobs, 1)
 	assert.Equal(t, MemberRemoveReasonKicked, jobs[0].Reason)
 	assert.Equal(t, removalCleanupDone, jobs[0].Status)
-	assert.Equal(t, MemberRemoveReasonRejoined, jobs[1].Reason)
-	assert.Equal(t, removalCleanupDone, jobs[1].Status)
 	assert.NotEqual(t, "skipped_rejoined", jobs[0].LastError,
 		"外层门不得把已解散空间里的孤儿成员行当成『已重新加入』")
 }
@@ -1171,23 +1100,15 @@ func TestCleanupSkipsMemberInBannedSpace(t *testing.T) {
 		},
 	}})
 	defer restore()
-	restoreRejoin := swapRejoinCleanupStepsForTest([]namedCleanupStep{{
-		name: "projection",
-		fn: func(*config.Context, MemberRemoval) error {
-			return nil
-		},
-	}})
-	defer restoreRejoin()
 
 	f.processMemberRemovalCleanups()
 
 	assert.Zero(t, called, "空间只是被封禁、人还是成员，不得触发任何清理步骤")
 	jobs := cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 2)
+	require.Len(t, jobs, 1)
 	assert.Equal(t, MemberRemoveReasonKicked, jobs[0].Reason)
 	assert.Equal(t, "skipped_rejoined", jobs[0].LastError)
-	assert.Equal(t, MemberRemoveReasonRejoined, jobs[1].Reason)
-	assert.Equal(t, removalCleanupDone, jobs[1].Status)
+	assert.Equal(t, removalCleanupDone, jobs[0].Status)
 }
 
 // TestCheckMembershipForCleanupMatrix 直接把谓词的真值表钉死。
@@ -1482,11 +1403,9 @@ func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
 	assert.GreaterOrEqual(t, promtestutil.ToFloat64(removalCleanupOldestPendingGauge), float64(600))
 }
 
-// TestRejoinIntentRunsProjectionFinalizerOnly distinguishes a durable rejoin
-// intent from the ordinary removal job. Rejoining must not replay destructive
-// cleanup steps, but its projection finalizer must still run after a worker
-// restart/claim.
-func TestRejoinIntentRunsProjectionFinalizerOnly(t *testing.T) {
+// TestLegacyRejoinJobRetiresWithoutCleanup ensures an old projection job
+// reaches a terminal state without running Space removal steps.
+func TestLegacyRejoinJobRetiresWithoutCleanup(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
 
@@ -1496,12 +1415,11 @@ func TestRejoinIntentRunsProjectionFinalizerOnly(t *testing.T) {
 		"INSERT INTO space_member_removal_cleanup "+
 			"(space_id, uid, operator_uid, reason, status, next_attempt_at) "+
 			"VALUES (?, ?, ?, ?, ?, ?)",
-		spaceID, uid, "operator", "rejoined", removalCleanupPending, time.Now().UTC(),
+		spaceID, uid, "operator", MemberRemoveReasonRejoined, removalCleanupPending, time.Now().UTC().Add(-time.Second),
 	).Exec()
 	require.NoError(t, err)
 
 	stepsCalled := 0
-	finalizersCalled := 0
 	restoreSteps := swapCleanupStepsForTest([]namedCleanupStep{{
 		name: "must-not-run",
 		fn: func(*config.Context, MemberRemoval) error {
@@ -1510,63 +1428,13 @@ func TestRejoinIntentRunsProjectionFinalizerOnly(t *testing.T) {
 		},
 	}})
 	defer restoreSteps()
-	restoreRejoin := swapRejoinCleanupStepsForTest([]namedCleanupStep{{
-		name: "project-projection",
-		fn: func(_ *config.Context, removal MemberRemoval) error {
-			finalizersCalled++
-			assert.Equal(t, "rejoined", removal.Reason)
-			return nil
-		},
-	}})
-	defer restoreRejoin()
 	f.processMemberRemovalCleanups()
 
-	assert.Zero(t, stepsCalled, "rejoin intent must not execute destructive removal steps")
-	assert.Equal(t, 1, finalizersCalled, "rejoin intent must execute projection finalizer")
+	assert.Zero(t, stepsCalled, "遗留 rejoined 工单不得执行破坏性移除步骤")
 	jobs := cleanupJobs(t, spaceID)
 	require.Len(t, jobs, 1)
-	assert.Equal(t, removalCleanupDone, jobs[0].Status)
-	assert.Empty(t, jobs[0].LastError)
-}
-
-func TestRejoinRetryResumesFailedPage(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-	const spaceID, uid = "wk-rejoin-retry", "rejoin-retry-user"
-	seedMember(t, f, spaceID, uid, 0)
-	require.NoError(t, EnqueueMemberRejoinIntent(f.ctx, spaceID, uid, uid))
-	failPage := true
-	restore := swapRejoinCleanupStepsForTest([]namedCleanupStep{{
-		name: "project-projection",
-		fn: func(_ *config.Context, removal MemberRemoval) error {
-			if removal.RejoinCursor == "" {
-				require.True(t, failPage, "a retry must not revisit a completed first page")
-				return &MemberRejoinPageIncompleteError{Cursor: "project-midpoint"}
-			}
-			require.Equal(t, "project-midpoint", removal.RejoinCursor)
-			if failPage {
-				failPage = false
-				return errors.New("projection temporarily unavailable")
-			}
-			return nil
-		},
-	}})
-	defer restore()
-	f.processMemberRemovalCleanups()
-	f.processMemberRemovalCleanups()
-	jobs := cleanupJobs(t, spaceID)
-	require.Len(t, jobs, 1)
-	require.Equal(t, removalCleanupPending, jobs[0].Status)
-	require.EqualValues(t, 1, jobs[0].Attempts, "a real failure must consume retry budget")
-	require.Contains(t, jobs[0].LastError, "projection temporarily unavailable")
-	require.True(t, jobs[0].NextAttemptAt.After(time.Now().UTC()), "retain failure backoff")
-	_, err = f.ctx.DB().Exec(
-		"UPDATE space_member_removal_cleanup SET next_attempt_at = ? WHERE id = ?",
-		time.Now().UTC().Add(-time.Second), jobs[0].ID,
-	)
-	require.NoError(t, err)
-	f.processMemberRemovalCleanups()
-	jobs = cleanupJobs(t, spaceID)
-	require.Equal(t, removalCleanupDone, jobs[0].Status,
-		"the retry must resume the failed page instead of revisiting the first page")
+	assert.Equal(t, removalCleanupDone, jobs[0].Status,
+		"遗留工单必须非破坏性终结，而不是留在 pending 等重试")
+	assert.Equal(t, "rejoin_projection_retired", jobs[0].LastError)
+	assert.Empty(t, jobs[0].LeaseOwner, "终结后不得再持有租约")
 }

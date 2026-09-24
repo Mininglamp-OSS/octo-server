@@ -88,22 +88,23 @@ func groupNosOf(list []ProjectGroupRelation) []string {
 // every live relation even when they hold no group_member row.
 func TestListProjectGroupsReturnsAllAssociatedGroups(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-associated")
 
+	first := util.GenerUUID()
 	mine := util.GenerUUID()
 	theirs := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, mine, spaceA, created.ProjectID)
 	seedProjectGroup(t, theirs, spaceA, created.ProjectID)
 	seedGroupMemberRow(t, mine, "owner1")
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{allMember.groupNo, mine, theirs}, groupNosOf(decodeGroupList(t, w)),
-		"the relation list must include initial provisioning and must not filter on native group membership")
+	assert.Equal(t, []string{first, mine, theirs}, groupNosOf(decodeGroupList(t, w)),
+		"the relation list must return every linked group and must not filter on native group membership")
 	assert.Equal(t, "3", w.Header().Get("X-Total-Count"))
 }
 
@@ -155,14 +156,15 @@ func TestListProjectGroupsExcludesLegacyBoundAIContainers(t *testing.T) {
 // expected state, not corruption.
 func TestListProjectGroupsExcludesDisbandedGroups(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-disband")
 
+	first := util.GenerUUID()
 	live := util.GenerUUID()
 	dead := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, live, spaceA, created.ProjectID)
 	seedProjectGroup(t, dead, spaceA, created.ProjectID)
 	seedGroupMemberRow(t, live, "owner1")
@@ -171,7 +173,7 @@ func TestListProjectGroupsExcludesDisbandedGroups(t *testing.T) {
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{allMember.groupNo, live}, groupNosOf(decodeGroupList(t, w)),
+	assert.Equal(t, []string{first, live}, groupNosOf(decodeGroupList(t, w)),
 		"a disbanded group keeps its group_member rows, so only the status filter excludes it")
 }
 
@@ -179,14 +181,15 @@ func TestListProjectGroupsExcludesDisbandedGroups(t *testing.T) {
 // remains stable when native group membership changes independently.
 func TestListProjectGroupsIgnoresNativeMemberState(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-native-state")
 
+	first := util.GenerUUID()
 	left := util.GenerUUID()
 	abnormal := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, left, spaceA, created.ProjectID)
 	seedProjectGroup(t, abnormal, spaceA, created.ProjectID)
 	seedInactiveGroupMemberRow(t, left, "owner1", 1, 1)
@@ -194,7 +197,7 @@ func TestListProjectGroupsIgnoresNativeMemberState(t *testing.T) {
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{allMember.groupNo, left, abnormal}, groupNosOf(decodeGroupList(t, w)),
+	assert.Equal(t, []string{first, left, abnormal}, groupNosOf(decodeGroupList(t, w)),
 		"native group membership is independent from Project relation visibility")
 }
 
@@ -202,30 +205,32 @@ func TestListProjectGroupsIgnoresNativeMemberState(t *testing.T) {
 // blacklist state does not alter Project relation metadata visibility.
 func TestListProjectGroupsIncludesBlacklistedNativeMember(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-blacklist")
 
+	first := util.GenerUUID()
 	banned := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, banned, spaceA, created.ProjectID)
 	seedInactiveGroupMemberRow(t, banned, "owner1", 0, int(common.GroupMemberStatusBlacklist))
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{allMember.groupNo, banned}, groupNosOf(decodeGroupList(t, w)))
+	assert.Equal(t, []string{first, banned}, groupNosOf(decodeGroupList(t, w)))
 }
 func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-paging")
 
 	// Seeded in order, so `group`.id ascends with the slice index.
-	want := []string{allMember.groupNo}
+	first := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
+	want := []string{first}
 	for i := 0; i < 3; i++ {
 		groupNo := util.GenerUUID()
 		seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
@@ -273,7 +278,6 @@ func TestListProjectGroupsPagesInCreationOrder(t *testing.T) {
 // to object.
 func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	seedSpace(t, spaceB, 1)
 	ownerTok := seedUser(t, "owner1")
@@ -281,22 +285,25 @@ func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-scope")
 	other := createProjectVia(t, srv, spaceA, ownerTok, "groups-scope-other")
 
+	first := util.GenerUUID()
 	spaceDirect := util.GenerUUID()
 	otherProject := util.GenerUUID()
 	crossSpace := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, spaceDirect, spaceA, "")
 	seedProjectGroup(t, otherProject, spaceA, other.ProjectID)
 	// This project's id, another Space's group. Only the space_id predicate keeps
 	// it out; seeded in raw SQL because no endpoint can produce it.
 	seedProjectGroup(t, crossSpace, spaceB, created.ProjectID)
+	seedGroupMemberRow(t, first, "owner1")
 	seedGroupMemberRow(t, spaceDirect, "owner1")
 	seedGroupMemberRow(t, otherProject, "owner1")
 	seedGroupMemberRow(t, crossSpace, "owner1")
 
 	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []string{allMember.groupNo}, groupNosOf(decodeGroupList(t, w)),
-		"only the initial all-member relation belongs to this project; a Space-direct group, "+
+	assert.Equal(t, []string{first}, groupNosOf(decodeGroupList(t, w)),
+		"only the relation linked to this project may be listed; a Space-direct group, "+
 			"another project's group and a cross-Space group carrying this project's id stay out")
 }
 
@@ -304,13 +311,14 @@ func TestListProjectGroupsExcludesGroupsOutsideTheProject(t *testing.T) {
 // free of chat membership metadata and proves the row remains visible.
 func TestListProjectGroupsDoesNotExposeNativeMemberCounts(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-count")
 
+	first := util.GenerUUID()
 	groupNo := util.GenerUUID()
+	seedProjectGroup(t, first, spaceA, created.ProjectID)
 	seedProjectGroup(t, groupNo, spaceA, created.ProjectID)
 	seedGroupMemberRow(t, groupNo, "owner1")
 	seedInactiveGroupMemberRow(t, groupNo, "quitter", 1, 1)
@@ -320,7 +328,7 @@ func TestListProjectGroupsDoesNotExposeNativeMemberCounts(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	list := decodeGroupList(t, w)
 	require.Len(t, list, 2)
-	assert.Contains(t, groupNosOf(list), allMember.groupNo)
+	assert.Contains(t, groupNosOf(list), first)
 	var relation *ProjectGroupRelation
 	for index := range list {
 		if list[index].GroupNo == groupNo {
@@ -343,7 +351,6 @@ func TestListProjectGroupsDoesNotExposeNativeMemberCounts(t *testing.T) {
 // boundary from widening to Space-admin read access.
 func TestListProjectGroupsRefusesNonProjectMembers(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	adminTok := seedUser(t, "spaceadmin")
@@ -367,7 +374,6 @@ func TestListProjectGroupsRefusesNonProjectMembers(t *testing.T) {
 // Any Space member could turn a query parameter into self-serve alert noise.
 func TestListProjectGroupsPaginationIsBounded(t *testing.T) {
 	srv, _ := setup(t)
-	stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
@@ -412,52 +418,19 @@ func TestListProjectGroupsIsOnTheAuthenticatedGroup(t *testing.T) {
 	}
 }
 
-// TestListProjectGroupsIncludesTheAllMemberGroup runs with the REAL hooks — no
-// stand-in — so it exercises the path a client actually gets: #855 provisions the
-// all-member group with the project and seats the creator in it, and this endpoint
-// must return it without knowing anything about it.
-//
-// It also exercises the ordering for the FRESH-provisioning case this test seeds,
-// which is the common one. Not a guarantee: the DAO documents that position is a
-// convenience and never the contract, because ensureAllMemberGroup rebuilds the
-// group on a later write path with a fresh, higher id. The client labels 全员群 by
-// comparing against all_member_group_no, which is right in both cases.
-func TestListProjectGroupsIncludesTheAllMemberGroup(t *testing.T) {
-	srv, _ := setup(t)
-	seedSpace(t, spaceA, 1)
-	ownerTok := seedUser(t, "owner1")
-	seedSpaceMember(t, spaceA, "owner1", 0, 1)
-	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-allmember")
-	require.NotEmpty(t, created.AllMemberGroupNo,
-		"the real provisioner is registered in this binary, so the create must produce a group")
-
-	later := util.GenerUUID()
-	seedProjectGroup(t, later, spaceA, created.ProjectID)
-	seedGroupMemberRow(t, later, "owner1")
-
-	w := doJSON(t, srv, http.MethodGet, "/v1/projects/"+created.ProjectID+"/groups", ownerTok, nil)
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	list := decodeGroupList(t, w)
-	require.Len(t, list, 2)
-	assert.Equal(t, created.AllMemberGroupNo, list[0].GroupNo,
-		"provisioned with the project, so in THIS scenario creation order puts it first; "+
-			"a rebuilt group sorts wherever its new id falls, which is why the client "+
-			"labels it by comparing against all_member_group_no rather than by position")
-	assert.Equal(t, later, list[1].GroupNo)
-}
-
 // TestListProjectGroupsReturnsRelationMetadata verifies that the endpoint
 // exposes only relation fields, including the nullable actor for legacy rows.
 func TestListProjectGroupsReturnsRelationMetadata(t *testing.T) {
 	srv, _ := setup(t)
-	allMember := stubAllMemberGroup(t, util.GenerUUID())
 	seedSpace(t, spaceA, 1)
 	ownerTok := seedUser(t, "owner1")
 	seedSpaceMember(t, spaceA, "owner1", 0, 1)
 	created := createProjectVia(t, srv, spaceA, ownerTok, "groups-relation-fields")
 
+	third := util.GenerUUID()
 	legacy := util.GenerUUID()
 	current := util.GenerUUID()
+	seedProjectGroup(t, third, spaceA, created.ProjectID)
 	seedProjectGroup(t, legacy, spaceA, created.ProjectID)
 	seedProjectGroup(t, current, spaceA, created.ProjectID)
 	_, err := testCtx.DB().UpdateBySql(
@@ -478,7 +451,7 @@ func TestListProjectGroupsReturnsRelationMetadata(t *testing.T) {
 	assert.Equal(t, created.ProjectID, byNo[legacy].ProjectID)
 	assert.Nil(t, byNo[legacy].LinkedBy)
 	require.Contains(t, byNo, current)
-	require.Contains(t, byNo, allMember.groupNo)
+	require.Contains(t, byNo, third)
 	assert.Equal(t, "owner1", derefProjectLinkedBy(byNo[current].LinkedBy))
 }
 

@@ -1,16 +1,7 @@
 package botfather
 
-// D14 on the SECOND bot-deletion path.
-//
-// PR #855 routed the chat-command deletion through the Space removal outbox and
-// left DELETE /v1/user/bots/:bot_id doing the bare `UPDATE space_member SET
-// status=0`, so the same rule had two different answers depending on which door
-// the owner used. The seventh review found it by running the census nobody had
-// run — "which entry points can delete a bot" — and it is a residue with no
-// witness: the bare update skips P0's project-seat cascade and P1's group detach,
-// I1's scan is default-off (and gated on the collation conversion), I4 scan B
-// looks for a member MISSING from the group while this ghost has both rows, and
-// D13 can never reclaim the seat because it requires an active robot row.
+// REST Bot deletion must close each Space seat through the removal outbox
+// before disabling the Bot, so Project and native group cleanup can finish.
 
 import (
 	"fmt"
@@ -80,10 +71,6 @@ func TestRESTBotDeleteClosesSeatsThroughTheOutbox(t *testing.T) {
 
 	assert.Zero(t, seatCountFor(t, ctx, botID, 1), "every Space seat must be closed")
 	assert.Equal(t, 2, cleanupJobsFor(t, ctx, botID),
-		"and each closed seat must leave a cleanup job — that job is what drives P0's "+
-			"project-seat cascade and P1's group detach. A bare UPDATE closes the seat and "+
-			"enqueues nothing, leaving a disabled bot holding an active project seat and an "+
-			"active group_member row: I1's scan is default-off, I4 scan B looks for the "+
-			"opposite state, and D13 cannot reclaim a seat whose robot row is disabled")
+		"each closed seat must enqueue native group and Project seat cleanup")
 	assert.Equal(t, 0, robotStatusOf(t, ctx, botID), "the deletion itself still completes")
 }

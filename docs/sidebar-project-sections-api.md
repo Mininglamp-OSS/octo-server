@@ -61,7 +61,6 @@ interface ProjectPayload {
   project_id: string;
   project_name: string;
   logo: string;
-  all_member_group_no: string; // 可能为空串
   groups: ProjectGroup[];
 }
 
@@ -89,14 +88,7 @@ interface SidebarSectionSortItem {
   返回当前 Project 的全部存活关联群，不按调用者是否有原生 `group_member` 席位过滤，
   包括非原生成员或被原生黑名单标记的关系，最多返回 50 条。需要更多群时继续调用
   原 Project groups 分页接口。
-- `groups` 是 Project 关系元数据，不包含原生群成员计数，也不授予原生群读写、子区
-  或成员权限。
-- `groups[0]` 不保证是全员群。如 UI 要固定全员群在首位，请比较
-  `group_no === all_member_group_no` 后由客户端排序。
-
-- Sidebar 只读取 Project 关系元数据，不定义或改变原生群成员同步。普通 Project 发起群
-  和关联已有群保持各自独立的既有成员/关系语义；同步细节不属于本接口，也不改变
-  `groups[]` 不授予原生权限的约束。
+- `groups` 仅展示当前 Project 的存活关联群（包括历史群），不包含原生群成员计数，也不授予原生聊天、子区或成员权限。Project 成员变化不会同步原生群成员。
 
 ## 3. 获取关注页顶层结构
 
@@ -136,11 +128,10 @@ HTTP `200`，响应体为数组，不额外包裹 `data`：
       "project_id": "project-001",
       "project_name": "供应链运营协同",
       "logo": "",
-      "all_member_group_no": "group-all-001",
       "groups": [
         {
-          "group_no": "group-all-001",
-          "name": "全员群",
+          "group_no": "group-001",
+          "name": "项目讨论",
           "project_id": "project-001",
           "linked_by": null,
           "pinned": false
