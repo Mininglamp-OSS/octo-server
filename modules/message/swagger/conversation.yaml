@@ -58,6 +58,9 @@ paths:
               recent_filter:
                 type: boolean
                 description: "可选，默认 false。为 true 时对返回的会话列表套用 sidebar recent tab 同款的按频道类型活动窗口过滤（system_settings 的 sidebar.recent_filter_{group,thread,person}_days，0=该类型不过滤）。供 Web「最近」tab 使用；不传则行为与历史完全一致（不过滤）。cursor 推进与 per-Space 未读仍基于过滤前的原始会话。豁免：有未读、已置顶、系统 Bot 的 DM 永不被时间窗口隐藏（与 /v1/sidebar/sync 的 recent tab 逐条一致）；置顶集合查询失败时**整体跳过**本次窗口过滤（返回未过滤的完整列表），而不是套用一个已知不完整的豁免集合去藏东西。"
+              include_space_unreads:
+                type: boolean
+                description: "可选，默认 false。请求按当前用户有权访问的 Space 聚合的权威未读快照。仅当 version=0、msg_count>0、last_msg_seqs 为空且服务端启用跨设备消息保存时可返回；基线或归属信息不完整时响应会省略 space_unreads。"
       responses:
         200:
           description: "返回"
@@ -142,6 +145,19 @@ paths:
                       description: |
                         外部群成员视角下的 source Space ID（仅当登录用户是外部成员时返回，
                         空 source_space_id 会兜底为用户默认 Space）。
+              space_unreads:
+                type: object
+                additionalProperties:
+                  type: integer
+                description: |
+                  当前用户仍是有效成员且 Space 状态正常的组织未读权威快照。
+                  已退出或已停用 Space 的历史未读不属于该快照范围；过滤这些键不会
+                  使快照变为不完整，也不会把其未读重新归属到其他 Space。
+                  当 WuKongIM 会话基线达到固定的 conversation.userMaxCount 上限时，
+                  服务端无法确认是否被截断，因此同样省略该字段。
+                  字段省略表示本次无法生成完整快照，客户端必须保留上一份值；
+                  `{}` 表示完整快照且所有有权访问的 Space 未读均为零，客户端可以
+                  按 wipe-replace 语义清空旧值。
         400:
           description: "错误"
           schema:

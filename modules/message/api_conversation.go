@@ -301,6 +301,11 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		// 端点列为 "intentionally untouched"），避免安静群/子区从通用会话同步中消失。
 		// 过滤只作用于响应 list，cursor 推进与 per-Space 未读仍基于过滤前的原始会话。
 		RecentFilter bool `json:"recent_filter"`
+		// IncludeSpaceUnreads 为 Web 组织切换器附带按 Space 聚合的未读快照。
+		// 仅在当前 IM 同步能够提供完整基线时返回，旧客户端不传时不增加计算。
+		// MessageSaveAcrossDevice=false 时服务端会用设备缓存覆盖请求 version，无法
+		// 确认本批是全量基线，因此即使请求该字段也会省略响应。
+		IncludeSpaceUnreads bool `json:"include_space_unreads"`
 	}
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
@@ -311,6 +316,13 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// Space 过滤（从 middleware 获取，已校验 membership）
 	filterSpaceID := spacepkg.GetSpaceID(c)
 	hasSpaceFilter := filterSpaceID != ""
+	// 只有完整会话基线才能生成可整体替换的 Space 快照。带增量游标、没有
+	// Recents 窗口或关闭跨设备保存时都省略字段，Web 会保留上一份权威值。
+	wantSpaceUnreads := canBuildCompleteSpaceUnreadSnapshot(
+		req.IncludeSpaceUnreads, req.Version, req.MsgCount, req.LastMsgSeqs,
+		co.ctx.GetConfig().MessageSaveAcrossDevice,
+	)
+	spaceUnreadsComplete := wantSpaceUnreads
 
 	version := req.Version
 	loginUID := c.GetLoginUID()
@@ -420,6 +432,16 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
+	if wantSpaceUnreads && !hasCompleteSpaceUnreadConversationBaseline(len(conversations)) {
+		// WuKongIM returns only its most recent conversation.userMaxCount rows and
+		// exposes no truncation flag. Keep the normal conversation response, but do
+		// not publish a wipe-replace snapshot from an ambiguous capped baseline.
+		spaceUnreadsComplete = false
+		co.Warn("WuKongIM 最近会话达到上限，省略 space_unreads",
+			zap.String("loginUID", loginUID),
+			zap.Int("conversationCount", len(conversations)),
+		)
+	}
 	groupNos := make([]string, 0, len(conversations))
 	uids := make([]string, 0, len(conversations))
 	channelIDs := make([]string, 0, len(conversations))
@@ -446,7 +468,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 				continue
 			}
 			if conversation.ChannelType == common.ChannelTypePerson.Uint8() {
-				uids = append(uids, conversation.ChannelID)
+				uids = append(uids, resolvePersonPeerUID(conversation.ChannelID))
 			} else {
 				addGroupNo(conversation.ChannelID)
 			}
@@ -464,6 +486,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 
 	userMap := map[string]*user.UserDetailResp{}                // 用户详情
+	nonSystemBotSet := map[string]bool{}                        // 普通 Bot（不含系统 Bot）
 	groupMap := map[string]*group.GroupResp{}                   // 群详情
 	conversationExtraMap := map[string]*conversationExtraResp{} // 最近会话扩展
 	groupVailds := make([]string, 0, len(conversations))        // 有效群
@@ -506,6 +529,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		activeIDs, err := co.threadDB.QueryActiveShortIDs(shortIDs)
 		if err != nil {
 			co.Error("查询有效子区失败！", zap.Error(err))
+			spaceUnreadsComplete = false
 		} else {
 			threadFilterEnabled = true
 			for _, id := range activeIDs {
@@ -537,13 +561,20 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			return
 		}
 		if len(users) > 0 {
+			// App Bot creation also creates a user row with robot=1 and rolls the
+			// app_bot row back if that fails; deletion preserves the user row for
+			// message history. Therefore user.robot intentionally classifies App
+			// Bots here regardless of their current app_bot publication status.
 			for _, user := range users {
 				userMap[user.UID] = user
+				if user.Robot == 1 && !spacepkg.IsSystemBot(user.UID) {
+					nonSystemBotSet[user.UID] = true
+				}
 			}
 		}
 	}
 
-	// ---------- App Bot 标记 ----------
+	// ---------- App Bot response marker (presentation only, not snapshot identity) ----------
 	appBotUIDs := make(map[string]bool)
 	if len(uids) > 0 {
 		var abUIDs []string
@@ -596,6 +627,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			// 的 GetGroupSpaceMap 路径，互不影响。
 			co.Warn("查询群原始 SpaceID 失败，跳过 conversation-level SpaceID 回填",
 				zap.Error(rawErr))
+			spaceUnreadsComplete = false
 		} else {
 			for _, g := range rawGroups {
 				if g == nil {
@@ -706,7 +738,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			var mute = 0
 			var stick = 0
 			if conversation.ChannelType == common.ChannelTypePerson.Uint8() {
-				userDetail := userMap[conversation.ChannelID]
+				userDetail := userMap[resolvePersonPeerUID(conversation.ChannelID)]
 				if userDetail != nil {
 					mute = userDetail.Mute
 					stick = userDetail.Top
@@ -739,7 +771,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 				}
 			}
 			// 填充 App Bot 标记
-			if conversation.ChannelType == common.ChannelTypePerson.Uint8() && appBotUIDs[conversation.ChannelID] {
+			if conversation.ChannelType == common.ChannelTypePerson.Uint8() && appBotUIDs[resolvePersonPeerUID(conversation.ChannelID)] {
 				syncUserConversationResp.BotType = "app_bot"
 			}
 			if len(syncUserConversationResp.Recents) > 0 {
@@ -766,6 +798,9 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			}
 		}
 	}
+	// 未读汇总必须早于 recent_filter 保存完整的有效会话集合；过滤后的列表只负责
+	// 当前 Space 的 UI，不应把安静但仍未读的会话从组织级数字中删掉。
+	spaceUnreadSource := syncUserConversationResps
 	// PR-B (#1377): cursor 必须基于 raw conversations 推进。服务端过滤掉的会话
 	// （archived 子区 / 已删除子区 / 当前用户已退群）可能正好是本批最高 version 的那条；
 	// 用过滤后列表的尾部 version 会让 cursor 卡在它前面，下次 sync 重复拉同一批。
@@ -861,7 +896,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
-	fillConversationSpaceIDs(syncUserConversationResps, rawGroupSpaceMap, externalGroupMap, defaultSpaceID)
+	fillConversationSpaceIDs(spaceUnreadSource, rawGroupSpaceMap, externalGroupMap, defaultSpaceID)
 
 	// 查询通话中的频道
 	// 加入的群聊
@@ -909,11 +944,50 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			})
 		}
 	}
+	var spaceUnreads *map[string]int
+	var authorizedSpaceIDs map[string]bool
+	if wantSpaceUnreads && spaceUnreadsComplete {
+		// The sideband spans Spaces beyond the middleware's X-Space-ID, so every
+		// emitted key must be authorized with the same active-membership predicate.
+		var authorizationErr error
+		authorizedSpaceIDs, authorizationErr = spacepkg.ActiveSpacesForMember(co.ctx.DB(), loginUID)
+		if authorizationErr != nil {
+			co.Warn("查询用户有效 Space 失败，省略 space_unreads", zap.Error(authorizationErr), zap.String("loginUID", loginUID))
+			spaceUnreadsComplete = false
+		}
+	}
+	if wantSpaceUnreads {
+		// Reuse each DM unread window for current-Space and organization counts.
+		// Only the post-recent_filter slice may receive the existing current-Space
+		// preview enrichment; the broader source is used solely for aggregation.
+		// Once upstream metadata is incomplete, disable only the all-Space walk so
+		// filtered-out DMs do not trigger pulls for a snapshot we must omit anyway.
+		collectAllSpaceUnreads := wantSpaceUnreads && spaceUnreadsComplete
+		personSpaceUnreads, personComplete := fillPersonSpaceUnreadAndCollect(
+			spaceUnreadSource, syncUserConversationResps, conversations, filterSpaceID, defaultSpaceID,
+			loginUID, co.ctx, co.messageExtraDB, nonSystemBotSet,
+			collectAllSpaceUnreads,
+		)
+		if wantSpaceUnreads && spaceUnreadsComplete && personComplete {
+			unreads, aggregateComplete := aggregateConversationSpaceUnreads(
+				spaceUnreadSource, personSpaceUnreads, groupActiveSet, groupMap, defaultSpaceID,
+			)
+			if aggregateComplete {
+				unreads = retainAuthorizedSpaceUnreads(unreads, authorizedSpaceIDs)
+				spaceUnreads = &unreads
+			}
+		}
+	} else if hasSpaceFilter {
+		// 未请求组织级快照时保持历史路径：只处理 recent_filter 后仍可见的会话。
+		// 避免旧客户端为已被窗口过滤的 DM 额外发起历史消息查询。
+		fillPersonSpaceUnread(
+			syncUserConversationResps, conversations, filterSpaceID, defaultSpaceID,
+			loginUID, co.ctx, co.messageExtraDB,
+		)
+	}
+
 	// Space 过滤
 	if hasSpaceFilter {
-		// Person 频道：计算 per-Space 未读计数（在过滤之前，需要原始会话数据）
-		fillPersonSpaceUnread(syncUserConversationResps, conversations, filterSpaceID, defaultSpaceID, loginUID, co.ctx, co.messageExtraDB)
-
 		syncUserConversationResps = FilterConversationsBySpace(
 			syncUserConversationResps, filterSpaceID, loginUID, co.ctx, co.groupService,
 		)
@@ -947,6 +1021,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		Groups:           groups,
 		ChannelStates:    channelStates,
 		SpaceMemberships: spaceMemberships,
+		SpaceUnreads:     spaceUnreads,
 	})
 }
 
@@ -1356,6 +1431,9 @@ type SyncUserConversationRespWrap struct {
 	Groups           []*group.GroupResp          `json:"groups"`            // 群
 	ChannelStates    []*ChannelState             `json:"channel_status"`    // 频道状态
 	SpaceMemberships []SpaceMembership           `json:"space_memberships"` // 用户加入的全部群的 Space 归属
+	// Pointer preserves the wire distinction between an unavailable snapshot
+	// (field omitted) and an authoritative empty snapshot ("space_unreads": {}).
+	SpaceUnreads *map[string]int `json:"space_unreads,omitempty"`
 }
 
 // SpaceMembership 是 /v1/conversation/sync 的 Space sideband 数据。

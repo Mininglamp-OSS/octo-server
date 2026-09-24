@@ -23,6 +23,30 @@ func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, er
 	return count > 0, nil
 }
 
+// ActiveSpacesForMember returns every active Space in which uid is an active member.
+// Its predicates intentionally match CheckMembership so callers can authorize a
+// multi-Space response with one query instead of checking each output key separately.
+func ActiveSpacesForMember(session dbr.SessionRunner, uid string) (map[string]bool, error) {
+	active := make(map[string]bool)
+	if uid == "" {
+		return active, nil
+	}
+	var spaceIDs []string
+	_, err := session.SelectBySql(
+		"SELECT sm.space_id FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.uid = ? AND sm.status = 1",
+		uid,
+	).Load(&spaceIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, spaceID := range spaceIDs {
+		active[spaceID] = true
+	}
+	return active, nil
+}
+
 // ResolveSpaceID returns the value stored in the Space table for a selector
 // accepted by that table's collation. The bool distinguishes "no such Space"
 // from a database failure; callers handling recovery must not manufacture a

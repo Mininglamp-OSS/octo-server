@@ -1,0 +1,27 @@
+brief: .octospec/tasks/organization-space-unread/brief.md
+injected:
+  - id: space-isolation
+    source: repo
+    reason: "Per-Space aggregation touches the tenant isolation boundary."
+  - id: error-handling
+    source: repo
+    reason: "The existing message API wire contract is extended."
+  - id: trust-boundary
+    source: repo
+    reason: "The optional wire-contract sideband must preserve omitted-versus-empty semantics."
+  - id: rate-limit
+    source: repo
+    reason: "The implementation modifies an existing authenticated message handler without adding a route."
+  - id: testing
+    source: repo
+    reason: "The load-bearing aggregation requires focused regression tests."
+  - id: commit-style
+    source: repo
+    reason: "Repository-wide commit and PR conventions apply."
+files_expected:
+  - pkg/space/membership.go
+  - modules/message/api_conversation.go
+  - modules/message/space_unread.go
+  - modules/message/space_unread_test.go
+  - modules/message/swagger/conversation.yaml
+updated_at: 2026-09-23T00:00:00Z

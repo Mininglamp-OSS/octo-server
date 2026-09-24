@@ -1,0 +1,37 @@
+## Verification
+
+- Rules checked: `space-isolation`, `error-handling`, `trust-boundary`, `rate-limit`, `testing`, `commit-style`.
+- Commands run:
+  - `go test ./pkg/space -run 'Test(ActiveSpacesForMember|CheckMembershipEmptyArgs)$' -count=1` → passed.
+  - `go test -ldflags='-s -w' ./modules/message -run 'Test(CanBuildCompleteSpaceUnreadSnapshot|HasCompleteSpaceUnreadConversationBaseline|FillPersonSpaceUnreadAndCollect|AggregateConversationSpaceUnreads|SyncUserConversationRespWrap|CountSpaceUnread|CountSpaceUnreads)' -count=1` → passed.
+  - `go test -race -ldflags='-s -w' ./modules/message -run 'Test(CanBuildCompleteSpaceUnreadSnapshot|HasCompleteSpaceUnreadConversationBaseline|FillPersonSpaceUnreadAndCollect|AggregateConversationSpaceUnreads|SyncUserConversationRespWrap|CountSpaceUnread|CountSpaceUnreads)' -count=1` → passed.
+  - `go vet ./modules/message/... ./pkg/space/...` → passed.
+  - `go build ./...` → passed.
+  - `ruby -e 'require "yaml"; YAML.load_file("modules/message/swagger/conversation.yaml")'` → passed.
+  - `git diff --check` → passed.
+  - `go test -ldflags='-s -w' ./modules/message -count=1` → environment-blocked because the package's integration tests require MySQL on `127.0.0.1:3306`; focused tests above do not require it and passed.
+- Acceptance:
+  - Optional request/response contract and empty-vs-omitted serialization → covered by focused tests.
+  - Group, external group, thread, DM, effective Space, muted DM/group, and parent-group mute behavior → covered by focused tests.
+  - DMs removed by `recent_filter` still contribute to organization totals without running current-Space preview fallback → covered by `TestFillPersonSpaceUnreadAndCollect_FilteredDMDoesNotRunPreviewFallback`.
+  - The existing `space_last_message` preview fallback remains outside this change and retains its pre-PR request bounds.
+  - Legacy groups/threads without `space_id` use the existing default-Space ownership rule.
+  - Incremental/empty request shapes and truncated DM windows omit the authoritative snapshot.
+  - A WuKongIM conversation baseline at or above the pinned 1000-row `conversation.userMaxCount` is treated as potentially truncated and omits the optional snapshot without changing the normal conversation response.
+  - Tagged and untagged unread from a non-system Bot both make the authoritative snapshot incomplete because send-time tags cannot prove current membership; existing current-Space unread and preview behavior remains unchanged.
+  - Space-scoped Person channel IDs are normalized to their bare peer UID before user, mute, and Bot metadata lookup; tagged Bot unread cannot bypass the fail-closed snapshot rule.
+  - App Bots are covered by the same `user.robot=1` classification: creation rolls back the `app_bot` row if the required user row cannot be created, startup repairs legacy published Bots, and deletion preserves the user row for historical message metadata and mute settings. The status-filtered `appBotUIDs` lookup is presentation-only.
+  - Published snapshot keys are intersected with the caller's active Space memberships using the same member/Space status predicates as `CheckMembership`; removed and inactive Space keys are dropped.
+  - The authoritative domain is the caller's active Spaces. Historical buckets for left or inactive Spaces are intentionally excluded without invalidating updates for the remaining active Spaces; they are not reassigned to a different default Space.
+  - Non-system Bot identity reuses the `user.robot` value from the handler's existing batch user-details query; the only added database read is one opted-in batch authorization query for all active Space keys.
+  - Invalid unread payloads and untagged unread DMs without a default Space omit the snapshot instead of silently under-counting it.
+  - An incomplete DM aggregation window does not stop later conversations from receiving their existing current-Space unread and preview fields.
+  - Once upstream metadata or an earlier DM makes the snapshot incomplete, later organization-only DM pulls are disabled while current-Space enrichment remains available.
+  - The deployed and CI image is pinned to `wukongim/wukongim:v2.2.4-20260313` (OCI revision `94b06a4694fa791604a26af3b7b6f279c42d7a12`; digest `sha256:c9bf2935d2c81bc484264c4b7fc862fad3bd1390e73c62088e8e796d864bcc8f`).
+  - At that exact WuKongIM revision, `internal/api/message.go` dispatches `PullModeDown` to `LoadPrevRangeMsgs` only when `EndMessageSeq <= StartMessageSeq`; `pkg/wkdb/message.go` rejects the opposite ordering and returns `(end, start]`. The pinned octo-lib defines `PullModeDown=0` and `PullModeUp=1`.
+  - The unread-window regression test mirrors that verified upstream guard so reversing the production bounds produces an empty response and fails the test; it is not the source of the contract claim.
+  - Repository examples using `pull_mode=1` exercise `PullModeUp` and therefore do not contradict the down-pull ordering.
+  - No third DM query → the existing unread-message window is shared by current-Space and all-Space counting.
+- Out of scope check: no new endpoint, table, Redis state, poller, notification behavior, mobile change, or independent `thread_setting.mute` lookup.
+- Scope check: regular-Bot unread remains intentionally fail-closed, and unrelated message-history/sidebar system-Bot normalization is unchanged.
+- Remaining environment limit: the full package suite requires local MySQL on `127.0.0.1:3306`, which is not running in this workspace.

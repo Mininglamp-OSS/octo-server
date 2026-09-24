@@ -6,9 +6,25 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
+
+// pinnedWuKongIMConversationUserMaxCount mirrors conversation.userMaxCount in
+// the pinned/deployed WuKongIM v2.2.4-20260313 configuration. The sync response
+// has no truncation flag, so reaching this limit cannot be treated as complete.
+// Keep this value aligned if the deployment overrides that WuKongIM setting.
+const pinnedWuKongIMConversationUserMaxCount = 1000
+
+// resolvePersonPeerUID removes the optional Space prefix before looking up user or Bot metadata.
+// Keep this normalization local to conversation metadata and unread accounting. Message visibility,
+// system-Bot placeholders, and sidebar filtering have separate compatibility contracts.
+func resolvePersonPeerUID(channelID string) string {
+	_, peerUID := spacepkg.ParseChannelID(channelID)
+	return peerUID
+}
 
 // fillPersonSpaceUnread 为 Person 频道计算 per-Space 未读计数，
 // 并填充 SpaceLastMessage（该 Space 的最后一条消息预览）。
@@ -28,8 +44,38 @@ func fillPersonSpaceUnread(
 	ctx *config.Context,
 	messageExtraDB *messageExtraDB,
 ) {
-	if spaceID == "" || len(conversations) == 0 {
-		return
+	fillPersonSpaceUnreadAndCollect(
+		conversations, conversations, rawConversations, spaceID, defaultSpaceID, loginUID,
+		ctx, messageExtraDB, nil, false,
+	)
+}
+
+// fillPersonSpaceUnreadAndCollect 复用 Person 会话当前已有的未读消息窗口：既可
+// 回填当前 Space 的 space_unread/预览，也可在同一次遍历中生成全部 Space 分桶。
+// currentSpaceConversations must be the post-recent_filter subset of conversations;
+// it prevents organization aggregation from widening existing preview behavior.
+// complete=false 表示某个需要聚合的未读窗口没有取全，或消息无法安全归属到
+// Space；调用方必须省略权威快照。
+func fillPersonSpaceUnreadAndCollect(
+	conversations []*SyncUserConversationResp,
+	currentSpaceConversations []*SyncUserConversationResp,
+	rawConversations []*config.SyncUserConversationResp,
+	spaceID string,
+	defaultSpaceID string,
+	loginUID string,
+	ctx *config.Context,
+	messageExtraDB *messageExtraDB,
+	nonSystemBotSet map[string]bool,
+	collectAll bool,
+) (map[string]int, bool) {
+	all := make(map[string]int)
+	if len(conversations) == 0 || (spaceID == "" && !collectAll) {
+		return all, true
+	}
+	complete := true
+	currentSpaceSet := make(map[*SyncUserConversationResp]struct{}, len(currentSpaceConversations))
+	for _, conv := range currentSpaceConversations {
+		currentSpaceSet[conv] = struct{}{}
 	}
 
 	// channelID -> raw conversation
@@ -45,27 +91,33 @@ func fillPersonSpaceUnread(
 
 		// 系统 Bot 的无标签历史在 filterPersonMessagesBySpace rule 4 里被隐藏，
 		// 预览/未读须同口径（见 dmSpaceMatch）。按频道身份判定一次即可。
-		isSysBot := spacepkg.IsSystemBot(conv.ChannelID)
+		peerUID := resolvePersonPeerUID(conv.ChannelID)
+		isSysBot := spacepkg.IsSystemBot(peerUID)
+		isNonSystemBot := nonSystemBotSet[peerUID]
 
-		// 从 Recents 中找该 Space 的最后一条消息作为预览
-		spaceLastMsg := findSpaceLastMessage(conv.Recents, spaceID, defaultSpaceID, isSysBot)
-		if spaceLastMsg != nil {
-			conv.SpaceLastMessage = spaceLastMsg
-		}
+		_, enrichCurrentSpace := currentSpaceSet[conv]
+		needCurrentSpace := spaceID != "" && enrichCurrentSpace
+		if needCurrentSpace {
+			// 从 Recents 中找该 Space 的最后一条消息作为预览
+			spaceLastMsg := findSpaceLastMessage(conv.Recents, spaceID, defaultSpaceID, isSysBot)
+			if spaceLastMsg != nil {
+				conv.SpaceLastMessage = spaceLastMsg
+			}
 
-		// Recents 中未找到匹配消息，从 WuKongIM 拉取更多历史消息查找。
-		// 典型场景：BotFather 等全局单例 Bot，用户在 Space B 发了大量消息后，
-		// Space A 的最后一条消息已被挤出 Recents 窗口。
-		if conv.SpaceLastMessage == nil && ctx != nil {
-			raw := rawMap[conv.ChannelID]
-			if raw != nil && raw.LastMsgSeq > 0 {
-				fallbackMsg := findSpaceLastMessageFallback(
-					conv.ChannelID, conv.ChannelType,
-					loginUID, spaceID, defaultSpaceID, isSysBot, uint32(raw.LastMsgSeq), ctx,
-					messageExtraDB,
-				)
-				if fallbackMsg != nil {
-					conv.SpaceLastMessage = fallbackMsg
+			// Recents 中未找到匹配消息，从 WuKongIM 拉取更多历史消息查找。
+			// 典型场景：BotFather 等全局单例 Bot，用户在 Space B 发了大量消息后，
+			// Space A 的最后一条消息已被挤出 Recents 窗口。
+			if conv.SpaceLastMessage == nil && ctx != nil {
+				raw := rawMap[conv.ChannelID]
+				if raw != nil && raw.LastMsgSeq > 0 {
+					fallbackMsg := findSpaceLastMessageFallback(
+						conv.ChannelID, conv.ChannelType,
+						loginUID, spaceID, defaultSpaceID, isSysBot, uint32(raw.LastMsgSeq), ctx,
+						messageExtraDB,
+					)
+					if fallbackMsg != nil {
+						conv.SpaceLastMessage = fallbackMsg
+					}
 				}
 			}
 		}
@@ -74,9 +126,24 @@ func fillPersonSpaceUnread(
 		if conv.Unread <= 0 {
 			continue
 		}
+		needAggregate := collectAll && complete && conv.Mute == 0
+		if needAggregate && isNonSystemBot {
+			// A message space_id records the Bot's Space when the message was sent;
+			// it does not prove that the Bot is still a member there. Without adding
+			// a current cross-Space membership query, no regular-Bot unread can be
+			// published safely in a wipe-replace authoritative snapshot.
+			complete = false
+			needAggregate = false
+		}
+		if !needCurrentSpace && !needAggregate {
+			continue
+		}
 
 		raw := rawMap[conv.ChannelID]
 		if raw == nil {
+			if needAggregate {
+				complete = false
+			}
 			continue
 		}
 
@@ -87,18 +154,22 @@ func fillPersonSpaceUnread(
 		if len(raw.Recents) >= raw.Unread {
 			// Recents 覆盖了所有未读消息，直接使用
 			messages = raw.Recents
-		} else {
-			// Recents 不足，从 WuKongIM 拉取未读消息
-			startSeq := readSeq + 1
-			if startSeq < 1 {
-				startSeq = 1
+		} else if ctx != nil {
+			// Recents 不足，从 WuKongIM 由新到旧拉取未读消息。
+			// The pinned WuKongIM v2.2.4-20260313 source (revision 94b06a4694fa)
+			// defines PullModeDown as 0. /channel/messagesync calls LoadPrevRangeMsgs
+			// only when end <= start, and that DB method returns (end, start]. In-repo
+			// examples using pull_mode=1 are PullModeUp and do not define this path.
+			endSeq := readSeq
+			if endSeq < 0 {
+				endSeq = 0
 			}
 			resp, err := ctx.IMSyncChannelMessage(config.SyncChannelMessageReq{
 				LoginUID:        loginUID,
 				ChannelID:       conv.ChannelID,
 				ChannelType:     conv.ChannelType,
-				StartMessageSeq: uint32(startSeq),
-				EndMessageSeq:   uint32(raw.LastMsgSeq),
+				StartMessageSeq: uint32(raw.LastMsgSeq),
+				EndMessageSeq:   uint32(endSeq),
 				Limit:           raw.Unread,
 				PullMode:        config.PullModeDown,
 			})
@@ -107,14 +178,186 @@ func fillPersonSpaceUnread(
 					zap.Error(err),
 					zap.String("channelID", conv.ChannelID),
 					zap.String("loginUID", loginUID))
+				if needAggregate {
+					complete = false
+				}
 				continue
 			}
+			if resp == nil {
+				if needAggregate {
+					complete = false
+				}
+				continue
+			}
+			if needAggregate && len(resp.Messages) < raw.Unread {
+				// WuKongIM 会限制单次返回量。未读窗口没有完整返回时不能把
+				// 部分分桶当成权威快照；继续处理当前及后续会话，只在最终
+				// 省略组织级快照，避免影响既有 current-Space 字段。
+				complete = false
+			}
 			messages = resp.Messages
+		} else {
+			if needAggregate {
+				complete = false
+			}
+			continue
 		}
 
-		count := countSpaceUnreadFromMessages(messages, spaceID, defaultSpaceID, isSysBot, readSeq)
-		conv.SpaceUnread = &count
+		if needCurrentSpace {
+			count := countSpaceUnreadFromMessages(messages, spaceID, defaultSpaceID, isSysBot, readSeq)
+			conv.SpaceUnread = &count
+		}
+		if needAggregate {
+			counts, attributable := countSpaceUnreadsFromMessages(
+				messages, defaultSpaceID, isSysBot, readSeq,
+			)
+			if !attributable {
+				complete = false
+			}
+			mergeSpaceUnreadCounts(all, counts)
+		}
 	}
+	return all, complete
+}
+
+// countSpaceUnreadsFromMessages returns complete=false when an unread message cannot
+// be attributed safely. Current-Space unread behavior remains on the existing
+// countSpaceUnreadFromMessages path; only the authoritative all-Space snapshot
+// fails closed.
+func countSpaceUnreadsFromMessages(
+	messages []*config.MessageResp,
+	defaultSpaceID string,
+	isSysBot bool,
+	readSeq int64,
+) (map[string]int, bool) {
+	complete := true
+	counts := make(map[string]int)
+	for _, msg := range messages {
+		if int64(msg.MessageSeq) <= readSeq {
+			continue
+		}
+		payloadMap, err := msg.GetPayloadMap()
+		if err != nil || payloadMap == nil {
+			// The conversation unread already includes this message; skipping it would under-count.
+			complete = false
+			continue
+		}
+		spaceID := dmMessageSpaceID(payloadMap)
+		if spaceID == "" {
+			if isSysBot {
+				continue
+			}
+			if defaultSpaceID == "" {
+				// Untagged human DMs can fall back only when the user's default Space is known.
+				complete = false
+				continue
+			}
+			spaceID = defaultSpaceID
+		}
+		counts[spaceID]++
+	}
+	return counts, complete
+}
+
+func mergeSpaceUnreadCounts(target, source map[string]int) {
+	for spaceID, unread := range source {
+		if spaceID != "" && unread > 0 {
+			target[spaceID] += unread
+		}
+	}
+}
+
+func retainAuthorizedSpaceUnreads(unreads map[string]int, authorizedSpaceIDs map[string]bool) map[string]int {
+	// The authoritative domain is the caller's currently active Spaces. Historical
+	// unread attributed to a Space the caller left, or to an inactive Space, is
+	// intentionally outside that domain. Dropping it must not invalidate the whole
+	// snapshot, otherwise inaccessible history could freeze every active-Space badge.
+	result := make(map[string]int, len(unreads))
+	for spaceID, unread := range unreads {
+		if authorizedSpaceIDs[spaceID] {
+			result[spaceID] = unread
+		}
+	}
+	return result
+}
+
+// aggregateConversationSpaceUnreads 把已有会话未读按 effective Space 汇总。
+// Person 数字由上面的消息级分桶提供；群聊和子区直接复用 conversation.Unread。
+// Scope: DM and group mute settings are honored. A topic inherits its parent
+// group's mute state; this lightweight sideband intentionally does not query
+// the independent thread_setting.mute preference.
+func aggregateConversationSpaceUnreads(
+	conversations []*SyncUserConversationResp,
+	personUnreads map[string]int,
+	groupActiveSet map[string]struct{},
+	groupMap map[string]*group.GroupResp,
+	defaultSpaceID string,
+) (map[string]int, bool) {
+	result := make(map[string]int)
+	mergeSpaceUnreadCounts(result, personUnreads)
+	for _, conv := range conversations {
+		if conv == nil || conv.Unread <= 0 || conv.Mute != 0 {
+			continue
+		}
+		groupNo := conv.ChannelID
+		switch conv.ChannelType {
+		case common.ChannelTypePerson.Uint8():
+			continue
+		case common.ChannelTypeCommunityTopic.Uint8():
+			parentNo, _, err := thread.ParseChannelID(conv.ChannelID)
+			if err != nil {
+				continue
+			}
+			groupNo = parentNo
+		case common.ChannelTypeGroup.Uint8():
+		default:
+			continue
+		}
+		// Organization unread intentionally requires active membership. A legacy
+		// conversation-list entry retained for a blacklisted member does not make
+		// that group's unread eligible for the authoritative snapshot.
+		if _, active := groupActiveSet[groupNo]; !active {
+			continue
+		}
+		parent := groupMap[groupNo]
+		if parent == nil {
+			// 缺少群详情时无法判断父群静音状态，不能把部分结果伪装成权威快照。
+			return result, false
+		}
+		if parent.Mute != 0 {
+			continue
+		}
+		spaceID := conv.SpaceID
+		if conv.MySourceSpaceID != "" {
+			spaceID = conv.MySourceSpaceID
+		}
+		if spaceID == "" {
+			// 与现有 Space 会话过滤一致：有群详情但 legacy space_id 为空的
+			// 群/子区归入用户默认 Space。默认 Space 也未知时才省略快照。
+			if defaultSpaceID == "" {
+				return result, false
+			}
+			spaceID = defaultSpaceID
+		}
+		result[spaceID] += conv.Unread
+	}
+	return result, true
+}
+
+// canBuildCompleteSpaceUnreadSnapshot 判断当前请求是否能产生可整体替换的完整快照。
+// lastMsgSeqs 非空或 msgCount<=0 时 IM 可能只返回增量/空 Recents，不能返回 {} 冒充零未读。
+func canBuildCompleteSpaceUnreadSnapshot(
+	include bool,
+	version int64,
+	msgCount int64,
+	lastMsgSeqs string,
+	messageSaveAcrossDevice bool,
+) bool {
+	return include && version == 0 && msgCount > 0 && lastMsgSeqs == "" && messageSaveAcrossDevice
+}
+
+func hasCompleteSpaceUnreadConversationBaseline(conversationCount int) bool {
+	return conversationCount < pinnedWuKongIMConversationUserMaxCount
 }
 
 // dmMessageSpaceID 读取消息 payload 的 space_id（缺失 / 空 / 非字符串一律视为 ""，
@@ -174,6 +417,8 @@ func findSpaceLastMessageFallback(
 		return nil
 	}
 
+	// This legacy preview fallback is outside the organization-unread sideband.
+	// Its request bounds are not the contract for the separate unread-window pull above.
 	// 从最新消息向前拉取 200 条
 	endSeq := lastMsgSeq
 	startSeq := uint32(1)

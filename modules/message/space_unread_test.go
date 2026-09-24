@@ -2,10 +2,15 @@ package message
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -103,6 +108,468 @@ func TestCountSpaceUnreadFromMessages_MixedSpaces(t *testing.T) {
 
 	count = countSpaceUnreadFromMessages(messages, "spaceB", "", false, 12)
 	assert.Equal(t, 1, count)
+}
+
+func TestCountSpaceUnreadsFromMessages_BucketsDefaultAndExplicitSpaces(t *testing.T) {
+	messages := []*config.MessageResp{
+		makeMessageResp(10, "spaceA"),
+		makeMessageResp(11, "spaceB"),
+		makeMessageResp(12, ""),
+		makeMessageResp(13, "spaceA"),
+	}
+
+	counts, complete := countSpaceUnreadsFromMessages(messages, "spaceDefault", false, 11)
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{
+		"spaceA":       1,
+		"spaceDefault": 1,
+	}, counts)
+
+	counts, complete = countSpaceUnreadsFromMessages(messages, "spaceDefault", true, 11)
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{
+		"spaceA": 1,
+	}, counts)
+}
+
+func TestCountSpaceUnreadsFromMessages_ReportsIncompleteAttribution(t *testing.T) {
+	t.Run("invalid unread payload", func(t *testing.T) {
+		messages := []*config.MessageResp{
+			makeMessageResp(10, "spaceA"),
+			{MessageSeq: 11, Payload: []byte("invalid json")},
+		}
+
+		counts, complete := countSpaceUnreadsFromMessages(messages, "spaceDefault", false, 9)
+
+		assert.False(t, complete)
+		assert.Equal(t, map[string]int{"spaceA": 1}, counts)
+	})
+
+	t.Run("untagged unread without default Space", func(t *testing.T) {
+		counts, complete := countSpaceUnreadsFromMessages(
+			[]*config.MessageResp{makeMessageResp(11, "")}, "", false, 10,
+		)
+
+		assert.False(t, complete)
+		assert.Empty(t, counts)
+	})
+}
+
+func TestRetainAuthorizedSpaceUnreads(t *testing.T) {
+	got := retainAuthorizedSpaceUnreads(
+		map[string]int{"spaceA": 2, "spaceRemoved": 5, "spaceDisabled": 3},
+		map[string]bool{"spaceA": true},
+	)
+
+	assert.Equal(t, map[string]int{"spaceA": 2}, got)
+	assert.NotNil(t, retainAuthorizedSpaceUnreads(map[string]int{"spaceRemoved": 1}, nil))
+}
+
+func TestFillPersonSpaceUnreadAndCollect_ExcludesMutedDMsAndReportsIncomplete(t *testing.T) {
+	convs := []*SyncUserConversationResp{
+		{ChannelID: "active", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 2},
+		{ChannelID: "muted", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 1, Mute: 1},
+	}
+	raw := []*config.SyncUserConversationResp{
+		{ChannelID: "active", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 2, LastMsgSeq: 2, Recents: []*config.MessageResp{
+			makeMessageResp(1, "spaceA"), makeMessageResp(2, "spaceB"),
+		}},
+		{ChannelID: "muted", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 1, LastMsgSeq: 1, Recents: []*config.MessageResp{
+			makeMessageResp(1, "spaceA"),
+		}},
+	}
+
+	got, complete := fillPersonSpaceUnreadAndCollect(convs, convs, raw, "", "spaceDefault", "me", nil, nil, nil, true)
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{"spaceA": 1, "spaceB": 1}, got)
+
+	incomplete, complete := fillPersonSpaceUnreadAndCollect(
+		[]*SyncUserConversationResp{{ChannelID: "missing", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 1}},
+		[]*SyncUserConversationResp{{ChannelID: "missing", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 1}},
+		nil, "", "spaceDefault", "me", nil, nil, nil, true,
+	)
+	assert.False(t, complete)
+	assert.Empty(t, incomplete)
+}
+
+func TestFillPersonSpaceUnreadAndCollect_IncompleteAggregateKeepsCurrentSpaceFields(t *testing.T) {
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/channel/messagesync", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{
+			Messages: []*config.MessageResp{
+				makeMessageResp(2, "spaceA"),
+				makeMessageResp(3, "spaceB"),
+			},
+		}))
+	}))
+	defer im.Close()
+
+	cfg := config.New()
+	cfg.WuKongIM.APIURL = im.URL
+	ctx := config.NewContext(cfg)
+	convs := []*SyncUserConversationResp{
+		{
+			ChannelID: "short-window", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 3,
+			Recents: []*MsgSyncResp{{MessageSeq: 2, Payload: map[string]interface{}{"space_id": "spaceA"}}},
+		},
+		{
+			ChannelID: "complete-window", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 2,
+			Recents: []*MsgSyncResp{{MessageSeq: 2, Payload: map[string]interface{}{"space_id": "spaceA"}}},
+		},
+	}
+	raw := []*config.SyncUserConversationResp{
+		{
+			ChannelID: "short-window", ChannelType: common.ChannelTypePerson.Uint8(),
+			Unread: 3, LastMsgSeq: 3, Recents: []*config.MessageResp{makeMessageResp(3, "spaceB")},
+		},
+		{
+			ChannelID: "complete-window", ChannelType: common.ChannelTypePerson.Uint8(),
+			Unread: 2, LastMsgSeq: 2, Recents: []*config.MessageResp{
+				makeMessageResp(1, "spaceA"), makeMessageResp(2, "spaceA"),
+			},
+		},
+	}
+
+	_, complete := fillPersonSpaceUnreadAndCollect(
+		convs, convs, raw, "spaceA", "spaceDefault", "me", ctx, nil, nil, true,
+	)
+
+	assert.False(t, complete)
+	if assert.NotNil(t, convs[0].SpaceUnread) {
+		assert.Equal(t, 1, *convs[0].SpaceUnread)
+	}
+	if assert.NotNil(t, convs[1].SpaceUnread) {
+		assert.Equal(t, 2, *convs[1].SpaceUnread)
+	}
+	assert.NotNil(t, convs[1].SpaceLastMessage)
+}
+
+func TestFillPersonSpaceUnreadAndCollect_NonSystemBotFailsClosedWithoutChangingCurrentSpace(t *testing.T) {
+	tests := []struct {
+		name         string
+		botUID       string
+		channelID    string
+		messageSpace string
+		currentSpace string
+		defaultSpace string
+	}{
+		{name: "untagged", botUID: "regular-bot", channelID: "regular-bot", currentSpace: "spaceDefault", defaultSpace: "spaceDefault"},
+		{name: "tagged", botUID: "regular-bot", channelID: "regular-bot", messageSpace: "spaceB", currentSpace: "spaceB", defaultSpace: "spaceDefault"},
+		{
+			name:         "tagged Space-scoped App Bot channel",
+			botUID:       "app_review_bot",
+			channelID:    spacepkg.BuildChannelID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "app_review_bot"),
+			messageSpace: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			currentSpace: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			defaultSpace: "spaceDefault",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := map[string]interface{}{"content": "hello"}
+			if tt.messageSpace != "" {
+				payload["space_id"] = tt.messageSpace
+			}
+			convs := []*SyncUserConversationResp{{
+				ChannelID: tt.channelID, ChannelType: common.ChannelTypePerson.Uint8(), Unread: 2,
+				Recents: []*MsgSyncResp{
+					{MessageSeq: 1, Payload: payload},
+					{MessageSeq: 2, Payload: payload},
+				},
+			}}
+			raw := []*config.SyncUserConversationResp{{
+				ChannelID: tt.channelID, ChannelType: common.ChannelTypePerson.Uint8(),
+				Unread: 2, LastMsgSeq: 2,
+				Recents: []*config.MessageResp{
+					makeMessageResp(1, tt.messageSpace), makeMessageResp(2, tt.messageSpace),
+				},
+			}}
+
+			got, complete := fillPersonSpaceUnreadAndCollect(
+				convs, convs, raw, tt.currentSpace, tt.defaultSpace, "me", nil, nil,
+				map[string]bool{tt.botUID: true}, true,
+			)
+
+			assert.False(t, complete, "regular-Bot unread must omit the authoritative snapshot")
+			assert.Empty(t, got)
+			if assert.NotNil(t, convs[0].SpaceUnread) {
+				assert.Equal(t, 2, *convs[0].SpaceUnread, "existing current-Space unread stays unchanged")
+			}
+			assert.NotNil(t, convs[0].SpaceLastMessage, "existing current-Space preview stays unchanged")
+		})
+	}
+}
+
+func TestFillPersonSpaceUnreadAndCollect_StopsOrganizationPullsAfterIncomplete(t *testing.T) {
+	var requests atomic.Int32
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{}))
+	}))
+	defer im.Close()
+
+	cfg := config.New()
+	cfg.WuKongIM.APIURL = im.URL
+	ctx := config.NewContext(cfg)
+	convs := []*SyncUserConversationResp{
+		{ChannelID: "regular-bot", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 1},
+		{ChannelID: "filtered-peer", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 2},
+	}
+	raw := []*config.SyncUserConversationResp{
+		{
+			ChannelID: "regular-bot", ChannelType: common.ChannelTypePerson.Uint8(),
+			Unread: 1, LastMsgSeq: 1, Recents: []*config.MessageResp{makeMessageResp(1, "spaceA")},
+		},
+		{
+			ChannelID: "filtered-peer", ChannelType: common.ChannelTypePerson.Uint8(),
+			Unread: 2, LastMsgSeq: 2, Recents: []*config.MessageResp{makeMessageResp(2, "spaceB")},
+		},
+	}
+
+	got, complete := fillPersonSpaceUnreadAndCollect(
+		convs, nil, raw, "spaceA", "spaceDefault", "me", ctx, nil,
+		map[string]bool{"regular-bot": true}, true,
+	)
+
+	assert.False(t, complete)
+	assert.Empty(t, got)
+	assert.Zero(t, requests.Load(), "organization-only pulls stop once the snapshot is incomplete")
+}
+
+func TestFillPersonSpaceUnreadAndCollect_FallbackPullsUnreadDownward(t *testing.T) {
+	var gotReq config.SyncChannelMessageReq
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/channel/messagesync", r.URL.Path)
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		w.Header().Set("Content-Type", "application/json")
+		if gotReq.PullMode == config.PullModeDown && gotReq.EndMessageSeq > gotReq.StartMessageSeq {
+			assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{}))
+			return
+		}
+		assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{
+			Messages: []*config.MessageResp{
+				makeMessageResp(39, "spaceA"),
+				makeMessageResp(40, "spaceB"),
+				makeMessageResp(41, "spaceB"),
+			},
+		}))
+	}))
+	defer im.Close()
+
+	cfg := config.New()
+	cfg.WuKongIM.APIURL = im.URL
+	ctx := config.NewContext(cfg)
+	convs := []*SyncUserConversationResp{{
+		ChannelID: "peer", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 3,
+	}}
+	raw := []*config.SyncUserConversationResp{{
+		ChannelID: "peer", ChannelType: common.ChannelTypePerson.Uint8(),
+		Unread: 3, LastMsgSeq: 41, Recents: []*config.MessageResp{makeMessageResp(41, "spaceB")},
+	}}
+
+	got, complete := fillPersonSpaceUnreadAndCollect(convs, convs, raw, "", "spaceDefault", "me", ctx, nil, nil, true)
+
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{"spaceA": 1, "spaceB": 2}, got)
+	assert.Equal(t, uint32(41), gotReq.StartMessageSeq)
+	assert.Equal(t, uint32(38), gotReq.EndMessageSeq)
+	assert.Equal(t, 3, gotReq.Limit)
+	assert.Equal(t, config.PullModeDown, gotReq.PullMode)
+}
+
+func TestFillPersonSpaceUnreadAndCollect_FilteredDMDoesNotRunPreviewFallback(t *testing.T) {
+	var requests atomic.Int32
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{}))
+	}))
+	defer im.Close()
+
+	cfg := config.New()
+	cfg.WuKongIM.APIURL = im.URL
+	ctx := config.NewContext(cfg)
+	allConversations := []*SyncUserConversationResp{{
+		ChannelID: "filtered-peer", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 2,
+	}}
+	raw := []*config.SyncUserConversationResp{{
+		ChannelID: "filtered-peer", ChannelType: common.ChannelTypePerson.Uint8(),
+		Unread: 2, LastMsgSeq: 2, Recents: []*config.MessageResp{
+			makeMessageResp(1, "spaceA"), makeMessageResp(2, "spaceB"),
+		},
+	}}
+
+	got, complete := fillPersonSpaceUnreadAndCollect(
+		allConversations,
+		nil, // recent_filter removed this DM from current-Space enrichment
+		raw, "spaceA", "spaceDefault", "me", ctx, nil, nil, true,
+	)
+
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{"spaceA": 1, "spaceB": 1}, got)
+	assert.Zero(t, requests.Load())
+	assert.Nil(t, allConversations[0].SpaceUnread)
+	assert.Nil(t, allConversations[0].SpaceLastMessage)
+}
+
+func TestFillPersonSpaceUnreadAndCollect_DisabledAggregationSkipsFilteredDMPull(t *testing.T) {
+	var requests atomic.Int32
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{}))
+	}))
+	defer im.Close()
+
+	cfg := config.New()
+	cfg.WuKongIM.APIURL = im.URL
+	ctx := config.NewContext(cfg)
+	convs := []*SyncUserConversationResp{{
+		ChannelID: "filtered-peer", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 3,
+	}}
+	raw := []*config.SyncUserConversationResp{{
+		ChannelID: "filtered-peer", ChannelType: common.ChannelTypePerson.Uint8(),
+		Unread: 3, LastMsgSeq: 3, Recents: []*config.MessageResp{makeMessageResp(3, "spaceB")},
+	}}
+
+	got, complete := fillPersonSpaceUnreadAndCollect(
+		convs,
+		nil, // no current-Space enrichment; only all-Space aggregation could issue a pull
+		raw, "spaceA", "spaceDefault", "me", ctx, nil, nil, false,
+	)
+
+	assert.True(t, complete)
+	assert.Empty(t, got)
+	assert.Zero(t, requests.Load())
+}
+
+func TestAggregateConversationSpaceUnreads_EffectiveSpaceAndParentGroupMuteRules(t *testing.T) {
+	convs := []*SyncUserConversationResp{
+		{ChannelID: "g-internal", ChannelType: common.ChannelTypeGroup.Uint8(), SpaceID: "spaceA", Unread: 4},
+		{ChannelID: "g-external", ChannelType: common.ChannelTypeGroup.Uint8(), SpaceID: "spaceRemote", MySourceSpaceID: "spaceB", Unread: 3},
+		{ChannelID: "g-muted", ChannelType: common.ChannelTypeGroup.Uint8(), SpaceID: "spaceA", Unread: 8, Mute: 1},
+		{ChannelID: "g-parent____topic", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), SpaceID: "spaceC", Unread: 5},
+		{ChannelID: "g-muted-parent____topic", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), SpaceID: "spaceC", Unread: 7},
+		{ChannelID: "g-blacklisted", ChannelType: common.ChannelTypeGroup.Uint8(), SpaceID: "spaceA", Unread: 9},
+	}
+	active := map[string]struct{}{
+		"g-internal": {}, "g-external": {}, "g-muted": {}, "g-parent": {}, "g-muted-parent": {},
+	}
+	groups := map[string]*group.GroupResp{
+		"g-internal":     {},
+		"g-external":     {},
+		"g-muted":        {},
+		"g-parent":       {},
+		"g-muted-parent": {Mute: 1},
+	}
+
+	got, complete := aggregateConversationSpaceUnreads(convs, map[string]int{"spaceA": 2}, active, groups, "spaceDefault")
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{"spaceA": 6, "spaceB": 3, "spaceC": 5}, got)
+}
+
+func TestAggregateConversationSpaceUnreads_ReportsIncompleteMetadata(t *testing.T) {
+	active := map[string]struct{}{"g-missing": {}}
+	convs := []*SyncUserConversationResp{{
+		ChannelID: "g-missing", ChannelType: common.ChannelTypeGroup.Uint8(), Unread: 1,
+	}}
+
+	_, complete := aggregateConversationSpaceUnreads(convs, nil, active, nil, "spaceDefault")
+	assert.False(t, complete)
+
+	_, complete = aggregateConversationSpaceUnreads(convs, nil, active, map[string]*group.GroupResp{
+		"g-missing": {},
+	}, "")
+	assert.False(t, complete)
+}
+
+func TestAggregateConversationSpaceUnreads_LegacyGroupUsesDefaultSpace(t *testing.T) {
+	convs := []*SyncUserConversationResp{
+		{ChannelID: "g-legacy", ChannelType: common.ChannelTypeGroup.Uint8(), Unread: 4},
+		{ChannelID: "g-legacy____topic", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Unread: 3},
+	}
+	active := map[string]struct{}{"g-legacy": {}}
+	groups := map[string]*group.GroupResp{"g-legacy": {}}
+
+	got, complete := aggregateConversationSpaceUnreads(convs, nil, active, groups, "spaceDefault")
+
+	assert.True(t, complete)
+	assert.Equal(t, map[string]int{"spaceDefault": 7}, got)
+}
+
+func TestCanBuildCompleteSpaceUnreadSnapshot(t *testing.T) {
+	tests := []struct {
+		name             string
+		include          bool
+		version          int64
+		msgCount         int64
+		lastMsgSeqs      string
+		saveAcrossDevice bool
+		want             bool
+	}{
+		{name: "complete baseline", include: true, msgCount: 1, saveAcrossDevice: true, want: true},
+		{name: "not requested", msgCount: 1, saveAcrossDevice: true},
+		{name: "incremental version", include: true, version: 1, msgCount: 1, saveAcrossDevice: true},
+		{name: "empty recents window", include: true, msgCount: 0, saveAcrossDevice: true},
+		{name: "incremental message cursor", include: true, msgCount: 1, lastMsgSeqs: "peer:1:9", saveAcrossDevice: true},
+		{name: "device cache can override version", include: true, msgCount: 1, saveAcrossDevice: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, canBuildCompleteSpaceUnreadSnapshot(
+				tt.include, tt.version, tt.msgCount, tt.lastMsgSeqs, tt.saveAcrossDevice,
+			))
+		})
+	}
+}
+
+func TestHasCompleteSpaceUnreadConversationBaseline(t *testing.T) {
+	assert.True(t, hasCompleteSpaceUnreadConversationBaseline(0))
+	assert.True(t, hasCompleteSpaceUnreadConversationBaseline(pinnedWuKongIMConversationUserMaxCount-1))
+	assert.False(t, hasCompleteSpaceUnreadConversationBaseline(pinnedWuKongIMConversationUserMaxCount))
+	assert.False(t, hasCompleteSpaceUnreadConversationBaseline(pinnedWuKongIMConversationUserMaxCount+1))
+}
+
+func TestFillPersonSpaceUnreadAndCollect_ShortWindowIsIncomplete(t *testing.T) {
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(config.SyncChannelMessageResp{
+			Messages: []*config.MessageResp{
+				makeMessageResp(40, "spaceA"),
+				makeMessageResp(41, "spaceB"),
+			},
+		}))
+	}))
+	defer im.Close()
+
+	cfg := config.New()
+	cfg.WuKongIM.APIURL = im.URL
+	ctx := config.NewContext(cfg)
+	convs := []*SyncUserConversationResp{{
+		ChannelID: "peer", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 3,
+	}}
+	raw := []*config.SyncUserConversationResp{{
+		ChannelID: "peer", ChannelType: common.ChannelTypePerson.Uint8(),
+		Unread: 3, LastMsgSeq: 41, Recents: []*config.MessageResp{makeMessageResp(41, "spaceB")},
+	}}
+
+	_, complete := fillPersonSpaceUnreadAndCollect(convs, convs, raw, "", "spaceDefault", "me", ctx, nil, nil, true)
+
+	assert.False(t, complete)
+}
+
+func TestSyncUserConversationRespWrap_SpaceUnreadsOptionalAndEmpty(t *testing.T) {
+	without, err := json.Marshal(SyncUserConversationRespWrap{})
+	assert.NoError(t, err)
+	assert.NotContains(t, string(without), "space_unreads")
+
+	empty := map[string]int{}
+	withEmpty, err := json.Marshal(SyncUserConversationRespWrap{SpaceUnreads: &empty})
+	assert.NoError(t, err)
+	assert.Contains(t, string(withEmpty), `"space_unreads":{}`)
 }
 
 func TestFillPersonSpaceUnread_OnlyPersonChannels(t *testing.T) {
