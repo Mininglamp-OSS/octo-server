@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -30,23 +31,46 @@ func NewDB(ctx *config.Context) *DB {
 // InsertTx 插入群信息（含事务）
 func (d *DB) InsertTx(m *Model, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("group").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
-	return err
+	if err != nil {
+		return err
+	}
+	return imreconcile.TouchGroupTx(tx, m.GroupNo)
 }
 
 // Insert 插入群信息
 func (d *DB) Insert(m *Model) error {
+	if imreconcile.Enabled() {
+		tx, err := d.session.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.RollbackUnlessCommitted()
+		if err := d.InsertTx(m, tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	_, err := d.session.InsertInto("group").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 // 修改群类型
 func (d *DB) UpdateGroupTypeTx(groupNo string, groupType GroupType, tx *dbr.Tx) error {
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	_, err := tx.Update("group").Set("group_type", int(groupType)).Where("group_no=?", groupNo).Exec()
 	return err
 }
 
 // 修改群类型
 func (d *DB) UpdateGroupType(groupNo string, groupType GroupType) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Mutate(d.session, groupNo, func(tx *dbr.Tx) error {
+			_, err := tx.Update("group").Set("group_type", int(groupType)).Where("group_no=?", groupNo).Exec()
+			return err
+		})
+	}
 	_, err := d.session.Update("group").Set("group_type", int(groupType)).Where("group_no=?", groupNo).Exec()
 	return err
 }
@@ -85,6 +109,9 @@ func (d *DB) InsertMember(m *MemberModel) error {
 // either), so clearing it on the way OUT is what makes a rejoining member come
 // back unmuted — the same rule as the bot_admin reset.
 func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.Tx) error {
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	_, err := tx.Update("group_member").
 		Set("is_deleted", 1).
 		Set("version", version).
@@ -95,6 +122,13 @@ func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.T
 
 // DeleteMember 删除群成员
 func (d *DB) DeleteMember(groupNo string, uid string, version int64) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Mutate(d.session, groupNo, func(tx *dbr.Tx) error {
+			_, err := tx.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
+			return err
+		})
+	}
+
 	_, err := d.session.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
 	return err
 }
@@ -151,12 +185,18 @@ func (d *DB) queryGroupMemberMaxVersion(groupNo string) (int64, error) {
 
 // UpdateMemberRoleTx 更新群成员角色
 func (d *DB) UpdateMemberRoleTx(groupNo string, uid string, role int, version int64, tx *dbr.Tx) error {
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	_, err := tx.Update("group_member").Set("role", role).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
 	return err
 }
 
 // updateMemberForbiddenExpirTimeTx 修改成员禁言时长
 func (d *DB) updateMemberForbiddenExpirTimeTx(groupNo string, uid string, time int, version int64, tx *dbr.Tx) error {
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	_, err := tx.Update("group_member").Set("forbidden_expir_time", time).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
 	return err
 }
@@ -325,6 +365,20 @@ func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 // already established the member is live, and a member who left mid-request has
 // nothing left to update.
 func (d *DB) UpdateMember(member *MemberModel) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Mutate(d.session, member.GroupNo, func(tx *dbr.Tx) error {
+			_, err := tx.Update("group_member").SetMap(map[string]interface{}{
+				"remark":               member.Remark,
+				"role":                 member.Role,
+				"version":              member.Version,
+				"is_deleted":           member.IsDeleted,
+				"invite_uid":           member.InviteUID,
+				"forbidden_expir_time": member.ForbiddenExpirTime,
+			}).Where("group_no=? and uid=? and is_deleted=0", member.GroupNo, member.UID).Exec()
+			return err
+		})
+	}
+
 	_, err := d.session.Update("group_member").SetMap(map[string]interface{}{
 		"remark":               member.Remark,
 		"role":                 member.Role,
@@ -342,6 +396,9 @@ func (d *DB) UpdateMember(member *MemberModel) error {
 // as the subsequent IM and thread resubscriptions. Group manager authorization
 // is enforced by the handler before this helper is called.
 func (d *DB) updateMembersStatusTx(tx *dbr.Tx, version int64, groupNo string, status int, uids []string) error {
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
 		"status":  status,
 		"version": version,
@@ -351,6 +408,16 @@ func (d *DB) updateMembersStatusTx(tx *dbr.Tx, version int64, groupNo string, st
 
 // 修改群成员状态
 func (d *DB) updateMembersStatus(version int64, groupNo string, status int, uids []string) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Mutate(d.session, groupNo, func(tx *dbr.Tx) error {
+			_, err := tx.Update("group_member").SetMap(map[string]interface{}{
+				"status":  status,
+				"version": version,
+			}).Where("group_no=? and uid in ?", groupNo, uids).Exec()
+			return err
+		})
+	}
+
 	_, err := d.session.Update("group_member").SetMap(map[string]interface{}{
 		"status":  status,
 		"version": version,
@@ -407,6 +474,15 @@ func (d *DB) queryUserSupers(uid string) ([]*Model, error) {
 
 // UpdateTx 更新群信息（带事务）
 func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
+	if imreconcile.Enabled() {
+		var groupNo string
+		if err := tx.QueryRow("SELECT group_no FROM `group` WHERE id=?", model.Id).Scan(&groupNo); err != nil {
+			return err
+		}
+		if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+			return err
+		}
+	}
 	_, err := tx.Update("group").SetMap(map[string]interface{}{
 		"name":      model.Name,
 		"is_named":  model.IsNamed, // 原样回写当前值（改名不再改动 is_named；仅 #500 迁移回填存量老群为 1）
@@ -472,6 +548,9 @@ func (d *DB) UpdateInviteTx(groupNo string, invite int, version int64, tx *dbr.T
 // UpdateTx 全列回写会用旧快照覆盖并发修改（lost-update）。列级写只动 status/version，
 // 与并发的群设置变更互不踩踏，对齐 UpdateInviteTx 的设计。
 func (d *DB) UpdateStatusTx(groupNo string, status int, version int64, tx *dbr.Tx) error {
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	_, err := tx.Update("group").SetMap(map[string]interface{}{
 		"status":  status,
 		"version": version,
@@ -481,6 +560,30 @@ func (d *DB) UpdateStatusTx(groupNo string, status int, version int64, tx *dbr.T
 
 // Update 更新群信息
 func (d *DB) Update(model *Model) error {
+	if imreconcile.Enabled() {
+		var groupNo string
+		if err := d.session.Select("group_no").From("group").Where("id=?", model.Id).LoadOne(&groupNo); err != nil {
+			return err
+		}
+		return imreconcile.Mutate(d.session, groupNo, func(tx *dbr.Tx) error {
+			_, err := tx.Update("group").SetMap(map[string]interface{}{
+				"name":                        model.Name,
+				"notice":                      model.Notice,
+				"creator":                     model.Creator,
+				"status":                      model.Status,
+				"version":                     model.Version,
+				"forbidden":                   model.Forbidden,
+				"invite":                      model.Invite,
+				"forbidden_add_friend":        model.ForbiddenAddFriend,
+				"allow_view_history_msg":      model.AllowViewHistoryMsg,
+				"allow_member_pinned_message": model.AllowMemberPinnedMessage,
+				"allow_external":              model.AllowExternal,
+				"allow_no_mention":            model.AllowNoMention,
+			}).Where("id=?", model.Id).Exec()
+			return err
+		})
+	}
+
 	_, err := d.session.Update("group").SetMap(map[string]interface{}{
 		"name":                        model.Name,
 		"notice":                      model.Notice,
@@ -1009,6 +1112,9 @@ func (d *DB) QueryBotMemberUIDs(groupNo string) ([]string, error) {
 // 没有活跃 robot 行的 bot（孤儿 / 禁用）不视为任何人的 bot，不被级联。
 // 群主 / 其他管理员仍可通过常规移除成员接口清理它们。
 func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, requireCommonRole bool, tx *dbr.Tx) ([]string, error) {
+	if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+		return nil, err
+	}
 	if groupNo == "" || inviterUID == "" {
 		return nil, nil
 	}
@@ -1104,6 +1210,9 @@ func (d *DB) QuerySecondOldestMemberExcludingBotsOf(groupNo string, leaverUID st
 // bot 的 is_external + source_space_id 字段仅用于能力路由，不影响群的外部属性。
 // 详见 YUJ-48 / Mininglamp-OSS/octo-server#1184。
 func (d *DB) QueryExternalMemberCountTx(groupNo string, tx *dbr.Tx) (int64, error) {
+	if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+		return 0, err
+	}
 	var count int64
 	_, err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND is_external=1 AND is_deleted=0 AND robot=0 FOR UPDATE",
@@ -1249,6 +1358,9 @@ func (d *DB) QueryCategoryByID(categoryID string) (*CategoryRow, error) {
 //     的提升会通过重查、行真的被删，而且 removedUIDs 里有它、调用方的集合比对
 //     也发现不了，等于普通成员越权移除了一个群管理员。
 func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole bool, tx *dbr.Tx) (bool, error) {
+	if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+		return false, err
+	}
 	var roles []int
 	_, err := tx.SelectBySql(
 		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",

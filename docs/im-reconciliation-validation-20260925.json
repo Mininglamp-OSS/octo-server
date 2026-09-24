@@ -1,0 +1,944 @@
+{
+  "status": "documented workload acceptance passed; full repository suite remains non-green",
+  "im_build": {
+    "commit": "988a5a802ca9f2e11f54f737ec1c3e4871c03dda",
+    "sha256": "60931515d80a7f7c5ce800f9c317870d6199d4e1153e5e680fcd4a389f246c88",
+    "command": "CGO_ENABLED=1 /usr/local/go/bin/go build -buildvcs=false -o <artifact>/bin/wukongim-companion-v3 .",
+    "parent_hour_tested_commit": "636dc81bf9cc7f70c212a75dc4f18aa17ebaab36",
+    "production_change_since_hour": "Preserve DeletedAtMsgSeq in the existing atomic lifecycle batch during legacy row adoption; no wire/timeout/throughput changes."
+  },
+  "backend_build": {
+    "source_commit": "fea95364df17e55925e1a67de8ac35ebb7d8460d",
+    "base_commit": "d72384470cb72188af4f99c2576f92d2a0e39738",
+    "binary_sha256": "d8dabedc84e02263f66301779749d457472314091bc86eaf7c4d3d0d64900987",
+    "build": "CGO_ENABLED=1, static external link; source binary overrides the older runtime base image"
+  },
+  "baseline": {
+    "label": "baseline",
+    "load_wall_s": 601.9946663659939,
+    "totals": {
+      "requests": 3819558,
+      "failures": 327
+    },
+    "log_counts": {
+      "slot_raft_timeout": 253,
+      "channel_raft_timeout": 0,
+      "store_message_failed": 0,
+      "invalid_effect_page": 0,
+      "context_deadline": 1,
+      "enospc": 0
+    }
+  },
+  "hour_pre_adoption_fix": {
+    "source_commit": "636dc81bf9cc7f70c212a75dc4f18aa17ebaab36",
+    "binary_sha256": "640f0360f9eefcd26edc53ee8a0b72b7eed5bd60ad7cf8d3796251bcce08f4f6",
+    "label": "companion-v2-hour",
+    "duration_s": 3600.8672168670164,
+    "kinds": {
+      "message": {
+        "requests": 24615089,
+        "completed_operations": 24615089,
+        "transport_errors": 0,
+        "over_1s": 0,
+        "max_latency_s": 0.669313816,
+        "statuses": {
+          "200": 24615089
+        },
+        "completed_operations_per_second": 6835.878003137448
+      },
+      "upsert": {
+        "requests": 266103,
+        "completed_operations": 266103,
+        "transport_errors": 0,
+        "over_1s": 191,
+        "max_latency_s": 1.804435281,
+        "statuses": {
+          "200": 266103
+        },
+        "completed_operations_per_second": 73.89969803760954
+      },
+      "churn": {
+        "requests": 250352,
+        "completed_operations": 250352,
+        "transport_errors": 0,
+        "over_1s": 24491,
+        "max_latency_s": 2.693651012,
+        "statuses": {
+          "200": 250352
+        },
+        "completed_operations_per_second": 69.52547398229868
+      }
+    },
+    "totals": {
+      "requests": 25131544,
+      "failures": 0
+    },
+    "checks": {
+      "setup_drain": true,
+      "setup_audit": true,
+      "tail_operations_resolved": true,
+      "final_state": true,
+      "roundtrip_add_requests": true,
+      "roundtrip_add_drain": true,
+      "roundtrip_remove_requests": true,
+      "roundtrip_remove_drain": true,
+      "roundtrip": true,
+      "restart_drain": true,
+      "restart_audit": true
+    },
+    "message_audit": {
+      "passed": true,
+      "samples": 2555,
+      "failed_samples": 0,
+      "count_audit": {
+        "channels": 378,
+        "expected_messages": 24615089,
+        "passed": true
+      }
+    },
+    "restart_message_audit": {
+      "passed": true,
+      "samples": 2555,
+      "failed_samples": 0,
+      "count_audit": {
+        "channels": 378,
+        "expected_messages": 24615089,
+        "passed": true
+      }
+    },
+    "recovery": {
+      "passed": true,
+      "duration_s": 121.49461525399238,
+      "first_converged_s": 1.2652465080027469,
+      "same_process": true,
+      "failed_unique_operations": 0,
+      "complete_failed_operations": 0,
+      "timeout_slots": {}
+    },
+    "resources": {
+      "label": "companion-v2-hour",
+      "samples": 721,
+      "first_sample": "2026-09-24T15:25:15.096855+00:00",
+      "last_sample": "2026-09-24T16:25:15.709597+00:00",
+      "peak_sampled_memory_bytes": 4294950912,
+      "memory_event_maxima": {
+        "low": 0,
+        "high": 0,
+        "max": 4072,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "cpu_counter_delta": {
+        "usage_usec": 6821717120,
+        "user_usec": 6419996315,
+        "system_usec": 401720804,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 36006,
+        "nr_throttled": 87,
+        "throttled_usec": 64067,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "io_counter_delta_by_device": {
+        "259:0": {
+          "rbytes": 602083328,
+          "wbytes": 144165273600,
+          "rios": 113426,
+          "wios": 3406024,
+          "dbytes": 0,
+          "dios": 0
+        },
+        "252:0": {
+          "rbytes": 602083328,
+          "wbytes": 144165273600,
+          "rios": 112944,
+          "wios": 2661153,
+          "dbytes": 0,
+          "dios": 0
+        }
+      },
+      "min_available_disk_bytes": 377669009408,
+      "host_peak_io_psi_avg10": {
+        "some": 9.86,
+        "full": 6.93
+      },
+      "scope": "sampled load phase only, excludes setup/drain/restart; host PSI is not process attribution"
+    }
+  },
+  "business_final": {
+    "passed_core_assertions": true,
+    "assertions": 4886,
+    "groups": 126,
+    "children": 252,
+    "message_identities": 419,
+    "business_http_requests": 710,
+    "business_http_statuses": {
+      "200": 710
+    },
+    "business_http_latency": {
+      "p50_ms": 993.437,
+      "p95_ms": 1320.849,
+      "p99_ms": 1691.19,
+      "max_ms": 1969.815
+    },
+    "mutation_http_latency": {
+      "p50_ms": 1076.061,
+      "p95_ms": 1338.342,
+      "p99_ms": 1710.524,
+      "max_ms": 1969.815
+    },
+    "resources": {
+      "subscriber-durable-biz-im": {
+        "peak_sampled_memory_bytes": 200306688,
+        "peak_memory_events": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0,
+          "sock_throttled": 0
+        },
+        "cpu_stat_delta": {
+          "usage_usec": 15112894,
+          "user_usec": 11926100,
+          "system_usec": 3186794,
+          "nice_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 4109,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        }
+      },
+      "subscriber-durable-biz-backend": {
+        "peak_sampled_memory_bytes": 35840000,
+        "peak_memory_events": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0,
+          "sock_throttled": 0
+        },
+        "cpu_stat_delta": {
+          "usage_usec": 4435521,
+          "user_usec": 3117145,
+          "system_usec": 1318376,
+          "nice_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 1825,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        }
+      },
+      "subscriber-durable-biz-mysql": {
+        "peak_sampled_memory_bytes": 518787072,
+        "peak_memory_events": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0,
+          "sock_throttled": 0
+        },
+        "cpu_stat_delta": {
+          "usage_usec": 6723787,
+          "user_usec": 4676647,
+          "system_usec": 2047140,
+          "nice_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 3088,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        }
+      },
+      "subscriber-durable-biz-redis": {
+        "peak_sampled_memory_bytes": 5844992,
+        "peak_memory_events": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0,
+          "sock_throttled": 0
+        },
+        "cpu_stat_delta": {
+          "usage_usec": 1936623,
+          "user_usec": 1543481,
+          "system_usec": 393142,
+          "nice_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 2888,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        }
+      },
+      "subscriber-durable-biz-minio": {
+        "peak_sampled_memory_bytes": 82919424,
+        "peak_memory_events": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0,
+          "sock_throttled": 0
+        },
+        "cpu_stat_delta": {
+          "usage_usec": 224259,
+          "user_usec": 194248,
+          "system_usec": 30010,
+          "nice_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nr_periods": 148,
+          "nr_throttled": 0,
+          "throttled_usec": 0,
+          "nr_bursts": 0,
+          "burst_usec": 0
+        }
+      }
+    },
+    "known_baseline_removal_notification_defect": true,
+    "resource_observation_window": [
+      "2026-09-24T16:33:40.084693+00:00",
+      "2026-09-24T16:40:44.275322+00:00"
+    ]
+  },
+  "business_workload": {
+    "startedAt": "2026-09-24T16:39:51.443Z",
+    "endedAt": "2026-09-24T16:40:35.617Z",
+    "userCount": 25,
+    "groupCount": 126,
+    "channels": 378,
+    "churnRounds": 10,
+    "activeGroupCount": 3,
+    "createWorkers": 16,
+    "apiInterval": 550,
+    "sendInterval": 100,
+    "registerInterval": 12100,
+    "firstOwner": 0,
+    "reuseAccounts": false,
+    "scenario": "Real group/child creation concurrent with kick/rejoin and SDK ACK/delivery; all groups contain all users.",
+    "reproductionBoundary": "378 channels and 25 users when using defaults. Memberships and business API workload differ from the earlier synthetic 225-membership, 100-worker mapping; original external screenshot script is unavailable."
+  },
+  "business_queue": {
+    "authority_rows": 265,
+    "pending": 0,
+    "incomplete": 0,
+    "passed": true
+  },
+  "business_faults_final": {
+    "passed": true,
+    "error": null,
+    "cases": [
+      {
+        "case": "lost all successful create replies through foreground deadline",
+        "business_status": 400,
+        "repeated_same_operation_ids": true,
+        "compensation_complete": true
+      },
+      {
+        "case": "child request never reached IM",
+        "business_status": 400,
+        "recovered_without_user_retry": true
+      },
+      {
+        "case": "backend SIGKILL after SQL commit before IM delivery",
+        "recovered_without_user_retry": true
+      },
+      {
+        "case": "failed kick then rejoin then delayed old snapshots",
+        "latest_membership_preserved": true,
+        "stale_response_statuses": [
+          409,
+          409,
+          409,
+          409,
+          409
+        ]
+      }
+    ]
+  },
+  "fault_queue": {
+    "authority_rows": 266,
+    "pending": 0,
+    "incomplete": 0,
+    "passed": true
+  },
+  "full_im_suite": {
+    "command": "go test -json -count=1 -timeout=150s ./...",
+    "exit_code": 1,
+    "passed_packages": [
+      "github.com/WuKongIM/WuKongIM/cmd/wkcli",
+      "github.com/WuKongIM/WuKongIM/internal/eventbus",
+      "github.com/WuKongIM/WuKongIM/internal/api",
+      "github.com/WuKongIM/WuKongIM/internal/options",
+      "github.com/WuKongIM/WuKongIM/internal/manager",
+      "github.com/WuKongIM/WuKongIM/internal/service",
+      "github.com/WuKongIM/WuKongIM/pkg/client",
+      "github.com/WuKongIM/WuKongIM/pkg/fasttime",
+      "github.com/WuKongIM/WuKongIM/pkg/grpcpool",
+      "github.com/WuKongIM/WuKongIM/pkg/pool/byteslice",
+      "github.com/WuKongIM/WuKongIM/pkg/jsonrpc",
+      "github.com/WuKongIM/WuKongIM/pkg/pse",
+      "github.com/WuKongIM/WuKongIM/pkg/raft/track",
+      "github.com/WuKongIM/WuKongIM/pkg/ring",
+      "github.com/WuKongIM/WuKongIM/pkg/raft/types",
+      "github.com/WuKongIM/WuKongIM/pkg/trace",
+      "github.com/WuKongIM/WuKongIM/pkg/wkcache",
+      "github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig",
+      "github.com/WuKongIM/WuKongIM/pkg/wklog",
+      "github.com/WuKongIM/WuKongIM/pkg/wkserver/proto",
+      "github.com/WuKongIM/WuKongIM/pkg/wkutil",
+      "github.com/WuKongIM/WuKongIM/pkg/cluster/store",
+      "github.com/WuKongIM/WuKongIM/test/e2e",
+      "github.com/WuKongIM/WuKongIM/pkg/raft/raft",
+      "github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup",
+      "github.com/WuKongIM/WuKongIM/pkg/cluster/slot"
+    ],
+    "failed_packages": [
+      "github.com/WuKongIM/WuKongIM/internal/track",
+      "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster",
+      "github.com/WuKongIM/WuKongIM/pkg/wkserver/test",
+      "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+      "github.com/WuKongIM/WuKongIM/internal/server",
+      "github.com/WuKongIM/WuKongIM/pkg/wknet",
+      "github.com/WuKongIM/WuKongIM/internal/user/event",
+      "github.com/WuKongIM/WuKongIM/pkg/wkserver"
+    ],
+    "failed_tests": [
+      {
+        "package": "github.com/WuKongIM/WuKongIM/internal/track",
+        "test": "TestMessageString"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster",
+        "test": "TestAdaptiveSendQueue_Shrinking"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster",
+        "test": "TestSendBatchOptimization/SingleMessage"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster",
+        "test": "TestSendBatchOptimization/BatchMessages"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster",
+        "test": "TestSendBatchOptimization"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestCacheStats"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestUpdateConversationsInCacheWithNewConversation"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestDeviceCacheStats"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestPermissionCacheStats"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestSearchDevices"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestTruncateLogTo"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestAddPluginUsers"
+      },
+      {
+        "package": "github.com/WuKongIM/WuKongIM/pkg/wkdb",
+        "test": "TestGetPluginUsers"
+      }
+    ]
+  },
+  "introduced_tests": {
+    "new_tests": [
+      {
+        "file": "pkg/cluster/cluster/subscriber_capability_test.go",
+        "test": "TestSubscriberJoinDoesNotConfusePartialCapabilityWithActivation",
+        "full_suite_pass": false,
+        "explicit_protocol_pass": true
+      },
+      {
+        "file": "pkg/cluster/cluster/subscriber_capability_test.go",
+        "test": "TestSubscriberRevisionNeedsDistinctProofFromProtocolThree",
+        "full_suite_pass": false,
+        "explicit_protocol_pass": true
+      },
+      {
+        "file": "pkg/cluster/node/clusterconfig/subscriber_protocol_test.go",
+        "test": "TestSubscriberRevisionProofFencesAlreadyProposedOldJoin",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/slot/storage_apply_cursor_test.go",
+        "test": "TestOrdinaryApplyCallbackRestoresSynchronousCursor",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/slot/storage_apply_cursor_test.go",
+        "test": "TestReplaySafeApplyCursorMayLagAfterPowerLoss",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/slot/storage_apply_cursor_test.go",
+        "test": "TestReplaySafeApplyFailureDoesNotAdvanceCursor",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/slot/storage_pebble_test.go",
+        "test": "TestAppendCanProgressWhileSameSlotApplyIsBlocked",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/slot/storage_pebble_test.go",
+        "test": "TestTruncateWaitsForApplyAndKeepsItsDurablePrefix",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/slot/storage_space_linux_test.go",
+        "test": "TestSlotWALStartupSpaceAndReopen",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/channel_metadata_batch_test.go",
+        "test": "TestMetadataBatchBoundsOneDurabilityUnit",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/channel_metadata_batch_test.go",
+        "test": "TestMetadataBatchCheckpointFailureReplaysFinalState",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/channel_metadata_batch_test.go",
+        "test": "TestMetadataBatchDoesNotMoveUpdatesPastChannelDeletion",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/store_apply_replay_test.go",
+        "test": "TestRecoveryReplaysAfterReopenWithoutLegacyCheckpoint",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/subscriber_remaining_deadline_test.go",
+        "test": "TestSubscriberActualDeadlineRetainsRecoverablePendingWork",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/subscriber_remaining_deadline_test.go",
+        "test": "TestSubscriberCompletionUsesRemainingRequestDeadline",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/cluster/store/subscriber_revision_test.go",
+        "test": "TestManagedSubscriberSnapshotFencesCommittedLegacyCommands",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/channel_metadata_batch_test.go",
+        "test": "TestMetadataBatchPartialDurabilityNeverExposesIntermediateFlags",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/channel_metadata_batch_test.go",
+        "test": "TestMetadataBatchRetainsHistoryCountsAndFinalIndexes",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/conversation_sync_test.go",
+        "test": "TestConversationCrossShardPartialSyncReplay",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/conversation_sync_test.go",
+        "test": "TestConversationShardFailureWaitsForSuccessfulSibling",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/conversation_sync_test.go",
+        "test": "TestConversationShardSyncsOverlapButCompletionWaitsForAll",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_adoption_history_test.go",
+        "test": "TestSubscriberSnapshotAdoptionPreservesBusinessConversationDeletion",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_power_loss_test.go",
+        "test": "TestCompletedSubscriberWorkSurvivesLostRelationDoneMarker",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotDenylistPreservesMutedMembership",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotDisbandPreservesConversationsAndOtherMetadata",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotLateRemoveCannotUndoRejoinAfterReceiptExpiry",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotOnlySkipsDurablyCompletedUnchangedTargets",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotPageValidation",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotPagesReplaceOnlyTheirRangeAndFenceLatePages",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      },
+      {
+        "file": "pkg/wkdb/subscriber_revision_test.go",
+        "test": "TestSubscriberSnapshotRejectedAdmissionDoesNotAdvanceAuthority",
+        "full_suite_pass": true,
+        "explicit_protocol_pass": false
+      }
+    ],
+    "introduced_test_count": 30,
+    "all_observed_pass": true,
+    "scope": "Full suite includes baseline failures; explicit protocol run uses previous commit with identical protocol source. Final adoption test additionally has race/restart/partial-power-loss coverage."
+  },
+  "limits": [
+    "Original external screenshot script unavailable; workload parameter mapping is explicit.",
+    "Full IM suite is not green.",
+    "Baseline kicked-member notification payload defect remains.",
+    "The hour is the exact prior binary; only adoption field persistence changed afterward.",
+    "No membership-throughput improvement claim: closed-loop message traffic dominates aggregate RPS.",
+    "All IM replicas and backend writers must upgrade before coordinated authority activation.",
+    "Already-activated protocol data cannot be downgraded.",
+    "Historical identities deleted before durable ownership tombstones require a separate audit."
+  ],
+  "final_mixed": {
+    "label": "companion-v3",
+    "duration_s": 603.4516411389923,
+    "kinds": {
+      "message": {
+        "requests": 7977210,
+        "completed_operations": 7977210,
+        "transport_errors": 0,
+        "over_1s": 0,
+        "max_latency_s": 0.275969135,
+        "statuses": {
+          "200": 7977210
+        },
+        "completed_operations_per_second": 13219.302850752574
+      },
+      "upsert": {
+        "requests": 76347,
+        "completed_operations": 76347,
+        "transport_errors": 0,
+        "over_1s": 0,
+        "max_latency_s": 0.727062271,
+        "statuses": {
+          "200": 76347
+        },
+        "completed_operations_per_second": 126.51718016028245
+      },
+      "churn": {
+        "requests": 67979,
+        "completed_operations": 67979,
+        "transport_errors": 0,
+        "over_1s": 129,
+        "max_latency_s": 1.591020264,
+        "statuses": {
+          "200": 67979
+        },
+        "completed_operations_per_second": 112.65028606383801
+      }
+    },
+    "totals": {
+      "requests": 8121536,
+      "failures": 0
+    },
+    "checks": {
+      "setup_drain": true,
+      "setup_audit": true,
+      "tail_operations_resolved": true,
+      "final_state": true,
+      "roundtrip_add_requests": true,
+      "roundtrip_add_drain": true,
+      "roundtrip_remove_requests": true,
+      "roundtrip_remove_drain": true,
+      "roundtrip": true,
+      "restart_drain": true,
+      "restart_audit": true
+    },
+    "message_audit": {
+      "passed": true,
+      "samples": 448,
+      "failed_samples": 0,
+      "count_audit": {
+        "channels": 378,
+        "expected_messages": 7977210,
+        "passed": true
+      }
+    },
+    "restart_message_audit": {
+      "passed": true,
+      "samples": 448,
+      "failed_samples": 0,
+      "count_audit": {
+        "channels": 378,
+        "expected_messages": 7977210,
+        "passed": true
+      }
+    },
+    "recovery": {
+      "passed": true,
+      "duration_s": 120.21323963999748,
+      "first_converged_s": 0.06652415101416409,
+      "same_process": true,
+      "failed_unique_operations": 0,
+      "complete_failed_operations": 0,
+      "timeout_slots": {}
+    },
+    "resources": {
+      "label": "companion-v3",
+      "samples": 121,
+      "first_sample": "2026-09-24T16:42:07.032516+00:00",
+      "last_sample": "2026-09-24T16:52:07.133038+00:00",
+      "peak_sampled_memory_bytes": 2360377344,
+      "memory_event_maxima": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "cpu_counter_delta": {
+        "usage_usec": 1103990956,
+        "user_usec": 1007086478,
+        "system_usec": 96904478,
+        "nice_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 6001,
+        "nr_throttled": 1,
+        "throttled_usec": 347,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "io_counter_delta_by_device": {
+        "259:0": {
+          "rbytes": 20480,
+          "wbytes": 19744845824,
+          "rios": 5,
+          "wios": 671351,
+          "dbytes": 0,
+          "dios": 0
+        },
+        "252:0": {
+          "rbytes": 20480,
+          "wbytes": 19744845824,
+          "rios": 5,
+          "wios": 590868,
+          "dbytes": 0,
+          "dios": 0
+        }
+      },
+      "min_available_disk_bytes": 376591941632,
+      "host_peak_io_psi_avg10": {
+        "some": 0.96,
+        "full": 0.91
+      },
+      "scope": "sampled load phase only, excludes setup/drain/restart; host PSI is not process attribution"
+    },
+    "manifest": {
+      "label": "companion-v3",
+      "revision": "988a5a802ca9f2e11f54f737ec1c3e4871c03dda",
+      "binary_sha256": "60931515d80a7f7c5ce800f9c317870d6199d4e1153e5e680fcd4a389f246c88",
+      "image": "sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b",
+      "cpus": 2,
+      "memory_bytes": 4294967296,
+      "duration_s": 600,
+      "groups": 42,
+      "channels_per_group": 9,
+      "channels": 378,
+      "active_channels": 9,
+      "users": 25,
+      "initial_memberships": 225,
+      "workers": {
+        "churn": 42,
+        "message": 42,
+        "upsert": 16
+      },
+      "churn": "original harness: channel=worker_id%9, user=worker_id%25; remove/add same pair with stable operation_id retries",
+      "message": "original harness: channel=(worker_id*9+sequence)%378; persistent messages",
+      "upsert": "16 workers cycling all 378 channel metadata records",
+      "disk_guard_free_bytes": 85899345920,
+      "disk_guard_free_inodes": 1000000,
+      "started_at": "2026-09-24T16:41:56.917464+00:00",
+      "container": "subscriber-durable-companion-v3",
+      "api_scope": "IM HTTP business APIs; no frontend, gateway login or online delivery assertion",
+      "recovery_observation_s": 600,
+      "minimum_quiet_observation_s": 120,
+      "workload_change": "same 378 channels/225 memberships; stable-ID 10ms retries; phase timing only on profile binary",
+      "no_foreground_retries_during_observation": true,
+      "historical_data_copy": false,
+      "diagnostic_overlay": false,
+      "load_started_at": "2026-09-24T16:42:06.845677+00:00",
+      "load_ended_at": "2026-09-24T16:52:10.297562+00:00"
+    }
+  },
+  "business_resource_limits": {
+    "subscriber-durable-biz-im": {
+      "Memory": 4294967296,
+      "MemorySwap": 4294967296,
+      "NanoCpus": 2000000000,
+      "image": "sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b",
+      "started_at": "2026-09-24T16:33:01.63316588Z"
+    },
+    "subscriber-durable-biz-backend": {
+      "Memory": 2147483648,
+      "MemorySwap": 4294967296,
+      "NanoCpus": 2000000000,
+      "image": "octo-server:agentmem-4442db4-20260831",
+      "started_at": "2026-09-24T16:33:14.367679358Z"
+    },
+    "subscriber-durable-biz-mysql": {
+      "Memory": 1073741824,
+      "MemorySwap": 2147483648,
+      "NanoCpus": 1000000000,
+      "image": "mysql:8.0",
+      "started_at": "2026-09-24T16:33:01.634376322Z"
+    },
+    "subscriber-durable-biz-redis": {
+      "Memory": 268435456,
+      "MemorySwap": 536870912,
+      "NanoCpus": 500000000,
+      "image": "redis:7-alpine",
+      "started_at": "2026-09-24T16:33:01.633913283Z"
+    },
+    "subscriber-durable-biz-minio": {
+      "Memory": 536870912,
+      "MemorySwap": 1073741824,
+      "NanoCpus": 500000000,
+      "image": "minio/minio:latest",
+      "started_at": "2026-09-24T16:33:01.632062504Z"
+    }
+  },
+  "preserved_failed_experiments": [
+    {
+      "label": "candidate6-hour",
+      "load_wall_s": 3601.736175294005,
+      "totals": {
+        "requests": 22534730,
+        "failures": 9
+      },
+      "log_counts": {
+        "slot_raft_timeout": 4,
+        "channel_raft_timeout": 0,
+        "store_message_failed": 0,
+        "invalid_effect_page": 0,
+        "context_deadline": 0,
+        "enospc": 0
+      },
+      "recovery": {
+        "passed": true,
+        "duration_s": 121.04832191100286,
+        "first_converged_s": 1.8637371150107356,
+        "same_process": true,
+        "failed_unique_operations": 9,
+        "complete_failed_operations": 9,
+        "timeout_slots": {
+          "7": 89757,
+          "30": 76732,
+          "50": 88066,
+          "16": 24621
+        }
+      }
+    },
+    {
+      "label": "candidate7",
+      "load_wall_s": 604.8860487470083,
+      "totals": {
+        "requests": 5908275,
+        "failures": 1
+      },
+      "log_counts": {
+        "slot_raft_timeout": 1,
+        "channel_raft_timeout": 0,
+        "store_message_failed": 0,
+        "invalid_effect_page": 0,
+        "context_deadline": 0,
+        "enospc": 0
+      },
+      "recovery": {
+        "passed": true,
+        "duration_s": 120.30875044601271,
+        "first_converged_s": 0.06381091100047342,
+        "same_process": true,
+        "failed_unique_operations": 1,
+        "complete_failed_operations": 1,
+        "timeout_slots": {
+          "36": 26571
+        }
+      }
+    }
+  ]
+}
