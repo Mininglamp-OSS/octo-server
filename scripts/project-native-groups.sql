@@ -2,6 +2,8 @@
 -- instances plus in-flight Project/group tasks have drained. The Project module
 -- automatically applies embedded migrations on startup, so this post-drain
 -- contraction must stay outside modules/project/sql during a rolling deployment.
+-- A fresh installation has no old instances or in-flight work; run this SQL
+-- after its first startup once the compatible application is serving traffic.
 --
 -- This removes only the obsolete Project group pointer and provisioning lease.
 -- Historical groups retain group.project_id, members, owners, messages and IM

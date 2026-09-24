@@ -291,7 +291,7 @@ Project 创建、列表、详情及 Sidebar 的 Project 条目不再返回 `all_
 - 保留 `modules/space/sql/20260910000002_group_project_linked_by.sql`：可空关联人，历史不伪造。
 - 保留 `modules/project/sql/20260911000001_project_group_user_setting.sql`：个人Project关联群置顶存储及唯一键。
 - 保留 `modules/project/sql/20260911000002_project_member_joined_at.sql`：单条可空ADD COLUMN，读侧COALESCE，旧写入可省略，不做回填/NOT NULL收缩。
-- 已应用迁移保持原样。追加 Project 前向迁移删除 `octo_project.all_member_group_no` 与 `all_member_group_lease_until`；升级前记录存量关联群及消息/成员抽样，升级后核对原生群与 `group.project_id` 均未变。若数据库不支持预期在线 DDL 算法，迁移失败关闭，不接受隐式大表重建。
+- 已应用迁移保持原样；`modules/project/sql` 不新增删列迁移。升级前记录存量关联群及消息/成员抽样，确认旧实例和在途任务排空后，由运维手动运行 `scripts/project-native-groups.sql` 删除 `octo_project.all_member_group_no` 与 `all_member_group_lease_until`，再核对原生群与 `group.project_id` 均未变。若数据库不支持预期在线 DDL 算法，脚本失败关闭，不接受隐式大表重建。
 - 同步 Project/Sidebar API 文档及真实客户端消费方，撤去仅供专属群使用的错误码、翻译、配置、对账指标和运维告警；保留 Project/Space 共用的清理、epoch 与相关监控。其他已确认的用户 API、Drive 前提及字段切换责任不变。
 - 用户API批量添加/Owner权限和sidebar DTO切换需调用方联合验收；列出仓库内真实调用点及外部责任系统，不假设前端已发布。Drive接口与30字符支持仍是外部部署前提。
 
@@ -299,7 +299,7 @@ Project 创建、列表、详情及 Sidebar 的 Project 条目不再返回 `all_
 
 1. 枚举受影响的服务实例、客户端字段消费者、Project/Group/Space/Bot/Category 写读路径及尚未完成的 Project removal、Space `rejoined` 工单；确认原生 Space 清理和 Project 席位关闭仍可独立完成。
 2. 适配客户端并联合验收新 DTO；冻结受影响写入口，排空旧服务与在途专属群外部调用。部署不再访问专属列的新服务，确认它不会发起投影或由旧工单修改群；保留旧列直至所有旧实例退出。
-3. 使用新前向迁移删除专属列，核对存量群、群成员、消息和 Project 关联记录。此后只允许使用兼容新模式的应用回滚包，不回放旧专属群任务。
+3. 旧实例和在途任务排空后，备份 schema，由运维手动运行 `scripts/project-native-groups.sql` 删除专属列；不将删列 SQL 加入 `modules/project/sql` 的启动迁移。核对存量群、群成员、消息和 Project 关联记录。此后只允许使用兼容新模式的应用回滚包，不回放旧专属群任务。
 4. 实际验证创建 Project 无群、历史群正常聊天和群面操作、Project 成员/Owner/名称独立、普通群创建快照、Space 撤权清理、Project 解散回落、旧工单及跨重启边界。窄用例先行，再验证 Project/Group/Space/Category 和受影响 Bot 路径；API 响应形状、错误与数据库失败需实测。
 
 ## 未决事项
