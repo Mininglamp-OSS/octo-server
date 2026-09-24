@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/gocraft/dbr/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -239,6 +240,10 @@ func (d *DB) admitOrRestoreMembersTx(
 			// stops being discoverable only in production.
 			return fmt.Errorf("group: admission carries no version for uid %s", a.UID)
 		}
+	}
+
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
 	}
 
 	const cols = "(group_no, uid, remark, role, `version`, status, vercode, is_deleted, " +

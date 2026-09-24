@@ -20,6 +20,7 @@ import (
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"go.uber.org/zap"
 )
 
@@ -249,6 +250,13 @@ func (m *Manager) leftbangroup(c *wkhttp.Context) {
 	}
 
 	if groupStatus == group.Status {
+		if imreconcile.Enabled() {
+			if err := imreconcile.Flush(m.ctx, groupNo); err != nil {
+				m.Error("IM channel state reconciliation remains pending", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+				return
+			}
+		}
 		c.ResponseOK()
 		return
 	}
@@ -256,17 +264,20 @@ func (m *Manager) leftbangroup(c *wkhttp.Context) {
 	if groupStatus == GroupStatusDisabled {
 		ban = 1
 	}
-	err = m.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Ban:         ban,
-		Large:       group.GroupType,
-	})
-	if err != nil {
-		m.Error("调用IM修改channel信息服务失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
-		return
+	if !imreconcile.Enabled() {
+		err = m.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			Ban:         ban,
+			Large:       group.GroupType,
+		})
+		if err != nil {
+			m.Error("调用IM修改channel信息服务失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+			return
+		}
 	}
+
 	group.Status = groupStatus
 	//通知群成员更新群资料
 	// todo
@@ -310,6 +321,13 @@ func (m *Manager) leftbangroup(c *wkhttp.Context) {
 		return
 	}
 	m.ctx.EventCommit(eventID)
+	if imreconcile.Enabled() {
+		if err := imreconcile.Flush(m.ctx, groupNo); err != nil {
+			m.Error("IM channel state reconciliation remains pending", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+			return
+		}
+	}
 
 	c.ResponseOK()
 }

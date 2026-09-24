@@ -18,8 +18,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -1487,21 +1489,25 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	s.applyCreatorCategoryBestEffort(groupNo, req.Creator, req.CategoryID)
 
 	// 创建 IM 频道
-	err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+	err = imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		Subscribers: realMemberUIDs,
 	})
 	if err != nil {
 		s.Error("create IM channel failed, performing compensating rollback", zap.Error(err), zap.String("groupNo", groupNo))
-		// Compensating delete: remove group_member and group records that were
-		// already committed. Use s.ctx.DB() (not tx) because the transaction
-		// has already been committed.
-		if _, delErr := s.ctx.DB().DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); delErr != nil {
-			s.Error("compensating delete group_member failed", zap.Error(delErr), zap.String("groupNo", groupNo))
-		}
-		if _, delErr := s.ctx.DB().DeleteFrom("group").Where("group_no=?", groupNo).Exec(); delErr != nil {
-			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
+		// Compensation and its newer authority commit together, including
+		// when IM accepted the original create but its response was lost.
+		compensationErr := imreconcile.Mutate(s.ctx.DB(), groupNo, func(cleanupTx *dbr.Tx) error {
+			if _, err := cleanupTx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); err != nil {
+				return err
+			}
+			_, err := cleanupTx.DeleteFrom("group").Where("group_no=?", groupNo).Exec()
+			return err
+		})
+		if compensationErr != nil {
+			s.Error("compensating group deletion failed", zap.Error(compensationErr), zap.String("groupNo", groupNo))
+			return nil, errors.New("failed to create IM channel; group compensation failed")
 		}
 		return nil, errors.New("failed to create IM channel, group has been rolled back")
 	}
@@ -1751,17 +1757,24 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		channelUpdateDur = time.Since(t0)
 	}
 
+	var reconcileErr error
+	if imreconcile.Enabled() && len(addedUIDs) == 0 {
+		reconcileErr = imreconcile.Flush(s.ctx, req.GroupNo)
+	}
 	// IM 操作（事务提交之后）。这一段是同步、串行、对 WuKongIM 的阻塞 HTTP 调用，
 	// 也是「邀请成员慢」的主要嫌疑段；逐跳计时以便从日志定位是哪一跳慢。
 	if len(addedUIDs) > 0 {
 		// 添加 IM 订阅
 		t0 := time.Now()
-		if err := s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		if err := imreconcile.AddSubscribers(s.ctx, &config.SubscriberAddReq{
 			ChannelID:   req.GroupNo,
 			ChannelType: common.ChannelTypeGroup.Uint8(),
 			Subscribers: addedUIDs,
 		}); err != nil {
 			s.Error("add IM subscriber failed", zap.Error(err))
+			if imreconcile.Enabled() {
+				reconcileErr = err
+			}
 		}
 		imSubscriberDur = time.Since(t0)
 
@@ -1829,9 +1842,11 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		)
 	}
 
-	return &AddGroupMembersServiceResp{
-		Added: len(addedUIDs),
-	}, nil
+	resp := &AddGroupMembersServiceResp{Added: len(addedUIDs)}
+	if reconcileErr != nil {
+		return resp, fmt.Errorf("IM membership reconciliation remains pending: %w", reconcileErr)
+	}
+	return resp, nil
 }
 
 // RemoveGroupMembers 移除群成员
@@ -1891,7 +1906,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		removableMembers = append(removableMembers, m)
 	}
 	if len(removableMembers) == 0 {
-		return &RemoveGroupMembersServiceResp{Removed: 0}, nil
+		resp := &RemoveGroupMembersServiceResp{Removed: 0}
+		if imreconcile.Enabled() {
+			return resp, imreconcile.Flush(s.ctx, req.GroupNo)
+		}
+		return resp, nil
 	}
 
 	// 开启事务
@@ -1934,6 +1953,10 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 				}, nil
 			}
 		}
+	}
+
+	if err := imreconcile.LockGroupTx(tx, req.GroupNo); err != nil {
+		return nil, err
 	}
 
 	// Space revocation always follows the native group's own rule: hand the
@@ -2108,15 +2131,22 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		s.ctx.SendChannelUpdateToGroup(req.GroupNo)
 	}
 
+	var reconcileErr error
+	if imreconcile.Enabled() && len(removedUIDs) == 0 {
+		reconcileErr = imreconcile.Flush(s.ctx, req.GroupNo)
+	}
 	// IM 操作（事务提交之后）
 	if len(removedUIDs) > 0 {
 		// 移除 IM 订阅
-		if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		if err := imreconcile.RemoveSubscribers(s.ctx, &config.SubscriberRemoveReq{
 			ChannelID:   req.GroupNo,
 			ChannelType: common.ChannelTypeGroup.Uint8(),
 			Subscribers: removedUIDs,
 		}); err != nil {
 			s.Error("remove IM subscriber failed", zap.Error(err))
+			if imreconcile.Enabled() {
+				reconcileErr = err
+			}
 		}
 
 		// 发送被踢消息
@@ -2179,6 +2209,9 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	resp := &RemoveGroupMembersServiceResp{
 		Removed:     len(removedUIDs),
 		RemovedUIDs: removedUIDs,
+	}
+	if reconcileErr != nil {
+		return resp, fmt.Errorf("IM membership reconciliation remains pending: %w", reconcileErr)
 	}
 	return resp, nil
 }
@@ -2412,6 +2445,10 @@ func (s *Service) RemoveUserFromGroupThreads(groupNo, uid, spaceID string) {
 
 // addUsersToGroupThreads 新成员入群时，将其加入该群所有子区的 IM 订阅（直接 SQL）
 func (s *Service) addUsersToGroupThreads(groupNo string, uids []string) {
+	// Parent reconciliation includes all children.
+	if imreconcile.Enabled() {
+		return
+	}
 	if len(uids) == 0 {
 		return
 	}
@@ -2434,7 +2471,7 @@ func (s *Service) addUsersToGroupThreads(groupNo string, uids []string) {
 
 	for _, t := range threads {
 		channelID := groupNo + "____" + t.ShortID
-		if addErr := s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		if addErr := imreconcile.AddSubscribers(s.ctx, &config.SubscriberAddReq{
 			ChannelID:   channelID,
 			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 			Subscribers: uids,

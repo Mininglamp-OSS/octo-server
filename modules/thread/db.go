@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -11,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -59,18 +61,30 @@ type ThreadMdResult struct {
 
 // Insert 插入子区
 func (d *DB) Insert(m *Model) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Mutate(d.session, m.GroupNo, func(tx *dbr.Tx) error {
+			_, err := tx.InsertInto("thread").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+			return err
+		})
+	}
 	_, err := d.session.InsertInto("thread").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 // InsertTx 事务插入子区
 func (d *DB) InsertTx(m *Model, tx *dbr.Tx) error {
+	if err := imreconcile.TouchGroupTx(tx, m.GroupNo); err != nil {
+		return err
+	}
 	_, err := tx.InsertInto("thread").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 // InsertTxReturningID 事务插入子区并返回 ID
 func (d *DB) InsertTxReturningID(m *Model, tx *dbr.Tx) (int64, error) {
+	if err := imreconcile.TouchGroupTx(tx, m.GroupNo); err != nil {
+		return 0, err
+	}
 	result, err := tx.InsertInto("thread").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	if err != nil {
 		return 0, err
@@ -550,12 +564,14 @@ func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error
 		if err != nil {
 			return fmt.Errorf("mark deleted: gen version: %w", err)
 		}
-		result, err := d.session.UpdateBySql(
-			"UPDATE thread SET status=?, version=?, updated_at=? "+
-				"WHERE short_id=? AND status!=? AND version<?",
-			ThreadStatusDeleted, version, time.Now(),
-			shortID, ThreadStatusDeleted, version,
-		).Exec()
+		result, err := d.mutateMembership(shortID, func(tx *dbr.Tx) (sql.Result, error) {
+			query := "UPDATE thread SET status=?, version=?, updated_at=? WHERE short_id=? AND status!=? AND version<?"
+			args := []interface{}{ThreadStatusDeleted, version, time.Now(), shortID, ThreadStatusDeleted, version}
+			if tx != nil {
+				return tx.UpdateBySql(query, args...).Exec()
+			}
+			return d.session.UpdateBySql(query, args...).Exec()
+		})
 		if err != nil {
 			return fmt.Errorf("mark deleted: %w", err)
 		}
@@ -631,13 +647,36 @@ func (d *DB) probeStatus(shortID string) (int, bool, error) {
 
 // Update 更新子区信息
 func (d *DB) Update(m *Model) error {
-	_, err := d.session.Update("thread").SetMap(map[string]interface{}{
-		"name":       m.Name,
-		"status":     m.Status,
-		"version":    m.Version,
-		"updated_at": time.Now(),
-	}).Where("short_id=?", m.ShortID).Exec()
+	_, err := d.mutateMembership(m.ShortID, func(tx *dbr.Tx) (sql.Result, error) {
+		fields := map[string]interface{}{"name": m.Name, "status": m.Status, "version": m.Version, "updated_at": time.Now()}
+		if tx != nil {
+			return tx.Update("thread").SetMap(fields).Where("short_id=?", m.ShortID).Exec()
+		}
+		return d.session.Update("thread").SetMap(fields).Where("short_id=?", m.ShortID).Exec()
+	})
 	return err
+}
+
+// Resolve immutable ownership before locking the parent and intent. The child
+// is not locked first: member changes use parent -> intent -> child ordering.
+func (d *DB) mutateMembership(shortID string, write func(*dbr.Tx) (sql.Result, error)) (sql.Result, error) {
+	if !imreconcile.Enabled() {
+		return write(nil)
+	}
+	var groupNo string
+	if err := d.session.Select("group_no").From("thread").Where("short_id=?", shortID).LoadOne(&groupNo); err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return nil, ErrThreadNotFound
+		}
+		return nil, err
+	}
+	var result sql.Result
+	err := imreconcile.Mutate(d.session, groupNo, func(tx *dbr.Tx) error {
+		var err error
+		result, err = write(tx)
+		return err
+	})
+	return result, err
 }
 
 // ExistByShortID 检查子区是否存在
@@ -978,11 +1017,20 @@ func (d *DB) DeleteThreadAndMembers(threadID int64) error {
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
+	defer tx.RollbackUnlessCommitted()
+	if imreconcile.Enabled() {
+		var groupNo, shortID string
+		err = tx.QueryRow("SELECT group_no, short_id FROM thread WHERE id=?", threadID).Scan(&groupNo, &shortID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
 		}
-	}()
+		if err != nil {
+			return err
+		}
+		if err := imreconcile.RetireChildTx(tx, threadID, groupNo, shortID); err != nil {
+			return err
+		}
+	}
 
 	// 删除 thread_member 记录
 	if _, err = tx.DeleteBySql("DELETE FROM thread_member WHERE thread_id=?", threadID).Exec(); err != nil {
