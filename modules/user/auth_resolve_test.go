@@ -41,14 +41,14 @@ func newAuthResolveTestRoute(t *testing.T, reader obo.SnapshotReader, registryJS
 		oboRegistry: registry,
 	}
 	route := wkhttp.New()
-	route.POST("/v1/auth/resolve", u.authResolveBot)
+	route.POST("/v1/internal/auth/resolve", u.authResolveBot)
 	return route
 }
 
 func postAuthResolve(t *testing.T, route *wkhttp.WKHttp, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/v1/auth/resolve", bytes.NewBufferString(body))
+	request := httptest.NewRequest(http.MethodPost, "/v1/internal/auth/resolve", bytes.NewBufferString(body))
 	request.Header.Set("Content-Type", "application/json")
 	route.ServeHTTP(recorder, request)
 	return recorder

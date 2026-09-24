@@ -9,7 +9,7 @@ under a case-insensitive database collation no longer authenticate. Channel
 OBO also honors a Grant's `expires_at` when that field is set by the new
 management API.
 
-`POST /v1/auth/resolve` accepts the same `bf_` Bot credential as the legacy
+`POST /v1/internal/auth/resolve` accepts the same `bf_` Bot credential as the legacy
 Bot verifier; no additional service token is configured or sent. Its OBO
 Action is checked against the server's Action registry. There are no built-in
 Action-to-Scope mappings: all mappings come from
@@ -29,7 +29,7 @@ OCTO_OBO_ACTION_SCOPES_JSON='{"all":["ALL"]}'
 ```
 
 The Project list, detail, and member-list handlers derive Action `all` from
-their trusted routes. A caller of `/v1/auth/resolve` submits the same registered
+their trusted routes. A caller of `/v1/internal/auth/resolve` submits the same registered
 Action through the SDK. Both paths use the same registry rules; neither has a
 hardcoded or `Local` fallback. The CLI never submits an Action to the Project
 business endpoints.
