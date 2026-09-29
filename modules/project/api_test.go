@@ -130,7 +130,15 @@ func flushProjectCache(t *testing.T, ctx *config.Context) {
 // setup returns a clean server plus a fresh Project instance.
 func setup(t *testing.T) (*server.Server, *Project) {
 	t.Helper()
-	require.NoError(t, testutil.CleanAllTables(testCtx))
+	// CleanAllTables issues one DELETE per table while workers from whichever case ran
+	// before may still be committing: project creation builds the all-member group and
+	// enqueues provisioning work that retries in the background, so the cleanup can be
+	// picked as a deadlock victim. CI shard 3 lost
+	// TestListProjectGroupsIncludesTheAllMemberGroup to `Error 1213 … Deadlock found`
+	// raised from this exact line. Retry the way the module's own service paths do: each
+	// DELETE is its own autocommit statement (so there is no half-open transaction to
+	// re-run), and the conflicting worker commits within the retry window.
+	require.NoError(t, retryOnLockConflict(func() error { return testutil.CleanAllTables(testCtx) }))
 	resetUIDRateLimit(t, testCtx)
 	flushProjectCache(t, testCtx)
 	// `cursors` is package-global and survives between cases, while CI runs -shuffle=on. A

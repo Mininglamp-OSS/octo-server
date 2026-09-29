@@ -30,6 +30,16 @@ func newTestServer(t *testing.T) (*server.Server, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	bindTestDBPool(ctx)
+	// The per-UID bucket behind SharedUIDRateLimiter is process-wide, lives in
+	// Redis, and is NOT reset by CleanAllTables. Every authenticated route in this
+	// package draws on the same `ratelimit:uid:{UID}` bucket, so a case that
+	// spends the tokens leaves the next one — in `-shuffle=on` order, any case —
+	// receiving `err.shared.rate.limited` instead of the response it asserts.
+	// CI hit exactly that in TestGroupInviteAuthorize_Expired (429 where the case
+	// expected "邀请链接已过期"). Resetting per test makes each case start from a
+	// full bucket; cases that assert 429 (api_project_create_test.go) drain their
+	// own quota inside the case and are unaffected.
+	resetGroupUIDRateLimit(t, ctx)
 	return s, ctx
 }
 

@@ -67,8 +67,8 @@ func TestProjectReadListRequiresActiveProjectMemberAndCountsFilteredRows(t *test
 	).Exec(); err != nil {
 		t.Fatalf("remove project member: %v", err)
 	}
-	if _, err := p.readProject(spaceA, result.Rows[0].ProjectID, uid); !errors.Is(err, errProjectReadNotFound) {
-		t.Fatalf("inactive project member detail error = %v, want errProjectReadNotFound", err)
+	if _, err := p.readProject(spaceA, result.Rows[0].ProjectID, uid); !errors.Is(err, ErrProjectReadNotFound) {
+		t.Fatalf("inactive project member detail error = %v, want ErrProjectReadNotFound", err)
 	}
 }
 

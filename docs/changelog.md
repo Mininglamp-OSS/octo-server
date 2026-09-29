@@ -32,6 +32,7 @@
   Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
+- 新增 Bot 侧 Project 只读接口 `GET /v1/bot/projects`（必填 `space_id`，返回与 Web 侧同形的列表投影、排序与 `X-Total-Count`）与 `GET /v1/bot/projects/:project_id`（Space 由项目行推导）：仅 User Bot 可用，App Bot 返回 `app_bot_unsupported`；可见范围为 bot 自身有效席位 ∪ 其 owner（`robot.creator_uid`）有效席位，且席位持有人须当前仍满足 Space 有效成员与有效账号，owner 席位不因异步席位级联或账号注销而继续授权；detail 不可见一律折叠为同一个 not-found，list 非目标 Space 成员返回 `not_space_member`，不新增错误码、迁移或用户侧行为变更。
 
 ## [v1.1.2] - 2026-03-05
 
