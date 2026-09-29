@@ -2,7 +2,7 @@
 mode: "debug" #   运行模式 debug or release
 # adminpwd: "123456" # 管理员密码
 #addr: ":8090" # api监听地址
-#grpcAddr: "0.0.0.0:6979" # webhook grpc监听地址 给悟空IM提供的
+#grpcAddr: "0.0.0.0:6979" # webhook grpc监听地址，仅供悟空IM回调使用；建议绑定内网或回环地址（如 127.0.0.1:6979），见下方「Webhook gRPC 安全配置」
 #appName: "DMWork" # 项目名称
 #rootDir: "tsdddata" # 数据根目录
 #messageSaveAcrossDevice: true # 消息是否跨设备保存（换设备登录消息是否还能同步到老消息）
@@ -17,6 +17,19 @@ mode: "debug" #   运行模式 debug or release
 # 配置后，所有入站 webhook 请求必须携带 X-Signature-256 头
 # 签名格式: sha256=<hex(HMAC-SHA256(body, secret_key))>
 #webhookSecretKey: "" # 留空则不验证签名
+
+##################### Webhook gRPC 安全配置 ####################
+# 详细说明见 docs/webhook-grpc.md
+# grpcAddr 监听端口与 HTTP API（addr）相互独立，只需要悟空IM能访问：
+#   - 同机部署时绑定回环地址；跨机部署时绑定内网地址，并通过安全组 / NetworkPolicy 只放行悟空IM。
+# 认证（仅环境变量）：
+#   TS_GRPC_AUTH_TOKEN    共享 token；配置后调用方必须在 metadata auth_token 中携带相同值。默认空
+#   TS_GRPC_AUTH_REQUIRED 默认 false：行为与之前一致（配了 token 才校验）。
+#                         设为 true 且未配置 TS_GRPC_AUTH_TOKEN 时，服务拒绝启动（进程退出）；
+#                         取值不是合法布尔值时同样拒绝启动。
+# ⚠ 悟空IM v2.2.4 调用时不携带 auth_token：只要配置了 TS_GRPC_AUTH_TOKEN（不论 REQUIRED 为何值），
+#   消息落库、离线推送、在线状态回调都会被拒绝。在悟空IM 支持发送 token 之前不要配置这两个变量。
+# 监听地址不是回环地址且未配置 token 时，启动日志会输出告警。
 
 ##################### 悟空IM配置 ####################
 #wukongIM:

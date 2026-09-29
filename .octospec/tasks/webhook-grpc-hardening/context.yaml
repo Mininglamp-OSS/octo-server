@@ -1,0 +1,47 @@
+schema_version: 1
+task: webhook-grpc-hardening
+brief: .octospec/tasks/webhook-grpc-hardening/brief.md
+resolved_at: 2026-09-28T00:00:00+08:00
+global_rules: not synced (.octospec/_global absent); repo-tier rules only
+
+injected:
+  - id: trust-boundary
+    source: repo
+    load_bearing: true
+    why: >
+      Path match (modules/webhook/**) and touches webhook / wire-contract. Callback
+      payloads are external input; bounds are enforced in the shared handleEvent
+      path so the gRPC and HTTP adapters keep parity, and structural limits
+      (entry counts, decompressed size) back up the transport byte cap.
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      Path match (modules/**/*.go) and touches auth. The listener sits outside
+      AuthMiddleware by design (service-to-service callback); this task keeps that
+      exclusion documented and makes its own auth fail closed when required.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Path match (modules/**/*.go). gRPC errors are not HTTP envelope responses; no
+      pkg/errcode codes or HTTP handlers change, so i18n-extract / i18n-lint must
+      stay unchanged. Auth failures keep one generic Unauthenticated message.
+  - id: rate-limit
+    source: repo
+    load_bearing: true
+    why: >
+      Path match (modules/**/*.go). Payload bounds are structural limits, not
+      request-frequency limiting; no Redis counter is introduced.
+  - id: testing
+    source: repo
+    load_bearing: false
+    why: >
+      New *_test.go. Tests use synthetic values and run without MySQL/Redis
+      (minimal config.Context, loopback listeners on free ports).
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Path match (**). English Conventional Commits; wording limited to
+      configuration hardening per the brief.
