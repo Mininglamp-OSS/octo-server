@@ -43,6 +43,14 @@ func setupBotCreateThreadOBO(t *testing.T) (http.Handler, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// These fixtures write grants directly, bypassing the production cache
+	// invalidation. A shuffled no-grant case must not leave a negative answer
+	// for the next case after its database rows have been replaced.
+	clearGrantCache := func() {
+		require.NoError(t, ctx.GetRedisConn().Del(oboGrantorCacheKey(oboThreadGrantor)))
+	}
+	clearGrantCache()
+	t.Cleanup(clearGrantCache)
 
 	// bot（robot 表 + 群成员）。
 	_, err := ctx.DB().InsertBySql(

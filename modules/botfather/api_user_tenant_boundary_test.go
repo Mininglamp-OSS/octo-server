@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -130,6 +131,66 @@ func TestUserKeyThreadMessageIsPinnedToBoundSpace(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, crossTenant.Code,
 		"a key bound to another Space must not read this thread: %s", crossTenant.Body.String())
 	assert.NotContains(t, crossTenant.Body.String(), "hello")
+}
+
+// Contact details are a human profile-card capability, not an automation
+// directory. A User API Key may still resolve a colleague's identity inside its
+// bound Space, but the reused handler must omit every peer-contact field even
+// while the deployment-wide profile switch is enabled.
+func TestUserKeyUserDetailWithholdsPeerContactInfo(t *testing.T) {
+	route, ctx := newUserAPITestServer(t)
+	settings := commonsettings.EnsureSystemSettings(ctx)
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("system_setting").
+			Where("category = ? AND key_name = ?", "profile", "contact_info_on").Exec()
+		require.NoError(t, settings.Reload())
+	})
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO system_setting (category, key_name, value, value_type, description) " +
+			"VALUES ('profile', 'contact_info_on', '1', 'bool', '') " +
+			"ON DUPLICATE KEY UPDATE value=VALUES(value), value_type=VALUES(value_type)",
+	).Exec()
+	require.NoError(t, err)
+	require.NoError(t, settings.Reload())
+
+	owner := "u_" + util.GenerUUID()[:8]
+	colleague := "u_" + util.GenerUUID()[:8]
+	insertTestUser(t, ctx, owner, "owner")
+	insertTestUser(t, ctx, colleague, "colleague")
+	_, err = ctx.DB().Update("user").Set("phone", "13800008888").
+		Set("email", "peer@example.com").Set("zone", "0086").
+		Where("uid=?", colleague).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().Update("user").Set("phone", "13900009999").
+		Set("email", "owner@example.com").Set("zone", "0086").
+		Where("uid=?", owner).Exec()
+	require.NoError(t, err)
+
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	insertTestSpace(t, ctx, spaceID, owner)
+	insertTestSpace(t, ctx, spaceID, colleague)
+	token := mintUserAPIKeyInSpace(t, ctx, owner, spaceID)
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, userAPIRequest(t, http.MethodGet,
+		"/v1/user/users/"+colleague, token, nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, colleague, body["uid"], "identity lookup must remain available")
+	for _, key := range []string{"phone", "email", "zone", "phone_country_code"} {
+		assert.NotContains(t, body, key, "User API Keys must not receive peer contact data")
+	}
+
+	self := httptest.NewRecorder()
+	route.ServeHTTP(self, userAPIRequest(t, http.MethodGet,
+		"/v1/user/users/"+owner, token, nil))
+	require.Equal(t, http.StatusOK, self.Code, self.Body.String())
+	var selfBody map[string]any
+	require.NoError(t, json.Unmarshal(self.Body.Bytes(), &selfBody))
+	assert.Equal(t, "13900009999", selfBody["phone"], "key owner keeps historical self contact fields")
+	assert.Equal(t, "owner@example.com", selfBody["email"])
+	assert.Equal(t, "0086", selfBody["zone"])
 }
 
 // 🔴 Jerry-Xin blocker 1 / lml2468 P0 — /users/:uid must not resolve profiles

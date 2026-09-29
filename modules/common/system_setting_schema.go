@@ -346,6 +346,9 @@ var systemSettingSchema = []settingDef{
 	{Category: "tracking", Key: "enabled", Type: settingTypeBool, Description: "是否开启前端埋点(octo-dap)采集（collector 与 egress 在集群内验证通过前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.TrackingEnabled()) }},
 
+	{Category: "profile", Key: "contact_info_on", Type: settingTypeBool, Description: "Show phone and email on authorized human profiles (disabled by default)",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ProfileContactInfoOn()) }},
+
 	// 自定义贴纸上传限制（sticker-upload-compression 任务）。原先硬编码在
 	// modules/file/const.go；挪进 system_setting 后可灰度/回滚，且每键都有
 	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会

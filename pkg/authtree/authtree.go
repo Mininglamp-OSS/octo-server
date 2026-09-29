@@ -64,6 +64,13 @@
 //	      ?group_no   STRIPPED by that guard. Unguarded it returns another Space's
 //	                  group metadata (source_space_id/name, vercode) because
 //	                  GetGroupMember/IsShowShortNo never check the caller.
+//	      response    profile phone/email enrichment is disabled whenever the
+//	                  verified key-bound Space is present; automation may resolve
+//	                  identity fields but cannot enumerate peer contact details.
+//	                  The session route separately requires self/friend/active
+//	                  shared Space authorization; common-group visibility alone
+//	                  never grants contacts. A failed contact lookup falls back
+//	                  to the already authorized basic profile.
 //	  GET /groups/:group_no/messages/:message_id        ScopeRouteGuard
 //	      :group_no   message.requireBoundSpaceGroup — group's effective Space must
 //	                  equal the bound Space
