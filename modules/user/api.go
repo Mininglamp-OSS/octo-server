@@ -1333,14 +1333,16 @@ func (u *User) get(c *wkhttp.Context) {
 		SystemBot: spacepkg.IsSystemBot(uid),
 		Robot:     userDetailResp.Robot == 1,
 	}
+	// Only self, friendship or active shared Space membership authorizes
+	// contacts. Keep that grant separate from common-group display visibility.
+	contactRelated := loginUID == uid
 	visible, err := chservice.PersonProfileVisible(fastPath, nil)
 	if err == nil && !visible {
 		// 关系腿走授权口径：不能用 userDetailResp.Follow（展示字段，其同 Space 来源
 		// 不校验 Space 活性，封禁 Space 的成员行仍在）。
-		var related bool
-		if related, err = u.userService.HasAuthzRelation(loginUID, uid); err == nil {
+		if contactRelated, err = u.userService.HasAuthzRelation(loginUID, uid); err == nil {
 			in := fastPath
-			in.Followed = related
+			in.Followed = contactRelated
 			visible, err = chservice.PersonProfileVisible(in, chservice.CommonGroupChecker(getCommonGroupChecker()))
 		}
 	}
@@ -1463,7 +1465,18 @@ func (u *User) get(c *wkhttp.Context) {
 			userDetailResp.Vercode = vercode
 		}
 	}
-	c.Response(userDetailResp)
+	// User API Keys may resolve bound-Space members through this reused handler,
+	// but must not turn that automation surface into a peer-contact directory.
+	// Self contact fields remain available through the historical UserDetailResp.
+	contactInfoEnabled := contactRelated && authtree.BoundSpaceID(c) == "" && common2.EnsureSystemSettings(u.ctx).ProfileContactInfoOn()
+	profile, err := u.profileWithContactInfo(userDetailResp, contactInfoEnabled)
+	if err != nil {
+		u.Error("query profile contact information failed", zap.Error(err), zap.String("uid", uid))
+		// Contact lookup is optional enrichment. Omit peer contacts on failure
+		// while preserving the already authorized basic profile.
+		profile = userDetailResp
+	}
+	c.Response(profile)
 }
 
 //	获取用户详情

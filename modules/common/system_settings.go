@@ -1841,6 +1841,14 @@ func (s *SystemSettings) TrackingEnabled() bool {
 	return s.getBool("tracking", "enabled", false)
 }
 
+// ProfileContactInfoOn enables contact fields on authorized human profiles.
+// Missing, empty or invalid settings keep the feature off. Both appconfig and
+// the profile handler read this shared snapshot, so disabling it also stops
+// peer contact disclosure without waiting for clients to refresh their config.
+func (s *SystemSettings) ProfileContactInfoOn() bool {
+	return s.getBool("profile", "contact_info_on", false)
+}
+
 // ---------------------------------------------------------------------------
 // Custom-sticker upload constraints + optional server-side compression
 // (sticker-upload-compression task).

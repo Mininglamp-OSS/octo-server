@@ -44,7 +44,9 @@ type minimalUserDetailResp struct {
 // 剥掉的是对方身份/在线态：username / short_no / sex / category / source_desc /
 // vercode / online / last_offline / device_flag / 实名字段 / bot_* / be_deleted /
 // be_blacklist（后两者是**对方**对调用方的动作，属对方信息）。
-// 手机号 / 邮箱 / 区号本就只对本人下发（见 NewUserDetailResp 的 self 判定）。
+// 共享 UserDetailResp 中的手机号 / 邮箱 / 区号仍只对本人填充。HTTP 端点可通过
+// profileWithContactInfo / profileContactResp 为有授权关系的他人补充联系方式；
+// 最小资料分支在该补充步骤之前返回，且本白名单不包含这些字段。
 //
 // 白名单而非黑名单——将来给 UserDetailResp 新增字段时默认不泄露；新增的若属"调用方
 // 自己的状态"，须显式加进来，否则客户端写回时会把它清零。
