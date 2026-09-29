@@ -164,21 +164,24 @@ func (w *Webhook) Start() error {
 	grpcAddr := w.ctx.GetConfig().GRPCAddr
 
 	var opts []grpc.ServerOption
-	unaryInterceptors := []grpc.UnaryServerInterceptor{
-		i18n.UnaryServerLanguageInterceptor(),
-	}
+	var unaryInterceptors []grpc.UnaryServerInterceptor
 
 	// 配置了 TS_GRPC_AUTH_TOKEN 才安装认证拦截器；TS_GRPC_AUTH_REQUIRED=true 时
-	// 未配置 token 已在 loadGRPCAuthConfig 中拒绝启动。
+	// 未配置 token 已在 loadGRPCAuthConfig 中拒绝启动。认证拦截器排在最前，
+	// 未通过认证的请求不再经过后续拦截器。
 	if authCfg.token != "" {
 		unaryInterceptors = append(unaryInterceptors, grpcAuthInterceptor(authCfg.token))
-		w.Info("gRPC server auth enabled", zap.Bool("required", authCfg.required), zap.String("grpcAddr", grpcAddr))
+		// 用 Warn 而不是 Info：这是一个需要调用方配合的配置，WuKongIM v2.2.4 不发送
+		// auth_token，此时它的回调会全部被拒绝。
+		w.Warn("gRPC server auth enabled: callers must send a matching auth_token in gRPC metadata; WuKongIM v2.2.4 does not send it and its callbacks will be rejected",
+			zap.Bool("required", authCfg.required), zap.String("grpcAddr", grpcAddr))
 	} else if isLoopbackListenAddr(grpcAddr) {
 		w.Info("gRPC server auth not configured, listening on loopback only", zap.String("grpcAddr", grpcAddr))
 	} else {
 		w.Warn("gRPC server auth not configured on a non-loopback address; bind grpcAddr to an internal address or set TS_GRPC_AUTH_TOKEN and TS_GRPC_AUTH_REQUIRED=true",
 			zap.String("grpcAddr", grpcAddr))
 	}
+	unaryInterceptors = append(unaryInterceptors, i18n.UnaryServerLanguageInterceptor())
 	opts = append(opts, grpc.ChainUnaryInterceptor(unaryInterceptors...))
 
 	w.grpcServer = grpc.NewServer(opts...)
@@ -467,12 +470,20 @@ func (w *Webhook) handleMsgOffline(data []byte) error {
 	}
 	w.Debug("收到离线消息->", zap.Any("msg", msgResp))
 
+	// 收件人列表被拒绝时整条离线推送都不会发出，日志带上消息标识便于定位。
+	eventFields := []zap.Field{
+		zap.Int64("messageID", msgResp.MessageID),
+		zap.String("channelID", msgResp.ChannelID),
+		zap.Uint8("channelType", msgResp.ChannelType),
+		zap.String("fromUID", msgResp.FromUID),
+	}
+
 	var toUids []string
 	if msgResp.Compress == "gzip" {
 		if len(msgResp.CompresssToUIDs) > 0 {
 			toUids, err = decodeCompressedRecipients(msgResp.CompresssToUIDs)
 			if err != nil {
-				w.Error("解析压缩收件人列表失败！", zap.Error(err), zap.Int("compressedLen", len(msgResp.CompresssToUIDs)))
+				w.Error("解析压缩收件人列表失败！", append(eventFields, zap.Error(err), zap.Int("compressedLen", len(msgResp.CompresssToUIDs)))...)
 				return err
 			}
 		}
@@ -483,7 +494,7 @@ func (w *Webhook) handleMsgOffline(data []byte) error {
 
 	toUids, err = normalizeOfflineRecipients(toUids)
 	if err != nil {
-		w.Error("离线推送收件人列表无效！", zap.Error(err))
+		w.Error("离线推送收件人列表无效！", append(eventFields, zap.Error(err))...)
 		return err
 	}
 	if len(toUids) == 0 {

@@ -179,10 +179,11 @@ func TestGRPCAuthInterceptor_EmptyExpectedTokenRejectsAll(t *testing.T) {
 	assert.False(t, called, "handler must not run when no token is configured")
 }
 
-// 源码断言：token 比较必须是常量时间比较。
+// 源码断言：token 先做 SHA-256 得到等长摘要，再做常量时间比较。
 func TestGRPCAuthInterceptor_UsesConstantTimeCompare(t *testing.T) {
 	src, err := os.ReadFile("grpc_auth.go")
 	require.NoError(t, err)
+	assert.Contains(t, string(src), "sha256.Sum256(")
 	assert.Contains(t, string(src), "subtle.ConstantTimeCompare(")
 	assert.NotContains(t, string(src), "!= expectedToken")
 	assert.NotContains(t, string(src), "== expectedToken")
@@ -267,6 +268,24 @@ func TestWebhookGRPC_NonLoopbackWithoutToken_LogsWarn(t *testing.T) {
 	assert.Equal(t, 1, rec.levels()["warn"])
 }
 
+// 配置了 token 时 WuKongIM v2.2.4 的回调会被拒绝，启动日志用 Warn 提示，而不是 Info。
+func TestWebhookGRPC_TokenConfigured_LogsWarn(t *testing.T) {
+	for _, required := range []string{"", "true"} {
+		t.Run("required="+required, func(t *testing.T) {
+			_, _, rec, err := startTestWebhook(t, testGRPCSentinelToken, required, freeLoopbackAddr(t))
+			require.NoError(t, err)
+			var warns []recordedLogEntry
+			for _, e := range rec.snapshot() {
+				if e.level == "warn" {
+					warns = append(warns, e)
+				}
+			}
+			require.Len(t, warns, 1)
+			assert.Contains(t, warns[0].msg, "auth_token")
+		})
+	}
+}
+
 func TestWebhookGRPC_StartupLogsNeverContainToken(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -329,6 +348,29 @@ func TestDecodeCompressedRecipients(t *testing.T) {
 	oversized := []byte(`["` + strings.Repeat("a", maxOfflineRecipientsDecompressedBytes) + `"]`)
 	_, err = decodeCompressedRecipients(gzipBytes(t, oversized))
 	require.Error(t, err)
+
+	// JSON null 与之前的解码行为一致：没有收件人，不报错。
+	got, err = decodeCompressedRecipients(gzipBytes(t, []byte("null")))
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	_, err = decodeCompressedRecipients(gzipBytes(t, []byte(`{"to_uids":["u1"]}`)))
+	require.Error(t, err, "non-array payload is rejected")
+}
+
+// 大量重复的短 uid：条目逐个解码，达到去重前上限时立即停止，不会先全部展开。
+func TestDecodeCompressedRecipients_EntryCap(t *testing.T) {
+	jsonList := func(n int) []byte {
+		return []byte("[" + strings.Repeat(`"a",`, n-1) + `"a"]`)
+	}
+
+	got, err := decodeCompressedRecipients(gzipBytes(t, jsonList(maxOfflineRecipientEntries)))
+	require.NoError(t, err)
+	assert.Len(t, got, maxOfflineRecipientEntries)
+
+	_, err = decodeCompressedRecipients(gzipBytes(t, jsonList(maxOfflineRecipientEntries+1)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "去重前")
 }
 
 func TestNormalizeOfflineRecipients(t *testing.T) {
@@ -344,6 +386,16 @@ func TestNormalizeOfflineRecipients(t *testing.T) {
 
 	_, err = normalizeOfflineRecipients(syntheticUIDs(maxOfflineRecipients + 1))
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("输入 %d 条", maxOfflineRecipients+1), "error carries the observed input size")
+
+	// 去重前的条目数也有上限，重复项不会被无限遍历。
+	dupes := make([]string, maxOfflineRecipientEntries+1)
+	for i := range dupes {
+		dupes[i] = "same"
+	}
+	_, err = normalizeOfflineRecipients(dupes)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("%d", maxOfflineRecipientEntries+1))
 }
 
 // 超限事件在进入 pushTo 之前报错：此处 Webhook 没有注入任何服务，
@@ -360,10 +412,27 @@ func TestHandleMsgOffline_RejectsOverLimitRecipients(t *testing.T) {
 	})
 
 	t.Run("收件人数超限", func(t *testing.T) {
-		data := offlineEventData(t, msgOfflineNotify{ToUIDS: syntheticUIDs(maxOfflineRecipients + 1)})
+		rec := &recordingLog{}
+		w := &Webhook{Log: rec}
+		data := offlineEventData(t, msgOfflineNotify{
+			MsgResp: MsgResp{MessageID: 424242, ChannelID: "g_synthetic_channel", FromUID: "u_synthetic_sender"},
+			ToUIDS:  syntheticUIDs(maxOfflineRecipients + 1),
+		})
 		err := w.handleMsgOffline(data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "上限")
+
+		// 拒绝日志带上消息标识，便于定位是哪条消息的离线推送没有发出。
+		var errorLogs []string
+		for _, e := range rec.snapshot() {
+			if e.level == "error" {
+				errorLogs = append(errorLogs, e.text)
+			}
+		}
+		require.Len(t, errorLogs, 1)
+		assert.Contains(t, errorLogs[0], "g_synthetic_channel")
+		assert.Contains(t, errorLogs[0], "424242")
+		assert.Contains(t, errorLogs[0], "u_synthetic_sender")
 	})
 
 	t.Run("压缩收件人数超限", func(t *testing.T) {
