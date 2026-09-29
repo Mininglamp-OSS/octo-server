@@ -3,12 +3,15 @@ package user
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,7 +54,10 @@ func TestProfileContactInfoWithheld(t *testing.T) {
 		enabled bool
 		profile *UserDetailResp
 	}{{"off", false, &UserDetailResp{UID: "peer"}}, {"bot", true, &UserDetailResp{UID: "bot", Robot: 1}},
-		{"system bot", true, &UserDetailResp{UID: "fileHelper"}}, {"destroyed", true, &UserDetailResp{UID: "peer", IsDestroy: IsDestroyDone}}} {
+		{"system bot", true, &UserDetailResp{UID: "fileHelper"}},
+		{"system category", true, &UserDetailResp{UID: "peer", Category: CategorySystem}},
+		{"customer service category", true, &UserDetailResp{UID: "peer", Category: CategoryCustomerService}},
+		{"destroyed", true, &UserDetailResp{UID: "peer", IsDestroy: IsDestroyDone}}} {
 		t.Run(tc.name, func(t *testing.T) {
 			// No DB at all: these paths must not read contact data.
 			resp, err := (&User{}).profileWithContactInfo(tc.profile, tc.enabled)
@@ -60,14 +66,25 @@ func TestProfileContactInfoWithheld(t *testing.T) {
 		})
 	}
 	for _, tc := range []struct {
-		name, state              string
-		status, robot, destroyed int
-	}{{"disabled", "", 0, 0, 0}, {"destroyed during read", "", 1, 0, 2}, {"bot during read", "", 1, 1, 0}, {"missing", "missing", 1, 0, 0}} {
+		name, state, category, role string
+		status, robot, destroyed    int
+	}{
+		{name: "disabled"},
+		{name: "destroyed during read", status: 1, destroyed: 2},
+		{name: "bot during read", status: 1, robot: 1},
+		{name: "missing", state: "missing", status: 1},
+		{name: "system category during read", category: CategorySystem, status: 1},
+		{name: "customer service category during read", category: CategoryCustomerService, status: 1},
+		{name: "admin role during read", role: string(wkhttp.Admin), status: 1},
+		{name: "super admin role during read", role: string(wkhttp.SuperAdmin), status: 1},
+		{name: "dashboard role during read", role: auth.ManagerRoleDashboardReader, status: 1},
+		{name: "market role during read", role: auth.ManagerRoleMarketAdmin, status: 1},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, mock := newPhoneLookupMock(t)
-			rows := sqlmock.NewRows([]string{"uid", "status", "robot", "is_destroy", "phone", "email"})
+			rows := sqlmock.NewRows([]string{"uid", "status", "robot", "is_destroy", "phone", "email", "category", "role"})
 			if tc.state != "missing" {
-				rows.AddRow("peer", tc.status, tc.robot, tc.destroyed, "13800001234", "hidden@example.com")
+				rows.AddRow("peer", tc.status, tc.robot, tc.destroyed, "13800001234", "hidden@example.com", tc.category, tc.role)
 			}
 			mock.ExpectQuery(`SELECT \* FROM user WHERE \(uid='peer'\)`).WillReturnRows(rows)
 			profile := &UserDetailResp{UID: "peer"}
@@ -86,6 +103,72 @@ func TestProfileContactInfoWithheld(t *testing.T) {
 		assert.Nil(t, resp)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
+}
+
+func TestProfileContactInfoHTTPPrivilegedAccounts(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	settings := commonsettings.EnsureSystemSettings(ctx)
+	t.Cleanup(func() {
+		require.NoError(t, testutil.CleanAllTables(ctx))
+		require.NoError(t, settings.Reload())
+	})
+	setSystemSettingForUserTest(t, ctx, "profile", "contact_info_on", "1", "bool")
+	require.NoError(t, settings.Reload())
+	seedSpace(t, ctx, "privileged_space", 1)
+	seedSpaceMemberRow(t, ctx, "privileged_space", testutil.UID)
+	_, err := ctx.DB().InsertBySql("INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('privileged_group', 'Privileged', ?, 1, 1)", testutil.UID).Exec()
+	require.NoError(t, err)
+	seedUserGroupMember(t, ctx, "privileged_group", testutil.UID)
+
+	for i, tc := range []struct{ name, category, role string }{
+		{"system category", CategorySystem, ""},
+		{"seeded super admin", CategorySystem, string(wkhttp.SuperAdmin)},
+		{"customer service", CategoryCustomerService, ""},
+		{"admin", "", string(wkhttp.Admin)},
+		{"super admin", "", string(wkhttp.SuperAdmin)},
+		{"dashboard reader", "", auth.ManagerRoleDashboardReader},
+		{"market admin", "", auth.ManagerRoleMarketAdmin},
+	} {
+		for j, relation := range []string{"friend", "space", "group"} {
+			t.Run(tc.name+"/"+relation, func(t *testing.T) {
+				uid := fmt.Sprintf("contact_priv_%d_%d", i, j)
+				seedBatchUser(t, ctx, uid, tc.name, 1, 0)
+				_, err := ctx.DB().Update("user").Set("category", tc.category).Set("role", tc.role).Where("uid=?", uid).Exec()
+				require.NoError(t, err)
+				switch relation {
+				case "friend":
+					_, err := ctx.DB().InsertBySql("INSERT INTO friend (uid, to_uid, is_deleted) VALUES (?, ?, 0)", testutil.UID, uid).Exec()
+					require.NoError(t, err)
+				case "space":
+					seedSpaceMemberRow(t, ctx, "privileged_space", uid)
+				case "group":
+					seedUserGroupMember(t, ctx, "privileged_group", uid)
+				}
+				w := getUser(s, uid)
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				var body map[string]any
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+				require.Contains(t, body, "category", "must reach the full-profile path, not pass via stranger redaction")
+				assert.Equal(t, tc.category, body["category"])
+				for _, key := range []string{"phone", "email", "zone", "phone_country_code"} {
+					assert.NotContains(t, body, key)
+				}
+			})
+		}
+	}
+
+	// The new restriction concerns peer disclosure; the historical self-only
+	// contact fields must remain available to their owner, even for a manager.
+	_, err = ctx.DB().Update("user").Set("category", CategorySystem).
+		Set("role", string(wkhttp.SuperAdmin)).Set("phone", "13800001234").
+		Set("email", "self-manager@example.com").Where("uid=?", testutil.UID).Exec()
+	require.NoError(t, err)
+	w := getUser(s, testutil.UID)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var self map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &self))
+	assert.Equal(t, "13800001234", self["phone"])
+	assert.Equal(t, "self-manager@example.com", self["email"])
 }
 
 func TestProfileContactInfoHTTPVisibility(t *testing.T) {

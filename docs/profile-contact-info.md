@@ -51,10 +51,31 @@ active shared Space membership, or an active shared group. A caller-provided
 which has no contact fields. Bots, system identities, disabled users and
 completed account deletions do not gain contact disclosure.
 
+For this feature, system identities explicitly include:
+
+- UIDs in the shared system-Bot whitelist.
+- Accounts with category `system` or `customerService`, even when `robot=0`
+  and their UID is not whitelisted.
+- Accounts with any manager-console role accepted by
+  `auth.IsManagerConsoleRole`: currently `admin`, `superAdmin`, `dashboardReader`
+  and `marketAdmin`, including accounts whose category is empty.
+
+These restrictions apply even when the caller is a friend or shares an active
+Space or group with the account. Categories are checked on both the profile
+and the fresh user row; roles are checked on the fresh user row because the
+shared profile DTO does not carry them. Their historical self-only contact
+fields remain available to the account owner. Ordinary human accounts retain
+the relationship-based behavior described above; a Space/group membership role
+alone is not a manager-console role and does not exclude an ordinary account.
+
 Disabling the setting stops additional contact disclosure on subsequent profile
 requests, even if a client still has an enabled appconfig cached. Existing
 self-only contact fields remain backward compatible. Login/current-user,
 shared user services, IM channel data and batch identity responses are unchanged.
+
+The phone currently comes from `user.phone`, matching the existing self-profile
+read during the phone-encryption dual-write phase. When reads move to decrypted
+`phone_encrypted` values, include `profileWithContactInfo` in that migration.
 
 ## Verification
 

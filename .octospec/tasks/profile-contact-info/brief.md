@@ -8,7 +8,12 @@ enabled, an authorized full profile of an active human includes phone and email,
 including explicit empty strings for unset values. Existing self, friend,
 active shared Space and shared-group visibility rules remain authoritative.
 Strangers retain the minimal profile; bots, system identities, disabled and
-destroyed accounts do not gain contact disclosure. No new user entry point.
+destroyed accounts do not gain contact disclosure. System identities include
+the system-Bot UID whitelist, both `system` and `customerService` categories,
+and every role accepted by `auth.IsManagerConsoleRole` (currently `admin`,
+`superAdmin`, `dashboardReader`, `marketAdmin`). These accounts retain their
+pre-existing self-only contact fields but never gain peer disclosure through
+this feature. No new user entry point.
 
 ## File map
 
@@ -33,6 +38,9 @@ editing, frontend work, authentication changes or new routes are required.
 - Test both appconfig response branches and manager setting validation.
 - Test authorized self, friend, shared Space/group, unrelated viewers, empty
   values, bots, destroyed/disabled accounts, and shared-service/batch redaction.
+- Test restricted categories before the lookup and on the authoritative row,
+  and manager roles on the authoritative row. HTTP tests must cover restricted
+  accounts with actual friend/Space/group relations, plus self compatibility.
 - Run focused common/user tests, existing profile authorization tests and
   relevant channel regression tests; run gofmt and git diff --check.
 - Manual integration: enable the setting, refresh appconfig and open the existing
