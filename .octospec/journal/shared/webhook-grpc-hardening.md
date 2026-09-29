@@ -57,8 +57,21 @@ source: user
   `true`) → IM callbacks rejected with `Unauthenticated`. The last row is the
   pre-existing token behavior, now documented.
 
+## Review round 1 (PR #921)
+
+Three approvals, P2 advisories only. Adopted in a follow-up commit:
+duplicate-heavy recipient input is now bounded during decoding (entry cap 2×
+the unique cap, decompressed cap lowered to 16 MiB to match); over-limit errors
+and logs carry the input size and message identity; a configured token logs
+Warn with the IM compatibility note; the token compare hashes both sides
+before the constant-time compare; the auth interceptor runs first.
+
 ## Follow-ups
 
 - octo-lib: default `GRPCAddr` is `0.0.0.0:6979` (separate PR there).
 - IM side: send `auth_token` from the webhook client, then flip the default.
 - `msg.notify` list length is bounded only by transport and IM batch size.
+- HTTP webhook body is read without a size limit before signature check
+  (pre-existing).
+- Over-limit events return a plain error (`codes.Unknown`); a typed status
+  would let the IM tell permanent from transient failures.

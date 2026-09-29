@@ -58,12 +58,12 @@ WuKongIM 通过 gRPC 把事件回调给 octo-server，由 `modules/webhook` 处�
 
 | 情况 | 日志 |
 |---|---|
-| 已配置 token | Info：`gRPC server auth enabled` |
+| 已配置 token | **Warn**：`gRPC server auth enabled: callers must send a matching auth_token ...`（提示 WuKongIM v2.2.4 不发送 token，其回调会被拒绝） |
 | 未配置 token，监听回环地址 | Info：`gRPC server auth not configured, listening on loopback only` |
 | 未配置 token，监听非回环地址 | **Warn**：`gRPC server auth not configured on a non-loopback address ...` |
 | 认证配置无效 | Error + 进程退出（错误信息只包含环境变量名） |
 
-token 的值不会写入日志。
+token 的值不会写入日志。token 比较时两边先做 SHA-256，再做常量时间比较；认证在其他拦截器之前执行。
 
 ## 回调数据上限
 
@@ -71,8 +71,11 @@ token 的值不会写入日志。
 
 | 项目 | 上限 |
 |---|---|
-| `msg.offline` 压缩收件人列表解压后大小 | 32 MiB |
+| `msg.offline` 压缩收件人列表解压后大小 | 16 MiB |
+| `msg.offline` 收件人条目数（去重前） | 400,000 |
 | `msg.offline` 收件人数（去重后） | 200,000 |
 | `user.onlinestatus` 条目数 | 100,000 |
 
-`msg.offline` 中重复的收件人只推送一次。这些上限对 HTTP webhook（`/v1/webhook`）同样生效。
+`msg.offline` 中重复的收件人只推送一次。压缩的收件人列表逐条解析，达到去重前的上限时立即停止。这些上限对 HTTP webhook（`/v1/webhook`）同样生效。
+
+`msg.offline` 因超限被拒绝时，Error 日志会带上 `messageID`、`channelID`、`channelType`、`fromUID` 和输入条目数，便于定位是哪条消息的离线推送没有发出。

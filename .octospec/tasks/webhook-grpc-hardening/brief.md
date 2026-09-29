@@ -42,9 +42,11 @@ configuration choice rather than by omission:
    Exceeding any limit rejects the whole event with an error — never a silent
    truncation. Limits are package constants with conservative defaults,
    documented next to the constant.
-4. **Operator visibility.** At startup, log (Warn) when the listener is bound
-   to a non-loopback address without auth; log (Info) the effective auth mode.
-   Never log the token value.
+4. **Operator visibility.** At startup, log the effective auth mode: Warn when
+   the listener is bound to a non-loopback address without auth, and Warn when
+   a token is configured (the pinned IM does not send it, so its callbacks
+   will be rejected); Info only for loopback without a token. Never log the
+   token value.
 5. **Docs.** State in every operator-facing doc that the default (`false`)
    keeps existing behavior, that `true` without a token (or an invalid value)
    makes the server refuse to start, and that WuKongIM `v2.2.4-20260313` does
@@ -150,3 +152,21 @@ ports with a minimal `config.Context`):
 - [x] Commit message describes configuration hardening only (no exploit or
       impact narrative). PR not opened yet; its title/body must follow the
       same rule.
+
+### Review round 1 (PR #921, three approvals, P2 advisories adopted)
+
+- [x] Duplicate-heavy recipient input is bounded before the full walk: the
+      compressed list is decoded entry by entry and stops at
+      `maxOfflineRecipientEntries` (2× the unique cap, before de-duplication);
+      the plain list is checked against the same bound; the decompressed cap
+      is lowered to 16 MiB to agree with the recipient cap.
+- [x] Over-limit errors carry the observed input size; the rejection log
+      carries `messageID` / `channelID` / `channelType` / `fromUID`.
+- [x] A configured token logs Warn (IM compatibility note) instead of Info.
+- [x] Token compare hashes both sides with SHA-256 before
+      `subtle.ConstantTimeCompare` (no length side channel).
+- [x] The auth interceptor runs before the language interceptor.
+- [x] Docs updated (`docs/webhook-grpc.md`, `configs/tsdd.yaml`, changelog);
+      tests added for each item.
+- Not adopted here (follow-ups): `msg.notify` entry cap, HTTP webhook body
+  size limit, typed gRPC status for over-limit events, TLS.

@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
 	"net"
@@ -49,21 +50,21 @@ func loadGRPCAuthConfig(getenv func(string) string) (grpcAuthConfig, error) {
 }
 
 // grpcAuthInterceptor 返回一个 gRPC 一元拦截器，验证请求 metadata 中的 auth_token。
-// expectedToken 为空时拒绝所有请求；token 使用常量时间比较。
+// expectedToken 为空时拒绝所有请求。比较前两边都先做 SHA-256，得到等长摘要后再做
+// 常量时间比较，响应耗时既不随内容也不随长度变化。
 // 所有失败统一返回同一个 Unauthenticated 错误，不区分具体原因。
 func grpcAuthInterceptor(expectedToken string) grpc.UnaryServerInterceptor {
+	configured := expectedToken != ""
+	expectedSum := sha256.Sum256([]byte(expectedToken))
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		if !grpcAuthTokenMatches(ctx, expectedToken) {
+		if !configured || !grpcAuthTokenMatches(ctx, expectedSum) {
 			return nil, status.Error(codes.Unauthenticated, "invalid or missing auth_token")
 		}
 		return handler(ctx, req)
 	}
 }
 
-func grpcAuthTokenMatches(ctx context.Context, expectedToken string) bool {
-	if expectedToken == "" {
-		return false
-	}
+func grpcAuthTokenMatches(ctx context.Context, expectedSum [sha256.Size]byte) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return false
@@ -72,7 +73,8 @@ func grpcAuthTokenMatches(ctx context.Context, expectedToken string) bool {
 	if len(tokens) == 0 {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(tokens[0]), []byte(expectedToken)) == 1
+	gotSum := sha256.Sum256([]byte(tokens[0]))
+	return subtle.ConstantTimeCompare(gotSum[:], expectedSum[:]) == 1
 }
 
 // isLoopbackListenAddr 判断监听地址是否只绑定在本机回环地址上。
