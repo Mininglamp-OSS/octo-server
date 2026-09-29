@@ -27,8 +27,9 @@ After enabling, refresh the client configuration and reopen the profile card.
 
 ## Profile contract
 
-When enabled, `GET /v1/users/:uid` includes the following fields for an active
-human whose full profile is visible to the caller:
+When enabled, the session-authenticated `GET /v1/users/:uid` includes the
+following fields for an eligible active human whose full profile is visible
+to the caller and who has not blocked the caller:
 
 ```json
 {
@@ -50,6 +51,21 @@ active shared Space membership, or an active shared group. A caller-provided
 `group_no` does not grant visibility. Unrelated users retain the minimal profile,
 which has no contact fields. Bots, system identities, disabled users and
 completed account deletions do not gain contact disclosure.
+
+The target's blacklist takes precedence over those relationships for contact
+disclosure: when the target has blocked the caller (`be_blacklist=1`), phone,
+email, zone and country code are withheld even if the friendship or shared
+Space/group is still active. Unblocking restores the normal contact policy on
+the next profile request. This check uses the target-owned setting already
+loaded by the profile service and does not add another database query.
+
+The `uk_*` User API Key route, `GET /v1/user/users/:uid`, reuses the profile
+handler but does **not** gain this contact projection. Its verified key-bound
+Space comes from authentication middleware, not request parameters. Bound keys
+continue to receive the previous profile shape, including self-only contact
+fields for the key owner. Unbound keys are rejected by the existing tenant
+guards before the handler runs. A deployment enabling the profile-card feature
+therefore does not also enable automated peer-contact collection.
 
 For this feature, system identities explicitly include:
 
@@ -84,6 +100,7 @@ With the repository's MySQL/Redis test services available:
 ```sh
 go test ./modules/common -run '^TestProfileContactInfo' -count=1
 go test ./modules/user -run 'TestProfileContactInfo|TestUserGet_|TestNewMinimalUserDetailResp|TestBatchUsersHuman' -count=1
+go test ./modules/botfather -run 'TestUserKeyProfileContactInfoSessionOnly|TestUserKeyUserDetail|TestUserKeyUpstreamRefusesKeyWithNoBinding' -count=1
 ```
 
 Enable the setting, open a self profile and an authorized peer profile, then

@@ -301,8 +301,8 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	// 复用后 actor 仍是真人而非 bot。search 复用 human 侧那**同一个** searchLimit 实例，
 	// 于是两棵树共享 per-IP 的 `strict:search` 桶——这是刻意的取舍：搜索是用户存在性探测
 	// 面，共享桶意味着攻击者无法通过换 surface 把配额翻倍；代价是同一出口 IP 下的自动化
-	// 客户端会吃掉真人的额度。反枚举优先于额度隔离，故选共享。（uk 树自己的 per-uid 桶是
-	// 120 req/min，比 human 的 30 req/min 宽，缺这一层会让自动化路径成为更省力的入口。）
+	// 客户端会吃掉真人的额度。两树还共用同一把 SharedUIDRateLimiter；30 req/min 是
+	// searchLimit 的额外 per-IP 约束，不是资料接口的 UID 配额。
 	//
 	// 两条路由的租户锚点不同，故 Tenant 声明不同：
 	//   /users/:uid  → handler 不读请求 Space，注入对它是 no-op，必须靠路由自己的
@@ -1463,7 +1463,11 @@ func (u *User) get(c *wkhttp.Context) {
 			userDetailResp.Vercode = vercode
 		}
 	}
-	profile, err := u.profileWithContactInfo(userDetailResp, common2.EnsureSystemSettings(u.ctx).ProfileContactInfoOn())
+	// New contact disclosure is session-only. The user-key tree supplies a
+	// verified binding here; requireBoundSpaceMember rejects unbound keys before
+	// this handler, so an empty binding cannot turn a legacy key into a session.
+	contactInfoOn := authtree.BoundSpaceID(c) == "" && common2.EnsureSystemSettings(u.ctx).ProfileContactInfoOn()
+	profile, err := u.profileWithContactInfo(userDetailResp, contactInfoOn)
 	if err != nil {
 		u.Error("query profile contact information failed", zap.Error(err), zap.String("uid", uid))
 		respondUserError(c, errcode.ErrUserQueryFailed)

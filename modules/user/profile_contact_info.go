@@ -22,7 +22,10 @@ type profileContactResp struct {
 // check in User.get. The authoritative row is read only for the opted-in HTTP
 // path, so neither the shared service nor a minimal profile can acquire peer PII.
 func (u *User) profileWithContactInfo(profile *UserDetailResp, enabled bool) (any, error) {
-	if !enabled || profile.Robot != 0 || spacepkg.IsSystemBot(profile.UID) || profileContactCategoryRestricted(profile.Category) || profile.IsDestroy == IsDestroyDone {
+	// BeBlacklist is the target's block of this caller. Profile visibility can
+	// survive through a friendship or shared Space/group after that block.
+	if !enabled || profile.BeBlacklist == 1 || profile.Robot != 0 ||
+		spacepkg.IsSystemBot(profile.UID) || profileContactCategoryRestricted(profile.Category) || profile.IsDestroy == IsDestroyDone {
 		return profile, nil
 	}
 	account, err := u.db.QueryByUID(profile.UID)

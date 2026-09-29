@@ -64,6 +64,18 @@
 //	      ?group_no   STRIPPED by that guard. Unguarded it returns another Space's
 //	                  group metadata (source_space_id/name, vercode) because
 //	                  GetGroupMember/IsShowShortNo never check the caller.
+//	      actor UID   authenticated key owner; GetUserDetail reads the target's
+//	                  user row and the pair's user_setting/friend rows. Existing
+//	                  self-only contacts remain available to the key owner.
+//	      key Space   verified CtxKeySpaceID, never a caller-supplied query/header;
+//	                  non-empty on every admitted request (unbound keys rejected).
+//	                  User.get uses it to disable the session-only contact
+//	                  projection regardless of profile.contact_info_on. This tree
+//	                  gains no peer phone/email/zone/country-code response fields
+//	                  and never performs the extra contact QueryByUID read. On the
+//	                  session route that read is gated by the deployment setting,
+//	                  full-profile visibility and the target's BeBlacklist flag;
+//	                  the fresh row also supplies account eligibility checks.
 //	  GET /groups/:group_no/messages/:message_id        ScopeRouteGuard
 //	      :group_no   message.requireBoundSpaceGroup — group's effective Space must
 //	                  equal the bound Space

@@ -6,14 +6,19 @@ Support Mininglamp-OSS/octo-web#1764 through the existing profile cards and
 `GET /v1/users/:uid`. Publish `profile_contact_info_on`, default false. When
 enabled, an authorized full profile of an active human includes phone and email,
 including explicit empty strings for unset values. Existing self, friend,
-active shared Space and shared-group visibility rules remain authoritative.
+active shared Space and shared-group visibility rules remain necessary for
+profile access. The contact projection additionally withholds contacts when
+the target has blocked the caller (`BeBlacklist == 1`).
 Strangers retain the minimal profile; bots, system identities, disabled and
 destroyed accounts do not gain contact disclosure. System identities include
 the system-Bot UID whitelist, both `system` and `customerService` categories,
 and every role accepted by `auth.IsManagerConsoleRole` (currently `admin`,
 `superAdmin`, `dashboardReader`, `marketAdmin`). These accounts retain their
 pre-existing self-only contact fields but never gain peer disclosure through
-this feature. No new user entry point.
+this feature. The existing session and User API Key routes remain in place;
+new contact disclosure is session-only. `GET /v1/user/users/:uid` on the `uk_*`
+tree retains its historical self-only contact behavior even when the feature
+is enabled. Unbound keys are rejected by the existing tenant guards.
 
 ## File map
 
@@ -21,7 +26,12 @@ this feature. No new user entry point.
   hot-reloaded `profile.contact_info_on` setting and manager configuration entry.
 - `modules/common/api.go`: publish the flag on full and version-shortcut responses.
 - `modules/user/api.go` and `profile_contact_info.go`: apply contact projection
-  only after the existing profile authorization, using the authoritative user row.
+  only for session requests after profile authorization and the target's
+  blacklist check, using the authoritative user row.
+- `pkg/authtree/authtree.go`: document the reused route's credential context,
+  data reads and response boundary in the route census.
+- `modules/botfather/profile_contact_info_test.go`: real `uk_*` authentication
+  regression with a session request as the positive control.
 - Common/user tests: configuration, wire contract and access regression coverage.
 - `docs/profile-contact-info.md`: enablement, response and visibility contract.
 
@@ -41,6 +51,11 @@ editing, frontend work, authentication changes or new routes are required.
 - Test restricted categories before the lookup and on the authoritative row,
   and manager roles on the authoritative row. HTTP tests must cover restricted
   accounts with actual friend/Space/group relations, plus self compatibility.
+- Test target block/unblock with each live friend/Space/group relation, without
+  deleting that relation. A blocked full profile must omit all contact keys.
+- Test the real session and `uk_*` routes for the same caller/target with the
+  setting on: only the session gains peer contacts; key self access stays
+  compatible and unbound keys remain rejected.
 - Run focused common/user tests, existing profile authorization tests and
   relevant channel regression tests; run gofmt and git diff --check.
 - Manual integration: enable the setting, refresh appconfig and open the existing

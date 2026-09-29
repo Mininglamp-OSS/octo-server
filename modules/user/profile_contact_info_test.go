@@ -54,6 +54,7 @@ func TestProfileContactInfoWithheld(t *testing.T) {
 		enabled bool
 		profile *UserDetailResp
 	}{{"off", false, &UserDetailResp{UID: "peer"}}, {"bot", true, &UserDetailResp{UID: "bot", Robot: 1}},
+		{"blocked by target", true, &UserDetailResp{UID: "peer", BeBlacklist: 1}},
 		{"system bot", true, &UserDetailResp{UID: "fileHelper"}},
 		{"system category", true, &UserDetailResp{UID: "peer", Category: CategorySystem}},
 		{"customer service category", true, &UserDetailResp{UID: "peer", Category: CategoryCustomerService}},
@@ -103,6 +104,63 @@ func TestProfileContactInfoWithheld(t *testing.T) {
 		assert.Nil(t, resp)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
+}
+
+func TestProfileContactInfoHTTPBlockedCaller(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	settings := commonsettings.EnsureSystemSettings(ctx)
+	t.Cleanup(func() {
+		require.NoError(t, testutil.CleanAllTables(ctx))
+		require.NoError(t, settings.Reload())
+	})
+	setSystemSettingForUserTest(t, ctx, "profile", "contact_info_on", "1", "bool")
+	require.NoError(t, settings.Reload())
+	seedSpace(t, ctx, "contact_block_space", 1)
+	seedSpaceMemberRow(t, ctx, "contact_block_space", testutil.UID)
+	_, err := ctx.DB().InsertBySql("INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('contact_block_group', 'Contacts', ?, 1, 1)", testutil.UID).Exec()
+	require.NoError(t, err)
+	seedUserGroupMember(t, ctx, "contact_block_group", testutil.UID)
+
+	for _, relation := range []string{"friend", "space", "group"} {
+		t.Run(relation, func(t *testing.T) {
+			uid := "contact_block_" + relation
+			seedBatchUser(t, ctx, uid, uid, 1, 0)
+			switch relation {
+			case "friend":
+				_, err := ctx.DB().InsertBySql("INSERT INTO friend (uid, to_uid, is_deleted) VALUES (?, ?, 0)", testutil.UID, uid).Exec()
+				require.NoError(t, err)
+			case "space":
+				seedSpaceMemberRow(t, ctx, "contact_block_space", uid)
+			case "group":
+				seedUserGroupMember(t, ctx, "contact_block_group", uid)
+			}
+			// Target-owned setting: the target blocks the caller. Keep the
+			// friendship/Space/group relation alive throughout block and unblock.
+			_, err := ctx.DB().InsertBySql("INSERT INTO user_setting (uid, to_uid, blacklist) VALUES (?, ?, 0)", uid, testutil.UID).Exec()
+			require.NoError(t, err)
+			for _, blocked := range []int{0, 1, 0} {
+				t.Run(fmt.Sprintf("blocked=%d", blocked), func(t *testing.T) {
+					_, err := ctx.DB().Update("user_setting").Set("blacklist", blocked).
+						Where("uid=? AND to_uid=?", uid, testutil.UID).Exec()
+					require.NoError(t, err)
+					w := getUser(s, uid)
+					require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+					var body map[string]any
+					require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+					require.Contains(t, body, "category", "must still reach the full-profile path")
+					require.Equal(t, float64(blocked), body["be_blacklist"])
+					if blocked == 1 {
+						for _, key := range []string{"phone", "email", "zone", "phone_country_code"} {
+							assert.NotContains(t, body, key)
+						}
+					} else {
+						assert.Equal(t, "13800008888", body["phone"])
+						assert.Equal(t, uid+"@example.com", body["email"])
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestProfileContactInfoHTTPPrivilegedAccounts(t *testing.T) {
