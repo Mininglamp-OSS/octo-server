@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -12,18 +11,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"go.uber.org/zap"
 )
 
-const channelPageSize = 16
 const memberPageSize = 128
 
 // Bound work from foreground requests and background recovery together.
@@ -77,11 +73,11 @@ func New(ctx *config.Context) *Worker {
 			return err
 		}
 		defer resp.Body.Close()
-		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 8192))
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("IM subscriber reconciliation returned HTTP %d", resp.StatusCode)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		if readErr != nil {
+			return readErr
 		}
-		return readErr
+		return snapshotResponseError(resp.StatusCode, body)
 	}}
 }
 
@@ -177,7 +173,15 @@ func Flush(ctx *config.Context, group string) error {
 func (w *Worker) flush(c context.Context, group string) error {
 	var lastErr error
 	var wanted uint64
-	if err := w.db.QueryRowContext(c, "SELECT revision FROM im_group_reconcile WHERE group_no=?", group).Scan(&wanted); err != nil {
+	err := w.db.QueryRowContext(c, "SELECT revision FROM im_group_reconcile WHERE group_no=?", group).Scan(&wanted)
+	if errors.Is(err, sql.ErrNoRows) {
+		// During initial adoption a no-op caller can arrive before the scanner.
+		// Capture real authority; absence of a queue row does not prove IM agrees.
+		if err = w.adoptGroup(c, group); err == nil {
+			err = w.db.QueryRowContext(c, "SELECT revision FROM im_group_reconcile WHERE group_no=?", group).Scan(&wanted)
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("missing durable IM intent: %w", err)
 	}
 	for {
@@ -202,15 +206,31 @@ func (w *Worker) flush(c context.Context, group string) error {
 	}
 }
 
+func (w *Worker) adoptGroup(ctx context.Context, group string) error {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var canonical string
+	if err := tx.QueryRowContext(ctx, "SELECT group_no FROM `group` WHERE group_no=? FOR UPDATE", group).Scan(&canonical); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO im_group_reconcile (group_no,revision,pending,next_attempt_at)
+		VALUES (?,1,1,UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE group_no=group_no`, canonical); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 type page struct {
-	group      string
-	revision   uint64
-	owner      string
-	lastChild  int64
-	memberPage uint32
-	lastPage   bool
-	attempts   uint32
-	snapshots  []Snapshot
+	group          string
+	revision       uint64 // immutable active revision
+	desired        uint64 // observed latest business revision, for claim-error CAS
+	observedActive uint64
+	owner          string
+	attempts       uint32
+	snapshots      []channelWork
 }
 
 func (w *Worker) step(ctx context.Context, group string) (bool, error) {
@@ -221,53 +241,25 @@ func (w *Worker) step(ctx context.Context, group string) (bool, error) {
 		return false, ctx.Err()
 	}
 	p, err := w.claim(ctx, group)
-	if err != nil || p == nil {
-		return false, err
+	if err != nil {
+		return false, errors.Join(err, w.recordClaimError(p, err))
 	}
-	// The claim transaction has committed. No SQL locks are held over HTTP.
+	if p == nil {
+		return false, nil
+	}
+	// Claim committed. No SQL locks span HTTP; every request uses stored data.
 	results := make([]error, len(p.snapshots))
 	var wg sync.WaitGroup
-	slots := make(chan struct{}, 4)
 	for i, snapshot := range p.snapshots {
-		slots <- struct{}{}
 		wg.Add(1)
-		go func(i int, snapshot Snapshot) {
+		go func(i int, snapshot channelWork) {
 			defer wg.Done()
-			defer func() { <-slots }()
-			results[i] = w.send(ctx, snapshot)
+			results[i] = w.send(ctx, snapshot.Snapshot)
 		}(i, snapshot)
 	}
 	wg.Wait()
-	err = errors.Join(results...)
-	// Persist outcome even if the original HTTP client has disconnected.
-	finishCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err != nil {
-		delay := time.Second * time.Duration(1<<min(p.attempts, 8))
-		message := err.Error()
-		if len(message) > 512 {
-			message = message[:512]
-		}
-		_, finishErr := w.db.ExecContext(finishCtx, `UPDATE im_group_reconcile
-            SET attempts=attempts+1, next_attempt_at=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? SECOND), lease_owner='',
-            lease_until=NULL, last_error=? WHERE group_no=? AND revision=? AND lease_owner=?`,
-			int64(delay/time.Second), message, group, p.revision, p.owner)
-		return false, errors.Join(err, finishErr)
-	}
-	query := `UPDATE im_group_reconcile SET child_cursor=?, member_page=?, lease_owner='',
-        lease_until=NULL, last_error='', attempts=0, next_attempt_at=UTC_TIMESTAMP(6)
-        WHERE group_no=? AND revision=? AND lease_owner=?`
-	if p.lastPage {
-		query = `UPDATE im_group_reconcile SET child_cursor=?, member_page=?, completed_revision=revision,
-            pending=0, lease_owner='', lease_until=NULL, last_error='', attempts=0
-            WHERE group_no=? AND revision=? AND lease_owner=?`
-	}
-	result, err := w.db.ExecContext(finishCtx, query, p.lastChild, p.memberPage, group, p.revision, p.owner)
-	if err != nil {
-		return false, err
-	}
-	changed, err := result.RowsAffected()
-	return changed > 0, err // superseded workers cannot clear newer work
+	changed, finishErr := w.checkpoint(p, results)
+	return changed, errors.Join(errors.Join(results...), finishErr)
 }
 
 func (w *Worker) claim(ctx context.Context, group string) (*page, error) {
@@ -278,215 +270,204 @@ func (w *Worker) claim(ctx context.Context, group string) (*page, error) {
 	defer tx.Rollback()
 	p := &page{group: group}
 	var claimable bool
-	err = tx.QueryRowContext(ctx, `SELECT group_no, revision, child_cursor, member_page, attempts,
-        pending=1 AND next_attempt_at<=UTC_TIMESTAMP(6)
-        AND (lease_until IS NULL OR lease_until<=UTC_TIMESTAMP(6))
-        FROM im_group_reconcile WHERE group_no=? FOR UPDATE`, group).
-		Scan(&p.group, &p.revision, &p.lastChild, &p.memberPage, &p.attempts, &claimable)
+	err = tx.QueryRowContext(ctx, `SELECT group_no,revision,active_revision,attempts,
+		pending=1 AND next_attempt_at<=UTC_TIMESTAMP(6)
+		AND (lease_until IS NULL OR lease_until<=UTC_TIMESTAMP(6))
+		FROM im_group_reconcile WHERE group_no=? FOR UPDATE`, group).
+		Scan(&p.group, &p.desired, &p.observedActive, &p.attempts, &claimable)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return p, err
 	}
 	if !claimable {
 		return nil, nil
 	}
-	group = p.group
+	p.revision = p.observedActive
+	if p.revision != 0 && p.desired > p.revision && p.attempts >= 3 {
+		// A healthy snapshot is never restarted by churn. But an obsolete
+		// snapshot that repeatedly fails must not indefinitely block a newer
+		// compensation (e.g. deleting a group whose create reply was lost).
+		// Yield only after durable backoff, with the group lease available.
+		// All later sends use the newer receiver-fenced revision.
+		if err = deleteSnapshot(ctx, tx, p.group); err != nil {
+			return p, err
+		}
+		p.revision, p.attempts = 0, 0
+	}
+	if p.revision == 0 {
+		p.revision = p.desired
+		if err = captureSnapshot(ctx, tx, p.group, p.revision); err != nil {
+			return p, err
+		}
+	}
 	var token [16]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return nil, err
+	if _, err = rand.Read(token[:]); err != nil {
+		return p, err
 	}
 	p.owner = hex.EncodeToString(token[:])
-	if _, err = tx.ExecContext(ctx, `UPDATE im_group_reconcile SET lease_owner=?,
-        lease_until=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 30 SECOND) WHERE group_no=?`, p.owner, group); err != nil {
-		return nil, err
+	if _, err = tx.ExecContext(ctx, `UPDATE im_group_reconcile SET active_revision=?,lease_owner=?,attempts=?,
+		lease_until=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 30 SECOND) WHERE group_no=?`,
+		p.revision, p.owner, p.attempts, p.group); err != nil {
+		return p, err
 	}
-	// The dirty row blocks concurrent mutations from committing their matching
-	// intent. The following consistent reads therefore belong to this revision.
-	var status, groupType int
-	err = tx.QueryRowContext(ctx, "SELECT status, group_type FROM `group` WHERE group_no=?", group).Scan(&status, &groupType)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	exists := err == nil // Disband preserves historical memberships/conversations.
-	var subscribers, parentDeny, childDeny []string
-	if exists {
-		rows, err := tx.QueryContext(ctx, `SELECT uid, status, forbidden_expir_time FROM group_member
-            WHERE group_no=? AND is_deleted=0 ORDER BY uid`, group)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var uid string
-			var memberStatus, forbidden int
-			if err = rows.Scan(&uid, &memberStatus, &forbidden); err != nil {
-				break
-			}
-			if memberStatus == int(common.GroupMemberStatusNormal) {
-				subscribers = append(subscribers, uid)
-			}
-			if memberStatus == int(common.GroupMemberStatusBlacklist) {
-				parentDeny = append(parentDeny, uid)
-				childDeny = append(childDeny, uid)
-			} else if forbidden != 0 {
-				// Existing per-member mutes are installed on the parent channel.
-				parentDeny = append(parentDeny, uid)
-			}
-		}
-		if err = errors.Join(err, rows.Err(), rows.Close()); err != nil {
-			return nil, err
-		}
-	}
-	makeSnapshot := func(channel string, channelType uint8, deleted bool) Snapshot {
-		s := Snapshot{ChannelID: channel, ChannelType: channelType, Revision: p.revision,
-			OperationID: fmt.Sprintf("business-%d", p.revision)}
-		if groupType == 1 {
-			s.Large = 1
-		}
-		if exists && status == 0 {
-			s.Ban = 1
-		}
-		if deleted || (exists && status == 2) {
-			s.Disband = 1
-		}
-		if !deleted {
-			s.Subscribers = subscribers
-			if channelType == 2 {
-				s.Denylist = parentDeny
-			} else {
-				s.Denylist = childDeny
-			}
-		}
-		return s
-	}
-	if p.lastChild == 0 {
-		p.snapshots = append(p.snapshots, makeSnapshot(group, 2, !exists))
-	}
-	type child struct {
-		id      int64
-		channel string
-		deleted bool
-		banned  bool
-	}
-	children := make(map[int64]child)
-	rows, err := tx.QueryContext(ctx, `SELECT id, short_id, status FROM thread
-        WHERE group_no=? AND id>? ORDER BY id LIMIT ?`, group, p.lastChild, channelPageSize+1)
+	p.snapshots, err = loadSnapshotWork(ctx, tx, p.group, p.revision)
 	if err != nil {
-		return nil, err
+		return p, err
 	}
-	for rows.Next() {
-		var id int64
-		var shortID string
-		var state int
-		if err = rows.Scan(&id, &shortID, &state); err != nil {
-			break
-		}
-		children[id] = child{id: id, channel: group + "____" + shortID, deleted: !exists}
-		if state == 3 {
-			c := children[id]
-			c.banned = true
-			children[id] = c
-		}
-	}
-	if err = errors.Join(err, rows.Err(), rows.Close()); err != nil {
-		return nil, err
-	}
-	rows, err = tx.QueryContext(ctx, `SELECT thread_id, channel_id FROM im_reconcile_deleted_channel
-        WHERE group_no=? AND thread_id>? ORDER BY thread_id LIMIT ?`, group, p.lastChild, channelPageSize+1)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var id int64
-		var channel string
-		if err = rows.Scan(&id, &channel); err != nil {
-			break
-		}
-		children[id] = child{id: id, channel: channel, deleted: true}
-	}
-	if err = errors.Join(err, rows.Err(), rows.Close()); err != nil {
-		return nil, err
-	}
-	ordered := make([]child, 0, len(children))
-	for _, c := range children {
-		ordered = append(ordered, c)
-	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].id < ordered[j].id })
-	p.lastPage = len(ordered) <= channelPageSize
-	if len(ordered) > channelPageSize {
-		ordered = ordered[:channelPageSize]
-	}
-	originalChildCursor := p.lastChild
-	for _, child := range ordered {
-		snapshot := makeSnapshot(child.channel, 5, child.deleted)
-		if child.banned {
-			snapshot.Ban = 1
-		}
-		p.snapshots = append(p.snapshots, snapshot)
-		p.lastChild = child.id
-	}
-	// Page the authority by lexical UID ranges. The last range includes every
-	// old UID beyond the desired set, so removals are complete too. Keep a
-	// durable member cursor in addition to the child cursor: a large group
-	// cannot starve by replaying its first pages on each five-second attempt.
-	union := append(append(append([]string(nil), subscribers...), parentDeny...), childDeny...)
-	sort.Strings(union)
-	unique := union[:0]
-	for _, uid := range union {
-		if len(unique) == 0 || unique[len(unique)-1] != uid {
-			unique = append(unique, uid)
-		}
-	}
-	pageCount := uint32(max(1, (len(unique)+memberPageSize-1)/memberPageSize))
-	if p.memberPage >= pageCount {
-		return nil, errors.New("IM member cursor exceeds authoritative revision")
-	}
-	start := int(p.memberPage) * memberPageSize
-	end := min(start+memberPageSize, len(unique))
-	rangeStart, rangeEnd := "", ""
-	if start > 0 {
-		rangeStart = unique[start]
-	}
-	if end < len(unique) {
-		rangeEnd = unique[end]
-	}
-	inRange := func(uids []string) []string {
-		result := []string(nil)
-		for _, uid := range uids {
-			if uid >= rangeStart && (rangeEnd == "" || uid < rangeEnd) {
-				result = append(result, uid)
-			}
-		}
-		sort.Strings(result)
-		return result
-	}
-	for i := range p.snapshots {
-		snapshot := &p.snapshots[i]
-		sort.Strings(snapshot.Subscribers)
-		sort.Strings(snapshot.Denylist)
-		encoded, err := json.Marshal(snapshot)
-		if err != nil {
-			return nil, err
-		}
-		digest := sha256.Sum256(encoded)
-		snapshot.SnapshotID = hex.EncodeToString(digest[:])
-		snapshot.PageIndex, snapshot.PageCount = p.memberPage, pageCount
-		snapshot.RangeStart, snapshot.RangeEnd = rangeStart, rangeEnd
-		snapshot.OperationID = fmt.Sprintf("business-%d-%d", p.revision, p.memberPage)
-		snapshot.Subscribers, snapshot.Denylist = inRange(snapshot.Subscribers), inRange(snapshot.Denylist)
-	}
-	if p.memberPage+1 < pageCount {
-		p.memberPage++
-		p.lastChild = originalChildCursor
-		p.lastPage = false
-	} else {
-		p.memberPage = 0
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	if err = tx.Commit(); err != nil {
+		return p, err
 	}
 	return p, nil
+}
+
+// A failed claim rolls back its lease and capture. Update only the exact
+// observed generation while it remains unleased; never delay a newer mutation
+// or steal the lease of a worker that claimed after our rollback.
+func (w *Worker) recordClaimError(p *page, cause error) error {
+	if p == nil || p.desired == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := w.db.ExecContext(ctx, `UPDATE im_group_reconcile SET attempts=attempts+1,
+		next_attempt_at=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL ? SECOND),last_error=?
+		WHERE group_no=? AND revision=? AND active_revision=? AND pending=1
+		AND (lease_until IS NULL OR lease_until<=UTC_TIMESTAMP(6))`,
+		retrySeconds(p.attempts), errorMessage(cause), p.group, p.desired, p.observedActive)
+	return err
+}
+
+func retrySeconds(attempts uint32) int64 { return int64(1 << min(attempts, 8)) }
+
+func errorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := []rune(err.Error())
+	return string(message[:min(len(message), 512)])
+}
+
+func (w *Worker) checkpoint(p *page, results []error) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var active uint64
+	var owner string
+	if err = tx.QueryRowContext(ctx, `SELECT active_revision,lease_owner FROM im_group_reconcile
+		WHERE group_no=? FOR UPDATE`, p.group).Scan(&active, &owner); err != nil {
+		return false, err
+	}
+	if active != p.revision || owner != p.owner {
+		return false, nil
+	}
+	for _, result := range results {
+		var response *snapshotHTTPError
+		if errors.As(result, &response) && response.Status == http.StatusConflict && response.Code == "snapshot_upgrade_required" {
+			// Only this receiver-declared upgrade condition permits a new revision.
+			// Concurrent responses can reset once: this lease/active CAS fences all
+			// old senders. Ordinary 409 conflicts remain visible and retryable.
+			if err = deleteSnapshot(ctx, tx, p.group); err != nil {
+				return false, err
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE im_group_reconcile SET revision=GREATEST(revision,active_revision)+1,
+				active_revision=0,child_cursor=0,member_page=0,pending=1,attempts=0,
+				lease_owner='',lease_until=NULL,last_error=?,next_attempt_at=UTC_TIMESTAMP(6)
+				WHERE group_no=?`, errorMessage(result), p.group)
+			if err != nil {
+				return false, err
+			}
+			return true, tx.Commit()
+		}
+	}
+	progress := false
+	for i, snapshot := range p.snapshots {
+		if results[i] != nil {
+			continue
+		}
+		r, err := tx.ExecContext(ctx, `UPDATE im_reconcile_snapshot_channel SET member_page=member_page+1,complete=(member_page=page_count)
+			WHERE group_no=? AND revision=? AND child_id=? AND member_page=?`,
+			p.group, p.revision, snapshot.ChildID, snapshot.PageIndex)
+		if err != nil {
+			return false, err
+		}
+		changed, err := r.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		progress = progress || changed > 0
+		if snapshot.Deleted && snapshot.ChildID > 0 && snapshot.PageIndex+1 == snapshot.PageCount {
+			// Retain the historical identity, but stop replaying confirmed physical
+			// deletions on every unrelated future group mutation.
+			if _, err = tx.ExecContext(ctx, `UPDATE im_reconcile_deleted_channel SET completed_revision=?
+				WHERE group_no=? AND thread_id=? AND BINARY channel_id=BINARY ? AND completed_revision=0`,
+				p.revision, p.group, snapshot.ChildID, snapshot.ChannelID); err != nil {
+				return false, err
+			}
+		}
+	}
+	var child int64
+	var member uint32
+	err = tx.QueryRowContext(ctx, `SELECT child_id,member_page FROM im_reconcile_snapshot_channel
+		WHERE group_no=? AND revision=? AND complete=0 ORDER BY child_id LIMIT 1`, p.group, p.revision).Scan(&child, &member)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `UPDATE im_group_reconcile SET completed_revision=GREATEST(completed_revision,active_revision),
+			pending=(revision>active_revision),active_revision=0,child_cursor=0,member_page=0,
+			lease_owner='',lease_until=NULL,attempts=0,last_error='',next_attempt_at=UTC_TIMESTAMP(6) WHERE group_no=?`, p.group)
+		if err != nil {
+			return false, err
+		}
+		if err = deleteSnapshot(ctx, tx, p.group); err != nil {
+			return false, err
+		}
+	} else {
+		if err != nil {
+			return false, err
+		}
+		cause := errors.Join(results...)
+		delay, attempts := int64(0), uint32(0)
+		if cause != nil {
+			delay, attempts = retrySeconds(p.attempts), p.attempts+1
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE im_group_reconcile SET child_cursor=?,member_page=?,lease_owner='',lease_until=NULL,
+			attempts=?,last_error=?,next_attempt_at=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL ? SECOND) WHERE group_no=?`,
+			child, member, attempts, errorMessage(cause), delay, p.group)
+		if err != nil {
+			return false, err
+		}
+	}
+	return progress, tx.Commit()
+}
+
+type snapshotHTTPError struct {
+	Status int
+	Code   string
+}
+
+func (e *snapshotHTTPError) Error() string {
+	return fmt.Sprintf("IM subscriber reconciliation returned HTTP %d: %s", e.Status, e.Code)
+}
+func snapshotResponseError(status int, body []byte) error {
+	if status == http.StatusOK {
+		return nil
+	}
+	var response struct {
+		Message string `json:"msg"`
+		Data    struct {
+			Error string `json:"error"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(body, &response)
+	code := response.Data.Error
+	if code == "" {
+		code = response.Message
+	}
+	return &snapshotHTTPError{Status: status, Code: code}
 }
 
 // Adoption is a bounded primary-key scan, separate from normal mutation

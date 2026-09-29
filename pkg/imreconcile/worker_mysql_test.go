@@ -54,13 +54,22 @@ func queueMySQL(t *testing.T) (*sql.DB, *dbr.Session) {
 		_, err := conn.Exec(statement)
 		require.NoError(t, err)
 	}
-	data, err := os.ReadFile(filepath.Join("..", "..", "modules", "group", "sql", "20260924000001_im_group_reconcile.sql"))
-	require.NoError(t, err)
-	up := strings.Split(string(data), "-- +migrate Down")[0]
-	for _, statement := range strings.Split(up, ";") {
-		if strings.TrimSpace(statement) != "" {
-			_, err := conn.Exec(statement)
-			require.NoError(t, err)
+	for _, migration := range []string{"20260924000001_im_group_reconcile.sql", "20260928000001_im_reconcile_snapshot.sql"} {
+		data, err := os.ReadFile(filepath.Join("..", "..", "modules", "group", "sql", migration))
+		require.NoError(t, err)
+		up := strings.Split(string(data), "-- +migrate Down")[0]
+		lines := strings.Split(up, "\n")
+		for i, line := range lines {
+			if strings.HasPrefix(strings.TrimSpace(line), "--") {
+				lines[i] = ""
+			}
+		}
+		up = strings.Join(lines, "\n")
+		for _, statement := range strings.Split(up, ";") {
+			if strings.TrimSpace(statement) != "" {
+				_, err := conn.Exec(statement)
+				require.NoError(t, err)
+			}
 		}
 	}
 	t.Setenv("DM_IM_RECONCILE_ENABLED", "true")
@@ -145,9 +154,15 @@ func TestMySQLSnapshotReleasesLocksAndFencesStaleCheckpoint(t *testing.T) {
 	newer := &Worker{db: db, send: func(_ context.Context, s Snapshot) error { latest = s; return nil }}
 	changed, err := newer.step(ctx, "g")
 	require.NoError(t, err)
+	require.False(t, changed, "a new mutation must not preempt the active lease")
+	// An expired lease may be reclaimed, but it sends the same immutable data.
+	_, err = db.Exec("UPDATE im_group_reconcile SET lease_until=DATE_SUB(UTC_TIMESTAMP(6),INTERVAL 1 SECOND)")
+	require.NoError(t, err)
+	changed, err = newer.step(ctx, "g")
+	require.NoError(t, err)
 	require.True(t, changed)
-	require.Greater(t, latest.Revision, first.Revision)
-	require.Equal(t, []string{"a", "b"}, latest.Subscribers)
+	require.Equal(t, first.Revision, latest.Revision)
+	require.Equal(t, []string{"a"}, latest.Subscribers)
 	// A third transaction must remain pending even when the oldest sender
 	// finally reports success. Its lease and checkpoint are obsolete.
 	require.NoError(t, Mutate(session, "g", func(tx *dbr.Tx) error {
@@ -198,10 +213,15 @@ func TestMySQLRestartRecoversPagedChildrenAndPhysicalDeletion(t *testing.T) {
 		seen[s.ChannelID] = s
 		return nil
 	}}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 34; i++ {
 		changed, err := restarted.step(context.Background(), "g")
 		require.NoError(t, err)
 		require.True(t, changed)
+		var pending int
+		require.NoError(t, db.QueryRow("SELECT pending FROM im_group_reconcile").Scan(&pending))
+		if pending == 0 {
+			break
+		}
 	}
 	require.Len(t, seen, 34)
 	for channel, s := range seen {
@@ -224,7 +244,7 @@ func TestMySQLRestartRecoversPagedChildrenAndPhysicalDeletion(t *testing.T) {
 	require.Zero(t, pending)
 }
 
-func TestMySQLFailedReconcileRemainsRetryableAndNewMutationRevivesIt(t *testing.T) {
+func TestMySQLNewMutationPreservesActiveRetryAndThenConverges(t *testing.T) {
 	db, session := queueMySQL(t)
 	require.NoError(t, Mutate(session, "g", func(*dbr.Tx) error { return nil }))
 	failure := errors.New("lost IM response")
@@ -242,6 +262,17 @@ func TestMySQLFailedReconcileRemainsRetryableAndNewMutationRevivesIt(t *testing.
 	var sent Snapshot
 	w.send = func(_ context.Context, s Snapshot) error { sent = s; return nil }
 	changed, err := w.step(context.Background(), "g")
+	require.NoError(t, err)
+	require.False(t, changed, "a mutation must not cancel active error backoff")
+	_, err = db.Exec("UPDATE im_group_reconcile SET next_attempt_at=UTC_TIMESTAMP(6)")
+	require.NoError(t, err)
+	changed, err = w.step(context.Background(), "g")
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, []string{"a", "b"}, sent.Subscribers)
+	require.NoError(t, db.QueryRow("SELECT pending FROM im_group_reconcile").Scan(&pending))
+	require.Equal(t, 1, pending, "finishing an old snapshot must leave the newer revision pending")
+	changed, err = w.step(context.Background(), "g")
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.Equal(t, []string{"a"}, sent.Subscribers)

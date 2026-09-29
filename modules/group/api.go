@@ -2053,6 +2053,21 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 		}
 	}
 	if len(realMembers) == 0 {
+		if imreconcile.Enabled() && len(newMembers) == len(tempNewMembers) {
+			active := make(map[string]bool, len(existMembers))
+			for _, member := range existMembers {
+				if member.Status == int(common.GroupMemberStatusNormal) {
+					active[member.UID] = true
+				}
+			}
+			allActive := len(newMembers) > 0
+			for _, uid := range newMembers {
+				allActive = allActive && active[uid]
+			}
+			if allActive {
+				return nil, errMembersAlreadyActive
+			}
+		}
 		g.Error("添加的成员已在群内或在群黑名单内", zap.Error(err))
 		return nil, errors.New("添加的成员已在群内或在群黑名单内")
 	}
@@ -2189,6 +2204,8 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	}, nil
 }
 
+var errMembersAlreadyActive = errors.New("members are already active")
+
 func (g *Group) addMembers(members []string, groupNo string, operator, operatorName string) error {
 	tx, err := g.ctx.DB().Begin()
 	if err != nil {
@@ -2202,6 +2219,12 @@ func (g *Group) addMembers(members []string, groupNo string, operator, operatorN
 		}
 	}()
 	commitCallback, err := g.addMembersTx(members, groupNo, operator, operatorName, tx)
+	if errors.Is(err, errMembersAlreadyActive) {
+		// Event redelivery after SQL commit must wait for the existing intent,
+		// without re-admitting members or re-sending the first call's notices.
+		tx.RollbackUnlessCommitted()
+		return imreconcile.Flush(g.ctx, groupNo)
+	}
 	if err != nil {
 		tx.RollbackUnlessCommitted()
 		return err
@@ -3644,6 +3667,20 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		return
 	}
 	if loginMember == nil && imreconcile.Enabled() {
+		// Only a persisted historical membership proves this can be an exit
+		// retry. Pending work for other members does not authorize this branch.
+		var deleted int
+		_, err := g.db.session.Select("COUNT(*)").From("group_member").
+			Where("group_no=? AND uid=? AND is_deleted=1", groupNo, loginUID).Load(&deleted)
+		if err != nil {
+			g.Error("query historical exit membership failed", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if deleted == 0 {
+			httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+			return
+		}
 		// A previous exit may have committed SQL but timed out waiting for IM.
 		// Retrying must wait for that durable intent instead of reporting done
 		// from the now-absent member row.

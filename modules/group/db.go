@@ -109,6 +109,18 @@ func (d *DB) InsertMember(m *MemberModel) error {
 // either), so clearing it on the way OUT is what makes a rejoining member come
 // back unmuted — the same rule as the bot_admin reset.
 func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.Tx) error {
+	if imreconcile.Enabled() {
+		if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+			return err
+		}
+		var active []string
+		if _, err := tx.Select("uid").From("group_member").Where("group_no=? AND uid=? AND is_deleted=0", groupNo, uid).Suffix("FOR UPDATE").Load(&active); err != nil {
+			return err
+		}
+		if len(active) == 0 {
+			return nil
+		}
+	}
 	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
 		return err
 	}
@@ -1112,11 +1124,11 @@ func (d *DB) QueryBotMemberUIDs(groupNo string) ([]string, error) {
 // 没有活跃 robot 行的 bot（孤儿 / 禁用）不视为任何人的 bot，不被级联。
 // 群主 / 其他管理员仍可通过常规移除成员接口清理它们。
 func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, requireCommonRole bool, tx *dbr.Tx) ([]string, error) {
-	if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
-		return nil, err
-	}
 	if groupNo == "" || inviterUID == "" {
 		return nil, nil
+	}
+	if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+		return nil, err
 	}
 	var uids []string
 	// requireCommonRole 决定要不要额外排除被授予群角色的 bot。

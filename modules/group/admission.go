@@ -242,8 +242,37 @@ func (d *DB) admitOrRestoreMembersTx(
 		}
 	}
 
-	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
-		return err
+	if imreconcile.Enabled() {
+		// Serialize on the parent before a current (not MVCC snapshot) read.
+		// No-op re-admission must not bump authority or interrupt pending work.
+		if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+			return err
+		}
+		uids := make([]string, 0, len(admissions))
+		for _, a := range admissions {
+			uids = append(uids, a.UID)
+		}
+		var active []string
+		if _, err := tx.Select("uid").From("group_member").Where("group_no=? AND uid IN ? AND is_deleted=0", groupNo, uids).Suffix("FOR UPDATE").Load(&active); err != nil {
+			return err
+		}
+		present := make(map[string]bool, len(active))
+		for _, uid := range active {
+			present[uid] = true
+		}
+		changed := false
+		for _, uid := range uids {
+			changed = changed || !present[uid]
+		}
+		if !changed {
+			return nil
+		}
+		// Still record intent before the write: callers cannot accidentally
+		// commit membership after ignoring a failed enqueue. The parent lock
+		// serializes all writers, and claim only uses non-locking member reads.
+		if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+			return err
+		}
 	}
 
 	const cols = "(group_no, uid, remark, role, `version`, status, vercode, is_deleted, " +

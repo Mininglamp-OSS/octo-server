@@ -597,6 +597,18 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 		commit(err)
 		return
 	}
+	// Flush all affected groups before the first non-idempotent notice. A
+	// timeout may redeliver this event, and must not replay earlier notices.
+	// Actual message-send failure behavior remains the legacy behavior below.
+	if imreconcile.Enabled() {
+		for groupNo := range list {
+			if err := imreconcile.Flush(g.ctx, groupNo); err != nil {
+				g.Error("organization membership reconciliation remains pending", zap.Error(err))
+				commit(err)
+				return
+			}
+		}
+	}
 	// 添加IM订阅者和发布入群消息（必须在tx.Commit()成功之后）
 	for _, m := range addMembers {
 		groupName := ""
@@ -617,16 +629,19 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 			})
 			uids = append(uids, m.Members[index].EmployeeUid)
 		}
-		err = imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
-			ChannelID:   m.GroupNo,
-			ChannelType: common.ChannelTypeGroup.Uint8(),
-			Subscribers: uids,
-		})
-		if err != nil {
-			g.Error("调用IM的订阅接口失败！", zap.Error(err))
-			commit(err)
-			return
+		if !imreconcile.Enabled() {
+			err = imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
+				ChannelID:   m.GroupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				Subscribers: uids,
+			})
+			if err != nil {
+				g.Error("调用IM的订阅接口失败！", zap.Error(err))
+				commit(err)
+				return
+			}
 		}
+
 		content := fmt.Sprintf("欢迎%s 加入 %s，新成员入群可查看所有历史消息", strings.Join(params, ","), groupName)
 		err = g.ctx.SendMessage(&config.MsgSendReq{
 			Header: config.MsgHeader{
@@ -672,16 +687,19 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 			for index := range m.Members {
 				members = append(members, m.Members[index].EmployeeUid)
 			}
-			err = imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
-				ChannelID:   m.GroupNo,
-				ChannelType: common.ChannelTypeGroup.Uint8(),
-				Subscribers: members,
-			})
-			if err != nil {
-				g.Error("调用IM的订阅接口失败！", zap.Error(err))
-				commit(err)
-				return
+			if !imreconcile.Enabled() {
+				err = imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
+					ChannelID:   m.GroupNo,
+					ChannelType: common.ChannelTypeGroup.Uint8(),
+					Subscribers: members,
+				})
+				if err != nil {
+					g.Error("调用IM的订阅接口失败！", zap.Error(err))
+					commit(err)
+					return
+				}
 			}
+
 			// Issue #27 同型：组织/部门删人必须摘除该 uid 在群内所有非删除子区的
 			// IM 订阅（复用统一 helper，best-effort）。
 			for _, uid := range members {

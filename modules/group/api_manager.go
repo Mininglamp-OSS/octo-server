@@ -250,13 +250,6 @@ func (m *Manager) leftbangroup(c *wkhttp.Context) {
 	}
 
 	if groupStatus == group.Status {
-		if imreconcile.Enabled() {
-			if err := imreconcile.Flush(m.ctx, groupNo); err != nil {
-				m.Error("IM channel state reconciliation remains pending", zap.Error(err))
-				httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
-				return
-			}
-		}
 		c.ResponseOK()
 		return
 	}

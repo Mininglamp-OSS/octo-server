@@ -105,14 +105,11 @@ func (s *Service) AddAgent(spaceID, userUID, botID string) (*Agent, error) {
 
 	containerNeedsReconcile := false
 	if agent.GroupNo != "" {
-		if err := imreconcile.TouchGroupTx(tx, agent.GroupNo); err != nil {
-			return nil, err
-		}
 		repaired, repairErr := s.admitContainerMembersTx(tx, agent.GroupNo, spaceID, userUID, botID)
 		if repairErr != nil {
 			return nil, repairErr
 		}
-		containerNeedsReconcile = repaired || agent.ContainerState != containerReady || imreconcile.Enabled()
+		containerNeedsReconcile = repaired || agent.ContainerState != containerReady
 		if containerNeedsReconcile {
 			if _, err = tx.Update("ai_team_agent").Set("container_state", containerProvisioning).Where("id=?", agent.ID).Exec(); err != nil {
 				return nil, err

@@ -120,6 +120,37 @@ jobs:
       - name: Run unit tests
         run: ci/run-unit-tests.sh
 
+  reconciliation-test:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Reconciliation MySQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: demo
+        ports:
+          - 35906:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pdemo"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Test durable snapshots and recovery with real MySQL
+        env:
+          IM_RECONCILE_TEST_DSN: root:demo@tcp(127.0.0.1:35906)/test?parseTime=true
+          GOMAXPROCS: '2'
+        run: go test -race -count=1 -p 1 -parallel 1 -timeout=180s ./pkg/imreconcile
+
   e2e-test:
     needs: [changes]
     if: |

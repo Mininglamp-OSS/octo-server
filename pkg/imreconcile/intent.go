@@ -12,7 +12,7 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-// Enable only after all IM nodes support subscriber protocol 4. Once used,
+// Enable only after all IM nodes support subscriber protocol 5. Once used,
 // disabling is an unsupported rollback: Start refuses existing authority rows.
 func Enabled() bool {
 	v := strings.ToLower(os.Getenv("DM_IM_RECONCILE_ENABLED"))
@@ -40,8 +40,9 @@ func LockGroupTx(tx *dbr.Tx, groupNo string) error {
 // acquire those first. Recording intent first also protects callers which log
 // and continue after a failed mutation: they cannot commit a write whose
 // intent failed, and a harmless extra intent reconciles unchanged SQL state.
-// A new mutation invalidates old leases; the receiver's revision, rather than
-// that lease, prevents a delayed old network request from overwriting it.
+// A mutation updates the desired revision without interrupting an immutable
+// active snapshot. The active revision finishes before the newest desired state
+// is captured. Receiver revision fences still reject delayed older requests.
 func TouchGroupTx(tx *dbr.Tx, groupNo string) error {
 	if !Enabled() {
 		return nil
@@ -62,9 +63,9 @@ func TouchGroupTx(tx *dbr.Tx, groupNo string) error {
 	_, err = tx.Exec(`INSERT INTO im_group_reconcile
         (group_no, revision, pending, next_attempt_at)
         VALUES (?, 1, 1, UTC_TIMESTAMP(6))
-        ON DUPLICATE KEY UPDATE revision=revision+1, pending=1, child_cursor=0, member_page=0,
-        attempts=0, next_attempt_at=UTC_TIMESTAMP(6), lease_owner='',
-        lease_until=NULL, last_error='', updated_at=UTC_TIMESTAMP(6)`, groupNo)
+        ON DUPLICATE KEY UPDATE revision=revision+1, pending=1,
+        next_attempt_at=IF(active_revision=0,UTC_TIMESTAMP(6),next_attempt_at),
+        updated_at=UTC_TIMESTAMP(6)`, groupNo)
 	return err
 }
 
@@ -78,6 +79,11 @@ func RetireChildTx(tx *dbr.Tx, threadID int64, groupNo, shortID string) error {
 		return errors.New("invalid child reconciliation tombstone")
 	}
 	if err := TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
+	// TouchGroupTx locked the canonical parent/authority identity. IM keys are
+	// byte-sensitive even when the SQL collation accepts mixed-case input.
+	if err := tx.QueryRow("SELECT group_no FROM im_group_reconcile WHERE group_no=?", groupNo).Scan(&groupNo); err != nil {
 		return err
 	}
 	_, err := tx.Exec(`INSERT INTO im_reconcile_deleted_channel
