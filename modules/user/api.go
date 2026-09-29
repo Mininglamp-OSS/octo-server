@@ -1463,7 +1463,13 @@ func (u *User) get(c *wkhttp.Context) {
 			userDetailResp.Vercode = vercode
 		}
 	}
-	c.Response(userDetailResp)
+	profile, err := u.profileWithContactInfo(userDetailResp, common2.EnsureSystemSettings(u.ctx).ProfileContactInfoOn())
+	if err != nil {
+		u.Error("query profile contact information failed", zap.Error(err), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	c.Response(profile)
 }
 
 //	获取用户详情

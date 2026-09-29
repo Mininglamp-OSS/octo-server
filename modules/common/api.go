@@ -406,6 +406,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 			TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+			ProfileContactInfoOn:   cn.systemSettings.ProfileContactInfoOn(),
 			OctoAssistantUIDs:      octoAssistantUIDs,
 			MessageReaction:        messageReaction,
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
@@ -464,6 +465,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 		TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+		ProfileContactInfoOn:   cn.systemSettings.ProfileContactInfoOn(),
 		OctoAssistantUIDs:      octoAssistantUIDs,
 		MessageReaction:        messageReaction,
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
@@ -930,6 +932,8 @@ type appConfigResp struct {
 	// 只表达采集策略，不承担服务端鉴权(collector 自身鉴权)。与 app_config.version 解耦的原因
 	// 同 DocsOn：运维切策略后老客户端命中 version 短路分支也须拿到最新值，故两分支都下发。
 	TrackingEnabled bool `json:"tracking_enabled"`
+	// ProfileContactInfoOn gates both the profile card rows and peer contact data.
+	ProfileContactInfoOn bool `json:"profile_contact_info_on"`
 
 	// OctoAssistantUIDs 下发 Octo Assistant 的 UID 列表，供前端判别当前打开的
 	// 应用 bot 是否为 Octo Assistant（YUJ-277 / octo-dap S3 埋点）。前端根据此
