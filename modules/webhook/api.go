@@ -1,13 +1,10 @@
 package webhook
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"runtime/debug"
@@ -30,9 +27,6 @@ import (
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 // Webhook Webhook
@@ -159,40 +153,40 @@ func (w *Webhook) Route(r *wkhttp.WKHttp) {
 
 }
 
-// grpcAuthInterceptor 返回一个 gRPC 一元拦截器，验证请求 metadata 中的 auth_token
-func grpcAuthInterceptor(expectedToken string) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		md, ok := metadata.FromIncomingContext(ctx)
-		if !ok {
-			return nil, status.Error(codes.Unauthenticated, "missing metadata")
-		}
-		tokens := md.Get("auth_token")
-		if len(tokens) == 0 || tokens[0] != expectedToken {
-			return nil, status.Error(codes.Unauthenticated, "invalid or missing auth_token")
-		}
-		return handler(ctx, req)
-	}
-}
-
+// Start 启动供 WuKongIM 回调的 webhook gRPC 监听器。它是服务间回调通道，不经过
+// HTTP AuthMiddleware，由 grpc_auth.go 中的 token 拦截器认证。
 func (w *Webhook) Start() error {
-	var opts []grpc.ServerOption
-	unaryInterceptors := []grpc.UnaryServerInterceptor{
-		i18n.UnaryServerLanguageInterceptor(),
+	authCfg, err := loadGRPCAuthConfig(os.Getenv)
+	if err != nil {
+		w.Error("webhook gRPC 监听器未启动：认证配置无效", zap.Error(err))
+		return err
 	}
+	grpcAddr := w.ctx.GetConfig().GRPCAddr
 
-	// 配置 gRPC 认证拦截器（通过环境变量 TS_GRPC_AUTH_TOKEN 启用）
-	grpcAuthToken := os.Getenv("TS_GRPC_AUTH_TOKEN")
-	if grpcAuthToken != "" {
-		unaryInterceptors = append(unaryInterceptors, grpcAuthInterceptor(grpcAuthToken))
-		w.Info("gRPC server auth enabled")
+	var opts []grpc.ServerOption
+	var unaryInterceptors []grpc.UnaryServerInterceptor
+
+	// 配置了 TS_GRPC_AUTH_TOKEN 才安装认证拦截器；TS_GRPC_AUTH_REQUIRED=true 时
+	// 未配置 token 已在 loadGRPCAuthConfig 中拒绝启动。认证拦截器排在最前，
+	// 未通过认证的请求不再经过后续拦截器。
+	if authCfg.token != "" {
+		unaryInterceptors = append(unaryInterceptors, grpcAuthInterceptor(authCfg.token))
+		// 用 Warn 而不是 Info：这是一个需要调用方配合的配置，WuKongIM v2.2.4 不发送
+		// auth_token，此时它的回调会全部被拒绝。
+		w.Warn("gRPC server auth enabled: callers must send a matching auth_token in gRPC metadata; WuKongIM v2.2.4 does not send it and its callbacks will be rejected",
+			zap.Bool("required", authCfg.required), zap.String("grpcAddr", grpcAddr))
+	} else if isLoopbackListenAddr(grpcAddr) {
+		w.Info("gRPC server auth not configured, listening on loopback only", zap.String("grpcAddr", grpcAddr))
 	} else {
-		w.Warn("gRPC server auth not configured, set TS_GRPC_AUTH_TOKEN to enable authentication")
+		w.Warn("gRPC server auth not configured on a non-loopback address; bind grpcAddr to an internal address or set TS_GRPC_AUTH_TOKEN and TS_GRPC_AUTH_REQUIRED=true",
+			zap.String("grpcAddr", grpcAddr))
 	}
+	unaryInterceptors = append(unaryInterceptors, i18n.UnaryServerLanguageInterceptor())
 	opts = append(opts, grpc.ChainUnaryInterceptor(unaryInterceptors...))
 
 	w.grpcServer = grpc.NewServer(opts...)
 
-	lis, err := net.Listen("tcp", w.ctx.GetConfig().GRPCAddr)
+	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		return err
 	}
@@ -210,7 +204,9 @@ func (w *Webhook) Start() error {
 }
 
 func (w *Webhook) Stop() error {
-	w.grpcServer.Stop()
+	if w.grpcServer != nil {
+		w.grpcServer.Stop()
+	}
 	return nil
 }
 
@@ -398,6 +394,11 @@ func (w *Webhook) handleOnlineStatus(data []byte) error {
 	if len(onlineStatusList) == 0 {
 		return nil
 	}
+	if len(onlineStatusList) > maxOnlineStatusEntries {
+		err := fmt.Errorf("在线状态条目数 %d 超过上限 %d", len(onlineStatusList), maxOnlineStatusEntries)
+		w.Error("在线状态事件无效！", zap.Error(err))
+		return err
+	}
 	onlineStatusArray := make([]config.OnlineStatus, 0)
 	for _, onlineStatus := range onlineStatusList {
 		onlineStatusSplits := strings.Split(onlineStatus, "-")
@@ -469,23 +470,20 @@ func (w *Webhook) handleMsgOffline(data []byte) error {
 	}
 	w.Debug("收到离线消息->", zap.Any("msg", msgResp))
 
+	// 收件人列表被拒绝时整条离线推送都不会发出，日志带上消息标识便于定位。
+	eventFields := []zap.Field{
+		zap.Int64("messageID", msgResp.MessageID),
+		zap.String("channelID", msgResp.ChannelID),
+		zap.Uint8("channelType", msgResp.ChannelType),
+		zap.String("fromUID", msgResp.FromUID),
+	}
+
 	var toUids []string
 	if msgResp.Compress == "gzip" {
 		if len(msgResp.CompresssToUIDs) > 0 {
-			gReader, err := gzip.NewReader(bytes.NewReader(msgResp.CompresssToUIDs))
+			toUids, err = decodeCompressedRecipients(msgResp.CompresssToUIDs)
 			if err != nil {
-				w.Error("解码gzip失败！", zap.String("compresssToUIDs", string(msgResp.CompresssToUIDs)))
-				return err
-			}
-			defer gReader.Close()
-			compresssToUIDBytes, err := io.ReadAll(gReader)
-			if err != nil {
-				w.Error("读取gzip压缩数据失败！", zap.Error(err))
-				return err
-			}
-			err = util.ReadJsonByByte(compresssToUIDBytes, &toUids)
-			if err != nil {
-				w.Error("")
+				w.Error("解析压缩收件人列表失败！", append(eventFields, zap.Error(err), zap.Int("compressedLen", len(msgResp.CompresssToUIDs)))...)
 				return err
 			}
 		}
@@ -494,6 +492,11 @@ func (w *Webhook) handleMsgOffline(data []byte) error {
 		toUids = msgResp.ToUIDS
 	}
 
+	toUids, err = normalizeOfflineRecipients(toUids)
+	if err != nil {
+		w.Error("离线推送收件人列表无效！", append(eventFields, zap.Error(err))...)
+		return err
+	}
 	if len(toUids) == 0 {
 		return nil
 	}
