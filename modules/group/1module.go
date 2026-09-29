@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 )
 
@@ -23,6 +24,7 @@ func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 
 		api := New(ctx.(*config.Context))
+		reconciler := imreconcile.New(ctx.(*config.Context))
 		// 注册群成员检查函数，供 user 模块置顶校验使用
 		user.RegisterGroupMemberChecker(api.groupService.ExistMember)
 		// YUJ-206：注册群成员外部来源 / 归属 Space 提供者，
@@ -50,7 +52,9 @@ func init() {
 		// 关联群按普通原生群各自管理。
 		api.registerProjectCascadeSteps()
 		return register.Module{
-			Name: "group",
+			Name:  "group",
+			Start: reconciler.Start,
+			Stop:  reconciler.Stop,
 			SetupAPI: func() register.APIRouter {
 				return api
 			},
