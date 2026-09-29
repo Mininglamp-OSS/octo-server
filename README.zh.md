@@ -52,6 +52,9 @@ go build -o octo-server .
 默认 dev 配置期望本地存在一个 WuKongIM 实例与一个 MySQL 兼容的数据库。
 参考仓库自带的 `configs/tsdd.yaml` 模板获取单二进制运行路径，配合
 [`QUICKSTART.md`](./QUICKSTART.md) 与 [`BUILDING.md`](./BUILDING.md) 获取完整步骤。
+WuKongIM 回调监听端口（`grpcAddr`，默认 6979）及 `TS_GRPC_AUTH_TOKEN` / `TS_GRPC_AUTH_REQUIRED`
+的配置说明见 [`docs/webhook-grpc.md`](./docs/webhook-grpc.md)；`TS_GRPC_AUTH_REQUIRED=true`
+但未配置 token 时服务会拒绝启动。
 
 若需要一键拉起完整 OCTO 栈（server + admin + web + matter + smart-summary
 + WuKongIM + MySQL + Redis + MinIO + nginx），请使用官方 OOTB 部署仓库

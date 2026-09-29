@@ -33,6 +33,12 @@
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
 
+### 配置
+- Webhook gRPC 回调监听器新增环境变量 `TS_GRPC_AUTH_REQUIRED`，默认 `false`，现有部署行为不变（仍是配置了 `TS_GRPC_AUTH_TOKEN` 才校验）。设为 `true` 但未配置 `TS_GRPC_AUTH_TOKEN`，或取值不是合法布尔值时，服务拒绝启动。
+- 运维注意：WuKongIM `v2.2.4-20260313` 调用时不携带 `auth_token`，只要配置了 `TS_GRPC_AUTH_TOKEN`，消息落库、离线推送、在线状态回调都会被拒绝；在 IM 支持发送 token 前不要配置。详见 `docs/webhook-grpc.md`。
+- 监听地址不是回环地址且未配置 token 时，启动日志输出告警；token 比较改为常量时间比较。
+- 回调事件增加处理上限（压缩收件人列表解压后 32 MiB、去重后收件人 20 万、在线状态 10 万条），超限整条事件返回错误；`msg.offline` 重复收件人只推送一次。
+
 ## [v1.1.2] - 2026-03-05
 
 ### 新功能

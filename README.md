@@ -55,7 +55,10 @@ The default dev config expects a local WuKongIM instance and a
 MySQL-compatible database. See the bundled `configs/tsdd.yaml`
 template for the standalone-binary path, [`QUICKSTART.md`](./QUICKSTART.md) for an
 end-to-end walkthrough, and [`BUILDING.md`](./BUILDING.md) for
-cross-repo build notes.
+cross-repo build notes. The WuKongIM callback listener (`grpcAddr`,
+default port 6979) and its `TS_GRPC_AUTH_TOKEN` / `TS_GRPC_AUTH_REQUIRED`
+settings are described in [`docs/webhook-grpc.md`](./docs/webhook-grpc.md);
+`TS_GRPC_AUTH_REQUIRED=true` without a token makes the server refuse to start.
 
 For a one-command Docker Compose stack (server + admin + web + matter
 + smart-summary + WuKongIM + MySQL + Redis + MinIO + nginx), use the
