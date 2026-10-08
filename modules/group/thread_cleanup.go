@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"go.uber.org/zap"
 )
 
@@ -75,12 +76,14 @@ func removeUserFromGroupThreadsCleanup(ctx *config.Context, logger log.Log, grou
 	for _, shortID := range shortIDs {
 		// 子区 channelID 格式: {groupNo}____{shortID} (与 thread.BuildChannelID 一致)
 		channelID := groupNo + "____" + shortID
-		if rmErr := ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-			ChannelID:   channelID,
-			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
-			Subscribers: []string{uid},
-		}); rmErr != nil {
-			logger.Error("移除子区IM订阅者失败", zap.Error(rmErr), zap.String("channelID", channelID), zap.String("uid", uid))
+		if !imreconcile.Enabled() {
+			if rmErr := imreconcile.RemoveSubscribers(ctx, &config.SubscriberRemoveReq{
+				ChannelID:   channelID,
+				ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+				Subscribers: []string{uid},
+			}); rmErr != nil {
+				logger.Error("移除子区IM订阅者失败", zap.Error(rmErr), zap.String("channelID", channelID), zap.String("uid", uid))
+			}
 		}
 		// 清理用户在该子区的置顶 / 会话扩展
 		user.RemovePinnedForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())

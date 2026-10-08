@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -315,6 +316,10 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 		agent.ContainerState = containerProvisioning
 	}
 
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return nil, err
+	}
+
 	membershipRepaired, err := s.admitContainerMembersTx(tx, groupNo, spaceID, userUID, botID)
 	if err != nil {
 		return nil, err
@@ -410,16 +415,22 @@ func (s *Service) CreateSession(spaceID, userUID, botID, idempotencyKey, name st
 }
 
 func (s *Service) ensureIMReady(groupNo, shortID, userUID, botID string) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Flush(s.ctx, groupNo)
+	}
 	subscribers := []string{userUID, botID}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers}); err != nil {
+	if err := imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers}); err != nil {
 		return err
 	}
-	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers})
+	return imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers})
 }
 
 func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID string) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Flush(s.ctx, groupNo)
+	}
 	subscribers := []string{userUID, botID}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+	if err := imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{
 		ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: subscribers,
 	}); err != nil {
 		return err
@@ -432,7 +443,7 @@ func (s *Service) ensureContainerIMReady(agentID int64, groupNo, userUID, botID 
 		return err
 	}
 	for _, shortID := range shortIDs {
-		if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+		if err := imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{
 			ChannelID: thread.BuildChannelID(groupNo, shortID), ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Subscribers: subscribers,
 		}); err != nil {
 			return err
