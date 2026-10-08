@@ -48,6 +48,12 @@ func (f *foldedCollisionStore) Insert(m *IdentityModel) error {
 	return nil
 }
 
+// (uid, issuer) 这条路径在本文件里走不到:ResolveOrLink step 1 就被折叠碰撞拦死了。
+func (f *foldedCollisionStore) GetByUIDIssuer(string, string) (*IdentityModel, error) {
+	return nil, nil
+}
+func (f *foldedCollisionStore) UpdateSubject(int64, string) error { return nil }
+
 func (f *foldedCollisionStore) UpdateLogin(int64, string, int, string, int) error { return nil }
 
 // ResolveOrLink 绝不能在折叠碰撞时回 IsNew=true —— 那是调用方建号的开关。

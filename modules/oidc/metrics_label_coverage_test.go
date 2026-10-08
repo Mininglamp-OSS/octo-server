@@ -35,6 +35,7 @@ func prewarmed() map[string]map[string]bool {
 		"metricSyncTickTotal":               syncTickResultLabels(),
 		"metricSyncProcessedTotal":          syncProcessedResultLabels(),
 		"metricSyncVerificationSyncedTotal": syncVerificationSyncedResultLabels(),
+		"metricIdentitySubjectRotatedTotal": identitySubjectRotationResultLabels(),
 		"metricExchangeResult":              exchangeResultLabels(),
 		"metricBearerExchangeResult":        exchangeJWTResultLabels(),
 		"metricBearerRedemptionTotal":       redemptionOutcomeLabels(),

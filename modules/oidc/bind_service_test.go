@@ -104,6 +104,9 @@ type fakeIdentityWriter struct {
 	duplicate   bool // true => insertErr is treated as MySQL 1062
 	getResp     map[string]*IdentityModel
 	updateLogin error
+
+	byUIDIssuerCalls int
+	subjectUpdates   int
 }
 
 func (f *fakeIdentityWriter) Get(issuer, subject string) (*IdentityModel, error) {
@@ -126,6 +129,22 @@ func (f *fakeIdentityWriter) Insert(m *IdentityModel) error {
 }
 func (f *fakeIdentityWriter) UpdateLogin(_ int64, _ string, _ int, _ string, _ int) error {
 	return f.updateLogin
+}
+
+// sub 轮换只发生在 ResolveOrLink 的自动绑定路径上。/bind confirm 走的是显式用户
+// 同意 + 它自己的 ErrBindAlreadyBound 语义,不该碰这两个方法 —— 记次数而不是
+// 静默 no-op,这样"绑定流程开始改 subject 了"能被断言发现。
+func (f *fakeIdentityWriter) GetByUIDIssuer(_, _ string) (*IdentityModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byUIDIssuerCalls++
+	return nil, nil
+}
+func (f *fakeIdentityWriter) UpdateSubject(_ int64, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.subjectUpdates++
+	return nil
 }
 
 type fakeIssueSession struct {

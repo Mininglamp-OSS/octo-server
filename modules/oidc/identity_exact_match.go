@@ -60,3 +60,20 @@ func identityRowMatches(row *IdentityModel, issuer, subject string) bool {
 	return identitySubjectMatches(issuer, row.Issuer) &&
 		identitySubjectMatches(subject, row.Subject)
 }
+
+// identityBindingMatches 报告一行 identity 是否精确对应查询用的 (uid, issuer)。
+//
+// 给 sub 轮换路径用(service.linkSingleMatch):那条路径要 UPDATE 这一行的
+// subject,而 `WHERE uid=? AND issuer=?` 在 ci collation 下会命中只差大小写的行。
+// 改一行 issuer 字节不等的记录,等于把另一个身份命名空间的绑定改写到当前 sub
+// 上 —— 账号接管。uid 同理。所以写之前必须逐字节确认这一行真的属于这对 (uid, issuer)。
+//
+// nil 行报 false:调用方对"没查到"和"查到了但只是折叠相等"采取同一个动作
+// (都不许动 subject),把两者并到一个判断里反而更难漏。
+func identityBindingMatches(row *IdentityModel, uid, issuer string) bool {
+	if row == nil {
+		return false
+	}
+	return identitySubjectMatches(uid, row.UID) &&
+		identitySubjectMatches(issuer, row.Issuer)
+}
