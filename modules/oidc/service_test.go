@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -63,6 +64,24 @@ type fakeIdentityStore struct {
 	// 永久隐藏会让 recoverFromIdentityRace 也找不到赢家,测到的是另一条分支。
 	winnerAppearsAfterFirstGet bool
 	getCalls                   int
+
+	// ---- sub 轮换路径(linkSingleMatch)----
+
+	// uidIssuerRaceWinner 建模 (uid, issuer) 上的 INSERT 竞态:那一行是在**我方
+	// GetByUIDIssuer 之后、Insert 之前**落库的,所以第一次查不到,Insert 撞 1062
+	// 之后的重查才看得到。同 winnerAppearsAfterFirstGet 的理由:竞态是时序现象。
+	uidIssuerRaceWinner *IdentityModel
+	getByUIDIssuerCalls int
+
+	getByUIDIssuerErr error
+	updateSubjectErr  error
+	subjectUpdates    []subjectUpdate
+}
+
+// subjectUpdate 记一次 UpdateSubject 调用,断言"轮换确实落到了那一行"。
+type subjectUpdate struct {
+	id      int64
+	subject string
 }
 
 func newFakeIdentityStore() *fakeIdentityStore {
@@ -80,6 +99,29 @@ func (s *fakeIdentityStore) Get(issuer, sub string) (*IdentityModel, error) {
 	}
 	return s.bindings[issuer+"|"+sub], nil
 }
+
+// GetByUIDIssuer 用 EqualFold 匹配 uid/issuer,**刻意**模拟生产的 ci collation:
+// 真库的 `WHERE uid=? AND issuer=?` 会命中只差大小写的行,而 linkSingleMatch 要
+// 对那种行逐字节复核后拒绝。字节相等的 fake 查不出这条路径。
+func (s *fakeIdentityStore) GetByUIDIssuer(uid, issuer string) (*IdentityModel, error) {
+	if s.getByUIDIssuerErr != nil {
+		return nil, s.getByUIDIssuerErr
+	}
+	s.getByUIDIssuerCalls++
+	if s.uidIssuerRaceWinner != nil {
+		if s.getByUIDIssuerCalls == 1 {
+			return nil, nil // 赢家还没 commit
+		}
+		return s.uidIssuerRaceWinner, nil
+	}
+	for _, m := range s.bindings {
+		if strings.EqualFold(m.UID, uid) && strings.EqualFold(m.Issuer, issuer) {
+			return m, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *fakeIdentityStore) Insert(m *IdentityModel) error {
 	if s.failInsertWithDuplicate {
 		// 复刻 go-sql-driver/mysql 的 *MySQLError{Number: 1062}
@@ -89,6 +131,24 @@ func (s *fakeIdentityStore) Insert(m *IdentityModel) error {
 	s.written = append(s.written, m)
 	return nil
 }
+
+// UpdateSubject 按 id 定位并改 subject,让后续 Get 能命中轮换后的行(真库行为)。
+func (s *fakeIdentityStore) UpdateSubject(id int64, subject string) error {
+	if s.updateSubjectErr != nil {
+		return s.updateSubjectErr
+	}
+	s.subjectUpdates = append(s.subjectUpdates, subjectUpdate{id: id, subject: subject})
+	for key, m := range s.bindings {
+		if m.Id != id {
+			continue
+		}
+		delete(s.bindings, key)
+		m.Subject = subject
+		s.bindings[m.Issuer+"|"+subject] = m
+	}
+	return nil
+}
+
 func (s *fakeIdentityStore) UpdateLogin(id int64, email string, emailVerified int, phone string, phoneVerified int) error {
 	return nil
 }

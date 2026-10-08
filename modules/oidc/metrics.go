@@ -5,7 +5,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// 本文件登记 OIDC 模块的全部 Prometheus 指标(7 项)。
+// 本文件登记 OIDC 模块的全部 Prometheus 指标(18 项)。
 //
 // 设计取舍:
 //   - 注册到全局默认 Registry(promauto.New*),由后续基础设施 PR 暴露
@@ -138,6 +138,20 @@ func initialSpaceJoinResultLabels() []string {
 	return []string{"ok", "already_member", "space_full", "space_inactive", "error"}
 }
 
+// identitySubjectRotationResultLabels 上游换掉某用户 sub 之后,自动绑定路径上
+// "既有 (uid, issuer) 绑定行怎么收场"的结果维度(service.linkSingleMatch)。
+//
+// service 层没有 logger(Service struct 不持 log),所以这条曲线是该路径唯一的
+// 线上可观测入口:
+//   - rotated         正常轮换,UPDATE subject 成功
+//   - race_recovered  INSERT 撞 1062 后重查到本 uid 的行并完成轮换
+//   - conflict_manual 拒绝写入(折叠碰撞 / 新 sub 已归别的 uid),转人工绑定
+//
+// conflict_manual 必须能被预先告警:它代表有用户此刻登不进来。
+func identitySubjectRotationResultLabels() []string {
+	return []string{"rotated", "race_recovered", "conflict_manual"}
+}
+
 // init 把每个声明的 label 都预热成 0 值序列。Prometheus 在没观察到样本前不会
 // 暴露 series,导致 Grafana"区分不出零次"和"未注册"两种状态。
 func init() {
@@ -161,6 +175,9 @@ func init() {
 	}
 	for _, l := range syncVerificationSyncedResultLabels() {
 		metricSyncVerificationSyncedTotal.WithLabelValues(l).Add(0)
+	}
+	for _, l := range identitySubjectRotationResultLabels() {
+		metricIdentitySubjectRotatedTotal.WithLabelValues(l).Add(0)
 	}
 	// 自助绑定:6 端点 × 10 结果 = 60 个序列,Prometheus 内存可忽略。
 	for _, ep := range bindEndpointLabels() {
@@ -235,6 +252,16 @@ var (
 		Name:      "sync_verification_synced_total",
 		Help:      "SyncWorker verification sync outcomes after RT rotate (upserted|skipped_unverified|fetch_failed|upsert_failed).",
 	}, []string{"status"})
+
+	// metricIdentitySubjectRotatedTotal 上游 sub 轮换在自动绑定路径上的收场分布
+	// (service.linkSingleMatch,见 identitySubjectRotationResultLabels)。
+	//
+	// 刻意不带 issuer/uid label:单 issuer 够用,uid 会爆 Prometheus 内存。
+	metricIdentitySubjectRotatedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "identity_subject_rotated_total",
+		Help:      "Outcomes of reconciling an existing (uid, issuer) identity binding when the upstream subject rotated (rotated|race_recovered|conflict_manual).",
+	}, []string{"result"})
 
 	// metricBindRequestTotal /bind/* handler 的调用 + 结果分布。endpoint 列
 	// 取自 bindEndpointLabels(),result 列取自 bindResultLabels()。

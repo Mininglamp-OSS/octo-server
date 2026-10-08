@@ -70,9 +70,21 @@ type userLookup interface {
 }
 
 // identityStore oidc service 对 oidc DB 的最小读写接口(仅 ResolveOrLink 用到)。
+//
+// GetByUIDIssuer/UpdateSubject 是上游轮换 sub 时的恢复路径:uk_uid_issuer 规定
+// 一个 uid 在一个 issuer 下只能有一行,所以换了 sub 之后必须 UPDATE 既有行,
+// 盲 INSERT 会撞 1062 把该用户永久锁死(见 linkSingleMatch)。
 type identityStore interface {
 	Get(issuer, subject string) (*IdentityModel, error)
+	// GetByUIDIssuer 返回该 (uid, issuer) 下的绑定行;无行返回 (nil, nil)。
+	//
+	// 列 collation 是 ci,所以返回行的 uid/issuer **可能只是折叠相等**。
+	// 调用方必须自己逐字节复核,见 linkSingleMatch。
+	GetByUIDIssuer(uid, issuer string) (*IdentityModel, error)
 	Insert(m *IdentityModel) error
+	// UpdateSubject 只改 subject 一列。claims(email/phone/last_login_at)由调用方
+	// 随后的 Get+UpdateLogin 刷新,这里重复写一遍只会制造两处会漂移的真相。
+	UpdateSubject(id int64, subject string) error
 	UpdateLogin(id int64, email string, emailVerified int, phone string, phoneVerified int) error
 }
 
@@ -196,29 +208,115 @@ func (s *Service) IssueSession(ctx context.Context, req IssueSessionReq) (*Issue
 	return resp, nil
 }
 
-// linkSingleMatch 把唯一匹配的 uid 写一行 identity 绑定;多匹配返回冲突;无匹配返回("", nil)走下一规则。
+// linkSingleMatch 把唯一匹配的 uid 绑到 claims 上;多匹配返回冲突;无匹配返回("", nil)走下一规则。
+//
+// 唯一匹配分支不能盲 INSERT —— uk_uid_issuer 规定一个 uid 在一个 issuer 下只有
+// 一行。上游把某用户的 sub 换掉后,ResolveOrLink step 1 按新 sub 查不到,
+// email/phone 又匹到同一个 uid,盲 INSERT 于是撞 1062:整条 callback 失败,重试
+// 完全幂等,用户永久登不进来,只能人工删行。所以先查 (uid, issuer):
+//
+//	无行          → 首次绑定,照原路 INSERT
+//	有行且 sub 相同 → 幂等返回(理论上 step 1 就该命中)
+//	有行且 sub 不同 → sub 轮换,UPDATE 既有行的 subject
+//
+// UPDATE 对 uk_issuer_subject 是安全的:step 1 的 Get(issuer, claims.Subject)
+// 已经证明新 sub 当前没绑在任何 uid 上(命中就从 fast path 返回了)。信任边界
+// 沿用已经授权 auto-link 的那一条(verified email / verified phone + 本模块配置
+// 开关),不新开口子。
 func (s *Service) linkSingleMatch(uids []string, claims *IDTokenClaims) (string, error) {
 	switch len(uids) {
 	case 0:
 		return "", nil
 	case 1:
 		uid := uids[0]
-		if err := s.store.Insert(&IdentityModel{
-			UID:           uid,
-			Issuer:        claims.Issuer,
-			Subject:       claims.Subject,
-			Email:         claims.Email,
-			EmailVerified: boolToInt(claims.EmailVerified),
-			Phone:         claims.PhoneNumber,
-			PhoneVerified: boolToInt(claims.PhoneVerified),
-			LinkedAt:      s.now(),
-		}); err != nil {
-			return "", fmt.Errorf("oidc: link identity: %w", err)
+		existing, err := s.store.GetByUIDIssuer(uid, claims.Issuer)
+		if err != nil {
+			return "", fmt.Errorf("oidc: link identity: query existing binding: %w", err)
 		}
-		return uid, nil
+		if existing == nil {
+			return s.insertLink(uid, claims)
+		}
+		// ci collation 下 `WHERE uid=? AND issuer=?` 会命中只差大小写的行。对一行
+		// issuer 字节不等的记录 UPDATE subject,等于把**另一个身份命名空间**的绑定
+		// 改写到当前 sub 上 —— 账号接管,不是脏数据。所以折叠行一律响亮拒绝。
+		//
+		// 不能当作"没查到"继续 INSERT:那会再次撞 ci 唯一键,回到 1062 死循环
+		// (正是 ErrIdentityCaseCollision 注释里那个坑)。
+		if !identityBindingMatches(existing, uid, claims.Issuer) {
+			metricIdentitySubjectRotatedTotal.WithLabelValues("conflict_manual").Inc()
+			return "", fmt.Errorf("oidc: link identity: existing binding differs only by case "+
+				"folding, refusing to rewrite another identity namespace: %w", ErrConflictNeedManual)
+		}
+		if identitySubjectMatches(claims.Subject, existing.Subject) {
+			return uid, nil
+		}
+		return s.rotateSubject(existing.Id, uid, claims.Subject, "rotated")
 	default:
 		return "", ErrConflictNeedManual
 	}
+}
+
+// insertLink 写首次绑定行,并把 1062 翻成可区分的业务结果。
+//
+// GetByUIDIssuer 与 Insert 之间没有锁,两种并发都会以 1062 回来:
+//
+//	(uid, issuer) 被并发插了一行 → 重查:同 sub 幂等返回 / 不同 sub 走轮换恢复
+//	(issuer, sub) 被别的 uid 抢绑 → 重查查不到本 uid 的行 → ErrConflictNeedManual
+//
+// 两者都绝不裸抛 1062:上层把 ErrConflictNeedManual 路由到人工绑定流程,比
+// 500 + 永久重试强得多。也绝不改写别的 uid 对该 sub 的所有权。
+func (s *Service) insertLink(uid string, claims *IDTokenClaims) (string, error) {
+	err := s.store.Insert(&IdentityModel{
+		UID:           uid,
+		Issuer:        claims.Issuer,
+		Subject:       claims.Subject,
+		Email:         claims.Email,
+		EmailVerified: boolToInt(claims.EmailVerified),
+		Phone:         claims.PhoneNumber,
+		PhoneVerified: boolToInt(claims.PhoneVerified),
+		LinkedAt:      s.now(),
+	})
+	if err == nil {
+		return uid, nil
+	}
+	if !isDuplicateKeyError(err) {
+		return "", fmt.Errorf("oidc: link identity: %w", err)
+	}
+	existing, qerr := s.store.GetByUIDIssuer(uid, claims.Issuer)
+	if qerr != nil {
+		return "", fmt.Errorf("oidc: link identity: re-query after duplicate key: %w", qerr)
+	}
+	// 折叠行与"查不到"在这里同样处理:两者都意味着这一行不是本 (uid, issuer)
+	// 字节意义上的绑定,碰 subject 就是接管别人的身份。
+	if !identityBindingMatches(existing, uid, claims.Issuer) {
+		metricIdentitySubjectRotatedTotal.WithLabelValues("conflict_manual").Inc()
+		return "", fmt.Errorf("oidc: link identity: duplicate key and no binding owned by this "+
+			"user: %w", ErrConflictNeedManual)
+	}
+	if identitySubjectMatches(claims.Subject, existing.Subject) {
+		// 并发赢家写的就是同一个绑定,幂等。
+		return uid, nil
+	}
+	return s.rotateSubject(existing.Id, uid, claims.Subject, "race_recovered")
+}
+
+// rotateSubject 把既有绑定行的 subject 换成本次已验证的新 sub。
+//
+// 1062 只可能来自 uk_issuer_subject —— 新 sub 在 step 1 查空之后被别的 uid 抢绑。
+// 这种情况下所有权属于对方,返回 ErrConflictNeedManual 交人工,不覆盖。
+//
+// outcome 区分正常轮换与 INSERT 竞态后的恢复,两条曲线在运维上问的不是同一个问题。
+func (s *Service) rotateSubject(id int64, uid, subject, outcome string) (string, error) {
+	if err := s.store.UpdateSubject(id, subject); err != nil {
+		if isDuplicateKeyError(err) {
+			metricIdentitySubjectRotatedTotal.WithLabelValues("conflict_manual").Inc()
+			return "", fmt.Errorf("oidc: rotate identity subject: subject already owned by "+
+				"another user: %w", ErrConflictNeedManual)
+		}
+		return "", fmt.Errorf("oidc: rotate identity subject: %w", err)
+	}
+	metricIdentitySubjectRotatedTotal.WithLabelValues(outcome).Inc()
+	return uid, nil
 }
 
 func boolToInt(b bool) int {

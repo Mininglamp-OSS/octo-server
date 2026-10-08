@@ -87,6 +87,41 @@ func (d *DB) queryIdentityByIssuerSubject(issuer, subject string) (*IdentityMode
 	return m, nil
 }
 
+// queryIdentityByUIDIssuer 查询某个 uid 在某个 issuer 下的绑定行(uk_uid_issuer
+// 保证至多一行:任何会被本查询一起命中的两行,自己就先撞了那个 ci 唯一键)。
+//
+// 未命中返回 (nil, nil)。
+//
+// **不导出**:同 queryIdentityByIssuerSubject —— ci collation 下它会命中 uid/issuer
+// 只差大小写的行,单独使用不安全。唯一调用方 service.linkSingleMatch 会对返回行做
+// 逐字节复核(identityBindingMatches)再决定能不能改它的 subject;复核只有那一份,
+// 因为两份实现就是两处会漂移的判断,而判断错的后果是账号接管。
+func (d *DB) queryIdentityByUIDIssuer(uid, issuer string) (*IdentityModel, error) {
+	var m *IdentityModel
+	if _, err := d.session.Select("*").From("user_oidc_identity").
+		Where("uid=? AND issuer=?", uid, issuer).
+		Load(&m); err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, fmt.Errorf("oidc: query identity by uid=%q issuer=%q: %w", uid, issuer, err)
+	}
+	return m, nil
+}
+
+// updateIdentitySubject 把一行绑定的 subject 换成上游轮换后的新值。
+//
+// 只改 subject 一列:email/phone/last_login_at 由调用路径随后的 UpdateIdentityLogin
+// 刷新。按 id 定位,所以调用方必须已经确认这一行归属正确(见 queryIdentityByUIDIssuer)。
+//
+// **不导出**:换 subject 就是改一行的身份归属,包外没有任何用例,导出只会让
+// "不带归属前提就改 subject"变成可能。
+func (d *DB) updateIdentitySubject(id int64, subject string) error {
+	if _, err := d.session.Update("user_oidc_identity").
+		Set("subject", subject).
+		Where("id=?", id).Exec(); err != nil {
+		return fmt.Errorf("oidc: update identity subject id=%d: %w", id, err)
+	}
+	return nil
+}
+
 // QueryIdentitiesByEmail 通过邮箱查询(用于自动绑定时检测冲突)
 func (d *DB) QueryIdentitiesByEmail(issuer, email string) ([]*IdentityModel, error) {
 	var list []*IdentityModel

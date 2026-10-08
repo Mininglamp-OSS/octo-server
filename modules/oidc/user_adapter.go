@@ -88,6 +88,15 @@ func (a identityStoreAdapter) Get(issuer, subject string) (*IdentityModel, error
 func (a identityStoreAdapter) Insert(m *IdentityModel) error {
 	return a.db.InsertIdentity(m)
 }
+
+// GetByUIDIssuer 原样返回 ci 查询结果 —— 逐字节复核在 service.linkSingleMatch,
+// 因为那里才知道复核不通过该返回哪个业务错误(ErrConflictNeedManual)。
+func (a identityStoreAdapter) GetByUIDIssuer(uid, issuer string) (*IdentityModel, error) {
+	return a.db.queryIdentityByUIDIssuer(uid, issuer)
+}
+func (a identityStoreAdapter) UpdateSubject(id int64, subject string) error {
+	return a.db.updateIdentitySubject(id, subject)
+}
 func (a identityStoreAdapter) UpdateLogin(id int64, email string, emailVerified int, phone string, phoneVerified int) error {
 	return a.db.UpdateIdentityLogin(id, email, emailVerified, phone, phoneVerified)
 }
