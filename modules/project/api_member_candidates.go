@@ -37,7 +37,7 @@ func (p *Project) listMemberCandidatesHandler(c *wkhttp.Context) {
 	)
 	if err != nil {
 		switch {
-		case errors.Is(err, errProjectReadNotFound), errors.Is(err, errProjectGone):
+		case errors.Is(err, ErrProjectReadNotFound), errors.Is(err, errProjectGone):
 			p.Debug("查询项目成员候选不可读",
 				zap.String("projectId", projectID), zap.String("uid", actorUID))
 			respondProjectNotFound(c)

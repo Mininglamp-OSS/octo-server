@@ -110,10 +110,10 @@ func projectMemberReadResponse(member *projectReadMemberRow) *MemberResp {
 
 func (p *Project) respondProjectReadError(c *wkhttp.Context, err error, message, resource, uid string) {
 	switch {
-	case errors.Is(err, errProjectReadNotFound), errors.Is(err, errProjectGone):
+	case errors.Is(err, ErrProjectReadNotFound), errors.Is(err, errProjectGone):
 		p.Debug(message+"：项目不可读", zap.String("resource", resource), zap.String("uid", uid))
 		respondProjectNotFound(c)
-	case errors.Is(err, errProjectReadForbidden):
+	case errors.Is(err, ErrProjectReadForbidden):
 		respondForbidden(c)
 	default:
 		p.Error(message, zap.Error(err), zap.String("resource", resource), zap.String("uid", uid))

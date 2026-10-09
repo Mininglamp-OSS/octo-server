@@ -442,6 +442,11 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/groups/:group_no/threads/:short_id/archive", ba.protectAIContainerMutation, ba.botArchiveThread)
 		botAPI.GET("/groups/:group_no/threads/:short_id/md", ba.botGetThreadMd)
 		botAPI.PUT("/groups/:group_no/threads/:short_id/md", ba.protectAIContainerMutation, ba.botUpdateThreadMd)
+		// Project 只读 API（projects.go）。可见范围 = bot 自身有效 Project 席位 ∪
+		// owner（robot.creator_uid）有效席位；App Bot 在 handler 内以
+		// ErrBotAPIAppBotUnsupported 拒绝；list 必填 space_id、get 由项目行推导 Space。
+		botAPI.GET("/projects", ba.botListProjects)
+		botAPI.GET("/projects/:project_id", ba.botGetProject)
 		botAPI.POST("/setCommands", ba.setCommands)
 		// File API
 		botAPI.POST("/file/upload", ba.botUploadFile)
