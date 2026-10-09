@@ -4,6 +4,20 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-29 — webhook-grpc-hardening
+
+- Webhook gRPC callback listener: new `TS_GRPC_AUTH_REQUIRED` (default
+  `false`, behavior unchanged); `true` without `TS_GRPC_AUTH_TOKEN` or an
+  invalid value refuses to start. Constant-time token check, startup log of
+  the effective mode, and structural caps on callback payloads (rejected
+  whole, never truncated).
+- Documented that WuKongIM `v2.2.4-20260313` sends no `auth_token`, so a
+  configured token rejects IM callbacks: `docs/webhook-grpc.md`,
+  `configs/tsdd.yaml`, `QUICKSTART.md`, READMEs, changelog.
+- Spec in [tasks/webhook-grpc-hardening](tasks/webhook-grpc-hardening/brief.md);
+  journal `journal/shared/webhook-grpc-hardening.md`; pending learning
+  `learnings/pending/check-the-caller-before-enforcing-auth.md`.
+
 ## 2026-09-21 — project-group-category
 
 - Revoked the sidebar-project-sections D3 mutual exclusion: Project groups —

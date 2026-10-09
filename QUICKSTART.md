@@ -100,6 +100,25 @@ runs behind trusted reverse proxies, also set `OCTO_TRUSTED_PROXY_CIDRS`;
 the server will peel `X-Forwarded-For` from right to left through those
 proxies before applying the trusted language CIDR check.
 
+WuKongIM delivers events (message persistence, offline push, online
+status) to octo-server over a separate gRPC listener, `grpcAddr`
+(default `0.0.0.0:6979`, independent of the HTTP `addr`). Only WuKongIM
+needs to reach it: bind it to loopback or an internal address and allow
+only WuKongIM at the network layer. Its authentication is controlled by
+two environment variables:
+
+- `TS_GRPC_AUTH_REQUIRED` — default `false`, which keeps the existing
+  behavior. When `true` and `TS_GRPC_AUTH_TOKEN` is unset (or the value
+  is not a valid boolean), **the server refuses to start**.
+- `TS_GRPC_AUTH_TOKEN` — when set, callers must send the same value in
+  gRPC metadata `auth_token`. WuKongIM `v2.2.4-20260313` does not send
+  it, so **setting the token rejects every IM callback** regardless of
+  `TS_GRPC_AUTH_REQUIRED`. Leave both unset until your WuKongIM sends
+  the token.
+
+See [`docs/webhook-grpc.md`](./docs/webhook-grpc.md) for the full
+behavior table and the enablement order.
+
 ### Run
 
 `octo-server` parses the `--config` flag with the stdlib `flag`
