@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"go.uber.org/zap"
 )
 
@@ -192,18 +193,21 @@ func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) 
 		}
 		realMemberUids := make([]string, 0)
 		realMemberUids = append(realMemberUids, g.ctx.GetConfig().Account.SystemUID)
-		// 创建IM频道
-		err = g.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-			ChannelID:   g.ctx.GetConfig().Account.SystemGroupID,
-			ChannelType: common.ChannelTypeGroup.Uint8(),
-			Subscribers: realMemberUids,
-		})
-		if err != nil {
-			g.Error("创建im频道失败")
-			tx.Rollback()
-			commit(err)
-			return
+		if !imreconcile.Enabled() {
+			// 创建IM频道
+			err = imreconcile.CreateChannel(g.ctx, &config.ChannelCreateReq{
+				ChannelID:   g.ctx.GetConfig().Account.SystemGroupID,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				Subscribers: realMemberUids,
+			})
+			if err != nil {
+				g.Error("创建im频道失败")
+				tx.Rollback()
+				commit(err)
+				return
+			}
 		}
+
 	}
 
 	err = tx.Commit()
@@ -365,18 +369,21 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 		}
 
 		realMemberUids = append(realMemberUids, req.Operator)
-		// 创建IM频道
-		err = g.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-			ChannelID:   req.GroupNo,
-			ChannelType: common.ChannelTypeGroup.Uint8(),
-			Subscribers: realMemberUids,
-		})
-		if err != nil {
-			g.Error("创建im频道失败")
-			tx.Rollback()
-			commit(err)
-			return
+		if !imreconcile.Enabled() {
+			// 创建IM频道
+			err = imreconcile.CreateChannel(g.ctx, &config.ChannelCreateReq{
+				ChannelID:   req.GroupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				Subscribers: realMemberUids,
+			})
+			if err != nil {
+				g.Error("创建im频道失败")
+				tx.Rollback()
+				commit(err)
+				return
+			}
 		}
+
 	}
 	err = tx.Commit()
 	if err != nil {
@@ -384,6 +391,13 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 		tx.Rollback()
 		commit(err)
 		return
+	}
+	if imreconcile.Enabled() {
+		if err := imreconcile.Flush(g.ctx, req.GroupNo); err != nil {
+			g.Error("IM directory group reconciliation remains pending", zap.Error(err))
+			commit(err)
+			return
+		}
 	}
 	// 发送一条系统消息
 	content := fmt.Sprintf("欢迎%s加入%s，新成员入群可查看所有历史消息", req.OperatorName, req.Name)
@@ -583,6 +597,18 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 		commit(err)
 		return
 	}
+	// Flush all affected groups before the first non-idempotent notice. A
+	// timeout may redeliver this event, and must not replay earlier notices.
+	// Actual message-send failure behavior remains the legacy behavior below.
+	if imreconcile.Enabled() {
+		for groupNo := range list {
+			if err := imreconcile.Flush(g.ctx, groupNo); err != nil {
+				g.Error("organization membership reconciliation remains pending", zap.Error(err))
+				commit(err)
+				return
+			}
+		}
+	}
 	// 添加IM订阅者和发布入群消息（必须在tx.Commit()成功之后）
 	for _, m := range addMembers {
 		groupName := ""
@@ -603,16 +629,19 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 			})
 			uids = append(uids, m.Members[index].EmployeeUid)
 		}
-		err = g.ctx.IMAddSubscriber(&config.SubscriberAddReq{
-			ChannelID:   m.GroupNo,
-			ChannelType: common.ChannelTypeGroup.Uint8(),
-			Subscribers: uids,
-		})
-		if err != nil {
-			g.Error("调用IM的订阅接口失败！", zap.Error(err))
-			commit(err)
-			return
+		if !imreconcile.Enabled() {
+			err = imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
+				ChannelID:   m.GroupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				Subscribers: uids,
+			})
+			if err != nil {
+				g.Error("调用IM的订阅接口失败！", zap.Error(err))
+				commit(err)
+				return
+			}
 		}
+
 		content := fmt.Sprintf("欢迎%s 加入 %s，新成员入群可查看所有历史消息", strings.Join(params, ","), groupName)
 		err = g.ctx.SendMessage(&config.MsgSendReq{
 			Header: config.MsgHeader{
@@ -658,16 +687,19 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 			for index := range m.Members {
 				members = append(members, m.Members[index].EmployeeUid)
 			}
-			err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-				ChannelID:   m.GroupNo,
-				ChannelType: common.ChannelTypeGroup.Uint8(),
-				Subscribers: members,
-			})
-			if err != nil {
-				g.Error("调用IM的订阅接口失败！", zap.Error(err))
-				commit(err)
-				return
+			if !imreconcile.Enabled() {
+				err = imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
+					ChannelID:   m.GroupNo,
+					ChannelType: common.ChannelTypeGroup.Uint8(),
+					Subscribers: members,
+				})
+				if err != nil {
+					g.Error("调用IM的订阅接口失败！", zap.Error(err))
+					commit(err)
+					return
+				}
 			}
+
 			// Issue #27 同型：组织/部门删人必须摘除该 uid 在群内所有非删除子区的
 			// IM 订阅（复用统一 helper，best-effort）。
 			for _, uid := range members {
@@ -846,7 +878,7 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 	for _, groupNo := range realGroups {
 		members := make([]string, 0)
 		members = append(members, req.Operator)
-		err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		err = imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
 			ChannelID:   groupNo,
 			ChannelType: common.ChannelTypeGroup.Uint8(),
 			Subscribers: members,

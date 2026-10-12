@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -300,7 +301,7 @@ func (s *Service) finishProjectGroupCreate(state *projectGroupCreateState) (*Cre
 	if state == nil {
 		return nil, errors.New("Project group create state is nil")
 	}
-	if err := s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+	if err := imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{
 		ChannelID: state.groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Subscribers: state.realMemberUIDs,
 	}); err != nil {
 		s.Error("create Project group IM channel failed, performing compensating rollback", zap.Error(err), zap.String("groupNo", state.groupNo))
@@ -369,6 +370,9 @@ func (s *Service) compensateProjectGroupCreate(groupNo string) error {
 		return fmt.Errorf("begin compensation: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
+	if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+		return err
+	}
 	if _, err := tx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); err != nil {
 		return fmt.Errorf("delete group members: %w", err)
 	}

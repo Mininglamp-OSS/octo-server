@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"go.uber.org/zap"
 )
@@ -282,7 +283,7 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 
 	// 创建 IM 频道
 	channelID := BuildChannelID(req.GroupNo, shortID)
-	err = s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+	err = imreconcile.CreateChannel(s.ctx, &config.ChannelCreateReq{
 		ChannelID:   channelID,
 		ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 		Subscribers: subscribers,
@@ -299,7 +300,7 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 				zap.String("groupNo", req.GroupNo),
 				zap.String("channelID", channelID))
 			// 推送 Disband:1 到新子区 IM channel（幂等，确保 WuKongIM 层也标记）
-			if pushErr := s.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+			if pushErr := imreconcile.UpdateChannelInfo(s.ctx, &config.ChannelInfoCreateReq{
 				ChannelID:   channelID,
 				ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 				Disband:     1,
@@ -933,6 +934,9 @@ func (s *Service) DeleteThread(groupNo, shortID, operatorUID string) error {
 		return errors.New("thread not found")
 	}
 	if thread.Status == ThreadStatusDeleted {
+		if imreconcile.Enabled() {
+			return imreconcile.Flush(s.ctx, groupNo)
+		}
 		return nil // 已删除，无需操作
 	}
 
@@ -952,7 +956,7 @@ func (s *Service) DeleteThread(groupNo, shortID, operatorUID string) error {
 	}
 
 	channelID := BuildChannelID(groupNo, shortID)
-	err = s.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+	err = imreconcile.UpdateChannelInfo(s.ctx, &config.ChannelInfoCreateReq{
 		ChannelID:   channelID,
 		ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 		Ban:         1,
@@ -965,6 +969,9 @@ func (s *Service) DeleteThread(groupNo, shortID, operatorUID string) error {
 	user.RemovePinnedForChannel(channelID, common.ChannelTypeCommunityTopic.Uint8())
 	conversation_ext.RemoveConvExtForChannel(channelID, common.ChannelTypeCommunityTopic.Uint8())
 
+	if imreconcile.Enabled() && err != nil {
+		return fmt.Errorf("IM child deletion reconciliation remains pending: %w", err)
+	}
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"go.uber.org/zap"
 )
 
@@ -63,6 +64,11 @@ func (g *Group) admitToPresetGroup(ctx *config.Context, spaceID, groupNo, uid st
 	// The caller (modules/space) has already checked the group belongs to this
 	// Space; repeating it here under the share lock keeps the admission's own
 	// precondition explicit rather than inheriting a stale read.
+	// Acquire exclusive ownership before a shared read when this transaction
+	// will also record intent; concurrent shared-to-exclusive upgrades deadlock.
+	if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+		return fmt.Errorf("group: preset admission lock group: %w", err)
+	}
 	count, err := tx.SelectBySql(
 		"SELECT group_no FROM `group` WHERE group_no=? AND space_id=? FOR SHARE",
 		groupNo, spaceID,
@@ -94,7 +100,7 @@ func (g *Group) admitToPresetGroup(ctx *config.Context, spaceID, groupNo, uid st
 	// admission path carries; it is not re-solved here (see the brief's D6 — the
 	// IM outbox is separately tracked in #797). Reported as an error so the
 	// caller logs it rather than claiming success.
-	if err := ctx.IMAddSubscriber(&config.SubscriberAddReq{
+	if err := imreconcile.AddSubscribers(ctx, &config.SubscriberAddReq{
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		Subscribers: []string{uid},

@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	aiteampkg "github.com/Mininglamp-OSS/octo-server/pkg/aiteam"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	"github.com/gocraft/dbr/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -238,6 +239,39 @@ func (d *DB) admitOrRestoreMembersTx(
 			// row exists but no client ever syncs it. Refusing here is how that
 			// stops being discoverable only in production.
 			return fmt.Errorf("group: admission carries no version for uid %s", a.UID)
+		}
+	}
+
+	if imreconcile.Enabled() {
+		// Serialize on the parent before a current (not MVCC snapshot) read.
+		// No-op re-admission must not bump authority or interrupt pending work.
+		if err := imreconcile.LockGroupTx(tx, groupNo); err != nil {
+			return err
+		}
+		uids := make([]string, 0, len(admissions))
+		for _, a := range admissions {
+			uids = append(uids, a.UID)
+		}
+		var active []string
+		if _, err := tx.Select("uid").From("group_member").Where("group_no=? AND uid IN ? AND is_deleted=0", groupNo, uids).Suffix("FOR UPDATE").Load(&active); err != nil {
+			return err
+		}
+		present := make(map[string]bool, len(active))
+		for _, uid := range active {
+			present[uid] = true
+		}
+		changed := false
+		for _, uid := range uids {
+			changed = changed || !present[uid]
+		}
+		if !changed {
+			return nil
+		}
+		// Still record intent before the write: callers cannot accidentally
+		// commit membership after ignoring a failed enqueue. The parent lock
+		// serializes all writers, and claim only uses non-locking member reads.
+		if err := imreconcile.TouchGroupTx(tx, groupNo); err != nil {
+			return err
 		}
 	}
 

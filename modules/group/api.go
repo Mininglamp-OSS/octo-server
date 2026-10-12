@@ -35,6 +35,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/imreconcile"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -335,6 +336,16 @@ func (g *Group) disband(c *wkhttp.Context) {
 	}
 	g.ctx.EventCommit(eventID)
 
+	if imreconcile.Enabled() {
+		if err := imreconcile.Flush(g.ctx, groupNo); err != nil {
+			g.Error("IM disband reconciliation remains pending", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+			return
+		}
+		c.ResponseOK()
+		return
+	}
+
 	// ====== 第二阶段：推送 WuKongIM disband flag（fail-closed） ======
 	// MySQL 已提交，现在推送 IM disband。重新查询 thread IDs 以捕获所有子区。
 	// WuKongIM 推送失败时返回错误（fail-closed），客户端可重试（MySQL 已提交，
@@ -376,6 +387,9 @@ func (g *Group) disband(c *wkhttp.Context) {
 // WuKongIM IMCreateOrUpdateChannelInfo 是 upsert 幂等操作，重复推送安全。
 // 返回 error 表示推送失败（调用方应返回错误给客户端，确保 fail-closed）。
 func (g *Group) retryWuKongIMDisbandPush(groupNo string, groupType int) error {
+	if imreconcile.Enabled() {
+		return imreconcile.Flush(g.ctx, groupNo)
+	}
 	threadShortIDs, err := g.db.queryThreadShortIDsByGroup(groupNo)
 	if err != nil {
 		g.Error("重试解散推送：查询子区列表失败（fail-closed：必须推送所有子区）",
@@ -408,7 +422,7 @@ func (g *Group) retryWuKongIMDisbandPush(groupNo string, groupType int) error {
 func (g *Group) pushWuKongIMDisbandWithRetry(channelID string, channelType uint8, groupType int, label string) error {
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		if err := g.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+		if err := imreconcile.UpdateChannelInfo(g.ctx, &config.ChannelInfoCreateReq{
 			ChannelID:   channelID,
 			ChannelType: channelType,
 			Disband:     1,
@@ -2039,6 +2053,21 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 		}
 	}
 	if len(realMembers) == 0 {
+		if imreconcile.Enabled() && len(newMembers) == len(tempNewMembers) {
+			active := make(map[string]bool, len(existMembers))
+			for _, member := range existMembers {
+				if member.Status == int(common.GroupMemberStatusNormal) {
+					active[member.UID] = true
+				}
+			}
+			allActive := len(newMembers) > 0
+			for _, uid := range newMembers {
+				allActive = allActive && active[uid]
+			}
+			if allActive {
+				return nil, errMembersAlreadyActive
+			}
+		}
 		g.Error("添加的成员已在群内或在群黑名单内", zap.Error(err))
 		return nil, errors.New("添加的成员已在群内或在群黑名单内")
 	}
@@ -2136,15 +2165,18 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			return nil, errors.New("开启无法添加到群聊事件失败！")
 		}
 	}
-	// 调用IM的添加订阅者
-	err = g.ctx.IMAddSubscriber(&config.SubscriberAddReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: realMembers,
-	})
-	if err != nil {
-		g.Error("调用IM的订阅接口失败！", zap.Error(err))
-		return nil, errors.New("调用IM的订阅接口失败！")
+	if !imreconcile.Enabled() {
+		// 调用IM的添加订阅者
+		err = imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			Subscribers: realMembers,
+		})
+		if err != nil {
+			g.Error("调用IM的订阅接口失败！", zap.Error(err))
+			return nil, errors.New("调用IM的订阅接口失败！")
+		}
+
 	}
 
 	// 检查新增成员中是否有Bot用户，推送 bot_joined_group 事件
@@ -2172,6 +2204,8 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	}, nil
 }
 
+var errMembersAlreadyActive = errors.New("members are already active")
+
 func (g *Group) addMembers(members []string, groupNo string, operator, operatorName string) error {
 	tx, err := g.ctx.DB().Begin()
 	if err != nil {
@@ -2185,6 +2219,12 @@ func (g *Group) addMembers(members []string, groupNo string, operator, operatorN
 		}
 	}()
 	commitCallback, err := g.addMembersTx(members, groupNo, operator, operatorName, tx)
+	if errors.Is(err, errMembersAlreadyActive) {
+		// Event redelivery after SQL commit must wait for the existing intent,
+		// without re-admitting members or re-sending the first call's notices.
+		tx.RollbackUnlessCommitted()
+		return imreconcile.Flush(g.ctx, groupNo)
+	}
 	if err != nil {
 		tx.RollbackUnlessCommitted()
 		return err
@@ -2198,6 +2238,11 @@ func (g *Group) addMembers(members []string, groupNo string, operator, operatorN
 		commitCallback()
 	}
 
+	if imreconcile.Enabled() {
+		if err := imreconcile.Flush(g.ctx, groupNo); err != nil {
+			return fmt.Errorf("IM membership reconciliation remains pending: %w", err)
+		}
+	}
 	// 同步新成员到群内所有子区的 IM 订阅（允许发消息）
 	g.addUsersToGroupThreads(groupNo, members)
 
@@ -2905,7 +2950,7 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 	}
 
 	// 调用IM的添加订阅者（在事务提交后执行，确保数据一致性）
-	err = g.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+	err = imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		Subscribers: []string{scaner},
@@ -3104,7 +3149,7 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 	if forbiddenExpirTime > 0 {
 		toUIDs := make([]string, 0)
 		toUIDs = append(toUIDs, toUID)
-		err = g.ctx.IMBlacklistRemove(config.ChannelBlacklistReq{
+		err = imreconcile.RemoveDenylist(g.ctx, config.ChannelBlacklistReq{
 			ChannelReq: config.ChannelReq{
 				ChannelID:   groupNo,
 				ChannelType: common.ChannelTypeGroup.Uint8(),
@@ -3602,21 +3647,49 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
-	// 调用IM的移除订阅者
-	err = g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: []string{loginUID},
-	})
-	if err != nil {
-		g.Error("移除订阅者失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
-		return
+	if !imreconcile.Enabled() {
+		// 调用IM的移除订阅者
+		err = imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			Subscribers: []string{loginUID},
+		})
+		if err != nil {
+			g.Error("移除订阅者失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+			return
+		}
 	}
 	loginMember, err := g.db.QueryMemberWithUID(loginUID, groupNo)
 	if err != nil {
 		g.Error("查询是否存在群成员失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	}
+	if loginMember == nil && imreconcile.Enabled() {
+		// Only a persisted historical membership proves this can be an exit
+		// retry. Pending work for other members does not authorize this branch.
+		var deleted int
+		_, err := g.db.session.Select("COUNT(*)").From("group_member").
+			Where("group_no=? AND uid=? AND is_deleted=1", groupNo, loginUID).Load(&deleted)
+		if err != nil {
+			g.Error("query historical exit membership failed", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if deleted == 0 {
+			httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+			return
+		}
+		// A previous exit may have committed SQL but timed out waiting for IM.
+		// Retrying must wait for that durable intent instead of reporting done
+		// from the now-absent member row.
+		if err := imreconcile.Flush(g.ctx, groupNo); err != nil {
+			g.Error("IM exit reconciliation remains pending", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+			return
+		}
+		c.ResponseOK()
 		return
 	}
 	if loginMember == nil {
@@ -3754,6 +3827,12 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	}
 	g.ctx.EventCommit(eventID)
 
+	// Only the committed revision contains this exit and the bot cascade.
+	var reconcileErr error
+	if imreconcile.Enabled() {
+		reconcileErr = imreconcile.Flush(g.ctx, groupNo)
+	}
+
 	// 外部群标记发生变化时，通知成员刷新频道信息
 	if resetExternalGroup {
 		g.ctx.SendChannelUpdateToGroup(groupNo)
@@ -3799,8 +3878,8 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 			}
 			botUIDs = append(botUIDs, bu.UID)
 		}
-		if len(botUIDs) > 0 {
-			if err := g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		if len(botUIDs) > 0 && !imreconcile.Enabled() {
+			if err := imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
 				ChannelID:   groupNo,
 				ChannelType: common.ChannelTypeGroup.Uint8(),
 				Subscribers: botUIDs,
@@ -3826,6 +3905,11 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	// 清理用户在该群的置顶（按 Space 隔离）
 	user.RemovePinnedForUserInSpace(loginUID, groupInfo.SpaceID, groupNo, common.ChannelTypeGroup.Uint8())
 	conversation_ext.RemoveConvExtForUserInSpace(loginUID, groupInfo.SpaceID, groupNo, common.ChannelTypeGroup.Uint8())
+	if reconcileErr != nil {
+		g.Error("IM exit reconciliation remains pending", zap.Error(reconcileErr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+		return
+	}
 	c.ResponseOK()
 
 }
@@ -3839,6 +3923,9 @@ func (g *Group) removeUserFromGroupThreads(groupNo, uid, spaceID string) {
 
 // addUsersToGroupThreads 新成员入群时，将其加入该群所有子区的 IM 订阅（允许发消息）
 func (g *Group) addUsersToGroupThreads(groupNo string, uids []string) {
+	if imreconcile.Enabled() {
+		return
+	}
 	if len(uids) == 0 {
 		return
 	}
@@ -3864,7 +3951,7 @@ func (g *Group) addUsersToGroupThreads(groupNo string, uids []string) {
 	for _, t := range threads {
 		// 子区 channelID 格式: {groupNo}____{shortID} (与 thread.BuildChannelID 一致)
 		channelID := groupNo + "____" + t.ShortID
-		if addErr := g.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		if addErr := imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
 			ChannelID:   channelID,
 			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 			Subscribers: uids,
@@ -3959,6 +4046,13 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
+	if imreconcile.Enabled() {
+		if err := imreconcile.Flush(g.ctx, groupNo); err != nil {
+			g.Error("IM blacklist reconciliation remains pending", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+			return
+		}
+	}
 	if status == int(common.GroupMemberStatusBlacklist) {
 		err = g.setGroupBlacklist(groupNo, targetUIDs, status == int(common.GroupMemberStatusBlacklist))
 		if err != nil {
@@ -3974,7 +4068,7 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		for _, uid := range targetUIDs {
 			g.removeUserFromGroupThreads(groupNo, uid, group.SpaceID)
 		}
-		if rmErr := g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+		if rmErr := imreconcile.RemoveSubscribers(g.ctx, &config.SubscriberRemoveReq{
 			ChannelID:   groupNo,
 			ChannelType: common.ChannelTypeGroup.Uint8(),
 			Subscribers: targetUIDs,
@@ -4009,7 +4103,7 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 			// updateMembersStatus 已把 status 改回 Normal，此处把这些成员重新挂回父群和
 			// 群内所有非删除子区的 IM 订阅，参考入群 addUsersToGroupThreads。
 			// best-effort：失败只记日志，不回滚解除黑名单。
-			if addErr := g.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+			if addErr := imreconcile.AddSubscribers(g.ctx, &config.SubscriberAddReq{
 				ChannelID:   groupNo,
 				ChannelType: common.ChannelTypeGroup.Uint8(),
 				Subscribers: removeUIDs,
@@ -4277,13 +4371,13 @@ func (g *Group) CheckForbiddenLoop() {
 func (g *Group) setGroupBlacklist(groupNo string, uids []string, isAdd bool) error {
 	var err error
 	if isAdd {
-		err = g.ctx.IMBlacklistAdd(config.ChannelBlacklistReq{
+		err = imreconcile.AddDenylist(g.ctx, config.ChannelBlacklistReq{
 			ChannelReq: config.ChannelReq{
 				ChannelID:   groupNo,
 				ChannelType: common.ChannelTypeGroup.Uint8(),
 			}, UIDs: uids})
 	} else {
-		err = g.ctx.IMBlacklistRemove(config.ChannelBlacklistReq{
+		err = imreconcile.RemoveDenylist(g.ctx, config.ChannelBlacklistReq{
 			ChannelReq: config.ChannelReq{
 				ChannelID:   groupNo,
 				ChannelType: common.ChannelTypeGroup.Uint8(),
