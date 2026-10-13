@@ -29,7 +29,10 @@ RUN GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) && \
     GIT_TREE_STATE=$(test -n "`git status --porcelain 2>/dev/null`" && echo "dirty" || echo "clean") && \
     CGO_ENABLED=0 GOOS=linux go build \
       -ldflags="-w -extldflags '-static' -X main.Commit=$GIT_COMMIT -X main.CommitDate=$GIT_COMMIT_DATE -X main.Version=$GIT_VERSION -X main.TreeState=$GIT_TREE_STATE" \
-      -installsuffix cgo -o app .
+      -installsuffix cgo -o app . && \
+    CGO_ENABLED=0 GOOS=linux go build \
+      -ldflags="-w -X main.Commit=$GIT_COMMIT -X main.Version=$GIT_VERSION" \
+      -o wukongim-v3-compat ./cmd/wukongim-v3-compat
 
 
 FROM alpine:3.21 AS prod
@@ -40,6 +43,7 @@ RUN mkdir -p /usr/share/zoneinfo/Asia && \
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 WORKDIR /home
 COPY --from=build /go/release/app /home
+COPY --from=build /go/release/wukongim-v3-compat /home
 COPY --from=build /go/release/assets /home/assets
 COPY --from=build /go/release/configs /home/configs
 RUN echo "Asia/Shanghai" > /etc/timezone
