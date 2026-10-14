@@ -535,3 +535,45 @@ func TestManagerSystemSetting_UpdateAcceptsPositiveIncomingWebhookNumerics(t *te
 	assert.Equal(t, "100000", got["incomingwebhook.per_webhook_burst"], "no artificial upper bound for Positive keys")
 	assert.Equal(t, "50", got["incomingwebhook.max_per_group"])
 }
+
+// TestManagerSystemSetting_UpdateDriveUploadMaxSizeKB pins the drive upload
+// limit's write-side semantics (task drive-upload-policy, design §6.1):
+//   - 1048576 (1 GiB) must be ACCEPTED — the key is Positive:true, so it opts
+//     out of the shared [0,3650] day-window cap that would otherwise reject it.
+//   - 0 / negative must be 400 ("must be a positive integer").
+//   - a non-integer must be 400 ("must be an integer").
+//   - a value above the hard cap is NOT rejected here: the write side stores it
+//     and the read side clamps (06 freeze decision 4E / §9-Q8).
+func TestManagerSystemSetting_UpdateDriveUploadMaxSizeKB(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "") // default 10 GiB cap
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	post := func(value string) *httptest.ResponseRecorder {
+		body := []byte(`{"items":[{"category":"drive","key":"upload_max_size_kb","value":"` + value + `"}]}`)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	// 接受 1 GiB（Positive 绕过 [0,3650]）。
+	w := post("1048576")
+	require.Equal(t, http.StatusOK, w.Code, "1048576 must be accepted: %s", w.Body.String())
+
+	// 拒绝 0 / 负数 / 非整数。
+	for _, bad := range []string{"0", "-1", "abc"} {
+		w := post(bad)
+		assert.NotEqualf(t, http.StatusOK, w.Code, "drive.upload_max_size_kb=%q must be rejected", bad)
+	}
+
+	// 超硬上限写入被接受（只钳不拒）。
+	w = post("10485761")
+	require.Equal(t, http.StatusOK, w.Code, "值超硬上限时写侧只钳不拒: %s", w.Body.String())
+}

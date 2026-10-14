@@ -1814,6 +1814,18 @@ func (s *SystemSettings) DriveSearchEnabled() bool {
 	return s.getBool("drive", "search_enabled", false)
 }
 
+// DriveUploadV2On reports whether clients should gray-enable the Drive
+// chunked-upload (v2) front-end UI. Pure display / rollout policy: it controls
+// only the ③/④ front-end multipart UI, NOT a server-side capability gate —
+// the server gate is the request header X-Drive-Upload-Capabilities alone
+// (contract-freeze 06 §1). Default false so the v2 UI stays hidden until ops
+// flips drive.upload_v2_enabled for a controlled rollout. Value source:
+// system_setting drive.upload_v2_enabled (DB, hot-reloaded). Downstream field
+// name: appconfig drive_upload_v2_on.
+func (s *SystemSettings) DriveUploadV2On() bool {
+	return s.getBool("drive", "upload_v2_enabled", false)
+}
+
 // DmloopEnabled reports whether the Loop(回路)module entry should be shown to
 // clients. Default false — the loop feature (backend service + fleet proxy +
 // daemon runtimes) stays hidden until ops flips dmloop.enabled after those deps
@@ -1928,6 +1940,10 @@ func (s *SystemSettings) clampIntUpper(key string, v, fallback, hardCap int) int
 		return min(fallback, hardCap)
 	}
 	if v > hardCap {
+		// Count every clamp event — not just the first per (key, v) — so the
+		// metric reflects live traffic rather than the deduped log. See
+		// system_setting_metrics.go; design §5.2.
+		systemSettingClampTotal.WithLabelValues(key).Inc()
 		s.warnClampOnce(fmt.Sprintf("%s=%d>%d", key, v, hardCap),
 			"system_setting knob exceeds hard cap; clamped",
 			zap.String("key", key),

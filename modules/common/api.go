@@ -413,6 +413,9 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			// 也能立刻拿到最新值。文件上传限制同理。
 			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
 			FileUploadLimits:    buildFileUploadLimitsResp(),
+			// Drive 上传限制:短路分支同样下发(DriveUploadV2On 同)。
+			DriveUploadLimits: buildDriveUploadLimitsResp(cn.systemSettings),
+			DriveUploadV2On:   cn.systemSettings.DriveUploadV2On(),
 		})
 		return
 	}
@@ -471,6 +474,9 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
 		FileUploadLimits:    buildFileUploadLimitsResp(),
+		// Drive 上传限制:客户端本地预校验用,兜底(字节级强制/分片)在 ② octo-drive。
+		DriveUploadLimits: buildDriveUploadLimitsResp(cn.systemSettings),
+		DriveUploadV2On:   cn.systemSettings.DriveUploadV2On(),
 	})
 }
 
@@ -1000,6 +1006,32 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦的原因同 StickerUploadLimits：运维在管理台调整
 	// 后，老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	FileUploadLimits *fileUploadLimitsResp `json:"file_upload_limits,omitempty"`
+
+	// DriveUploadLimits 是 Drive 上传的生效策略（task drive-upload-policy）。
+	// 与 drive.upload_max_size_kb 及一组分片参数 env 同源，经 /v1/common/appconfig
+	// 下发给客户端做本地预校验 + 并发上限提示。字段形状与单位对齐
+	// sticker_upload_limits / file_upload_limits（KB）。
+	//
+	// **值类型恒下发**（不是指针 + omitempty）：本字段由 system_setting 恒可
+	// 计算，不存在 file_upload_limits 那种「provider 未注册」态（06 冻结决策
+	// 4E / 01 §9-Q1）。恒下发让 ③④ 少一条「字段缺失」分支。
+	//
+	// 不含 policy_version（Web 不按版本缓存，06 4E / 01 §9-Q6）。客户端的本地
+	// 预校验只是 UX 优化：模式（单次直传 vs 分片）始终由服务端在 prepare 决定，
+	// 客户端这些值不得作为放行依据，缺失 / 非法时逐字段回退默认（01 §3.4-B）。
+	//
+	// 与 app_config.version 解耦的原因同 StickerUploadLimits：运维调整后老客户端
+	// 命中 version 短路分支也必须拿到最新值，故两个分支都下发（R2.1 硬要求）。
+	DriveUploadLimits driveUploadLimitsResp `json:"drive_upload_limits"`
+
+	// DriveUploadV2On 是 Drive 分片上传(v2)前端的灰度开关，来源 system_setting
+	// drive.upload_v2_enabled。**纯前端灰度开关**：只控制 ③/④ 的前端分片 UI /
+	// 代码路径是否启用，**不是**服务端能力门 —— 服务端门只看请求头
+	// X-Drive-Upload-Capabilities（唯一强制点，06 §1）。默认 false。
+	//
+	// 与 app_config.version 解耦的原因同 DocsOn / DriveOn：运维切策略后老客户端
+	// 命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	DriveUploadV2On bool `json:"drive_upload_v2_on"`
 }
 
 // fileUploadLimitsResp 是 appConfigResp.file_upload_limits 的形状。
@@ -1018,6 +1050,32 @@ func buildFileUploadLimitsResp() *fileUploadLimitsResp {
 		return nil
 	}
 	return &fileUploadLimitsResp{MaxSizeKB: maxSizeKB, AllowedExtensions: allowed}
+}
+
+// driveUploadLimitsResp 是 appConfigResp.drive_upload_limits 的形状。
+// 5 个字段一起下发、一起用于客户端预校验与并发上限提示；单位 KB，与
+// sticker_upload_limits / file_upload_limits 对齐。不含 policy_version（Web 不
+// 按版本缓存）。
+type driveUploadLimitsResp struct {
+	MaxSizeKB             int `json:"max_size_kb"`
+	MultipartThresholdKB  int `json:"multipart_threshold_kb"`
+	PartSizeKB            int `json:"part_size_kb"`
+	MaxConcurrentParts    int `json:"max_concurrent_parts"`
+	MaxConcurrentSessions int `json:"max_concurrent_sessions"`
+}
+
+// buildDriveUploadLimitsResp 从 SystemSettings 派生一份 driveUploadLimitsResp。
+// 字段来自同一份 DriveUploadPolicy（单次快照读），值类型恒下发（不存在 provider
+// 缺失导致的整字段省略）。
+func buildDriveUploadLimitsResp(s *SystemSettings) driveUploadLimitsResp {
+	p := s.DriveUploadPolicy()
+	return driveUploadLimitsResp{
+		MaxSizeKB:             p.MaxSizeKB,
+		MultipartThresholdKB:  p.MultipartThresholdKB,
+		PartSizeKB:            p.PartSizeKB,
+		MaxConcurrentParts:    p.MaxConcurrentParts,
+		MaxConcurrentSessions: p.MaxConcurrentSessions,
+	}
 }
 
 type messageReactionCapabilityResp struct {

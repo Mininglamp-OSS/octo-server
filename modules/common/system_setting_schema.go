@@ -328,6 +328,27 @@ var systemSettingSchema = []settingDef{
 	{Category: "drive", Key: "search_enabled", Type: settingTypeBool, Description: "是否向客户端展示全局搜索的\"网盘\"tab（与 drive.enabled 解耦；搜索端点上线+索引就绪前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveSearchEnabled()) }},
 
+	// drive 单文件上传上限（task drive-upload-policy）。必须 Positive:true ——
+	// 值为 1048576，会被 settingTypeInt 默认的 [settingIntMin, settingIntMax]=
+	// [0,3650] 上界拒掉；上界由读侧 DriveUploadMaxSizeKBHardCap clamp 承担，同
+	// file.max_size_kb / sticker.upload_max_size_kb 那组。effective_value 是钳位
+	// 后的生效值，管理台另有 value 列回显 stored（超硬上限时写侧只钳不拒，见
+	// 06 冻结决策 4E / Q8）。语义：单文件上限，只作用于 Drive 上传，不影响聊天
+	// 文件/贴纸/文档附件（它们的上限各由 file.max_size_kb / sticker.upload_* 管）。
+	{Category: "drive", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "Drive 单文件上传大小上限(KB)；默认 1048576(1 GiB)。天花板由部署侧 env OCTO_DRIVE_UPLOAD_MAX_SIZE_KB_HARD_CAP 决定(未配置时 10485760/10 GiB)，本值超过天花板会被钳到天花板",
+		Positive: true,
+		Effective: func(s *SystemSettings) string {
+			return strconv.Itoa(s.DriveUploadMaxSizeKB())
+		}},
+
+	// drive 分片上传(v2)的前端灰度开关（task drive-upload-policy，06 4D.1）。
+	// **纯前端灰度开关**：只控制 ③/④ 的前端分片 UI / 代码路径是否启用，**不是**
+	// 服务端能力门 —— 服务端能力门只看请求头 X-Drive-Upload-Capabilities（唯一
+	// 强制点，06 §1）。默认 false，走 drive.enabled / drive.search_enabled 的既有
+	// staged-flag 模式，经 appconfig 的 drive_upload_v2_on 下发给客户端。
+	{Category: "drive", Key: "upload_v2_enabled", Type: settingTypeBool, Description: "是否向客户端灰度启用 Drive 分片上传(v2)前端 UI；默认关闭。纯前端灰度开关，不构成服务端能力门(服务端门只看请求头 X-Drive-Upload-Capabilities)",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveUploadV2On()) }},
+
 	// Loop(回路)模块展示开关。loop 依赖后端服务 + fleet 代理 + daemon runtime 一整套,未就绪前
 	// 默认关闭;feature 分支合入 main 也不暴露,上线后由管理台切 dmloop.enabled 灰度放量。仅表达
 	// 展示策略,不承担服务端鉴权(/fleet 鉴权在后端)。经 GET /v1/common/appconfig 的 dmloop_on 下发给客户端。
