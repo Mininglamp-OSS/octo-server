@@ -19,12 +19,17 @@ var (
 	// SystemSettings snapshot has never loaded successfully, so the effective
 	// policy is genuinely unknown. Publishing the compile-time default with a
 	// valid-looking fingerprint would let the drive side raise its limit on a
-	// value no admin ever configured, breaking fail-closed. The caller branches
-	// on error.http_status (503), not the message.
+	// value no admin ever configured, breaking fail-closed.
 	//
-	// Internal=true keeps any snapshot/DB detail off the wire — the renderer
-	// emits a generic placeholder and the underlying cause is logged by the
-	// module, never surfaced.
+	// Internal=true follows the repo-wide 5xx hygiene rule (every 5xx code is
+	// Internal; see TestSharedCodes_InternalFlag / TestOIDCCodesInternalFlag and
+	// ErrOIDCBindServiceUnavailable, which carries the same shape). The renderer
+	// then emits the shared err.shared.internal copy, so this DefaultMessage and
+	// its zh-CN translation in active.zh-CN.toml are intentionally NOT reachable
+	// on the wire — they are kept to satisfy Register and to document intent. The
+	// octo-drive consumer tells the fail-closed 503 apart by error.code
+	// (err.server.drive_policy.unavailable) and error.http_status, never by the
+	// human-readable message.
 	ErrDriveUploadPolicyUnavailable = register(codes.Code{
 		ID:             "err.server.drive_policy.unavailable",
 		HTTPStatus:     http.StatusServiceUnavailable,

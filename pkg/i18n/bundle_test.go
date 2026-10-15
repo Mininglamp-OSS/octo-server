@@ -88,10 +88,17 @@ func TestBundle_LoadsZhTOML(t *testing.T) {
 	}
 }
 
-// TestBundle_DrivePolicyUnavailableHasZhCN 回归 PR #930 review P1：新增的
-// err.server.drive_policy.unavailable（drive 上传策略不可用 → 503）已在
-// active.zh-CN.toml 补齐运行时翻译，zh-CN 客户端不再拿到 en-US 兜底文案。
-func TestBundle_DrivePolicyUnavailableHasZhCN(t *testing.T) {
+// TestBundle_DrivePolicyUnavailableZhCNMarkerResolves 回归 PR #930 review：新增的
+// err.server.drive_policy.unavailable（drive 上传策略不可用 → 503）在
+// active.zh-CN.toml 中登记了 zh-CN marker，localizer 能解析出对应文案。
+//
+// 这是 **marker / 翻译表契约**，不是运行时 HTTP 契约：该码是 5xx，按仓库
+// 「5xx ⇒ Internal=true」约定（见 pkg/errcode/drive_policy.go 与
+// ErrOIDCBindServiceUnavailable 的同款注释），HTTP 路径渲染的是
+// err.shared.internal 占位文案，本码专属的 zh-CN 文案在 wire 上不可达——保留它
+// 只为登记翻译意图。HTTP 侧的真实口径由 drivepolicy 的
+// TestGetUploadPolicy_UnavailableSnapshotRendersSharedInternalCopy 钉住。
+func TestBundle_DrivePolicyUnavailableZhCNMarkerResolves(t *testing.T) {
 	resetBundle()
 	t.Cleanup(resetBundle)
 

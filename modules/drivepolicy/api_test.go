@@ -41,6 +41,18 @@ func newRouter(m *Module) *wkhttp.WKHttp {
 	return r
 }
 
+// newRouterWithI18nMiddleware mounts the production EarlyMiddleware so a test can
+// drive per-request language negotiation (Accept-Language) through the real
+// renderer. Without it the renderer falls back to i18n.DefaultLanguage, which is
+// unavoidable for the plain newRouter harness.
+func newRouterWithI18nMiddleware(m *Module) *wkhttp.WKHttp {
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	r.UseGin(i18n.EarlyMiddleware(i18n.MiddlewareOptions{DefaultLanguage: i18n.SourceLanguage}))
+	r.GET("/v1/internal/drive/upload-policy", m.internalAuthMiddleware(), m.getUploadPolicy)
+	return r
+}
+
 func doGet(t *testing.T, r *wkhttp.WKHttp, token string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v1/internal/drive/upload-policy", nil)
@@ -171,6 +183,61 @@ func TestGetUploadPolicy_UnavailableSnapshotFailsClosed(t *testing.T) {
 	assert.NotContains(t, body, "policy_version", "503 不得携带策略指纹")
 	assert.NotContains(t, body, "max_size_kb", "503 不得携带 6 字段策略体")
 	assert.NotContains(t, body, "84c1b192b780", "503 不得泄漏被拒绝的默认值指纹")
+}
+
+// 503 的 wire 文案口径（PR #930 fix-round-1 P2）：该码是 5xx，按仓库
+// 「5xx ⇒ Internal=true」约定（见 pkg/errcode/drive_policy.go 与
+// ErrOIDCBindServiceUnavailable），renderer 一律输出 err.shared.internal 占位文案，
+// 而不是本码的 DefaultMessage / zh-CN 翻译（那些是 marker，wire 上不可达）。
+//
+// 这里在真实 EarlyMiddleware 下驱动 HTTP 路径，钉住这条被 test 复验质疑过的行为：
+// 状态 503、error.code 仍是可编程分支用的本码、error.message 是随 Accept-Language
+// 变化的共享占位文案，且**永不**是本码专属文案。若将来有人为了让专属文案上线而
+// 去掉 Internal=true，本用例与 pkg/errcode 的 TestDrivePolicyCodesInternalFlag
+// 会一起失败，把这次「有意的约定变更」顶到 review 面前。
+func TestGetUploadPolicy_UnavailableSnapshotRendersSharedInternalCopy(t *testing.T) {
+	unavailable := func() (common.DriveUploadPolicy, bool) {
+		return common.DriveUploadPolicy{
+			MaxSizeKB:             1048576,
+			MultipartThresholdKB:  131072,
+			PartSizeKB:            65536,
+			MaxConcurrentParts:    3,
+			MaxConcurrentSessions: 3,
+			PolicyVersion:         "84c1b192b780",
+		}, false
+	}
+	r := newRouterWithI18nMiddleware(newModule(unavailable))
+
+	cases := []struct {
+		acceptLanguage string
+		wantMessage    string
+	}{
+		{"en-US", "Internal server error."},
+		{"zh-CN", "服务器内部错误。"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.acceptLanguage, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/internal/drive/upload-policy", nil)
+			req.Header.Set(internalTokenHeader, testToken)
+			req.Header.Set("Accept-Language", tc.acceptLanguage)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusServiceUnavailable, w.Code, "body=%s", w.Body.String())
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+			errObj, ok := body["error"].(map[string]any)
+			require.True(t, ok, "body=%s", w.Body.String())
+			assert.Equal(t, "err.server.drive_policy.unavailable", errObj["code"],
+				"可编程分支用的 error.code 必须保持本码")
+			assert.Equal(t, tc.wantMessage, errObj["message"],
+				"5xx 必须下发共享占位文案（随 Accept-Language 变化）")
+			assert.NotContains(t, w.Body.String(), "Drive 上传策略尚未就绪",
+				"本码专属 zh-CN 文案是 marker，不得出现在 5xx wire 上")
+			assert.NotContains(t, w.Body.String(), "Drive upload policy is not available yet.",
+				"本码专属 DefaultMessage 不得出现在 5xx wire 上")
+		})
+	}
 }
 
 // 与上一条成对：快照已成功加载但为空 map（管理员什么都没配）是**合法**状态，
