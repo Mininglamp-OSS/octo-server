@@ -101,8 +101,32 @@ func driveUploadPolicyVersion(maxSizeKB, threshold, partSize, parts, sessions, h
 // 同一次 s.snapshot.Load() —— 不存在跨键二次 Load 拼出的撕裂组合（对比
 // FileStickerSizeOrdering 的两次 snapshot.Load()）。分片参数与 hardCap 是静态
 // env，不是 DB 键。
+//
+// 快照从未成功加载时，返回由代码默认值拼出的策略。Web 下发通道的契约是「值
+// 类型恒下发」（06 冻结决策 1），客户端自行按需回落，所以这里保持恒有值。需要
+// 区分「快照不可用」的下游（内部服务间通道）改用 DriveUploadPolicyAvail。
 func (s *SystemSettings) DriveUploadPolicy() DriveUploadPolicy {
+	policy, _ := s.driveUploadPolicyAvail()
+	return policy
+}
+
+// DriveUploadPolicyAvail 是 DriveUploadPolicy 的可用性感知版本：第二个返回值
+// ok 为 false 表示进程内 settings 快照**从未成功加载过**（DB 从未读通），此刻
+// 返回的策略是代码默认值而非管理员配置。
+//
+// 这个区分对内部下发通道是 load-bearing 的：把「不可用配置」当成「合法策略」
+// 以 200 + 正常 fingerprint 发给 octo-drive，会让 drive 侧据此抬升上限，破坏
+// fail-closed（设计 C2：本项目内部接口的错误契约含 503）。Web 通道不需要它 ——
+// 那里恒下发值类型是刻意的。
+//
+// 一次快照读：ok 与策略 6 字段出自同一次 s.snapshot.Load()。
+func (s *SystemSettings) DriveUploadPolicyAvail() (DriveUploadPolicy, bool) {
+	return s.driveUploadPolicyAvail()
+}
+
+func (s *SystemSettings) driveUploadPolicyAvail() (DriveUploadPolicy, bool) {
 	getenv := os.Getenv
 	hardCap := driveUploadMaxSizeKBHardCapFrom(getenv)
-	return driveUploadPolicyFrom(s.driveUploadMaxSizeKBFromSnapshot(hardCap), getenv)
+	maxSizeKB, loaded := s.driveUploadMaxSizeKBFromSnapshot(hardCap)
+	return driveUploadPolicyFrom(maxSizeKB, getenv), loaded
 }

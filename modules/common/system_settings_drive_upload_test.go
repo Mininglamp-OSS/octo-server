@@ -21,6 +21,12 @@ func driveSnapSettings(snap map[string]string) *SystemSettings {
 	return s
 }
 
+// driveSnapSettingsUninitialized 造一个 snapshot 从未发布过的 SystemSettings，
+// 即「设置表从未成功读取」的进程状态（NewSystemSettings 的初始形态）。
+func driveSnapSettingsUninitialized() *SystemSettings {
+	return &SystemSettings{Log: log.NewTLog("SystemSettingsTest")}
+}
+
 // ----- 天花板 env：OCTO_DRIVE_UPLOAD_MAX_SIZE_KB_HARD_CAP -----
 
 func TestDriveUploadMaxSizeKBHardCap_DefaultsWhenUnset(t *testing.T) {

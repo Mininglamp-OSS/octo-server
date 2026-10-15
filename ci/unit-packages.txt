@@ -9,6 +9,7 @@
 ./modules/botfather/cmdmenu
 ./modules/cardtrust
 ./modules/channel/service
+./modules/drivepolicy
 ./modules/search
 ./pkg/accesslog
 ./pkg/authtree

@@ -3,6 +3,9 @@ package common
 import (
 	"testing"
 
+	// 注册 mysql driver，供下面「reload 必然失败」的用例构造连不上的 dbr 会话。
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/gocraft/dbr/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -127,4 +130,74 @@ func TestDriveUploadPolicy_FieldsConsistentUnderSnapshotSwap(t *testing.T) {
 	want := driveUploadPolicyVersion(p.MaxSizeKB, p.MultipartThresholdKB, p.PartSizeKB,
 		p.MaxConcurrentParts, p.MaxConcurrentSessions, DriveUploadMaxSizeKBHardCap())
 	assert.Equal(t, want, p.PolicyVersion)
+}
+
+// ---------------------------------------------------------------------------
+// 可用性区分（PR #930 review fix）：snapshot==nil 表示「设置表从未成功读取」，
+// 与「读成功但管理员什么都没配（空 map）」是两种状态。Web 通道恒下发值类型不符
+// 区分，但内部服务间通道必须据此 fail-closed（503），否则会把编译期默认值当成
+// 合法策略抬升 drive 侧上限。三条回归：unavailable / empty / recovery。
+// ---------------------------------------------------------------------------
+
+// 未初始化快照 → 不可用。注意值本身仍是默认 + 正常 fingerprint（reviewer 复现
+// 的 84c1b192b780 格），所以可用性只能靠 ok 判断，不能靠值判断。
+func TestDriveUploadPolicyAvail_UnavailableSnapshot(t *testing.T) {
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "")
+	s := driveSnapSettingsUninitialized()
+
+	p, ok := s.DriveUploadPolicyAvail()
+	require.False(t, ok, "从未成功加载的快照必须报告不可用（内部通道据此 503）")
+	assert.Equal(t, DefaultDriveUploadMaxSizeKB, p.MaxSizeKB)
+	require.NotEmpty(t, p.PolicyVersion, "不可用时值里仍有 fingerprint，正是要被 ok 拦住的诱饵")
+
+	// Web 通道（DriveUploadPolicy）保持「恒下发」语义，不受可用性影响。
+	assert.Equal(t, p, s.DriveUploadPolicy())
+}
+
+// 成功加载但为空 map → 可用（管理员未配置 ≠ 配置不可用）。
+func TestDriveUploadPolicyAvail_SuccessfulEmptySnapshot(t *testing.T) {
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "")
+	s := driveSnapSettings(nil)
+
+	p, ok := s.DriveUploadPolicyAvail()
+	require.True(t, ok, "成功加载的空快照是合法状态")
+	assert.Equal(t, DefaultDriveUploadMaxSizeKB, p.MaxSizeKB)
+}
+
+// 恢复：初次不可用 → 后续成功加载发布快照后自愈为可用，并反映加载到的值。
+func TestDriveUploadPolicyAvail_RecoversAfterSuccessfulLoad(t *testing.T) {
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "")
+	s := driveSnapSettingsUninitialized()
+	_, ok := s.DriveUploadPolicyAvail()
+	require.False(t, ok)
+
+	// loadWithGeneration 的成功路径就是一次 snapshot.Store。
+	snap := map[string]string{schemaKey("drive", "upload_max_size_kb"): "2097152"}
+	s.snapshot.Store(&snap)
+
+	p, ok := s.DriveUploadPolicyAvail()
+	require.True(t, ok, "成功加载后必须自愈为可用")
+	assert.Equal(t, 2097152, p.MaxSizeKB)
+}
+
+// 后续 reload 失败必须保留最后一次成功快照（继续可用 + 旧值），而不是退回
+// 不可用或默认值。用一个必然连不上的 DB 会话让 listAll 报错。
+func TestDriveUploadPolicyAvail_ReloadFailureKeepsLastGoodSnapshot(t *testing.T) {
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "")
+	s := driveSnapSettings(map[string]string{"drive.upload_max_size_kb": "2097152"})
+	if _, ok := s.DriveUploadPolicyAvail(); !ok {
+		t.Fatalf("前置条件失败：成功加载的快照应为可用")
+	}
+
+	conn, err := dbr.Open("mysql", "root@tcp(127.0.0.1:1)/none", nil)
+	require.NoError(t, err)
+	session := conn.NewSession(nil)
+	t.Cleanup(func() { _ = conn.Close() })
+	s.db = &systemSettingDB{session: session}
+
+	require.Error(t, s.Load(), "reload 必须失败（连不上）")
+
+	p, ok := s.DriveUploadPolicyAvail()
+	require.True(t, ok, "reload 失败必须保留最后成功快照，不得转为不可用")
+	assert.Equal(t, 2097152, p.MaxSizeKB, "reload 失败不得覆盖最后一次成功值")
 }

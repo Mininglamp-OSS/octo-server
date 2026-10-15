@@ -73,19 +73,26 @@ func DriveUploadMaxSizeKBHardCap() int {
 }
 
 // driveUploadMaxSizeKBFromSnapshot 在**一次快照读**内解析 drive.upload_max_size_kb
-// 并钳到 hardCap。未配置 → min(默认, hardCap)；已配置 → clampIntUpper。
+// 并钳到 hardCap。返回值第二项 loaded 报告该快照是否**成功加载过**：
+//
+//	loaded=false  s.snapshot 为 nil，即设置表从未成功读过（不是「管理员没配」）。
+//	              Web 下发通道仍需一个值（值类型恒下发），所以照旧回落
+//	              min(默认, hardCap)；但内部服务间通道必须据此 fail-closed，
+//	              见 DriveUploadPolicyAvail。
+//	loaded=true   快照已发布（可能为空 map）：未配置 → min(默认, hardCap)；
+//	              已配置 → clampIntUpper。
 //
 // 未配置那一格刻意不走钳位器：天花板可以低于代码默认值，把默认值喂进去会报
 // configured，而 system_setting 表里一行都没有 —— 那是在诬告一次没发生过的
 // 变更（与 FileMaxSizeKB 同理由）。回落值本身仍要过天花板。
-func (s *SystemSettings) driveUploadMaxSizeKBFromSnapshot(hardCap int) int {
+func (s *SystemSettings) driveUploadMaxSizeKBFromSnapshot(hardCap int) (int, bool) {
 	snapPtr := s.snapshot.Load()
 	if snapPtr == nil {
-		return min(DefaultDriveUploadMaxSizeKB, hardCap)
+		return min(DefaultDriveUploadMaxSizeKB, hardCap), false
 	}
 	raw, ok := (*snapPtr)[schemaKey("drive", "upload_max_size_kb")]
 	if !ok || raw == "" {
-		return min(DefaultDriveUploadMaxSizeKB, hardCap)
+		return min(DefaultDriveUploadMaxSizeKB, hardCap), true
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil {
@@ -93,11 +100,15 @@ func (s *SystemSettings) driveUploadMaxSizeKBFromSnapshot(hardCap int) int {
 		// 与 getIntOK 的 (0, true) 语义逐字节一致。
 		v = 0
 	}
-	return s.clampIntUpper("drive.upload_max_size_kb", v, DefaultDriveUploadMaxSizeKB, hardCap)
+	return s.clampIntUpper("drive.upload_max_size_kb", v, DefaultDriveUploadMaxSizeKB, hardCap), true
 }
 
 // DriveUploadMaxSizeKB 返回 drive 单文件上传上限（KB）。回退链只有
 // DB → code default 两层；越界处理与 sticker / file 那组键共用同一个钳位器。
+//
+// 快照从未加载时返回 min(默认, hardCap)：这是 Web 下发通道要的「恒有一个值」，
+// 不是「配置权威」的断言 —— 需要区分两者的调用方用 DriveUploadPolicyAvail。
 func (s *SystemSettings) DriveUploadMaxSizeKB() int {
-	return s.driveUploadMaxSizeKBFromSnapshot(DriveUploadMaxSizeKBHardCap())
+	v, _ := s.driveUploadMaxSizeKBFromSnapshot(DriveUploadMaxSizeKBHardCap())
+	return v
 }

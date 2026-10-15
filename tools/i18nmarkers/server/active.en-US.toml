@@ -399,6 +399,9 @@ other = "Invalid space welcome configuration."
 ["err.server.common.thread_archive_window_ordering"]
 other = "Thread auto-archive window must not be shorter than the recent-tab thread window."
 
+["err.server.drive_policy.unavailable"]
+other = "Drive upload policy is not available yet."
+
 ["err.server.file.extension_list_too_large"]
 other = "The extension list is too large (max {{.max_entries}} entries, {{.max_length}} chars each)."
 

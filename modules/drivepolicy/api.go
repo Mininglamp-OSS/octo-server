@@ -23,13 +23,16 @@ type Module struct {
 	internalToken string
 	log.Log
 
-	// policy resolves the currently-effective drive upload policy. Nil in
+	// policy resolves the currently-effective drive upload policy together with
+	// its availability. The second result is false when the process-wide
+	// SystemSettings snapshot has never loaded successfully, which the handler
+	// must surface as 503 rather than a valid-looking 200 (fail-closed). Nil in
 	// production, where the handler falls back to
-	// common.EnsureSystemSettings(ctx).DriveUploadPolicy(). Tests inject a
+	// common.EnsureSystemSettings(ctx).DriveUploadPolicyAvail(). Tests inject a
 	// stub here so the handler can be exercised without MySQL / a *SystemSettings
 	// with a live snapshot, and so a single test can prove the handler reads
 	// the policy exactly once per request.
-	policy func() common.DriveUploadPolicy
+	policy func() (common.DriveUploadPolicy, bool)
 }
 
 // New loads OCTO_DRIVE_INTERNAL_TOKEN at construction. When it is unset, too
@@ -148,18 +151,28 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 }
 
 // getUploadPolicy serves the currently-effective policy as the 6-field wire
-// body defined by the shared contract §3.3 (DriveUploadPolicy). 200 only; a
-// downstream failure to load settings surfaces as the zero policy, which the
-// drive side treats as fail-closed (it will not raise any limit above its own
-// compile-time defaults).
+// body defined by the shared contract §3.3 (DriveUploadPolicy).
+//
+// 200 only when the policy is authoritative. If the process-wide settings
+// snapshot has never loaded successfully, the effective policy is unknown —
+// the handler answers 503 instead of publishing a compile-time default with a
+// valid-looking fingerprint, because the drive side would otherwise raise its
+// limit to a value no admin ever configured. A later successful auto-reload
+// self-heals (the snapshot is swapped in-place), so this is transient.
 //
 // The policy is read exactly once per request (single snapshot read, see
-// common.SystemSettings.DriveUploadPolicy) so the six fields and the version
-// can never disagree.
+// common.SystemSettings.DriveUploadPolicyAvail) so the six fields, the version,
+// and the availability flag can never disagree.
 func (m *Module) getUploadPolicy(c *wkhttp.Context) {
-	policy := m.currentPolicy()
+	policy, available := m.currentPolicy()
+	if !available {
+		servedTotal.WithLabelValues(resultUnavailable).Inc()
+		m.Warn("drive upload policy unavailable: settings snapshot never loaded")
+		respondUnavailable(c)
+		return
+	}
 	servedTotal.WithLabelValues(resultOk).Inc()
-	policyVersionInfo.WithLabelValues(policy.PolicyVersion).Set(1)
+	policyVersionInfo.Set(policy.PolicyVersion)
 	m.Debug("drive upload policy served",
 		zap.String("policy_version", policy.PolicyVersion),
 		zap.Int("max_size_kb", policy.MaxSizeKB))
@@ -168,9 +181,9 @@ func (m *Module) getUploadPolicy(c *wkhttp.Context) {
 
 // currentPolicy resolves the effective policy, honoring the test-injected
 // stub when present. Kept as a method so the handler stays a single call site.
-func (m *Module) currentPolicy() common.DriveUploadPolicy {
+func (m *Module) currentPolicy() (common.DriveUploadPolicy, bool) {
 	if m.policy != nil {
 		return m.policy()
 	}
-	return common.EnsureSystemSettings(m.ctx).DriveUploadPolicy()
+	return common.EnsureSystemSettings(m.ctx).DriveUploadPolicyAvail()
 }

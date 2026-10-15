@@ -16,8 +16,10 @@ import (
 )
 
 // samplePolicy is the fixed policy the hermetic tests serve. Values chosen so
-// every field is distinguishable from a zero value and from the others.
-func samplePolicy() common.DriveUploadPolicy {
+// every field is distinguishable from a zero value and from the others. The
+// second result is the availability flag: a snapshot that loaded successfully
+// and produced this policy, so the handler answers 200.
+func samplePolicy() (common.DriveUploadPolicy, bool) {
 	return common.DriveUploadPolicy{
 		MaxSizeKB:             2097152,
 		MultipartThresholdKB:  131072,
@@ -25,7 +27,7 @@ func samplePolicy() common.DriveUploadPolicy {
 		MaxConcurrentParts:    3,
 		MaxConcurrentSessions: 3,
 		PolicyVersion:         "abcdef123456",
-	}
+	}, true
 }
 
 func newRouter(m *Module) *wkhttp.WKHttp {
@@ -49,7 +51,7 @@ func doGet(t *testing.T, r *wkhttp.WKHttp, token string) *httptest.ResponseRecor
 	return w
 }
 
-func newModule(policy func() common.DriveUploadPolicy) *Module {
+func newModule(policy func() (common.DriveUploadPolicy, bool)) *Module {
 	return &Module{
 		internalToken: testToken,
 		policy:        policy,
@@ -120,7 +122,7 @@ func TestGetUploadPolicy_BodyHasNoSecrets(t *testing.T) {
 // 一次请求只能加一。
 func TestGetUploadPolicy_ReadsPolicyOncePerRequest(t *testing.T) {
 	calls := 0
-	m := newModule(func() common.DriveUploadPolicy {
+	m := newModule(func() (common.DriveUploadPolicy, bool) {
 		calls++
 		return samplePolicy()
 	})
@@ -142,4 +144,51 @@ func TestGetUploadPolicy_UnauthorizedOmitsPolicy(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 	assert.NotContains(t, w.Body.String(), "policy_version")
 	assert.NotContains(t, w.Body.String(), "max_size_kb")
+}
+
+// 快照从未成功加载时返回 503，而不是把默认值当成合法策略下发（fail-closed，
+// 设计 C2）。响应不得携带 6 字段 —— 一个看似合法的 200 + fingerprint 会让 drive
+// 侧据此抬升上限。
+func TestGetUploadPolicy_UnavailableSnapshotFailsClosed(t *testing.T) {
+	unavailable := func() (common.DriveUploadPolicy, bool) {
+		// 值本身是代码默认 + 正常 fingerprint：若 handler 只看值不看 flag，
+		// 就会把它当合法策略 200 下发 —— 这正是本用例要拦住的行为。
+		return common.DriveUploadPolicy{
+			MaxSizeKB:             1048576,
+			MultipartThresholdKB:  131072,
+			PartSizeKB:            65536,
+			MaxConcurrentParts:    3,
+			MaxConcurrentSessions: 3,
+			PolicyVersion:         "84c1b192b780",
+		}, false
+	}
+	r := newRouter(newModule(unavailable))
+	w := doGet(t, r, testToken)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, "body=%s", w.Body.String())
+	body := w.Body.String()
+	assert.NotContains(t, body, "policy_version", "503 不得携带策略指纹")
+	assert.NotContains(t, body, "max_size_kb", "503 不得携带 6 字段策略体")
+	assert.NotContains(t, body, "84c1b192b780", "503 不得泄漏被拒绝的默认值指纹")
+}
+
+// 与上一条成对：快照已成功加载但为空 map（管理员什么都没配）是**合法**状态，
+// 必须 200 下发默认策略。区分「从未加载」与「加载成功但为空」是本次修复的核心。
+func TestGetUploadPolicy_LoadedButEmptySnapshotIsOK(t *testing.T) {
+	empty := func() (common.DriveUploadPolicy, bool) {
+		return common.DriveUploadPolicy{
+			MaxSizeKB:             1048576,
+			MultipartThresholdKB:  131072,
+			PartSizeKB:            65536,
+			MaxConcurrentParts:    3,
+			MaxConcurrentSessions: 3,
+			PolicyVersion:         "84c1b192b780",
+		}, true
+	}
+	r := newRouter(newModule(empty))
+	w := doGet(t, r, testToken)
+
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "policy_version")
+	assert.Contains(t, w.Body.String(), "max_size_kb")
 }
