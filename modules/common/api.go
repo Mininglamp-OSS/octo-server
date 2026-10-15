@@ -1065,16 +1065,18 @@ type driveUploadLimitsResp struct {
 }
 
 // buildDriveUploadLimitsResp 从 SystemSettings 派生一份 driveUploadLimitsResp。
-// 字段来自同一份 DriveUploadPolicy（单次快照读），值类型恒下发（不存在 provider
-// 缺失导致的整字段省略）。
+// 走 Web 专用 accessor DriveUploadLimits()（单次快照读、**不构造 policy_version
+// 指纹**），字段来自同一份快照；值类型恒下发（不存在 provider 缺失导致的整字段
+// 省略）。指纹是内部服务间通道的东西，在未鉴权的 appconfig 热路径上算它是纯开销
+// （reviewer yujiawei，PR #930 P2）。
 func buildDriveUploadLimitsResp(s *SystemSettings) driveUploadLimitsResp {
-	p := s.DriveUploadPolicy()
+	lim := s.DriveUploadLimits()
 	return driveUploadLimitsResp{
-		MaxSizeKB:             p.MaxSizeKB,
-		MultipartThresholdKB:  p.MultipartThresholdKB,
-		PartSizeKB:            p.PartSizeKB,
-		MaxConcurrentParts:    p.MaxConcurrentParts,
-		MaxConcurrentSessions: p.MaxConcurrentSessions,
+		MaxSizeKB:             lim.MaxSizeKB,
+		MultipartThresholdKB:  lim.MultipartThresholdKB,
+		PartSizeKB:            lim.PartSizeKB,
+		MaxConcurrentParts:    lim.MaxConcurrentParts,
+		MaxConcurrentSessions: lim.MaxConcurrentSessions,
 	}
 }
 

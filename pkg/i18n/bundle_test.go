@@ -88,6 +88,31 @@ func TestBundle_LoadsZhTOML(t *testing.T) {
 	}
 }
 
+// TestBundle_DrivePolicyUnavailableHasZhCN 回归 PR #930 review P1：新增的
+// err.server.drive_policy.unavailable（drive 上传策略不可用 → 503）已在
+// active.zh-CN.toml 补齐运行时翻译，zh-CN 客户端不再拿到 en-US 兜底文案。
+func TestBundle_DrivePolicyUnavailableHasZhCN(t *testing.T) {
+	resetBundle()
+	t.Cleanup(resetBundle)
+
+	b, err := Bundle()
+	if err != nil {
+		t.Fatalf("Bundle() err = %v", err)
+	}
+
+	loc := i18n.NewLocalizer(b, "zh-CN")
+	got, err := loc.Localize(&i18n.LocalizeConfig{
+		MessageID: "err.server.drive_policy.unavailable",
+	})
+	if err != nil {
+		t.Fatalf("Localize(zh-CN, err.server.drive_policy.unavailable) err = %v", err)
+	}
+	want := "Drive 上传策略尚未就绪，请稍后重试。"
+	if got != want {
+		t.Errorf("Localize(zh-CN, err.server.drive_policy.unavailable) = %q, want %q", got, want)
+	}
+}
+
 // TestBundle_TagsParse 防御性测试：所有 SDK 用到的 lang 标签必须是合法 BCP-47，
 // 否则 language.MustParse 会 panic。
 func TestBundle_TagsParse(t *testing.T) {

@@ -2,6 +2,7 @@ package drivepolicy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"os"
@@ -91,11 +92,20 @@ func (m *Module) ipRateLimit(r *wkhttp.WKHttp) wkhttp.HandlerFunc {
 	limiter := r.StrictIPRateLimitMiddleware(
 		context.Background(), rlRedis, drivePolicyRateLimitTag, rps, burst,
 	)
-	// Wrap so the rate_limited outcome lands on the served_total metric without
-	// moving the limiter out of its position at the head of the chain. The
-	// limiter calls c.Next() itself when it admits the request and aborts
-	// (without Next) when it rejects, so a non-admitted request returns here
-	// with the chain already aborted at 429.
+	return countRateLimited(limiter)
+}
+
+// countRateLimited wraps a rate-limit handler so the rate_limited outcome lands
+// on the served_total metric without moving the limiter out of its position at
+// the head of the chain. The limiter calls c.Next() itself when it admits the
+// request and aborts (without Next) when it rejects, so a non-admitted request
+// returns here with the chain already aborted at 429.
+//
+// Extracted from ipRateLimit so a hermetic test can drive the real rejection
+// branch (429 → metric) with an injected limiter — the real limiter needs Redis,
+// and the pass-through stubs used by the route-order tests never produce a 429,
+// which is exactly the coverage gap reviewer yujiawei flagged (PR #930 P2).
+func countRateLimited(limiter wkhttp.HandlerFunc) wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		limiter(c)
 		if c.IsAborted() && c.Writer.Status() == http.StatusTooManyRequests {
@@ -138,8 +148,7 @@ func (m *Module) Route(r *wkhttp.WKHttp) {
 func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		token := c.GetHeader(internalTokenHeader)
-		if m.internalToken == "" ||
-			subtle.ConstantTimeCompare([]byte(token), []byte(m.internalToken)) != 1 {
+		if m.internalToken == "" || !internalTokenMatches(token, m.internalToken) {
 			servedTotal.WithLabelValues(resultUnauthorized).Inc()
 			internalAuthFailTotal.Inc()
 			respondUnauthorized(c)
@@ -148,6 +157,24 @@ func (m *Module) internalAuthMiddleware() wkhttp.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// internalTokenMatches reports whether presented equals the configured secret.
+//
+// Both sides are folded through SHA-256 first so the constant-time comparison
+// always runs over two fixed 32-byte digests. Comparing the raw, variable-length
+// byte slices instead would let subtle.ConstantTimeCompare return on its very
+// first length check (it is only constant-time for equal-length inputs), so a
+// repeat-timing observer could recover the *configured* token's length before
+// any content comparison happened (reviewer yujiawei, PR #930 P2). Hashing also
+// keeps the comparison cost independent of how much of the secret matches.
+//
+// The early "unset token" refusal lives in the caller: an unset secret is a
+// configuration state, not a secret whose length must be protected.
+func internalTokenMatches(presented, configured string) bool {
+	got := sha256.Sum256([]byte(presented))
+	want := sha256.Sum256([]byte(configured))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 // getUploadPolicy serves the currently-effective policy as the 6-field wire

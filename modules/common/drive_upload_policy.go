@@ -72,18 +72,46 @@ func positiveIntFromEnv(getenv func(string) string, key string, fallback int) in
 // —— 它们都是静态 env，不是 DB 键，所以不存在跨快照撕裂。生产路径传 os.Getenv，
 // 与 DriveUploadMaxSizeKB() 用的是同一套解析。
 func driveUploadPolicyFrom(maxSizeKB int, getenv func(string) string) DriveUploadPolicy {
+	lim := driveUploadLimitsFrom(maxSizeKB, getenv)
 	hardCap := driveUploadMaxSizeKBHardCapFrom(getenv)
-	threshold := positiveIntFromEnv(getenv, envDriveUploadMultipartThresholdKB, defaultDriveUploadMultipartThresholdKB)
-	partSize := positiveIntFromEnv(getenv, envDriveUploadPartSizeKB, defaultDriveUploadPartSizeKB)
-	parts := positiveIntFromEnv(getenv, envDriveUploadMaxConcurrentParts, defaultDriveUploadMaxConcurrentParts)
-	sessions := positiveIntFromEnv(getenv, envDriveUploadMaxConcurrentSessions, defaultDriveUploadMaxConcurrentSessions)
 	return DriveUploadPolicy{
+		MaxSizeKB:             lim.MaxSizeKB,
+		MultipartThresholdKB:  lim.MultipartThresholdKB,
+		PartSizeKB:            lim.PartSizeKB,
+		MaxConcurrentParts:    lim.MaxConcurrentParts,
+		MaxConcurrentSessions: lim.MaxConcurrentSessions,
+		PolicyVersion: driveUploadPolicyVersion(
+			lim.MaxSizeKB, lim.MultipartThresholdKB, lim.PartSizeKB,
+			lim.MaxConcurrentParts, lim.MaxConcurrentSessions, hardCap,
+		),
+	}
+}
+
+// DriveUploadLimits 是生效策略的 **Web 下发视图**：appconfig 下发的 5 个字段，
+// 不含 policy_version 指纹。
+//
+// 单独一个类型（而不是复用 DriveUploadPolicy 再丢掉版本）是为了让「Web 只需要
+// 5 个值」在类型上成立：构造它不触发内容哈希，也不会在**未鉴权**的 appconfig
+// 热路径上做无谓的 sha256 + 字符串格式化（reviewer yujiawei，PR #930 P2）。指纹
+// 只对内部服务间通道有价值（drive 侧按版本日志 / 观测）。
+type DriveUploadLimits struct {
+	MaxSizeKB             int `json:"max_size_kb"`
+	MultipartThresholdKB  int `json:"multipart_threshold_kb"`
+	PartSizeKB            int `json:"part_size_kb"`
+	MaxConcurrentParts    int `json:"max_concurrent_parts"`
+	MaxConcurrentSessions int `json:"max_concurrent_sessions"`
+}
+
+// driveUploadLimitsFrom 是构造 Web 视图的纯函数：分片参数从注入的 getenv 派生，
+// **不计算指纹**。与 driveUploadPolicyFrom 共享同一套 env 解析与默认值，因此两条
+// 通道的 5 个字段逐字节一致。
+func driveUploadLimitsFrom(maxSizeKB int, getenv func(string) string) DriveUploadLimits {
+	return DriveUploadLimits{
 		MaxSizeKB:             maxSizeKB,
-		MultipartThresholdKB:  threshold,
-		PartSizeKB:            partSize,
-		MaxConcurrentParts:    parts,
-		MaxConcurrentSessions: sessions,
-		PolicyVersion:         driveUploadPolicyVersion(maxSizeKB, threshold, partSize, parts, sessions, hardCap),
+		MultipartThresholdKB:  positiveIntFromEnv(getenv, envDriveUploadMultipartThresholdKB, defaultDriveUploadMultipartThresholdKB),
+		PartSizeKB:            positiveIntFromEnv(getenv, envDriveUploadPartSizeKB, defaultDriveUploadPartSizeKB),
+		MaxConcurrentParts:    positiveIntFromEnv(getenv, envDriveUploadMaxConcurrentParts, defaultDriveUploadMaxConcurrentParts),
+		MaxConcurrentSessions: positiveIntFromEnv(getenv, envDriveUploadMaxConcurrentSessions, defaultDriveUploadMaxConcurrentSessions),
 	}
 }
 
@@ -129,4 +157,17 @@ func (s *SystemSettings) driveUploadPolicyAvail() (DriveUploadPolicy, bool) {
 	hardCap := driveUploadMaxSizeKBHardCapFrom(getenv)
 	maxSizeKB, loaded := s.driveUploadMaxSizeKBFromSnapshot(hardCap)
 	return driveUploadPolicyFrom(maxSizeKB, getenv), loaded
+}
+
+// DriveUploadLimits 返回 Web 下发通道需要的 5 个字段（单次快照读），**不计算
+// policy_version** —— appconfig 不按版本缓存（06 4E / 01 §9-Q6），在未鉴权热路径
+// 上做内容哈希没有客户端价值（reviewer yujiawei，PR #930 P2）。
+//
+// 值类型恒下发（06 冻结决策 1）：快照从未加载时同样回落到默认值 + 天花板钳位；
+// 「不可用」只在内部服务间通道上有意义，由 DriveUploadPolicyAvail 承担。
+func (s *SystemSettings) DriveUploadLimits() DriveUploadLimits {
+	getenv := os.Getenv
+	hardCap := driveUploadMaxSizeKBHardCapFrom(getenv)
+	maxSizeKB, _ := s.driveUploadMaxSizeKBFromSnapshot(hardCap)
+	return driveUploadLimitsFrom(maxSizeKB, getenv)
 }

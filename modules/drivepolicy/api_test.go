@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -191,4 +192,117 @@ func TestGetUploadPolicy_LoadedButEmptySnapshotIsOK(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), "policy_version")
 	assert.Contains(t, w.Body.String(), "max_size_kb")
+}
+
+// ---------------------------------------------------------------------------
+// PR #930 review fix（reviewer yujiawei）
+// ---------------------------------------------------------------------------
+
+// 401 鉴权：现对「定长 digest 比较」做定值回归。相等 → 放行；不等 / 长度不同 /
+// 只是前缀 → 一律拒绝。长度不同以前会在 ConstantTimeCompare 的首个长度判断处
+// 短路；hash 之后两条输入都折成 32 字节，比较不再以长度先行分叉。
+func TestInternalTokenMatches_FixedLengthDigestSemantics(t *testing.T) {
+	secret := testToken
+	assert.True(t, internalTokenMatches(secret, secret), "相等 token 必须匹配")
+	assert.False(t, internalTokenMatches("wrong-token-wrong-token-wrong-tok", secret))
+	assert.False(t, internalTokenMatches(secret[:len(secret)-1], secret), "前缀必须拒绝")
+	assert.False(t, internalTokenMatches(secret+"-extra-bytes", secret), "更长输入必须拒绝")
+	assert.False(t, internalTokenMatches("", secret), "空输入必须拒绝")
+	// 换一个字符也不行（防 digest 比较被退化成前缀比较）。
+	flipped := []byte(secret)
+	flipped[0] ^= 0x01
+	assert.False(t, internalTokenMatches(string(flipped), secret))
+}
+
+// servedTotalValue 读默认 Registry 上 octo_drive_upload_policy_served_total 的某个
+// result 分支当前值。计数器是全局的，所以测试断言增量而非绝对值。
+func servedTotalValue(t *testing.T, result string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, mf := range families {
+		if mf.GetName() != "octo_drive_upload_policy_served_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "result" && lp.GetValue() == result {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// 生产 429 路径的覆盖（reviewer yujiawei P2）：route-order 测试用的是 pass-through
+// stub，从不触发真实拒绝，所以 rate_limited 指标与 429 响应此前无断言。这里把
+// countRateLimited 和真实拒绝形态的 limiter（abort 429、不调 Next）拼起来，钉住：
+// 响应 429、handler 不执行、rate_limited 计数 +1。
+func TestCountRateLimited_RejectedRequestSets429AndCountsMetric(t *testing.T) {
+	m := newModule(samplePolicy)
+	handlerRan := false
+
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+
+	// 复刻 StrictIPRateLimitMiddleware 的拒绝形态：abort 429，且**不**调 c.Next()。
+	reject := func(c *wkhttp.Context) { c.AbortWithStatus(http.StatusTooManyRequests) }
+	internal := r.Group("/v1/internal")
+	internal.GET(
+		"/drive/upload-policy",
+		countRateLimited(reject),
+		m.internalAuthMiddleware(),
+		func(c *wkhttp.Context) {
+			handlerRan = true
+			m.getUploadPolicy(c)
+		},
+	)
+
+	before := servedTotalValue(t, resultRateLimited)
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/drive/upload-policy", nil)
+	req.Header.Set(internalTokenHeader, testToken) // 即便带着正确 token，也被限流拦下
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusTooManyRequests, w.Code, "body=%s", w.Body.String())
+	assert.False(t, handlerRan, "被限流的请求不得进入 handler")
+	assert.Equal(t, before+1, servedTotalValue(t, resultRateLimited),
+		"429 拒绝必须在 served_total{result=rate_limited} 上 +1")
+}
+
+// 与上一条成对：放行的请求不得污染 rate_limited 计数（否则告警语义会反过来）。
+func TestCountRateLimited_AdmittedRequestDoesNotCount(t *testing.T) {
+	m := newModule(samplePolicy)
+
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+
+	admit := func(c *wkhttp.Context) { c.Next() }
+	internal := r.Group("/v1/internal")
+	internal.GET("/drive/upload-policy", countRateLimited(admit), m.internalAuthMiddleware(), m.getUploadPolicy)
+
+	before := servedTotalValue(t, resultRateLimited)
+	w := doGet(t, r, testToken)
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Equal(t, before, servedTotalValue(t, resultRateLimited),
+		"放行请求不得递增 rate_limited")
+}
+
+// 401 路径（鉴权 abort）不是限流拒绝，不得计入 rate_limited。
+func TestCountRateLimited_UnauthorizedAbortIsNotRateLimited(t *testing.T) {
+	m := newModule(samplePolicy)
+
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+
+	admit := func(c *wkhttp.Context) { c.Next() }
+	internal := r.Group("/v1/internal")
+	internal.GET("/drive/upload-policy", countRateLimited(admit), m.internalAuthMiddleware(), m.getUploadPolicy)
+
+	before := servedTotalValue(t, resultRateLimited)
+	w := doGet(t, r, "wrong-token-wrong-token-wrong-tok")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, before, servedTotalValue(t, resultRateLimited),
+		"401 鉴权失败不得被记成 rate_limited")
 }

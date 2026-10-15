@@ -1,6 +1,8 @@
 package common
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	// 注册 mysql driver，供下面「reload 必然失败」的用例构造连不上的 dbr 会话。
@@ -116,6 +118,93 @@ func TestDriveUploadPolicy_VersionTracksSnapshot(t *testing.T) {
 	v1 := driveSnapSettings(nil).DriveUploadPolicy().PolicyVersion
 	v2 := driveSnapSettings(map[string]string{"drive.upload_max_size_kb": "2097152"}).DriveUploadPolicy().PolicyVersion
 	assert.NotEqual(t, v1, v2)
+}
+
+// ---------------------------------------------------------------------------
+// Web 视图（PR #930 review fix / reviewer yujiawei P2）：appconfig 只下发 5 个
+// 字段，不按版本缓存，因此不得在未鉴权热路径上构造 policy_version 指纹。
+// ---------------------------------------------------------------------------
+
+// Web 视图与内部策略的 5 个字段必须逐字节一致（同一个 accessor 家族、同一套 env
+// 解析与快照钳位）；唯有指纹是内部通道独有的。
+func TestDriveUploadLimits_MatchesPolicyFiveFields(t *testing.T) {
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "")
+	t.Setenv(envDriveUploadMultipartThresholdKB, "262144")
+	s := driveSnapSettings(map[string]string{"drive.upload_max_size_kb": "2097152"})
+
+	lim := s.DriveUploadLimits()
+	p := s.DriveUploadPolicy()
+	assert.Equal(t, p.MaxSizeKB, lim.MaxSizeKB)
+	assert.Equal(t, p.MultipartThresholdKB, lim.MultipartThresholdKB)
+	assert.Equal(t, p.PartSizeKB, lim.PartSizeKB)
+	assert.Equal(t, p.MaxConcurrentParts, lim.MaxConcurrentParts)
+	assert.Equal(t, p.MaxConcurrentSessions, lim.MaxConcurrentSessions)
+	// 明确确认 env 覆盖进入 Web 视图，而不是「两边都退化成默认值所以相等」。
+	assert.Equal(t, 262144, lim.MultipartThresholdKB)
+	assert.Equal(t, 2097152, lim.MaxSizeKB)
+}
+
+// Web 视图在快照未加载时也必须恒有值（值类型恒下发），回落 min(默认, 天花板)。
+func TestDriveUploadLimits_UnavailableSnapshotStillServesDefaults(t *testing.T) {
+	t.Setenv(envDriveUploadMaxSizeKBHardCap, "524288") // 天花板 < 代码默认，验证钳位
+	lim := driveSnapSettingsUninitialized().DriveUploadLimits()
+	assert.Equal(t, 524288, lim.MaxSizeKB)
+	assert.Equal(t, 131072, lim.MultipartThresholdKB)
+}
+
+// 源级护栏：buildDriveUploadLimitsResp 必须走无指纹 accessor，不得回退到
+// DriveUploadPolicy()（那会把 sha256 + 格式化带回未鉴权热路径）。
+func TestBuildDriveUploadLimitsResp_SkipsPolicyVersionDerivation(t *testing.T) {
+	src, err := os.ReadFile("api.go")
+	require.NoError(t, err)
+	body := extractFuncBody(t, string(src), "func buildDriveUploadLimitsResp(s *SystemSettings) driveUploadLimitsResp {")
+	require.Contains(t, body, "s.DriveUploadLimits()",
+		"Web 视图必须走 DriveUploadLimits()（无指纹）")
+	require.NotContains(t, body, "DriveUploadPolicy",
+		"Web 响应只含 5 字段，builder 不得构造 policy_version 指纹")
+	require.NotContains(t, body, "PolicyVersion")
+}
+
+// extractFuncBody 从源码里截出某个函数（给定 `func ... {` 起始串）的花括号主体，
+// 供源级护栏断言只作用于该函数，不被文件里其它调用点污染。
+func extractFuncBody(t *testing.T, src, needle string) string {
+	t.Helper()
+	start := strings.Index(src, needle)
+	require.GreaterOrEqual(t, start, 0, "api.go 已不含锚点 %q，请同步更新该测试", needle)
+	i := start + len(needle)
+	depth := 1
+	for ; i < len(src) && depth > 0; i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[start:i]
+			}
+		}
+	}
+	t.Fatalf("api.go 中 %q 的括号不配对", needle)
+	return ""
+}
+
+// 基准：Web 视图省掉的正是内容哈希那条链（sha256 + fmt.Sprintf + hex）。用
+// -benchmem 对比两者的每操作分配与耗时，作为「未鉴权热路径不再做无谓哈希」的
+// 量化证据（reviewer yujiawei 要求附基准证据）。
+func BenchmarkDriveUploadLimits_WebView(b *testing.B) {
+	s := driveSnapSettings(nil)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = s.DriveUploadLimits()
+	}
+}
+
+func BenchmarkDriveUploadPolicy_WithFingerprint(b *testing.B) {
+	s := driveSnapSettings(nil)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = s.DriveUploadPolicy()
+	}
 }
 
 // 单次快照读的结构性证据：把同一份快照换成另一份，DriveUploadPolicy 的两个
