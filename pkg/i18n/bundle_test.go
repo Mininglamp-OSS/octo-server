@@ -88,6 +88,38 @@ func TestBundle_LoadsZhTOML(t *testing.T) {
 	}
 }
 
+// TestBundle_DrivePolicyUnavailableZhCNMarkerResolves 回归 PR #930 review：新增的
+// err.server.drive_policy.unavailable（drive 上传策略不可用 → 503）在
+// active.zh-CN.toml 中登记了 zh-CN marker，localizer 能解析出对应文案。
+//
+// 这是 **marker / 翻译表契约**，不是运行时 HTTP 契约：该码是 5xx，按仓库
+// 「5xx ⇒ Internal=true」约定（见 pkg/errcode/drive_policy.go 与
+// ErrOIDCBindServiceUnavailable 的同款注释），HTTP 路径渲染的是
+// err.shared.internal 占位文案，本码专属的 zh-CN 文案在 wire 上不可达——保留它
+// 只为登记翻译意图。HTTP 侧的真实口径由 drivepolicy 的
+// TestGetUploadPolicy_UnavailableSnapshotRendersSharedInternalCopy 钉住。
+func TestBundle_DrivePolicyUnavailableZhCNMarkerResolves(t *testing.T) {
+	resetBundle()
+	t.Cleanup(resetBundle)
+
+	b, err := Bundle()
+	if err != nil {
+		t.Fatalf("Bundle() err = %v", err)
+	}
+
+	loc := i18n.NewLocalizer(b, "zh-CN")
+	got, err := loc.Localize(&i18n.LocalizeConfig{
+		MessageID: "err.server.drive_policy.unavailable",
+	})
+	if err != nil {
+		t.Fatalf("Localize(zh-CN, err.server.drive_policy.unavailable) err = %v", err)
+	}
+	want := "Drive 上传策略尚未就绪，请稍后重试。"
+	if got != want {
+		t.Errorf("Localize(zh-CN, err.server.drive_policy.unavailable) = %q, want %q", got, want)
+	}
+}
+
 // TestBundle_TagsParse 防御性测试：所有 SDK 用到的 lang 标签必须是合法 BCP-47，
 // 否则 language.MustParse 会 panic。
 func TestBundle_TagsParse(t *testing.T) {
