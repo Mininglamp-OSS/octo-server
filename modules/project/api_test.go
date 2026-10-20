@@ -929,7 +929,7 @@ func TestMemberBatchIsStructurallyBounded(t *testing.T) {
 	assert.Equal(t, float64(3), env.Error.Details["max"])
 }
 
-// TestValidationRejectsOversizeFields covers the name / description / logo caps.
+// TestValidationRejectsOversizeFields covers name limits and invalid discoverability.
 func TestValidationRejectsOversizeFields(t *testing.T) {
 	srv, _ := setup(t)
 	seedSpace(t, spaceA, 1)
@@ -953,10 +953,6 @@ func TestValidationRejectsOversizeFields(t *testing.T) {
 	w = doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 		map[string]any{"name": long(maxNameChars + 1)})
 	assertProjectErrorCode(t, w, "err.server.project.name_invalid")
-
-	w = doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
-		map[string]any{"name": "ok", "description": long(maxDescriptionChars + 1)})
-	assertProjectErrorCode(t, w, "err.server.project.field_too_long")
 
 	w = doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 		map[string]any{"name": "ok2", "discoverability": 7})

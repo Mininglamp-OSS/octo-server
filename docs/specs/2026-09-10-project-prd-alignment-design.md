@@ -152,6 +152,13 @@ Project 创建、列表、详情及 Sidebar 的 Project 条目不再返回 `all_
 - 单查沿用 `readProjectAccessTx`，在同一 `REPEATABLE READ` 只读事务中校验调用者的有效账号、Project 所属 Space 当前组织成员资格及当前 Project 成员资格，再用 `project_id + target uid` 的有界 point query 读取目标；不得读取分页列表后在内存筛选。目标有效性与成员列表一致，仅要求 Project 正常且目标席位 `status=active`、`removing=0`；不额外把目标 `user`/Space 席位状态当作此关系事实的过滤条件。目标未知、已移除或 `removing=1` 均返回既有 not-found 语义；数据库错误必须返回 query_failed，不能降级成 not-found。该响应只表示目标的 Project 成员事实，不是目标账号或 Drive 资源授权决定，Drive 必须继续自行校验目标资格和 ACL。
 - Drive 关系判权需要用户态成员事实时，保留同一用户原始 session `token`（首选 `token` header，兼容 `Authorization: Bearer <session>`）调用 `GET /v1/projects/{project_id}/members/{uid}`；`project_id` 和目标 `uid` 是路径 selector，不要求 `X-Space-ID`，不接受 `X-Internal-Token`、客户端自报 UID 或角色。Drive 仍负责自己的映射、ACL 和撤权窗口，Project `role` 不替代 Drive 权限；没有用户 session 的后台任务不能借此用户路由。
 
+### Project description capacity（2026-10-20）
+
+- Project 创建与编辑接受最多 **32,768 UTF-8 字节**的 `description`，与 Fleet Project 生命周期事件的描述上限一致；不是 32,768 个 Unicode 字符。名称仍最多 30 个 Unicode 字符，图标仍最多 200 个 Unicode 字符。
+- `octo_project.description` 通过迁移 `20261020000001_project_description_text.sql` 扩容为 `TEXT NOT NULL DEFAULT ('')`，保留已有描述和空字符串默认值；Down 保留扩容后的字段，避免回滚时丢失长描述。
+- 超限继续返回 `err.server.project.field_too_long`，details 为 `field=description`、`max_bytes=32768`；按字符计数的字段继续使用 `max_chars`。读接口原样返回描述，不截断。
+- 先完成数据库扩容再接收长描述。独立 `octo-project-sync` 工具的描述过滤也必须改用同一字节上限后，才能执行包含长描述的 Workspace 数据迁移；本服务端 PR 不执行该数据迁移。
+
 ### Project→Drive provisioning boundary（2026-09-11）
 
 - 经授权的 provisioning 以 `project_id` 作为唯一管理与幂等依据；Project 创建/响应不要求返回 Drive ID。

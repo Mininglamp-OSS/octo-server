@@ -163,11 +163,11 @@ const (
 	defaultLifecycleEventTimeout = 10 * time.Second
 )
 
-// Field length caps follow the Project contract. Name is measured in Unicode
-// code points (the HTTP layer uses utf8.RuneCountInString), not bytes.
+// Name and logo limits count Unicode code points. The description limit counts
+// UTF-8 bytes to match Fleet's Project lifecycle event contract.
 const (
 	maxNameChars        = 30
-	maxDescriptionChars = 500
+	maxDescriptionBytes = 32 * 1024
 	maxLogoChars        = 200
 )
 

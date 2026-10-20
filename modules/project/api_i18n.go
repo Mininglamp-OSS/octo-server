@@ -80,6 +80,13 @@ func respondProjectFieldTooLong(c *wkhttp.Context, field string, maxChars int) {
 	})
 }
 
+func respondProjectDescriptionTooLong(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrProjectFieldTooLong, nil, i18n.Details{
+		"field":     "description",
+		"max_bytes": maxDescriptionBytes,
+	})
+}
+
 // respondProjectBatchTooLarge surfaces the per-request member batch cap.
 func respondProjectBatchTooLarge(c *wkhttp.Context, max int) {
 	httperr.ResponseErrorL(c, errcode.ErrProjectBatchTooLarge, nil, i18n.Details{
