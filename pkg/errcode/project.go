@@ -44,7 +44,7 @@ var (
 		ID:             "err.server.project.field_too_long",
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "The field exceeds the maximum allowed length.",
-		SafeDetailKeys: []string{"field", "max_chars"},
+		SafeDetailKeys: []string{"field", "max_chars", "max_bytes"},
 	})
 	// ErrProjectBatchTooLarge bounds the per-request member batch. A structural
 	// cap on top of any byte cap, so a well-formed but pathological payload

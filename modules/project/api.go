@@ -314,8 +314,8 @@ func (p *Project) createProjectHandler(c *wkhttp.Context) {
 		respondProjectNameInvalid(c)
 		return
 	}
-	if utf8.RuneCountInString(req.Description) > maxDescriptionChars {
-		respondProjectFieldTooLong(c, "description", maxDescriptionChars)
+	if len(req.Description) > maxDescriptionBytes {
+		respondProjectDescriptionTooLong(c)
 		return
 	}
 	if utf8.RuneCountInString(req.Logo) > maxLogoChars {
@@ -500,8 +500,8 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		}
 		req.Name = &name
 	}
-	if req.Description != nil && utf8.RuneCountInString(*req.Description) > maxDescriptionChars {
-		respondProjectFieldTooLong(c, "description", maxDescriptionChars)
+	if req.Description != nil && len(*req.Description) > maxDescriptionBytes {
+		respondProjectDescriptionTooLong(c)
 		return
 	}
 	if req.Logo != nil && utf8.RuneCountInString(*req.Logo) > maxLogoChars {

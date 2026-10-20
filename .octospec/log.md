@@ -4,6 +4,15 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-10-20 — project-description-capacity
+
+- Widened `octo_project.description` to `TEXT` and aligned create/update validation
+  with Fleet's 32 KiB UTF-8 byte limit. Length errors expose `max_bytes`; name and
+  logo limits remain character-based.
+- Added HTTP round-trip/boundary coverage and migration data-preservation coverage.
+  The Down migration retains the widened column to preserve long descriptions.
+- Spec: [project-description-capacity](tasks/project-description-capacity/brief.md).
+
 ## 2026-09-29 — webhook-grpc-hardening
 
 - Webhook gRPC callback listener: new `TS_GRPC_AUTH_REQUIRED` (default
