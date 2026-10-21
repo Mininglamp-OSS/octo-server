@@ -22,11 +22,12 @@ type UserProject struct {
 }
 
 // userProjectSeat keeps the actual seat identity out of the response DTO.
-// Legacy and Project collations can disagree on UID equality, so the matched
-// seat must also bind to the qualified target through FoldID.
+// Legacy and Project collations can disagree on UID and Space equality, so both
+// the seat and Project must bind to the qualified identities through FoldID.
 type userProjectSeat struct {
 	UserProject
-	SeatUID string `db:"seat_uid"`
+	SeatUID     string `db:"seat_uid"`
+	SeatSpaceID string `db:"seat_space_id"`
 }
 
 // UserProjectsInSpace returns every activated Project of spaceID that uid has
@@ -39,8 +40,8 @@ type userProjectSeat struct {
 // status = 1, removing = 0 and carries the Project's own space_id. All reads share
 // one read-only REPEATABLE READ transaction.
 //
-// The private seat UID is matched with ASCII-only FoldID before projection;
-// SQL collation equality alone does not establish the qualified account's identity.
+// The private seat UID and both Project/seat Space IDs are matched with ASCII-only
+// FoldID before projection; SQL collation equality alone does not establish identity.
 //
 // Legacy tables are reached only through pkg/user and pkg/space in separate
 // legacy-only statements; joining them to octo_* mixes utf8mb4_0900_ai_ci with
@@ -67,7 +68,15 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 		return out, nil
 	}
 
-	seats, err := space.ActiveMembers(tx, spaceID, []string{uid})
+	qualifiedSpaceID, found, err := space.ResolveSpaceID(tx, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return out, nil
+	}
+
+	seats, err := space.ActiveMembers(tx, qualifiedSpaceID, []string{uid})
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +86,7 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 
 	var seatRows []userProjectSeat
 	if _, err := tx.SelectBySql(
-		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, pm.role, pm.uid AS seat_uid "+
+		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, pm.role, pm.uid AS seat_uid, pm.space_id AS seat_space_id "+
 			"FROM `octo_project_member` pm "+
 			"INNER JOIN `octo_project` p "+
 			"ON p.project_id = pm.project_id AND p.space_id = pm.space_id "+
@@ -85,16 +94,18 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 			"  AND pm.status = 1 AND pm.removing = 0 "+
 			"  AND p.status = 1 AND p.activated_at IS NOT NULL "+
 			"ORDER BY p.id DESC",
-		spaceID, uid,
+		qualifiedSpaceID, uid,
 	).Load(&seatRows); err != nil {
 		return nil, err
 	}
 
-	// Bind actual seat identity without merging non-ASCII legacy accounts.
+	// Bind actual identities without merging distinct legacy accounts or Spaces.
 	uidFold := FoldID(uid)
+	spaceFold := FoldID(qualifiedSpaceID)
 	out = make([]UserProject, 0, len(seatRows))
 	for _, seat := range seatRows {
-		if FoldID(seat.SeatUID) != uidFold {
+		if FoldID(seat.SeatUID) != uidFold ||
+			FoldID(seat.SpaceID) != spaceFold || FoldID(seat.SeatSpaceID) != spaceFold {
 			continue
 		}
 		out = append(out, seat.UserProject)

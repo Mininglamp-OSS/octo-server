@@ -23,7 +23,7 @@ source: self
 
 - 复用 internal membership token、启用门槛、strict IP 限流和真实 HTTP 状态错误 envelope。
 - 有效账号、Space、Space 席位、Project、Project 激活标记和 Project 席位共同决定可见性；所有查询在同一 RR 只读事务内完成。
-- Project 与成员的 Space 一致；不以 Space 管理员身份绕过 Project 成员边界。
+- Project 与成员的实际 Space 均绑定到同一快照解析、校验后的 legacy Space；不以 SQL 宽松判等或 Space 管理员身份绕过成员与 Space 边界。
 - 不分页、不截断，直接数组，角色编码沿用 `0/1/2`；数据库失败与真实空结果分开。
 
 ## Out of scope

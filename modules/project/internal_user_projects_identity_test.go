@@ -95,3 +95,60 @@ func TestUserProjectsInSpaceRejectsDistinctLegacySeatIdentity(t *testing.T) {
 	require.Equal(t, own, query(t, "s"),
 		"activating ß must not leak its seat to s, nor s's Project to ß")
 }
+
+func TestUserProjectsInSpaceBindsQualifiedSpaceIdentity(t *testing.T) {
+	sess := iupProbeSession(t)
+	exec := func(statement string) {
+		t.Helper()
+		_, err := sess.Exec(statement)
+		require.NoError(t, err)
+	}
+	for _, statement := range []string{
+		"INSERT INTO `user` (uid,name,short_no,status) VALUES ('reader','Reader','space-reader',1)",
+		"INSERT INTO space (space_id,name,creator,status) VALUES ('s','Active Space','reader',1),('ß','Banned Space','reader',2)",
+		"INSERT INTO space_member (space_id,uid,role,status) VALUES ('s','reader',0,1),('ß','reader',0,1)",
+		"INSERT INTO octo_project (project_id,space_id,name,description,creator,status,activated_at,created_at,updated_at) VALUES ('private-project','ß','Banned Space project','Private banned Space description','reader',1,NOW(3),NOW(3),NOW(3))",
+		"INSERT INTO octo_project_member (project_id,space_id,uid,role,status,removing,created_at,updated_at) VALUES ('private-project','ß','reader',2,1,0,NOW(3),NOW(3))",
+	} {
+		exec(statement)
+	}
+	query := func(spaceID string) []projectpkg.UserProject {
+		t.Helper()
+		rows, err := projectpkg.UserProjectsInSpace(context.Background(), sess, spaceID, "reader")
+		require.NoError(t, err)
+		require.NotNil(t, rows)
+		return rows
+	}
+
+	require.Empty(t, query("s"), "an active Space must not expose the distinct banned Space's Project")
+	require.Empty(t, query("ß"), "the actual banned Space must remain unavailable")
+
+	exec("INSERT INTO octo_project (project_id,space_id,name,description,creator,status,activated_at,created_at,updated_at) VALUES ('own-project','S','Own project','Own description','reader',1,NOW(3),NOW(3),NOW(3))")
+	exec("INSERT INTO octo_project_member (project_id,space_id,uid,role,status,removing,created_at,updated_at) VALUES ('own-project','s','READER',0,1,0,NOW(3),NOW(3))")
+	own := []projectpkg.UserProject{{
+		ProjectID:   "own-project",
+		SpaceID:     "S",
+		Name:        "Own project",
+		Description: "Own description",
+		Role:        0,
+	}}
+	require.Equal(t, own, query("s"))
+	require.Equal(t, own, query("S"), "ASCII recasing must preserve the Project's stored Space spelling")
+	require.Equal(t, own, query("ś"), "bind against the resolved legacy Space, not the selector's raw spelling")
+
+	// Each side of the Project/member join must independently name the qualified
+	// Space, even when general_ci considers the two different Space IDs equal.
+	exec("INSERT INTO octo_project (project_id,space_id,name,creator,status,activated_at,created_at,updated_at) VALUES ('wrong-project-space','ß','Wrong Project Space','reader',1,NOW(3),NOW(3),NOW(3)),('wrong-seat-space','s','Wrong seat Space','reader',1,NOW(3),NOW(3),NOW(3))")
+	exec("INSERT INTO octo_project_member (project_id,space_id,uid,role,status,removing,created_at,updated_at) VALUES ('wrong-project-space','s','reader',1,1,0,NOW(3),NOW(3)),('wrong-seat-space','ß','reader',2,1,0,NOW(3),NOW(3))")
+	require.Equal(t, own, query("s"), "neither a foreign Project nor a foreign seat may pass the Space binding")
+
+	exec("UPDATE space SET status = 1 WHERE space_id = 'ß'")
+	require.Equal(t, []projectpkg.UserProject{{
+		ProjectID:   "private-project",
+		SpaceID:     "ß",
+		Name:        "Banned Space project",
+		Description: "Private banned Space description",
+		Role:        2,
+	}}, query("ß"), "restoring the Space must expose only its own valid Project/seat pair")
+	require.Equal(t, own, query("s"), "restoring another Space must not change this Space's list")
+}

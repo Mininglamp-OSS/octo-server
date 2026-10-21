@@ -98,7 +98,7 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 - `modules/internal_membership` 负责路由、现有鉴权/限流复用、参数、错误 facade 和最小响应投影；在既有 store 接缝增加对应列表能力。
 - 数据查询放在 `pkg/project` 的只读事实层；该包不得导入 `modules/project`，不借用用户态 handler 或其带默认分页的服务来获取“全部”结果。
 - 账号、Space 和 Space 席位资格使用相同事务连接，遵循现有独立查询方式，避免跨 legacy 表和 `octo_*` 表直接 JOIN 导致混合 collation 故障。Project 与 Project 成员通过 Project ID 及 Space ID 关联，并以指定 Space 和目标 UID 过滤。
-- 返回数据库存储的 ID，不改写其大小写；跨读取结果匹配 ID 时沿用已有 ASCII-only `FoldID` 语义。查询使用私有投影保留实际 `pm.uid`，仅将其 `FoldID` 与已合格目标 UID 一致的席位投影到六字段响应；SQL 的 collation 判等不能替代此身份绑定。这样保留 ASCII 大小写兼容，同时不将 legacy `0900_ai_ci` 下不同的账号按 Project `general_ci` 的宽松匹配合并。查询不依赖个人偏好记录，不做逐项目查询。
+- 返回数据库存储的 ID，不改写其大小写；跨读取结果匹配 ID 时沿用已有 ASCII-only `FoldID` 语义。同一事务中先通过 `pkg/space.ResolveSpaceID` 按 legacy 表的 collation 解析实际 Space ID，再用该 ID 校验 Space/席位资格并限定 Project 查询；不能以原始 selector 的字面值代替已解析身份。查询使用私有投影保留实际 `pm.uid` 和 `pm.space_id`，仅将席位 UID 与已合格目标 UID、Project 和席位双方的 Space ID 与已合格实际 Space ID 分别 `FoldID` 一致的行投影到六字段响应；SQL 的 collation 判等不能替代此身份绑定。这样保留 ASCII 大小写兼容，同时不将 legacy `0900_ai_ci` 下不同的账号或 Space 按 Project `general_ci` 的宽松匹配合并。查询不依赖个人偏好记录，不做逐项目查询。
 - 沿用请求 context 开启 `Isolation: sql.LevelRepeatableRead, ReadOnly: true` 的事务，并设置已有 membership 单语句读取期限（当前为 5 秒）。所有读取使用能应用 `tx.Timeout` 的 `Load` / `LoadOne` 调用形态，不使用忽略该期限的 `Rows` / `Iterate` 路径。超过读取期限时整个请求返回 `500`，不截断结果、不增加重试；任何查询或事务错误都不返回已收集的部分结果。
 
 响应只表示该事务快照时的有效成员关系及基础资料，不承诺在 HTTP 响应后持续有效。列表不返回 epoch；调用方不得把它作为长期授权快照，具体资源访问仍由资源侧校验，后续成员判定继续使用既有验证契约。
@@ -120,7 +120,7 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 ## 验收标准
 
 1. 同一 Space 下，目标用户分别以成员、管理员和 Owner 加入且已完成激活的项目均出现且角色正确；仅由目标创建的历史关系或 Space 管理员身份不扩大结果。
-2. 同一用户加入另一 Space 的项目不会出现在当前 Space 的结果；Project 成员行与 Project 的 Space 不一致时也不出现。
+2. 同一用户加入另一 Space 的项目不会出现在当前 Space 的结果；Project 成员行与 Project 的 Space 不一致时也不出现。混合 collation 下，legacy Space `s` active、`ß` banned，目标在两者均保留 active Space 席位，只有 `ß` 存在有效 Project/Owner 席位时，查询 `s` 和 `ß` 均返回 `[]`。恢复 `ß` 后，每个 Space 只返回自身 Project/席位均合格的行；Project 与成员行任一侧实际 Space 不符均不能进入结果。保留 ASCII 大小写以及经 legacy 表解析到同一实际 Space 的 selector，响应仍返回 Project 的存储拼写。
 3. `status=1`、成员资格有效但 `activated_at IS NULL` 的 Project 不出现；确认流程置位后，后续请求返回该项目。已解散、Project 席位非 active 或 `removing=1` 时不出现；退出后消失，重新有效加入且已完成激活后恢复并返回当前角色。
 4. 账号被停用或注销完成、Space 失效、Space 席位撤销时，即使仍保留 active Project 席位或 Owner 记录也返回 `[]`；注销冷静期且其余资格有效时仍正常返回。
 5. 合格用户无符合条件的项目、所有已加入项目均未完成激活、未知用户、未知 Space、非 Space 成员均返回 `200 []`，不返回 `null`。
@@ -137,13 +137,14 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 
 ## 实施与验证记录
 
-- 路由及 store：`modules/internal_membership/user_projects.go`、`api.go`、`store.go`；只读查询及六字段类型：`pkg/project/user_projects.go`。账号与 Space 资格分别调用现有 `ActiveAccounts` 和 `ActiveMembers`，后者同时校验 Space 状态与 Space 席位；三条查询均在同一个显式 RR 只读事务中执行。
+- 路由及 store：`modules/internal_membership/user_projects.go`、`api.go`、`store.go`；只读查询及六字段类型：`pkg/project/user_projects.go`。账号资格调用现有 `ActiveAccounts`；Space 先经 `ResolveSpaceID` 解析存储身份，再由 `ActiveMembers` 校验 Space 状态与 Space 席位；四条查询均在同一个显式 RR 只读事务中执行。
 - 回归红灯：实现前 `TestInternalUserProjectsHTTPActivatedMembership` 在真实模块路由上得到 `404`，与预期 `200` 不符；实现后同一回归通过。
 - `go test -p 1 ./pkg/project ./modules/internal_membership ./modules/project -count=1`：三包全量通过，执行期间持有 `/tmp/octo_testdb_lock`。
 - 数据库回归覆盖 205 项目全量返回、角色与激活/撤权状态、混合 collation、大小写标识、语句故障和确定性跨连接快照；快照测试以默认 READ COMMITTED 的独立连接运行。HTTP 回归覆盖真实模块路由、strict 桶共享及拒绝路径读取边界、selector、服务凭据与真实 socket 响应。
 - 独立一次性 Go 程序在隔离临时库和动态 loopback 端口上实际调用同一模块：观察到激活前仅返回一个项目，激活后带 `limit=1` 仍完整返回两个项目；跨 Space 查询、字面 `[]`、`401`、重复 selector `400`、移走项目表后的 `500` 均符合契约。程序结束后释放 listener 并删除临时库。
 - `go build ./...`、`go vet ./pkg/project ./modules/internal_membership ./modules/project`、`make i18n-extract-check i18n-lint` 均通过。
 - 审查修复回归：`TestUserProjectsInSpaceRejectsDistinctLegacySeatIdentity` 在修复前实际返回另一账号的 Owner 席位，畸形重复 selector 两例在修复前实际返回 `200` 而非 `400`；修复后这些回归、ASCII 大小写正例及上述三包全量测试再次通过。独立 HTTP 程序在真实混合 collation 临时库中验证 `s`/`ß` 账号隔离、停用与恢复、六字段响应及坏编码值/键的 `400`，输出 `REVIEW_FIX_HTTP_SMOKE_OK`；全仓库 build、相关包 vet 和 i18n 门禁再次通过。
+- Space 身份回归：`TestUserProjectsInSpaceBindsQualifiedSpaceIdentity` 在修复前查询 `s` 实际返回 banned `ß` 的项目描述及 Owner 角色；修复后验证两侧 Space 独立绑定、ASCII 大小写、legacy selector 解析和 Space 恢复后隔离。`go test -race -shuffle=on -p 1 ./pkg/space ./pkg/project ./modules/internal_membership ./modules/project -count=1` 全量通过。独立程序在真实混合 collation 临时库和生产模块路由上验证相同 HTTP 行为，输出 `SPACE_IDENTITY_HTTP_SMOKE_OK`；全仓库 build、相关包 vet 和 i18n 门禁通过。
 
 未执行全仓库测试或外部消费方联合验收。本机 WuKongIM `127.0.0.1:5001` 未运行，相关包测试初始化有 IM 连接失败日志；本接口的真实 MySQL、Redis、HTTP 路径及上述测试均通过，未使用 IM 替身。
 

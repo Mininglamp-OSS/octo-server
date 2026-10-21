@@ -51,7 +51,8 @@ func ActiveSpacesForMember(session dbr.SessionRunner, uid string) (map[string]bo
 // accepted by that table's collation. The bool distinguishes "no such Space"
 // from a database failure; callers handling recovery must not manufacture a
 // canonical value when it is false.
-func ResolveSpaceID(session *dbr.Session, spaceID string) (string, bool, error) {
+// A caller-owned transaction keeps resolution in its authorization snapshot.
+func ResolveSpaceID(session dbr.SessionRunner, spaceID string) (string, bool, error) {
 	if session == nil || spaceID == "" {
 		return "", false, nil
 	}
