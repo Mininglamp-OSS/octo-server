@@ -27,6 +27,14 @@ type membershipStore interface {
 	// holding an active seat. Epoch 0 with an empty map means the project is
 	// not an active project of spaceID.
 	Memberships(ctx context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error)
+	// UserProjects returns every activated project of spaceID that uid holds an
+	// active seat in, with uid's role, ordered by the database row id
+	// (`octo_project.id DESC`, not project_id).
+	//
+	// A successful empty answer must be a non-nil slice: the handler writes the
+	// slice straight to the wire, and `null` would read as a failed lookup to a
+	// caller whose contract says "no rows is []".
+	UserProjects(ctx context.Context, spaceID, uid string) ([]projectpkg.UserProject, error)
 }
 
 // dbStore is the production implementation, delegating to pkg/project.
@@ -83,4 +91,18 @@ func (s dbStore) Epochs(ctx context.Context, spaceID string, projectIDs []string
 
 func (s dbStore) Memberships(ctx context.Context, spaceID, projectID string, uids []string) (int64, map[string]int, error) {
 	return projectpkg.ProjectMemberships(ctx, s.ctx.DB(), spaceID, projectID, uids)
+}
+
+// UserProjects delegates to the read-only fact layer.
+//
+// Unlike Epochs, the transaction lives inside pkg/project rather than here: the
+// qualification reads (account, Space, Space seat) and the project list must share
+// one repeatable-read snapshot, and keeping them in one function is what makes it
+// impossible to call the list against a different connection than the checks that
+// gate it. See projectpkg.UserProjectsInSpace.
+//
+// The request's context is passed through, so a peer that hangs up releases the
+// pooled connection instead of holding it to the five-second statement deadline.
+func (s dbStore) UserProjects(ctx context.Context, spaceID, uid string) ([]projectpkg.UserProject, error) {
+	return projectpkg.UserProjectsInSpace(ctx, s.ctx.DB(), spaceID, uid)
 }

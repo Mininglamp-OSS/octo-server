@@ -25,8 +25,9 @@ import (
 const testInternalToken = "0123456789abcdef0123456789abcdef" // 32 bytes
 
 const (
-	epochsPath = "/v1/internal/membership/epochs"
-	verifyPath = "/v1/internal/project-memberships/_verify"
+	epochsPath   = "/v1/internal/membership/epochs"
+	verifyPath   = "/v1/internal/project-memberships/_verify"
+	projectsPath = "/v1/internal/projects"
 )
 
 // stubStore is an in-memory membershipStore. Errors are settable per method so
@@ -37,13 +38,15 @@ type stubStore struct {
 	epoch    int64
 	epochErr error
 	memErr   error
+	projErr  error
 
-	epochCalls  int
-	memberCalls int
-	lastSpaceID string
-	lastProject string
-	lastUIDs    []string
-	lastIDs     []string
+	epochCalls   int
+	memberCalls  int
+	projectCalls int
+	lastSpaceID  string
+	lastProject  string
+	lastUIDs     []string
+	lastIDs      []string
 	// lastEpochCtx / lastMemberCtx record the context each handler passed down, so
 	// TestBothHandlersPassTheRequestContextToTheStore can assert the plumbing is
 	// real rather than trusting the signature.
@@ -98,6 +101,18 @@ func (s *stubStore) Memberships(ctx context.Context, spaceID, projectID string, 
 	return s.epoch, out, nil
 }
 
+// UserProjects returns the store's success contract — an empty non-nil slice —
+// and only exists so the failure/selector paths can prove they never reach it.
+// Real rows, filtering and ordering are pkg/project's contract, covered by the
+// real-database HTTP test.
+func (s *stubStore) UserProjects(ctx context.Context, spaceID, uid string) ([]projectpkg.UserProject, error) {
+	s.projectCalls++
+	if s.projErr != nil {
+		return nil, s.projErr
+	}
+	return []projectpkg.UserProject{}, nil
+}
+
 func newTestModule(store membershipStore) *Module {
 	return &Module{
 		store:         store,
@@ -108,9 +123,9 @@ func newTestModule(store membershipStore) *Module {
 
 // newRouter mounts the read deadline + auth + handler. The production order is
 // deadline → IP limiter → auth → handler on the concrete routes; only the
-// limiter is left out here, because it is the one middleware that needs Redis,
-// and route_order_test.go asserts the full order separately with recording
-// middleware.
+// limiter is left out here, because it is the one middleware that needs Redis.
+// user_projects_route_test.go drives the real Route() for the limiter/bucket
+// properties; this helper exists for handler-level behaviour.
 //
 // The deadline IS mounted, because leaving it out would make every test in this
 // file exercise a chain that cannot reproduce the hazard it exists for — and
@@ -121,6 +136,7 @@ func newRouter(m *Module) *wkhttp.WKHttp {
 	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	r.GET(epochsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.membershipEpochs)
 	r.POST(verifyPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	r.GET(projectsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listUserProjects)
 	return r
 }
 

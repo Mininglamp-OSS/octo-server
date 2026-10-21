@@ -5,16 +5,19 @@
 
 ---
 
-## 0. 两条通道，各管一件事
+## 0. 读取接口与事件通道，各管一件事
 
 | 通道 | 方向 | 回答的问题 | 语义 |
 |---|---|---|---|
 | `GET /v1/internal/membership/epochs` | 对端拉 | 「这个项目的成员关系变了吗」 | **变更检测器** |
 | `POST /v1/internal/project-memberships/_verify` | 对端拉 | 「这些人现在还在这个项目里吗」 | **权威判定** |
+| `GET /v1/internal/projects?space_id=...&uid=...` | 对端拉 | 「这个用户在指定 Space 有效加入了哪些已激活项目」 | **全量关系与基础信息列表** |
 | 生命周期事件 | 我方推 | 「项目发生了什么」 | **变更通知** |
 
 **事件不是数据同步。** 事件告诉你「有事发生了、以及发生的顺序」，需要具体内容就回来拉。
 这条区分是硬约定，理由见 §5。
+
+Project 全量列表使用现有 membership `X-Internal-Token` 及启用条件，直接返回含 `project_id`、`space_id`、`name`、`description`、`logo`、`role` 的数组，不分页。资格与项目来自同一 RR 只读快照；查询失败返回 `500`，真实空结果返回 `200 []`。完整契约与验收见 [Internal 指定用户 Project 全量列表设计](specs/2026-10-21-project-internal-user-list-design.md)。列表表示当前关系事实，不替代资源 ACL。
 
 ---
 
@@ -153,10 +156,11 @@ octo-server **权威持有项目名与描述，且不通过任何出站通道发
 - 超时/失败以**同一 `event_id`** 重试。
 - 项目停在 `provisioning` 期间，两个入站接口对它的回答与「项目不存在」**不做区分**
   （epoch `0`、`member: false`）。
+- `GET /v1/internal/projects` 同样只返回 `activated_at IS NOT NULL` 的项目；等待确认的项目不进入列表，确认后的新请求可查到。
 
   ⚠️ **覆盖范围的边界，明确写出来免得你方按「全部接口」理解**：这里的「两个入站接口」
   指 `/v1/internal/membership/epochs` 与 `/v1/internal/project-memberships/_verify`。
-  我方还有第三个会回答项目成员身份的接口 —— `POST /v1/auth/verify`（网关每请求都调）——
+  用户态另有 `POST /v1/auth/verify`（网关每请求都调）——
   它**不受**本节的 provisioning 门控制，未确认的项目在那里会照常答 `member: true` 带角色。
 
   它对你方不构成缺口：那个接口的 uid 取自**调用方出示的 token**，不取自请求体，所以它
