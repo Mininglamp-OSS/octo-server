@@ -3,6 +3,7 @@
 ## [Unreleased] - 2026-09-11
 
 ### Project 协作
+- 新增服务间 Project 全量列表 `GET /v1/internal/projects?space_id=...&uid=...`：使用 membership internal token，返回目标用户在指定 Space 有效加入且已完成激活的项目基础信息及角色；不分页，资格和项目来自同一 RR 只读快照，沿用共享 strict IP 限流与 i18n 错误响应。
 - Project 支持同一 Space 内重名、字面名称搜索及 `X-Total-Count` 列表计数；GET 列表为纯读，仅返回已有且当前有权访问的显式创建 Project，空列表不产生写入。
 - 成员批量入口 `POST /v1/projects/:project_id/members/add` 原子应用成员/管理员角色；新增专用 Owner 转让 `PUT /v1/projects/:project_id/owner`；退出 `POST /v1/projects/:project_id/leave` 按唯一 Owner 规则校验。
 - 群 Project 关系支持 `GET/PUT/DELETE /v1/groups/:group_no/project` 的查询、绑定、换绑和解除，并支持 `POST /v1/group/create` 从 Project 创建群；原生群成员席位独立于 Project 关系并在解除关联后保留。

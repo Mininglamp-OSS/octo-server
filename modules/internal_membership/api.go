@@ -107,7 +107,7 @@ func New(ctx *config.Context) *Module {
 	}
 }
 
-// Route mounts the membership endpoints under /v1/internal.
+// Route mounts the membership and project-list endpoints under /v1/internal.
 //
 // Middleware EXECUTION ORDER matters and is asserted by a test:
 //
@@ -123,10 +123,11 @@ func New(ctx *config.Context) *Module {
 // to the much wider global per-IP bucket. modules/internal_resolve documents
 // having been bitten by exactly this ordering.
 //
-// Neither route takes AuthMiddleware. That is the deliberate exclusion the
+// None of these routes takes AuthMiddleware. That is the deliberate exclusion the
 // space-isolation rule asks to be documented: these endpoints have no end user,
 // the caller is a peer service authenticated by a deployment-issued token, and
-// there is no uid for a user-scoped middleware to read. Space isolation is
+// there is no session identity for a user-scoped middleware to read. On the list
+// route uid is a token-authorized QUERY TARGET, not the caller. Space isolation is
 // enforced instead by making space_id a REQUIRED part of every query predicate
 // — see the handlers and pkg/project.
 func (m *Module) Route(r *wkhttp.WKHttp) {
@@ -135,9 +136,10 @@ func (m *Module) Route(r *wkhttp.WKHttp) {
 	internal := r.Group("/v1/internal")
 	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
 	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/projects", deadline, ipLimit, m.internalAuthMiddleware(), m.listUserProjects)
 }
 
-// ipRateLimit builds the per-IP strict limiter shared by both endpoints.
+// ipRateLimit builds the per-IP strict limiter shared by every endpoint.
 //
 // Shared bucket, not one per endpoint: they are called by the same peer on the
 // same authorization path, and splitting the quota would only make each half
