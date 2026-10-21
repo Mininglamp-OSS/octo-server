@@ -21,6 +21,14 @@ type UserProject struct {
 	Role        int    `db:"role" json:"role"`
 }
 
+// userProjectSeat keeps the actual seat identity out of the response DTO.
+// Legacy and Project collations can disagree on UID equality, so the matched
+// seat must also bind to the qualified target through FoldID.
+type userProjectSeat struct {
+	UserProject
+	SeatUID string `db:"seat_uid"`
+}
+
 // UserProjectsInSpace returns every activated Project of spaceID that uid has
 // joined, newest first (octo_project.id DESC, unpaginated); an empty non-nil
 // slice means none.
@@ -30,6 +38,9 @@ type UserProject struct {
 // and the Project is status = 1 with activated_at set while uid's seat row is
 // status = 1, removing = 0 and carries the Project's own space_id. All reads share
 // one read-only REPEATABLE READ transaction.
+//
+// The private seat UID is matched with ASCII-only FoldID before projection;
+// SQL collation equality alone does not establish the qualified account's identity.
 //
 // Legacy tables are reached only through pkg/user and pkg/space in separate
 // legacy-only statements; joining them to octo_* mixes utf8mb4_0900_ai_ci with
@@ -64,9 +75,9 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 		return out, nil
 	}
 
-	var rows []UserProject
+	var seatRows []userProjectSeat
 	if _, err := tx.SelectBySql(
-		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, pm.role "+
+		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, pm.role, pm.uid AS seat_uid "+
 			"FROM `octo_project_member` pm "+
 			"INNER JOIN `octo_project` p "+
 			"ON p.project_id = pm.project_id AND p.space_id = pm.space_id "+
@@ -75,11 +86,18 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 			"  AND p.status = 1 AND p.activated_at IS NOT NULL "+
 			"ORDER BY p.id DESC",
 		spaceID, uid,
-	).Load(&rows); err != nil {
+	).Load(&seatRows); err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return out, nil
+
+	// Bind actual seat identity without merging non-ASCII legacy accounts.
+	uidFold := FoldID(uid)
+	out = make([]UserProject, 0, len(seatRows))
+	for _, seat := range seatRows {
+		if FoldID(seat.SeatUID) != uidFold {
+			continue
+		}
+		out = append(out, seat.UserProject)
 	}
-	return rows, nil
+	return out, nil
 }

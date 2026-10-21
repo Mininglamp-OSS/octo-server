@@ -44,7 +44,7 @@
 
 `GET /v1/internal/projects?space_id=space-a&uid=user-a`
 
-- `space_id` 和 `uid` 为必填、单值 query 参数，空值或带首尾空白的值返回参数错误；重复参数返回参数错误，不选择其中某一个值。
+- `space_id` 和 `uid` 为必填、单值 query 参数，空值或带首尾空白的值返回参数错误；重复参数返回参数错误，不选择其中某一个值。先一次性解析完整 `RawQuery`，任一键或值的编码无法解析时整请求返回 `400`，不使用部分解析结果判定 selector。
 - ID 沿用既有存量标识语义，不新增 UUID 格式约束，不在 Go 中用精确大小写比较替代数据库的标识判等。
 - 凭据通过 `X-Internal-Token` 提供，值来自 `OCTO_MEMBERSHIP_INTERNAL_TOKEN`。
 - 复用现有 `OCTO_MEMBERSHIP_INTERNAL_PEER_MAX_CACHE_AGE_SECONDS` 配置门槛及凭据互斥检查；既有配置不能启用 membership 模块时，本接口也不可用。
@@ -98,7 +98,7 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 - `modules/internal_membership` 负责路由、现有鉴权/限流复用、参数、错误 facade 和最小响应投影；在既有 store 接缝增加对应列表能力。
 - 数据查询放在 `pkg/project` 的只读事实层；该包不得导入 `modules/project`，不借用用户态 handler 或其带默认分页的服务来获取“全部”结果。
 - 账号、Space 和 Space 席位资格使用相同事务连接，遵循现有独立查询方式，避免跨 legacy 表和 `octo_*` 表直接 JOIN 导致混合 collation 故障。Project 与 Project 成员通过 Project ID 及 Space ID 关联，并以指定 Space 和目标 UID 过滤。
-- 返回数据库存储的 ID，不改写其大小写；跨读取结果匹配 ID 时沿用已有 `FoldID` 语义。查询不依赖个人偏好记录，不做逐项目查询。
+- 返回数据库存储的 ID，不改写其大小写；跨读取结果匹配 ID 时沿用已有 ASCII-only `FoldID` 语义。查询使用私有投影保留实际 `pm.uid`，仅将其 `FoldID` 与已合格目标 UID 一致的席位投影到六字段响应；SQL 的 collation 判等不能替代此身份绑定。这样保留 ASCII 大小写兼容，同时不将 legacy `0900_ai_ci` 下不同的账号按 Project `general_ci` 的宽松匹配合并。查询不依赖个人偏好记录，不做逐项目查询。
 - 沿用请求 context 开启 `Isolation: sql.LevelRepeatableRead, ReadOnly: true` 的事务，并设置已有 membership 单语句读取期限（当前为 5 秒）。所有读取使用能应用 `tx.Timeout` 的 `Load` / `LoadOne` 调用形态，不使用忽略该期限的 `Rows` / `Iterate` 路径。超过读取期限时整个请求返回 `500`，不截断结果、不增加重试；任何查询或事务错误都不返回已收集的部分结果。
 
 响应只表示该事务快照时的有效成员关系及基础资料，不承诺在 HTTP 响应后持续有效。列表不返回 epoch；调用方不得把它作为长期授权快照，具体资源访问仍由资源侧校验，后续成员判定继续使用既有验证契约。
@@ -108,6 +108,7 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 | 场景 | HTTP 状态及行为 |
 | --- | --- |
 | 必填参数缺失、空值、首尾空白或重复 | `400`，`err.shared.param.invalid`，details 使用对应 `field` |
+| 完整 query 解析失败（含畸形重复值或键） | `400`，`err.shared.param.invalid`；不归因到单一 field，不使用部分解析结果，不返回 parser 内部原因 |
 | 凭据缺失、错误或模块未启用 | `401`，`err.shared.auth.token_invalid`，不透露具体配置状态 |
 | 超过现有 strict IP 限额 | `429`，沿用既有限流响应与 headers |
 | 账号/Space 不存在、失效或不具备有效 Space 席位 | `200 []` |
@@ -125,9 +126,9 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 5. 合格用户无符合条件的项目、所有已加入项目均未完成激活、未知用户、未知 Space、非 Space 成员均返回 `200 []`，不返回 `null`。
 6. 构造超过现有用户态默认及最大单页数量的匹配项目，单次请求完整返回，不受 `page`、`limit` 或分页默认值截断；重复读取顺序符合 `id DESC`。
 7. 用户设置项目置顶或隐藏后，返回集合及顺序不变；`role=0` 和空 `logo` 字段保留，描述原样返回。
-8. 缺失、空白及重复 selector 返回 `400`；用户 session 不能替代 internal token；配置不满足启用条件或凭据错误时返回 `401`；限流继续返回 `429`，拒绝请求不执行业务查询。
+8. 缺失、空白及重复 selector 返回 `400`；畸形重复 selector 或畸形 query 键同样在业务查询前返回 `400`。用户 session 不能替代 internal token；配置不满足启用条件或凭据错误时返回 `401`；限流继续返回 `429`，拒绝请求不执行业务查询。
 9. 通过资格读取与列表读取之间的确定性同步点，控制另一连接提交账号/Space 撤权或角色变更，验证当前响应仍描述同一旧快照、随后新请求反映新状态；用例在连接默认隔离为 READ COMMITTED 时也必须成立，不依赖调度时机或仅检查事务配置。
-10. 资格查询、列表查询或事务失败返回 `500`，不会输出成功空数组或部分结果；混合 legacy/Project 表 collation 及大小写不同的有效存量 ID 不产生错误放行或精确字符串比较导致的误拒绝。
+10. 资格查询、列表查询或事务失败返回 `500`，不会输出成功空数组或部分结果；混合 legacy/Project 表 collation 及大小写不同的有效存量 ID 不产生错误放行或精确字符串比较导致的误拒绝。混合 collation 下，以 active `s` 和 banned `ß` 两个不同 legacy 账号、仅 `ß` 持有 Owner 席位的夹具查询 `s`，必须返回空数组；恢复 `ß` 的账号资格后，也只返回其自己的项目。加入 `s`/`S` 的独立合法席位后，ASCII 大小写查询均保留其自身项目，两个账号不得互相串席位或角色。
 11. 新路由使用真实模块路由挂载完成 HTTP smoke，核对凭据、完整数组、Space 隔离和故障状态；运行时覆盖新路由的读取边界→strict IP 限流→鉴权顺序，验证错误凭据仍消耗 strict IP 配额，401/429 拒绝路径仍受已有读取边界约束；不能仅依赖手工挂载的两条旧路由测试。现有 membership 与用户态 Project 列表契约保持不变。
 
 ## 实施与发布边界
@@ -142,6 +143,7 @@ HTTP `200`，body 直接为数组，不包 `data` 或 `projects`，不返回分�
 - 数据库回归覆盖 205 项目全量返回、角色与激活/撤权状态、混合 collation、大小写标识、语句故障和确定性跨连接快照；快照测试以默认 READ COMMITTED 的独立连接运行。HTTP 回归覆盖真实模块路由、strict 桶共享及拒绝路径读取边界、selector、服务凭据与真实 socket 响应。
 - 独立一次性 Go 程序在隔离临时库和动态 loopback 端口上实际调用同一模块：观察到激活前仅返回一个项目，激活后带 `limit=1` 仍完整返回两个项目；跨 Space 查询、字面 `[]`、`401`、重复 selector `400`、移走项目表后的 `500` 均符合契约。程序结束后释放 listener 并删除临时库。
 - `go build ./...`、`go vet ./pkg/project ./modules/internal_membership ./modules/project`、`make i18n-extract-check i18n-lint` 均通过。
+- 审查修复回归：`TestUserProjectsInSpaceRejectsDistinctLegacySeatIdentity` 在修复前实际返回另一账号的 Owner 席位，畸形重复 selector 两例在修复前实际返回 `200` 而非 `400`；修复后这些回归、ASCII 大小写正例及上述三包全量测试再次通过。独立 HTTP 程序在真实混合 collation 临时库中验证 `s`/`ß` 账号隔离、停用与恢复、六字段响应及坏编码值/键的 `400`，输出 `REVIEW_FIX_HTTP_SMOKE_OK`；全仓库 build、相关包 vet 和 i18n 门禁再次通过。
 
 未执行全仓库测试或外部消费方联合验收。本机 WuKongIM `127.0.0.1:5001` 未运行，相关包测试初始化有 IM 连接失败日志；本接口的真实 MySQL、Redis、HTTP 路径及上述测试均通过，未使用 IM 替身。
 

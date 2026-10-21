@@ -1,6 +1,7 @@
 package internal_membership
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -17,7 +18,7 @@ import (
 //     nothing qualifies, never `null`. Filtering, activation and ordering belong
 //     to projectpkg.UserProjectsInSpace.
 //   - 400 err.shared.param.invalid — space_id or uid missing, empty, padded or
-//     repeated.
+//     repeated, or the raw query itself unparseable.
 //   - 401 err.shared.auth.token_invalid — token failure (middleware).
 //   - 500 err.shared.internal — lookup failure; never an empty 200.
 //
@@ -25,12 +26,20 @@ import (
 // identity: uid is a token-authorized query target, and no header or context
 // value may override either selector.
 func (m *Module) listUserProjects(c *wkhttp.Context) {
-	spaceID, ok := singleQueryValue(c, "space_id")
+	// ParseQuery can return partial values with an error; reject those before
+	// checking selector cardinality.
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		respondInvalidParam(c, "")
+		return
+	}
+
+	spaceID, ok := singleQueryValue(query, "space_id")
 	if !ok {
 		respondInvalidParam(c, "space_id")
 		return
 	}
-	uid, ok := singleQueryValue(c, "uid")
+	uid, ok := singleQueryValue(query, "uid")
 	if !ok {
 		respondInvalidParam(c, "uid")
 		return
@@ -52,8 +61,8 @@ func (m *Module) listUserProjects(c *wkhttp.Context) {
 // singleQueryValue accepts the field only when it appears exactly once, with a
 // non-empty value and no leading/trailing whitespace. A repeated parameter is
 // rejected rather than resolved to one of its values.
-func singleQueryValue(c *wkhttp.Context, field string) (string, bool) {
-	values := c.QueryArray(field)
+func singleQueryValue(query url.Values, field string) (string, bool) {
+	values := query[field]
 	if len(values) != 1 {
 		return "", false
 	}
