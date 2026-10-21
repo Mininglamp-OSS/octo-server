@@ -5,6 +5,7 @@ description: 为服务间调用增加指定用户在指定 Space 下的有效 Pr
 tags: [project, internal-api, space, isolation, auth, wire-contract]
 timestamp: 2026-10-21
 slug: project-internal-user-list
+upstream: Mininglamp-OSS/octo-server#933
 source: self
 ---
 
