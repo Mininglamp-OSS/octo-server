@@ -127,16 +127,15 @@ func New(ctx *config.Context) *Module {
 // space-isolation rule asks to be documented: these endpoints have no end user,
 // the caller is a peer service authenticated by a deployment-issued token, and
 // there is no session identity for a user-scoped middleware to read. On the list
-// route uid is a token-authorized QUERY TARGET, not the caller. Space isolation is
-// enforced instead by making space_id a REQUIRED part of every query predicate
-// — see the handlers and pkg/project.
+// route uid is a token-authorized query target, or project_ids names metadata
+// candidates; neither is caller identity. The required space_id scopes both modes.
 func (m *Module) Route(r *wkhttp.WKHttp) {
 	ipLimit := m.ipRateLimit(r)
 	deadline := boundBodyReadTime()
 	internal := r.Group("/v1/internal")
 	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
 	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
-	internal.GET("/projects", deadline, ipLimit, m.internalAuthMiddleware(), m.listUserProjects)
+	internal.GET("/projects", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjects)
 }
 
 // ipRateLimit builds the per-IP strict limiter shared by every endpoint.
@@ -312,10 +311,9 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 // one deduplicated, trimmed list, preserving first-seen order.
 //
 // Accepting both shapes costs nothing and removes a class of integration bug
-// where one side sends ?ids=a&ids=b and the other expects ?ids=a,b. Duplicates
-// are dropped rather than rejected here because the response is a MAP: a
-// repeated id cannot produce a duplicate or missing answer the way it can in the
-// verify endpoint's array, so there is nothing for strictness to protect.
+// where one side sends ?ids=a&ids=b and the other expects ?ids=a,b. Both consumers
+// treat IDs as a set: epoch lookup maps them by ID, and metadata lookup returns
+// each Project once, so duplicates do not change either answer.
 //
 // It stops at `limit` unique ids and reports whether more were present, so the
 // caller can refuse an oversized batch WITHOUT this function first materializing
@@ -329,22 +327,12 @@ func (m *Module) membershipEpochs(c *wkhttp.Context) {
 // consulted: one `?project_ids=` value with a hundred thousand commas used to
 // allocate a hundred thousand strings on the way to a 400.
 //
-// Scoped honestly, because an earlier version of this comment claimed more than
-// it delivered. The query string is ALREADY materialized before this is reached
-// — gin's c.QueryArray goes through url.ParseQuery — so the saving is one
-// allocation pass, not the whole input; and the loop still walks every duplicate
-// and empty field past the limit, since only UNIQUE ids count against it. Both
-// are bounded by the server's request-line/header limits and both sit behind
-// token auth, so what is left is a constant factor, not a hazard.
+// The request query is already materialized before this is reached: epochs uses
+// c.QueryArray and the project-list handler parses RawQuery into url.Values. The
+// saving is one allocation pass, not the whole input; the loop still walks every
+// duplicate and empty field past the limit, since only UNIQUE IDs count against it.
 //
-// Whitespace around a comma is SEPARATOR syntax here, so it is trimmed: a caller
-// that builds the query with `strings.Join(ids, ", ")` means the ids, not the
-// spaces. The consequence is that the answer is keyed by the TRIMMED id, which is
-// what the caller's own id was in that shape. An id whose value genuinely
-// contains surrounding whitespace is therefore not round-tripped — but such an id
-// is outside the contract's canonical-uuid form, and the verify endpoint, whose
-// uids arrive in a JSON array where whitespace is unambiguously part of the
-// value, rejects that shape outright rather than trimming it.
+// Whitespace around comma-separated values is trimmed, and empty items are ignored.
 func parseIDList(raw []string, limit int) (ids []string, overLimit bool) {
 	out := make([]string, 0, limit)
 	seen := make(map[string]bool, limit)

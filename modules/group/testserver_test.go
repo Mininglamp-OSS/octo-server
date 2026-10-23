@@ -10,8 +10,8 @@ import (
 )
 
 // newTestServer wraps testutil.NewTestServer with a test-scoped connection
-// pool bound.
-//
+// pool and clears persistent Redis UID rate-limit buckets once at fixture
+// setup. Production middleware remains installed for requests in the fixture.
 // testutil.NewTestServer builds a fresh *config.Context per call, and each
 // Context lazily opens its own *sql.DB pool (default 100 max / 10 idle conns)
 // that nothing ever closes. This package has 200+ tests that each call it, so
@@ -30,6 +30,7 @@ func newTestServer(t *testing.T) (*server.Server, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	bindTestDBPool(ctx)
+	resetGroupUIDRateLimit(t, ctx)
 	return s, ctx
 }
 

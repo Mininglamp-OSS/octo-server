@@ -4,6 +4,7 @@
 
 ### Project 协作
 - 新增服务间 Project 全量列表 `GET /v1/internal/projects?space_id=...&uid=...`：使用 membership internal token，返回目标用户在指定 Space 有效加入且已完成激活的项目基础信息及角色；不分页，资格和项目来自同一 RR 只读快照，沿用共享 strict IP 限流与 i18n 错误响应。先解析实际 legacy Space，实际 Project 席位 UID 及 Project/席位双方 Space 经 ASCII-only 身份绑定后投影，支持混合 collation 下的 legacy 账号与 Space 隔离；完整 query 解析失败时返回 `400`。
+- 扩展 `GET /v1/internal/projects` 支持互斥的 `project_ids` 批量模式（每批最多 50 个 ID）：按指定 Space 批量读取当前存储的有效、已激活 Project 基础资料，显式返回 `role:null`，不查询用户或成员关系、不缓存或回写名称；原 `uid` 模式保持不变。
 - Project 支持同一 Space 内重名、字面名称搜索及 `X-Total-Count` 列表计数；GET 列表为纯读，仅返回已有且当前有权访问的显式创建 Project，空列表不产生写入。
 - 成员批量入口 `POST /v1/projects/:project_id/members/add` 原子应用成员/管理员角色；新增专用 Owner 转让 `PUT /v1/projects/:project_id/owner`；退出 `POST /v1/projects/:project_id/leave` 按唯一 Owner 规则校验。
 - 群 Project 关系支持 `GET/PUT/DELETE /v1/groups/:group_no/project` 的查询、绑定、换绑和解除，并支持 `POST /v1/group/create` 从 Project 创建群；原生群成员席位独立于 Project 关系并在解除关联后保留。
@@ -33,6 +34,9 @@
   Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
+
+### 测试
+- Group HTTP 测试在每个 server fixture 初始化时清理共享 UID 限流桶，保持跨测试隔离；同一 fixture 内的限流中间件照常生效。
 
 ### 配置
 - Webhook gRPC 回调监听器新增环境变量 `TS_GRPC_AUTH_REQUIRED`，默认 `false`，现有部署行为不变（仍是配置了 `TS_GRPC_AUTH_TOKEN` 才校验）。设为 `true` 但未配置 `TS_GRPC_AUTH_TOKEN`，或取值不是合法布尔值时，服务拒绝启动。

@@ -112,3 +112,77 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 	}
 	return out, nil
 }
+
+// ProjectMetadata is the six-field projection returned by an internal lookup
+// that has no user-role context. Role is deliberately nil and is encoded as JSON
+// null; it must not be interpreted as a membership answer.
+type ProjectMetadata struct {
+	ProjectID   string `db:"project_id" json:"project_id"`
+	SpaceID     string `db:"space_id" json:"space_id"`
+	Name        string `db:"name" json:"name"`
+	Description string `db:"description" json:"description"`
+	Logo        string `db:"logo" json:"logo"`
+	Role        *int   `json:"role"`
+}
+
+// ProjectMetadataInSpace returns the matching active, activated Project rows
+// without consulting any user or membership tables. The Space is resolved and
+// checked in the same read-only REPEATABLE READ transaction as the Project read.
+func ProjectMetadataInSpace(ctx context.Context, session *dbr.Session, spaceID string, projectIDs []string) ([]ProjectMetadata, error) {
+	tx, err := session.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	tx.Timeout = membershipReadTimeout
+
+	qualifiedSpaceID, found, err := space.ResolveSpaceID(tx, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return []ProjectMetadata{}, nil
+	}
+	active, err := space.IsActiveSpace(tx, qualifiedSpaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !active {
+		return []ProjectMetadata{}, nil
+	}
+
+	var rows []ProjectMetadata
+	_, err = tx.SelectBySql(
+		"SELECT project_id, space_id, name, description, logo "+
+			"FROM `octo_project` "+
+			"WHERE space_id = ? AND project_id IN ? "+
+			"  AND status = 1 AND activated_at IS NOT NULL",
+		qualifiedSpaceID, projectIDs,
+	).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+
+	spaceFold := FoldID(qualifiedSpaceID)
+	requested := make(map[string]struct{}, len(projectIDs))
+	for _, projectID := range projectIDs {
+		requested[FoldID(projectID)] = struct{}{}
+	}
+	if rows == nil {
+		rows = []ProjectMetadata{}
+	}
+	out := rows[:0]
+	for _, row := range rows {
+		if FoldID(row.SpaceID) != spaceFold {
+			continue
+		}
+		if _, ok := requested[FoldID(row.ProjectID)]; !ok {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
