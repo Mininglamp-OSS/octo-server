@@ -10,24 +10,20 @@ import (
 
 // ---------- GET /v1/internal/projects ----------
 
-// listUserProjects answers every activated project of one Space that the named
-// uid holds an active seat in, with that uid's role.
+// listProjects selects either the user's Project memberships or bare Project
+// metadata from the query keys. The two modes are mutually exclusive.
 //
 // Contract:
-//   - 200 — a bare JSON array (no envelope, no pagination metadata); `[]` when
-//     nothing qualifies, never `null`. Filtering, activation and ordering belong
-//     to projectpkg.UserProjectsInSpace.
-//   - 400 err.shared.param.invalid — space_id or uid missing, empty, padded or
-//     repeated, or the raw query itself unparseable.
+//   - 200 — a bare JSON array; [] when nothing qualifies, never null.
+//   - 400 err.shared.param.invalid — malformed query, invalid space_id or uid,
+//     conflicting selectors, or an empty/oversized project_ids batch.
 //   - 401 err.shared.auth.token_invalid — token failure (middleware).
 //   - 500 err.shared.internal — lookup failure; never an empty 200.
 //
-// The selector comes from the query string only. This surface has no session
-// identity: uid is a token-authorized query target, and no header or context
-// value may override either selector.
-func (m *Module) listUserProjects(c *wkhttp.Context) {
-	// ParseQuery can return partial values with an error; reject those before
-	// checking selector cardinality.
+// Both selectors come from the query string only. This surface has no session
+// identity: uid is a token-authorized query target, while project_ids names the
+// metadata candidates and does not imply membership or resource authorization.
+func (m *Module) listProjects(c *wkhttp.Context) {
 	query, err := url.ParseQuery(c.Request.URL.RawQuery)
 	if err != nil {
 		respondInvalidParam(c, "")
@@ -39,22 +35,41 @@ func (m *Module) listUserProjects(c *wkhttp.Context) {
 		respondInvalidParam(c, "space_id")
 		return
 	}
-	uid, ok := singleQueryValue(query, "uid")
-	if !ok {
-		respondInvalidParam(c, "uid")
+	_, hasUID := query["uid"]
+	_, hasProjectIDs := query["project_ids"]
+	if hasUID == hasProjectIDs {
+		respondInvalidParam(c, "uid|project_ids")
 		return
 	}
 
-	rows, err := m.store.UserProjects(c.Request.Context(), spaceID, uid)
+	if hasUID {
+		uid, ok := singleQueryValue(query, "uid")
+		if !ok {
+			respondInvalidParam(c, "uid")
+			return
+		}
+		rows, err := m.store.UserProjects(c.Request.Context(), spaceID, uid)
+		if err != nil {
+			m.Error("list user projects: lookup failed",
+				zap.Error(err), zap.String("space_id", spaceID), zap.String("uid", uid))
+			respondInternal(c)
+			return
+		}
+		c.Response(rows)
+		return
+	}
+
+	projectIDs, overLimit := parseIDList(query["project_ids"], maxBatchProjectIDs)
+	if len(projectIDs) == 0 || overLimit {
+		respondInvalidParam(c, "project_ids")
+		return
+	}
+	rows, err := m.store.ProjectMetadata(c.Request.Context(), spaceID, projectIDs)
 	if err != nil {
-		// Keep the reason in the log, not on the wire. The scope ids make the line
-		// actionable without exposing query text or DSN.
-		m.Error("list user projects: lookup failed",
-			zap.Error(err), zap.String("space_id", spaceID), zap.String("uid", uid))
+		m.logLookupFailure("project metadata", err, spaceID, len(projectIDs))
 		respondInternal(c)
 		return
 	}
-
 	c.Response(rows)
 }
 

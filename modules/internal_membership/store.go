@@ -10,12 +10,10 @@ import (
 
 // membershipStore is the narrow data surface these handlers need.
 //
-// An interface rather than a direct pkg/project call so the handlers' behaviour
-// — answer shape, ordering, the non-member/unknown-project folding, the
-// fail-closed 500 — is testable without MySQL. Every value crossing this
-// boundary is an authorization fact, so "the happy path is only covered by an
-// integration suite that needs a database" is not good enough: those are exactly
-// the assertions that must run on every change.
+// An interface rather than a direct pkg/project call so the handlers' behavior —
+// request-mode selection, response projection and fail-closed errors — is testable
+// without MySQL. Database facts remain in pkg/project and are covered by its
+// real-database HTTP tests.
 //
 // Same shape as modules/internal_resolve's identityResolver, for the same
 // reason.
@@ -35,6 +33,9 @@ type membershipStore interface {
 	// slice straight to the wire, and `null` would read as a failed lookup to a
 	// caller whose contract says "no rows is []".
 	UserProjects(ctx context.Context, spaceID, uid string) ([]projectpkg.UserProject, error)
+	// ProjectMetadata returns the active, activated Project rows in spaceID whose
+	// IDs match the request. Role is nil because no user membership was queried.
+	ProjectMetadata(ctx context.Context, spaceID string, projectIDs []string) ([]projectpkg.ProjectMetadata, error)
 }
 
 // dbStore is the production implementation, delegating to pkg/project.
@@ -105,4 +106,9 @@ func (s dbStore) Memberships(ctx context.Context, spaceID, projectID string, uid
 // pooled connection instead of holding it to the five-second statement deadline.
 func (s dbStore) UserProjects(ctx context.Context, spaceID, uid string) ([]projectpkg.UserProject, error) {
 	return projectpkg.UserProjectsInSpace(ctx, s.ctx.DB(), spaceID, uid)
+}
+
+// ProjectMetadata delegates to the read-only metadata fact layer.
+func (s dbStore) ProjectMetadata(ctx context.Context, spaceID string, projectIDs []string) ([]projectpkg.ProjectMetadata, error) {
+	return projectpkg.ProjectMetadataInSpace(ctx, s.ctx.DB(), spaceID, projectIDs)
 }

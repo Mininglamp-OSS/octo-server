@@ -2,12 +2,15 @@ package project
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	internalmembership "github.com/Mininglamp-OSS/octo-server/modules/internal_membership"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -27,12 +30,16 @@ const (
 // router, with the enablement env in place. No hand-assembled middleware list:
 // a case that passes here exercises the wiring in Route().
 func iupMountInternalRoute(t *testing.T) *wkhttp.WKHttp {
+	return iupMountInternalRouteWithContext(t, testCtx)
+}
+
+func iupMountInternalRouteWithContext(t *testing.T, ctx *config.Context) *wkhttp.WKHttp {
 	t.Helper()
 	t.Setenv(internalmembership.MembershipInternalTokenEnv, iupInternalToken)
 	t.Setenv(internalmembership.PeerMaxCacheAgeEnv, "30")
 	route := wkhttp.New()
 	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
-	internalmembership.New(testCtx).Route(route)
+	internalmembership.New(ctx).Route(route)
 	return route
 }
 
@@ -78,6 +85,54 @@ func iupDecodeProjects(t *testing.T, body []byte) []iupHTTPProject {
 	var rows []iupHTTPProject
 	require.NoError(t, json.Unmarshal(body, &rows), "body: %s", string(body))
 	return rows
+}
+
+type iupHTTPProjectMetadata struct {
+	ProjectID   string          `json:"project_id"`
+	SpaceID     string          `json:"space_id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Logo        string          `json:"logo"`
+	Role        json.RawMessage `json:"role"`
+}
+
+func iupDecodeProjectMetadata(t *testing.T, body []byte) []iupHTTPProjectMetadata {
+	t.Helper()
+	var rows []iupHTTPProjectMetadata
+	require.NoError(t, json.Unmarshal(body, &rows), "body: %s", string(body))
+
+	var wireRows []map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(body, &wireRows), "body: %s", string(body))
+	for i, row := range wireRows {
+		require.Len(t, row, 6, "project row must contain exactly the six contract fields")
+		for _, field := range []string{"project_id", "space_id", "name", "description", "logo", "role"} {
+			require.Contains(t, row, field)
+		}
+		require.Equal(t, "null", string(rows[i].Role), "role must be an explicit JSON null")
+	}
+	return rows
+}
+
+func iupProbeContext(t *testing.T) *config.Context {
+	t.Helper()
+	addr := testCtx.GetConfig().DB.MySQLAddr
+	slash := strings.LastIndex(addr, "/")
+	require.Positive(t, slash, "unexpected DSN shape: %s", addr)
+	opts := ""
+	if q := strings.Index(addr[slash:], "?"); q >= 0 {
+		opts = addr[slash+q:]
+	}
+
+	cfg := *testCtx.GetConfig()
+	cfg.DB.MySQLAddr = addr[:slash+1] + iupCollationProbeDB + opts
+	ctx := config.NewContext(&cfg)
+	session := ctx.DB()
+	t.Cleanup(func() {
+		if err := session.DB.Close(); err != nil {
+			t.Errorf("close collation-probe database session: %v", err)
+		}
+	})
+	return ctx
 }
 
 func TestInternalUserProjectsHTTPActivatedMembership(t *testing.T) {
@@ -278,4 +333,219 @@ func TestInternalUserProjectsHTTPSelectorsShapeAndIsolation(t *testing.T) {
 
 	_, unknownBody := iupSocketGet(t, base, client, iupProjectsPath+"?space_id=space_unknown&uid="+target, forged)
 	require.Equal(t, "[]", strings.TrimSpace(string(unknownBody)))
+}
+
+func TestInternalProjectsByIDHTTPMetadataFiltersAndRename(t *testing.T) {
+	setup(t)
+	const (
+		readyID       = "IUP-ID-Ready"
+		pendingID     = "iup-id-pending"
+		disbandedID   = "iup-id-disbanded"
+		otherSpaceID  = "iup-id-other-space"
+		inactiveSpace = "iup-id-inactive-space"
+		inactiveID    = "iup-id-inactive-space-project"
+	)
+	seedSpace(t, spaceA, 1)
+	seedSpace(t, spaceB, 1)
+	seedSpace(t, inactiveSpace, 2)
+	longDescription := strings.Repeat("长", 1024)
+	iupProject(t, readyID, spaceA, "unrelated-creator", "Current project name", longDescription, "", 1, true)
+	iupProject(t, pendingID, spaceA, "unrelated-creator", "Awaiting activation", "", "", 1, false)
+	iupProject(t, disbandedID, spaceA, "unrelated-creator", "Disbanded", "", "", 2, true)
+	iupProject(t, otherSpaceID, spaceB, "unrelated-creator", "Other Space", "", "", 1, true)
+	iupProject(t, inactiveID, inactiveSpace, "unrelated-creator", "Inactive Space", "", "", 1, true)
+	// No user, Space-member, or Project-member fixtures are created: metadata reads
+	// must not acquire an implicit user or membership precondition.
+
+	srv := httptest.NewServer(iupMountInternalRoute(t))
+	t.Cleanup(srv.Close)
+	headers := map[string]string{
+		"X-Internal-Token": iupInternalToken,
+		"X-Real-Ip":        "198.51.100.41",
+	}
+	query := url.Values{}
+	query.Set("space_id", spaceA)
+	query.Add("project_ids", " ,iup-id-ready,, ")
+	query.Add("project_ids", "IUP-ID-READY,unknown-id,"+pendingID+","+disbandedID+","+otherSpaceID)
+	query.Set("page", "9")
+	query.Set("limit", "1")
+	response, body := iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, []iupHTTPProjectMetadata{{
+		ProjectID:   readyID,
+		SpaceID:     spaceA,
+		Name:        "Current project name",
+		Description: longDescription,
+		Logo:        "",
+		Role:        json.RawMessage("null"),
+	}}, iupDecodeProjectMetadata(t, body))
+
+	// A subsequent read sees the committed database name, without process restart
+	// or cache invalidation.
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE octo_project SET name = ? WHERE project_id = ?", "Renamed project", readyID).Exec()
+	require.NoError(t, err)
+	headers["X-Real-Ip"] = "198.51.100.42"
+	query.Set("project_ids", "iup-id-ready")
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	rows := iupDecodeProjectMetadata(t, body)
+	require.Len(t, rows, 1)
+	require.Equal(t, "Renamed project", rows[0].Name)
+	headers["X-Real-Ip"] = "198.51.100.46"
+	query.Set("space_id", spaceA)
+	query.Set("project_ids", "unknown-id")
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, "[]", strings.TrimSpace(string(body)),
+		"an all-unmatched ID request must be a literal empty array")
+
+	// The Space selector isolates the other-tenant project: it was excluded above
+	// under spaceA and is returned when queried in its actual active Space.
+	headers["X-Real-Ip"] = "198.51.100.43"
+	query.Set("space_id", spaceB)
+	query.Set("project_ids", otherSpaceID)
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, []iupHTTPProjectMetadata{{
+		ProjectID: otherSpaceID,
+		SpaceID:   spaceB,
+		Name:      "Other Space",
+		Role:      json.RawMessage("null"),
+	}}, iupDecodeProjectMetadata(t, body))
+
+	headers["X-Real-Ip"] = "198.51.100.44"
+	query.Set("space_id", inactiveSpace)
+	query.Set("project_ids", inactiveID)
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, "[]", strings.TrimSpace(string(body)))
+
+	headers["X-Real-Ip"] = "198.51.100.45"
+	query.Set("space_id", "iup-unknown-space")
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, "[]", strings.TrimSpace(string(body)))
+}
+
+func TestInternalProjectsByIDHTTPAcceptsExactlyFiftyUniqueIDs(t *testing.T) {
+	setup(t)
+	seedSpace(t, spaceA, 1)
+	ids := make([]string, 50)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("iup-id-limit-%02d", i)
+		iupProject(t, ids[i], spaceA, "unrelated-creator", ids[i], "", "", 1, true)
+	}
+
+	srv := httptest.NewServer(iupMountInternalRoute(t))
+	t.Cleanup(srv.Close)
+	headers := map[string]string{
+		"X-Internal-Token": iupInternalToken,
+		"X-Real-Ip":        "198.51.100.51",
+	}
+	query := url.Values{}
+	query.Set("space_id", spaceA)
+	query.Set("project_ids", ", "+ids[0]+", ,"+strings.Join(ids[1:], ", ")+", "+ids[0]+",")
+	query.Set("page", "1")
+	query.Set("limit", "1")
+	response, body := iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	rows := iupDecodeProjectMetadata(t, body)
+	require.Len(t, rows, 50)
+	got := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		got[row.ProjectID] = true
+	}
+	for _, id := range ids {
+		require.True(t, got[id], "missing project %q", id)
+	}
+
+	headers["X-Real-Ip"] = "198.51.100.52"
+	ids = append(ids, "iup-id-limit-50")
+	query.Set("project_ids", strings.Join(ids, ","))
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusBadRequest, response.StatusCode, string(body))
+	errEnv := iupDecodeError(t, body)
+	require.Equal(t, "err.shared.param.invalid", errEnv.Error.Code)
+	require.Equal(t, "project_ids", errEnv.Error.Details["field"])
+}
+
+func TestInternalProjectsByIDHTTPBindsMixedCollationIdentitiesAndFailsClosed(t *testing.T) {
+	session := iupProbeSession(t)
+	_, err := session.InsertBySql(
+		"INSERT INTO `space` (space_id, name, creator, status) VALUES " +
+			"('s', 'active', 'creator', 1), ('ß', 'inactive', 'creator', 2)").Exec()
+	require.NoError(t, err)
+
+	insertProject := func(projectID, projectSpace, name string) {
+		_, insertErr := session.InsertBySql(
+			"INSERT INTO octo_project "+
+				"(project_id, space_id, name, description, logo, creator, status, activated_at, created_at, updated_at) "+
+				"VALUES (?, ?, ?, ?, ?, 'unrelated-creator', 1, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+			projectID, projectSpace, name, "stored description", "",
+		).Exec()
+		require.NoError(t, insertErr)
+	}
+	insertProject("IUP-ID-ASCII", "s", "ASCII case project")
+	insertProject("iup-id-cross-space", "ß", "Other identity project")
+	insertProject("project-ß", "s", "Collation-equivalent but distinct project ID")
+
+	// Assert that MySQL's general_ci equality really does collapse the hostile
+	// pairs; otherwise this fixture would not exercise the Go-side identity bind.
+	var crossSpaceMatch int
+	require.NoError(t, session.SelectBySql(
+		"SELECT COUNT(*) FROM octo_project WHERE project_id = ? AND space_id = ?",
+		"iup-id-cross-space", "s",
+	).LoadOne(&crossSpaceMatch))
+	require.Equal(t, 1, crossSpaceMatch)
+	var projectIDMatch int
+	require.NoError(t, session.SelectBySql(
+		"SELECT COUNT(*) FROM octo_project WHERE project_id = ?", "project-s",
+	).LoadOne(&projectIDMatch))
+	require.Equal(t, 1, projectIDMatch)
+
+	probeCtx := iupProbeContext(t)
+	srv := httptest.NewServer(iupMountInternalRouteWithContext(t, probeCtx))
+	t.Cleanup(srv.Close)
+	headers := map[string]string{
+		"X-Internal-Token": iupInternalToken,
+		"X-Real-Ip":        "198.51.100.61",
+	}
+	query := url.Values{}
+	query.Set("space_id", "S")
+	query.Set("project_ids", "iup-id-ascii")
+	response, body := iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, []iupHTTPProjectMetadata{{
+		ProjectID:   "IUP-ID-ASCII",
+		SpaceID:     "s",
+		Name:        "ASCII case project",
+		Description: "stored description",
+		Logo:        "",
+		Role:        json.RawMessage("null"),
+	}}, iupDecodeProjectMetadata(t, body))
+
+	headers["X-Real-Ip"] = "198.51.100.62"
+	query.Set("project_ids", "iup-id-cross-space")
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, "[]", strings.TrimSpace(string(body)),
+		"a SQL-collation-equal Space must not be treated as the resolved Space identity")
+
+	headers["X-Real-Ip"] = "198.51.100.63"
+	query.Set("project_ids", "project-s")
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+	require.Equal(t, "[]", strings.TrimSpace(string(body)),
+		"a SQL-collation-equal Project ID must not expand the ASCII FoldID request set")
+
+	// The fixture database is disposable and is dropped by iupProbeSession cleanup.
+	// Removing just the project table makes the real query fail after Space lookup.
+	_, err = session.UpdateBySql("RENAME TABLE `octo_project` TO `octo_project_offline`").Exec()
+	require.NoError(t, err)
+	headers["X-Real-Ip"] = "198.51.100.64"
+	query.Set("project_ids", "iup-id-ascii")
+	response, body = iupSocketGet(t, srv.URL, srv.Client(), iupProjectsPath+"?"+query.Encode(), headers)
+	require.Equal(t, http.StatusInternalServerError, response.StatusCode, string(body))
+	require.Equal(t, "err.shared.internal", iupDecodeError(t, body).Error.Code)
 }

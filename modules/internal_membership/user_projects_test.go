@@ -10,6 +10,7 @@ package internal_membership
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,11 +34,10 @@ func doGetProjects(t *testing.T, r *wkhttp.WKHttp, token, query string) *httptes
 	return w
 }
 
-// TestUserProjectsRejectsNonSingleOrPaddedSelectors covers every malformed
-// selector shape the contract names: missing, empty, padded on either side, and
-// repeated. The repeated case matters most: accepting one of the values would
-// answer a question the caller did not unambiguously ask.
-func TestUserProjectsRejectsNonSingleOrPaddedSelectors(t *testing.T) {
+// TestProjectListRejectsNonSingleOrPaddedSelectors covers malformed selector
+// shapes: missing or malformed Space/user selectors. Key presence is tested by
+// the multi-mode selector cases below.
+func TestProjectListRejectsNonSingleOrPaddedSelectors(t *testing.T) {
 	cases := []struct {
 		name  string
 		query string
@@ -48,7 +48,9 @@ func TestUserProjectsRejectsNonSingleOrPaddedSelectors(t *testing.T) {
 		{"leading space in space_id", "?space_id=%20space-a&uid=User-A", "space_id"},
 		{"trailing space in space_id", "?space_id=space-a%20&uid=User-A", "space_id"},
 		{"repeated space_id", "?space_id=space-a&space_id=space-b&uid=User-A", "space_id"},
-		{"missing uid", "?space_id=space-a", "uid"},
+		{"missing space_id in ID mode", "?project_ids=project-a", "space_id"},
+		{"repeated space_id in ID mode", "?space_id=space-a&space_id=space-b&project_ids=project-a", "space_id"},
+		{"missing both selectors", "?space_id=space-a", "uid|project_ids"},
 		{"empty uid", "?space_id=space-a&uid=", "uid"},
 		{"leading space in uid", "?space_id=space-a&uid=%20User-A", "uid"},
 		{"trailing space in uid", "?space_id=space-a&uid=User-A%20", "uid"},
@@ -75,6 +77,73 @@ func TestUserProjectsRejectsNonSingleOrPaddedSelectors(t *testing.T) {
 
 			require.Zero(t, s.projectCalls,
 				"a malformed selector must be rejected before any database work")
+			require.Zero(t, s.metadataCalls,
+				"a malformed selector must be rejected before any metadata lookup")
+		})
+	}
+}
+
+func TestProjectListRejectsConflictingSelectors(t *testing.T) {
+	for _, query := range []string{
+		"?space_id=space-a&uid=User-A&project_ids=project-a",
+		"?space_id=space-a&uid=User-A&project_ids=",
+		"?space_id=space-a&uid=&project_ids=project-a",
+	} {
+		t.Run(query, func(t *testing.T) {
+			store := &stubStore{}
+			response := doGetProjects(t, newRouter(newTestModule(store)), testInternalToken, query)
+
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			env := decodeError(t, response)
+			require.Equal(t, errcode.ErrSharedParamInvalid.ID, env.Error.Code)
+
+			var body struct {
+				Error struct {
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			require.Equal(t, "uid|project_ids", body.Error.Details["field"])
+			require.Zero(t, store.projectCalls,
+				"conflicting selectors must be rejected before any data lookup")
+			require.Zero(t, store.metadataCalls,
+				"conflicting selectors must be rejected before any metadata lookup")
+		})
+	}
+}
+
+func TestProjectListRejectsEmptyAndOversizedProjectIDSelectors(t *testing.T) {
+	ids := make([]string, 51)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("project-%02d", i)
+	}
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"empty", "?space_id=space-a&project_ids=,,%20"},
+		{"over 50 unique IDs", "?space_id=space-a&project_ids=" + strings.Join(ids, ",")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &stubStore{}
+			response := doGetProjects(t, newRouter(newTestModule(store)), testInternalToken, tc.query)
+
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			env := decodeError(t, response)
+			require.Equal(t, errcode.ErrSharedParamInvalid.ID, env.Error.Code)
+
+			var body struct {
+				Error struct {
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			require.Equal(t, "project_ids", body.Error.Details["field"])
+			require.Zero(t, store.projectCalls,
+				"invalid project ID selectors must be rejected before any data lookup")
+			require.Zero(t, store.metadataCalls,
+				"invalid project ID selectors must be rejected before any metadata lookup")
 		})
 	}
 }

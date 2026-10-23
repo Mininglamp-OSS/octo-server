@@ -30,8 +30,8 @@ const (
 	projectsPath = "/v1/internal/projects"
 )
 
-// stubStore is an in-memory membershipStore. Errors are settable per method so
-// each fail-closed path can be driven independently.
+// stubStore is an in-memory membershipStore. It provides the existing failure
+// seams and counts metadata calls so selector gates can prove they stop first.
 type stubStore struct {
 	epochs   map[string]int64
 	roles    map[string]int
@@ -40,13 +40,14 @@ type stubStore struct {
 	memErr   error
 	projErr  error
 
-	epochCalls   int
-	memberCalls  int
-	projectCalls int
-	lastSpaceID  string
-	lastProject  string
-	lastUIDs     []string
-	lastIDs      []string
+	epochCalls    int
+	memberCalls   int
+	projectCalls  int
+	metadataCalls int
+	lastSpaceID   string
+	lastProject   string
+	lastUIDs      []string
+	lastIDs       []string
 	// lastEpochCtx / lastMemberCtx record the context each handler passed down, so
 	// TestBothHandlersPassTheRequestContextToTheStore can assert the plumbing is
 	// real rather than trusting the signature.
@@ -113,6 +114,13 @@ func (s *stubStore) UserProjects(ctx context.Context, spaceID, uid string) ([]pr
 	return []projectpkg.UserProject{}, nil
 }
 
+func (s *stubStore) ProjectMetadata(ctx context.Context, spaceID string, projectIDs []string) ([]projectpkg.ProjectMetadata, error) {
+	s.metadataCalls++
+	s.lastSpaceID = spaceID
+	s.lastIDs = projectIDs
+	return []projectpkg.ProjectMetadata{}, nil
+}
+
 func newTestModule(store membershipStore) *Module {
 	return &Module{
 		store:         store,
@@ -136,7 +144,7 @@ func newRouter(m *Module) *wkhttp.WKHttp {
 	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	r.GET(epochsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.membershipEpochs)
 	r.POST(verifyPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.verifyProjectMemberships)
-	r.GET(projectsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listUserProjects)
+	r.GET(projectsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listProjects)
 	return r
 }
 
