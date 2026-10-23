@@ -8,10 +8,19 @@ import (
 
 const directoryAgentsPerOwner = 50
 
-// directoryAgentHostingOctoHosted is the only self-reported hosting value the
-// Space directory treats as a visible cloud agent. This is not an authz
-// signal: any holder of the bot's bf_ token can claim the value.
+// directoryAgentHostingOctoHosted is the self-reported hosting value for an
+// agent hosted by Octo.
 const directoryAgentHostingOctoHosted = "octo_hosted"
+
+// directoryAgentHostingVisiblePredicate is the single visibility predicate
+// shared by the owner keyword subquery and the agent candidate CTE. An empty
+// string is visible alongside octo_hosted because the production robot table
+// has no non-empty agent_hosting rows yet: requiring octo_hosted alone hides
+// every bot from the directory. self_hosted and third-party <vendor>_hosted
+// slugs stay hidden. agent_hosting is bot self-reported presentation
+// telemetry, never an authz/tenancy signal: any holder of the bot's bf_ token
+// can claim the value.
+const directoryAgentHostingVisiblePredicate = "(r.agent_hosting='" + directoryAgentHostingOctoHosted + "' OR r.agent_hosting='')"
 
 // The legacy user and space_member tables can carry a different collation from
 // migration-created user_verification. Pin the completed display expression so
@@ -45,7 +54,7 @@ func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) 
 			INNER JOIN robot r
 				ON r.robot_id=bot_sm.uid
 				AND r.status=1
-				AND r.agent_hosting='` + directoryAgentHostingOctoHosted + `'
+				AND ` + directoryAgentHostingVisiblePredicate + `
 			INNER JOIN ` + "`user`" + ` bot_u
 				ON bot_u.uid=r.robot_id
 				AND bot_u.robot=1
@@ -93,11 +102,11 @@ func (d *DB) queryDirectoryOwners(ctx context.Context, spaceID, keyword string) 
 }
 
 // queryDirectoryAgents returns at most directoryAgentsPerOwner details per
-// eligible owner while retaining the exact count for that owner. Only
-// octo_hosted bots with an eligible human owner in this Space are visible.
-// agent_hosting is bot self-reported telemetry and therefore filters this
-// presentation only; it must never be reused for authorization or other
-// security decisions.
+// eligible owner while retaining the exact count for that owner. Only bots with
+// an eligible human owner in this Space and a visible hosting value (octo_hosted
+// or the empty string) are returned. agent_hosting is bot self-reported
+// telemetry and therefore filters this presentation only; it must never be
+// reused for authorization or other security decisions.
 func (d *DB) queryDirectoryAgents(ctx context.Context, spaceID, loginUID, keyword string) ([]*directoryAgentModel, error) {
 	var agents []*directoryAgentModel
 	systemBots := spacepkg.SystemBotList()
@@ -113,7 +122,7 @@ func (d *DB) queryDirectoryAgents(ctx context.Context, spaceID, loginUID, keywor
 			INNER JOIN robot r
 				ON r.robot_id=bot_sm.uid
 				AND r.status=1
-				AND r.agent_hosting='` + directoryAgentHostingOctoHosted + `'
+				AND ` + directoryAgentHostingVisiblePredicate + `
 			INNER JOIN ` + "`user`" + ` bot_u
 				ON bot_u.uid=r.robot_id
 				AND bot_u.robot=1

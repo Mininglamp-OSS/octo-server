@@ -218,9 +218,16 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	require.Len(t, resp.Data, 4, "only active non-system humans are directory rows")
 
 	caller := findDirectoryMember(t, resp.Data, testutil.UID)
-	require.Equal(t, int64(0), caller.AgentCount, "empty and retracted hosting must not count as cloud agents")
+	require.Equal(t, int64(2), caller.AgentCount, "unreported and withdrawn hosting values are visible")
 	require.False(t, caller.AgentsTruncated)
-	require.Empty(t, caller.Agents)
+	require.Len(t, caller.Agents, 2)
+	unreported := findDirectoryAgent(t, caller.Agents, "bot-unreported")
+	require.Equal(t, "", unreported.Hosting, "an unreported bot keeps the empty hosting value on the wire")
+	require.Nil(t, unreported.HostingReportedAt)
+	withdrawn := findDirectoryAgent(t, caller.Agents, "bot-withdrawn")
+	require.Equal(t, "", withdrawn.Hosting, "a withdrawn bot is indistinguishable from an unreported one")
+	require.NotNil(t, withdrawn.HostingReportedAt)
+	require.Equal(t, "2026-09-04 11:00:00", *withdrawn.HostingReportedAt)
 
 	owner := findDirectoryMember(t, resp.Data, "owner-real-name")
 	require.Equal(t, "Real Name", owner.Name, "directory name must follow MemberDetailModel.DisplayName")
@@ -255,12 +262,12 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 		require.NotEqual(t, "bot-as-owner", member.UID, "a bot must not appear as a directory owner row")
 		for _, agent := range member.Agents {
 			require.NotContains(t, []string{
-				"bot-unreported", "bot-withdrawn", "bot-vendor", "bot-local",
-				"bot-inactive", "bot-removed", "bot-outside", "bot-orphan",
-				"bot-nested", "bot-as-owner",
+				"bot-vendor", "bot-local", "bot-inactive", "bot-removed",
+				"bot-outside", "bot-orphan", "bot-nested", "bot-as-owner",
 				"bot-inactive-owner", "bot-destroyed-owner", "bot-empty-owner",
 			}, agent.UID)
-			require.Equal(t, "octo_hosted", agent.Hosting)
+			require.Contains(t, []string{"octo_hosted", ""}, agent.Hosting,
+				"only octo_hosted and unreported hosting values are visible")
 		}
 	}
 
@@ -277,9 +284,15 @@ func TestSpaceDirectoryReturnsHumanOwnersAndCloudAgents(t *testing.T) {
 	}, testutil.Token)
 	require.Equal(t, http.StatusOK, onlyWithAgents.Code, onlyWithAgents.Body.String())
 	filtered := decodeDirectoryResponse(t, onlyWithAgents)
-	require.Len(t, filtered.Data, 1, "only humans who own octo_hosted bots remain")
-	require.Equal(t, "owner-real-name", filtered.Data[0].UID)
-	require.Positive(t, filtered.Data[0].AgentCount)
+	require.Len(t, filtered.Data, 2, "only humans who own visible bots remain")
+	filteredByUID := make(map[string]directoryMemberForTest, len(filtered.Data))
+	for _, member := range filtered.Data {
+		filteredByUID[member.UID] = member
+	}
+	require.Contains(t, filteredByUID, testutil.UID)
+	require.Positive(t, filteredByUID[testutil.UID].AgentCount)
+	require.Contains(t, filteredByUID, "owner-real-name")
+	require.Positive(t, filteredByUID["owner-real-name"].AgentCount)
 }
 
 func TestSpaceDirectoryKeywordFiltersHumanAndVisibleBotNames(t *testing.T) {
@@ -369,7 +382,13 @@ func TestSpaceDirectoryKeywordFiltersHumanAndVisibleBotNames(t *testing.T) {
 		"keyword":  {"Needle Empty"},
 	}, testutil.Token)
 	require.Equal(t, http.StatusOK, emptyBotName.Code, emptyBotName.Body.String())
-	require.Empty(t, decodeDirectoryResponse(t, emptyBotName).Data, "unreported Bot names must not match")
+	emptyBotResp := decodeDirectoryResponse(t, emptyBotName)
+	require.Len(t, emptyBotResp.Data, 1, "unreported Bot names must match")
+	emptyBotOwner := findDirectoryMember(t, emptyBotResp.Data, "owner-empty-only")
+	require.Equal(t, int64(1), emptyBotOwner.AgentCount)
+	require.Len(t, emptyBotOwner.Agents, 1)
+	require.Equal(t, "bot-empty-keyword", emptyBotOwner.Agents[0].UID)
+	require.Equal(t, "", emptyBotOwner.Agents[0].Hosting)
 
 	nestedBotName := getSpaceDirectory(t, srv, testCtx, url.Values{
 		"space_id": {spaceID},
