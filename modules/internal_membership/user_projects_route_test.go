@@ -97,7 +97,7 @@ func resetBucket(t *testing.T, ctx *config.Context, clientIP string) {
 }
 
 // TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection
-// covers all three shipped routes: a bad token consumes the strict bucket (401),
+// covers all shipped routes: a bad token consumes the strict bucket (401),
 // the following valid-token request is refused by the bucket (429), and both
 // rejects already carry the body read deadline. The handler is never reached.
 func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(t *testing.T) {
@@ -132,6 +132,11 @@ func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(
 			name: "projects", method: http.MethodGet,
 			path: projectsPath + "?space_id=space-a&uid=User-A",
 			ip:   "198.51.100.23",
+		},
+		{
+			name: "project members", method: http.MethodGet,
+			path: projectMembershipsPath + "?space_id=space-a&project_id=p1",
+			ip:   "198.51.100.26",
 		},
 	}
 	for _, tc := range routes {

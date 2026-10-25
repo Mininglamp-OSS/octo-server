@@ -25,9 +25,10 @@ import (
 const testInternalToken = "0123456789abcdef0123456789abcdef" // 32 bytes
 
 const (
-	epochsPath   = "/v1/internal/membership/epochs"
-	verifyPath   = "/v1/internal/project-memberships/_verify"
-	projectsPath = "/v1/internal/projects"
+	epochsPath             = "/v1/internal/membership/epochs"
+	verifyPath             = "/v1/internal/project-memberships/_verify"
+	projectsPath           = "/v1/internal/projects"
+	projectMembershipsPath = "/v1/internal/project-memberships"
 )
 
 // stubStore is an in-memory membershipStore. It provides the existing failure
@@ -145,6 +146,7 @@ func newRouter(m *Module) *wkhttp.WKHttp {
 	r.GET(epochsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.membershipEpochs)
 	r.POST(verifyPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.verifyProjectMemberships)
 	r.GET(projectsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listProjects)
+	r.GET(projectMembershipsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listProjectMemberships)
 	return r
 }
 

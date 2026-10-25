@@ -129,6 +129,8 @@ func New(ctx *config.Context) *Module {
 // there is no session identity for a user-scoped middleware to read. On the list
 // route uid is a token-authorized query target, or project_ids names metadata
 // candidates; neither is caller identity. The required space_id scopes both modes.
+// The Project member-list route binds its required space_id and project_id
+// together; its peer authorizes the end user.
 func (m *Module) Route(r *wkhttp.WKHttp) {
 	ipLimit := m.ipRateLimit(r)
 	deadline := boundBodyReadTime()
@@ -136,6 +138,7 @@ func (m *Module) Route(r *wkhttp.WKHttp) {
 	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
 	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 	internal.GET("/projects", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjects)
+	internal.GET("/project-memberships", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjectMemberships)
 }
 
 // ipRateLimit builds the per-IP strict limiter shared by every endpoint.

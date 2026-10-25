@@ -2,6 +2,7 @@ package project
 
 import (
 	"errors"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -63,10 +64,7 @@ func (p *Project) listMembersReadHandler(c *wkhttp.Context) {
 		p.respondProjectReadError(c, err, "查询项目成员失败", projectID, uid)
 		return
 	}
-	resps := make([]*MemberResp, 0, len(result.Rows))
-	for _, member := range result.Rows {
-		resps = append(resps, projectMemberReadResponse(member))
-	}
+	resps := projectMemberListResponse(result.Rows)
 	c.Writer.Header().Set("X-Total-Count", strconv.FormatInt(result.Total, 10))
 	c.Response(resps)
 }
@@ -122,8 +120,14 @@ func (p *Project) respondProjectReadError(c *wkhttp.Context, err error, message,
 }
 
 func projectReadPageParams(c *wkhttp.Context) projectReadPage {
+	page := MemberReadPageParams(c.Request.URL.Query())
+	return projectReadPage{Offset: page.Offset, Limit: page.Limit}
+}
+
+// MemberReadPageParams preserves the ordinary Project page/limit contract.
+func MemberReadPageParams(query url.Values) MemberReadPage {
 	limit := int64(projectDefaultPageLimit)
-	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
 		if value, err := strconv.ParseInt(raw, 10, 64); err == nil && value > 0 {
 			limit = value
 		}
@@ -132,7 +136,7 @@ func projectReadPageParams(c *wkhttp.Context) projectReadPage {
 		limit = int64(projectMaxPageLimit)
 	}
 	page := int64(1)
-	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+	if raw := strings.TrimSpace(query.Get("page")); raw != "" {
 		if value, err := strconv.ParseInt(raw, 10, 64); err == nil && value > 0 {
 			page = value
 		}
@@ -140,5 +144,13 @@ func projectReadPageParams(c *wkhttp.Context) projectReadPage {
 	if page > int64(projectMaxPage) {
 		page = int64(projectMaxPage)
 	}
-	return projectReadPage{Offset: (page - 1) * limit, Limit: limit}
+	return MemberReadPage{Offset: (page - 1) * limit, Limit: limit}
+}
+
+func projectMemberListResponse(rows []*projectReadMemberRow) []*MemberResp {
+	resps := make([]*MemberResp, 0, len(rows))
+	for _, row := range rows {
+		resps = append(resps, projectMemberReadResponse(row))
+	}
+	return resps
 }

@@ -46,3 +46,15 @@ type projectReadProjectResult struct {
 	Agents    int
 	Pinned    bool
 }
+
+// MemberReadPage is the bounded roster page accepted by the cross-module service.
+type MemberReadPage struct {
+	Offset int64
+	Limit  int64
+}
+
+// MemberListResult exposes the existing wire projection, not internal database rows.
+type MemberListResult struct {
+	Members []*MemberResp
+	Total   int64
+}

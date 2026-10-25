@@ -7,17 +7,45 @@
 
 ## 0. 读取接口与事件通道，各管一件事
 
+下表中的 Project 服务间内部读取接口统一由 `modules/internal_membership` 承载。
+模块名称沿用现有命名，职责覆盖 Project 相关的 internal 业务入口，包括 epochs、verify、
+projects 和成员列表。具体成员读取业务保留在 `modules/project`。
+成员列表 HTTP handler 直接调用 `modules/project.ListProjectMembersInSpace`，复用 Project
+已有的成员读取与响应组装。原有 verify、projects 等接口继续使用现有 store，本次成员列表不增加 store 转调层。
+
 | 通道 | 方向 | 回答的问题 | 语义 |
 |---|---|---|---|
 | `GET /v1/internal/membership/epochs` | 对端拉 | 「这个项目的成员关系变了吗」 | **变更检测器** |
 | `POST /v1/internal/project-memberships/_verify` | 对端拉 | 「这些人现在还在这个项目里吗」 | **权威判定** |
 | `GET /v1/internal/projects?space_id=...&uid=...` | 对端拉 | 「这个用户在指定 Space 有效加入了哪些已激活项目」 | **全量关系与基础信息列表** |
+| `GET /v1/internal/project-memberships?space_id=...&project_id=...` | 对端拉 | 「这个 Project 的成员列表是什么」 | **与普通成员接口一致的分页列表** |
 | 生命周期事件 | 我方推 | 「项目发生了什么」 | **变更通知** |
 
 **事件不是数据同步。** 事件告诉你「有事发生了、以及发生的顺序」，需要具体内容就回来拉。
 这条区分是硬约定，理由见 §5。
 
 Project 全量列表使用现有 membership `X-Internal-Token` 及启用条件，直接返回含 `project_id`、`space_id`、`name`、`description`、`logo`、`role` 的数组，不分页。资格与项目来自同一 RR 只读快照；查询失败返回 `500`，真实空结果返回 `200 []`。完整契约与验收见 [Internal 指定用户 Project 全量列表设计](specs/2026-10-21-project-internal-user-list-design.md)。列表表示当前关系事实，不替代资源 ACL。
+
+### Project 成员列表
+
+`GET /v1/internal/project-memberships?space_id=...&project_id=...&page=1&limit=50`
+使用相同的 internal 凭证、启用条件、共享 strict-IP 限流及读取超时。Fleet 必须先校验调用者的
+Project 访问权限（包括需要时验证 owner 兜底），再发起服务间读取；该接口不接受用户或 Bot token，
+也不需要 OBO。Server 在同一 RR 只读事务内校验 active Space 与 Project 的绑定并读取成员。
+成员 SQL、模型和响应组装保留在 `modules/project`，internal 接口只调用其导出的读取服务。
+
+成功响应与 `GET /v1/projects/{id}/members` 共用读取和投影：直接返回数组，附
+`X-Total-Count` 和 `Cache-Control: no-store`。字段为 `uid`、`name`、`role`、`invite_uid`、
+`robot`、`owner_uid`、`collaboration_roles`、`created_at`、`joined_at`，协作角色包含
+`role_id`、可选 `builtin_key`、`name`、`source`。排序、成员过滤和时间格式保持一致，
+空页及空角色返回 `[]`，不包装为 `{items,total}`。
+
+`page/limit` 默认 `1/50`，上限 `100000/200`；非法或非正分页值沿用普通接口的默认值。
+必填 scope 参数须单值、非空且无首尾空白，最长 256 字节；未知或重复参数、错误 query 编码返回
+`400`。无效凭证返回 `401`；Project 不存在、不活跃、跨 Space 或 Space 不活跃返回 `404`；
+限流返回 `429`；数据库失败返回 `500`，不返回空成功。普通成员接口的用户鉴权和权限保持原样。
+成员列表是关系事实，资源授权仍使用既有 ACL / `_verify`。完整验收见
+[实现说明](../.octospec/tasks/internal-project-memberships-list/brief.md)。
 
 ---
 
