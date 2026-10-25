@@ -19,9 +19,11 @@
 // peer service reads a real 401/400/500 like it does from every other
 // /v1/internal endpoint in this repository.
 //
-// Data access goes through pkg/project, never modules/project — importing the
-// module would recreate the cycle that pkg/project exists to avoid, and
-// TestPkgProjectDoesNotImportModulesProject pins that direction.
+// Scalar membership facts use pkg/project. The full roster calls the exported
+// modules/project read service, which owns its DAO and response projection;
+// this HTTP module never copies those reads. pkg/project remains independent
+// of modules/project. Cross-module HTTP tests live in the external test package
+// so the production dependency is not reversed by in-package test imports.
 //
 // # Consumers
 //

@@ -3,6 +3,7 @@
 ## [Unreleased] - 2026-09-11
 
 ### Project 协作
+- 新增服务间 `GET /v1/internal/project-memberships?space_id=...&project_id=...`，复用 internal 鉴权与限流，返回与普通 Project 成员接口一致的字段、分页和 `X-Total-Count`；调用方先做权限校验，Server 再校验 active Space/Project 范围。
 - 新增服务间 Project 全量列表 `GET /v1/internal/projects?space_id=...&uid=...`：使用 membership internal token，返回目标用户在指定 Space 有效加入且已完成激活的项目基础信息及角色；不分页，资格和项目来自同一 RR 只读快照，沿用共享 strict IP 限流与 i18n 错误响应。先解析实际 legacy Space，实际 Project 席位 UID 及 Project/席位双方 Space 经 ASCII-only 身份绑定后投影，支持混合 collation 下的 legacy 账号与 Space 隔离；完整 query 解析失败时返回 `400`。
 - 扩展 `GET /v1/internal/projects` 支持互斥的 `project_ids` 批量模式（每批最多 50 个 ID）：按指定 Space 批量读取当前存储的有效、已激活 Project 基础资料，显式返回 `role:null`，不查询用户或成员关系、不缓存或回写名称；原 `uid` 模式保持不变。
 - Project 支持同一 Space 内重名、字面名称搜索及 `X-Total-Count` 列表计数；GET 列表为纯读，仅返回已有且当前有权访问的显式创建 Project，空列表不产生写入。

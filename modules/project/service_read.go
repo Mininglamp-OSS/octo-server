@@ -211,11 +211,15 @@ func (p *Project) readProjectMember(spaceID, projectID, actorUID, targetUID stri
 }
 
 func (p *Project) readProjectMemberRolesTx(tx *dbr.Tx, projectID string, members []*projectReadMemberRow) error {
+	return populateProjectMemberRolesTx(p.db, tx, projectID, members)
+}
+
+func populateProjectMemberRolesTx(db *DB, tx *dbr.Tx, projectID string, members []*projectReadMemberRow) error {
 	uids := make([]string, 0, len(members))
 	for _, member := range members {
 		uids = append(uids, member.UID)
 	}
-	roles, err := p.db.memberCollaborationRolesReadTx(tx, projectID, uids)
+	roles, err := db.memberCollaborationRolesReadTx(tx, projectID, uids)
 	if err != nil {
 		return err
 	}
@@ -246,11 +250,8 @@ func (p *Project) readProjectMembers(spaceID, projectID, uid string, page projec
 	if _, err := p.readProjectAccessTx(tx, projectID, uid, spaceID); err != nil {
 		return nil, err
 	}
-	result, err := p.db.listProjectMembersReadTx(tx, projectID, page)
+	result, err := readProjectMembersTx(p.db, tx, projectID, page)
 	if err != nil {
-		return nil, err
-	}
-	if err := p.readProjectMemberRolesTx(tx, projectID, result.Rows); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -263,4 +264,16 @@ type projectReadAccess struct {
 	Project     *Model
 	ProjectRole int
 	SpaceRole   int
+}
+
+// readProjectMembersTx shares roster reads inside each entry's authorization snapshot.
+func readProjectMembersTx(db *DB, tx *dbr.Tx, projectID string, page projectReadPage) (*projectReadMembersResult, error) {
+	result, err := db.listProjectMembersReadTx(tx, projectID, page)
+	if err != nil {
+		return nil, err
+	}
+	if err := populateProjectMemberRolesTx(db, tx, projectID, result.Rows); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
