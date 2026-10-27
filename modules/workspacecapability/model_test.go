@@ -190,3 +190,26 @@ func TestNormalizedRejectsMalformedConnectorURLs(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeDefinitionStripsURLCredentialsCaseInsensitively(t *testing.T) {
+	for _, key := range []string{"url", "URL", "Url"} {
+		t.Run(key, func(t *testing.T) {
+			item := ImportItem{Kind: KindConnector, Name: "case-url", Source: SourceLocal, SourceID: "case-url",
+				Definition: map[string]any{
+					key:      "https://user:password@example.com/mcp?token=secret&region=us#fragment",
+					"nested": map[string]any{key: "https://example.com/mcp?access_token=secret&region=eu"},
+				}}
+			resource, err := item.normalized(time.Now(), "u1")
+			if err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if got := resource.Definition[key]; got != "https://example.com/mcp?region=us" {
+				t.Fatalf("%s credentials leaked: %v", key, got)
+			}
+			nested := resource.Definition["nested"].(map[string]any)
+			if got := nested[key]; got != "https://example.com/mcp?region=eu" {
+				t.Fatalf("nested %s credentials leaked: %v", key, got)
+			}
+		})
+	}
+}

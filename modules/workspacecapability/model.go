@@ -313,7 +313,7 @@ func sanitizeValue(value any, key string, depth int) any {
 		}
 		return out
 	case string:
-		if key == "url" {
+		if strings.EqualFold(key, "url") {
 			return stripURLCredentials(typed)
 		}
 		return typed
