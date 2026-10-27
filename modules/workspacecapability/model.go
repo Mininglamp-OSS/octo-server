@@ -159,6 +159,9 @@ func (item ImportItem) normalized(now time.Time, createdBy string) (Resource, er
 	definition := map[string]any(nil)
 	var auth *Auth
 	if item.Kind == KindConnector {
+		if err := validateDefinitionURLs(item.Definition, 0); err != nil {
+			return Resource{}, err
+		}
 		definition = sanitizeDefinition(item.Definition)
 		auth = normalizeAuth(item.Auth)
 	} else if item.Source == SourceLocal && strings.TrimSpace(item.Content) == "" {
@@ -223,6 +226,37 @@ func snapshotOf(resource Resource) (string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func validateDefinitionURLs(value any, depth int) error {
+	if depth > 20 {
+		return invalidf("connector definition is too deeply nested")
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if strings.EqualFold(key, "url") {
+				text, ok := child.(string)
+				if !ok {
+					return invalidf("connector definition contains an invalid URL")
+				}
+				parsed, err := url.Parse(text)
+				if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+					return invalidf("connector definition contains an invalid URL")
+				}
+			}
+			if err := validateDefinitionURLs(child, depth+1); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if err := validateDefinitionURLs(child, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func sanitizeDefinition(input map[string]any) map[string]any {
@@ -363,7 +397,7 @@ var sensitiveQueryKeys = map[string]struct{}{
 func stripURLCredentials(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return ""
 	}
 	parsed.User = nil
 	parsed.Fragment = ""

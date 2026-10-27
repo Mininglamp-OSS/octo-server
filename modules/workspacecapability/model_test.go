@@ -170,3 +170,23 @@ func TestValidScopeIDRejectsWhitespacePaddedIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizedRejectsMalformedConnectorURLs(t *testing.T) {
+	for _, raw := range []string{
+		"https://user:example-password@example.invalid:bad/mcp?token=example-token",
+		"https://example.com/%zz?token=example-token",
+	} {
+		item := ImportItem{Kind: KindConnector, Name: "bad-url", Source: SourceLocal, SourceID: "bad-url", Definition: map[string]any{"url": raw}}
+		_, err := item.normalized(time.Now(), "u1")
+		if err == nil {
+			t.Fatalf("expected validation error for %q", raw)
+		}
+		var validation *ValidationError
+		if !errors.As(err, &validation) {
+			t.Fatalf("expected ValidationError, got %T", err)
+		}
+		if strings.Contains(err.Error(), "example-password") || strings.Contains(err.Error(), "example-token") {
+			t.Fatalf("validation error echoed credentials: %v", err)
+		}
+	}
+}
