@@ -7,6 +7,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -47,6 +48,8 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("/common/system_setting", m.listSystemSettings)
 		auth.POST("/common/system_setting", m.updateSystemSettings)
 		auth.POST("/common/system_setting/test_email", m.testSystemSettingEmail)
+		auth.GET("/mcp-policy/default", appwkhttp.SharedUIDRateLimiter(r, m.ctx), m.getMCPPolicyDefault)
+		auth.PUT("/mcp-policy/default", appwkhttp.SharedUIDRateLimiter(r, m.ctx), m.putMCPPolicyDefault)
 	}
 }
 func (m *Manager) deleteAppModule(c *wkhttp.Context) {

@@ -603,6 +603,15 @@ other = "A request with this idempotency key is still in progress; please retry.
 ["err.server.integration.user_not_linked"]
 other = "User is not linked to an Octo account."
 
+["err.server.mcp.policy_conflict"]
+other = "MCP policy changed. Read the current generation and try again."
+
+["err.server.mcp.policy_invalid"]
+other = "Invalid MCP policy request."
+
+["err.server.mcp.policy_unavailable"]
+other = "MCP policy is unavailable."
+
 ["err.server.message.banword_not_found"]
 other = "The banned word does not exist."
 
