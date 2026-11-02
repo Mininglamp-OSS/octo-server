@@ -249,6 +249,25 @@ func TestResolveDeadlineAndCancellation(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT context_mode, generation").WillDelayFor(50 * time.Millisecond).WillReturnRows(sqlmock.NewRows([]string{"context_mode", "generation"}).AddRow("strict", 7))
 	mock.ExpectRollback()
+	t.Cleanup(func() {
+		// database/sql may return ErrTxDone before its cancellation goroutine
+		// reaches the driver rollback. Wait before mockStore closes the DB.
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		poll := time.NewTicker(time.Millisecond)
+		defer poll.Stop()
+		for {
+			err := mock.ExpectationsWereMet()
+			if err == nil {
+				return
+			}
+			select {
+			case <-deadline.C:
+				t.Fatalf("waiting for cancellation rollback: %v", err)
+			case <-poll.C:
+			}
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	if _, err := s.Resolve(ctx, "bot_B"); err != ErrUnavailable {
