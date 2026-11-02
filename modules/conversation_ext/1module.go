@@ -8,6 +8,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 )
 
 //go:embed sql
@@ -68,6 +69,10 @@ func (fr *followRouter) Route(r *wkhttp.WKHttp) {
 	grp.POST("/thread", fr.f.FollowThread)
 	grp.DELETE("/thread", fr.f.UnfollowThread)
 	grp.PUT("/sort", fr.f.UpdateSort)
+	folded := &foldedAPI{db: NewDB(fr.ctx), authorize: GetGlobalConvExtService().authorizeFold}
+	chats := r.Group("/v1/conversation/folded", fr.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(fr.ctx), appwkhttp.SharedUIDRateLimiter(r, fr.ctx))
+	chats.GET("", folded.list)
+	chats.PUT("", folded.set)
 }
 
 func init() {
