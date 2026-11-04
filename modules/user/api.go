@@ -25,6 +25,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mcppolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -5148,22 +5150,25 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 }
 
 type authVerifyBotReq struct {
-	BotToken string `json:"bot_token"`
+	BotToken         string `json:"bot_token"`
+	IncludeMCPPolicy bool   `json:"include_mcp_policy"`
 }
 
 type authVerifyBotResp struct {
-	BotUID    string `json:"bot_uid"`
-	BotName   string `json:"bot_name"`
-	OwnerUID  string `json:"owner_uid"`
-	OwnerName string `json:"owner_name"`
-	SpaceID   string `json:"space_id"`
+	BotUID    string            `json:"bot_uid"`
+	BotName   string            `json:"bot_name"`
+	OwnerUID  string            `json:"owner_uid"`
+	OwnerName string            `json:"owner_name"`
+	SpaceID   string            `json:"space_id"`
+	MCPPolicy *mcppolicy.Policy `json:"mcp_policy,omitempty"`
 }
 
 // authVerifyBot validates a Bot token (BotFather Bearer token) and returns bot + owner info.
 func (u *User) authVerifyBot(c *wkhttp.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	var req authVerifyBotReq
 	if err := c.BindJSON(&req); err != nil {
-		u.Warn("authVerifyBot 请求体格式错误", zap.Error(err))
+		u.Warn("invalid verify-bot request")
 		respondUserRequestInvalid(c, "")
 		return
 	}
@@ -5184,6 +5189,18 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid bot token"})
 		return
+	}
+
+	// The legacy/debug identity path must never access the new tables.
+	var mcpPolicy *mcppolicy.Policy
+	if req.IncludeMCPPolicy {
+		p, err := (mcppolicy.Store{Session: u.db.session}).Resolve(c.Request.Context(), botInfo.RobotID)
+		if err != nil {
+			u.Error("mcp policy unavailable")
+			httperr.ResponseErrorL(c, errcode.ErrMCPPolicyUnavailable, nil, nil)
+			return
+		}
+		mcpPolicy = &p
 	}
 
 	// Get bot display name
@@ -5216,6 +5233,7 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 		OwnerUID:  botInfo.CreatorUID,
 		OwnerName: ownerName,
 		SpaceID:   spaceID,
+		MCPPolicy: mcpPolicy,
 	})
 }
 

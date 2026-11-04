@@ -1568,3 +1568,12 @@ other = "该项目不可用。"
 
 ["err.server.group.project_conflict"]
 other = "群与项目的关联状态已变化，请刷新后重试。"
+
+["err.server.mcp.policy_invalid"]
+other = "MCP 策略请求无效。"
+
+["err.server.mcp.policy_conflict"]
+other = "MCP 策略已变更，请读取当前版本后重试。"
+
+["err.server.mcp.policy_unavailable"]
+other = "MCP 策略暂不可用。"

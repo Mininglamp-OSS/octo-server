@@ -436,6 +436,9 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.GET("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.listBotSettings)
 		auth.PUT("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.updateBotSettings)
 		auth.DELETE("/robot/:robot_id/settings/:key", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteBotSetting)
+		auth.GET("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.getMCPPolicy)
+		auth.PUT("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.putMCPPolicy)
+		auth.DELETE("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteMCPPolicy)
 	}
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))

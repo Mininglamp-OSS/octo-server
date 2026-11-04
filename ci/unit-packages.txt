@@ -35,6 +35,7 @@
 ./pkg/markdown
 ./pkg/mentionrewrite
 ./pkg/metrics
+./pkg/mcppolicy
 ./pkg/network
 ./pkg/obopayload
 ./pkg/pool
