@@ -1,6 +1,6 @@
 module github.com/Mininglamp-OSS/octo-server
 
-go 1.25
+go 1.25.0
 
 require (
 	firebase.google.com/go/v4 v4.13.0
@@ -54,8 +54,8 @@ require (
 	golang.org/x/crypto v0.36.0
 	golang.org/x/image v0.5.0
 	golang.org/x/oauth2 v0.13.0
-	golang.org/x/sync v0.19.0
-	golang.org/x/text v0.32.0
+	golang.org/x/sync v0.22.0
+	golang.org/x/text v0.41.0
 	google.golang.org/api v0.122.0
 	google.golang.org/grpc v1.57.0
 	google.golang.org/protobuf v1.31.0
