@@ -74,7 +74,7 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 	// case, this route has no such case: a settings PUT that mentions nothing is a
 	// client bug worth reporting, not a shape to accept silently. Stated because the
 	// previous wording claimed the wider behaviour and the test sends `{}`.
-	if req.Pinned != nil && p.rejectArchivedWrite(c, entryProjectSetting, row) {
+	if req.Pinned != nil && *req.Pinned && p.rejectArchivedWrite(c, entryProjectSetting, row) {
 		return
 	}
 	if req.Pinned != nil || req.ArchiveNoticeDismissedVersion != nil {
@@ -154,7 +154,7 @@ func (p *Project) applyProjectSettings(row *Model, uid string, req settingReq) (
 	if locked == nil || locked.SpaceID != row.SpaceID {
 		return nil, errProjectGone
 	}
-	if req.Pinned != nil && locked.ArchivedAt.Valid {
+	if req.Pinned != nil && *req.Pinned && locked.ArchivedAt.Valid {
 		return nil, errProjectArchived
 	}
 	if version := req.ArchiveNoticeDismissedVersion; version != nil &&
@@ -169,12 +169,14 @@ func (p *Project) applyProjectSettings(row *Model, uid string, req settingReq) (
 		return nil, errMemberNotFound
 	}
 	if req.Pinned != nil {
+		shouldUpsert := !*req.Pinned
 		if *req.Pinned {
 			already, err := p.db.queryProjectPinnedReadTx(tx, row.ProjectID, uid)
 			if err != nil {
 				return nil, err
 			}
-			if !already {
+			shouldUpsert = !already
+			if shouldUpsert {
 				n, err := p.db.countPinnedInSpaceTx(tx, locked.SpaceID, uid)
 				if err != nil {
 					return nil, err
@@ -184,8 +186,10 @@ func (p *Project) applyProjectSettings(row *Model, uid string, req settingReq) (
 				}
 			}
 		}
-		if err := p.db.upsertProjectUserSettingTx(tx, row.ProjectID, uid, *req.Pinned); err != nil {
-			return nil, err
+		if shouldUpsert {
+			if err := p.db.upsertProjectUserSettingTx(tx, row.ProjectID, uid, *req.Pinned); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if version := req.ArchiveNoticeDismissedVersion; version != nil {

@@ -151,15 +151,10 @@ const sqlCountPinnedInSpace = "SELECT COUNT(*) FROM octo_project_user_setting s 
 // through octo_project to resolve each pinned Project's Space, so the setting row
 // does not duplicate the Project's space_id fact.
 //
-// Not "every pinned row". The quota predicate mirrors the Project list predicate:
-// p.status is normal, the Space matches, and the caller has an active Project seat
-// whose removal is not in progress. A row for a Project whose seat is closing or
-// removed is no longer actionable through the membership-only Project routes and
-// must not consume a slot.
-//
-// An active member's pin remains counted because that same membership row keeps the
-// Project in the caller's list. The count is only a quota check; it does not grant
-// access or widen the settings endpoint beyond the Project membership gate.
+// Normal Projects in this Space count while the caller's Project seat is active
+// and not closing. Both active and archived Projects retain their personal pins;
+// a current member can explicitly unpin an archived Project to release a slot.
+// The count is only a quota check and grants no Project or settings access.
 //
 // All three tables are octo_project*, i.e. all general_ci, so no COLLATE: an
 // explicit one has coercibility 0 and would cost octo_project its primary key on

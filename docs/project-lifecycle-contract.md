@@ -237,6 +237,7 @@ octo-server **权威持有项目名与描述，且不通过任何出站通道发
 - 真实归档与恢复分别递增 `lifecycle_version`，同事务写入 `project.archived` / `project.restored` outbox；重复目标状态不增版本或重复事件。`member_epoch` 不因归档或恢复变化。
 - `archive_version` 记录最近一次归档时的生命周期版本，支撑成员级提醒关闭；恢复保留该轮次，再次归档替换为新版本。
 - 用户 API 为 `PUT /v1/projects/:id/archive`（`{"archived":true|false}`，仅当前有效真人 owner；幂等重复不增版本）、`GET /v1/space/:space_id/projects?archive_status=active|archived|all`（默认 active）及 `GET /v1/space/:space_id/projects/archive-notices`；详情、列表和内部用户项目关系包含 lifecycle/archive 字段。归档期间仅 owner 可恢复，成员可关闭本人当前轮次提醒，旧轮次关闭冲突；pin 与提醒偏好互不覆盖。
+- 归档期间有效成员可提交 `pinned:false` 取消本人置顶、释放既有个人配额，不能提交 `pinned:true` 新增置顶。恢复不复活已取消偏好；重复置顶活跃项目不刷新 `pinned_at` 或改变顺序。以上只影响本人设置，不改成员、生命周期版本或工作空间业务数据。
 - 内部 `GET /v1/internal/projects/:project_id/lifecycle?space_id=...` 使用既有 membership internal token、strict-IP 限流及请求超时；所有响应 `Cache-Control: no-store`。成功仅返回 `project_id`、`space_id`、`lifecycle_version`、`archive_version`、`archived_at`。仅有效、已激活且父 Space 活跃的 normal Project 返回 200；不存在/跨 Space/未激活/父 Space 不可用返回 404，凭证失败 401，scope 参数无效 400，存储失败 500。该接口不要求成员席位且不携带项目内容或用户数据。
 - 归档/恢复要求 Project 写开关与生命周期事件集成有效、匹配的 Fleet Workspace 已就绪；失败不改变状态。归档不改变 `member_epoch`。Fleet 新业务写与执行准入需校验权威生命周期状态，并要求本地已应用版本追平；不能仅依赖延迟到达的事件或成员资格缓存。权威读取不推进消费版本。归档事务成功后记录 last_applied_archive_version；恢复必须匹配 payload.archive_version，缺少前序归档时回滚该次事件接收事务并返回可重试 503，不推进版本或固化失败回执。快速恢复及重试终态都不能越过归档副作用。
 - metadata_updated 及其他版本推进不能跨越尚未应用的归档/恢复。即使归档/恢复投递耗尽，后续资料事件也须满足冻结轮次/状态与本地副作用一致，否则可重试 503，不抬高 external_version。启用前排空旧空 payload 事件并退出旧实例；不能投递时改写已冻结 payload。

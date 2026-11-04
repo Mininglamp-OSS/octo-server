@@ -14,5 +14,22 @@
   "archive_reminders_per_member_and_round": true,
   "metadata_barrier_rejected_then_applied": true,
   "final_workspace_status": "active",
+  "pin_review_smoke": {
+    "event": "OCTO59_NATIVE_PROJECT_PIN_REVIEW_ACCEPTED",
+    "project_ids": [
+      "436e28b4-d595-421a-86db-f0fcfb7934de",
+      "9f71e209-fd8c-4da2-8799-6afd848914e3",
+      "0bdd8756-00b7-46ca-bbee-9ef39ae8cc6e"
+    ],
+    "quota_limit": 2,
+    "quota_rejection_before_unpin": true,
+    "archived_personal_unpin_frees_slot": true,
+    "active_pin_after_unpin_succeeds": true,
+    "archived_pin_true_rejected": true,
+    "repeat_pin_preserves_pinned_at": true,
+    "member_seats_unchanged": true,
+    "pinned_count_after_scenario": 2,
+    "http_statuses": [200, 400, 200, 200, 200, 400, 200]
+  },
   "scope": "Isolated Server/Fleet/Drive canonical lifecycle API, authentic signed event delivery/replay, archived transfer/leave and per-member archive reminder rounds."
 }
