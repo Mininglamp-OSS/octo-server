@@ -4,16 +4,9 @@ package space
 //
 // # What it is for
 //
-// The writer census in modules/project answers "did a new statement start writing
-// space_member?". It cannot answer the question this file exists for: "did a new path
-// flip a seat WITHOUT going through the funnel?" — because such a path's statement is
-// indistinguishable from a sanctioned one by regexp alone.
-//
-// This asserts the funnel property directly and mechanically: `runSeatTransitionTxSteps`
-// has exactly one caller file, and inside it exactly two call sites, one per direction.
-// A door that writes the status itself and then calls the steps by hand fails here. A
-// door that writes the status and forgets the steps fails the census next door. Between
-// them the two ways to bypass the funnel are both covered.
+// These checks constrain the call shape of the established seat-transition
+// funnel. They do not enumerate every possible SQL writer. The owning modules'
+// engine tests exercise the resulting seat status and Project epoch changes.
 //
 // # Why this shape rather than counting again
 //
@@ -88,11 +81,8 @@ func TestSeatTransitionStepsHaveOneCaller(t *testing.T) {
 
 // TestSeatDoorsUseTheFunnel pins the other direction: the known doors call it.
 //
-// Named explicitly rather than discovered, because "which functions are seat doors" is
-// exactly the enumeration that kept losing elements. The point is not that this list is
-// complete — TestSeatTransitionStepsHaveOneCaller and the writer census cover a door
-// that is missing from it. The point is that a door being SILENTLY REWIRED away from the
-// funnel, which neither of those would catch, fails here.
+// This list covers established seat doors. It detects those call sites being
+// rewired away from the funnel, but does not discover arbitrary new SQL writers.
 func TestSeatDoorsUseTheFunnel(t *testing.T) {
 	doors := map[string][]string{
 		"db_manager.go": {

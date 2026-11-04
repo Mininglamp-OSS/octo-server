@@ -10,8 +10,10 @@
 //     正常运营依赖 bundle 里的 translate.<lang>.toml，不要塞业务文案到这里。
 //   - SafeDetailKeys 是 details 字段白名单——renderer 渲染时只透传白名单内的 key，
 //     防止业务层不小心把 uid/token/raw_err 泄露给客户端。
-//   - Internal=true 标记 5xx 一类错误；renderer 看到 Internal=true 时输出
-//     占位文案，避免内部 message 泄露给客户端（D11/D13）。
+//   - 约定 5xx 错误默认标记 Internal=true：renderer 输出通用内部错误文案并丢弃 details。
+//     当前唯一 Project 公开例外是 err.server.project.not_ready 这一预期就绪 503：
+//     它保留固定本地化提示且仍不输出 details；其它 Project 5xx（包括任意其它 503）
+//     都应保持通用内部响应。
 //
 // 调用顺序约定：codes 包通过 init() 注册；errcode 包同样在 init() 注册业务码；
 // init 顺序由 Go 包依赖图决定（registry → shared → server），重复注册 panic
@@ -47,16 +49,16 @@ var idPattern = regexp.MustCompile(`^err\.(shared|server)\.[a-z0-9_]+(\.[a-z0-9_
 // 字段语义：
 //   - ID:              全局唯一稳定 key，如 "err.shared.auth.required"。
 //   - HTTPStatus:      canonical HTTP status（401/403/429/...）。兼容期内 renderer
-//                      可能把响应头固定为 400（D14），但 error.http_status body 字段
-//                      仍暴露真值。
+//     可能把响应头固定为 400（D14），但 error.http_status body 字段
+//     仍暴露真值。
 //   - DefaultMessage:  source 文案（en-US），AST extractor 生成的 message marker
-//                      用它做 Other 字段；运行期当 bundle 缺译时也用它做最后兜底。
+//     用它做 Other 字段；运行期当 bundle 缺译时也用它做最后兜底。
 //   - DefaultMessages: 极端故障兜底（bundle 加载失败 / 全部 lang 缺译时使用）。
-//                      key 是 BCP-47 lang tag，如 "zh-CN"。
+//     key 是 BCP-47 lang tag，如 "zh-CN"。
 //   - SafeDetailKeys:  ResponseErrorL 调用方传入 details 时，renderer 只透传
-//                      此列表内的 key；其余键被丢弃并记 i18n_unsafe_details_dropped_total。
-//   - Internal:        5xx 类错误标记。renderer 看到时不输出 spec.DefaultMessage，
-//                      改用「服务器内部错误」之类占位文案。
+//     此列表内的 key；其余键被丢弃并记 i18n_unsafe_details_dropped_total。
+//   - Internal:        true 时 renderer 不输出 spec.DefaultMessage，改用通用内部错误
+//     文案并丢弃全部 details。
 type Code struct {
 	ID              string
 	HTTPStatus      int

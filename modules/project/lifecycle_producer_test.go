@@ -106,32 +106,46 @@ func TestCreateEnqueuesProjectCreated(t *testing.T) {
 		"project.created carries the creator and nothing else")
 }
 
-// TestProfileUpdateEnqueuesAnEmptyMetadataEvent pins that the event is a change
-// SIGNAL rather than a sync — the same shape member_epoch already has.
-func TestProfileUpdateEnqueuesAnEmptyMetadataEvent(t *testing.T) {
-	_, p := setup(t)
-	enableOutbox(t, p)
-	r := mountProject(t, p)
-	seedSpace(t, spaceA, 1)
-	token := seedUser(t, "evtUpdater")
-	seedSpaceMember(t, spaceA, "evtUpdater", 0, 1)
+// TestProfileUpdateEnqueuesFrozenArchiveSnapshot verifies that each metadata event
+// keeps the archive facts current in its own transaction, even when later lifecycle
+// transitions change the Project before the stored event is inspected.
+func TestProfileUpdateEnqueuesFrozenArchiveSnapshot(t *testing.T) {
+	f := archiveAPISetup(t)
+	created := f.createBoundProject(t, "event-update")
 
-	created := createProjectOn(t, r, spaceA, token, "event-update")
-	w := doOn(t, r, http.MethodPut, "/v1/projects/"+created.ProjectID, token,
-		map[string]any{"name": "event-update-renamed"})
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	firstUpdate := doOn(t, f.route, http.MethodPut, "/v1/projects/"+created.ProjectID, f.ownerToken,
+		map[string]any{"name": "event-update-before-archive"})
+	require.Equal(t, http.StatusOK, firstUpdate.Code, firstUpdate.Body.String())
+	require.Equal(t, http.StatusOK, archiveProject(t, f, created.ProjectID, f.ownerToken, true).Code)
+	archiveRound := projectArchiveStateOf(t, created.ProjectID)
+	require.True(t, archiveRound.ArchivedAt.Valid)
+	require.Equal(t, http.StatusOK, archiveProject(t, f, created.ProjectID, f.ownerToken, false).Code)
 
-	rows := outboxRows(t, created.ProjectID)
-	require.Len(t, rows, 2, "create + update")
-	row := rows[1]
+	secondUpdate := doOn(t, f.route, http.MethodPut, "/v1/projects/"+created.ProjectID, f.ownerToken,
+		map[string]any{"name": "event-update-after-restore"})
+	require.Equal(t, http.StatusOK, secondUpdate.Code, secondUpdate.Body.String())
 
-	assert.Equal(t, LifecycleEventMetadataUpdated, row.EventType)
-	assert.JSONEq(t, `{}`, row.Payload,
-		"the payload must be an EMPTY object: the event says the profile changed and at which "+
-			"version, and a consumer that wants the new name reads it back")
-	assert.NotContains(t, row.Payload, "renamed", "the new name must not travel with the event")
-	require.NotNil(t, row.ProjectVersion)
-	assert.Greater(t, *row.ProjectVersion, int64(1), "the update must advance the version")
+	var metadata []outboxRow
+	for _, row := range outboxRows(t, created.ProjectID) {
+		if row.EventType == LifecycleEventMetadataUpdated {
+			metadata = append(metadata, row)
+		}
+	}
+	require.Len(t, metadata, 2, "one metadata event before and one after the archive round")
+	for _, row := range metadata {
+		require.NotNil(t, row.ProjectVersion)
+		assert.NotContains(t, row.Payload, "event-update-before-archive")
+		assert.NotContains(t, row.Payload, "event-update-after-restore")
+	}
+
+	var firstPayload, secondPayload map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(metadata[0].Payload), &firstPayload))
+	require.NoError(t, json.Unmarshal([]byte(metadata[1].Payload), &secondPayload))
+	assert.Equal(t, int64(0), archiveJSONInt64(t, firstPayload, "archive_version"),
+		"the first event keeps the pre-archive round even though it is read after restore")
+	assert.False(t, archiveJSONBool(t, firstPayload, "archived"))
+	assert.Equal(t, archiveRound.ArchiveVersion, archiveJSONInt64(t, secondPayload, "archive_version"))
+	assert.False(t, archiveJSONBool(t, secondPayload, "archived"))
 }
 
 // TestMemberRemovalEnqueuesRevocationWithoutAVersion is the event whose loss is

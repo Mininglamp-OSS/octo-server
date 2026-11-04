@@ -96,9 +96,9 @@ Project 访问权限（包括需要时验证 owner 兜底），再发起服务�
 | `event_type` | 何时发出 | `project_version` | `payload` |
 |---|---|---|---|
 | `project.created` | 项目创建事务提交 | 有 | `{"creator_uid": "..."}` |
-| `project.metadata_updated` | 项目资料变更事务提交 | 有 | `{}` |
+| `project.metadata_updated` | 项目资料变更事务提交 | 有 | `{"archive_version":12,"archived":false}`，入队事务冻结的归档轮次及状态；首次归档前轮次 0 |
 | `project.archived` | 归档事务提交 | 有 | `{"reason": "..."}` |
-| `project.restored` | 恢复事务提交 | 有 | `{}` |
+| `project.restored` | 恢复事务提交 | 有 | `{"archive_version": 12}`，引用本次恢复对应的归档版本 |
 | `project.member_revoked` | 成员被移出项目 / 被移出 Space | **无（`null`）** | `{"subject_uid": "...", "member_epoch": 12, "reason": "..."}` |
 
 **`payload` 里没有项目名和描述，这是刻意的**，见 §5。
@@ -116,6 +116,7 @@ Project 访问权限（包括需要时验证 owner 兜底），再发起服务�
 - 收到 `project_version` **不大于**已持有值的生命周期事件 → **丢弃**（是重投或乱序）；
 - `member_revoked` 没有 `project_version`，因为它不是关于项目本身的陈述——用 payload 里的
   `member_epoch` 与你缓存的授权比对。
+- 版本推进之前还必须应用归档/恢复前序屏障（§8）。metadata_updated 要求其冻结 archive_version 等于本地 last_applied_archive_version、archived 等于本地状态；不匹配返回可重试 503 PROJECT_WORKSPACE_NOT_READY，不推进版本或固化回执。较高资料版本不能使漏投的归档/恢复变成可丢弃旧事件。
 
 **为什么不共用一个计数器**：共用的话，每一次改名都会让下游所有缓存的授权判定失效，
 而每一次成员变动又都会被当成一条生命周期陈述。两者变化频率和原因都不同。
@@ -126,7 +127,7 @@ octo-server **权威持有项目名与描述，且不通过任何出站通道发
 
 - provisioning 请求里的 `name` 字段**不是项目名**，是一个固定的低信息标签——
   **每个容器拿到的都一样**。你方 UI 直接展示它会看到所有项目一个名字。
-- `project.metadata_updated` 的 payload 是**空的**：它只说「资料变了，版本是 N」。
+- `project.metadata_updated` 的 payload 只有归档轮次/状态结构事实，不携带项目名称、描述或其他用户内容；它只通知资料版本变化并支持生命周期前序校验。
 
 **理由**：项目名是用户自由输入的文本。外发会让这条通道变成内容通道，带来转义、
 信息披露、以及「同一份文本在两个系统里不一致」的问题。
@@ -226,22 +227,29 @@ octo-server **权威持有项目名与描述，且不通过任何出站通道发
     启用 fleet 的场景：新旧 pod 并存时，旧 pod 的配置里没有 fleet，若按进程配置判定，
     它会把新 pod 刚建的、工单还在跑的项目一起闩上。
 
-## 8. 归档 / 恢复（契约先定，实现暂缓）
+## 8. 归档 / 恢复（OCTO-59 目标契约）
 
-> **本期不实现**，但契约在此冻结，避免你方按别的形状先写。
+本节记录 2026-11-03 确认的设计与 Server/Fleet 接口约定；源码实现及验收、部署状态分别以代码变更和发布记录为准。完整用户 API、状态字段和验收见 [工作空间转让、退出与归档：Server 契约](specs/2026-11-03-workspace-transfer-leave-archive-design.md)；Fleet 按其配套消费规格实施。
 
-- 归档是**可逆**状态，不是解散。解散是终态、不可逆。
-- 实现方式是 `octo_project` 上的独立列 `archived_at`，**不是新增 status 值**——
-  本仓约二十处谓词读 `status = 1`，加第三个值需要逐一复核，漏一处就是一个静默的
-  可见性/授权缺陷。
-- **归档中的项目，两个入站接口的回答与「不存在」相同**（epoch `0`、`member: false`）。
-  也就是说：即使你方漏收了 `project.archived`，也会在一个缓存窗口内收敛到拒绝。
-- `project.archived` / `project.restored` 各自 bump `lifecycle_version`。
-- 恢复后 `member_epoch` **不变**（名册没变），`lifecycle_version` 变。
+- 归档是可逆的只读状态。`octo_project.archived_at` 独立于现有 normal/disbanded `status`，成员与历史保留。
+- 归档期间 `_verify` 和 epochs 继续返回真实成员与实际 `member_epoch`；归档本身不使成员变为不存在。账号、Space 与真实成员撤权仍按既有资格裁决。
+- 归档期间允许当前 owner 转让给空间内有效真人 admin/member，转让后唯一 owner、原 owner 成为 admin，归档状态不变；有效非 owner 成员可自行退出，owner 必须先转让。转让/退出沿现有成员 API，HTTP 与最终事务按当前身份校验。
+- 真实归档与恢复分别递增 `lifecycle_version`，同事务写入 `project.archived` / `project.restored` outbox；重复目标状态不增版本或重复事件。`member_epoch` 不因归档或恢复变化。
+- `archive_version` 记录最近一次归档时的生命周期版本，支撑成员级提醒关闭；恢复保留该轮次，再次归档替换为新版本。
+- 用户 API 为 `PUT /v1/projects/:id/archive`（`{"archived":true|false}`，仅当前有效真人 owner；幂等重复不增版本）、`GET /v1/space/:space_id/projects?archive_status=active|archived|all`（默认 active）及 `GET /v1/space/:space_id/projects/archive-notices`；详情、列表和内部用户项目关系包含 lifecycle/archive 字段。归档期间仅 owner 可恢复，成员可关闭本人当前轮次提醒，旧轮次关闭冲突；pin 与提醒偏好互不覆盖。
+- 归档期间有效成员可提交 `pinned:false` 取消本人置顶、释放既有个人配额，不能提交 `pinned:true` 新增置顶。恢复不复活已取消偏好；重复置顶活跃项目不刷新 `pinned_at` 或改变顺序。以上只影响本人设置，不改成员、生命周期版本或工作空间业务数据。
+- 内部 `GET /v1/internal/projects/:project_id/lifecycle?space_id=...` 使用既有 membership internal token、strict-IP 限流及请求超时；所有响应 `Cache-Control: no-store`。成功仅返回 `project_id`、`space_id`、`lifecycle_version`、`archive_version`、`archived_at`。仅有效、已激活且父 Space 活跃的 normal Project 返回 200；不存在/跨 Space/未激活/父 Space 不可用返回 404，凭证失败 401，scope 参数无效 400，存储失败 500。该接口不要求成员席位且不携带项目内容或用户数据。
+- 归档/恢复要求 Project 写开关与生命周期事件集成有效、匹配的 Fleet Workspace 已就绪；失败不改变状态。归档不改变 `member_epoch`。Fleet 新业务写与执行准入需校验权威生命周期状态，并要求本地已应用版本追平；不能仅依赖延迟到达的事件或成员资格缓存。权威读取不推进消费版本。归档事务成功后记录 last_applied_archive_version；恢复必须匹配 payload.archive_version，缺少前序归档时回滚该次事件接收事务并返回可重试 503，不推进版本或固化失败回执。快速恢复及重试终态都不能越过归档副作用。
+- epochs、`_verify`、lifecycle 三条权限事实路由在全局 IP 限流前设置 `Cache-Control: no-store`，全局桶、端点 strict 桶及鉴权拒绝均保留该响应头；全局和端点限流规则不变，其他路由缓存策略不变。
+- `err.server.project.not_ready` 是安全的预期就绪状态：嵌套语义状态为 503，公开固定的本地化重试提示，不接收诊断插值或可透传详情；沿用 wire 400 兼容约定。它是 Project 5xx 通用内部响应约定的唯一公开例外，其他 Project 5xx 仍输出通用内部错误并过滤私有详情。
+- metadata_updated 及其他版本推进不能跨越尚未应用的归档/恢复。即使归档/恢复投递耗尽，后续资料事件也须满足冻结轮次/状态与本地副作用一致，否则可重试 503，不抬高 external_version。启用前排空旧空 payload 事件并退出旧实例；不能投递时改写已冻结 payload。
+- Fleet 取消本工作空间排队和运行中的未完成任务、撤销任务凭据；仅本空间专属 Runtime 可离线，共享 Runtime 不影响其他空间。归档保留每条自动化 status 和触发器 enabled，workspace 状态提供额外执行门禁；恢复按原开关开放执行并重算未来调度时间，不补跑，不复活已取消执行或凭据。
+- Drive 仅将 Project 同步分量限制为只读，退出只撤销该来源；独立授权保留。Docs 合并自身独立角色、分享与 Drive reader，来源失效通知加活跃绑定批量版本探测处理已打开连接，不把 Project 归档写成整个文档归档。
 
-## 9. 会改变成员判定、但**不**改变 `member_epoch` 的情况
 
-这张表是逐条核过的，因为「授权答案与它的失效信号不一致」是本集成最容易出的一类缺陷。
+## 9. 成员判定与生命周期变化的失效边界
+
+成员资格变化与工作空间读写状态分别排序；授权缓存失效不能替代生命周期写入门禁。
 
 | 变化 | `member_epoch` 会动吗 | 对端如何感知 |
 |---|---|---|
@@ -250,12 +258,12 @@ octo-server **权威持有项目名与描述，且不通过任何出站通道发
 | **Space 封禁 / 解封** | ❌ 不动 | epochs 的谓词把父 Space 不活跃的项目折成 `0`；解封后恢复原值 |
 | **Space 解散** | ❌ 不动 | 同上。注意本仓**不会**级联解散其下项目 |
 | **Space 成员移除** | ✅ **同事务 +1** | 关席位是异步的，但 epoch 在移除提交时就动 |
-| 归档 / 恢复 | ❌ 不动 | 归档中读作 `0`（见 §8） |
+| 归档 / 恢复 | ❌ 不动 | 成员事实及 epoch 保留；以 lifecycle_version、权威状态读取和既有事件约束业务写与执行准入（见 §8） |
 | **项目由未确认变为已确认**（两阶段创建置位 `activated_at`） | ❌ 不动 | 置位前 epochs 的谓词不命中，读作 `0`；置位后下一次轮询读到真实 epoch（自创建起就是 1）。**置位不发事件，也不动 `lifecycle_version`** —— 与 Space 封禁/解封同形，靠你方的周期性 epochs 轮询在一个缓存窗口内收敛 |
 
-**结论**：以上每一条都能被对端在一个缓存窗口内感知。**建议你方仍加一个不依赖 epoch
-一致的硬 TTL（≤60s）作为纵深防御**——它不再是必需的上限，但表里任何一行将来出错时，
-它是唯一还站得住的东西。
+成员资格变化使用 epoch 检测与有限期成员核验；归档读写限制使用 §8 的独立生命周期准入。账号封禁/销毁不会推进 Project epoch，版本相等不能延长旧成员事实。本次 Drive/Docs peer 上界为 30 秒，Drive 成员结果最长 15 秒；新判权的 epochs 与 lifecycle 读取 no-store，_verify/epochs 分批分别最多 50 UID/50 Project。
+
+Server→Drive 来源提示复用 Drive 内部 token，目标 URL 由 `OCTO_PROJECT_DRIVE_ACCESS_CHANGED_URL` 配置，通知接口为 POST /internal/v1/docs/project-access-changed，body 为 event_id、space_id、project_id、subject_uid、member_epoch。既有 member_revoked 出站完成 Fleet 本次投递与状态记录后旁路提示；Drive 不是现有单目标 outbox 的第二个可靠消费者，提示失败不改变 Fleet 回执/重试/顺序。权威事实查询及有限期证明负责通知缺失时收敛；详见 Server、Drive、Docs 的 2026-11-03 配套规格。
 
 ## 10. 未定项
 

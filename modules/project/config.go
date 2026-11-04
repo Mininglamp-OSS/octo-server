@@ -116,6 +116,9 @@ const (
 	LifecycleEventSecretEnv = "OCTO_PROJECT_LIFECYCLE_EVENT_SECRET"
 	// envLifecycleEventTimeout bounds ONE delivery attempt.
 	envLifecycleEventTimeout = "OCTO_PROJECT_LIFECYCLE_EVENT_TIMEOUT"
+	// envDriveAccessChangedURL is the full POST endpoint for the best-effort
+	// member-revocation hint. An empty value leaves the hint disabled.
+	envDriveAccessChangedURL = "OCTO_PROJECT_DRIVE_ACCESS_CHANGED_URL"
 )
 
 // Defaults. The three project/member caps come from the brief; the batch cap and
@@ -197,6 +200,11 @@ type Config struct {
 	LifecycleEventURL      string
 	LifecycleEventSecret   string
 	LifecycleEventTimeout  time.Duration
+	// Drive's source-change hint is an optional side path after Fleet lifecycle
+	// delivery is recorded.
+	DriveAccessChangedURL string
+	// DriveInternalToken reuses OCTO_DRIVE_INTERNAL_TOKEN and must never be logged.
+	DriveInternalToken string
 	// LifecycleEventProblem is why the secret was dropped, when it was. Carried
 	// rather than logged at load, for the reason ProvisioningConfig.Problems is:
 	// loadConfig has no logger, and a config loader that logs is a config loader
@@ -246,6 +254,8 @@ func loadConfig() Config {
 		LifecycleEventSecret:   lifecycleSecret,
 		LifecycleEventProblem:  lifecycleProblem,
 		LifecycleEventTimeout:  envDuration(envLifecycleEventTimeout, defaultLifecycleEventTimeout),
+		DriveAccessChangedURL:  strings.TrimSpace(envString(envDriveAccessChangedURL, "")),
+		DriveInternalToken:     strings.TrimSpace(os.Getenv(DriveInternalTokenEnv)),
 		// Rejected targets are dropped rather than fatal; the reasons ride along on
 		// ProvisioningConfig.Problems for New() to log. See loadProvisioningConfig.
 		Provisioning: provisioning,

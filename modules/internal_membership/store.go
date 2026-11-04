@@ -36,6 +36,9 @@ type membershipStore interface {
 	// ProjectMetadata returns the active, activated Project rows in spaceID whose
 	// IDs match the request. Role is nil because no user membership was queried.
 	ProjectMetadata(ctx context.Context, spaceID string, projectIDs []string) ([]projectpkg.ProjectMetadata, error)
+	// Lifecycle returns the minimal active Project facts in the required active
+	// Space scope. Archived Projects remain queryable.
+	Lifecycle(ctx context.Context, spaceID, projectID string) (*projectpkg.ProjectLifecycle, error)
 }
 
 // dbStore is the production implementation, delegating to pkg/project.
@@ -111,4 +114,9 @@ func (s dbStore) UserProjects(ctx context.Context, spaceID, uid string) ([]proje
 // ProjectMetadata delegates to the read-only metadata fact layer.
 func (s dbStore) ProjectMetadata(ctx context.Context, spaceID string, projectIDs []string) ([]projectpkg.ProjectMetadata, error) {
 	return projectpkg.ProjectMetadataInSpace(ctx, s.ctx.DB(), spaceID, projectIDs)
+}
+
+// Lifecycle delegates to the scoped lifecycle fact layer.
+func (s dbStore) Lifecycle(ctx context.Context, spaceID, projectID string) (*projectpkg.ProjectLifecycle, error) {
+	return projectpkg.ProjectLifecycleInSpace(ctx, s.ctx.DB(), spaceID, projectID)
 }

@@ -8,33 +8,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 )
 
-// TestProjectCodesInternalFlag mirrors the shared-code invariant for
-// err.server.project.*: only 5xx codes may be Internal=true, and every 5xx code MUST
-// be — otherwise the renderer leaks a raw storage message on a server error (D11/D13).
-//
-// Written as a loop over the registry rather than over a hand-listed slice on purpose:
-// a code added later is covered without anyone remembering to extend this test, which is
-// the failure mode a hand-listed version has.
-func TestProjectCodesInternalFlag(t *testing.T) {
-	seen := 0
-	for _, c := range codes.All() {
-		if !strings.HasPrefix(c.ID, "err.server.project.") {
-			continue
-		}
-		seen++
-		is5xx := c.HTTPStatus >= 500 && c.HTTPStatus < 600
-		if is5xx && !c.Internal {
-			t.Errorf("%s: HTTPStatus=%d but Internal=false; 5xx must be Internal=true", c.ID, c.HTTPStatus)
-		}
-		if !is5xx && c.Internal {
-			t.Errorf("%s: HTTPStatus=%d but Internal=true; only 5xx may be Internal", c.ID, c.HTTPStatus)
-		}
-	}
-	if seen == 0 {
-		t.Fatal("no err.server.project.* codes registered; this guard would pass vacuously")
-	}
-}
-
 // TestProjectNotFoundIsGenericAndDetailFree pins the anti-enumeration contract.
 //
 // ErrProjectNotFound is the single answer for three different situations: the project

@@ -98,6 +98,19 @@ func globalRateLimitExcludePaths() []string {
 	return []string{"/v1/ping", "/v1/health", "/v1/bot/heartbeat", "/v1/bot/register"}
 }
 
+func globalRateLimitMiddleware(route *libwkhttp.WKHttp, client *rd.Client, rps float64, burst int) libwkhttp.HandlerFunc {
+	rateLimit := route.RateLimitMiddleware(context.Background(), client, rps, burst, globalRateLimitExcludePaths()...)
+	return func(c *libwkhttp.Context) {
+		switch c.FullPath() {
+		case "/v1/internal/membership/epochs",
+			"/v1/internal/project-memberships/_verify",
+			"/v1/internal/projects/:project_id/lifecycle":
+			c.Writer.Header().Set("Cache-Control", "no-store")
+		}
+		rateLimit(c)
+	}
+}
+
 // exposeProjectPaginationHeader keeps the existing CORS exposure list and adds the
 // pagination count used by Project and other list endpoints. The shared CORS
 // middleware may already have emitted several comma-separated values (or several
@@ -338,7 +351,7 @@ func runAPI(ctx *config.Context) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
 	})
-	route.Use(route.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, globalRateLimitExcludePaths()...))
+	route.Use(globalRateLimitMiddleware(route, rlRedis, rps, burst))
 	// 上游依赖可观测性(issue #440 P0-a):依赖调用延迟 + 连接池指标,均注册到
 	// DefaultRegisterer,经 /metrics 暴露(与 httpMetrics 同一端点)。连接池用
 	// scrape 时读取的 Collector,不起后台 goroutine。此处 rlRedis 与 ctx.DB().DB

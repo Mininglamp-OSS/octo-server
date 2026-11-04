@@ -1,11 +1,35 @@
 package project
 
+import "database/sql"
+
 // projectReadPage is the bounded page requested by a project list or roster
 // read. The read service receives normalized values so count and page queries
 // cannot accidentally use different limits.
 type projectReadPage struct {
 	Offset int64
 	Limit  int64
+}
+
+type projectArchiveFilter uint8
+
+const (
+	projectArchiveActive projectArchiveFilter = iota
+	projectArchiveOnly
+	projectArchiveAll
+)
+
+type archiveNoticeReadRow struct {
+	ProjectID      string       `db:"project_id"`
+	Name           string       `db:"name"`
+	ArchiveVersion int64        `db:"archive_version"`
+	ArchivedAt     sql.NullTime `db:"archived_at"`
+}
+
+type archiveNoticeResp struct {
+	ProjectID      string `json:"project_id"`
+	Name           string `json:"name"`
+	ArchiveVersion int64  `json:"archive_version"`
+	ArchivedAt     string `json:"archived_at"`
 }
 
 // projectReadListRow carries project data plus caller-relative list fields.
@@ -35,6 +59,10 @@ type projectReadListResult struct {
 
 type projectReadMembersResult struct {
 	Rows  []*projectReadMemberRow
+	Total int64
+}
+type projectArchiveNoticeResult struct {
+	Rows  []*archiveNoticeReadRow
 	Total int64
 }
 

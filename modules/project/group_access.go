@@ -1,6 +1,7 @@
 package project
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -18,6 +19,7 @@ var (
 	ErrGroupProjectForbidden     = errors.New("project: group access forbidden")
 	ErrGroupProjectSpaceConflict = errors.New("project: group access space conflict")
 	ErrGroupProjectDependency    = errors.New("project: group access dependency unavailable")
+	ErrGroupProjectArchived      = errors.New("project: group access Project is archived")
 )
 
 // PrepareGroupProjectSpaceSeatRefs resolves the requested Space-member
@@ -184,6 +186,9 @@ func lockGroupProjectAccessesWithStateTx(
 		}
 		if !active {
 			return nil, nil, nil, ErrGroupProjectForbidden
+		}
+		if locked.ArchivedAt.Valid {
+			return nil, nil, nil, ErrGroupProjectArchived
 		}
 		result[projectID] = GroupProjectAccess{
 			ProjectID: projectID,
@@ -365,15 +370,16 @@ func AuthorizeGroupProjectReadTx(tx *dbr.Tx, actorUID, projectID, expectedSpaceI
 }
 
 type groupProjectLocation struct {
-	ProjectID string `db:"project_id"`
-	SpaceID   string `db:"space_id"`
-	Status    int    `db:"status"`
+	ProjectID  string       `db:"project_id"`
+	SpaceID    string       `db:"space_id"`
+	Status     int          `db:"status"`
+	ArchivedAt sql.NullTime `db:"archived_at"`
 }
 
 func readGroupProjectLocationTx(tx *dbr.Tx, projectID string) (*groupProjectLocation, error) {
 	var rows []*groupProjectLocation
 	_, err := tx.SelectBySql(
-		"SELECT project_id, space_id, status FROM `octo_project` WHERE project_id = ? LIMIT 1",
+		"SELECT project_id, space_id, status, archived_at FROM `octo_project` WHERE project_id = ? LIMIT 1",
 		projectID,
 	).Load(&rows)
 	if err != nil {
@@ -388,7 +394,7 @@ func readGroupProjectLocationTx(tx *dbr.Tx, projectID string) (*groupProjectLoca
 func readGroupProjectLocationSession(session *dbr.Session, projectID string) (*groupProjectLocation, error) {
 	var rows []*groupProjectLocation
 	_, err := session.SelectBySql(
-		"SELECT project_id, space_id, status FROM `octo_project` WHERE project_id = ? LIMIT 1",
+		"SELECT project_id, space_id, status, archived_at FROM `octo_project` WHERE project_id = ? LIMIT 1",
 		projectID,
 	).Load(&rows)
 	if err != nil {
@@ -403,7 +409,7 @@ func readGroupProjectLocationSession(session *dbr.Session, projectID string) (*g
 func lockGroupProjectLocationTx(tx *dbr.Tx, projectID string) (*groupProjectLocation, error) {
 	var rows []*groupProjectLocation
 	_, err := tx.SelectBySql(
-		"SELECT project_id, space_id, status FROM `octo_project` WHERE project_id = ? LIMIT 1 FOR UPDATE",
+		"SELECT project_id, space_id, status, archived_at FROM `octo_project` WHERE project_id = ? LIMIT 1 FOR UPDATE",
 		projectID,
 	).Load(&rows)
 	if err != nil {

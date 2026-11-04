@@ -35,6 +35,10 @@
   Bot/IM 提示、订阅及其他提交后通知按 best-effort 处理，数据库提交事实权威，失败走既有补偿/重试路径。
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
+- OCTO-59：归档中的 Owner 仍可原子转让、转让后的管理员及普通成员仍可退出，Owner 必须先转让；metadata_updated 同事务冻结 archive_version/archived。member_revoked 在 Fleet 本次结果入账后旁路提示 Drive，提示失败不更改 Fleet 状态；epochs、_verify 与 lifecycle 的权限事实及鉴权、限流错误响应统一设置 `Cache-Control: no-store`。仅由归档提醒创建的 pin 偏好使用 `pinned=NULL` 表示未设置；显式 `pinned=0` 仍隐藏侧边栏项目。
+- 项目归档错误码已纳入生成的英文消息目录；未就绪错误保留可公开的本地化重试提示，私有错误详情仍由呈现层过滤。
+- 归档项目允许有效成员取消本人置顶以释放个人配额，恢复不会复活已取消偏好；归档期间仍拒绝新增置顶。重复置顶活跃项目保持原 `pinned_at` 与列表顺序，并可独立处理同请求中的其他有效设置。
+- epochs、`_verify`、lifecycle 在全局 IP 限流前设置 `Cache-Control: no-store`，被全局桶拒绝的 429 同样禁止缓存；全局及端点限流、既有豁免和其他路由缓存策略不变。明确 `project.not_ready` 固定就绪提示为 Project 5xx 的唯一公开例外，其余 Project 5xx 通过真实响应回归维持通用错误及私有详情过滤。
 
 ### 测试
 - Group HTTP 测试在每个 server fixture 初始化时清理共享 UID 限流桶，保持跨测试隔离；同一 fixture 内的限流中间件照常生效。
@@ -44,6 +48,7 @@
 - 运维注意：WuKongIM `v2.2.4-20260313` 调用时不携带 `auth_token`，只要配置了 `TS_GRPC_AUTH_TOKEN`，消息落库、离线推送、在线状态回调都会被拒绝；在 IM 支持发送 token 前不要配置。详见 `docs/webhook-grpc.md`。
 - 启动日志说明认证状态：配置了 token（提示 IM 需发送 token），或监听非回环地址且未配置 token 时输出告警。token 两边先做 SHA-256 再常量时间比较，认证拦截器排在最前。
 - 回调事件增加处理上限（压缩收件人列表解压后 16 MiB、去重前 40 万条、去重后收件人 20 万、在线状态 10 万条），超限整条事件返回错误，日志带上消息标识；`msg.offline` 重复收件人只推送一次。
+- `OCTO_PROJECT_DRIVE_ACCESS_CHANGED_URL` 配置 Drive 来源变化提示完整 POST URL；复用既有 `OCTO_DRIVE_INTERNAL_TOKEN`，未配置 URL 时关闭提示，不新增凭据。
 
 ## [v1.1.2] - 2026-03-05
 

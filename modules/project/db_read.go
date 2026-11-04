@@ -8,8 +8,8 @@ import (
 )
 
 const projectReadModelColumns = "p.id, p.project_id, p.space_id, p.name, p.description, p.logo, p.creator, " +
-	"p.discoverability, p.max_members, p.member_epoch, p.collaboration_role_epoch, p.status, " +
-	"p.created_at, p.updated_at"
+	"p.discoverability, p.max_members, p.member_epoch, p.collaboration_role_epoch, p.lifecycle_version, " +
+	"p.archive_version, p.archived_at, p.status, p.created_at, p.updated_at"
 const projectReadMemberColumns = "pm.project_id, pm.uid, pm.space_id, pm.role, pm.status, pm.removing, " +
 	"pm.invite_uid, pm.created_at, COALESCE(pm.joined_at, pm.created_at) AS joined_at, pm.updated_at"
 
@@ -19,9 +19,15 @@ const projectReadMemberJoin = "FROM `octo_project_member` pm INNER JOIN `octo_pr
 const projectReadMemberWhere = "p.status = ? AND pm.project_id = ? AND pm.space_id = p.space_id " +
 	"AND pm.status = ? AND pm.removing = 0"
 
-func projectReadListPredicate(spaceID, uid, keyword string) (string, []interface{}) {
+func projectReadListPredicate(spaceID, uid, keyword string, archiveFilter projectArchiveFilter) (string, []interface{}) {
 	where := "p.space_id = ? AND p.status = ? AND pm.space_id = p.space_id AND pm.uid = ? AND pm.status = ? AND pm.removing = 0"
 	args := []interface{}{spaceID, StatusNormal, uid, MemberStatusActive}
+	switch archiveFilter {
+	case projectArchiveActive:
+		where += " AND p.archived_at IS NULL"
+	case projectArchiveOnly:
+		where += " AND p.archived_at IS NOT NULL"
+	}
 	if keyword != "" {
 		where += " AND p.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'"
 		args = append(args, projectLikePattern(keyword))
@@ -129,11 +135,13 @@ func (d *DB) queryProjectReadMemberRoleTx(tx *dbr.Tx, projectID, spaceID, uid st
 	return rows[0].Role, true, nil
 }
 
-func (d *DB) listProjectsReadTx(tx *dbr.Tx, spaceID, uid, keyword string, page projectReadPage) (*projectReadListResult, error) {
+func (d *DB) listProjectsReadTx(
+	tx *dbr.Tx, spaceID, uid, keyword string, page projectReadPage, archiveFilter projectArchiveFilter,
+) (*projectReadListResult, error) {
 	if err := d.ensureReadTx(tx); err != nil {
 		return nil, err
 	}
-	where, args := projectReadListPredicate(spaceID, uid, keyword)
+	where, args := projectReadListPredicate(spaceID, uid, keyword, archiveFilter)
 	var total int64
 	if err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM `octo_project` p INNER JOIN `octo_project_member` pm ON "+
@@ -161,13 +169,44 @@ func (d *DB) listProjectsReadTx(tx *dbr.Tx, spaceID, uid, keyword string, page p
 	return &projectReadListResult{Rows: rows, Total: total}, nil
 }
 
+func (d *DB) listArchiveNoticesReadTx(
+	tx *dbr.Tx, spaceID, uid string, page projectReadPage,
+) (*projectArchiveNoticeResult, error) {
+	if err := d.ensureReadTx(tx); err != nil {
+		return nil, err
+	}
+	where := "p.space_id = ? AND p.status = ? AND pm.space_id = p.space_id AND pm.uid = ? " +
+		"AND pm.status = ? AND pm.removing = 0 AND p.archived_at IS NOT NULL " +
+		"AND COALESCE(s.archive_notice_dismissed_version, 0) <> p.archive_version"
+	args := []interface{}{spaceID, StatusNormal, uid, MemberStatusActive}
+	const source = "FROM `octo_project` p INNER JOIN `octo_project_member` pm " +
+		"ON pm.project_id = p.project_id LEFT JOIN `octo_project_user_setting` s " +
+		"ON s.project_id = p.project_id AND s.uid = pm.uid"
+	var total int64
+	if err := tx.SelectBySql(
+		"SELECT COUNT(*) "+source+" WHERE "+where, args...,
+	).LoadOne(&total); err != nil {
+		return nil, fmt.Errorf("project: count archive notices: %w", err)
+	}
+	pageArgs := append(append([]interface{}{}, args...), page.Limit, page.Offset)
+	var rows []*archiveNoticeReadRow
+	if _, err := tx.SelectBySql(
+		"SELECT p.project_id, p.name, p.archive_version, p.archived_at "+source+
+			" WHERE "+where+" ORDER BY p.archived_at DESC, p.id DESC LIMIT ? OFFSET ?",
+		pageArgs...,
+	).Load(&rows); err != nil {
+		return nil, fmt.Errorf("project: list archive notices: %w", err)
+	}
+	return &projectArchiveNoticeResult{Rows: rows, Total: total}, nil
+}
+
 func (d *DB) queryProjectPinnedReadTx(tx *dbr.Tx, projectID, uid string) (bool, error) {
 	if err := d.ensureReadTx(tx); err != nil {
 		return false, err
 	}
 	var rows []int
 	if _, err := tx.SelectBySql(
-		"SELECT pinned FROM `octo_project_user_setting` WHERE project_id = ? AND uid = ? LIMIT 1",
+		"SELECT COALESCE(pinned, 0) FROM `octo_project_user_setting` WHERE project_id = ? AND uid = ? LIMIT 1",
 		projectID, uid,
 	).Load(&rows); err != nil {
 		return false, fmt.Errorf("project: read project pin: %w", err)

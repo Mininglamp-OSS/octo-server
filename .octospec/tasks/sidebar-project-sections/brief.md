@@ -330,7 +330,8 @@ an active Project member. The setting row is the durable opt-out used by both
 the render predicate and the repair predicate; the ordering row is retained as
 `status=2` so unpin is not confused with departure/disband and a later pin can
 reactivate the previous position. The post-commit hide hook remains best-effort:
-if it fails, `pinned=0` still suppresses the Project on the next read. A later
+if it fails, the explicit `pinned=0` row still suppresses the Project on the next
+read; `pinned=NULL` means no pin preference and never suppresses it. A later
 eligible `pinned=true` reactivates the row, and the read backstop repairs a
 missed reactivation hook.
 

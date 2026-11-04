@@ -1497,6 +1497,15 @@ other = "你已不是该空间的有效成员。"
 ["err.server.project.member_not_space_member"]
 other = "目标用户不是该空间的有效成员。"
 
+["err.server.project.archived"]
+other = "项目已归档，无法修改。"
+
+["err.server.project.not_ready"]
+other = "项目工作空间尚未就绪，请稍后重试。"
+
+["err.server.project.archive_version_conflict"]
+other = "归档提醒属于其他归档轮次，无法关闭。"
+
 ["err.server.project.quota_pinned"]
 other = "置顶项目数已达上限。"
 

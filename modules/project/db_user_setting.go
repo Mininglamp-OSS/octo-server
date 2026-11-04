@@ -71,6 +71,31 @@ func (d *DB) upsertProjectUserSettingTx(tx *dbr.Tx, projectID, uid string, pinne
 	return nil
 }
 
+func (d *DB) upsertArchiveNoticeDismissalTx(
+	tx *dbr.Tx, projectID, uid string, version int64, now time.Time,
+) error {
+	if projectID == "" || uid == "" || version <= 0 {
+		return fmt.Errorf("project: invalid archive notice dismissal")
+	}
+	// A member who never expressed a pin preference must get pinned NULL, not 0.
+	// The category sidebar treats pinned = 0 as the durable explicit-unpin
+	// opt-out, so writing 0 here would hide the Project from a member who only
+	// dismissed a reminder. NULL means not set; the ON DUPLICATE branch already
+	// leaves pinned alone, because a dismissal never changes the pin.
+	_, err := tx.InsertBySql(
+		"INSERT INTO octo_project_user_setting "+
+			"(project_id, uid, pinned, pinned_at, archive_notice_dismissed_version, created_at, updated_at) "+
+			"VALUES (?, ?, NULL, NULL, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE archive_notice_dismissed_version = "+
+			"VALUES(archive_notice_dismissed_version), updated_at = VALUES(updated_at)",
+		projectID, uid, version, now, now,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("project: upsert archive notice dismissal: %w", err)
+	}
+	return nil
+}
+
 // queryProjectPinned answers whether uid has pinned projectID.
 //
 // A point query rather than a join, for the routes that already hold one project
@@ -82,13 +107,18 @@ func (d *DB) upsertProjectUserSettingTx(tx *dbr.Tx, projectID, uid string, pinne
 // The create route does not call this: a project id that was generated inside the
 // transaction that just committed cannot have a setting row yet, so false there is
 // provable rather than assumed.
+//
+// pinned is tri-state: NULL means the row exists only for another preference
+// (archive notice dismissal), 0 is an explicit unpin, 1 is a pin. COALESCE keeps
+// the caller-facing answer boolean without teaching this read about the third
+// state.
 func (d *DB) queryProjectPinned(projectID, uid string) (bool, error) {
 	if projectID == "" || uid == "" {
 		return false, nil
 	}
 	var pinned []int
 	_, err := d.session.SelectBySql(
-		"SELECT pinned FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		"SELECT COALESCE(pinned, 0) FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
 		projectID, uid,
 	).Load(&pinned)
 	if err != nil {
@@ -121,15 +151,10 @@ const sqlCountPinnedInSpace = "SELECT COUNT(*) FROM octo_project_user_setting s 
 // through octo_project to resolve each pinned Project's Space, so the setting row
 // does not duplicate the Project's space_id fact.
 //
-// Not "every pinned row". The quota predicate mirrors the Project list predicate:
-// p.status is normal, the Space matches, and the caller has an active Project seat
-// whose removal is not in progress. A row for a Project whose seat is closing or
-// removed is no longer actionable through the membership-only Project routes and
-// must not consume a slot.
-//
-// An active member's pin remains counted because that same membership row keeps the
-// Project in the caller's list. The count is only a quota check; it does not grant
-// access or widen the settings endpoint beyond the Project membership gate.
+// Normal Projects in this Space count while the caller's Project seat is active
+// and not closing. Both active and archived Projects retain their personal pins;
+// a current member can explicitly unpin an archived Project to release a slot.
+// The count is only a quota check and grants no Project or settings access.
 //
 // All three tables are octo_project*, i.e. all general_ci, so no COLLATE: an
 // explicit one has coercibility 0 and would cost octo_project its primary key on

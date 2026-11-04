@@ -195,6 +195,10 @@ func TestGroupCreateProjectDisabledExplicitTargetReturnsForbidden(t *testing.T) 
 func TestGroupCreateProjectGroupWithCategoryPersistsCreatorSetting(t *testing.T) {
 	srv, ctx := newTestServer(t)
 	defer func() { require.NoError(t, testutil.CleanAllTables(ctx)) }()
+	newGroupIMStub(t, ctx)
+	ctx.Event = noopGroupEvent{}
+	srv = server.New(ctx)
+	New(ctx).Route(srv.GetRoute())
 	wireI18nRendererForGroupTest(srv)
 	resetGroupUIDRateLimit(t, ctx)
 	enableProjectGroupsForWire(t, ctx)

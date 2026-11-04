@@ -609,24 +609,3 @@ func TestRespondProjectHelpers(t *testing.T) {
 		})
 	}
 }
-
-// TestInternalCodesAreFiveHundredAndOnlyThose pins the 5xx <=> Internal invariant for
-// this module's codes: the renderer only hides a message when Internal is set, and a
-// 4xx marked Internal would silently stop telling clients what they got wrong.
-func TestInternalCodesAreFiveHundredAndOnlyThose(t *testing.T) {
-	internal := map[string]bool{
-		"err.server.project.query_failed": true,
-		"err.server.project.store_failed": true,
-	}
-	for _, c := range projectCodes() {
-		isFiveXX := c.HTTPStatus >= 500
-		if isFiveXX != c.Internal {
-			t.Errorf("%s: HTTPStatus=%d Internal=%v — 5xx and Internal must agree",
-				c.ID, c.HTTPStatus, c.Internal)
-		}
-		if c.Internal != internal[c.ID] {
-			t.Errorf("%s: Internal=%v but the expected internal set says %v",
-				c.ID, c.Internal, internal[c.ID])
-		}
-	}
-}

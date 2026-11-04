@@ -10,8 +10,10 @@ import (
 // api_member.go / middleware.go). DefaultMessage holds the en-US source (D4);
 // the zh-CN runtime translation lives in pkg/i18n/locales/active.zh-CN.toml.
 //
-// Internal=true codes never surface their message on the wire — call sites MUST
-// log the underlying err with full context (zap.Error) before responding.
+// Project 5xx errors are internal by default: Internal=true hides their
+// messages and details, so call sites MUST log the underlying err with full
+// context before responding. ErrProjectNotReady is the sole narrow exception:
+// its expected-readiness message is public, but it has no safe details.
 //
 // Anti-enumeration: ErrProjectNotFound is the single answer for "does not
 // exist", "exists in a Space you are not in" and "exists but is unlisted and you
@@ -158,6 +160,25 @@ var (
 		DefaultMessage: "You are no longer an active member of this space.",
 	})
 
+	// ErrProjectArchived is returned when a user business write targets a
+	// read-only archived Project. The owner restore and personal notice dismissal
+	// are handled by their explicit exceptions.
+	ErrProjectArchived = register(codes.Code{
+		ID:             "err.server.project.archived",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This project is archived and cannot be changed.",
+	})
+	// ErrProjectNotReady means a Fleet workspace has not completed binding yet.
+	// Archive transitions require a matching ready workspace and can be retried
+	// once provisioning completes. This is the sole public Project 5xx: its fixed
+	// localized readiness prompt and semantic 503 are intentional; details remain
+	// undisclosed.
+	ErrProjectNotReady = register(codes.Code{
+		ID:             "err.server.project.not_ready",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "The project workspace is not ready yet.",
+	})
+
 	// ---- quotas (403) --------------------------------------------------------
 
 	// ErrProjectQuotaPinned covers the per-Space cap on pinned projects.
@@ -262,6 +283,11 @@ var (
 		ID:             "err.server.project.last_owner_must_transfer",
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "Transfer ownership before leaving or being demoted.",
+	})
+	ErrProjectArchiveVersionConflict = register(codes.Code{
+		ID:             "err.server.project.archive_version_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The archive notice belongs to a different archive round.",
 	})
 
 	// ---- internal (500) ------------------------------------------------------

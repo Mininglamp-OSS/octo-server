@@ -18,8 +18,8 @@ import (
 // Round 8 found this as the mirror image of the removal bump shipped in round 7,
 // and the asymmetry was real: closing a seat moved member_epoch, reopening one did
 // not. Since the Space conjunction landed, space_member.status IS part of the answer
-// to "is this uid a member of this project" — in BOTH directions — so the invariant
-// the writer guard states covers reopening too.
+// to "is this uid a member of this project" in both directions. Reactivation must
+// therefore advance the Project epoch as well as closing a seat.
 //
 // The failure it produces is a stuck cached DENIAL, which the contract cares about
 // because the peer caches the DECISION rather than only positive grants:

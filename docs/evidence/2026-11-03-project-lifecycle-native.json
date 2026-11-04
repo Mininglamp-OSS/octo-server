@@ -1,0 +1,47 @@
+{
+  "event": "OCTO59_NATIVE_FLEET_SCENARIO_ACCEPTED",
+  "project_id": "f2761681-c0dd-4418-8a04-9ad3d55833ff",
+  "workspace_id": "f2761681-c0dd-4418-8a04-9ad3d55833ff",
+  "archive_rounds": [
+    2,
+    5
+  ],
+  "final_lifecycle_version": 6,
+  "former_owner_uid": "u_octo59_owner",
+  "new_owner_uid": "u_octo59_admin",
+  "former_owner_left_after_transfer": true,
+  "owner_leave_blocked_before_transfer": true,
+  "archive_reminders_per_member_and_round": true,
+  "metadata_barrier_rejected_then_applied": true,
+  "final_workspace_status": "active",
+  "pin_review_smoke": {
+    "event": "OCTO59_NATIVE_PROJECT_PIN_REVIEW_ACCEPTED",
+    "project_ids": [
+      "436e28b4-d595-421a-86db-f0fcfb7934de",
+      "9f71e209-fd8c-4da2-8799-6afd848914e3",
+      "0bdd8756-00b7-46ca-bbee-9ef39ae8cc6e"
+    ],
+    "quota_limit": 2,
+    "quota_rejection_before_unpin": true,
+    "archived_personal_unpin_frees_slot": true,
+    "active_pin_after_unpin_succeeds": true,
+    "archived_pin_true_rejected": true,
+    "repeat_pin_preserves_pinned_at": true,
+    "member_seats_unchanged": true,
+    "pinned_count_after_scenario": 2,
+    "http_statuses": [200, 400, 200, 200, 200, 400, 200]
+  },
+  "permission_fact_global_limit_smoke": {
+    "event": "OCTO59_GLOBAL_PERMISSION_FACT_NOSTORE_ACCEPTED",
+    "scope": "Production global-rate-limit middleware, real Redis and loopback HTTP; business modules not started.",
+    "responses": [
+      {"method": "GET", "path": "/smoke-control", "status": 204, "cache_control": null},
+      {"method": "GET", "path": "/v1/internal/membership/epochs", "status": 429, "cache_control": "no-store"},
+      {"method": "POST", "path": "/v1/internal/project-memberships/_verify", "status": 429, "cache_control": "no-store"},
+      {"method": "GET", "path": "/v1/internal/projects/native-project/lifecycle", "status": 429, "cache_control": "no-store"},
+      {"method": "GET", "path": "/smoke-control", "status": 429, "cache_control": null},
+      {"method": "GET", "path": "/v1/health", "status": 204, "cache_control": null}
+    ]
+  },
+  "scope": "Isolated Server/Fleet/Drive canonical lifecycle API, authentic signed event delivery/replay, archived transfer/leave and per-member archive reminder rounds."
+}

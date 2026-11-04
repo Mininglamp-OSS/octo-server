@@ -131,14 +131,21 @@ func New(ctx *config.Context) *Module {
 // candidates; neither is caller identity. The required space_id scopes both modes.
 // The Project member-list route binds its required space_id and project_id
 // together; its peer authorizes the end user.
+// The lifecycle route binds its Project path id and required space_id together,
+// returning only the scoped lifecycle facts; it does not read membership.
 func (m *Module) Route(r *wkhttp.WKHttp) {
 	ipLimit := m.ipRateLimit(r)
 	deadline := boundBodyReadTime()
 	internal := r.Group("/v1/internal")
-	internal.GET("/membership/epochs", deadline, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
-	internal.POST("/project-memberships/_verify", deadline, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	internal.GET("/membership/epochs", deadline, noStoreResponse, ipLimit, m.internalAuthMiddleware(), m.membershipEpochs)
+	internal.POST("/project-memberships/_verify", deadline, noStoreResponse, ipLimit, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 	internal.GET("/projects", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjects)
 	internal.GET("/project-memberships", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjectMemberships)
+	internal.GET("/projects/:project_id/lifecycle", deadline, noStoreResponse, ipLimit, m.internalAuthMiddleware(), m.projectLifecycle)
+}
+func noStoreResponse(c *wkhttp.Context) {
+	c.Writer.Header().Set("Cache-Control", "no-store")
+	c.Next()
 }
 
 // ipRateLimit builds the per-IP strict limiter shared by every endpoint.

@@ -77,13 +77,17 @@ func isRetryableTxErr(err error) bool { return dbpkg.IsRetryableLockErr(err) }
 // errors rather than responding from the service keeps the transaction boundary and
 // the wire contract in separate files.
 var (
-	errQuotaPerSpace       = errors.New("project: per-space project quota reached")
-	errQuotaPerCreator     = errors.New("project: per-creator project quota reached")
-	errQuotaDailyCreate    = errors.New("project: daily project creation quota reached")
-	errQuotaMembers        = errors.New("project: per-project member quota reached")
-	errProjectGone         = errors.New("project: project is absent or disbanded")
-	errNotSpaceMember      = errors.New("project: target uid is not an active space member")
-	errActorNotSpaceMember = fmt.Errorf(
+	errQuotaPerSpace            = errors.New("project: per-space project quota reached")
+	errQuotaPerCreator          = errors.New("project: per-creator project quota reached")
+	errQuotaDailyCreate         = errors.New("project: daily project creation quota reached")
+	errQuotaMembers             = errors.New("project: per-project member quota reached")
+	errProjectGone              = errors.New("project: project is absent or disbanded")
+	errProjectArchived          = errors.New("project: project is archived")
+	errArchiveVersionConflict   = errors.New("project: archive notice version is stale")
+	errProjectNotReady          = errors.New("project: Fleet workspace is not ready")
+	errProjectLifecycleDisabled = errors.New("project: lifecycle event delivery is disabled")
+	errNotSpaceMember           = errors.New("project: target uid is not an active space member")
+	errActorNotSpaceMember      = fmt.Errorf(
 		"project: actor uid is not an active space member: %w", errNotSpaceMember)
 	errMemberNotFound        = errors.New("project: target uid is not an active project member")
 	errMemberRoleConflict    = errors.New("project: target already has a different active role")
@@ -115,15 +119,19 @@ func canAssignMemberRole(actorRole, role int) bool {
 
 func canViewMembers(projectRole, _ int) bool { return isProjectMember(projectRole) }
 
-func capabilitiesFor(projectRole, spaceRole int) Capabilities {
+func capabilitiesFor(projectRole, spaceRole int, archived bool) Capabilities {
 	_ = spaceRole
+	owner := projectRole == RoleOwner
 	return Capabilities{
-		CanUpdate:       canUpdateProject(projectRole),
-		CanDisband:      canDisbandProject(projectRole),
-		CanManageMember: canManageMembers(projectRole),
-		CanChangeRole:   canChangeMemberRole(projectRole),
-		CanLeave:        isProjectMember(projectRole) && projectRole != RoleOwner,
-		CanViewMembers:  isProjectMember(projectRole),
+		CanUpdate:        !archived && canUpdateProject(projectRole),
+		CanDisband:       !archived && canDisbandProject(projectRole),
+		CanManageMember:  !archived && canManageMembers(projectRole),
+		CanChangeRole:    !archived && canChangeMemberRole(projectRole),
+		CanLeave:         isProjectMember(projectRole) && projectRole != RoleOwner,
+		CanViewMembers:   isProjectMember(projectRole),
+		CanArchive:       owner && !archived,
+		CanRestore:       owner && archived,
+		CanTransferOwner: owner,
 	}
 }
 
@@ -733,6 +741,9 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 	if row == nil {
 		return nil, false, errProjectGone
 	}
+	if row.ArchivedAt.Valid {
+		return nil, false, errProjectArchived
+	}
 
 	// Re-read the actor's role under the project lock. The handler's check came from the
 	// middleware, i.e. from the Redis role cache read before this transaction opened, so an
@@ -843,17 +854,19 @@ func (p *Project) updateProjectOnce(projectID, actorUID, spaceID string, req upd
 		return nil, false, err
 	}
 	row.LifecycleVersion = version
-	// Payload is EMPTY: the event says "this project's profile changed, at
-	// version N" and nothing else. See docs/project-lifecycle-contract.md §5 —
-	// the name is user-supplied free text this repository holds authoritatively
-	// and does not egress, so the event is a change signal, not a sync.
+	// The row is locked by this transaction, so both archive facts are frozen
+	// with the metadata event and its lifecycle version. Names and descriptions
+	// remain authoritative here and are never sent to peers.
 	if err := p.enqueueLifecycleEventTx(tx, lifecycleEventInput{
 		EventType:      LifecycleEventMetadataUpdated,
 		ProjectID:      projectID,
 		SpaceID:        spaceID,
 		ProjectVersion: &version,
-		Payload:        metadataUpdatedPayload{},
-		OccurredAt:     now,
+		Payload: metadataUpdatedPayload{
+			ArchiveVersion: row.ArchiveVersion,
+			Archived:       row.ArchivedAt.Valid,
+		},
+		OccurredAt: now,
 	}, now); err != nil {
 		return nil, false, err
 	}
@@ -906,6 +919,9 @@ func (p *Project) disbandProjectOnce(projectID, actorUID, spaceID string) ([]str
 	}
 	if row == nil {
 		return nil, errProjectGone
+	}
+	if row.ArchivedAt.Valid {
+		return nil, errProjectArchived
 	}
 
 	// Owner role re-read under the project lock, same reason as updateProject: disband is the
@@ -1194,6 +1210,9 @@ func (p *Project) addMembersOnce(projectID, spaceID, actorUID string, members []
 	if row == nil {
 		return nil, errProjectGone
 	}
+	if row.ArchivedAt.Valid {
+		return nil, errProjectArchived
+	}
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {
 		return nil, err
@@ -1343,6 +1362,9 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	}
 	if row == nil {
 		return false, errProjectGone
+	}
+	if row.ArchivedAt.Valid {
+		return false, errProjectArchived
 	}
 
 	// Both roles are read under the project lock. The actor's role is deliberately NOT the
@@ -1520,6 +1542,9 @@ func (p *Project) changeMemberRoleOnce(projectID, spaceID, actorUID, targetUID s
 	}
 	if row == nil {
 		return false, errProjectGone
+	}
+	if row.ArchivedAt.Valid {
+		return false, errProjectArchived
 	}
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {

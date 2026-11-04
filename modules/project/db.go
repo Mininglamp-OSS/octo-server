@@ -143,7 +143,7 @@ func (d *DB) queryByProjectID(projectID string) (*Model, error) {
 	_, err := d.session.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
 			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
-			"lifecycle_version, status, activated_at, "+
+			"lifecycle_version, archive_version, archived_at, status, activated_at, "+
 			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? LIMIT 1", projectID,
 	).Load(&models)
@@ -167,7 +167,7 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 	_, err := tx.SelectBySql(
 		"SELECT id, project_id, space_id, name, description, logo, creator, "+
 			"discoverability, max_members, member_epoch, collaboration_role_epoch, "+
-			"lifecycle_version, status, activated_at, "+
+			"lifecycle_version, archive_version, archived_at, status, activated_at, "+
 			"created_at, updated_at "+
 			"FROM `octo_project` WHERE project_id = ? AND status = ? FOR UPDATE",
 		projectID, StatusNormal,
@@ -179,6 +179,28 @@ func (d *DB) lockActiveProjectTx(tx *dbr.Tx, projectID string) (*Model, error) {
 		return nil, nil
 	}
 	return models[0], nil
+}
+
+func (d *DB) updateArchiveStateTx(
+	tx *dbr.Tx, projectID string, archivedAt interface{}, archiveVersion int64, now time.Time,
+) (int64, error) {
+	result, err := tx.UpdateBySql(
+		"UPDATE `octo_project` SET lifecycle_version = lifecycle_version + 1, "+
+			"archived_at = ?, archive_version = ?, updated_at = ? "+
+			"WHERE project_id = ? AND status = ?",
+		archivedAt, archiveVersion, now, projectID, StatusNormal,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("project: update archive state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("project: update archive state rows: %w", err)
+	}
+	if affected != 1 {
+		return 0, fmt.Errorf("project: archive transition did not update one active row")
+	}
+	return d.readLifecycleVersionTx(tx, projectID)
 }
 
 // updateProfileTx applies a partial profile update. The caller passes only the
@@ -501,8 +523,8 @@ func (d *DB) bumpMemberEpochForSpaceMemberTx(tx *dbr.Tx, spaceID, uid string) er
 // absolute assignment, for the same reason bumpMemberEpochTx is: two writers
 // racing an absolute value can move it BACKWARDS, and a version that goes
 // backwards is worse than none — a consumer discards the NEW state as stale,
-// keeping a superseded one, silently. A source guard greps this package for any
-// other shape of write.
+// keeping a superseded one, silently. The archive transition has its own state
+// update helper but follows the same increment-only write discipline.
 //
 // Guarded on status = StatusNormal, which means a caller that changes status must
 // bump BEFORE the flip — disband does exactly that, mirroring how it already

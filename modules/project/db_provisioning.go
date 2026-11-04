@@ -746,3 +746,17 @@ func (d *DB) latchUnconfirmableProjects(now time.Time, limit int) (int64, error)
 	}
 	return affected, nil
 }
+
+func (d *DB) fleetWorkspaceReadyTx(tx *dbr.Tx, projectID, spaceID string) (bool, error) {
+	var rows []uint64
+	_, err := tx.SelectBySql(
+		"SELECT id FROM `octo_project_provisioning` "+
+			"WHERE project_id = ? AND space_id = ? AND target = ? AND status = ? "+
+			"LIMIT 1 FOR UPDATE",
+		projectID, spaceID, TargetFleet, provisionStatusReady,
+	).Load(&rows)
+	if err != nil {
+		return false, fmt.Errorf("project: read ready Fleet workspace: %w", err)
+	}
+	return len(rows) > 0, nil
+}

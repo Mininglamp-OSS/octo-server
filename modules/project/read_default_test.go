@@ -53,7 +53,7 @@ func TestProjectReadListRequiresActiveProjectMemberAndCountsFilteredRows(t *test
 		}
 	}
 
-	result, err := p.readProjects(spaceA, uid, "100%", projectReadPage{Limit: 50})
+	result, err := p.readProjects(spaceA, uid, "100%", projectReadPage{Limit: 50}, projectArchiveActive)
 	if err != nil {
 		t.Fatalf("readProjects: %v", err)
 	}
