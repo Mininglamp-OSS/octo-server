@@ -148,6 +148,8 @@ Drive 接收及 Docs 版本/会话契约分别见其配套的 2026-11-03 规格�
 
 置顶审查修复在真实隔离 MySQL/Redis 上通过 `modules/project` 整包非缓存回归（81.300s），覆盖满配额后归档、取消本人置顶、置顶其他项目及恢复不复活偏好；重复置顶保留时间和排序；取消置顶可同时关闭本轮提醒。实际本地 HTTP 另行验证配额拒绝 → 归档取消置顶 → 新项目置顶成功、归档新增置顶仍拒绝及重复置顶不改时间，成员席位保持不变。错误响应隐私与 Common appconfig 两种响应分支的容器标识不泄露由真实 HTTP 路由回归验证。
 
+全局限流回归先在真实 Redis 上复现三条权限事实路由 429 缺少 `no-store`，修复后通过；原生 loopback HTTP 另行验证同一全局桶耗尽后 epochs、`_verify`、lifecycle 均返回 429 和 `no-store`，普通路由仍受限流且不新增缓存策略，既有 health 豁免保留。本轮 smoke 仅启动生产全局限流 middleware 与 HTTP 路由，不启动业务模块。Project 错误呈现回归覆盖所有已注册 Project 5xx：仅安全固定的 `not_ready` 就绪提示公开，其余保持通用内部响应，raw error、uid、token 及私有详情均不出站。
+
 原生生命周期证据：[`../evidence/2026-11-03-project-lifecycle-native.json`](../evidence/2026-11-03-project-lifecycle-native.json)。
 
 `modules/project` 回归使用真实 MySQL/Redis，必须指向隔离验收服务。只读关系、生命周期、权限源变化及多服务异常需联合验收；不能借用默认业务数据库清表。

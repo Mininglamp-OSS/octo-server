@@ -10,8 +10,10 @@ import (
 // api_member.go / middleware.go). DefaultMessage holds the en-US source (D4);
 // the zh-CN runtime translation lives in pkg/i18n/locales/active.zh-CN.toml.
 //
-// Internal=true codes never surface their message on the wire — call sites MUST
-// log the underlying err with full context (zap.Error) before responding.
+// Project 5xx errors are internal by default: Internal=true hides their
+// messages and details, so call sites MUST log the underlying err with full
+// context before responding. ErrProjectNotReady is the sole narrow exception:
+// its expected-readiness message is public, but it has no safe details.
 //
 // Anti-enumeration: ErrProjectNotFound is the single answer for "does not
 // exist", "exists in a Space you are not in" and "exists but is unlisted and you
@@ -168,7 +170,9 @@ var (
 	})
 	// ErrProjectNotReady means a Fleet workspace has not completed binding yet.
 	// Archive transitions require a matching ready workspace and can be retried
-	// once provisioning completes.
+	// once provisioning completes. This is the sole public Project 5xx: its fixed
+	// localized readiness prompt and semantic 503 are intentional; details remain
+	// undisclosed.
 	ErrProjectNotReady = register(codes.Code{
 		ID:             "err.server.project.not_ready",
 		HTTPStatus:     http.StatusServiceUnavailable,

@@ -240,6 +240,8 @@ octo-server **权威持有项目名与描述，且不通过任何出站通道发
 - 归档期间有效成员可提交 `pinned:false` 取消本人置顶、释放既有个人配额，不能提交 `pinned:true` 新增置顶。恢复不复活已取消偏好；重复置顶活跃项目不刷新 `pinned_at` 或改变顺序。以上只影响本人设置，不改成员、生命周期版本或工作空间业务数据。
 - 内部 `GET /v1/internal/projects/:project_id/lifecycle?space_id=...` 使用既有 membership internal token、strict-IP 限流及请求超时；所有响应 `Cache-Control: no-store`。成功仅返回 `project_id`、`space_id`、`lifecycle_version`、`archive_version`、`archived_at`。仅有效、已激活且父 Space 活跃的 normal Project 返回 200；不存在/跨 Space/未激活/父 Space 不可用返回 404，凭证失败 401，scope 参数无效 400，存储失败 500。该接口不要求成员席位且不携带项目内容或用户数据。
 - 归档/恢复要求 Project 写开关与生命周期事件集成有效、匹配的 Fleet Workspace 已就绪；失败不改变状态。归档不改变 `member_epoch`。Fleet 新业务写与执行准入需校验权威生命周期状态，并要求本地已应用版本追平；不能仅依赖延迟到达的事件或成员资格缓存。权威读取不推进消费版本。归档事务成功后记录 last_applied_archive_version；恢复必须匹配 payload.archive_version，缺少前序归档时回滚该次事件接收事务并返回可重试 503，不推进版本或固化失败回执。快速恢复及重试终态都不能越过归档副作用。
+- epochs、`_verify`、lifecycle 三条权限事实路由在全局 IP 限流前设置 `Cache-Control: no-store`，全局桶、端点 strict 桶及鉴权拒绝均保留该响应头；全局和端点限流规则不变，其他路由缓存策略不变。
+- `err.server.project.not_ready` 是安全的预期就绪状态：嵌套语义状态为 503，公开固定的本地化重试提示，不接收诊断插值或可透传详情；沿用 wire 400 兼容约定。它是 Project 5xx 通用内部响应约定的唯一公开例外，其他 Project 5xx 仍输出通用内部错误并过滤私有详情。
 - metadata_updated 及其他版本推进不能跨越尚未应用的归档/恢复。即使归档/恢复投递耗尽，后续资料事件也须满足冻结轮次/状态与本地副作用一致，否则可重试 503，不抬高 external_version。启用前排空旧空 payload 事件并退出旧实例；不能投递时改写已冻结 payload。
 - Fleet 取消本工作空间排队和运行中的未完成任务、撤销任务凭据；仅本空间专属 Runtime 可离线，共享 Runtime 不影响其他空间。归档保留每条自动化 status 和触发器 enabled，workspace 状态提供额外执行门禁；恢复按原开关开放执行并重算未来调度时间，不补跑，不复活已取消执行或凭据。
 - Drive 仅将 Project 同步分量限制为只读，退出只撤销该来源；独立授权保留。Docs 合并自身独立角色、分享与 Drive reader，来源失效通知加活跃绑定批量版本探测处理已打开连接，不把 Project 归档写成整个文档归档。

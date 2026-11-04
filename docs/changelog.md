@@ -38,6 +38,7 @@
 - OCTO-59：归档中的 Owner 仍可原子转让、转让后的管理员及普通成员仍可退出，Owner 必须先转让；metadata_updated 同事务冻结 archive_version/archived。member_revoked 在 Fleet 本次结果入账后旁路提示 Drive，提示失败不更改 Fleet 状态；epochs、_verify 与 lifecycle 的权限事实及鉴权、限流错误响应统一设置 `Cache-Control: no-store`。仅由归档提醒创建的 pin 偏好使用 `pinned=NULL` 表示未设置；显式 `pinned=0` 仍隐藏侧边栏项目。
 - 项目归档错误码已纳入生成的英文消息目录；未就绪错误保留可公开的本地化重试提示，私有错误详情仍由呈现层过滤。
 - 归档项目允许有效成员取消本人置顶以释放个人配额，恢复不会复活已取消偏好；归档期间仍拒绝新增置顶。重复置顶活跃项目保持原 `pinned_at` 与列表顺序，并可独立处理同请求中的其他有效设置。
+- epochs、`_verify`、lifecycle 在全局 IP 限流前设置 `Cache-Control: no-store`，被全局桶拒绝的 429 同样禁止缓存；全局及端点限流、既有豁免和其他路由缓存策略不变。明确 `project.not_ready` 固定就绪提示为 Project 5xx 的唯一公开例外，其余 Project 5xx 通过真实响应回归维持通用错误及私有详情过滤。
 
 ### 测试
 - Group HTTP 测试在每个 server fixture 初始化时清理共享 UID 限流桶，保持跨测试隔离；同一 fixture 内的限流中间件照常生效。

@@ -31,5 +31,17 @@
     "pinned_count_after_scenario": 2,
     "http_statuses": [200, 400, 200, 200, 200, 400, 200]
   },
+  "permission_fact_global_limit_smoke": {
+    "event": "OCTO59_GLOBAL_PERMISSION_FACT_NOSTORE_ACCEPTED",
+    "scope": "Production global-rate-limit middleware, real Redis and loopback HTTP; business modules not started.",
+    "responses": [
+      {"method": "GET", "path": "/smoke-control", "status": 204, "cache_control": null},
+      {"method": "GET", "path": "/v1/internal/membership/epochs", "status": 429, "cache_control": "no-store"},
+      {"method": "POST", "path": "/v1/internal/project-memberships/_verify", "status": 429, "cache_control": "no-store"},
+      {"method": "GET", "path": "/v1/internal/projects/native-project/lifecycle", "status": 429, "cache_control": "no-store"},
+      {"method": "GET", "path": "/smoke-control", "status": 429, "cache_control": null},
+      {"method": "GET", "path": "/v1/health", "status": 204, "cache_control": null}
+    ]
+  },
   "scope": "Isolated Server/Fleet/Drive canonical lifecycle API, authentic signed event delivery/replay, archived transfer/leave and per-member archive reminder rounds."
 }
