@@ -807,6 +807,12 @@ other = "You are no longer an active member of this space."
 ["err.server.project.agent_not_eligible"]
 other = "One or more selected AI agents cannot join this project."
 
+["err.server.project.archive_version_conflict"]
+other = "The archive notice belongs to a different archive round."
+
+["err.server.project.archived"]
+other = "This project is archived and cannot be changed."
+
 ["err.server.project.batch_too_large"]
 other = "Too many members in a single request."
 
@@ -851,6 +857,9 @@ other = "Project not found."
 
 ["err.server.project.not_member"]
 other = "You are not a member of this project."
+
+["err.server.project.not_ready"]
+other = "The project workspace is not ready yet."
 
 ["err.server.project.permission_denied"]
 other = "You do not have permission to perform this operation."

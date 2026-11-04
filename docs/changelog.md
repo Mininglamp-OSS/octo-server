@@ -36,6 +36,7 @@
 - 普通 Space removal 使用原始 selector fail-safe 清理；Space 席位复核失败时保留工单重试，避免错误跳过撤权。
 - I1 与 abandoned-cleanup 对账仅对正常 Project 豁免 Space 撤权后保留的 Owner；已解散或不存在 Project 的 active Owner 且无有效 Space 席位仍报告，普通成员与 `LIMIT` inspected base 分页语义不变。
 - OCTO-59：归档中的 Owner 仍可原子转让、转让后的管理员及普通成员仍可退出，Owner 必须先转让；metadata_updated 同事务冻结 archive_version/archived。member_revoked 在 Fleet 本次结果入账后旁路提示 Drive，提示失败不更改 Fleet 状态；epochs、_verify 与 lifecycle 的权限事实及鉴权、限流错误响应统一设置 `Cache-Control: no-store`。仅由归档提醒创建的 pin 偏好使用 `pinned=NULL` 表示未设置；显式 `pinned=0` 仍隐藏侧边栏项目。
+- 项目归档错误码已纳入生成的英文消息目录；未就绪错误保留可公开的本地化重试提示，私有错误详情仍由呈现层过滤。
 
 ### 测试
 - Group HTTP 测试在每个 server fixture 初始化时清理共享 UID 限流桶，保持跨测试隔离；同一 fixture 内的限流中间件照常生效。
