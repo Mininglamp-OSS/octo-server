@@ -76,17 +76,18 @@ func literalFilenameHighlightWindow(name, keyword string, maxRunes int) string {
 	// the whole original segment, including reordered/combined marks.
 	var folded strings.Builder
 	var starts, ends []int
-	var it norm.Iter
-	it.InitString(norm.NFC, expanded.String())
-	for !it.Done() {
-		start := it.Pos()
-		piece := it.Next()
-		end := it.Pos()
-		folded.Write(piece)
+	input := expanded.String()
+	for start := 0; start < len(input); {
+		// Walk input boundaries, not output iterator positions: NFC can emit
+		// multiple decomposition segments without consuming another input rune.
+		end := start + norm.NFC.NextBoundaryInString(input[start:], true)
+		piece := norm.NFC.String(input[start:end])
+		folded.WriteString(piece)
 		for range len(piece) {
 			starts = append(starts, sourceStarts[start])
 			ends = append(ends, sourceEnds[end-1])
 		}
+		start = end
 	}
 	text := folded.String()
 	type span struct{ start, end int }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -12,6 +14,9 @@ import (
 
 func TestLiteralFilenameHighlight(t *testing.T) {
 	for _, tc := range []struct{ name, keyword, want string }{
+		{"\u0F43.pdf", "pdf", "\u0F43.<mark>pdf</mark>"},
+		{"pre\u0F43.pdf", "\u0F42", "pre<mark>\u0F43</mark>.pdf"},
+		{"\u0F43.pdf", "\u0FB7", "<mark>\u0F43</mark>.pdf"},
 		{"ｶﾞｲﾄﾞ.pdf", "ガイド", "<mark>ｶﾞｲﾄﾞ</mark>.pdf"},
 		{"ガイド.pdf", "ｶﾞｲﾄﾞ", "<mark>ガイド</mark>.pdf"},
 		{"ﾊﾟｰﾂ.pdf", "パーツ", "<mark>ﾊﾟｰﾂ</mark>.pdf"},
@@ -101,8 +106,11 @@ func TestFilenameHighlight_GlobalAndChannelParity(t *testing.T) {
 	}
 }
 
-func TestKanaFilenameHitHighlights(t *testing.T) {
+func TestCanonicalFilenameHitHighlights(t *testing.T) {
 	for _, tc := range []struct{ name, query, marked string }{
+		{"\u0F43.pdf", "pdf", "\u0F43.<mark>pdf</mark>"},
+		{"pre\u0F43.pdf", "\u0F42", "pre<mark>\u0F43</mark>.pdf"},
+		{"\u0F43.pdf", "\u0FB7", "<mark>\u0F43</mark>.pdf"},
 		{"ｶﾞｲﾄﾞ.pdf", "ガイド", "<mark>ｶﾞｲﾄﾞ</mark>.pdf"},
 		{"ガイド.pdf", "ｶﾞｲﾄﾞ", "<mark>ガイド</mark>.pdf"},
 		{"ﾊﾟｰﾂ.pdf", "パーツ", "<mark>ﾊﾟｰﾂ</mark>.pdf"},
@@ -124,5 +132,51 @@ func TestKanaFilenameHitHighlights(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCanonicalFilenameProjectionRecovery(t *testing.T) {
+	for _, name := range []string{"\u0F43.pdf", "pre\u0F43.pdf"} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() {
+					if recover() != nil {
+						http.Error(w, "projection panic", http.StatusInternalServerError)
+					}
+				}()
+				tp := payloadTypeFile
+				h := newHandlerForGlobalTests()
+				doc := Doc{MessageID: 1, ChannelID: "g", ChannelType: 2, Payload: &Payload{Type: &tp, File: &FilePayload{Name: name}}}
+				raw := json.RawMessage(mustJSON(doc))
+				hits := []*elastic.SearchHit{{Source: &raw}}
+				h.buildFileHits(r.Context(), hits, SearchFilesReq{Keyword: "pdf", ChannelID: "g", ChannelType: 2}, "me")
+				h.buildGlobalFileHits(r.Context(), hits, "me", "pdf")
+				h.buildSearchAllHits(r.Context(), hits, SearchAllReq{Keyword: "pdf", ChannelID: "g", ChannelType: 2}, "me")
+				h.buildGlobalSearchAllHits(r.Context(), hits, "me", "pdf")
+				h.projectPreview(r.Context(), [][]*elastic.SearchHit{hits}, "me", "pdf")
+				w.WriteHeader(http.StatusOK)
+			})
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("projection response: %d %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// These canonical composition exclusions may expand into multiple NFC output
+// segments. Every component must retain the original source rune's span.
+func TestCanonicalDecompositionSpans(t *testing.T) {
+	for _, r := range []rune{0x0F43, 0x0F4D, 0x0F52, 0x0F57, 0x0F5C, 0x0F69, 0x09DC} {
+		for _, prefix := range []string{"", "prefix-"} {
+			name := prefix + string(r) + ".pdf"
+			for _, component := range foldFilename(string(r)) {
+				want := prefix + "<mark>" + string(r) + "</mark>.pdf"
+				if got := literalFilenameHighlight(name, string(component)); got != want {
+					t.Fatalf("%q / %U: got %q want %q", name, component, got, want)
+				}
+			}
+		}
 	}
 }
