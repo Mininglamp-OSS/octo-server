@@ -14,6 +14,8 @@ import (
 
 func TestLiteralFilenameHighlight(t *testing.T) {
 	for _, tc := range []struct{ name, keyword, want string }{
+		{"ᾷ.pdf", "ᾷ", "<mark>ᾷ</mark>.pdf"},
+		{"ᾷ.pdf", "ᾷ", "<mark>ᾷ</mark>.pdf"},
 		{"\u0F43.pdf", "pdf", "\u0F43.<mark>pdf</mark>"},
 		{"pre\u0F43.pdf", "\u0F42", "pre<mark>\u0F43</mark>.pdf"},
 		{"\u0F43.pdf", "\u0FB7", "<mark>\u0F43</mark>.pdf"},

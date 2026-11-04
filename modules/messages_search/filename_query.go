@@ -15,7 +15,7 @@ import (
 // Keep this normalization in sync with octo-search-indexer/internal/esindex.
 // Do not use NFKC: compatibility characters beyond width are significant.
 func foldFilename(text string) string {
-	return norm.NFC.String(cases.Fold().String(width.Fold.String(text)))
+	return norm.NFC.String(cases.Fold().String(norm.NFC.String(width.Fold.String(text))))
 }
 
 func buildFileKeywordClause(ctx context.Context, analyzer tokenAnalyzer, strip bool, keyword string) (elastic.Query, error) {
@@ -64,7 +64,7 @@ func literalFilenameHighlightWindow(name, keyword string, maxRunes int) string {
 	var expanded strings.Builder
 	var sourceStarts, sourceEnds []int
 	for start, r := range name {
-		piece := cases.Fold().String(width.Fold.String(string(r)))
+		piece := width.Fold.String(string(r))
 		expanded.WriteString(piece)
 		for range len(piece) {
 			sourceStarts = append(sourceStarts, start)
@@ -81,7 +81,7 @@ func literalFilenameHighlightWindow(name, keyword string, maxRunes int) string {
 		// Walk input boundaries, not output iterator positions: NFC can emit
 		// multiple decomposition segments without consuming another input rune.
 		end := start + norm.NFC.NextBoundaryInString(input[start:], true)
-		piece := norm.NFC.String(input[start:end])
+		piece := norm.NFC.String(cases.Fold().String(norm.NFC.String(input[start:end])))
 		folded.WriteString(piece)
 		for range len(piece) {
 			starts = append(starts, sourceStarts[start])

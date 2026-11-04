@@ -67,3 +67,13 @@ significant. Highlights map complete canonical segments to original text.
 Existing non-NFC `nameLiteral` values must be repaired using the updated backfill
 even if the field already exists. Follow the same coordinated rollout above;
 old normalization writers must remain stopped.
+
+Canonical input is normalized before case folding as well as afterward, so
+reordered Greek combining sequences such as `ᾷ` and `ᾷ` agree. Rerun the updated
+backfill for any older normalization values, using the same paused-writer rollout.
+The offline audit now pages **all index documents**, requesting only payload type
+and the two filename fields, and selects file names from source. It does not rely
+on indexed eligibility to establish the audit population. Preflight rejects disabled
+ancestors, nested objects, and incompatible/unindexed original name or type fields.
+This increases audit work for indexes dominated by non-file messages; size the
+maintenance window against the entire index. Interactive search is unchanged.
