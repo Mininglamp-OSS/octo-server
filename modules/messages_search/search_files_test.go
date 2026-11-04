@@ -23,7 +23,7 @@ func TestBuildFileHits_FullFields(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleFileHit(doc, "", 0, nil)
+	got := h.singleFileHit(doc, "", 0, nil, "")
 	if got.FileName != "report.pdf" {
 		t.Errorf("file_name: got %q", got.FileName)
 	}
@@ -69,7 +69,7 @@ func TestResolveFileExt_FallbackFromName(t *testing.T) {
 func TestSingleFileHit_NilPayload(t *testing.T) {
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
 	doc := Doc{MessageID: 1, MessageSeq: 1, Timestamp: 100}
-	got := h.singleFileHit(doc, "", 0, nil)
+	got := h.singleFileHit(doc, "", 0, nil, "")
 	if got.FileName != "" || got.DownloadURL != "" {
 		t.Errorf("nil payload should leave file fields empty: %+v", got)
 	}
@@ -89,7 +89,7 @@ func TestSingleFileHit_Highlights(t *testing.T) {
 	// Name matched: name_highlight carries the marked name; content_snippet empty.
 	nameOnly := h.singleFileHit(doc, "", 0, map[string][]string{
 		"payload.file.name": {"quarterly-<mark>report</mark>.pdf"},
-	})
+	}, "")
 	if nameOnly.NameHighlight != "quarterly-<mark>report</mark>.pdf" {
 		t.Errorf("name_highlight: got %q", nameOnly.NameHighlight)
 	}
@@ -104,7 +104,7 @@ func TestSingleFileHit_Highlights(t *testing.T) {
 	// Body-only match: content_snippet carries the marked fragment; name_highlight empty.
 	bodyOnly := h.singleFileHit(doc, "", 0, map[string][]string{
 		"payload.file.content": {"...annual <mark>revenue</mark> grew..."},
-	})
+	}, "")
 	if bodyOnly.NameHighlight != "" {
 		t.Errorf("name_highlight should be empty for body-only hit, got %q", bodyOnly.NameHighlight)
 	}
@@ -113,7 +113,7 @@ func TestSingleFileHit_Highlights(t *testing.T) {
 	}
 
 	// Browse path (nil highlight): both empty.
-	browse := h.singleFileHit(doc, "", 0, nil)
+	browse := h.singleFileHit(doc, "", 0, nil, "")
 	if browse.NameHighlight != "" || browse.ContentSnippet != "" {
 		t.Errorf("browse path should carry no highlight fields: %+v", browse)
 	}
@@ -195,7 +195,7 @@ func TestSingleFileHit_HostileContentEscaped(t *testing.T) {
 	hit := h.singleFileHit(doc, "", 0, map[string][]string{
 		"payload.file.name":    {"<img src=x onerror=alert(1)>.<mark>pdf</mark>"},
 		"payload.file.content": {"quarterly <script>alert(1)</script> <mark>report</mark>"},
-	})
+	}, "")
 
 	wantName := "&lt;img src=x onerror=alert(1)&gt;.<mark>pdf</mark>"
 	if hit.NameHighlight != wantName {

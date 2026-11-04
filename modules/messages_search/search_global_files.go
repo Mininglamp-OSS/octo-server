@@ -136,7 +136,7 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 	}
 
 	sjStart := time.Now()
-	items := h.buildGlobalFileHits(ctx, filtered, loginUID)
+	items := h.buildGlobalFileHits(ctx, filtered, loginUID, req.Keyword)
 	searchTimings.senderJoin = time.Since(sjStart)
 	recordAudit(c, "search_global_files", 0, "", req.Keyword, len(items))
 	recordSearchTimings(c, searchTimings)
@@ -203,11 +203,7 @@ func buildGlobalFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordSt
 
 	var analyzeErr error
 	if req.Keyword != "" {
-		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
-			"payload.file.name^2",
-			"payload.file.caption",
-			"payload.file.content",
-		)
+		clause, err := buildFileKeywordClause(ctx, analyzer, stopwordStripEnabled, req.Keyword)
 		b.Must(clause)
 		analyzeErr = err
 	}
@@ -217,7 +213,7 @@ func buildGlobalFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordSt
 // buildGlobalFileHits is buildFileHits adapted to derive channel context from
 // each doc. Same senderJoin degradation to global user names — group remarks
 // aren't scoped in a multi-room feed.
-func (h *Handler) buildGlobalFileHits(ctx context.Context, hits []*elastic.SearchHit, loginUID string) []FileHit {
+func (h *Handler) buildGlobalFileHits(ctx context.Context, hits []*elastic.SearchHit, loginUID, keyword string) []FileHit {
 	if len(hits) == 0 {
 		return []FileHit{}
 	}
@@ -230,7 +226,7 @@ func (h *Handler) buildGlobalFileHits(ctx context.Context, hits []*elastic.Searc
 			continue
 		}
 		wireID, wireType := wireChannelFromDoc(doc, loginUID)
-		items = append(items, h.singleFileHit(doc, wireID, wireType, map[string][]string(hit.Highlight)))
+		items = append(items, h.singleFileHit(doc, wireID, wireType, map[string][]string(hit.Highlight), keyword))
 		senderIDs = append(senderIDs, doc.From)
 	}
 	if len(items) == 0 {
@@ -332,7 +328,7 @@ func (h *Handler) dispatchSingleFiles(c *wkhttp.Context, req SearchGlobalFilesRe
 		respondInternal(c)
 		return
 	}
-	items := h.buildGlobalFileHits(ctx, filtered, loginUID)
+	items := h.buildGlobalFileHits(ctx, filtered, loginUID, req.Keyword)
 	recordAudit(c, "search_global_files_fast", target.ChannelType, target.WireID, req.Keyword, len(items))
 	c.Response(envelope(items, hasMore, nextCursor))
 }

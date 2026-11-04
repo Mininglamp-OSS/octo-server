@@ -167,14 +167,7 @@ func buildSearchFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordSt
 	addCommonFilters(b, req.Filters)
 	var analyzeErr error
 	if req.Keyword != "" {
-		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
-			"payload.file.name^2",
-			"payload.file.caption",
-			// content: full extracted file body from Tika (indexer v1.12).
-			// Default weight ^1 lets name/caption matches still outrank a
-			// pure-body hit. See docs/messages-search/v1.12-file-content-mapping-integration.md.
-			"payload.file.content",
-		)
+		clause, err := buildFileKeywordClause(ctx, analyzer, stopwordStripEnabled, req.Keyword)
 		b.Must(clause)
 		analyzeErr = err
 	}
@@ -193,7 +186,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 			h.Warn("messages_search: bad file _source skipped", zap.Error(err))
 			continue
 		}
-		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType, map[string][]string(hit.Highlight)))
+		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType, map[string][]string(hit.Highlight), req.Keyword))
 		senderIDs = append(senderIDs, doc.From)
 	}
 
@@ -216,7 +209,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 // via peerFromFakeChannelID; for group/thread the doc.ChannelID as-is.
 // Single-channel callers pass req.ChannelID / req.ChannelType so the response
 // mirrors the request.
-func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) FileHit {
+func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8, hl map[string][]string, keyword string) FileHit {
 	fp := filePayloadOf(doc.Payload)
 	fh := FileHit{
 		MessageID:   strconv.FormatInt(doc.MessageID, 10),
@@ -234,6 +227,9 @@ func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8, hl
 		fh.DownloadURL = fp.URL
 	}
 	fh.NameHighlight = pickFileNameHighlight(hl)
+	if marked := literalFilenameHighlight(fh.FileName, keyword); marked != "" {
+		fh.NameHighlight = marked
+	}
 	fh.ContentSnippet = pickFileContentSnippet(hl)
 	return fh
 }

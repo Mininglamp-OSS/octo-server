@@ -3,6 +3,7 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"sort"
 	"strings"
 
@@ -67,12 +68,12 @@ type GroupsResult struct {
 // the OS pre-filter max(timestamp) — because a hidden newest match there would
 // leak its time and bias bucket order (a real leak, now fixed).
 type GroupBucket struct {
-	ChannelID        string       `json:"channel_id"`
-	ChannelType      uint8        `json:"channel_type"`
-	ParentGroupNo    string       `json:"parent_group_no,omitempty"`
-	GroupName        string       `json:"group_name"`
-	ThreadID         string       `json:"thread_id,omitempty"`
-	ThreadName       string       `json:"thread_name,omitempty"`
+	ChannelID     string `json:"channel_id"`
+	ChannelType   uint8  `json:"channel_type"`
+	ParentGroupNo string `json:"parent_group_no,omitempty"`
+	GroupName     string `json:"group_name"`
+	ThreadID      string `json:"thread_id,omitempty"`
+	ThreadName    string `json:"thread_name,omitempty"`
 	// MatchCount is the pre-visibility OS doc_count (may exceed the caller's
 	// visible count — see the type doc). Left as-is by design §6 / owner
 	// option A; MatchCountApprox flags it.
@@ -163,7 +164,7 @@ func (h *Handler) searchGlobalGroups(c *wkhttp.Context) {
 		return
 	}
 
-	result, hasMore, berr := h.buildGroupsResult(ctx, c, res, req.Sequence, loginUID, client, base)
+	result, hasMore, berr := h.buildGroupsResult(ctx, c, res, req.Sequence, loginUID, client, base, req.Keyword)
 	if berr != nil {
 		// Deep-probe OS round-trips can fail like any other search; a
 		// classifiable OS error maps to UPSTREAM_UNAVAILABLE, everything else
@@ -320,7 +321,7 @@ type parsedBucket struct {
 // index). Returns an error when calibration hits a fail-closed DB gate or a
 // deep-probe OS round-trip fails, so the caller can respond upstream/internal
 // instead of leaking.
-func (h *Handler) buildGroupsResult(ctx context.Context, c *wkhttp.Context, res *elastic.SearchResult, seq int64, loginUID string, client *elastic.Client, base elastic.Query) (GroupsResult, bool, error) {
+func (h *Handler) buildGroupsResult(ctx context.Context, c *wkhttp.Context, res *elastic.SearchResult, seq int64, loginUID string, client *elastic.Client, base elastic.Query, keyword string) (GroupsResult, bool, error) {
 	result := emptyGroupsResult(seq)
 	// Keep the FULL over-fetched top-T sample (T=perGroupMax+presenceProbe) for
 	// calibration — do not truncate to perGroupMax here; preview trimming to the
@@ -381,7 +382,7 @@ func (h *Handler) buildGroupsResult(ctx context.Context, c *wkhttp.Context, res 
 	groupNames := h.resolveGroupNames(groupNos)
 	threadNames := h.resolveThreadNames(shortIDs)
 	peerNames := h.resolvePeerNames(peerUIDs)
-	previews := h.projectPreview(ctx, visibleHits, loginUID)
+	previews := h.projectPreview(ctx, visibleHits, loginUID, keyword)
 
 	for i, cb := range calibrated {
 		result.Groups = append(result.Groups, assembleGroupBucket(cb.pb, cb.latestVisibleTS, previews[i], loginUID, groupNames, threadNames, peerNames))
@@ -448,7 +449,7 @@ func parseGroupsAggregation(res *elastic.SearchResult, capHits int) (buckets []p
 // scoping — channelType=0 degrades senderJoin to a plain user lookup). Input is
 // the presence-calibrated + N-trimmed visible hits per bucket, so nothing here
 // reaches the wire without having passed filterVisible.
-func (h *Handler) projectPreview(ctx context.Context, bucketHits [][]*elastic.SearchHit, loginUID string) [][]MessageHit {
+func (h *Handler) projectPreview(ctx context.Context, bucketHits [][]*elastic.SearchHit, loginUID, keyword string) [][]MessageHit {
 	previews := make([][]MessageHit, len(bucketHits))
 	var senderIDs []string
 	for bi, hitList := range bucketHits {
@@ -461,6 +462,13 @@ func (h *Handler) projectPreview(ctx context.Context, bucketHits [][]*elastic.Se
 			}
 			wireID, wireType := wireChannelFromDoc(doc, loginUID)
 			mh := h.singleMessageHit(doc, wireID, wireType, map[string][]string(hit.Highlight))
+			if payloadType(doc.Payload) == payloadTypeFile && doc.Payload.File != nil {
+				if snippet := literalFilenameHighlightWindow(doc.Payload.File.Name, keyword, snippetWindow); snippet != "" {
+					// MessageHit.Snippet is raw text plus mark tags; unlike FileHit,
+					// clients do not decode HTML entities on this existing wire field.
+					mh.Snippet = html.UnescapeString(snippet)
+				}
+			}
 			hits = append(hits, mh)
 			senderIDs = append(senderIDs, doc.From)
 			for _, im := range mh.InnerMessages {

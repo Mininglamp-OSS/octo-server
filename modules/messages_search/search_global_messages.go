@@ -159,7 +159,7 @@ func (h *Handler) searchGlobalMessages(c *wkhttp.Context) {
 	}
 
 	sjStart := time.Now()
-	items := h.buildGlobalSearchAllHits(ctx, filtered, loginUID)
+	items := h.buildGlobalSearchAllHits(ctx, filtered, loginUID, req.Keyword)
 	searchTimings.senderJoin = time.Since(sjStart)
 
 	recordAudit(c, "search_global_messages", 0, "", req.Keyword, len(items))
@@ -256,11 +256,7 @@ func buildGlobalMessagesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwor
 			"payload.richText.searchText^3",
 			"payload.mergeForward.msgs.searchText",
 		)
-		fileClause := buildKeywordClauseFromAnalyzed(eff, useMSM,
-			"payload.file.name^2",
-			"payload.file.caption",
-			"payload.file.content",
-		)
+		fileClause := buildFileKeywordClauseFromAnalyzed(req.Keyword, eff, useMSM)
 		b.Should(textClause, fileClause)
 		b.MinimumShouldMatch("1")
 	}
@@ -273,7 +269,7 @@ func buildGlobalMessagesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwor
 // (channelType=0, channelID="") signature so it degrades to a plain global
 // user lookup — per §5 step 7 we deliberately skip group-remark scoping
 // because a single global response mixes hits from many rooms.
-func (h *Handler) buildGlobalSearchAllHits(ctx context.Context, hits []*elastic.SearchHit, loginUID string) []SearchAllHit {
+func (h *Handler) buildGlobalSearchAllHits(ctx context.Context, hits []*elastic.SearchHit, loginUID, keyword string) []SearchAllHit {
 	if len(hits) == 0 {
 		return []SearchAllHit{}
 	}
@@ -287,7 +283,7 @@ func (h *Handler) buildGlobalSearchAllHits(ctx context.Context, hits []*elastic.
 		}
 		wireID, wireType := wireChannelFromDoc(doc, loginUID)
 		hl := map[string][]string(hit.Highlight)
-		entry := h.singleSearchAllHit(doc, wireID, wireType, hl)
+		entry := h.singleSearchAllHit(doc, wireID, wireType, hl, keyword)
 		items = append(items, entry)
 		senderIDs = append(senderIDs, doc.From)
 		if entry.Message != nil {

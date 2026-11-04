@@ -169,11 +169,7 @@ func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStri
 			"payload.richText.searchText^3",
 			"payload.mergeForward.msgs.searchText",
 		)
-		fileClause := buildKeywordClauseFromAnalyzed(eff, useMSM,
-			"payload.file.name^2",
-			"payload.file.caption",
-			"payload.file.content",
-		)
+		fileClause := buildFileKeywordClauseFromAnalyzed(req.Keyword, eff, useMSM)
 		b.Should(textClause, fileClause)
 		b.MinimumShouldMatch("1")
 	}
@@ -241,7 +237,7 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 			continue
 		}
 		hl := map[string][]string(hit.Highlight)
-		entry := h.singleSearchAllHit(doc, req.ChannelID, req.ChannelType, hl)
+		entry := h.singleSearchAllHit(doc, req.ChannelID, req.ChannelType, hl, req.Keyword)
 		items = append(items, entry)
 		senderIDs = append(senderIDs, doc.From)
 		// Forward children: their senders need the same batched name lookup
@@ -293,10 +289,10 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 // the peer uid via peerFromFakeChannelID; group/thread the doc.ChannelID
 // as-is) so the frontend can jump into the source room from a mixed-room
 // unified feed.
-func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) SearchAllHit {
+func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint8, hl map[string][]string, keyword string) SearchAllHit {
 	entry := SearchAllHit{SortedAt: msToRFC3339(doc.Timestamp)}
 	if payloadType(doc.Payload) == payloadTypeFile {
-		fh := h.singleFileHit(doc, channelID, channelType, hl)
+		fh := h.singleFileHit(doc, channelID, channelType, hl, keyword)
 		entry.ResultType = "file"
 		entry.File = &fh
 		entry.SortedAt = fh.SentAt

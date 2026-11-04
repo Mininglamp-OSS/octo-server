@@ -184,7 +184,7 @@ func TestGlobalHitShape_ChannelTypeAndIDPresent(t *testing.T) {
 	// File hit for a group.
 	fp := payloadTypeFile
 	docFile := Doc{MessageID: 2, Payload: &Payload{Type: &fp, File: &FilePayload{Name: "a.pdf"}}}
-	fh := h.singleFileHit(docFile, "gA", channelTypeGroup, nil)
+	fh := h.singleFileHit(docFile, "gA", channelTypeGroup, nil, "")
 	if b, _ := json.Marshal(fh); !strings.Contains(string(b), `"channel_id":"gA"`) || !strings.Contains(string(b), `"channel_type":2`) {
 		t.Errorf("FileHit must carry channel_id+channel_type: %s", b)
 	}
@@ -414,7 +414,7 @@ func TestBuildGlobalSearchAllHits_DMChannelReversal(t *testing.T) {
 		Payload:     &Payload{Type: &tp, Text: &TextPayload{Content: "hi"}},
 	}
 	src := json.RawMessage(mustJSON(docDM))
-	items := h.buildGlobalSearchAllHits(context.Background(), []*elastic.SearchHit{{Source: &src}}, loginUID)
+	items := h.buildGlobalSearchAllHits(context.Background(), []*elastic.SearchHit{{Source: &src}}, loginUID, "")
 	if len(items) != 1 || items[0].Message == nil {
 		t.Fatalf("expected one message hit, got %+v", items)
 	}
@@ -444,7 +444,7 @@ func TestBuildGlobalFileHits_DMChannelReversal(t *testing.T) {
 		Payload:     &Payload{Type: &fp, File: &FilePayload{Name: "a.pdf"}},
 	}
 	src := json.RawMessage(mustJSON(docFile))
-	items := h.buildGlobalFileHits(context.Background(), []*elastic.SearchHit{{Source: &src}}, loginUID)
+	items := h.buildGlobalFileHits(context.Background(), []*elastic.SearchHit{{Source: &src}}, loginUID, "")
 	if len(items) != 1 {
 		t.Fatalf("expected one file hit, got %d", len(items))
 	}
@@ -907,9 +907,9 @@ func TestResolveGlobalScope_MemberUIDs_ThreadsIncluded(t *testing.T) {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
 	want := map[string]bool{
-		"grpShared":                            true,
-		threadIDForTest("grpShared", "t1"):     true,
-		threadIDForTest("grpShared", "t2"):     true,
+		"grpShared":                        true,
+		threadIDForTest("grpShared", "t1"): true,
+		threadIDForTest("grpShared", "t2"): true,
 	}
 	if len(osIDs) != len(want) {
 		t.Fatalf("member filter must fold in shared group's threads (want %d entries); got %v", len(want), osIDs)
