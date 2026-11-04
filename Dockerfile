@@ -8,7 +8,7 @@
 #     build. The `2>/dev/null || echo dev` guard keeps the build green for
 #     OSS users without sacrificing the real version embed on internal builds.
 
-FROM golang:1.25 AS build
+FROM golang:1.26.10 AS build
 
 ENV GOPROXY https://goproxy.cn,direct
 ENV GO111MODULE on
