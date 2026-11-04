@@ -73,6 +73,9 @@ type Project struct {
 	// seams above: a mutable function pointer shared across the process is not
 	// something to put on a delivery path that carries revocations.
 	lifecycleEventSender lifecycleSender
+	// driveAccessChangedClient is the bounded best-effort Drive side path for
+	// member_revoked events after Fleet's outbox result has been recorded.
+	driveAccessChangedClient *driveAccessChangedClient
 
 	// builtLifecycleSender memoises the real HTTP client so it is built once per
 	// process rather than once per delivery tick.
@@ -166,6 +169,8 @@ func New(ctx *config.Context) *Project {
 	}
 
 	p.provisionClient = newProvisionClient()
+	p.driveAccessChangedClient = newDriveAccessChangedClient(
+		p.cfg.DriveAccessChangedURL, p.cfg.DriveInternalToken, p.cfg.LifecycleEventTimeout)
 	p.nudgeProvisioningFn = p.nudgeProvisioningWorker
 
 	p.registerSpaceMemberRemovalCleanup()
@@ -220,6 +225,7 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 	{
 		spaceScoped.POST("/:space_id/projects", p.createProjectHandler)
 		spaceScoped.GET("/:space_id/projects", p.listProjectsReadHandler)
+		spaceScoped.GET("/:space_id/projects/archive-notices", p.listArchiveNoticesHandler)
 	}
 
 	projectScoped := r.Group("/v1/projects",
@@ -231,6 +237,7 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 		projectScoped.GET("/:project_id", p.getProjectReadHandler)
 		projectScoped.PUT("/:project_id", p.updateProjectHandler)
 		projectScoped.DELETE("/:project_id", p.disbandProjectHandler)
+		projectScoped.PUT("/:project_id/archive", p.archiveProjectHandler)
 
 		projectScoped.GET("/:project_id/groups", p.listProjectGroupsHandler)
 		projectScoped.PUT("/:project_id/groups/:group_no/setting", p.updateProjectGroupSettingHandler)
@@ -481,6 +488,9 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedWrite(c, entryProjectUpdate, row) {
+		return
+	}
 	if !canUpdateProject(requestProjectRole(c)) {
 		observeRejected(entryProjectUpdate, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
@@ -521,6 +531,9 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	updated, changed, err := p.updateFn(row.ProjectID, uid, row.SpaceID, req)
 	switch {
 	case err == nil:
+	case errors.Is(err, errProjectArchived):
+		p.respondProjectArchivedError(c, entryProjectUpdate)
+		return
 	case errors.Is(err, errProjectGone):
 		respondProjectNotFound(c)
 		return
@@ -578,6 +591,9 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedWrite(c, entryProjectDisband, row) {
+		return
+	}
 	if !canDisbandProject(requestProjectRole(c)) {
 		observeRejected(entryProjectDisband, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
@@ -587,6 +603,9 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 	removed, err := p.disbandFn(row.ProjectID, uid, row.SpaceID)
 	switch {
 	case err == nil:
+	case errors.Is(err, errProjectArchived):
+		p.respondProjectArchivedError(c, entryProjectDisband)
+		return
 	case errors.Is(err, errProjectGone):
 		respondProjectNotFound(c)
 		return
@@ -658,10 +677,13 @@ func (p *Project) toResp(m *Model, myRole, spaceRole, humans, agents int, pinned
 		AgentMemberCount:       agents,
 		MemberEpoch:            m.MemberEpoch,
 		CollaborationRoleEpoch: m.CollaborationRoleEpoch,
+		LifecycleVersion:       m.LifecycleVersion,
+		ArchiveVersion:         m.ArchiveVersion,
+		ArchivedAt:             formatNullableTime(m.ArchivedAt),
 		Status:                 m.Status,
 		Pinned:                 pinned,
 		MyRole:                 myRole,
-		Capabilities:           capabilitiesFor(myRole, spaceRole),
+		Capabilities:           capabilitiesFor(myRole, spaceRole, m.ArchivedAt.Valid),
 		CreatedAt:              formatTime(m.CreatedAt),
 		UpdatedAt:              formatTime(m.UpdatedAt),
 	}

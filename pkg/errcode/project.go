@@ -158,6 +158,23 @@ var (
 		DefaultMessage: "You are no longer an active member of this space.",
 	})
 
+	// ErrProjectArchived is returned when a user business write targets a
+	// read-only archived Project. The owner restore and personal notice dismissal
+	// are handled by their explicit exceptions.
+	ErrProjectArchived = register(codes.Code{
+		ID:             "err.server.project.archived",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This project is archived and cannot be changed.",
+	})
+	// ErrProjectNotReady means a Fleet workspace has not completed binding yet.
+	// Archive transitions require a matching ready workspace and can be retried
+	// once provisioning completes.
+	ErrProjectNotReady = register(codes.Code{
+		ID:             "err.server.project.not_ready",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "The project workspace is not ready yet.",
+	})
+
 	// ---- quotas (403) --------------------------------------------------------
 
 	// ErrProjectQuotaPinned covers the per-Space cap on pinned projects.
@@ -262,6 +279,11 @@ var (
 		ID:             "err.server.project.last_owner_must_transfer",
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "Transfer ownership before leaving or being demoted.",
+	})
+	ErrProjectArchiveVersionConflict = register(codes.Code{
+		ID:             "err.server.project.archive_version_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The archive notice belongs to a different archive round.",
 	})
 
 	// ---- internal (500) ------------------------------------------------------

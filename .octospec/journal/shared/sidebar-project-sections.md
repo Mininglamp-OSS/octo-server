@@ -48,6 +48,9 @@ source: self
   Idempotent reads are the repair path.
 - A `pinned=0` row is meaningful sidebar state: it wins over active Project
   membership so an explicit unpin cannot be undone by the membership backstop.
+  `pinned` is tri-state; NULL means the row exists only for another preference
+  (archive-reminder dismissal), never suppresses the Project, and the
+  `pinned = 0` predicates ignore it naturally.
 - `SidebarItem.ProjectID` remains the existing string type. The pointer wire
   change in D6 is deferred pending client rollout confirmation.
 - The new migration and joins use `utf8mb4_general_ci`, matching the Project and

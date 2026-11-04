@@ -74,12 +74,15 @@ func iupDecodeError(t *testing.T, body []byte) iupErrorEnvelope {
 }
 
 type iupHTTPProject struct {
-	ProjectID   string `json:"project_id"`
-	SpaceID     string `json:"space_id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Logo        string `json:"logo"`
-	Role        int    `json:"role"`
+	ProjectID        string  `json:"project_id"`
+	SpaceID          string  `json:"space_id"`
+	Name             string  `json:"name"`
+	Description      string  `json:"description"`
+	Logo             string  `json:"logo"`
+	Role             int     `json:"role"`
+	LifecycleVersion int64   `json:"lifecycle_version"`
+	ArchiveVersion   int64   `json:"archive_version"`
+	ArchivedAt       *string `json:"archived_at"`
 }
 
 func iupDecodeProjects(t *testing.T, body []byte) []iupHTTPProject {
@@ -220,7 +223,7 @@ func TestInternalUserProjectsHTTPActivatedMembership(t *testing.T) {
 	response := httptest.NewRecorder()
 	route.ServeHTTP(response, req)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	require.JSONEq(t, `[{"project_id":"internal-ready","space_id":"space_a","name":"Ready project","description":"Ready description","logo":"","role":0}]`, response.Body.String())
+	require.JSONEq(t, `[{"project_id":"internal-ready","space_id":"space_a","name":"Ready project","description":"Ready description","logo":"","role":0,"lifecycle_version":0,"archive_version":0,"archived_at":null}]`, response.Body.String())
 }
 
 // TestInternalUserProjectsHTTPRequiresInternalCredential covers the two refusal

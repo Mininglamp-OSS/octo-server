@@ -149,6 +149,9 @@ func (p *Project) createCollaborationRoleOnce(
 	if project == nil || project.SpaceID != spaceID {
 		return nil, errProjectGone
 	}
+	if project.ArchivedAt.Valid {
+		return nil, errProjectArchived
+	}
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {
 		return nil, err
@@ -225,6 +228,9 @@ func (p *Project) renameCollaborationRoleOnce(
 	if project == nil || project.SpaceID != spaceID {
 		return nil, false, errProjectGone
 	}
+	if project.ArchivedAt.Valid {
+		return nil, false, errProjectArchived
+	}
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {
 		return nil, false, err
@@ -298,6 +304,9 @@ func (p *Project) deleteCollaborationRoleOnce(
 	if project == nil || project.SpaceID != spaceID {
 		return false, errProjectGone
 	}
+	if project.ArchivedAt.Valid {
+		return false, errProjectArchived
+	}
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {
 		return false, err
@@ -368,6 +377,9 @@ func (p *Project) replaceMemberCollaborationRolesOnce(
 	}
 	if project == nil || project.SpaceID != spaceID {
 		return false, errProjectGone
+	}
+	if project.ArchivedAt.Valid {
+		return false, errProjectArchived
 	}
 	actorRole, err := p.actorRoleTx(tx, projectID, actorUID)
 	if err != nil {

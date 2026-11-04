@@ -1,0 +1,18 @@
+{
+  "event": "OCTO59_NATIVE_FLEET_SCENARIO_ACCEPTED",
+  "project_id": "f2761681-c0dd-4418-8a04-9ad3d55833ff",
+  "workspace_id": "f2761681-c0dd-4418-8a04-9ad3d55833ff",
+  "archive_rounds": [
+    2,
+    5
+  ],
+  "final_lifecycle_version": 6,
+  "former_owner_uid": "u_octo59_owner",
+  "new_owner_uid": "u_octo59_admin",
+  "former_owner_left_after_transfer": true,
+  "owner_leave_blocked_before_transfer": true,
+  "archive_reminders_per_member_and_round": true,
+  "metadata_barrier_rejected_then_applied": true,
+  "final_workspace_status": "active",
+  "scope": "Isolated Server/Fleet/Drive canonical lifecycle API, authentic signed event delivery/replay, archived transfer/leave and per-member archive reminder rounds."
+}

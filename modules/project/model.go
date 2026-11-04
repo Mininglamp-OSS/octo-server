@@ -103,14 +103,19 @@ type Model struct {
 	// CollaborationRoleEpoch orders statements about the project's collaboration-role
 	// catalog. Third counter on this row, same increment-only discipline (from #871).
 	CollaborationRoleEpoch int64 `db:"collaboration_role_epoch"`
-	// LifecycleVersion orders statements about the PROJECT — its name, its
-	// description, whether it is active. Deliberately separate from MemberEpoch,
-	// which orders statements about the ROSTER: one shared counter would make
-	// every rename invalidate every cached authorization decision downstream, and
-	// every membership change look like a lifecycle statement. They move at
-	// different rates for different reasons.
+	// LifecycleVersion orders statements about the PROJECT — its name,
+	// description, archive state and whether it is disbanded. Deliberately separate
+	// from MemberEpoch, which orders statements about the ROSTER: one shared counter
+	// would make every rename invalidate every cached authorization decision
+	// downstream, and every membership change look like a lifecycle statement.
+	// They move at different rates for different reasons.
 	LifecycleVersion int64 `db:"lifecycle_version"`
-	Status           int   `db:"status"`
+
+	// Archive state is independent of status and the member epoch. Restoring
+	// clears ArchivedAt but deliberately retains the most recent archive round.
+	ArchiveVersion int64        `db:"archive_version"`
+	ArchivedAt     sql.NullTime `db:"archived_at"`
+	Status         int          `db:"status"`
 	// ActivatedAt is the two-phase create latch: when the subsystem side
 	// confirmed this project has a container. NULL until it does, and the two
 	// peer-facing endpoints answer about a NULL row exactly as they answer about
@@ -201,7 +206,12 @@ type updateReq struct {
 // one. A body that names no preference (`{}`) is a no-op, not a reset — a
 // zero-byte body is a 400, see updateSettingHandler.
 type settingReq struct {
-	Pinned *bool `json:"pinned"`
+	Pinned                        *bool  `json:"pinned"`
+	ArchiveNoticeDismissedVersion *int64 `json:"archive_notice_dismissed_version"`
+}
+
+type archiveReq struct {
+	Archived *bool `json:"archived"`
 }
 
 // memberAdd is the per-target role contract for an atomic members/add batch.
@@ -304,10 +314,13 @@ type Resp struct {
 	// Named for opanalytics' field rather than the shorter `agent_count`, which is
 	// already taken on the wire by the Space directory, where it means "how many
 	// agents this OWNER has" — a different question with the same short name.
-	AgentMemberCount       int   `json:"agent_member_count"`
-	MemberEpoch            int64 `json:"member_epoch"`
-	CollaborationRoleEpoch int64 `json:"collaboration_role_epoch"`
-	Status                 int   `json:"status"`
+	AgentMemberCount       int     `json:"agent_member_count"`
+	MemberEpoch            int64   `json:"member_epoch"`
+	CollaborationRoleEpoch int64   `json:"collaboration_role_epoch"`
+	Status                 int     `json:"status"`
+	LifecycleVersion       int64   `json:"lifecycle_version"`
+	ArchiveVersion         int64   `json:"archive_version"`
+	ArchivedAt             *string `json:"archived_at"`
 	// Pinned is the CALLER's own pin, not a property of the project: the same
 	// project reads true for one user and false for the next. It is on the list
 	// AND the detail route, because a field present on one and absent on the other
@@ -324,12 +337,15 @@ type Resp struct {
 // Capabilities is the server's verdict on what the caller may do with this
 // project, so clients never derive permissions from a role number.
 type Capabilities struct {
-	CanUpdate       bool `json:"can_update"`
-	CanDisband      bool `json:"can_disband"`
-	CanManageMember bool `json:"can_manage_member"`
-	CanChangeRole   bool `json:"can_change_role"`
-	CanLeave        bool `json:"can_leave"`
-	CanViewMembers  bool `json:"can_view_members"`
+	CanUpdate        bool `json:"can_update"`
+	CanDisband       bool `json:"can_disband"`
+	CanManageMember  bool `json:"can_manage_member"`
+	CanChangeRole    bool `json:"can_change_role"`
+	CanLeave         bool `json:"can_leave"`
+	CanViewMembers   bool `json:"can_view_members"`
+	CanArchive       bool `json:"can_archive"`
+	CanRestore       bool `json:"can_restore"`
+	CanTransferOwner bool `json:"can_transfer_owner"`
 }
 
 // MemberResp is one row of the project member roster.
@@ -388,4 +404,12 @@ func formatTime(t time.Time) string {
 		return ""
 	}
 	return t.Format(respTimeFormat)
+}
+
+func formatNullableTime(value sql.NullTime) *string {
+	if !value.Valid {
+		return nil
+	}
+	formatted := formatTime(utcFromColumn(value.Time))
+	return &formatted
 }

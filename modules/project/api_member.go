@@ -39,6 +39,9 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedWrite(c, entryMemberAdd, row) {
+		return
+	}
 	if !canManageMembers(requestProjectRole(c)) {
 		observeRejected(entryMemberAdd, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
@@ -68,6 +71,8 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 	changed, err := p.addMembers(row.ProjectID, row.SpaceID, c.GetLoginUID(), members)
 	if err != nil {
 		switch {
+		case errors.Is(err, errProjectArchived):
+			p.respondProjectArchivedError(c, entryMemberAdd)
 		case errors.Is(err, errProjectGone):
 			respondProjectNotFound(c)
 		case errors.Is(err, errActorNotSpaceMember):
@@ -121,6 +126,9 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedWrite(c, entryMemberRemove, row) {
+		return
+	}
 	if !canManageMembers(requestProjectRole(c)) {
 		observeRejected(entryMemberRemove, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
@@ -150,6 +158,16 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 			if removed {
 				p.audit(auditMemberRemove, actorUID, uid, row.ProjectID, row.SpaceID, "kicked")
 			}
+		case errors.Is(err, errProjectArchived):
+			if anyApplied(outcomes) {
+				observeRejected(entryMemberRemove, reasonProjectArchived)
+				outcomes = append(outcomes, memberOutcome{UID: uid, Reason: "project_archived"})
+				outcomes = appendNotAttemptedUIDs(outcomes, uids[i+1:])
+				c.Response(outcomes)
+				return
+			}
+			p.respondProjectArchivedError(c, entryMemberRemove)
+			return
 		case errors.Is(err, errActorNotSpaceMember):
 			if anyApplied(outcomes) {
 				outcomes = append(outcomes, memberOutcome{UID: uid, Reason: outcomeNotSpaceMember})
@@ -201,7 +219,7 @@ func (p *Project) leaveProjectHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
-	if !capabilitiesFor(requestProjectRole(c), requestSpaceRole(c)).CanLeave {
+	if !capabilitiesFor(requestProjectRole(c), requestSpaceRole(c), row.ArchivedAt.Valid).CanLeave {
 		observeRejected(entryLeave, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 		return
@@ -235,6 +253,9 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedWrite(c, entryRoleChange, row) {
+		return
+	}
 	if !canChangeMemberRole(requestProjectRole(c)) {
 		observeRejected(entryRoleChange, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
@@ -261,6 +282,8 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 			p.audit(auditRoleChange, c.GetLoginUID(), targetUID, row.ProjectID, row.SpaceID, "", zap.Int("new_role", *req.Role))
 		}
 		c.ResponseOK()
+	case errors.Is(err, errProjectArchived):
+		p.respondProjectArchivedError(c, entryRoleChange)
 	case errors.Is(err, errActorNotSpaceMember):
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 	case errors.Is(err, errNotSpaceMember):

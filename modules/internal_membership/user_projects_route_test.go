@@ -100,6 +100,7 @@ func resetBucket(t *testing.T, ctx *config.Context, clientIP string) {
 // covers all shipped routes: a bad token consumes the strict bucket (401),
 // the following valid-token request is refused by the bucket (429), and both
 // rejects already carry the body read deadline. The handler is never reached.
+// Permission-fact routes also forbid caching of auth and limiter rejections.
 func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(t *testing.T) {
 	ctx := newRedisBackedContext(t)
 	t.Setenv(envMembershipIPRPS, "0.000001")
@@ -147,6 +148,9 @@ func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(
 			doRouteRequest(t, r, rejected401, tc.method, tc.path,
 				"definitely-the-wrong-token-value", tc.ip, tc.body)
 			require.Equal(t, http.StatusUnauthorized, rejected401.Code, rejected401.Body.String())
+			if tc.name == "epochs" || tc.name == "verify" {
+				require.Equal(t, "no-store", rejected401.Header().Get("Cache-Control"))
+			}
 			require.Equal(t, 1, rejected401.deadlines,
 				"a request rejected by auth must still have the body read deadline installed")
 
@@ -154,6 +158,9 @@ func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(
 			doRouteRequest(t, r, rejected429, tc.method, tc.path,
 				testInternalToken, tc.ip, tc.body)
 			require.Equal(t, http.StatusTooManyRequests, rejected429.Code, rejected429.Body.String())
+			if tc.name == "epochs" || tc.name == "verify" {
+				require.Equal(t, "no-store", rejected429.Header().Get("Cache-Control"))
+			}
 			require.Equal(t, "strict:"+membershipRateLimitTag,
 				rejected429.Header().Get("X-RateLimit-Scope"))
 			require.Equal(t, 1, rejected429.deadlines,

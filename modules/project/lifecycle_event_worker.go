@@ -435,17 +435,22 @@ func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEve
 			return true
 		}
 		lifecycleEventOutcome.WithLabelValues(row.EventType, "delivered", lifecycleErrNone).Inc()
+		p.sendDriveAccessChangedHint(row)
 		return true
 
 	case !res.Retryable:
 		// Terminal refusal. Abandon immediately rather than burning the attempt
 		// budget on an answer that cannot change — the budget exists to outlast a
 		// transient peer, and spending it here only delays the alert.
-		p.abandonLifecycleEvent(row, owner, res, now)
+		if p.abandonLifecycleEvent(row, owner, res, now) {
+			p.sendDriveAccessChangedHint(row)
+		}
 		return true
 
 	case row.Attempts >= lifecycleEventMaxAttempts:
-		p.abandonLifecycleEvent(row, owner, res, now)
+		if p.abandonLifecycleEvent(row, owner, res, now) {
+			p.sendDriveAccessChangedHint(row)
+		}
 		return true
 
 	default:
@@ -461,7 +466,9 @@ func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEve
 		if !held {
 			p.Warn("项目生命周期事件租约已易主，放弃重排",
 				zap.Int64("id", row.ID), zap.String("lease_owner", owner))
+			return false
 		}
+		p.sendDriveAccessChangedHint(row)
 		return false
 	}
 }
@@ -473,15 +480,15 @@ func (p *Project) deliverLifecycleEvent(sender lifecycleSender, row lifecycleEve
 // and nothing else in the system will retry. The log line and the counter are
 // what an alert hangs off, and the event id is included because it is the key
 // the peer can be queried by during reconciliation.
-func (p *Project) abandonLifecycleEvent(row lifecycleEventRow, owner string, res lifecycleDeliveryResult, now time.Time) {
+func (p *Project) abandonLifecycleEvent(row lifecycleEventRow, owner string, res lifecycleDeliveryResult, now time.Time) bool {
 	held, err := p.db.completeLifecycleEvent(row.ID, owner, lifecycleEventAbandoned, res.Class+": "+res.Detail, now)
 	if err != nil {
 		p.Error("放弃项目生命周期事件失败", zap.Int64("id", row.ID), zap.Error(err))
-		return
+		return false
 	}
 	if !held {
 		p.Warn("项目生命周期事件租约已易主，未标记放弃", zap.Int64("id", row.ID))
-		return
+		return false
 	}
 	lifecycleEventOutcome.WithLabelValues(row.EventType, "abandoned", res.Class).Inc()
 	p.Error("项目生命周期事件已放弃投递，对端不会收到该变更",
@@ -496,6 +503,7 @@ func (p *Project) abandonLifecycleEvent(row lifecycleEventRow, owner string, res
 		// for the database column. A log line has no column to stop it.
 		zap.String("detail", truncateError(res.Detail)),
 		zap.Error(errFleetTerminal))
+	return true
 }
 
 // publishLifecycleEventBacklog refreshes both queue gauges.

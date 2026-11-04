@@ -9,30 +9,39 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-// UserProject is one Project the target user holds an active seat in, reduced to
-// the list's six fields: no epoch, counts or personal preference. role 0 is a
-// real (member) value and is never omitted.
+// UserProject is one Project the target user holds an active seat in. role 0
+// is a real member value and is never omitted; lifecycle fields remain present
+// for archived projects without turning them into non-members.
 type UserProject struct {
-	ProjectID   string `db:"project_id" json:"project_id"`
-	SpaceID     string `db:"space_id" json:"space_id"`
-	Name        string `db:"name" json:"name"`
-	Description string `db:"description" json:"description"`
-	Logo        string `db:"logo" json:"logo"`
-	Role        int    `db:"role" json:"role"`
+	ProjectID        string  `json:"project_id"`
+	SpaceID          string  `json:"space_id"`
+	Name             string  `json:"name"`
+	Description      string  `json:"description"`
+	Logo             string  `json:"logo"`
+	Role             int     `json:"role"`
+	LifecycleVersion int64   `json:"lifecycle_version"`
+	ArchiveVersion   int64   `json:"archive_version"`
+	ArchivedAt       *string `json:"archived_at"`
 }
 
-// userProjectSeat keeps the actual seat identity out of the response DTO.
-// Legacy and Project collations can disagree on UID and Space equality, so both
-// the seat and Project must bind to the qualified identities through FoldID.
+// userProjectSeat keeps scan-only qualification facts out of the response DTO.
 type userProjectSeat struct {
-	UserProject
-	SeatUID     string `db:"seat_uid"`
-	SeatSpaceID string `db:"seat_space_id"`
+	ProjectID        string         `db:"project_id"`
+	SpaceID          string         `db:"space_id"`
+	Name             string         `db:"name"`
+	Description      string         `db:"description"`
+	Logo             string         `db:"logo"`
+	Role             int            `db:"role"`
+	LifecycleVersion int64          `db:"lifecycle_version"`
+	ArchiveVersion   int64          `db:"archive_version"`
+	ArchivedAt       sql.NullString `db:"archived_at"`
+	SeatUID          string         `db:"seat_uid"`
+	SeatSpaceID      string         `db:"seat_space_id"`
 }
 
 // UserProjectsInSpace returns every activated Project of spaceID that uid has
-// joined, newest first (octo_project.id DESC, unpaginated); an empty non-nil
-// slice means none.
+// joined, newest first (octo_project.id DESC, unpaginated); archived projects
+// remain membership facts and are included.
 //
 // A row qualifies only when the account is live (pkg/user.ActiveAccounts), the
 // Space is active and uid holds an active seat in it (pkg/space.ActiveMembers),
@@ -86,7 +95,10 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 
 	var seatRows []userProjectSeat
 	if _, err := tx.SelectBySql(
-		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, pm.role, pm.uid AS seat_uid, pm.space_id AS seat_space_id "+
+		"SELECT p.project_id, p.space_id, p.name, p.description, p.logo, pm.role, "+
+			"p.lifecycle_version, p.archive_version, "+
+			"DATE_FORMAT(p.archived_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS archived_at, "+
+			"pm.uid AS seat_uid, pm.space_id AS seat_space_id "+
 			"FROM `octo_project_member` pm "+
 			"INNER JOIN `octo_project` p "+
 			"ON p.project_id = pm.project_id AND p.space_id = pm.space_id "+
@@ -108,7 +120,16 @@ func UserProjectsInSpace(ctx context.Context, session *dbr.Session, spaceID, uid
 			FoldID(seat.SpaceID) != spaceFold || FoldID(seat.SeatSpaceID) != spaceFold {
 			continue
 		}
-		out = append(out, seat.UserProject)
+		var archivedAt *string
+		if seat.ArchivedAt.Valid {
+			archivedAt = &seat.ArchivedAt.String
+		}
+		out = append(out, UserProject{
+			ProjectID: seat.ProjectID, SpaceID: seat.SpaceID, Name: seat.Name,
+			Description: seat.Description, Logo: seat.Logo, Role: seat.Role,
+			LifecycleVersion: seat.LifecycleVersion, ArchiveVersion: seat.ArchiveVersion,
+			ArchivedAt: archivedAt,
+		})
 	}
 	return out, nil
 }
@@ -185,4 +206,83 @@ func ProjectMetadataInSpace(ctx context.Context, session *dbr.Session, spaceID s
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// ProjectLifecycle is the minimal internal fact Fleet needs to gate workspace
+// writes and execution. It intentionally carries no Project content or user data.
+type ProjectLifecycle struct {
+	ProjectID        string  `json:"project_id"`
+	SpaceID          string  `json:"space_id"`
+	LifecycleVersion int64   `json:"lifecycle_version"`
+	ArchiveVersion   int64   `json:"archive_version"`
+	ArchivedAt       *string `json:"archived_at"`
+}
+
+type projectLifecycleRow struct {
+	ProjectID        string         `db:"project_id"`
+	SpaceID          string         `db:"space_id"`
+	LifecycleVersion int64          `db:"lifecycle_version"`
+	ArchiveVersion   int64          `db:"archive_version"`
+	ArchivedAt       sql.NullString `db:"archived_at"`
+}
+
+// ProjectLifecycleInSpace returns only active, activated Project rows whose
+// parent Space is active and matches the requested scope. The read is a single
+// bounded repeatable-read snapshot and does not authorize any user.
+func ProjectLifecycleInSpace(
+	ctx context.Context, session *dbr.Session, spaceID, projectID string,
+) (*ProjectLifecycle, error) {
+	if spaceID == "" || projectID == "" {
+		return nil, nil
+	}
+	tx, err := session.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	tx.Timeout = membershipReadTimeout
+
+	qualifiedSpaceID, found, err := space.ResolveSpaceID(tx, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	active, err := space.IsActiveSpace(tx, qualifiedSpaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !active {
+		return nil, nil
+	}
+	var rows []projectLifecycleRow
+	_, err = tx.SelectBySql(
+		"SELECT project_id, space_id, lifecycle_version, archive_version, "+
+			"DATE_FORMAT(archived_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS archived_at "+
+			"FROM `octo_project` "+
+			"WHERE project_id = ? AND space_id = ? AND status = 1 AND activated_at IS NOT NULL LIMIT 1",
+		projectID, qualifiedSpaceID,
+	).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 ||
+		FoldID(rows[0].ProjectID) != FoldID(projectID) ||
+		FoldID(rows[0].SpaceID) != FoldID(qualifiedSpaceID) {
+		return nil, nil
+	}
+	row := rows[0]
+	var archivedAt *string
+	if row.ArchivedAt.Valid {
+		archivedAt = &row.ArchivedAt.String
+	}
+	return &ProjectLifecycle{
+		ProjectID: row.ProjectID, SpaceID: row.SpaceID,
+		LifecycleVersion: row.LifecycleVersion, ArchiveVersion: row.ArchiveVersion,
+		ArchivedAt: archivedAt,
+	}, nil
 }

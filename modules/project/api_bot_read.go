@@ -119,7 +119,7 @@ func (p *Project) botListProjects(c *wkhttp.Context) {
 		respondProjectRequestInvalid(c, "limit|offset")
 		return
 	}
-	result, err := p.readProjects(principal.Subject.SpaceID, principal.Subject.UID, strings.TrimSpace(c.Query("keyword")), page)
+	result, err := p.readProjects(principal.Subject.SpaceID, principal.Subject.UID, strings.TrimSpace(c.Query("keyword")), page, projectArchiveActive)
 	if err != nil {
 		p.respondBotProjectReadError(c, err, "Bot 查询项目列表失败", principal.Subject.SpaceID, principal.Subject.UID)
 		return

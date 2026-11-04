@@ -100,7 +100,9 @@ func (p *Project) readProjectAccessTx(tx *dbr.Tx, projectID, uid, expectedSpaceI
 	}, nil
 }
 
-func (p *Project) readProjects(spaceID, uid, keyword string, page projectReadPage) (*projectReadListResult, error) {
+func (p *Project) readProjects(
+	spaceID, uid, keyword string, page projectReadPage, archiveFilter projectArchiveFilter,
+) (*projectReadListResult, error) {
 	spaceID = strings.TrimSpace(spaceID)
 	uid = strings.TrimSpace(uid)
 	keyword = strings.TrimSpace(keyword)
@@ -109,6 +111,9 @@ func (p *Project) readProjects(spaceID, uid, keyword string, page projectReadPag
 	}
 	if page.Offset < 0 {
 		page.Offset = 0
+	}
+	if archiveFilter > projectArchiveAll {
+		return nil, fmt.Errorf("project: invalid archive filter")
 	}
 	tx, err := p.beginProjectReadTx()
 	if err != nil {
@@ -120,7 +125,7 @@ func (p *Project) readProjects(spaceID, uid, keyword string, page projectReadPag
 	} else if !ok {
 		return nil, errProjectReadForbidden
 	}
-	result, err := p.db.listProjectsReadTx(tx, spaceID, uid, keyword, page)
+	result, err := p.db.listProjectsReadTx(tx, spaceID, uid, keyword, page, archiveFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +144,37 @@ func (p *Project) readProjects(spaceID, uid, keyword string, page projectReadPag
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("project: commit project list read: %w", err)
+	}
+	return result, nil
+}
+
+func (p *Project) readArchiveNotices(
+	spaceID, uid string, page projectReadPage,
+) (*projectArchiveNoticeResult, error) {
+	spaceID = strings.TrimSpace(spaceID)
+	uid = strings.TrimSpace(uid)
+	if page.Limit <= 0 {
+		page.Limit = projectDefaultPageLimit
+	}
+	if page.Offset < 0 {
+		page.Offset = 0
+	}
+	tx, err := p.beginProjectReadTx()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if _, ok, err := p.projectReadSpaceAccessTx(tx, spaceID, uid); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errProjectReadForbidden
+	}
+	result, err := p.db.listArchiveNoticesReadTx(tx, spaceID, uid, page)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("project: commit archive notices read: %w", err)
 	}
 	return result, nil
 }

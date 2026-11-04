@@ -20,6 +20,7 @@ var (
 	errProjectRelationForbidden  = errors.New("group Project relation forbidden")
 	errProjectRelationInvalid    = errors.New("group Project relation request invalid")
 	errProjectRelationDependency = errors.New("group Project relation dependency unavailable")
+	errProjectRelationArchived   = errors.New("group Project relation target is archived")
 )
 
 func changedProjectSourceAllowed(initialSource, currentSource, targetID string) bool {
@@ -340,6 +341,9 @@ func mapProjectAccessError(err error) error {
 		return errProjectRelationNotFound
 	case errors.Is(err, projectmod.ErrGroupProjectForbidden):
 		return errProjectRelationForbidden
+	case errors.Is(err, projectmod.ErrGroupProjectArchived):
+		return errProjectRelationArchived
+
 	case errors.Is(err, projectmod.ErrGroupProjectSpaceConflict):
 		return errProjectRelationConflict
 	case errors.Is(err, projectmod.ErrGroupProjectDependency):

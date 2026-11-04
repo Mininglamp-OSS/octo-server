@@ -2,9 +2,11 @@ package project
 
 import (
 	"errors"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -72,29 +74,45 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 	// case, this route has no such case: a settings PUT that mentions nothing is a
 	// client bug worth reporting, not a shape to accept silently. Stated because the
 	// previous wording claimed the wider behaviour and the test sends `{}`.
-	if req.Pinned != nil {
-		if err := p.applyPin(row, uid, *req.Pinned); err != nil {
-			if errors.Is(err, errPinQuotaExceeded) {
-				observeRejected(entryProjectSetting, reasonQuotaPinned)
-				respondProjectQuota(c, errcode.ErrProjectQuotaPinned, p.cfg.MaxPinned)
-				return
-			}
+	if req.Pinned != nil && p.rejectArchivedWrite(c, entryProjectSetting, row) {
+		return
+	}
+	if req.Pinned != nil || req.ArchiveNoticeDismissedVersion != nil {
+		updated, err := p.applyProjectSettings(row, uid, req)
+		switch {
+		case err == nil:
+			row = updated
+		case errors.Is(err, errProjectArchived):
+			p.respondProjectArchivedError(c, entryProjectSetting)
+			return
+		case errors.Is(err, errArchiveVersionConflict):
+			httperr.ResponseErrorL(c, errcode.ErrProjectArchiveVersionConflict, nil, nil)
+			return
+		case errors.Is(err, errProjectGone):
+			respondProjectNotFound(c)
+			return
+		case errors.Is(err, errActorNotSpaceMember), errors.Is(err, errNotSpaceMember):
+			observeRejected(entryProjectSetting, reasonNotSpaceMember)
+			httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
+			return
+		case errors.Is(err, errMemberNotFound):
+			httperr.ResponseErrorL(c, errcode.ErrProjectMemberNotFound, nil, nil)
+			return
+		case errors.Is(err, errPinQuotaExceeded):
+			observeRejected(entryProjectSetting, reasonQuotaPinned)
+			respondProjectQuota(c, errcode.ErrProjectQuotaPinned, p.cfg.MaxPinned)
+			return
+		default:
 			p.Error("写入项目个人设置失败", zap.Error(err),
 				zap.String("projectId", row.ProjectID))
 			respondStoreFailed(c)
 			return
 		}
+	}
+	if req.Pinned != nil {
 		if *req.Pinned {
-			// applyPin commits before this best-effort hook runs. A pin is an
-			// explicit request to surface the Project in the caller's personal
-			// Follow sidebar. The list path repairs a transient provisioning
-			// failure, so a sidebar write must not turn a committed pin into a 5xx.
 			p.provisionSidebarSection(row.ProjectID, row.SpaceID, uid)
 		} else {
-			// An explicit unpin is also an explicit removal from Follow. The
-			// pinned=0 setting prevents the membership repair path from bringing it
-			// back; this hook hides the retained ordering row without coupling this
-			// module to category's table.
 			p.removeSidebarSection(row.ProjectID, row.SpaceID, uid)
 		}
 	}
@@ -111,70 +129,72 @@ func (p *Project) updateSettingHandler(c *wkhttp.Context) {
 		p.pinnedOrFalse(row.ProjectID, uid)))
 }
 
-// applyPin writes the pin, enforcing the per-Space cap.
-//
-// # Why the count and the write share a transaction
-//
-// So the check reads the same snapshot the write lands in. It does NOT make the
-// pair atomic against concurrent pins by the same user: every request that reads
-// n < cap inserts, so the overshoot is the concurrency degree, not one.
-//
-// An earlier version of this comment called that "a double-click ... one extra
-// pinned row", and PR #861's review corrected it with the number: SharedUIDRateLimiter
-// is 2 rps with a BURST OF 60 (pkg/wkhttp/ratelimit_helper.go), so ~60 in-flight
-// pins of distinct projects can each read 5 and each insert, landing ~65 rows
-// against a cap of 6. The trade is still the one taken, on grounds that survive the
-// correction — the overshoot is confined to the caller's own pin list, every row is
-// self-removable because unpin is never refused, and the PUT response re-reads the
-// state so the wire never reports a false success — but it is taken with the real
-// number rather than a comfortable one. A cap that ever becomes billing- or
-// audit-bearing needs SELECT ... FOR UPDATE on the caller's rows instead.
-//
-// # Why unpinning is never refused
-//
-// It lowers the count. Gating it would strand a user who somehow got over the cap
-// (see the window above, or a cap lowered by configuration) at exactly the
-// operation that would fix it.
-//
-// # Why re-pinning something already pinned is not refused either
-//
-// The row already exists and counts toward the total, so the upsert rewrites it
-// rather than adding one. Counting first and comparing >= cap would refuse an
-// operation that changes nothing — the shape of bug where turning a toggle on
-// twice fails the second time.
-func (p *Project) applyPin(row *Model, uid string, pinned bool) error {
-	// An explicit false is not equivalent to the absence of a setting row. Active
-	// Project members are followed by default, so the sidebar repair path needs a
-	// pinned=0 tombstone to distinguish an opt-out from "never chose". Always
-	// upserting here also makes the first unpin durable for auto-provisioned members.
-	if !pinned {
-		return p.db.upsertProjectUserSetting(row.ProjectID, uid, false)
+// applyProjectSettings writes the caller's pin and archive-round dismissal in
+// one Project-locked transaction, preserving the other setting on each upsert.
+func (p *Project) applyProjectSettings(row *Model, uid string, req settingReq) (*Model, error) {
+	if req.Pinned == nil && req.ArchiveNoticeDismissedVersion == nil {
+		return row, nil
 	}
-
-	// A repeated pin is a true no-op and must not consume quota again.
-	already, err := p.db.queryProjectPinned(row.ProjectID, uid)
+	seatRefs, err := p.db.resolveSpaceSeatIDs(row.SpaceID, []string{uid})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if already {
-		return nil
-	}
-
 	tx, err := p.db.session.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.RollbackUnlessCommitted()
-
-	n, err := p.db.countPinnedInSpaceTx(tx, row.SpaceID, uid)
+	if err := p.requireSpaceSeatsTx(tx, row.SpaceID, uid, seatRefs); err != nil {
+		return nil, err
+	}
+	locked, err := p.db.lockActiveProjectTx(tx, row.ProjectID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if n >= p.cfg.MaxPinned {
-		return errPinQuotaExceeded
+	if locked == nil || locked.SpaceID != row.SpaceID {
+		return nil, errProjectGone
 	}
-	if err := p.db.upsertProjectUserSettingTx(tx, row.ProjectID, uid, true); err != nil {
-		return err
+	if req.Pinned != nil && locked.ArchivedAt.Valid {
+		return nil, errProjectArchived
 	}
-	return tx.Commit()
+	if version := req.ArchiveNoticeDismissedVersion; version != nil &&
+		(!locked.ArchivedAt.Valid || *version <= 0 || *version != locked.ArchiveVersion) {
+		return nil, errArchiveVersionConflict
+	}
+	member, err := p.db.queryMemberTx(tx, row.ProjectID, uid)
+	if err != nil {
+		return nil, err
+	}
+	if member == nil || member.Status != MemberStatusActive || member.Removing != 0 {
+		return nil, errMemberNotFound
+	}
+	if req.Pinned != nil {
+		if *req.Pinned {
+			already, err := p.db.queryProjectPinnedReadTx(tx, row.ProjectID, uid)
+			if err != nil {
+				return nil, err
+			}
+			if !already {
+				n, err := p.db.countPinnedInSpaceTx(tx, locked.SpaceID, uid)
+				if err != nil {
+					return nil, err
+				}
+				if n >= p.cfg.MaxPinned {
+					return nil, errPinQuotaExceeded
+				}
+			}
+		}
+		if err := p.db.upsertProjectUserSettingTx(tx, row.ProjectID, uid, *req.Pinned); err != nil {
+			return nil, err
+		}
+	}
+	if version := req.ArchiveNoticeDismissedVersion; version != nil {
+		if err := p.db.upsertArchiveNoticeDismissalTx(tx, row.ProjectID, uid, *version, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return locked, nil
 }

@@ -81,9 +81,9 @@ func iupProjectIDs(rows []projectpkg.UserProject) []string {
 // ---------- happy path: roles, stored fields, ordering ----------
 
 // TestUserProjectsInSpaceReturnsStoredFieldsAndEveryRole pins acceptance 1 and
-// the projection: member/admin/Owner all appear with their real role, the six
-// fields are the stored values (including an empty logo and a 500-character
-// description), and a creator with no seat gets nothing.
+// the projection: member/admin/Owner all appear with their real role, the Project
+// content and lifecycle fields are returned, including an empty logo and a
+// 500-character description, and a creator with no seat gets nothing.
 func TestUserProjectsInSpaceReturnsStoredFieldsAndEveryRole(t *testing.T) {
 	setup(t)
 	const uid = "iup-role-user"
@@ -114,6 +114,33 @@ func TestUserProjectsInSpaceReturnsStoredFieldsAndEveryRole(t *testing.T) {
 		{ProjectID: "iup-admin", SpaceID: spaceA, Name: "Admin project", Description: "admin description", Logo: "https://cdn.test/logo.png", Role: 1},
 		{ProjectID: "iup-member", SpaceID: spaceA, Name: "Member project", Description: "", Logo: "", Role: 0},
 	}, iupUserProjects(t, spaceA, uid))
+}
+
+func TestUserProjectsInSpaceIncludesArchivedLifecycleState(t *testing.T) {
+	setup(t)
+	const (
+		uid       = "iup-archived-user"
+		projectID = "iup-archived-project"
+	)
+	seedUserBare(t, uid)
+	seedSpace(t, spaceA, 1)
+	seedSpaceMember(t, spaceA, uid, 0, 1)
+	iupProject(t, projectID, spaceA, "someone-else", "Archived project", "", "", 1, true)
+	iupSeat(t, projectID, uid, spaceA, RoleCommon, 1, 0)
+	_, err := testCtx.DB().UpdateBySql(
+		"UPDATE octo_project SET lifecycle_version = 7, archive_version = 7, archived_at = UTC_TIMESTAMP(3) "+
+			"WHERE project_id = ?", projectID,
+	).Exec()
+	require.NoError(t, err)
+
+	rows := iupUserProjects(t, spaceA, uid)
+	require.Len(t, rows, 1, "archiving must not remove an active member's Project relation")
+	row := rows[0]
+	require.Equal(t, projectID, row.ProjectID)
+	require.EqualValues(t, 7, row.LifecycleVersion)
+	require.EqualValues(t, 7, row.ArchiveVersion)
+	require.NotNil(t, row.ArchivedAt)
+	require.Regexp(t, `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$`, *row.ArchivedAt)
 }
 
 // ---------- activation, seat lifecycle, project status ----------

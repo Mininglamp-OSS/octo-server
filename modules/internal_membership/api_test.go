@@ -41,14 +41,15 @@ type stubStore struct {
 	memErr   error
 	projErr  error
 
-	epochCalls    int
-	memberCalls   int
-	projectCalls  int
-	metadataCalls int
-	lastSpaceID   string
-	lastProject   string
-	lastUIDs      []string
-	lastIDs       []string
+	epochCalls     int
+	memberCalls    int
+	projectCalls   int
+	metadataCalls  int
+	lifecycleCalls int
+	lastSpaceID    string
+	lastProject    string
+	lastUIDs       []string
+	lastIDs        []string
 	// lastEpochCtx / lastMemberCtx record the context each handler passed down, so
 	// TestBothHandlersPassTheRequestContextToTheStore can assert the plumbing is
 	// real rather than trusting the signature.
@@ -121,6 +122,12 @@ func (s *stubStore) ProjectMetadata(ctx context.Context, spaceID string, project
 	s.lastIDs = projectIDs
 	return []projectpkg.ProjectMetadata{}, nil
 }
+func (s *stubStore) Lifecycle(ctx context.Context, spaceID, projectID string) (*projectpkg.ProjectLifecycle, error) {
+	s.lifecycleCalls++
+	s.lastSpaceID = spaceID
+	s.lastProject = projectID
+	return nil, nil
+}
 
 func newTestModule(store membershipStore) *Module {
 	return &Module{
@@ -130,21 +137,21 @@ func newTestModule(store membershipStore) *Module {
 	}
 }
 
-// newRouter mounts the read deadline + auth + handler. The production order is
-// deadline → IP limiter → auth → handler on the concrete routes; only the
-// limiter is left out here, because it is the one middleware that needs Redis.
-// user_projects_route_test.go drives the real Route() for the limiter/bucket
-// properties; this helper exists for handler-level behaviour.
+// newRouter mounts the read deadline + auth + handler, and no-store on permission facts.
+// The production permission-fact order is deadline → no-store → IP limiter → auth →
+// handler; only the limiter is left out here, because it is the one middleware
+// that needs Redis. user_projects_route_test.go drives the real Route() for the
+// limiter/bucket properties; this helper exists for handler-level behaviour.
 //
 // The deadline IS mounted, because leaving it out would make every test in this
-// file exercise a chain that cannot reproduce the hazard it exists for — and
-// that is not hypothetical: it was called from inside the handler for a round,
-// which meant it never covered a request that aborted at the limiter or at auth.
+// file exercise a chain that cannot reproduce the hazard it exists for — and that
+// is not hypothetical: it was called from inside the handler for a round, which
+// meant it never covered a request that aborted at the limiter or at auth.
 func newRouter(m *Module) *wkhttp.WKHttp {
 	r := wkhttp.New()
 	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
-	r.GET(epochsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.membershipEpochs)
-	r.POST(verifyPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.verifyProjectMemberships)
+	r.GET(epochsPath, boundBodyReadTime(), noStoreResponse, m.internalAuthMiddleware(), m.membershipEpochs)
+	r.POST(verifyPath, boundBodyReadTime(), noStoreResponse, m.internalAuthMiddleware(), m.verifyProjectMemberships)
 	r.GET(projectsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listProjects)
 	r.GET(projectMembershipsPath, boundBodyReadTime(), m.internalAuthMiddleware(), m.listProjectMemberships)
 	return r
@@ -383,6 +390,43 @@ func TestEpochsFailsClosedOnStoreError(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "db down") {
 		t.Error("internal error text leaked to the caller")
+	}
+}
+
+func TestEpochResponsesAreNotCacheable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		store *stubStore
+		token string
+		query string
+		want  int
+	}{
+		{
+			name: "success", store: &stubStore{epochs: map[string]int64{"p1": 7}},
+			token: testInternalToken, query: "?space_id=sp1&project_ids=p1", want: http.StatusOK,
+		},
+		{
+			name: "invalid credentials", store: &stubStore{},
+			token: "wrong", query: "?space_id=sp1&project_ids=p1", want: http.StatusUnauthorized,
+		},
+		{
+			name: "invalid scope", store: &stubStore{},
+			token: testInternalToken, query: "?space_id=sp1", want: http.StatusBadRequest,
+		},
+		{
+			name: "store failure", store: &stubStore{epochErr: errors.New("db down")},
+			token: testInternalToken, query: "?space_id=sp1&project_ids=p1", want: http.StatusInternalServerError,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := doGet(t, newRouter(newTestModule(tc.store)), tc.token, tc.query)
+			if w.Code != tc.want {
+				t.Fatalf("want %d, got %d (%s)", tc.want, w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control: want no-store, got %q", got)
+			}
+		})
 	}
 }
 

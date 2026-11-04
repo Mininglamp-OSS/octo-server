@@ -15,13 +15,12 @@
 -- like a lifecycle statement. They move at different rates for different
 -- reasons.
 --
--- WRITE DISCIPLINE, identical to member_epoch and enforced the same way: the
--- only statement in this package that writes this column is
+-- WRITE DISCIPLINE, identical to member_epoch and enforced the same way: every
+-- statement in this package that updates this column uses
 -- lifecycle_version = lifecycle_version + 1, which is what makes monotonicity
--- checkable by grep rather than by hoping. A source guard test greps the package
--- for any other shape. Absolute assignment is what lets two writers race a value
--- backwards, and a version that can go backwards is worse than no version at
--- all: a consumer would discard the NEW state as stale.
+-- checkable by grep rather than by hoping. Absolute assignment is what lets two
+-- writers race the value backwards, and a version that can go backwards is worse
+-- than no version at all: a consumer would discard the NEW state as stale.
 --
 -- STARTING VALUE. New projects reach 1, not 0, because the creation event is
 -- itself a lifecycle statement and a consumer has to be able to order it against

@@ -72,9 +72,12 @@ func (p *Project) updateProjectGroupSettingHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedWrite(c, entryProjectSetting, row) {
+		return
+	}
 
 	var req settingReq
-	if err := c.ShouldBindJSON(&req); err != nil || req.Pinned == nil {
+	if err := c.ShouldBindJSON(&req); err != nil || req.Pinned == nil || req.ArchiveNoticeDismissedVersion != nil {
 		respondProjectRequestInvalid(c, "pinned")
 		return
 	}
@@ -93,6 +96,8 @@ func (p *Project) updateProjectGroupSettingHandler(c *wkhttp.Context) {
 	)
 	if err != nil {
 		switch {
+		case errors.Is(err, ErrGroupProjectArchived):
+			p.respondProjectArchivedError(c, entryProjectSetting)
 		case errors.Is(err, ErrGroupProjectInvalid):
 			respondProjectRequestInvalid(c, "group_no")
 		case errors.Is(err, ErrGroupProjectNotFound), errors.Is(err, ErrGroupProjectSpaceConflict):

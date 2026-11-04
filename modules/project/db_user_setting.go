@@ -71,6 +71,31 @@ func (d *DB) upsertProjectUserSettingTx(tx *dbr.Tx, projectID, uid string, pinne
 	return nil
 }
 
+func (d *DB) upsertArchiveNoticeDismissalTx(
+	tx *dbr.Tx, projectID, uid string, version int64, now time.Time,
+) error {
+	if projectID == "" || uid == "" || version <= 0 {
+		return fmt.Errorf("project: invalid archive notice dismissal")
+	}
+	// A member who never expressed a pin preference must get pinned NULL, not 0.
+	// The category sidebar treats pinned = 0 as the durable explicit-unpin
+	// opt-out, so writing 0 here would hide the Project from a member who only
+	// dismissed a reminder. NULL means not set; the ON DUPLICATE branch already
+	// leaves pinned alone, because a dismissal never changes the pin.
+	_, err := tx.InsertBySql(
+		"INSERT INTO octo_project_user_setting "+
+			"(project_id, uid, pinned, pinned_at, archive_notice_dismissed_version, created_at, updated_at) "+
+			"VALUES (?, ?, NULL, NULL, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE archive_notice_dismissed_version = "+
+			"VALUES(archive_notice_dismissed_version), updated_at = VALUES(updated_at)",
+		projectID, uid, version, now, now,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("project: upsert archive notice dismissal: %w", err)
+	}
+	return nil
+}
+
 // queryProjectPinned answers whether uid has pinned projectID.
 //
 // A point query rather than a join, for the routes that already hold one project
@@ -82,13 +107,18 @@ func (d *DB) upsertProjectUserSettingTx(tx *dbr.Tx, projectID, uid string, pinne
 // The create route does not call this: a project id that was generated inside the
 // transaction that just committed cannot have a setting row yet, so false there is
 // provable rather than assumed.
+//
+// pinned is tri-state: NULL means the row exists only for another preference
+// (archive notice dismissal), 0 is an explicit unpin, 1 is a pin. COALESCE keeps
+// the caller-facing answer boolean without teaching this read about the third
+// state.
 func (d *DB) queryProjectPinned(projectID, uid string) (bool, error) {
 	if projectID == "" || uid == "" {
 		return false, nil
 	}
 	var pinned []int
 	_, err := d.session.SelectBySql(
-		"SELECT pinned FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
+		"SELECT COALESCE(pinned, 0) FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
 		projectID, uid,
 	).Load(&pinned)
 	if err != nil {

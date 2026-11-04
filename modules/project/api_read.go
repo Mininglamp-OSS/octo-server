@@ -11,14 +11,44 @@ import (
 	"go.uber.org/zap"
 )
 
+func parseProjectArchiveFilter(values url.Values) (projectArchiveFilter, bool) {
+	raw, present := values["archive_status"]
+	if !present {
+		return projectArchiveActive, true
+	}
+	if len(raw) != 1 {
+		return 0, false
+	}
+	switch raw[0] {
+	case "active":
+		return projectArchiveActive, true
+	case "archived":
+		return projectArchiveOnly, true
+	case "all":
+		return projectArchiveAll, true
+	default:
+		return 0, false
+	}
+}
+
 func (p *Project) listProjectsReadHandler(c *wkhttp.Context) {
 	spaceID := strings.TrimSpace(spacepkg.GetSpaceID(c))
 	if spaceID == "" {
 		spaceID = strings.TrimSpace(c.Param("space_id"))
 	}
 	uid := strings.TrimSpace(c.GetLoginUID())
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		respondProjectRequestInvalid(c, "archive_status")
+		return
+	}
+	archiveFilter, valid := parseProjectArchiveFilter(query)
+	if !valid {
+		respondProjectRequestInvalid(c, "archive_status")
+		return
+	}
 	page := projectReadPageParams(c)
-	result, err := p.readProjects(spaceID, uid, strings.TrimSpace(c.Query("keyword")), page)
+	result, err := p.readProjects(spaceID, uid, strings.TrimSpace(c.Query("keyword")), page, archiveFilter)
 	if err != nil {
 		p.respondProjectReadError(c, err, "查询项目列表失败", spaceID, uid)
 		return

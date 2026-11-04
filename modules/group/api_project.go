@@ -77,6 +77,8 @@ func respondGroupProjectError(c *wkhttp.Context, err error) {
 	switch {
 	case errors.Is(err, aiteampkg.ErrContainerProtected):
 		httperr.ResponseErrorL(c, errcode.ErrAITeamContainerProtected, nil, nil)
+	case errors.Is(err, errProjectRelationArchived):
+		httperr.ResponseErrorL(c, errcode.ErrProjectArchived, nil, nil)
 	case errors.Is(err, errProjectRelationInvalid):
 		httperr.ResponseErrorL(c, errcode.ErrGroupRequestInvalid, nil, nil)
 	case errors.Is(err, errProjectRelationNotFound):
@@ -101,7 +103,8 @@ func mapCreateProjectGroupError(err error) (error, bool) {
 	case errors.Is(err, projectmod.ErrGroupProjectInvalid),
 		errors.Is(err, projectmod.ErrGroupProjectNotFound),
 		errors.Is(err, projectmod.ErrGroupProjectForbidden),
-		errors.Is(err, projectmod.ErrGroupProjectSpaceConflict):
+		errors.Is(err, projectmod.ErrGroupProjectSpaceConflict),
+		errors.Is(err, projectmod.ErrGroupProjectArchived):
 		return mapProjectAccessError(err), true
 	default:
 		return nil, false

@@ -54,6 +54,9 @@ func (p *Project) createCollaborationRoleHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedCollaborationRoleWrite(c, entryCollaborationRoleCreate, row) {
+		return
+	}
 	if requestProjectRole(c) != RoleOwner {
 		p.rejectCollaborationRoleWrite(c, entryCollaborationRoleCreate)
 		return
@@ -83,6 +86,9 @@ func (p *Project) renameCollaborationRoleHandler(c *wkhttp.Context) {
 	if row == nil {
 		p.Error("projectMiddleware 未注入项目行", zap.String("path", c.FullPath()))
 		respondQueryFailed(c)
+		return
+	}
+	if p.rejectArchivedCollaborationRoleWrite(c, entryCollaborationRoleRename, row) {
 		return
 	}
 	if requestProjectRole(c) != RoleOwner {
@@ -126,6 +132,9 @@ func (p *Project) deleteCollaborationRoleHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
+	if p.rejectArchivedCollaborationRoleWrite(c, entryCollaborationRoleDelete, row) {
+		return
+	}
 	if requestProjectRole(c) != RoleOwner {
 		p.rejectCollaborationRoleWrite(c, entryCollaborationRoleDelete)
 		return
@@ -159,6 +168,9 @@ func (p *Project) replaceMemberCollaborationRolesHandler(c *wkhttp.Context) {
 	if row == nil {
 		p.Error("projectMiddleware 未注入项目行", zap.String("path", c.FullPath()))
 		respondQueryFailed(c)
+		return
+	}
+	if p.rejectArchivedCollaborationRoleWrite(c, entryCollaborationRoleBind, row) {
 		return
 	}
 	if !canManageMembers(requestProjectRole(c)) {
@@ -201,12 +213,21 @@ func (p *Project) rejectCollaborationRoleWrite(c *wkhttp.Context, entry string) 
 	observeCollaborationRoleWrite(entry, collaborationRoleOutcomeRejected)
 	httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 }
+func (p *Project) rejectArchivedCollaborationRoleWrite(c *wkhttp.Context, entry string, row *Model) bool {
+	if row == nil || !row.ArchivedAt.Valid {
+		return false
+	}
+	observeCollaborationRoleWrite(entry, collaborationRoleOutcomeRejected)
+	return p.rejectArchivedWrite(c, entry, row)
+}
 
 func (p *Project) respondCollaborationRoleWriteError(
 	c *wkhttp.Context, entry, projectID, targetUID string, err error,
 ) {
 	observeCollaborationRoleWrite(entry, collaborationRoleOutcomeRejected)
 	switch {
+	case errors.Is(err, errProjectArchived):
+		p.respondProjectArchivedError(c, entry)
 	case errors.Is(err, errActorNotSpaceMember):
 		observeRejected(entry, reasonNotSpaceMember)
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)

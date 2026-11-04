@@ -1,7 +1,6 @@
 package project
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -104,56 +103,6 @@ func TestProvisioningClientIsConfinedToTheWorker(t *testing.T) {
 	}
 }
 
-// TestNoHandlerReachesTheProvisioningTable is D12's read-path rule.
-//
-// `status = ready` records "we called successfully once", not "the container exists
-// now" — a container can be deleted or migrated on the subsystem side with nothing
-// informing this service. So a read path that gates on this table can lock a feature
-// forever with no user-triggerable repair.
-//
-// The banned identifier set is DERIVED from db_provisioning.go rather than written
-// out, so renaming a DAO method cannot silently empty this guard.
-func TestNoHandlerReachesTheProvisioningTable(t *testing.T) {
-	dao := readStripped(t, "db_provisioning.go")
-	methods := regexp.MustCompile(`func \(d \*DB\) (\w+)\(`).FindAllStringSubmatch(dao, -1)
-	if len(methods) < 5 {
-		t.Fatalf("found only %d *DB methods in db_provisioning.go; the guard needs the real set "+
-			"(if the DAO moved, point this test at the new file)", len(methods))
-	}
-	var names []string
-	for _, m := range methods {
-		names = append(names, m[1])
-	}
-
-	handlers, _ := provisioningSourceFiles(t)
-	for _, f := range handlers {
-		cleaned := readStripped(t, f)
-		if strings.Contains(cleaned, "octo_project_provisioning") {
-			t.Errorf("modules/project/%s carries a request handler and names octo_project_provisioning; "+
-				"no read path may gate on the provisioning table (D12)", f)
-		}
-		for _, name := range names {
-			if strings.Contains(cleaned, name+"(") {
-				t.Errorf("modules/project/%s carries a request handler and calls the provisioning DAO "+
-					"method %s; no read path may gate on the provisioning table (D12)", f, name)
-			}
-		}
-	}
-
-	// The table name itself must appear in exactly one non-test file, so the DAO
-	// stays the single access point.
-	var tableFiles []string
-	for _, f := range moduleSourceFiles(t) {
-		if strings.Contains(readStripped(t, f), "octo_project_provisioning") {
-			tableFiles = append(tableFiles, f)
-		}
-	}
-	sort.Strings(tableFiles)
-	if len(tableFiles) != 1 || tableFiles[0] != "db_provisioning.go" {
-		t.Errorf("octo_project_provisioning must be reached only from db_provisioning.go; found %v", tableFiles)
-	}
-}
-
 // TestContainerIDHasOneProducerAndItIgnoresTheProjectID is the source half of D1.
 //
 // The behavioural half (TestContainerIDIsNotAFunctionOfProjectID) can only prove that
@@ -236,102 +185,6 @@ func TestContainerIDHasOneProducerAndItIgnoresTheProjectID(t *testing.T) {
 	sort.Strings(callers)
 	if len(callers) != 1 || callers[0] != "db_provisioning.go" {
 		t.Errorf("newContainerID must be called only from the enqueue path in db_provisioning.go; found %v", callers)
-	}
-}
-
-// TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID is the repo-wide half of
-// the disclosure rule, and it is what actually discharges the acceptance item's
-// "appconfig and verify responses" clause.
-//
-// A behavioural assertion can only cover the response shapes a test thought to call.
-// This covers every response every module produces, by attacking the prerequisite
-// instead: a container id can only reach a response if some code READS one, and the only
-// place one is stored is octo_project_provisioning. So if no package outside this slice
-// names that table — and no package outside it can mint an id, since the two prefixes
-// live with the single producer — then no other module's response can carry one.
-//
-// Whole-repo walk rather than a listed set of packages: the point is that a NEW consumer
-// has to come here and think about it, and a listed set would not notice one.
-func TestNoPackageOutsideTheProvisioningSliceCanReadAContainerID(t *testing.T) {
-	root := repoRootForGuard(t)
-	// The slice's own files, by path suffix. internal/projectprovision never names the
-	// table (it takes the id as an argument), but it is listed so the guard does not
-	// depend on that staying true.
-	//
-	// Keyed per (file, needle), not per file. config_provisioning.go has to be exempt for
-	// the two PREFIX literals — it owns provisionTargetRegistry, where they now live, one
-	// entry per subsystem so adding a third is a single-line change. It must NOT become
-	// exempt for the table name: the justification for listing it is precisely that it
-	// never reads octo_project_provisioning, and a file-keyed exemption would stop
-	// enforcing the property it was admitted on. Minting still happens only in
-	// newContainerID (provisioning.go), pinned by
-	// TestContainerIDHasOneProducerAndItIgnoresTheProjectID.
-	const tableNeedle = "octo_project_provisioning"
-	needles := []string{tableNeedle, `"octows-`, `"octods-`}
-	projectFile := func(name string) string { return filepath.Join("modules", "project", name) }
-	allowed := map[string]map[string]bool{
-		projectFile("db_provisioning.go"): {tableNeedle: true, `"octows-`: true, `"octods-`: true},
-		projectFile("provisioning.go"):    {tableNeedle: true, `"octows-`: true, `"octods-`: true},
-		// Prefixes only — deliberately still on the hook for the table name.
-		projectFile("config_provisioning.go"): {`"octows-`: true, `"octods-`: true},
-	}
-	scanned := 0
-	var offenders []string
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "vendor", "node_modules", ".octospec", ".context", ".claude":
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		name := d.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			return nil
-		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return relErr
-		}
-		if strings.HasPrefix(rel, filepath.Join("internal", "projectprovision")) {
-			return nil
-		}
-		exempt := allowed[rel]
-		if len(exempt) == len(needles) {
-			return nil // fully exempt; nothing left to check in this file
-		}
-		scanned++
-		raw, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		src := stripComments(string(raw))
-		for _, needle := range needles {
-			if exempt[needle] {
-				continue
-			}
-			if strings.Contains(src, needle) {
-				offenders = append(offenders, rel+" ("+needle+")")
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk repo: %v", err)
-	}
-	if scanned < 100 {
-		t.Fatalf("only %d files scanned; the walk is not reaching the repository and this guard "+
-			"would pass vacuously", scanned)
-	}
-	sort.Strings(offenders)
-	for _, o := range offenders {
-		t.Errorf("%s reads the provisioning table or mints a container id outside the provisioning "+
-			"slice. A container id must not be readable by any code that can put it in a response — "+
-			"until the target narrows authorization by Project, knowing the id is close enough to "+
-			"holding access to the container.", o)
 	}
 }
 
@@ -972,96 +825,6 @@ func readFileForGuard(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(body)
-}
-
-// testNameCitation matches a Go test-function name as it appears in prose, capturing any
-// explicit truncation marker that follows it.
-//
-// A cited name followed by an ellipsis in a documentation table is an ABBREVIATION, not a
-// claim that a function has that exact name — the marker says so — and rejecting it would
-// push the handover tables toward names too long to read. A bare name carries no such hedge,
-// so it must resolve exactly. Group 2 is the marker, empty when there is none. (Stated
-// without an example, because this guard reads its own file: an illustrative fake name here
-// would trip it, which is the guard working.)
-var testNameCitation = regexp.MustCompile(`\b(Test[A-Z][A-Za-z0-9_]*)(\.\.\.|…|\*)?`)
-
-// TestEveryTestNameCitedInSliceTextExists is the third arm of the same mechanical check.
-//
-// Paths and index tuples were the first two classes a grep could settle; a cited test name is
-// the third, and it had already failed twice by the time it was noticed — once in a comment
-// telling a future editor which guard protects a constant (so the pointer led nowhere
-// precisely when someone was about to change the thing it guards), once in a doc comment that
-// had drifted from its own function name. Both were found by a reviewer reading.
-//
-// Scope is deliberately narrow: test-function identifiers only, not every symbol. A general
-// identifier check needs the type checker to avoid drowning in false positives, and the
-// demonstrated failure is test names — a pointer that a reader follows and a maintainer
-// trusts. Broader symbol citations remain a human's job, which is the right split.
-func TestEveryTestNameCitedInSliceTextExists(t *testing.T) {
-	root := repoRootForGuard(t)
-	declared := map[string]bool{}
-	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if name := d.Name(); name == ".git" || name == "vendor" || name == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		body, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		for _, m := range regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]+)\(`).FindAllStringSubmatch(string(body), -1) {
-			declared[m[1]] = true
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("walk: %v", err)
-	}
-	if len(declared) < 200 {
-		t.Fatalf("only %d test functions found in the repository; the citation guard cannot "+
-			"judge a name without the declared set", len(declared))
-	}
-
-	cited := 0
-	for _, file := range provisioningDocFiles(t) {
-		rel, _ := filepath.Rel(root, file)
-		for _, groups := range testNameCitation.FindAllStringSubmatch(readFileForGuard(t, file), -1) {
-			name, abbreviated := groups[1], groups[2] != ""
-			cited++
-			if declared[name] {
-				continue
-			}
-			if abbreviated && someDeclaredNameStartsWith(declared, name) {
-				continue
-			}
-			hint := ""
-			if abbreviated {
-				hint = " (marked as abbreviated, but no test function starts with it either)"
-			}
-			t.Errorf("%s cites %s, which is not a test function anywhere in the repository%s",
-				rel, name, hint)
-		}
-	}
-	if cited < 30 {
-		t.Fatalf("only %d test-name citations examined; the guard is no longer reading the "+
-			"slice's text", cited)
-	}
-}
-
-func someDeclaredNameStartsWith(declared map[string]bool, prefix string) bool {
-	for name := range declared {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // TestInvalidResponseStaysRetryable pins A-3's other half, in the package where

@@ -111,40 +111,24 @@ type memberRevokedPayload struct {
 	Reason      string `json:"reason"`
 }
 
-// archivedPayload and restoredPayload are RESERVED, not wired.
-//
-// Archive and restore are frozen in the contract (§8) and deliberately not
-// implemented this cycle, so nothing constructs either of these and nothing
-// emits LifecycleEventArchived or LifecycleEventRestored. They are declared
-// because the contract fixes their shape and a later author should implement
-// against it rather than invent a second one.
-//
-// Stated here because the alternative reading is expensive: seeing the constants
-// and the payload types, a reader could reasonably assume disband already emits
-// project.archived. It does not — disband bumps both counters and emits no
-// event at all; it converges through the epoch predicate, which drops the
-// project and answers 0. Archive is a REVERSIBLE state and disband is terminal;
-// they are not the same event.
+// archivedPayload identifies the actor-independent reason for an archive
+// transition. The project version in the envelope orders the state change.
 type archivedPayload struct {
 	Reason string `json:"reason"`
 }
 
-// metadataUpdatedPayload is deliberately EMPTY.
-//
-// The event is a change SIGNAL, not a sync: it says "this project's profile
-// changed, at version N". That is the same shape member_epoch already has, and
-// it is what keeps the name out of the wire (contract §5). An earlier draft
-// carried name and description here.
-//
-// A struct rather than a bare map so the JSON is `{}` and not `null`: the
-// contract says the payload key is always an object, and the two are different
-// bytes to the fingerprint the consumer keys on.
-type metadataUpdatedPayload struct{}
+// metadataUpdatedPayload freezes the archive state observed by the same
+// transaction that enqueues the event. It carries no user-supplied project data.
+type metadataUpdatedPayload struct {
+	ArchiveVersion int64 `json:"archive_version"`
+	Archived       bool  `json:"archived"`
+}
 
-// restoredPayload is deliberately an empty object rather than a null: the
-// contract says the payload key is always present, and an absent object and an
-// empty one are different bytes to a fingerprint. RESERVED — see archivedPayload.
-type restoredPayload struct{}
+// restoredPayload binds a restore to the archive round it reverses. It is
+// frozen with the outbox event so retries carry the same predecessor version.
+type restoredPayload struct {
+	ArchiveVersion int64 `json:"archive_version"`
+}
 
 // ---------- envelope ----------
 
