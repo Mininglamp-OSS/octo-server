@@ -64,6 +64,10 @@ func TestF3FilenameOpenSearch(t *testing.T) {
 		{"17", "ｶﾀｶﾅ.pdf", "", "", "g", "s", false, 2},
 		{"18", "繁體①.pdf", "", "", "g", "s", false, 2},
 		{"19", "emoji😀.pdf", "", "", "g", "s", false, 2},
+		{"20", "ｶﾞｲﾄﾞ.pdf", "", "", "g", "s", false, 2},
+		{"21", "ガイド.pdf", "", "", "g", "s", false, 2},
+		{"22", "ﾊﾟｰﾂ.pdf", "", "", "g", "s", false, 2},
+		{"23", "パーツ.pdf", "", "", "g", "s", false, 2},
 	}
 	bulk := client.Bulk().Index(index).Refresh("true")
 	for i, f := range fixtures {
@@ -92,6 +96,10 @@ func TestF3FilenameOpenSearch(t *testing.T) {
 		{"%_", []string{"7"}},
 		{"STRASSE", []string{"8"}},
 		{"カタカナ", []string{"17"}},
+		{"ガイド", []string{"20", "21"}},
+		{"ｶﾞｲﾄﾞ", []string{"20", "21"}},
+		{"パーツ", []string{"22", "23"}},
+		{"ﾊﾟｰﾂ", []string{"22", "23"}},
 		{"繁体", nil},
 		{"①", []string{"18"}},
 		{"😀", []string{"8", "19"}},

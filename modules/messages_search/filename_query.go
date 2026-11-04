@@ -8,13 +8,14 @@ import (
 
 	"github.com/olivere/elastic"
 	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 	"golang.org/x/text/width"
 )
 
 // Keep this normalization in sync with octo-search-indexer/internal/esindex.
 // Do not use NFKC: compatibility characters beyond width are significant.
 func foldFilename(text string) string {
-	return cases.Fold().String(width.Fold.String(text))
+	return norm.NFC.String(cases.Fold().String(width.Fold.String(text)))
 }
 
 func buildFileKeywordClause(ctx context.Context, analyzer tokenAnalyzer, strip bool, keyword string) (elastic.Query, error) {
@@ -60,14 +61,31 @@ func literalFilenameHighlightWindow(name, keyword string, maxRunes int) string {
 	if needle == "" {
 		return ""
 	}
+	var expanded strings.Builder
+	var sourceStarts, sourceEnds []int
+	for start, r := range name {
+		piece := cases.Fold().String(width.Fold.String(string(r)))
+		expanded.WriteString(piece)
+		for range len(piece) {
+			sourceStarts = append(sourceStarts, start)
+			sourceEnds = append(sourceEnds, start+len(string(r)))
+		}
+	}
+	// Normalize complete canonical segments: a halfwidth kana and its sound
+	// mark compose across source rune boundaries. Every output byte maps to
+	// the whole original segment, including reordered/combined marks.
 	var folded strings.Builder
 	var starts, ends []int
-	for start, r := range name {
-		piece := foldFilename(string(r))
-		folded.WriteString(piece)
+	var it norm.Iter
+	it.InitString(norm.NFC, expanded.String())
+	for !it.Done() {
+		start := it.Pos()
+		piece := it.Next()
+		end := it.Pos()
+		folded.Write(piece)
 		for range len(piece) {
-			starts = append(starts, start)
-			ends = append(ends, start+len(string(r)))
+			starts = append(starts, sourceStarts[start])
+			ends = append(ends, sourceEnds[end-1])
 		}
 	}
 	text := folded.String()

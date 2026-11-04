@@ -56,3 +56,14 @@ uniquely named test index. It compares channel/global file and mixed results,
 two-item cursor pages, distinct same-name identities, dual-field hits, forbidden
 channels, revoked documents and the existing DM Space constraint. Module tests
 also retain auth/allowlist/visibility/revocation/deletion/clear-history regressions.
+
+## Canonical filename equivalence (PR review correction)
+
+After width/case folding, apply NFC canonical normalization in both writer and
+reader. This makes voiced/semi-voiced pairs such as `ｶﾞｲﾄﾞ` / `ガイド` and
+`ﾊﾟｰﾂ` / `パーツ` match in both directions. It does not introduce NFKC;
+punctuation, internal whitespace and compatibility characters such as `①` remain
+significant. Highlights map complete canonical segments to original text.
+Existing non-NFC `nameLiteral` values must be repaired using the updated backfill
+even if the field already exists. Follow the same coordinated rollout above;
+old normalization writers must remain stopped.

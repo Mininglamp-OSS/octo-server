@@ -12,6 +12,11 @@ import (
 
 func TestLiteralFilenameHighlight(t *testing.T) {
 	for _, tc := range []struct{ name, keyword, want string }{
+		{"ｶﾞｲﾄﾞ.pdf", "ガイド", "<mark>ｶﾞｲﾄﾞ</mark>.pdf"},
+		{"ガイド.pdf", "ｶﾞｲﾄﾞ", "<mark>ガイド</mark>.pdf"},
+		{"ﾊﾟｰﾂ.pdf", "パーツ", "<mark>ﾊﾟｰﾂ</mark>.pdf"},
+		{"パーツ.pdf", "ﾊﾟｰﾂ", "<mark>パーツ</mark>.pdf"},
+		{"Cafe\u0301.pdf", "CAFÉ", "<mark>Cafe\u0301</mark>.pdf"},
 		{"ＯＣＴＯ方案ｖ１．２.pdf", " octo ", "<mark>ＯＣＴＯ</mark>方案ｖ１．２.pdf"},
 		{"Octo方案v1.2.pdf", "v12", ""},
 		{"ＯＣＴＯ方案ｖ１．２.pdf", "v1.2", "ＯＣＴＯ方案<mark>ｖ１．２</mark>.pdf"},
@@ -93,5 +98,31 @@ func TestFilenameHighlight_GlobalAndChannelParity(t *testing.T) {
 		if file.NameHighlight != "<mark>ＯＣＴＯ</mark> &amp;.pdf" || file.ContentSnippet != "" || file.ChannelID != "g" || file.MessageID != "1" {
 			t.Fatalf("incorrect projection: %+v", file)
 		}
+	}
+}
+
+func TestKanaFilenameHitHighlights(t *testing.T) {
+	for _, tc := range []struct{ name, query, marked string }{
+		{"ｶﾞｲﾄﾞ.pdf", "ガイド", "<mark>ｶﾞｲﾄﾞ</mark>.pdf"},
+		{"ガイド.pdf", "ｶﾞｲﾄﾞ", "<mark>ガイド</mark>.pdf"},
+		{"ﾊﾟｰﾂ.pdf", "パーツ", "<mark>ﾊﾟｰﾂ</mark>.pdf"},
+		{"パーツ.pdf", "ﾊﾟｰﾂ", "<mark>パーツ</mark>.pdf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHandlerForGlobalTests()
+			tp := payloadTypeFile
+			doc := Doc{MessageID: 1, ChannelID: "g", ChannelType: 2, Payload: &Payload{Type: &tp, File: &FilePayload{Name: tc.name}}}
+			raw := json.RawMessage(mustJSON(doc))
+			hits := []*elastic.SearchHit{{Source: &raw}}
+			files := h.buildFileHits(context.Background(), hits, SearchFilesReq{Keyword: tc.query, ChannelID: "g", ChannelType: 2}, "me")
+			global := h.buildGlobalFileHits(context.Background(), hits, "me", tc.query)
+			all := h.buildSearchAllHits(context.Background(), hits, SearchAllReq{Keyword: tc.query, ChannelID: "g", ChannelType: 2}, "me")
+			globalAll := h.buildGlobalSearchAllHits(context.Background(), hits, "me", tc.query)
+			for _, f := range []FileHit{files[0], global[0], *all[0].File, *globalAll[0].File} {
+				if f.NameHighlight != tc.marked || f.ContentSnippet != "" {
+					t.Fatalf("incorrect highlight: %+v", f)
+				}
+			}
+		})
 	}
 }

@@ -12,6 +12,11 @@ import (
 func TestFilenameGroupedPreview(t *testing.T) {
 	h := newHandlerForGlobalTests()
 	for _, tc := range []struct{ name, keyword, want string }{
+		{"ｶﾞｲﾄﾞ.pdf", "ガイド", "<mark>ｶﾞｲﾄﾞ</mark>.pdf"},
+		{"ガイド.pdf", "ｶﾞｲﾄﾞ", "<mark>ガイド</mark>.pdf"},
+		{"ﾊﾟｰﾂ.pdf", "パーツ", "<mark>ﾊﾟｰﾂ</mark>.pdf"},
+		{"パーツ.pdf", "ﾊﾟｰﾂ", "<mark>パーツ</mark>.pdf"},
+		{"Cafe\u0301.pdf", "CAFÉ", "<mark>Cafe\u0301</mark>.pdf"},
 		{"Octo.pdf", "cto", "O<mark>cto</mark>.pdf"},
 		{"😀ＯＣＴＯ<&.pdf", "octo", "😀<mark>ＯＣＴＯ</mark><&.pdf"},
 		{"Straße.pdf", "STRASSE", "<mark>Straße</mark>.pdf"},
