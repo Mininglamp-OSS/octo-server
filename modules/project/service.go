@@ -126,6 +126,7 @@ func capabilitiesFor(projectRole, spaceRole int, archived bool) Capabilities {
 		CanUpdate:        !archived && canUpdateProject(projectRole),
 		CanDisband:       !archived && canDisbandProject(projectRole),
 		CanManageMember:  !archived && canManageMembers(projectRole),
+		CanRemoveMember:  canManageMembers(projectRole),
 		CanChangeRole:    !archived && canChangeMemberRole(projectRole),
 		CanLeave:         isProjectMember(projectRole) && projectRole != RoleOwner,
 		CanViewMembers:   isProjectMember(projectRole),
@@ -1362,9 +1363,6 @@ func (p *Project) removeMemberOnce(projectID, spaceID, actorUID, targetUID strin
 	}
 	if row == nil {
 		return false, errProjectGone
-	}
-	if row.ArchivedAt.Valid {
-		return false, errProjectArchived
 	}
 
 	// Both roles are read under the project lock. The actor's role is deliberately NOT the

@@ -463,7 +463,6 @@ func TestArchivedProjectReadsRemainAvailableAndBusinessWritesAreRejected(t *test
 	}{
 		{name: "profile", method: http.MethodPut, path: "/v1/projects/" + created.ProjectID, token: f.ownerToken, body: map[string]any{"name": "must-not-rename"}},
 		{name: "add member", method: http.MethodPost, path: "/v1/projects/" + created.ProjectID + "/members/add", token: f.ownerToken, body: addMembersPayload("readonly-new-member")},
-		{name: "remove member", method: http.MethodPost, path: "/v1/projects/" + created.ProjectID + "/members/remove", token: f.ownerToken, body: map[string]any{"uids": []string{"readonly-member"}}},
 		{name: "role change", method: http.MethodPut, path: "/v1/projects/" + created.ProjectID + "/members/readonly-member/role", token: f.ownerToken, body: map[string]any{"role": RoleAdmin}},
 		{name: "disband", method: http.MethodDelete, path: "/v1/projects/" + created.ProjectID, token: f.ownerToken},
 		{name: "collaboration role", method: http.MethodPost, path: "/v1/projects/" + created.ProjectID + "/collaboration-roles", token: f.ownerToken, body: map[string]any{"name": "New role"}},
@@ -492,6 +491,73 @@ func TestArchivedProjectReadsRemainAvailableAndBusinessWritesAreRejected(t *test
 		"SELECT COUNT(*) FROM octo_project_user_setting WHERE project_id = ? AND uid = ?",
 		created.ProjectID, "readonly-member").LoadOne(&pinRows))
 	assert.Zero(t, pinRows, "the reminder exception must not permit unrelated pin writes")
+}
+
+func TestArchivedProjectMemberRemovalAndCapabilities(t *testing.T) {
+	f := archiveAPISetup(t)
+	created := f.createBoundProject(t, "archived-member-removal")
+	adminToken := archiveAddMember(t, f, created.ProjectID, "remove-admin")
+	peerToken := archiveAddMember(t, f, created.ProjectID, "remove-peer-admin")
+	memberToken := archiveAddMember(t, f, created.ProjectID, "remove-member")
+	commonToken := archiveAddMember(t, f, created.ProjectID, "remove-common")
+	for _, uid := range []string{"remove-admin", "remove-peer-admin"} {
+		w := doOn(t, f.route, http.MethodPut, "/v1/projects/"+created.ProjectID+"/members/"+uid+"/role",
+			f.ownerToken, map[string]any{"role": RoleAdmin})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	}
+
+	active := doOn(t, f.route, http.MethodGet, "/v1/projects/"+created.ProjectID, f.ownerToken, nil)
+	require.Equal(t, http.StatusOK, active.Code, active.Body.String())
+	assert.True(t, archiveCapability(t, archiveJSONObject(t, active.Body.Bytes()), "can_remove_member"))
+	require.Equal(t, http.StatusOK, archiveProject(t, f, created.ProjectID, f.ownerToken, true).Code)
+	for _, tc := range []struct {
+		token string
+		want  bool
+	}{{f.ownerToken, true}, {adminToken, true}, {commonToken, false}} {
+		w := doOn(t, f.route, http.MethodGet, "/v1/projects/"+created.ProjectID, tc.token, nil)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		body := archiveJSONObject(t, w.Body.Bytes())
+		assert.Equal(t, tc.want, archiveCapability(t, body, "can_remove_member"))
+		assert.False(t, archiveCapability(t, body, "can_manage_member"))
+	}
+
+	path := "/v1/projects/" + created.ProjectID + "/members/remove"
+	denied := doOn(t, f.route, http.MethodPost, path, commonToken, map[string]any{"uids": []string{"remove-member"}})
+	assertProjectErrorCode(t, denied, "err.server.project.permission_denied")
+	ownerProtected := doOn(t, f.route, http.MethodPost, path, adminToken, map[string]any{"uids": []string{"owner1"}})
+	require.Equal(t, http.StatusOK, ownerProtected.Code, ownerProtected.Body.String())
+	var protected []memberOutcome
+	require.NoError(t, json.Unmarshal(ownerProtected.Body.Bytes(), &protected))
+	require.Len(t, protected, 1)
+	assert.False(t, protected[0].OK)
+	assert.Equal(t, outcomeForbidden, protected[0].Reason)
+
+	before := projectArchiveStateOf(t, created.ProjectID)
+	beforeRevocations := countLifecycleEvent(lifecycleEventsOf(t, created.ProjectID), LifecycleEventMemberRevoked)
+	for _, tc := range []struct {
+		token        string
+		uid          string
+		removedToken string
+	}{{f.ownerToken, "remove-member", memberToken}, {adminToken, "remove-peer-admin", peerToken}} {
+		w := doOn(t, f.route, http.MethodPost, path, tc.token, map[string]any{"uids": []string{tc.uid}})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var outcomes []memberOutcome
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes))
+		require.Len(t, outcomes, 1)
+		require.True(t, outcomes[0].OK, outcomes[0].Reason)
+		member, err := f.p.db.queryMember(created.ProjectID, tc.uid)
+		require.NoError(t, err)
+		require.NotNil(t, member)
+		assert.Equal(t, 1, member.Removing)
+		removedRead := doOn(t, f.route, http.MethodGet, "/v1/projects/"+created.ProjectID, tc.removedToken, nil)
+		assertProjectErrorCode(t, removedRead, "err.server.project.not_found")
+	}
+	after := projectArchiveStateOf(t, created.ProjectID)
+	assert.True(t, after.ArchivedAt.Valid)
+	assert.Equal(t, before.ArchiveVersion, after.ArchiveVersion)
+	assert.Greater(t, after.MemberEpoch, before.MemberEpoch)
+	assert.Equal(t, beforeRevocations+2,
+		countLifecycleEvent(lifecycleEventsOf(t, created.ProjectID), LifecycleEventMemberRevoked))
 }
 
 func TestArchiveNoticeDismissalIsPerMemberRoundScopedAndPreservesPin(t *testing.T) {
