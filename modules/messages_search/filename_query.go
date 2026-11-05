@@ -34,19 +34,12 @@ func buildFileKeywordClauseFromAnalyzed(keyword, effective string, useMSM bool) 
 	literal := elastic.NewMatchPhraseQuery("payload.file.nameLiteral", foldFilename(strings.TrimSpace(keyword))).Slop(0)
 	fulltext := buildKeywordClauseFromAnalyzed(effective, useMSM,
 		"payload.file.name^2", "payload.file.caption", "payload.file.content")
-	// Preserve the existing cross-field query and its score. Require at least
-	// one caption/body token so tokenization of the filename alone cannot bypass
-	// T1 (e.g. punctuation or spaces). Filename + body joint matches still work.
-	bodyEvidence := elastic.NewMultiMatchQuery(effective, "payload.file.caption", "payload.file.content").
-		Type("cross_fields").MinimumShouldMatch("1")
-	// Retain existing scores for existing eligible matches, including literal
-	// names that the old analyzer could find. Newly supported substrings get the
-	// existing filename boost. Do not add scores when both branches match.
-	allowed := elastic.NewBoolQuery().Should(literal, bodyEvidence).MinimumShouldMatch("1")
-	textWithEvidence := elastic.NewBoolQuery().Must(fulltext).Filter(allowed)
+	// T2 retains the complete legacy fulltext branch, including filename-only
+	// segmented hits. T1 adds literal recall; it must not veto an existing hit.
+	// Excluding fulltext from the fallback keeps scores of legacy hits intact.
 	newLiteral := elastic.NewBoolQuery().Filter(literal).MustNot(fulltext)
 	literalFallback := elastic.NewConstantScoreQuery(newLiteral).Boost(2)
-	return elastic.NewDisMaxQuery().Query(textWithEvidence, literalFallback)
+	return elastic.NewDisMaxQuery().Query(fulltext, literalFallback)
 }
 
 // literalFilenameHighlight maps folded matches back onto the original filename.

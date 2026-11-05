@@ -12,12 +12,18 @@ phrase. Query edge whitespace is ignored; internal spaces, punctuation and
 version numbers are significant. `*`, `?`, `%`, `_` and quotes are literal.
 
 The original IK `cross_fields` query, 75% minimum-match threshold, stopword
-handling, analyzer-failure fallback, and field boosts remain. Existing fulltext
-matches are retained if either the literal filename matches or at least one
-caption/content query token matches. Thus filename + caption/body joint evidence
-still works, while filename-only token matches cannot bypass T1. Old eligible
-hits keep their score; newly supported filename substrings receive filename boost
-2. This intentionally changes recall for filename-only noncontiguous matches.
+handling, analyzer-failure fallback, field list and boosts remain as a complete
+T2 branch, without an additional filename/caption/body evidence gate. T1 adds
+literal matches independently. A T1 non-match does not veto a T2 fulltext hit:
+`排期 评审` is not a literal match for `排期与评审.pdf` or a double-space
+filename, but both retain their existing segmented fulltext eligibility.
+Likewise, `v12` does not literally match `Octo方案v1.2.pdf`; a document may still
+match if its caption/body independently provides the query's fulltext evidence.
+
+Every legacy fulltext hit retains its score. The existing boost-2 literal fallback
+only applies when fulltext does not match, so dual matches are not double-scored.
+This fallback weight is an implementation detail, not a PRD ranking requirement.
+No relevance redesign is introduced; default ordering remains by message time.
 
 All query branches remain inside existing channel/Space/revocation/type/virtual
 filters and existing post-query visibility checks. No permission grant or scope
@@ -54,7 +60,9 @@ go test ./modules/messages_search -run TestF3FilenameOpenSearch -count=1
 The live suite requires isolated OpenSearch with IK and creates/deletes only its
 uniquely named test index. It compares channel/global file and mixed results,
 two-item cursor pages, distinct same-name identities, dual-field hits, forbidden
-channels, revoked documents and the existing DM Space constraint. Module tests
+channels, revoked documents and the existing DM Space constraint. The suite asserts every legacy ID is retained before comparing scores across all
+four builders, with stopword stripping enabled/disabled, and checks grouped
+aggregation counts against the restored feed. Module tests
 also retain auth/allowlist/visibility/revocation/deletion/clear-history regressions.
 
 ## Canonical filename equivalence (PR review correction)

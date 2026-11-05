@@ -70,6 +70,8 @@ func TestF3FilenameOpenSearch(t *testing.T) {
 		{"23", "パーツ.pdf", "", "", "g", "s", false, 2},
 		{"24", "ᾷ.pdf", "", "", "g", "s", false, 2},
 		{"25", "ᾷ.pdf", "", "", "g", "s", false, 2},
+		{"26", "Octo方案v1.2.pdf", "", "", "g", "s", false, 2},
+		{"27", "Octo方案v1.2.pdf", "", "v12", "g", "s", false, 2},
 	}
 	bulk := client.Bulk().Index(index).Refresh("true")
 	for i, f := range fixtures {
@@ -89,11 +91,11 @@ func TestF3FilenameOpenSearch(t *testing.T) {
 		keyword string
 		ids     []string
 	}{
-		{"octo", []string{"1", "2", "9", "12", "13"}},
-		{"cto", []string{"1", "2", "9", "13"}},
-		{"  Ｖ１．２  ", []string{"1", "9"}},
-		{"v12", []string{"2"}},
-		{"排期 评审", []string{"3", "4", "6"}},
+		{"octo", []string{"1", "2", "9", "12", "13", "26", "27"}},
+		{"cto", []string{"1", "2", "9", "13", "26", "27"}},
+		{"  Ｖ１．２  ", []string{"1", "9", "26", "27"}},
+		{"v12", []string{"2", "27"}},
+		{"排期 评审", []string{"3", "4", "5", "6", "16"}},
 		{"*?", []string{"7"}},
 		{"%_", []string{"7"}},
 		{"STRASSE", []string{"8"}},
@@ -167,29 +169,76 @@ func TestF3FilenameOpenSearch(t *testing.T) {
 	if len(res.Hits.Hits) != 1 || res.Hits.Hits[0].Id != "15" {
 		t.Fatalf("DM Space filter changed: %+v", res.Hits.Hits)
 	}
-	// Existing eligible matches retain their fulltext scores; adding a literal
-	// branch must not double-count filename/body evidence or replace BM25 scores.
-	effective, useMSM, err := AnalyzeKeyword(ctx, analyzer, "octo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldClause := buildKeywordClauseFromAnalyzed(effective, useMSM, "payload.file.name^2", "payload.file.caption", "payload.file.content")
-	oldHits, err := client.Search(index).RestTotalHitsAsInt(true).Query(oldClause).Size(100).Do(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newClause := buildFileKeywordClauseFromAnalyzed("octo", effective, useMSM)
-	newHits, err := client.Search(index).RestTotalHitsAsInt(true).Query(newClause).Size(100).Do(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scores := map[string]float64{}
-	for _, hit := range newHits.Hits.Hits {
-		scores[hit.Id] = *hit.Score
-	}
-	for _, hit := range oldHits.Hits.Hits {
-		if score, exists := scores[hit.Id]; exists && math.Abs(score-*hit.Score) > 1e-6 {
-			t.Fatalf("score changed for %s: %v -> %v", hit.Id, *hit.Score, score)
+	// Compare the complete legacy population, not just the intersection. Scope
+	// filters are fixed; every fixture here is a file, so the mixed query's
+	// non-file fields cannot contribute a score.
+	for _, keyword := range []string{"octo", "排期 评审", "排期的评审", "v1.2", "v12", "pdf"} {
+		for _, strip := range []bool{false, true} {
+			effective, useMSM := keyword, true
+			if strip {
+				effective, useMSM, err = AnalyzeKeyword(ctx, analyzer, keyword)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			oldClause := buildKeywordClauseFromAnalyzed(effective, useMSM, "payload.file.name^2", "payload.file.caption", "payload.file.content")
+			oldQuery := elastic.NewBoolQuery().Filter(elastic.NewTermQuery("channelId", "g"), elastic.NewTermQuery("payload.type", 8)).MustNot(elastic.NewTermQuery("revoked", true)).Must(oldClause)
+			oldHits, err := client.Search(index).RestTotalHitsAsInt(true).Query(oldQuery).Size(100).Do(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(oldHits.Hits.Hits) == 0 && keyword != "v1.2" {
+				t.Fatalf("empty legacy baseline for %q strip=%v", keyword, strip)
+			}
+			for _, entry := range []string{"channel-files", "global-files", "channel-all", "global-messages"} {
+				q, err := filenameEntryQuery(ctx, analyzer, strip, entry, keyword)
+				if err != nil {
+					t.Fatal(err)
+				}
+				newHits, err := client.Search(index).RestTotalHitsAsInt(true).Query(q).Size(100).Do(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				scores := map[string]float64{}
+				for _, hit := range newHits.Hits.Hits {
+					scores[hit.Id] = *hit.Score
+				}
+				for _, hit := range oldHits.Hits.Hits {
+					score, exists := scores[hit.Id]
+					if !exists {
+						t.Fatalf("%s %q strip=%v lost legacy ID %s", entry, keyword, strip, hit.Id)
+					}
+					if math.Abs(score-*hit.Score) > 1e-6 {
+						t.Fatalf("%s %q score changed for %s: %v -> %v", entry, keyword, hit.Id, *hit.Score, score)
+					}
+				}
+				// The grouped route aggregates the same global-message base query.
+				if entry == "global-messages" {
+					grouped, err := client.Search(index).RestTotalHitsAsInt(true).Query(q).Size(0).Aggregation("channels", elastic.NewTermsAggregation().Field("channelId")).Do(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					buckets, ok := grouped.Aggregations.Terms("channels")
+					if !ok || len(buckets.Buckets) != 1 || int(buckets.Buckets[0].DocCount) != len(newHits.Hits.Hits) {
+						t.Fatalf("%q grouped count does not match complete restored feed", keyword)
+					}
+				}
+			}
 		}
+	}
+}
+
+func filenameEntryQuery(ctx context.Context, analyzer tokenAnalyzer, strip bool, entry, keyword string) (elastic.Query, error) {
+	switch entry {
+	case "channel-files":
+		return buildSearchFilesDSL(ctx, analyzer, strip, SearchFilesReq{ChannelID: "g", ChannelType: 2, Keyword: keyword}, "g", "s")
+	case "global-files":
+		return buildGlobalFilesDSL(ctx, analyzer, strip, SearchGlobalFilesReq{Keyword: keyword}, []string{"g"}, "s")
+	case "channel-all":
+		return buildSearchAllDSL(ctx, analyzer, strip, SearchAllReq{ChannelID: "g", ChannelType: 2, Keyword: keyword}, "g", "s")
+	case "global-messages":
+		return buildGlobalMessagesDSL(ctx, analyzer, strip, SearchGlobalMessagesReq{Keyword: keyword}, []string{"g"}, "s")
+	default:
+		return nil, fmt.Errorf("unknown filename entry %q", entry)
 	}
 }

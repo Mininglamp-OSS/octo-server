@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -180,5 +181,57 @@ func TestCanonicalDecompositionSpans(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// Non-live CI must also guard against wrapping the legacy branch in an extra
+// evidence filter, including the pure-stopword and analyzer-fallback shapes.
+func TestFileKeywordClausePreservesLegacyBranch(t *testing.T) {
+	for _, tc := range []struct {
+		keyword, effective string
+		msm                bool
+	}{
+		{"排期 评审", "排 期 评审", true},
+		{"排期 评审", "排期 评审", true},
+		{"的", "的", false},
+	} {
+		var got struct {
+			DisMax struct {
+				Queries []map[string]any `json:"queries"`
+			} `json:"dis_max"`
+		}
+		if err := json.Unmarshal([]byte(marshalDSL(t, buildFileKeywordClauseFromAnalyzed(tc.keyword, tc.effective, tc.msm))), &got); err != nil {
+			t.Fatal(err)
+		}
+		var want map[string]any
+		legacy := buildKeywordClauseFromAnalyzed(tc.effective, tc.msm, "payload.file.name^2", "payload.file.caption", "payload.file.content")
+		if err := json.Unmarshal([]byte(marshalDSL(t, legacy)), &want); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.DisMax.Queries) == 0 || !reflect.DeepEqual(got.DisMax.Queries[0], want) {
+			t.Fatalf("legacy fulltext eligibility changed for %+v", tc)
+		}
+	}
+}
+
+func TestLegacySegmentedFilenameHighlightAcrossEntries(t *testing.T) {
+	h := newHandlerForGlobalTests()
+	tp := payloadTypeFile
+	doc := Doc{MessageID: 1, MessageSeq: 1, ChannelID: "g", ChannelType: 2, Payload: &Payload{Type: &tp, File: &FilePayload{Name: "排期与评审.pdf"}}}
+	raw := json.RawMessage(mustJSON(doc))
+	marked := "<mark>排期</mark>与<mark>评审</mark>.pdf"
+	hits := []*elastic.SearchHit{{Source: &raw, Highlight: map[string][]string{"payload.file.name": {marked}}}}
+	files := h.buildFileHits(context.Background(), hits, SearchFilesReq{Keyword: "排期 评审", ChannelID: "g", ChannelType: 2}, "me")
+	global := h.buildGlobalFileHits(context.Background(), hits, "me", "排期 评审")
+	all := h.buildSearchAllHits(context.Background(), hits, SearchAllReq{Keyword: "排期 评审", ChannelID: "g", ChannelType: 2}, "me")
+	globalAll := h.buildGlobalSearchAllHits(context.Background(), hits, "me", "排期 评审")
+	for _, f := range []FileHit{files[0], global[0], *all[0].File, *globalAll[0].File} {
+		if f.NameHighlight != marked || f.ContentSnippet != "" {
+			t.Fatalf("incorrect legacy evidence: %+v", f)
+		}
+	}
+	groups := h.projectPreview(context.Background(), [][]*elastic.SearchHit{hits}, "me", "排期 评审")
+	if len(groups) != 1 || len(groups[0]) != 1 || groups[0][0].Snippet != marked {
+		t.Fatalf("group lost legacy highlight: %+v", groups)
 	}
 }
