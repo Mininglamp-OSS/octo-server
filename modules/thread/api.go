@@ -156,7 +156,12 @@ func classifyThreadError(err error) codes.Code {
 		return errcode.ErrThreadPermissionDenied
 	case strings.Contains(msg, "creator cannot leave"):
 		return errcode.ErrThreadCreatorCannotLeave
-	case strings.Contains(msg, "thread status changed concurrently"):
+	case strings.Contains(msg, "thread status changed concurrently"),
+		strings.Contains(msg, "thread status mismatch"):
+		// DB 层的 UpdateStatusFrom 用 ErrThreadStatusMismatch（"thread status mismatch"）
+		// 表示行 status 与 expectedStatus 不符且不是目标状态；漏掉这个分支会把它落进
+		// store_failed 兜底 → 500 → 前端只显示「未知错误」。两者语义都是「状态已变化，
+		// 请重试」，统一映射到 409。
 		return errcode.ErrThreadStatusChanged
 	case strings.Contains(msg, "thread is not active"):
 		return errcode.ErrThreadNotActive

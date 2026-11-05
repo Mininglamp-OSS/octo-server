@@ -337,6 +337,67 @@ func TestUpdateStatusFrom_CASRetriesOnConcurrentBump(t *testing.T) {
 	assert.Equal(t, int64(200), m.Version)
 }
 
+// TestUpdateStatusFrom_VersionAheadOfGenSeq 回归线上「有的子区点归档报未知错误」：
+// 多实例部署下各实例缓存的 seq 段可能重叠/落后，某行 version 可能已经大于本实例
+// GenSeq 返回的值。旧实现每次重试都重新取 GenSeq（仍然更小），三连败后返回
+// ErrThreadCASExhausted → 对外 500 store_failed → 前端「未知错误」。
+// 新实现改为用行内 version+1 重试，必须成功且 version 严格递增。
+func TestUpdateStatusFrom_VersionAheadOfGenSeq(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "version_ahead", ThreadStatusActive, &now, 5000)
+
+	// 本实例 GenSeq 一直返回落后的小值（模拟 seq 段回退/另一实例已推进）。
+	staleGen := func() (int64, error) { return 50, nil }
+
+	require.NoError(t, db.UpdateStatusFrom("version_ahead", ThreadStatusActive, ThreadStatusArchived, staleGen))
+
+	m, err := db.QueryByShortID("version_ahead")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusArchived, m.Status)
+	assert.Equal(t, int64(5001), m.Version, "version must advance past the row value, never regress")
+}
+
+// TestUpdateName_VersionAheadOfGenSeq 同名场景：改名也不能因 GenSeq 落后而 500。
+func TestUpdateName_VersionAheadOfGenSeq(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "rename_ahead", ThreadStatusActive, &now, 5000)
+
+	require.NoError(t, db.UpdateName("rename_ahead", "renamed", func() (int64, error) { return 50, nil }))
+
+	m, err := db.QueryByShortID("rename_ahead")
+	require.NoError(t, err)
+	assert.Equal(t, "renamed", m.Name)
+	assert.Equal(t, int64(5001), m.Version)
+}
+
+// TestMarkDeleted_VersionAheadOfGenSeq 同名场景：删除也不能因 GenSeq 落后而 500。
+func TestMarkDeleted_VersionAheadOfGenSeq(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "delete_ahead", ThreadStatusActive, &now, 5000)
+
+	require.NoError(t, db.MarkDeleted("delete_ahead", func() (int64, error) { return 50, nil }))
+
+	m, err := db.QueryByShortID("delete_ahead")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusDeleted, m.Status)
+	assert.Equal(t, int64(5001), m.Version)
+}
+
 func TestUpdateStatusFrom_NoSuchRow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
