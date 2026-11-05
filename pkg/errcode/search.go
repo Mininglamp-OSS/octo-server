@@ -8,6 +8,18 @@ import (
 
 // err.server.search.* — modules/search business error codes (api.go).
 var (
+	ErrSearchNameQueryChanged = register(codes.Code{
+		ID: "err.server.search.query_changed", HTTPStatus: http.StatusConflict,
+		DefaultMessage: "Search results changed. Please search again.",
+	})
+	ErrSearchNameForbidden = register(codes.Code{
+		ID: "err.server.search.name_forbidden", HTTPStatus: http.StatusForbidden,
+		DefaultMessage: "This search scope is not accessible.",
+	})
+	ErrSearchNameQueryFailed = register(codes.Code{
+		ID: "err.server.search.name_query_failed", HTTPStatus: http.StatusInternalServerError,
+		DefaultMessage: "Failed to search names.", Internal: true,
+	})
 	ErrSearchRequestInvalid = register(codes.Code{
 		ID:             "err.server.search.request_invalid",
 		HTTPStatus:     http.StatusBadRequest,
