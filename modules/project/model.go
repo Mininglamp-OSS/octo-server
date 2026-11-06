@@ -340,6 +340,7 @@ type Capabilities struct {
 	CanUpdate        bool `json:"can_update"`
 	CanDisband       bool `json:"can_disband"`
 	CanManageMember  bool `json:"can_manage_member"`
+	CanRemoveMember  bool `json:"can_remove_member"`
 	CanChangeRole    bool `json:"can_change_role"`
 	CanLeave         bool `json:"can_leave"`
 	CanViewMembers   bool `json:"can_view_members"`
