@@ -1005,6 +1005,15 @@ other = "Failed to query group search data."
 ["err.server.search.message_query_failed"]
 other = "Failed to query message search data."
 
+["err.server.search.name_forbidden"]
+other = "This search scope is not accessible."
+
+["err.server.search.name_query_failed"]
+other = "Failed to search names."
+
+["err.server.search.query_changed"]
+other = "Search results changed. Please search again."
+
 ["err.server.search.request_invalid"]
 other = "Invalid search request."
 

@@ -1,0 +1,45 @@
+{
+  "version": "s14-v1",
+  "scores": [
+    {"name":"向晨瑜","query":"向晨瑜","score":1000},
+    {"name":"向晨瑜","query":"向","score":900},
+    {"name":"向晨瑜","query":"瑜","score":800},
+    {"name":"向晨瑜","query":"xiangchenyu","score":700},
+    {"name":"向晨瑜","query":"xiangchen","score":650},
+    {"name":"向晨瑜","query":"chenyu","score":600},
+    {"name":"向晨瑜","query":"xcy","score":500},
+    {"name":"向晨瑜","query":"xc","score":450},
+    {"name":"向晨瑜","query":"cy","score":400}
+  ],
+  "rankings": [
+    {
+      "query":"小王",
+      "candidates":[
+        {"id":"7","kind":"contact","contact_type":"human","original_name":"王丁","remark_name":"同事小王"},
+        {"id":"6","kind":"contact","contact_type":"human","original_name":"小王团队","remark_name":"老王"},
+        {"id":"5","kind":"contact","contact_type":"human","original_name":"王丙","remark_name":"小王同事"},
+        {"id":"4","kind":"contact","contact_type":"human","original_name":"小王项目","remark_name":"小王伙伴"},
+        {"id":"3","kind":"contact","contact_type":"human","original_name":"小王","remark_name":""},
+        {"id":"2","kind":"contact","contact_type":"human","original_name":"王乙","remark_name":"小王"},
+        {"id":"1","kind":"contact","contact_type":"human","original_name":"王甲","remark_name":"小王"}
+      ],
+      "expected_ids":["1","2","3","4","5","6","7"]
+    },
+    {
+      "query":"向",
+      "candidates":[
+        {"id":"10","kind":"contact","contact_type":"ai","original_name":"social向量查询","remark_name":""},
+        {"id":"9","kind":"contact","contact_type":"ai","original_name":"要天天向上的巡检员","remark_name":""},
+        {"id":"8","kind":"contact","contact_type":"ai","original_name":"万向轮（数据穿透）需求管家","remark_name":""},
+        {"id":"7","kind":"contact","contact_type":"ai","original_name":"向日葵vip","remark_name":""},
+        {"id":"6","kind":"contact","contact_type":"ai","original_name":"向日葵女士","remark_name":""},
+        {"id":"5","kind":"contact","contact_type":"ai","original_name":"向日葵AI","remark_name":""},
+        {"id":"4","kind":"contact","contact_type":"ai","original_name":"向日葵","remark_name":""},
+        {"id":"3","kind":"contact","contact_type":"ai","original_name":"向导虾","remark_name":""},
+        {"id":"2","kind":"contact","contact_type":"human","original_name":"刘向东","remark_name":""},
+        {"id":"1","kind":"contact","contact_type":"human","original_name":"向东","remark_name":""}
+      ],
+      "expected_ids":["1","2","3","4","5","6","7","8","9","10"]
+    }
+  ]
+}

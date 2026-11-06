@@ -1039,6 +1039,15 @@ other = "更新空间数据失败。"
 
 # ---- err.server.search.* (modules/search: api.go) ----
 
+["err.server.search.query_changed"]
+other = "搜索结果已变化，请重新搜索。"
+
+["err.server.search.name_forbidden"]
+other = "无权搜索当前范围。"
+
+["err.server.search.name_query_failed"]
+other = "名称搜索失败。"
+
 ["err.server.search.request_invalid"]
 other = "搜索请求无效。"
 

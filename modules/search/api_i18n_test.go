@@ -19,7 +19,11 @@ func TestSearchNoLegacyResponseError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read api.go: %v", err)
 	}
-	cleaned := stripSearchLineComments(string(data))
+	names, err := os.ReadFile("api_names.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleaned := stripSearchLineComments(string(data) + "\n" + string(names))
 	for _, b := range []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", ".AbortWithStatusJSON(", ".AbortWithStatus(", ".ResponseWithStatus(", "c.Response(\""} {
 		if strings.Contains(cleaned, b) {
 			t.Fatalf("modules/search/api.go must use httperr.ResponseErrorL instead of legacy %s", b)
