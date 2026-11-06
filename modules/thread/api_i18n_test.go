@@ -40,6 +40,9 @@ func TestClassifyThreadError(t *testing.T) {
 		{"no permission", "no permission to edit", errcode.ErrThreadPermissionDenied},
 		{"creator cannot leave", "creator cannot leave thread", errcode.ErrThreadCreatorCannotLeave},
 		{"status changed concurrently", "thread status changed concurrently", errcode.ErrThreadStatusChanged},
+		// db.UpdateStatusFrom 返回 ErrThreadStatusMismatch（"thread status mismatch"），
+		// 与 status_changed 同义：状态已被并发改写，客户端应重试而不是收到 500。
+		{"status mismatch", "thread status mismatch", errcode.ErrThreadStatusChanged},
 		{"thread is not active", "thread is not active", errcode.ErrThreadNotActive},
 		{"thread has been deleted", "thread has been deleted", errcode.ErrThreadDeleted},
 		{"thread not found", "thread not found", errcode.ErrThreadNotFound},

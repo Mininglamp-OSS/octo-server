@@ -497,14 +497,20 @@ var (
 //   - ErrThreadStatusMismatch：行 status 与 expected 不符，也不是 newStatus
 //   - ErrThreadCASExhausted：CAS 三连败（基本不会发生）
 //
+// 重试策略：首次用 newVersion() 的值；若行仍是 expectedStatus 但 version 已被推到
+// >= 本次版本号（典型：多实例部署下各实例缓存的 seq 段重叠/落后，另一实例用更大的
+// GenSeq 写过这一行），下一次改用「行内 version+1」而不是再取一次 GenSeq。只重取
+// GenSeq 会三连败并返回 ErrThreadCASExhausted（对外 500 store_failed，前端只显示
+// 「未知错误」），用户表现为"有的子区归档/改名/删除一直报错"。
+//
 // 比起锁外读 status 再调 UpdateStatus 的旧路径，这里把状态判定整合进 UPDATE 的 WHERE，
 // 闭掉了"读完 status 之后被 delete/cron 改写"的窗口。
 func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, newVersion func() (int64, error)) error {
+	version, err := newVersion()
+	if err != nil {
+		return fmt.Errorf("update status: gen version: %w", err)
+	}
 	for attempt := 0; attempt < versionRetryAttempts; attempt++ {
-		version, err := newVersion()
-		if err != nil {
-			return fmt.Errorf("update status: gen version: %w", err)
-		}
 		result, err := d.session.UpdateBySql(
 			"UPDATE thread SET status=?, version=?, updated_at=? "+
 				"WHERE short_id=? AND status=? AND version<?",
@@ -522,7 +528,7 @@ func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, new
 			return nil
 		}
 		// 0 行：行可能不存在 / 已删 / 已是 newStatus / status 还在 expected 但被抢版本。
-		actual, ok, perr := d.probeStatus(shortID)
+		actual, currentVersion, ok, perr := d.probeStatusAndVersion(shortID)
 		if perr != nil {
 			return fmt.Errorf("update status: probe: %w", perr)
 		}
@@ -535,7 +541,18 @@ func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, new
 		case newStatus:
 			return nil // 已经是目标状态，幂等成功
 		case expectedStatus:
-			// 仍在期望状态，但 version 被并发抢先：换更大 GenSeq 重试
+			// 仍在期望状态但 version 已被抢先。优先再取一个更大的 GenSeq（保持原有
+			// "换更大版本号重试"语义）；若 GenSeq 落后于行内值（多实例 seq 段重叠/
+			// 回退），退回行内 version+1，保证新版本严格递增而不是三连败。
+			next, gerr := newVersion()
+			if gerr != nil {
+				return fmt.Errorf("update status: gen version: %w", gerr)
+			}
+			if next > currentVersion {
+				version = next
+			} else {
+				version = currentVersion + 1
+			}
 		default:
 			return ErrThreadStatusMismatch
 		}
@@ -545,11 +562,11 @@ func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, new
 
 // MarkDeleted 把任何非 deleted 状态的子区切到 deleted。幂等：已删除直接返回 nil。
 func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error {
+	version, err := newVersion()
+	if err != nil {
+		return fmt.Errorf("mark deleted: gen version: %w", err)
+	}
 	for attempt := 0; attempt < versionRetryAttempts; attempt++ {
-		version, err := newVersion()
-		if err != nil {
-			return fmt.Errorf("mark deleted: gen version: %w", err)
-		}
 		result, err := d.session.UpdateBySql(
 			"UPDATE thread SET status=?, version=?, updated_at=? "+
 				"WHERE short_id=? AND status!=? AND version<?",
@@ -566,7 +583,7 @@ func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error
 		if affected > 0 {
 			return nil
 		}
-		actual, ok, perr := d.probeStatus(shortID)
+		actual, currentVersion, ok, perr := d.probeStatusAndVersion(shortID)
 		if perr != nil {
 			return fmt.Errorf("mark deleted: probe: %w", perr)
 		}
@@ -576,18 +593,27 @@ func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error
 		if actual == ThreadStatusDeleted {
 			return nil // 已删除，幂等
 		}
-		// 行存在且非 deleted：被抢版本，重试
+		// 行存在且非 deleted：version 被抢先。优先取更大的 GenSeq，落后时用行内 version+1。
+		next, gerr := newVersion()
+		if gerr != nil {
+			return fmt.Errorf("mark deleted: gen version: %w", gerr)
+		}
+		if next > currentVersion {
+			version = next
+		} else {
+			version = currentVersion + 1
+		}
 	}
 	return ErrThreadCASExhausted
 }
 
 // UpdateName 改名。不允许在已删除的子区上改名（返回 ErrThreadDeleted）。
 func (d *DB) UpdateName(shortID string, name string, newVersion func() (int64, error)) error {
+	version, err := newVersion()
+	if err != nil {
+		return fmt.Errorf("update name: gen version: %w", err)
+	}
 	for attempt := 0; attempt < versionRetryAttempts; attempt++ {
-		version, err := newVersion()
-		if err != nil {
-			return fmt.Errorf("update name: gen version: %w", err)
-		}
 		result, err := d.session.UpdateBySql(
 			"UPDATE thread SET name=?, version=?, updated_at=? "+
 				"WHERE short_id=? AND status!=? AND version<?",
@@ -604,7 +630,7 @@ func (d *DB) UpdateName(shortID string, name string, newVersion func() (int64, e
 		if affected > 0 {
 			return nil
 		}
-		actual, ok, perr := d.probeStatus(shortID)
+		actual, currentVersion, ok, perr := d.probeStatusAndVersion(shortID)
 		if perr != nil {
 			return fmt.Errorf("update name: probe: %w", perr)
 		}
@@ -614,19 +640,32 @@ func (d *DB) UpdateName(shortID string, name string, newVersion func() (int64, e
 		if actual == ThreadStatusDeleted {
 			return ErrThreadDeleted
 		}
-		// 行存在且非 deleted：被抢版本，重试
+		// 行存在且非 deleted：version 被抢先。优先取更大的 GenSeq，落后时用行内 version+1。
+		next, gerr := newVersion()
+		if gerr != nil {
+			return fmt.Errorf("update name: gen version: %w", gerr)
+		}
+		if next > currentVersion {
+			version = next
+		} else {
+			version = currentVersion + 1
+		}
 	}
 	return ErrThreadCASExhausted
 }
 
-// probeStatus 读当前 status。返回 (status, exists, err)。
-func (d *DB) probeStatus(shortID string) (int, bool, error) {
-	var status int
-	n, err := d.session.SelectBySql("SELECT status FROM thread WHERE short_id=?", shortID).Load(&status)
-	if err != nil {
-		return 0, false, err
+// probeStatusAndVersion 读当前 status 与 version。返回 (status, version, exists, err)。
+// 供 CAS 写路径在 version 冲突后取「行内 version+1」重试用。
+func (d *DB) probeStatusAndVersion(shortID string) (int, int64, bool, error) {
+	var row struct {
+		Status  int   `db:"status"`
+		Version int64 `db:"version"`
 	}
-	return status, n > 0, nil
+	n, err := d.session.SelectBySql("SELECT status, version FROM thread WHERE short_id=?", shortID).Load(&row)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return row.Status, row.Version, n > 0, nil
 }
 
 // Update 更新子区信息
@@ -808,7 +847,7 @@ func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newV
 			return fmt.Errorf("record message: gen version: %w", gerr)
 		}
 		if _, err := tx.UpdateBySql(
-			"UPDATE thread SET status=?, version=?, last_message_at=?, "+
+			"UPDATE thread SET status=?, version=GREATEST(version+1, ?), last_message_at=?, "+
 				"message_count = message_count + 1, last_message_content=?, "+
 				"last_message_sender_uid=?, updated_at=? "+
 				"WHERE short_id=?",
