@@ -1,0 +1,32 @@
+{
+  "contract": "permission-server-handoff-v1",
+  "task": "XIN-2793",
+  "source_head": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+  "target": "chore/mcp-integration-20261103",
+  "delivery": "bounded_components_pending_native_authority_and_supported_catalog",
+  "owner_prefix": "/v1/robot/:robot_id/permission-bundle/v1?space_id=S",
+  "self_prefix": "/v1/bot/permission-bundle/v1?space_id=S",
+  "operations": [
+    {"method": "GET", "surface": "owner", "suffix": "", "response": "OwnerResponse"},
+    {"method": "PUT", "surface": "owner", "suffix": "", "request": "Mutation", "response": "OwnerResponse"},
+    {"method": "POST", "surface": "owner", "suffix": "/prepare", "request": "permission-prepare-v1.Request", "response": "permission-prepare-v1.Response"},
+    {"method": "GET", "surface": "self", "suffix": "", "response": "P"},
+    {"method": "GET", "surface": "owner_or_self", "suffix": "/catalog", "response": "supported_immutable_release"}
+  ],
+  "private_native_fact_route": {"path": "/v1/bot/permission-facts/v1?space_id=S", "status": "NOT_IMPLEMENTED_NATIVE_INTERFACES_ABSENT"},
+  "default_composition": "unavailable_no_fabricated_authority_or_catalog",
+  "stale_intent": "B_exact_same_stage_rule_id_effect_caller_source_defaulted_descendants_capabilities_deny_only",
+  "migration": "explicit_supported_old_target_semantic_equivalence_required_for_retained_deny",
+  "response_transport": {"errors": "D14_HTTP_400_error.code_and_error.http_status", "cache_control": "private, no-store", "complete_reads": true, "etag": false},
+  "errors": ["err.server.permission.invalid_bundle", "err.server.permission.revision_conflict", "err.server.permission.scope_forbidden", "err.server.permission.reference_unavailable", "err.server.permission.bundle_unavailable", "err.server.permission.unsupported_version"],
+  "immutable_source_contracts": {
+    "permission-wire-v1.schema.json": "3c77bfb4290c4c510ce3081496175bdb20cf8eb4014ff1c013e967742eb99609",
+    "permission-managed-v2.schema.json": "1deb9a708a39fb68e29ab61b4123254d4e02e77672e18b9619f7bbd97ab455fc",
+    "permission-native-facts-v1.schema.json": "bf08d33e87ad1a4726116c97171b008394e6896bba4babf03762914b5ad0e643",
+    "permission-rule-reference-resolver-v1.schema.json": "4274b23a57db8c60379d808656d72d08650bd8b52123918e0907383541b3b65a",
+    "permission-release-manifest-v1.schema-template.json": "8f77c88f5d0d432c1cd2a827c904930510a2dc2a897af7f3d94eece3e300696d"
+  },
+  "catalog_digest": null,
+  "native_runtime_acceptance": "NOT_RUN",
+  "cross_repository_acceptance": "NOT_RUN"
+}

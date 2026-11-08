@@ -810,6 +810,24 @@ other = "Failed to query analytics data."
 ["err.server.opanalytics.request_invalid"]
 other = "Invalid analytics request."
 
+["err.server.permission.bundle_unavailable"]
+other = "Permission bundle is unavailable."
+
+["err.server.permission.invalid_bundle"]
+other = "Invalid permission bundle request."
+
+["err.server.permission.reference_unavailable"]
+other = "Permission references are unavailable."
+
+["err.server.permission.revision_conflict"]
+other = "Permission bundle changed. Read the complete bundle and try again."
+
+["err.server.permission.scope_forbidden"]
+other = "Permission scope is unavailable to this identity."
+
+["err.server.permission.unsupported_version"]
+other = "Unsupported permission contract version."
+
 ["err.server.project.actor_not_space_member"]
 other = "You are no longer an active member of this space."
 

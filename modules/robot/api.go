@@ -40,6 +40,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -380,7 +381,8 @@ type Robot struct {
 	// (#627). All message_extra version allocation in this module goes through
 	// it; it selects legacy GenSeq vs the transactional channel sequence by the
 	// DB-authoritative state row.
-	seqStore *msgextraseq.Store
+	seqStore         *msgextraseq.Store
+	permissionBundle *permissionbundle.Store
 	// systemSettings is the process-wide admin-config snapshot, resolved once
 	// here rather than per call. common.EnsureSystemSettings takes a global
 	// mutex on every invocation, so calling it per request would put a
@@ -440,6 +442,12 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.putMCPPolicy)
 		auth.DELETE("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteMCPPolicy)
 	}
+
+	permissions := r.Group("/v1/robot/:robot_id/permission-bundle/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
+	permissions.GET("", rb.permissionBundleHandler("owner_get"))
+	permissions.PUT("", rb.permissionBundleHandler("mutate"))
+	permissions.POST("/prepare", rb.permissionBundleHandler("prepare"))
+	permissions.GET("/catalog", rb.permissionBundleHandler("catalog"))
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
 	{

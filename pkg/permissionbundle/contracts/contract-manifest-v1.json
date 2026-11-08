@@ -1,0 +1,14 @@
+{
+  "format": "permission-server-contract-manifest-v1",
+  "status": "component_contracts_not_a_supported_catalog",
+  "files": {
+    "handoff-v1.json": {"bytes": 2545, "sha256": "31cf10807ef0fac36c3d214354fbb69bcea0c79ee8a217d38644ad289893cfae"},
+    "permission-managed-v2.schema.json": {"bytes": 9203, "sha256": "1deb9a708a39fb68e29ab61b4123254d4e02e77672e18b9619f7bbd97ab455fc"},
+    "permission-native-facts-v1.schema.json": {"bytes": 30549, "sha256": "bf08d33e87ad1a4726116c97171b008394e6896bba4babf03762914b5ad0e643"},
+    "permission-prepare-v1.schema.json": {"bytes": 1559, "sha256": "7cfac561ee191c19b44d547d0566ac3d41281111d003e39246dc99ca6711a37c"},
+    "permission-release-manifest-v1.schema-template.json": {"bytes": 56076, "sha256": "8f77c88f5d0d432c1cd2a827c904930510a2dc2a897af7f3d94eece3e300696d"},
+    "permission-rule-reference-resolver-v1.schema.json": {"bytes": 3800, "sha256": "4274b23a57db8c60379d808656d72d08650bd8b52123918e0907383541b3b65a"},
+    "permission-wire-v1.schema.json": {"bytes": 14242, "sha256": "3c77bfb4290c4c510ce3081496175bdb20cf8eb4014ff1c013e967742eb99609"},
+    "synthetic-examples-v1.json": {"bytes": 1551, "sha256": "5b76f06c85d15ecc89c70af4d0e5ec0ef1e44f516de4a8374a4a92fa7f446c19"}
+  }
+}

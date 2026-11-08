@@ -22,6 +22,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 )
 
@@ -41,6 +42,8 @@ type BotAPI struct {
 	groupService  group.IService
 	userDB        *user.DB
 	threadService thread.IService
+
+	permissionBundle *permissionbundle.Store
 	// robotService gives the OBO fan-out path a way to enqueue synthetic
 	// events directly into a grantee bot's /v1/bot/events queue. The
 	// webhook layer drops NoPersist=1 messages before NotifyMessagesListeners
@@ -407,6 +410,8 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		),
 	)
 	{
+		botAPI.GET("/permission-bundle/v1", ba.permissionBundleHandler("self"))
+		botAPI.GET("/permission-bundle/v1/catalog", ba.permissionBundleHandler("catalog"))
 		botAPI.POST("/sendMessage", ba.sendMessage)
 		botAPI.POST("/typing", ba.typing)
 		botAPI.POST("/readReceipt", ba.readReceipt)
