@@ -52,16 +52,16 @@
       "sha256": "53f29a0e572cf240584511627236489658089bfcf70598a56216d545730f6a52"
     },
     "pkg/permissionbundle/contracts/remaining-producers-v2.json": {
-      "bytes": 28134,
-      "sha256": "f54ad32cf6e189b07113a12f7889d9872da01598cdb7de66a29ee495fcea0315"
+      "bytes": 29231,
+      "sha256": "ee1ecf62dc3902113674fb10f02403feb367677950487d1042ce59acbed76f9d"
     },
     "pkg/permissionbundle/contracts/synthetic-examples-v1.json": {
       "bytes": 1551,
       "sha256": "5b76f06c85d15ecc89c70af4d0e5ec0ef1e44f516de4a8374a4a92fa7f446c19"
     },
     "docs/permission-producer-map-v2.md": {
-      "bytes": 16794,
-      "sha256": "4e1c16aeb2e1a6bf2cbfdb0852cbe526fdefb950b75e94ddd07b12403b3d8a3c"
+      "bytes": 17385,
+      "sha256": "e642f60aea1eb105c022b47f05466d1d089e1a323e58d364fab81dbbdec783d8"
     }
   }
 }

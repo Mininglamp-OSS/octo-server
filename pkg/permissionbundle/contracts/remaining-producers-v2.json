@@ -31,11 +31,24 @@
       "task_id": "2f4a34e9-2be3-48ac-99f0-38a30f077acd",
       "repository": "ploy-elison/codex-channel-octo",
       "pr": 102,
-      "head": "c152cb54df8e3fb822288933e39cf6dcad4b9335",
-      "path": "docs/permission-component-contract.json",
-      "bytes": 2422,
-      "sha256": "3235d448421f4bfd34977d474a9a0568d720dfe8d12c825085eef463b6d13e83",
-      "observed": "replay/context components only; real native authority/host activation excluded"
+      "head": "e4601041bd9bab186e4122fb8c76a3444bd1da62",
+      "path": "docs/permission-endpoint-handoff-v2.json",
+      "bytes": 5414,
+      "sha256": "3499115d71c48cfd9680d3e465ce7325aae342c67820b44528285fe34a709b02",
+      "observed": "Managed startBot, mTLS control and private worker components delivered. Main factory, full content/reuse/renewal/manifest carrier, actual containment and real native adapters remain incomplete.",
+      "previous_component_contract": {
+        "head": "c152cb54df8e3fb822288933e39cf6dcad4b9335",
+        "path": "docs/permission-component-contract.json",
+        "bytes": 2422,
+        "sha256": "3235d448421f4bfd34977d474a9a0568d720dfe8d12c825085eef463b6d13e83",
+        "retained": "Length-prefixed HMAC delivery identity and unchanged shared schema commitments"
+      },
+      "control_consumer": {
+        "methods": ["hello", "register_ingress", "admit", "bind_context", "open_relay", "renew", "close", "checkpoint"],
+        "framing": "uint32 big-endian length plus canonical JSON <=65536 bytes",
+        "worker_abi_expected": "--turn-relay <one-turn handle>",
+        "remaining_sibling_reconciliation": "Runnable actual CLI control/relay producer plus bounded carrier preserving full 1MiB/256-original manifest; never truncate to one 64KiB frame."
+      }
     }
   ],
   "implementable_in_authorized_repositories": [
@@ -82,7 +95,7 @@
       "producer": "XIN-2795 / Ada-mini2",
       "component": "endpoint reserveBeforeAck, ReplayJournal, ContextProvenance and host binding",
       "state": "EXACT_SIBLING_OUTPUT_REQUIRED",
-      "input_output": "Real native delivery Header/stream identity, durable checkpoint and recovery fence into pre-ACK reservation; isolated context/worker/control integration. Preserve the registered length-prefixed HMAC identity.",
+      "input_output": "Real native delivery Header/stream identity, durable checkpoint and recovery fence into pre-ACK reservation; complete main factory, content/publication/reuse/renewal, manifest carrier and actual OS containment. Managed startBot/control client/private launch components now exist; preserve length-prefixed HMAC identity.",
       "affected_ac": [
         "AC13",
         "AC18",

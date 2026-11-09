@@ -16,7 +16,7 @@ This is source evidence, with no deployment inspection or native acceptance.
 | XIN-2793, `pkg/permissionbundle/releases.go` → `Store` and startup | Concrete `NewArtifactReleases([]SupportedCatalog, []CatalogTransition)` implements `Load`, `Compatible`, `SameIntent`. Startup verifies whole canonical bytes/pin, closed structural fragment, 827 unique identities, ten ordered profiles, content hashes/base64, source/content/profile/action references. Loads return defensive copies. No default/latest or built-in supported pin. | Independent adapter code and synthetic tests delivered here. XIN-2794 must supply the reviewed support list and directed compatible migration pairs. Structural validation is not source/profile reconciliation or support approval. The rejecting template root is unchanged. |
 | XIN-2793, association owners → `CommitAssociations` | Existing creation/join/rejoin commit owners use the same native transaction and final policy suffix; current SQL configuration guards, CAS, preparation, route correlation and startup installation seam are delivered. | Real current-authority/native bindings remain owned by this task. Calling `Install` in production before those bindings and a supported release exist would create false authority. No such call or enabling flag is added. |
 | XIN-2794, Fullstack-mini, Ken Draft234 at `3b07d4d2f6c4637f0c389a71fab056ddf91c3965` → server and endpoint | One final `permission-release-manifest-v1`, exact immutable version/digest, source/program reconciliation and finite compatible bounds; explicit supported pins and directed same-semantics migration pairs. | Exact registered [component contract](https://github.com/ken-anderson2006/octo-cli/blob/3b07d4d2f6c4637f0c389a71fab056ddf91c3965/docs/permission/cli-component-contract-v1.json) says `supported_catalog=NOT_AVAILABLE`, digest null, production MCP enforcement `NOT_WIRED`. This fixed consumed head is not a claim about its active execution's later output. No competing artifact or candidate digest is supplied here. |
-| XIN-2795, Ada-mini2, Ploy Draft102 at `c152cb54df8e3fb822288933e39cf6dcad4b9335` → native delivery / CLI host | Bind real header/stream identity to `reserveBeforeAck`, durable replay journal, native checkpoint/recovery and complete context provenance; connect actual isolated host workers and authenticated private control. | Exact [component contract](https://github.com/ploy-elison/codex-channel-octo/blob/c152cb54df8e3fb822288933e39cf6dcad4b9335/docs/permission-component-contract.json) and [component description](https://github.com/ploy-elison/codex-channel-octo/blob/c152cb54df8e3fb822288933e39cf6dcad4b9335/docs/permission-components.md) explicitly exclude native/host activation. Consume its length-prefixed HMAC delivery identity; do not replace it with message ID, a delimiter key or a uint32 sequence. |
+| XIN-2795, Ada-mini2, Ploy Draft102 at `e4601041bd9bab186e4122fb8c76a3444bd1da62` → native delivery / CLI host | Managed `startBot`, mTLS control client and private worker launch are delivered as components. Bind real header/stream identity to pre-ACK replay/context handling; complete main factory, all content/publication/reuse/renewal paths and actual OS containment. | Verified [handoff v2](https://github.com/ploy-elison/codex-channel-octo/blob/e4601041bd9bab186e4122fb8c76a3444bd1da62/docs/permission-endpoint-handoff-v2.json), 5,414 bytes / SHA-256 `3499115d71c48cfd9680d3e465ce7325aae342c67820b44528285fe34a709b02`. It keeps actual native/checkpoint/host composition incomplete. Preserve the registered length-prefixed HMAC delivery identity; no message-ID/delimiter/uint32 substitute. |
 
 `SameIntent` is deliberately conservative: an approved migration pair is
 necessary, and any change to the complete entry/program graph disables retained
@@ -25,6 +25,15 @@ reference validation for that deny. It never silently drops or converts a deny.
 Support inputs are trusted startup data from the single catalog owner, never
 request data or a manifest's self-declared format/status. The adapter validates
 defensive invariants, not facade rendering, branch totality or source equivalence.
+
+The refreshed endpoint handoff retains all eight control methods
+(`hello/register_ingress/admit/bind_context/open_relay/renew/close/checkpoint`),
+canonical JSON with uint32 length framing ≤65,536 bytes, and an expected
+`--turn-relay <handle>` worker ABI. CLI/endpoint must reconcile that actual relay
+producer and a bounded carrier preserving the complete 1 MiB/256-original
+manifest; a 64 KiB frame is not permission to truncate it. These are sibling
+integration obligations, not new server policy/fact wire fields. Server native
+outputs remain required at the real `inspect`/content/checkpoint boundaries.
 
 ## Actual native dependency and minimum producer changes
 
