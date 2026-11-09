@@ -28,10 +28,25 @@ OCTO 当前群与 Space 是 1:1 强绑定（`group.space_id`），建群和加�
 |--------|------|
 | 外部群识别方式 | 自动分类（企微模式），有外部成员即为外部群 |
 | 手动开关 | 不需要，已有 `invite=1` 作为安全阀 |
-| source_space_id 来源 | `GetUserDefaultSpaceID(user)`，不需要客户端传参 |
+| source_space_id 来源 | 扫码入群优先使用经成员校验的 `X-Space-ID`；外部成员的 header 缺失或不可用时回落 `GetUserDefaultSpaceID(user)`；邀请路径保持既有规则 |
 | 外部 Bot | 允许，检查 Bot 在邀请人的 Space 内即可 |
 | 跨第三方 Space 邀请 | 天然不可能（通讯录隔离） |
 | 关闭外部群 | 所有外部成员退出后自动恢复为普通群 |
+
+### 1.4 扫码入群的当前 Space 身份（2026-11-09，PR #952）
+
+用户同时属于 Space A 和 Space B 时，在 A 中扫描 B 的群二维码，若群允许外部成员，
+以经成员校验的 A 身份加入，记录 `is_external=1, source_space_id=A`。因此，即使用户
+也是 B 的成员，也可以通过外部成员模型在 A 中查看该群。
+
+从 B 扫码仍按内部成员加入。群禁止外部成员时，B 成员仍可内部加入，非 B 成员被拒绝。
+`X-Space-ID` 仅表示请求使用的身份，必须校验扫码者确实属于该 Space；header 缺失、
+伪造或校验失败时保留原有内部身份或外部成员的默认 Space 兜底。
+
+扫码响应新增 `my_source_space_id`。两个 H5 入群页仅在该值非空且等于当前
+`currentSpaceId` 时跳过切换 Space 提示；其余情况保留原有提示逻辑。
+完整行为约束及验收条件见
+[scanjoin-current-space-identity brief](../.octospec/tasks/scanjoin-current-space-identity/brief.md)。
 
 ---
 
@@ -60,7 +75,7 @@ ALTER TABLE `group` DROP COLUMN `is_external_group`;
 | 表 | 字段 | 类型 | 说明 |
 |----|------|------|------|
 | `group` | `is_external_group` | SMALLINT | 冗余字段。首个外部成员加入时设 1，最后一个退出时设 0 |
-| `group_member` | `is_external` | SMALLINT | 此成员是否为外部成员（不在群的 space_id 对应 Space 中） |
+| `group_member` | `is_external` | SMALLINT | 此成员是否以群外 Space 的身份加入；扫码者同时属于两个 Space 时也可能按外部身份加入，见 §1.4 |
 | `group_member` | `source_space_id` | VARCHAR(40) | 外部成员的来源 Space。外部群在此 Space 的会话列表中显示 |
 
 ### 2.3 索引
