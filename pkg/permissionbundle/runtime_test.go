@@ -24,6 +24,8 @@ func TestRuntimeAssociationCommitAtomicityAndNoRejoinSeed(t *testing.T) {
 	r := RuntimeFor(c)
 	require.NotNil(t, r.Store())
 	require.Nil(t, RuntimeFor(nil).Store())
+	require.False(t, RuntimeFor(nil).HasFacts())
+	require.Nil(t, RuntimeFor(&config.Context{}).Store())
 	require.False(t, r.HasFacts())
 	for _, fail := range []bool{true, false} {
 		tx, e := s.Session.Begin()
@@ -202,6 +204,23 @@ func TestNativeMetadataCorrelationAndKnownNegative(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNativeDisclosureHasNoResolveHeaderOrPurpose(t *testing.T) {
+	req, resp := nativeFixture(t, "history_disclosure")
+	_, _, e := nativeRequest(bytes.NewReader(canonical(req)))
+	require.NoError(t, e)
+	require.NotContains(t, req, "purpose")
+	require.NotPanics(t, func() {
+		_, e = nativeResponse(fixtureKey, req, canonical(resp))
+		require.NoError(t, e)
+	})
+	_, resolved := nativeFixture(t, "resolve")
+	resp["results"].([]any)[0].(map[string]any)["header"] = resolved["results"].([]any)[0].(map[string]any)["header"]
+	require.NotPanics(t, func() {
+		_, e = nativeResponse(fixtureKey, req, canonical(resp))
+		require.ErrorIs(t, e, ErrUnavailable, "disclosure schema rejects extra header before processing")
+	})
 }
 
 func TestNativeClosedProfilesAcrossDMGroupThreadAndUnsupported(t *testing.T) {

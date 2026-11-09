@@ -30,8 +30,8 @@ func loadRelease(ctx context.Context, releases Releases, pin CatalogPin) (Releas
 		return Release{}, ErrUnavailable
 	}
 	r, e := releases.Load(ctx, pin)
-	// The provider validates the final manifest and support status, including
-	// its defined digest material (which is not necessarily the raw file hash).
+	// The provider validates the final manifest and support status. For the
+	// selected release format, the digest hashes the whole canonical artifact.
 	if e != nil || r.Pin != pin || len(r.Bytes) == 0 || len(r.Bytes) > 8388608 || r.Capabilities == nil {
 		return Release{}, ErrUnavailable
 	}

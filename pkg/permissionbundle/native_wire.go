@@ -227,9 +227,12 @@ func nativeResponse(key Key, request map[string]any, body []byte) ([]byte, error
 					if h["author_kind"] == "human" && (!kinds["sql"] || !kinds["im"]) {
 						return nil, ErrUnavailable
 					}
-					kind := h["source"].(map[string]any)["kind"].(string)
-					if row["profile"] != kind+"_"+request["purpose"].(string)+"_v1" && h["author_kind"] == "human" {
-						return nil, ErrUnavailable
+					if request["operation"] == "resolve" && h["author_kind"] == "human" {
+						kind := h["source"].(map[string]any)["kind"].(string)
+						purpose, ok := request["purpose"].(string)
+						if !ok || row["profile"] != kind+"_"+purpose+"_v1" {
+							return nil, ErrUnavailable
+						}
 					}
 				}
 				if request["operation"] == "history_disclosure" && (row["context_id"] != request["context_id"] || row["context_epoch"] != request["context_epoch"]) {

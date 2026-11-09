@@ -1,0 +1,681 @@
+{
+  "format": "permission-server-remaining-producers-v2",
+  "task": "XIN-2793",
+  "task_id": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "supersedes": "remaining-producers-v1.json",
+  "directive_comment_id": "83e1136b-f7af-4b23-8e1f-cf8168bb48e8",
+  "readable_map": "docs/permission-producer-map-v2.md",
+  "scope": {
+    "write_repositories": [
+      "Mininglamp-OSS/octo-server (XIN-2793)",
+      "Mininglamp-OSS/octo-cli (XIN-2794 only)",
+      "Mininglamp-OSS/codex-channel-octo (XIN-2795 only)"
+    ],
+    "this_execution": "octo-server only; no sibling execution or deployment changes",
+    "native_candidate_inspection": "read-only; not a deployed-version assertion or fourth-repository edit authorization"
+  },
+  "consumed_siblings": [
+    {
+      "task": "XIN-2794",
+      "task_id": "229ad215-8526-4a04-8f5b-36f073f81a16",
+      "repository": "ken-anderson2006/octo-cli",
+      "pr": 234,
+      "head": "3b07d4d2f6c4637f0c389a71fab056ddf91c3965",
+      "path": "docs/permission/cli-component-contract-v1.json",
+      "bytes": 1436,
+      "sha256": "514d4edd4ce7f22b4f318de79d381cea083f5132fe3327198dc03aef9c104e73",
+      "observed": "supported catalog unavailable; digest null; production enforcement NOT_WIRED at this fixed consumed head"
+    },
+    {
+      "task": "XIN-2795",
+      "task_id": "2f4a34e9-2be3-48ac-99f0-38a30f077acd",
+      "repository": "ploy-elison/codex-channel-octo",
+      "pr": 102,
+      "head": "c152cb54df8e3fb822288933e39cf6dcad4b9335",
+      "path": "docs/permission-component-contract.json",
+      "bytes": 2422,
+      "sha256": "3235d448421f4bfd34977d474a9a0568d720dfe8d12c825085eef463b6d13e83",
+      "observed": "replay/context components only; real native authority/host activation excluded"
+    }
+  ],
+  "implementable_in_authorized_repositories": [
+    {
+      "producer": "XIN-2793",
+      "component": "pkg/permissionbundle/releases.go",
+      "state": "IMPLEMENTED_COMPONENT",
+      "input": "NewArtifactReleases([]SupportedCatalog{Pin, Artifact}, []CatalogTransition{From,To}) from trusted catalog-owner support configuration",
+      "output": "Releases.Load/Compatible/SameIntent",
+      "invariants": [
+        "canonical whole-artifact SHA-256, exact immutable version/digest and size",
+        "unchanged structural Release fragment; rejecting template root remains unchanged",
+        "827 distinct ordered IDs, 10 ordered profiles, content hashes, strict base64 and reference closure",
+        "no default/latest pin or built-in support list; defensive copies",
+        "directed explicit compatibility approval; retained deny requires unchanged complete entry/program/content-binding graph"
+      ],
+      "boundary": "This defensive loader does not perform or assert XIN-2794 source/program reconciliation, facade rendering, branch totality or support approval."
+    },
+    {
+      "producer": "XIN-2793",
+      "component": "pkg/permissionbundle/runtime.go, native_sql.go, native_wire.go, store.go",
+      "state": "IMPLEMENTED_COMPONENTS_REAL_BINDINGS_INCOMPLETE",
+      "output": "Current configuration SQL guards; final native association/header commit suffix; bounded correlated fact protocol; trusted startup Install seam",
+      "still_owned": "Actual elected SQL authority adapter, native original/current predicate composition, body/disclosure provider integration, replay checkpoint consumption and production startup binding after the native contracts exist."
+    },
+    {
+      "producer": "XIN-2794 / Fullstack-mini",
+      "component": "octo-cli supported catalog and MCP host",
+      "state": "EXACT_SIBLING_OUTPUT_REQUIRED",
+      "input_output": "One source-reconciled supported permission-release-manifest-v1; exact version/digest and capability graph; catalog-owner support list and directed approved compatibility pairs. Server adapter consumes these without publishing another artifact.",
+      "affected_ac": [
+        "AC01",
+        "AC02",
+        "AC03",
+        "AC04",
+        "AC05",
+        "AC11",
+        "AC12",
+        "AC19",
+        "AC21"
+      ]
+    },
+    {
+      "producer": "XIN-2795 / Ada-mini2",
+      "component": "endpoint reserveBeforeAck, ReplayJournal, ContextProvenance and host binding",
+      "state": "EXACT_SIBLING_OUTPUT_REQUIRED",
+      "input_output": "Real native delivery Header/stream identity, durable checkpoint and recovery fence into pre-ACK reservation; isolated context/worker/control integration. Preserve the registered length-prefixed HMAC identity.",
+      "affected_ac": [
+        "AC13",
+        "AC18",
+        "AC21"
+      ]
+    }
+  ],
+  "external_prerequisites": [
+    {
+      "id": "native-original-and-current",
+      "kind": "DEMONSTRATED_MISSING_NATIVE_PRODUCER_CONTRACT",
+      "producer_repository": "Mininglamp-OSS/octo-im is the inspected candidate; actual serving source revision must be attested",
+      "inspected_candidate_ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "component": "authoritative message append/delivery and current access; internal/usecase/message, pkg/channel; private API adapter internal/access/api",
+      "citations": [
+        "approved_backend",
+        "approved_atom_map",
+        "im_transport",
+        "server_sync",
+        "server_webhook",
+        "server_ingress_limit",
+        "native_candidate_routes",
+        "native_candidate_message",
+        "native_candidate_sync"
+      ],
+      "minimum_additive_change": "Persist and privately inspect authoritative original source/Space/author/recipient/version/hash, stable recipient delivery stream/incarnation/u64 sequence, and actual historical/native read and independent send facts at recognized native cuts; do not release content during inspection.",
+      "compatibility": "Preserve existing routes and DTOs; unknown historical metadata unavailable, no guessed backfill. Optional typed transport may live inside octo-server; octo-lib-wide DTO widening is not mandatory.",
+      "server_consumer": "NativeFactSource.Read/ValidateCuts plus current locking SQL atom aggregation under supplied transaction; all ten profiles unchanged",
+      "owner_mapping": "PjM binds actual IM source maintainer/revision. That maintainer owns native persistence/authority; XIN-2793 owns server adapter and SQL atoms; XIN-2795 owns native identity consumption.",
+      "required_authorization": "Only bounded additive native authority persistence/API changes in the verified serving source repository; no fourth-repository edit made under current scope.",
+      "affected_ac": [
+        "AC06",
+        "AC08",
+        "AC13",
+        "AC14",
+        "AC17",
+        "AC18",
+        "AC21",
+        "AC22"
+      ]
+    },
+    {
+      "id": "native-history-body",
+      "kind": "DEMONSTRATED_MISSING_NATIVE_PRODUCER_CONTRACT",
+      "producer_repository": "Same verified native content authority as original Header; candidate Mininglamp-OSS/octo-im at the inspected ref",
+      "component": "message metadata history/read/disclosure usecases and private API",
+      "citations": [
+        "approved_backend",
+        "im_transport",
+        "server_sync",
+        "server_webhook",
+        "native_candidate_sync"
+      ],
+      "minimum_additive_change": "Recipient/Space-bound immutable-cut metadata cursor pages; native one-use Header/version/hash/recipient/context/epoch-bound permit (<=30s) consumed before exact payload/quote/media bytes, with current and original-read checks at issue and consumption.",
+      "compatibility": "Add private versioned operations; ordinary sync remains ordinary and cannot substitute for managed content disclosure. No new public/model lookup or competing wire schema.",
+      "server_consumer": "Existing three-arm private fact adapter and actual provider composition; endpoint gates use after disclosure.",
+      "owner_mapping": "Native source/content maintainer supplies issuance/consumption authority; XIN-2793 supplies server adapter; XIN-2795 supplies consumer use boundary.",
+      "required_authorization": "Same bounded native source/API scope; no new generic token platform.",
+      "affected_ac": [
+        "AC06",
+        "AC13",
+        "AC14",
+        "AC17",
+        "AC21",
+        "AC22"
+      ]
+    },
+    {
+      "id": "native-replay-horizon",
+      "kind": "DEMONSTRATED_MISSING_NATIVE_REPLAY_CONTRACT",
+      "producer_repository": "Verified native delivery authority; inspected candidate Mininglamp-OSS/octo-im at 613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "component": "recipient delivery state, RecvAck/CMD sync acknowledgement, channel migration/recovery integration",
+      "citations": [
+        "approved_backend",
+        "im_transport",
+        "native_candidate_message",
+        "native_candidate_cmd",
+        "native_candidate_ack",
+        "native_candidate_recvack"
+      ],
+      "minimum_additive_change": "Persist recipient stream identity and consumed/no-redelivery horizon; couple ACK to committed endpoint reservation; expose GetReplayCheckpointV1/FenceThroughV1 with native monotonic comparison and guarantees across reconnect/migration/restore/key rotation.",
+      "existing_facility_limit": "Channel FenceAndDrain/DrainResult proves append drain/HW/checkpoint under leader epochs, not recipient consumption. Legacy SyncAck advances latest CMD generation and returns status, not an irrevocable replay horizon.",
+      "compatibility": "Ordinary ACK is unchanged. Endpoint retains terminal duplicate fences and stops at its bound until a real horizon exists; no TTL/reset/compaction based on ACK success.",
+      "owner_mapping": "Native delivery maintainer supplies checkpoint/fence semantics; XIN-2795 binds durable pre-ACK journal and exclusive recovery; XIN-2793 consumes real native authority/checkpoint output.",
+      "required_authorization": "Same bounded native source change plus separately evidenced recovery/ACK operating contract; no infrastructure launched.",
+      "affected_ac": [
+        "AC13",
+        "AC18",
+        "AC21"
+      ]
+    },
+    {
+      "id": "native-source-provenance",
+      "kind": "MISSING_DEPLOYMENT_FACT",
+      "citations": [
+        "server_dependency",
+        "server_ci_native_image",
+        "native_candidate_routes"
+      ],
+      "observed": "go.mod pins transport library only. CI uses wukongim/wukongim:v2.2.4-20260313. Prepared octo-im source is a different fixed candidate, not an attested deployed source.",
+      "minimum_output": "PjM/native deployment owner identifies actual serving image-to-repository/revision and source maintainer, then authorizes only the bounded native changes above. Do not infer deployment from repository presence or CI."
+    },
+    {
+      "id": "sql-current-and-recovery",
+      "kind": "MISSING_ADAPTER_CODE_AND_UNSUPPLIED_DEPLOYMENT_CAPABILITY",
+      "citations": [
+        "approved_backend",
+        "sql_composition",
+        "sql_configuration",
+        "sql_connector",
+        "cutover_state",
+        "cutover_flip",
+        "cutover_documentation",
+        "credential_writer_lease",
+        "credential_lease_binding",
+        "session_boot",
+        "session_control",
+        "session_runbook"
+      ],
+      "demonstrated_code_gap": "No source adapter binds permission transactions to elected-current SQL sessions/native positions and independent surviving minimum-acknowledged-position recovery coverage.",
+      "deployment_unknowns": [
+        "actual SQL routing/election and generation",
+        "old readers/writers/in-flight commit fencing",
+        "native read/commit position domain and comparator",
+        "independent surviving minimum-acknowledged-position domain",
+        "scope/catalog backup/import/restore ownership and RecoverAtLeast evidence"
+      ],
+      "existing_facility_limits": [
+        "DBR connector is an instrumented pool",
+        "cutover is rollbackable domain mode/floor control, not SQL leadership/acknowledged-state recovery",
+        "credential writer lease excludes validation readers and governs token issuance only",
+        "session rollout's MySQL floor and Redis scan run_id are not independent recovery coverage for permission state"
+      ],
+      "minimum_output": "Existing DB HA/recovery operator and adapter maintainer supplies actual capability API and proof for AcquireCurrent, AssertCurrent, durable native positions, RecordAcknowledgedPosition and RecoverAtLeast covering scope/catalog state. If unavailable, Owner disposition of the missing operational guarantee is required before implementation can assert it.",
+      "server_consumer": "Implement FencedAuthority.Begin -> transaction-specific AuthorityRead.Incarnation/Validate/Acknowledge and startup binding inside octo-server. Post-COMMIT ack failure requires reconciliation; no claimed rollback or retry.",
+      "required_authorization": "Current scope permits source adapter after a real existing facility is identified. It does not permit deploying a generic new fence service or changing shared DB/configuration.",
+      "affected_ac": [
+        "AC15",
+        "AC16",
+        "AC17",
+        "AC18"
+      ]
+    }
+  ],
+  "independent_work_remaining_now": "No supported production binding can be completed from the pinned content-first carrier or unverified pool alone. Actual adapters/startup remain owned here, gated by the precise producer contracts above; placeholders or an always-unavailable production provider are not delivery.",
+  "acceptance": "Native/MCP/restore acceptance NOT_RUN; synthetic component tests only; independent review deferred",
+  "source_citations": [
+    {
+      "id": "server_dependency",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "go.mod",
+      "bytes": 8822,
+      "sha256": "cc54016c8236a4d959d12216703cefadc84fa849d86c0156a632892e1243606b",
+      "git_blob_sha1": "853cacd24f3357bce04900c5b76048fe5fbabd90",
+      "lines": [
+        [
+          9,
+          9
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/go.mod"
+    },
+    {
+      "id": "server_sync",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "modules/bot_api/sync.go",
+      "bytes": 5102,
+      "sha256": "b09cc35073830a025426ed0c946aec3bd1624a62cc2173750d0ac446d09815e7",
+      "git_blob_sha1": "a1837abf895bd888b4cfc8cc2f84fd24acc40cd1",
+      "lines": [
+        [
+          25,
+          158
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/modules/bot_api/sync.go"
+    },
+    {
+      "id": "server_webhook",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "modules/webhook/api.go",
+      "bytes": 32457,
+      "sha256": "1c7aa407fe9df57d53b15baad7fc9c9d6c26199fbc0f9dbdec34637c6d2eb2e7",
+      "git_blob_sha1": "64589917ab915a3e7fbb9aad9cd681239b774b52",
+      "lines": [
+        [
+          252,
+          335
+        ],
+        [
+          849,
+          914
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/modules/webhook/api.go"
+    },
+    {
+      "id": "server_ci_native_image",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": ".github/workflows/ci.yml",
+      "bytes": 21237,
+      "sha256": "4b6019b861e19c614788ca5a7262b04704a8e9b7abc361525a4cd565e228ea68",
+      "git_blob_sha1": "62326b03426b5e78a7cda01677854b11ee43b7b5",
+      "lines": [
+        [
+          163,
+          184
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/.github/workflows/ci.yml"
+    },
+    {
+      "id": "server_ingress_limit",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "docs/card-protocol.md",
+      "bytes": 21664,
+      "sha256": "05115c403db4bd35ff0db2450266069a54f19f998c2e49477fcd1e7c2569661d",
+      "git_blob_sha1": "d875ae26d6987320a2d343a623964c8af9aef2cf",
+      "lines": [
+        [
+          173,
+          186
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/docs/card-protocol.md"
+    },
+    {
+      "id": "cutover_state",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "pkg/cutover/cutover.go",
+      "bytes": 6184,
+      "sha256": "61c5dddae9333c29dc375e3a84879ce89ad030b591d49e42ef5fe9f4ff5d52d4",
+      "git_blob_sha1": "4e65902ed563d90cdc2427452ecc1b60dc9fd977",
+      "lines": [
+        [
+          1,
+          28
+        ],
+        [
+          104,
+          134
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/pkg/cutover/cutover.go"
+    },
+    {
+      "id": "cutover_flip",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "pkg/cutover/flip.go",
+      "bytes": 14409,
+      "sha256": "7b173f1e3b2f2856ce31d69d1aeed0ef550334c025c8936423f5a5cc3d808380",
+      "git_blob_sha1": "7749101c4e84212e9bdc0ec24569a15a655c3a8d",
+      "lines": [
+        [
+          94,
+          149
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/pkg/cutover/flip.go"
+    },
+    {
+      "id": "cutover_documentation",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "docs/cutover-framework.md",
+      "bytes": 13196,
+      "sha256": "d3dff5593e786517ec9d52914c77bfb5b77e7154203d88efc16479183e3f3be6",
+      "git_blob_sha1": "35e87b417114545b918d452af3a24f642004fc60",
+      "lines": [
+        [
+          1,
+          67
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/docs/cutover-framework.md"
+    },
+    {
+      "id": "credential_writer_lease",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "pkg/auth/writer_registry.go",
+      "bytes": 15227,
+      "sha256": "a91b767084442b84e6ce497c5de2080e517b8541496aa80efd4dfcc9c529cbf9",
+      "git_blob_sha1": "62ff0d373d1fa119f2955ac7877524a1c816b72c",
+      "lines": [
+        [
+          3,
+          23
+        ],
+        [
+          138,
+          170
+        ],
+        [
+          211,
+          222
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/pkg/auth/writer_registry.go"
+    },
+    {
+      "id": "credential_lease_binding",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "pkg/auth/session_store.go",
+      "bytes": 30307,
+      "sha256": "65b37ed1f98ae9afcc04f6c5d027fd4ff74090d67fa271666aff3a8600c996dc",
+      "git_blob_sha1": "0b6c5e1616af699a32a9f7fbd1f67e7bc082cb9a",
+      "lines": [
+        [
+          796,
+          812
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/pkg/auth/session_store.go"
+    },
+    {
+      "id": "session_boot",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "pkg/auth/runtime.go",
+      "bytes": 8038,
+      "sha256": "1cce3185b2f32dce90dc4d4a13c57c30a99f4a491928f827005335349481ed60",
+      "git_blob_sha1": "105b9e0a80e39195107fab51da24ee8fafde913b",
+      "lines": [
+        [
+          98,
+          125
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/pkg/auth/runtime.go"
+    },
+    {
+      "id": "session_control",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "pkg/auth/session_rollout_control_store.go",
+      "bytes": 15548,
+      "sha256": "28cb57028e7d14b7e9e172d6f2e1fe1e848d55455c32efdb27d5959b2c2a8daf",
+      "git_blob_sha1": "7bb2a3981bc133a8c834433a206d8b255a1479b9",
+      "lines": [
+        [
+          84,
+          114
+        ],
+        [
+          388,
+          403
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/pkg/auth/session_rollout_control_store.go"
+    },
+    {
+      "id": "session_runbook",
+      "repository": "Mininglamp-OSS/octo-server",
+      "ref": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+      "path": "docs/token-session-rollout-runbook.md",
+      "bytes": 13212,
+      "sha256": "606592c978d8f721e435f8d5e3cdf42b19d4b524b34256be9a2ee202abfba3ca",
+      "git_blob_sha1": "02cca651f46e6c6992577f2f1c307d69bd51ac5b",
+      "lines": [
+        [
+          1,
+          39
+        ],
+        [
+          172,
+          198
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-server/blob/79701d4912eba79a8bcb02c58ed86609c38335e2/docs/token-session-rollout-runbook.md"
+    },
+    {
+      "id": "im_transport",
+      "repository": "Mininglamp-OSS/octo-lib",
+      "ref": "233dd6fcdda60ccf347811d1e7a069f1e9703bf8",
+      "path": "config/msg.go",
+      "bytes": 36815,
+      "sha256": "50ba35c7383508912c0522505a696bb69b3acd794096465dc5d6f94c40fa8be5",
+      "git_blob_sha1": "c573ba2c1dad5b863e36918e8fc9e4d899dfc7fc",
+      "lines": [
+        [
+          422,
+          490
+        ],
+        [
+          683,
+          701
+        ],
+        [
+          882,
+          899
+        ],
+        [
+          946,
+          970
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-lib/blob/233dd6fcdda60ccf347811d1e7a069f1e9703bf8/config/msg.go"
+    },
+    {
+      "id": "sql_composition",
+      "repository": "Mininglamp-OSS/octo-lib",
+      "ref": "233dd6fcdda60ccf347811d1e7a069f1e9703bf8",
+      "path": "config/context.go",
+      "bytes": 7883,
+      "sha256": "c379c384de3510df81180ecc3f112d6e7b2375defa9441e81b0bd29aea305b79",
+      "git_blob_sha1": "64d40647826438d2366c8dd0537f3b0bc6fa12ea",
+      "lines": [
+        [
+          81,
+          102
+        ],
+        [
+          175,
+          182
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-lib/blob/233dd6fcdda60ccf347811d1e7a069f1e9703bf8/config/context.go"
+    },
+    {
+      "id": "sql_configuration",
+      "repository": "Mininglamp-OSS/octo-lib",
+      "ref": "233dd6fcdda60ccf347811d1e7a069f1e9703bf8",
+      "path": "config/config.go",
+      "bytes": 49260,
+      "sha256": "8e78360ea8685f7443b6d50034d0406551ff28c179ef970236a5c1df2f14c3e5",
+      "git_blob_sha1": "fe73d4d3454881ef80483940f49dbf3dae3c3ac3",
+      "lines": [
+        [
+          99,
+          105
+        ],
+        [
+          595,
+          600
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-lib/blob/233dd6fcdda60ccf347811d1e7a069f1e9703bf8/config/config.go"
+    },
+    {
+      "id": "sql_connector",
+      "repository": "Mininglamp-OSS/octo-lib",
+      "ref": "233dd6fcdda60ccf347811d1e7a069f1e9703bf8",
+      "path": "pkg/db/mysql.go",
+      "bytes": 3695,
+      "sha256": "6fd4901ce95559f4c8bc1156a47c7f314818cfe008149fa9562b866d23b30a72",
+      "git_blob_sha1": "4391b69af3508fd37e39d11ff8b00fcb010cdeee",
+      "lines": [
+        [
+          17,
+          51
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-lib/blob/233dd6fcdda60ccf347811d1e7a069f1e9703bf8/pkg/db/mysql.go"
+    },
+    {
+      "id": "native_candidate_routes",
+      "repository": "Mininglamp-OSS/octo-im",
+      "ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "path": "internal/access/api/routes.go",
+      "bytes": 3283,
+      "sha256": "01b656737c8c7073ec5f239ecdac903152b67f4d9759ec4e268d18adb429ddaf",
+      "git_blob_sha1": "2e71af26917f3a4cb1bbc4b6f79bea7aa6bda326",
+      "lines": [
+        [
+          69,
+          72
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-im/blob/613fc2b2b3a4c23054385ee3f8238fc44a8f68e7/internal/access/api/routes.go"
+    },
+    {
+      "id": "native_candidate_message",
+      "repository": "Mininglamp-OSS/octo-im",
+      "ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "path": "pkg/channel/types.go",
+      "bytes": 13803,
+      "sha256": "b1f5155e5e85d0f23ad048b7ef0a06d2f5a821f888fde3d90b9bbbe5d6b04357",
+      "git_blob_sha1": "37ced9ffd4c2efe86e39668821de097fec874e1f",
+      "lines": [
+        [
+          48,
+          68
+        ],
+        [
+          119,
+          162
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-im/blob/613fc2b2b3a4c23054385ee3f8238fc44a8f68e7/pkg/channel/types.go"
+    },
+    {
+      "id": "native_candidate_sync",
+      "repository": "Mininglamp-OSS/octo-im",
+      "ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "path": "internal/usecase/message/sync.go",
+      "bytes": 4248,
+      "sha256": "214209f20db2c60c8d306edc130c030cac08e7df32d3aabb46c2d8b04346fddd",
+      "git_blob_sha1": "27d3e310bbe0ea356cb91ba88685f61ebefde6db",
+      "lines": [
+        [
+          29,
+          80
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-im/blob/613fc2b2b3a4c23054385ee3f8238fc44a8f68e7/internal/usecase/message/sync.go"
+    },
+    {
+      "id": "native_candidate_cmd",
+      "repository": "Mininglamp-OSS/octo-im",
+      "ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "path": "internal/usecase/cmdsync/types.go",
+      "bytes": 3384,
+      "sha256": "48bd5c9ca3c11e9d18ad7b1b769a98110442dc0448ce6c8af388837f6029320d",
+      "git_blob_sha1": "053086080c1ec3c8cae3e0a6bc0343398758a043",
+      "lines": [
+        [
+          24,
+          39
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-im/blob/613fc2b2b3a4c23054385ee3f8238fc44a8f68e7/internal/usecase/cmdsync/types.go"
+    },
+    {
+      "id": "native_candidate_ack",
+      "repository": "Mininglamp-OSS/octo-im",
+      "ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "path": "internal/usecase/cmdsync/app.go",
+      "bytes": 11199,
+      "sha256": "a1456021a6fec5b480289b48670d69af67f135baa6943ecde86a68cb251f2461",
+      "git_blob_sha1": "038947c6debb398174a48d02a59ee53f2251c6ed",
+      "lines": [
+        [
+          160,
+          224
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-im/blob/613fc2b2b3a4c23054385ee3f8238fc44a8f68e7/internal/usecase/cmdsync/app.go"
+    },
+    {
+      "id": "native_candidate_recvack",
+      "repository": "Mininglamp-OSS/octo-im",
+      "ref": "613fc2b2b3a4c23054385ee3f8238fc44a8f68e7",
+      "path": "internal/usecase/message/recvack.go",
+      "bytes": 526,
+      "sha256": "6cf022e5b6251cd0c98e4af7ebfa3d509f01ed029393ca7ebccd5535132292ff",
+      "git_blob_sha1": "2c8235e2bc7e6640f19975ca6f2b8a7d44dd214f",
+      "lines": [
+        [
+          5,
+          15
+        ]
+      ],
+      "url": "https://github.com/Mininglamp-OSS/octo-im/blob/613fc2b2b3a4c23054385ee3f8238fc44a8f68e7/internal/usecase/message/recvack.go"
+    },
+    {
+      "id": "approved_backend",
+      "approved_artifact": "backend-policy-native-fact-appendix-v8-draft.md",
+      "bytes": 71792,
+      "sha256": "3fe4936547c87ef4dce435c35442f5337ef35188ce7ecd5804371eaa9faf6eea",
+      "sections": [
+        "7",
+        "9",
+        "10"
+      ]
+    },
+    {
+      "id": "approved_shared",
+      "approved_artifact": "shared-contract-v6.json",
+      "bytes": 163796,
+      "sha256": "bb90830850e6ea97666b10230f14763d2ba06315c2cf2288cb2c42f59931abe1",
+      "sections": [
+        "/selected_contract_sections/5",
+        "/selected_contract_sections/10"
+      ]
+    },
+    {
+      "id": "approved_atom_map",
+      "approved_artifact": "backend-native-provider-map-v6.json",
+      "bytes": 26536,
+      "sha256": "6aaaa6a14b7e1a86cacf1708f02c938c303e71b227c8efe36498c34b1ac517d8",
+      "sections": [
+        "/atoms",
+        "/profiles"
+      ]
+    }
+  ]
+}

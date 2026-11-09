@@ -10,8 +10,8 @@ The `pkg/permissionbundle/contracts` directory carries the exact unchanged
 wire, managed identity, native-fact and private resolver schemas, plus the
 unchanged release **template**. The template's rejecting root remains intact;
 neither it nor the historical candidate is a supported runtime catalog.
-`handoff-v2.json` is the current sibling interface; `handoff-v1.json` is retained
-as the immutable prior handoff. `permission-prepare-v1.schema.json` specifies the approved bounded
+`handoff-v3.json` is the current sibling interface; earlier handoffs are retained
+as immutable history. `permission-prepare-v1.schema.json` specifies the approved bounded
 Owner preparation interface. No model-side evaluator or policy tool is added.
 `contract-manifest-v1.json` commits each contract's exact bytes and SHA-256;
 `synthetic-examples-v1.json` supplies positive and negative component fixtures.
@@ -67,8 +67,8 @@ permission or an acknowledged-position recovery guarantee.
 
 ## Explicit integration prerequisites
 
-The default composition has no `FencedAuthority` or supported `Releases`
-implementation. Permission routes are therefore **not mounted**. Trusted startup
+The default composition has no installed `FencedAuthority` or supported release.
+Permission routes are therefore **not mounted**. Trusted startup
 composition calls `permissionbundle.Install` once with real dependencies, before
 constructing modules. Robot and BotAPI constructors consume that context-bound
 runtime. The old unused `ConfigurePermissionBundle` hooks were removed. No
@@ -105,13 +105,26 @@ does **not** implement missing native original-message/content primitives.
 | Cross-repository dispatch / CLI + endpoint | Same-policy Stage1/Stage2 checks, context generation, process revision watermark and owned physical sends remain sibling work. This server never evaluates model permission decisions. AC05/11/12/15/16/19–22 NOT_RUN. |
 
 Exact producer/source/output requirements, consumed sibling pins and remaining
-owned adapter work are in `contracts/handoff-v2.json` and
-`contracts/remaining-producers-v1.json`. The old Jeff/wrapper blocker is stale:
+owned adapter work are in `contracts/handoff-v3.json` and
+`contracts/remaining-producers-v2.json`. The old Jeff/wrapper blocker is stale:
 XIN-2794 now has Ken Draft #234, with a still-null supported catalog digest.
 These are engineering blockers, not Owner waivers or completion by permanent
 refusal. Actual native/read/send/content/restore tests and V-A–V-E/V-D2 were
 not run. No shared DB, business content, provider, credentials, runtime or global
 configuration was changed.
+
+The PjM continuation adds `ArtifactReleases`, a concrete immutable loader and
+compatibility adapter against the approved release contract. It consumes an
+explicit trusted support list from XIN-2794, verifies the exact canonical whole
+artifact digest, structural fragment, ordering, content hashes and references,
+and requires directed approved migration pairs. Any changed entry/program graph
+requires current deny reference validation. It provides no supported artifact,
+source/profile reconciliation or competing catalog. See the bounded,
+[source-cited producer/consumer map](permission-producer-map-v2.md) for the
+precise split between delivered server code, sibling outputs, native source
+changes and missing deployment facts. `remaining-producers-v2.json` supersedes
+the generic v1 dependency disposition; `contract-manifest-v3.json` records current
+contract bytes/hashes and the readable map.
 
 ## Migration and rollback
 
@@ -153,6 +166,15 @@ and the inherited `my_bots` cross-Space listing gap. New regressions check absen
 unconfigured routes and member/nonmember/query-failure/legacy listing behavior.
 Core tests additionally cover atomic native association/header rollback, rejoin
 without reseeding, all ten metadata profiles and all three native request arms.
+
+Catalog tests include successful pinned load/migration/unchanged-deny retention,
+copy isolation, unsupported/rebound pins, corrupt content and descriptor hashes,
+invalid base64, open references, ordering, cancellation and unapproved migration.
+All test support entries are explicitly synthetic and never installed by
+production. Nil runtime checks are now explicit at constructors and route
+registration; nil-safe receiver behavior was already covered. Disclosure remains
+its closed permit-only arm, with no resolve Header/purpose; a regression checks
+both the valid response and rejection of an added Header without a panic.
 
 The source delivery remains incomplete. PjM coordinates the named producers;
 independent review is deferred until complete source delivery. No formal review,

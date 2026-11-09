@@ -392,8 +392,12 @@ type Robot struct {
 }
 
 func New(ctx *config.Context) *Robot {
+	var permissionStore *permissionbundle.Store
+	if runtime := permissionbundle.RuntimeFor(ctx); runtime != nil {
+		permissionStore = runtime.Store()
+	}
 	rb := &Robot{
-		permissionBundle:              permissionbundle.RuntimeFor(ctx).Store(),
+		permissionBundle:              permissionStore,
 		ctx:                           ctx,
 		Log:                           log.NewTLog("Robot"),
 		db:                            *newBotDB(ctx),

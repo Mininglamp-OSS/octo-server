@@ -24,5 +24,12 @@ association commit/composition and native-wire adapter integration to the
 load-bearing list. All native/project work precedes the final sorted header
 suffix. A rejoin cannot seed missing security state. Default permission routes
 are absent until trusted startup installs real dependencies. Exact sibling pins
-and remaining producer outputs are in `remaining-producers-v1.json`; incomplete
+and remaining producer outputs are in `remaining-producers-v2.json`; incomplete
 native bindings block source completion and independent review.
+
+PjM continuation `83e1136b-f7af-4b23-8e1f-cf8168bb48e8` adds the concrete
+immutable catalog loader/compatibility adapter and bounded source-cited producer
+map. Only XIN-2794 publishes a supported catalog; the server consumes its exact
+support pins and directed approved migration pairs. Native source provenance and
+DB HA/recovery capabilities must be established before actual adapters/startup
+can bind. No fourth-repository edit or new infrastructure is authorized.

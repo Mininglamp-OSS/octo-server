@@ -26,13 +26,17 @@ const MaxBundleBytes = 262144
 // decodeStrict rejects information that encoding/json would otherwise discard
 // or replace: decoded duplicate keys, invalid UTF-8 and unpaired UTF-16 escapes.
 func decodeStrict(r io.Reader, limit int) (any, error) {
+	return decodeStrictDepth(r, limit, 12)
+}
+
+func decodeStrictDepth(r io.Reader, limit, maxDepth int) (any, error) {
 	b, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	if err != nil || len(b) > limit || !utf8.Valid(b) || !pairedEscapes(b) {
 		return nil, ErrInvalid
 	}
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
-	v, err := value(d, 0)
+	v, err := value(d, 0, maxDepth)
 	if err != nil {
 		return nil, ErrInvalid
 	}
@@ -84,14 +88,14 @@ func pairedEscapes(b []byte) bool {
 	return !inside
 }
 
-func value(d *json.Decoder, depth int) (any, error) {
+func value(d *json.Decoder, depth, maxDepth int) (any, error) {
 	t, err := d.Token()
 	if err != nil {
 		return nil, err
 	}
 	switch t {
 	case json.Delim('{'):
-		if depth >= 12 {
+		if depth >= maxDepth {
 			return nil, ErrInvalid
 		}
 		m := map[string]any{}
@@ -107,7 +111,7 @@ func value(d *json.Decoder, depth int) (any, error) {
 			if _, ok := m[key]; ok {
 				return nil, ErrInvalid
 			}
-			v, err := value(d, depth+1)
+			v, err := value(d, depth+1, maxDepth)
 			if err != nil {
 				return nil, err
 			}
@@ -119,12 +123,12 @@ func value(d *json.Decoder, depth int) (any, error) {
 		}
 		return m, nil
 	case json.Delim('['):
-		if depth >= 12 {
+		if depth >= maxDepth {
 			return nil, ErrInvalid
 		}
 		a := []any{}
 		for d.More() {
-			v, err := value(d, depth+1)
+			v, err := value(d, depth+1, maxDepth)
 			if err != nil {
 				return nil, err
 			}
