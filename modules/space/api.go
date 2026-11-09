@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -57,7 +58,7 @@ func New(ctx *config.Context) *Space {
 		ctx:          ctx,
 		Log:          log.NewTLog("Space"),
 		db:           NewDB(ctx),
-		mdb:          newManagerDB(ctx.DB()),
+		mdb:          newManagerDB(ctx.DB(), ctx),
 		settings:     commonmod.EnsureSystemSettings(ctx),
 		welcomeStore: commonmod.NewSpaceWelcomeConfigStore(ctx.DB()),
 	}
@@ -360,7 +361,8 @@ func (s *Space) createSpace(c *wkhttp.Context) {
 // 事务内写 space + owner 成员；事务外建邀请码、BotFather 入驻、刷新 ParseChannelID 缓存、
 // 触发 SpaceMemberJoin 事件。与原先 createSpace 行为保持一致。
 func (s *Space) createSpaceCore(p createSpaceParams) (*createSpaceResult, error) {
-	tx, err := s.ctx.DB().Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(s.ctx, s.ctx.DB())
+	defer cancelAssociation()
 	if err != nil {
 		return nil, fmt.Errorf("开启事务失败: %w", err)
 	}
@@ -370,7 +372,7 @@ func (s *Space) createSpaceCore(p createSpaceParams) (*createSpaceResult, error)
 	if err != nil {
 		return nil, err
 	}
-	if err = tx.Commit(); err != nil {
+	if err = s.db.commitMemberTx(tx, spaceId, p.Creator, true); err != nil {
 		return nil, fmt.Errorf("提交事务失败: %w", err)
 	}
 	return s.createSpaceCorePostCommit(spaceId, p), nil

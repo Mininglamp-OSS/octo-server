@@ -10,8 +10,8 @@ The `pkg/permissionbundle/contracts` directory carries the exact unchanged
 wire, managed identity, native-fact and private resolver schemas, plus the
 unchanged release **template**. The template's rejecting root remains intact;
 neither it nor the historical candidate is a supported runtime catalog.
-`handoff-v1.json` records the sibling-facing routes, error contract and source
-hashes. `permission-prepare-v1.schema.json` specifies the approved bounded
+`handoff-v2.json` is the current sibling interface; `handoff-v1.json` is retained
+as the immutable prior handoff. `permission-prepare-v1.schema.json` specifies the approved bounded
 Owner preparation interface. No model-side evaluator or policy tool is added.
 `contract-manifest-v1.json` commits each contract's exact bytes and SHA-256;
 `synthetic-examples-v1.json` supplies positive and negative component fixtures.
@@ -68,20 +68,46 @@ permission or an acknowledged-position recovery guarantee.
 ## Explicit integration prerequisites
 
 The default composition has no `FencedAuthority` or supported `Releases`
-implementation. Owner/self routes therefore remain unavailable. The
-`ConfigurePermissionBundle` composition methods accept those reviewed adapters;
-no environment flag, fabricated nonce, cached pool or candidate catalog enables
-them. Synthetic test adapters are confined to test files.
+implementation. Permission routes are therefore **not mounted**. Trusted startup
+composition calls `permissionbundle.Install` once with real dependencies, before
+constructing modules. Robot and BotAPI constructors consume that context-bound
+runtime. The old unused `ConfigurePermissionBundle` hooks were removed. No
+environment flag, fabricated nonce, cached pool or candidate catalog enables
+the feature. Synthetic adapters remain confined to test files.
+
+The installed runtime now participates in the identified association commit
+owners: BotFather creation/binding (including the existing REST/OBO association
+units), Space creation and outer owner-invite commit, initial join, direct add,
+reactivation, both approval exits, per-member insert units, ignored inserts and
+manager batch upsert. A fresh RR transaction has a deadline beginning before its
+native prefix; native/project steps precede sorted header suffixes in the same
+commit. Rejoins require the existing header and never seed missing state. Human
+and built-in/legacy-token associations create no User Bot header. Default legacy
+transactions retain their original behavior when no runtime is installed.
+
+The optional private fact route now has a bounded server adapter for all three
+unchanged native request arms and all ten profiles. It verifies complete ordered
+results, request/key/recipient/profile binding, native widths, page bounds,
+authority read-nonce references, SQL/IM coverage, SQL incarnation and disclosure
+context. A real `NativeFactSource.Read` must supply the metadata and
+`ValidateCuts` must recognize the actual authority/position domains and prove
+acknowledgement-before-read semantics. Known false atoms are returned as facts;
+the server does not evaluate model permission decisions. This protocol adapter
+does **not** implement missing native original-message/content primitives.
 
 | Dependency / next owner | Exact missing interface/source and affected acceptance |
 | --- | --- |
 | Current SQL authority / native operations + backend | `FencedAuthority.Begin`, old-reader AND old-writer fencing, commit/read position acknowledgement and recovery at least through all acknowledged positions. The pinned pool/store exposes none of these. Required for serving, AC15–18 and positive owner/self/CAS acceptance. |
-| Supported catalog / CLI + endpoint, backend comparison | One final immutable supported manifest with exact shared digest, capability membership and explicit migration equivalence. Historical 827-ID candidate/template is not a release. Required for provisioning, save/self/catalog and AC04/05/11/12/19/21. The CLI task currently reports its prescribed account wrapper unavailable; no shared release was delivered in the sibling discussions read for this task. |
-| Association commit coverage / backend + native operations | `ProvisionSuffix` is implemented but is **not wired** into the 82-site/17-file association census. Every outer native commit must retain its prefix, finish registered steps, then append sorted header suffixes under real authority and the supported release. Requires the preceding dependencies. No GET/backfill or fake fresh nonce substitutes. AC01–04/08–10/18 remain unverified. |
-| Original native facts / native IM + backend | `InspectDeliveredHeaderV1`, `ReadCurrentAccessV1`, `ListHistoryHeadersV1`, `IssueHistoryDisclosureV1` and `ReadDisclosedBodyV1` are absent. Existing `bot_api/sync.go`, webhook payloads, message mirrors and directed friend/block checks do not attest original recipient/Space/version/visibility. The private fact route is intentionally **not registered**; unchanged schema bytes are supplied for integration. No fabricated false/positive profiles. AC06/08/13/14/17/18/21/22 NOT_RUN. |
+| Supported catalog / CLI + endpoint, backend comparison | One final immutable supported manifest with exact shared digest, capability membership and explicit migration equivalence. Historical 827-ID candidate/template is not a release. Required for provisioning, save/self/catalog and AC04/05/11/12/19/21. Ken Draft #234 delivers materialized engineering content but still has a null supported catalog digest. |
+| Association commit acceptance / backend + native operations | Identified association creation/rejoin commits now invoke `BeginAssociation`/`CommitAssociations`. Actual native writer/fence/index/collation/locking/recovery verification and installed runtime composition still require the preceding dependencies. The 82-site/17-file authority census is not a claim of dynamic/external-writer completeness. AC01–04/08–10/18 remain unverified. |
+| Original native facts / native IM + backend | The wire/provider adapter is implemented, but actual `InspectDeliveredHeaderV1`, `ReadCurrentAccessV1`, `ListHistoryHeadersV1`, `IssueHistoryDisclosureV1` and `ReadDisclosedBodyV1` primitives remain absent. Existing `bot_api/sync.go`, webhook payloads, message mirrors and directed friend/block checks do not attest original recipient/Space/version/visibility. The fact route mounts only with an installed real source. No fabricated false/positive profiles. AC06/08/13/14/17/18/21/22 NOT_RUN. |
 | Delivery/host / native IM + endpoint | `GetReplayCheckpointV1`, `FenceThroughV1`, stable stream incarnation/sequence and coordinated pre-ACK durable reservation are absent in the server/native carrier seams. Endpoint owns reservation/binding/context integration. AC13/18/21 NOT_RUN. |
 | Cross-repository dispatch / CLI + endpoint | Same-policy Stage1/Stage2 checks, context generation, process revision watermark and owned physical sends remain sibling work. This server never evaluates model permission decisions. AC05/11/12/15/16/19–22 NOT_RUN. |
 
+Exact producer/source/output requirements, consumed sibling pins and remaining
+owned adapter work are in `contracts/handoff-v2.json` and
+`contracts/remaining-producers-v1.json`. The old Jeff/wrapper blocker is stale:
+XIN-2794 now has Ken Draft #234, with a still-null supported catalog digest.
 These are engineering blockers, not Owner waivers or completion by permanent
 refusal. Actual native/read/send/content/restore tests and V-A–V-E/V-D2 were
 not run. No shared DB, business content, provider, credentials, runtime or global
@@ -122,7 +148,12 @@ MySQL-dependent rollout session; full package/integration tests remain NOT_RUN.
 The selected identity/parser/legacy verification tests can run without that
 entry point using `scripts/test-permission-identity.py`.
 
-The next reviewer is the independently assigned backend/security reviewer via
-PjM, reviewing the exact Draft head and these explicit incomplete integrations.
-No formal review, deployment, ready conversion, merge or product acceptance is
-claimed.
+The continuation also fixes the review's unconditional production route exposure
+and the inherited `my_bots` cross-Space listing gap. New regressions check absent
+unconfigured routes and member/nonmember/query-failure/legacy listing behavior.
+Core tests additionally cover atomic native association/header rollback, rejoin
+without reseeding, all ten metadata profiles and all three native request arms.
+
+The source delivery remains incomplete. PjM coordinates the named producers;
+independent review is deferred until complete source delivery. No formal review,
+deployment, ready conversion, merge or product acceptance is requested.

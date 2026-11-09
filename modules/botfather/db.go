@@ -7,6 +7,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -144,7 +145,8 @@ func (d *botfatherDB) resolveAuthorizedCreationSpace(creatorUID, selectedSpaceID
 // INSERT prevents a stale preflight decision from authorizing the commit after a
 // concurrent disable/removal.
 func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string) error {
-	tx, err := d.session.Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+	defer cancelAssociation()
 	if err != nil {
 		return fmt.Errorf("begin Bot Space binding: %w", err)
 	}
@@ -205,7 +207,7 @@ func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string)
 	if affected != 1 {
 		return errors.New("insert Bot Space membership: unexpected affected rows")
 	}
-	if err = tx.Commit(); err != nil {
+	if err = permissionbundle.CommitAssociations(d.ctx, tx, permissionbundle.Association{BotUID: robotID, SpaceID: spaceID, New: true}); err != nil {
 		return fmt.Errorf("commit Bot Space binding: %w", err)
 	}
 	return nil

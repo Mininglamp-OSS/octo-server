@@ -261,6 +261,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 	robotService := robot.NewService(ctx)
 
 	ba := &BotAPI{
+		permissionBundle:      permissionbundle.RuntimeFor(ctx).Store(),
 		ctx:                   ctx,
 		db:                    newBotAPIDB(ctx),
 		userService:           user.NewService(ctx),
@@ -410,8 +411,13 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		),
 	)
 	{
-		botAPI.GET("/permission-bundle/v1", ba.permissionBundleHandler("self"))
-		botAPI.GET("/permission-bundle/v1/catalog", ba.permissionBundleHandler("catalog"))
+		if ba.permissionBundle != nil {
+			botAPI.GET("/permission-bundle/v1", ba.permissionBundleHandler("self"))
+			botAPI.GET("/permission-bundle/v1/catalog", ba.permissionBundleHandler("catalog"))
+			if permissionbundle.RuntimeFor(ba.ctx).HasFacts() {
+				botAPI.POST("/permission-facts/v1", ba.permissionFacts)
+			}
+		}
 		botAPI.POST("/sendMessage", ba.sendMessage)
 		botAPI.POST("/typing", ba.typing)
 		botAPI.POST("/readReceipt", ba.readReceipt)

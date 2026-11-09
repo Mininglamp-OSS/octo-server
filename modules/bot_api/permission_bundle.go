@@ -7,9 +7,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 )
 
-func (ba *BotAPI) ConfigurePermissionBundle(store *permissionbundle.Store) {
-	ba.permissionBundle = store
-}
 func (ba *BotAPI) permissionBundleHandler(operation string) wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		c.Header("Cache-Control", "private, no-store")

@@ -1,0 +1,43 @@
+{
+  "format": "permission-server-remaining-producers-v1",
+  "server_task": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "consumed_siblings": [
+    {"task": "XIN-2794", "task_id": "229ad215-8526-4a04-8f5b-36f073f81a16", "repository": "ken-anderson2006/octo-cli", "pr": 234, "head": "3b07d4d2f6c4637f0c389a71fab056ddf91c3965", "path": "docs/permission/cli-component-contract-v1.json", "bytes": 1436, "sha256": "514d4edd4ce7f22b4f318de79d381cea083f5132fe3327198dc03aef9c104e73"},
+    {"task": "XIN-2795", "task_id": "2f4a34e9-2be3-48ac-99f0-38a30f077acd", "repository": "ploy-elison/codex-channel-octo", "pr": 102, "head": "c152cb54df8e3fb822288933e39cf6dcad4b9335", "path": "docs/permission-component-contract.json", "bytes": 2422, "sha256": "3235d448421f4bfd34977d474a9a0568d720dfe8d12c825085eef463b6d13e83"}
+  ],
+  "dependencies": [
+    {
+      "producer": "XIN-2794 / Fullstack-mini / octo-cli supported catalog producer",
+      "source": "Draft234 docs/permission/source-materialization-v1.json.gz and scripts/permission-catalog at the consumed head",
+      "required_output": "One supported immutable permission-release-manifest-v1 artifact, non-null shared catalog version/digest, exact capability membership, compatible templates/bounds and explicit old/target semantic equivalence",
+      "observed": "827-entry engineering materialization; supported catalog unavailable, catalog_digest null",
+      "server_owned_followup": "Implement Releases.Load/Compatible/SameIntent against that exact artifact and install the runtime; do not create a competing release",
+      "affected_ac": ["AC01", "AC02", "AC03", "AC04", "AC05", "AC11", "AC12", "AC19", "AC21"]
+    },
+    {
+      "producer": "Native WuKongIM authority behind octo-lib/config message transport; XIN-2793 owns the server adapter, PjM must bind the native implementation owner",
+      "source": "octo-lib v0.0.0-20260811160929-233dd6fcdda6 config/msg.go: IMGetWithChannelAndSeqs, IMSyncChannelMessage, MessageResp; server modules/bot_api/sync.go and modules/webhook/api.go",
+      "required_output": "InspectDeliveredHeaderV1, ReadCurrentAccessV1, ListHistoryHeadersV1, IssueHistoryDisclosureV1 and one-use ReadDisclosedBodyV1 with original recipient/Space/version/hash, stable stream incarnation/uint64 sequence, native current/original read and independent reply authority at recognized cuts",
+      "observed": "MessageResp is content-first, has uint32 MessageSeq, no original-Space or delivery-stream-incarnation contract and no immutable original-visibility/disclosure primitive",
+      "server_owned_followup": "Bind NativeFactSource.Read/ValidateCuts to the delivered primitive; implement actual original/current/content/reply providers. The implemented closed-wire adapter does not close this owned work",
+      "affected_ac": ["AC06", "AC08", "AC13", "AC14", "AC17", "AC18", "AC21", "AC22"]
+    },
+    {
+      "producer": "Actual database current-writer election/session and surviving recovery-fence owner; no such producer is exposed in the approved source; PjM must identify the existing deployment facility",
+      "source": "octo-lib config/context.go DB/NewMySQL returns a DBR pool; pkg/mcppolicy/store.go has snapshot storage only; pkg/permissionbundle/store.go defines the required FencedAuthority port",
+      "required_output": "Stable authority incarnation, verified elected-current SQL transaction, old-reader AND old-writer fencing, native read/commit positions, durable minimum-acknowledged-position recording and recovery verification outside coherent rollback of the serving database",
+      "observed": "No election/session/acknowledgement/recovery primitive or configured adapter exists. A pool, DB row, timestamp, startup UUID or guessed GTID is insufficient",
+      "server_owned_followup": "Implement and install the actual FencedAuthority adapter once the native facility and its evidence are supplied; this remains owned incomplete server work, not an unassigned side project",
+      "affected_ac": ["AC15", "AC16", "AC17", "AC18"]
+    },
+    {
+      "producer": "Native delivery authority plus XIN-2795 / Ada-mini2 replay and host integration",
+      "source": "Pinned endpoint src/octo/socket.ts reserveBeforeAck and src/permission replay component; native config/msg.go IMSyncMessageAck provides no surviving stream horizon",
+      "required_output": "GetReplayCheckpointV1/FenceThroughV1, stable delivery identity, delayed/coordinated ACK and recovery fence; endpoint must bind those to the durable pre-ACK journal and private host/control path",
+      "server_owned_followup": "Consume native checkpoint/fence and authority outputs without reinterpreting an ordinary ACK as an irrevocable no-redelivery horizon",
+      "affected_ac": ["AC13", "AC18", "AC21"]
+    }
+  ],
+  "remaining_owned_state": "Real native provider/authority bindings and production startup composition remain incomplete; association and wire adapters are implemented. No full MCP-path or native acceptance is claimed.",
+  "next_action_owner": "PjM/Dennis-mini coordinates exact producer delivery; Dennis-mini2 retains Draft951 server implementation. Independent review is deferred."
+}

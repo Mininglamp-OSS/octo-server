@@ -18,3 +18,11 @@ upstream interfaces. Missing interfaces must remain unavailable and be reported;
 synthetic providers prove component behavior only. A candidate catalog must never
 be published as a supported release. See `docs/permission-bundle-v1.md` for the
 delivery boundary and integration prerequisites.
+
+Owner continuation `8c0bc874-400f-409b-ac37-77f2bf9d1342` adds the implemented
+association commit/composition and native-wire adapter integration to the
+load-bearing list. All native/project work precedes the final sorted header
+suffix. A rejoin cannot seed missing security state. Default permission routes
+are absent until trusted startup installs real dependencies. Exact sibling pins
+and remaining producer outputs are in `remaining-producers-v1.json`; incomplete
+native bindings block source completion and independent review.
