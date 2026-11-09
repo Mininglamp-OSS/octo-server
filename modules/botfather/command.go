@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"go.uber.org/zap"
 )
 
@@ -918,6 +919,12 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 	// disable/removal that commits first is observed and denied; one that waits
 	// for these locks occurs after a valid binding commit.
 	if err = h.db.bindCreatedBotToSpace(creatorUID, robotID, targetSpaceID); err != nil {
+		if errors.Is(err, permissionbundle.ErrReconcile) {
+			// The native membership/header may already be durable. Preserve the
+			// exact Bot identity and scope for operator/current-authority readback.
+			h.Warn("Bot Space binding requires reconciliation", zap.String("bot_uid", robotID), zap.String("space_id", targetSpaceID))
+			return errors.Join(errCreateBotSpaceBindingFailed, err)
+		}
 		reason := "space_binding_persistence_failed"
 		if errors.Is(err, errCreateBotSpaceDenied) {
 			reason = "space_authorization_changed"

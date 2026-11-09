@@ -10,7 +10,7 @@ The `pkg/permissionbundle/contracts` directory carries the exact unchanged
 wire, managed identity, native-fact and private resolver schemas, plus the
 unchanged release **template**. The template's rejecting root remains intact;
 neither it nor the historical candidate is a supported runtime catalog.
-`handoff-v3.json` is the current sibling interface; earlier handoffs are retained
+`handoff-v4.json` is the current sibling interface; earlier handoffs are retained
 as immutable history. `permission-prepare-v1.schema.json` specifies the approved bounded
 Owner preparation interface. No model-side evaluator or policy tool is added.
 `contract-manifest-v1.json` commits each contract's exact bytes and SHA-256;
@@ -105,7 +105,7 @@ does **not** implement missing native original-message/content primitives.
 | Cross-repository dispatch / CLI + endpoint | Same-policy Stage1/Stage2 checks, context generation, process revision watermark and owned physical sends remain sibling work. This server never evaluates model permission decisions. AC05/11/12/15/16/19–22 NOT_RUN. |
 
 Exact producer/source/output requirements, consumed sibling pins and remaining
-owned adapter work are in `contracts/handoff-v3.json` and
+owned adapter work are in `contracts/handoff-v4.json` and
 `contracts/remaining-producers-v2.json`. The old Jeff/wrapper blocker is stale:
 XIN-2794 now has Ken Draft #234, with a still-null supported catalog digest.
 These are engineering blockers, not Owner waivers or completion by permanent
@@ -125,6 +125,16 @@ precise split between delivered server code, sibling outputs, native source
 changes and missing deployment facts. `remaining-producers-v2.json` supersedes
 the generic v1 dependency disposition; `contract-manifest-v3.json` records current
 contract bytes/hashes and the readable map.
+
+The approved v42 packaging continuation adds the independent v2 verifier,
+atomic `CatalogRegistry`, private manifest/listed-file reads, closed reader
+discriminator and complete semantic-pair/CAS integration. V1 artifacts retain
+their original serving behavior. The exact new interfaces, independently matched
+complete synthetic ledgers and remaining production-source requirements are in
+[permission-catalog-package-v2.md](permission-catalog-package-v2.md),
+`handoff-v4.json` and `contract-manifest-v4.json`. The old schemas/templates and
+historical handoffs remain immutable. Package verification does not supply the
+still-missing actual native/SQL/recovery bindings or a production support pin.
 
 ## Migration and rollback
 

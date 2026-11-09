@@ -418,6 +418,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		if ba.permissionBundle != nil {
 			botAPI.GET("/permission-bundle/v1", ba.permissionBundleHandler("self"))
 			botAPI.GET("/permission-bundle/v1/catalog", ba.permissionBundleHandler("catalog"))
+			botAPI.GET("/permission-bundle/v1/catalog/file", ba.permissionBundleHandler("catalog_file"))
 			if runtime := permissionbundle.RuntimeFor(ba.ctx); runtime != nil && runtime.HasFacts() {
 				botAPI.POST("/permission-facts/v1", ba.permissionFacts)
 			}

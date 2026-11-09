@@ -33,3 +33,15 @@ map. Only XIN-2794 publishes a supported catalog; the server consumes its exact
 support pins and directed approved migration pairs. Native source provenance and
 DB HA/recovery capabilities must be established before actual adapters/startup
 can bind. No fourth-repository edit or new infrastructure is authorized.
+
+Owner-approved v42 continuation `42cf053f-adf9-43ba-b7e2-0f4af4e8f73e` selects
+the corrected package-v2/revision3 addendum at SHA-256
+`f8bcf1af183fcb69b5c40575d26e21b8a37e7e8fb6720b53e4013924ad078725`.
+Load-bearing additions: independent complete package validation/typed closure,
+metadata/inherited/raw domain separation, occurrence ledgers, atomic immutable
+registry, private manifest/file reads and representation-neutral directed
+semantic migration under existing CAS/v28 retention. Test complete synthetic
+packages and real local storage/read/rollback; do not claim production support,
+actual source-renderer equality, native/OS/restore or full MCP acceptance from
+fixtures. Preserve 8 MiB stored and separate 16 MiB pre/post limits, policy depth12
+and all existing business/control limits. Current handoff is v4.

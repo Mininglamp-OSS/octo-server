@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -17,9 +18,10 @@ const runtimeKey = "permission-bundle/v1/runtime"
 // Runtime is installed once, before module construction. Dependencies come from
 // trusted server composition, never an HTTP request or a fallback catalog.
 type Runtime struct {
-	store Store
-	pin   CatalogPin
-	facts NativeFactSource
+	store               Store
+	pin                 CatalogPin
+	facts               NativeFactSource
+	associationContexts sync.Map // *dbr.Tx -> its original bounded context
 }
 
 func Install(ctx *config.Context, store Store, pin CatalogPin, facts NativeFactSource) error {
@@ -53,19 +55,28 @@ func (r *Runtime) HasFacts() bool { return r != nil && r.facts != nil }
 // installed. Enabled native units use one fresh RR transaction and one deadline
 // from before their native prefix through the final policy suffix.
 func BeginAssociation(c *config.Context, session *dbr.Session) (*dbr.Tx, context.CancelFunc, error) {
+	return BeginAssociationContext(context.Background(), c, session)
+}
+
+// BeginAssociationContext also carries cancellation for native callers with an
+// existing request context. Both entry points retain one transaction deadline.
+func BeginAssociationContext(parent context.Context, c *config.Context, session *dbr.Session) (*dbr.Tx, context.CancelFunc, error) {
 	if session == nil {
 		return nil, func() {}, ErrUnavailable
 	}
-	if RuntimeFor(c) == nil {
+	r := RuntimeFor(c)
+	if r == nil {
 		tx, e := session.Begin()
 		return tx, func() {}, e
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	tx, e := session.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if e != nil {
 		cancel()
+		return nil, func() {}, e
 	}
-	return tx, cancel, e
+	r.associationContexts.Store(tx, ctx)
+	return tx, func() { r.associationContexts.Delete(tx); cancel() }, nil
 }
 
 type Association struct {
@@ -87,7 +98,11 @@ func CommitAssociations(c *config.Context, tx *dbr.Tx, associations ...Associati
 	if r == nil {
 		return tx.Commit()
 	}
-	return r.commitAssociations(context.Background(), tx, associations)
+	ctx, ok := r.associationContexts.Load(tx)
+	if !ok {
+		return ErrUnavailable
+	}
+	return r.commitAssociations(ctx.(context.Context), tx, associations)
 }
 func (r *Runtime) commitAssociations(ctx context.Context, tx *dbr.Tx, associations []Association) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)

@@ -454,6 +454,7 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		permissions.PUT("", rb.permissionBundleHandler("mutate"))
 		permissions.POST("/prepare", rb.permissionBundleHandler("prepare"))
 		permissions.GET("/catalog", rb.permissionBundleHandler("catalog"))
+		permissions.GET("/catalog/file", rb.permissionBundleHandler("catalog_file"))
 	}
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))

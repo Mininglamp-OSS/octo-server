@@ -30,13 +30,19 @@ func decodeStrict(r io.Reader, limit int) (any, error) {
 }
 
 func decodeStrictDepth(r io.Reader, limit, maxDepth int) (any, error) {
+	return decodeBudget(r, limit, maxDepth, nil)
+}
+
+// budget is shared by all v2 metadata files. It counts values before allocation;
+// nil retains the original policy/v1 depth semantics.
+func decodeBudget(r io.Reader, limit, maxDepth int, budget *int) (any, error) {
 	b, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	if err != nil || len(b) > limit || !utf8.Valid(b) || !pairedEscapes(b) {
 		return nil, ErrInvalid
 	}
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
-	v, err := value(d, 0, maxDepth)
+	v, err := valueCount(d, 0, maxDepth, budget)
 	if err != nil {
 		return nil, ErrInvalid
 	}
@@ -89,6 +95,16 @@ func pairedEscapes(b []byte) bool {
 }
 
 func value(d *json.Decoder, depth, maxDepth int) (any, error) {
+	return valueCount(d, depth, maxDepth, nil)
+}
+
+func valueCount(d *json.Decoder, depth, maxDepth int, budget *int) (any, error) {
+	if budget != nil {
+		if *budget <= 0 || depth >= maxDepth {
+			return nil, ErrInvalid
+		}
+		*budget--
+	}
 	t, err := d.Token()
 	if err != nil {
 		return nil, err
@@ -111,7 +127,7 @@ func value(d *json.Decoder, depth, maxDepth int) (any, error) {
 			if _, ok := m[key]; ok {
 				return nil, ErrInvalid
 			}
-			v, err := value(d, depth+1, maxDepth)
+			v, err := valueCount(d, depth+1, maxDepth, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -128,7 +144,7 @@ func value(d *json.Decoder, depth, maxDepth int) (any, error) {
 		}
 		a := []any{}
 		for d.More() {
-			v, err := value(d, depth+1, maxDepth)
+			v, err := valueCount(d, depth+1, maxDepth, budget)
 			if err != nil {
 				return nil, err
 			}

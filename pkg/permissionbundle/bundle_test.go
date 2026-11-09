@@ -203,7 +203,7 @@ func fixtureStore(t *testing.T, path string) Store {
 	t.Cleanup(func() { conn.Close() })
 	return Store{Session: conn.NewSession(nil), Origin: fixtureKey.Origin, Authority: fixtureAuthority{}, Native: SQLNative{testNoLocks: true}, Releases: fixtureReleases{}, testNoLocks: true}
 }
-func seed(t *testing.T, s Store) {
+func seed(t *testing.T, s Store, pins ...CatalogPin) {
 	t.Helper()
 	for _, q := range []string{
 		`CREATE TABLE user(id INTEGER PRIMARY KEY,uid TEXT UNIQUE,status INTEGER,is_destroy INTEGER,robot INTEGER)`,
@@ -229,7 +229,11 @@ func seed(t *testing.T, s Store) {
 	defer tx.RollbackUnlessCommitted()
 	a, e := s.Native.Scope(ctx, tx, fixtureKey, "owner", strings.Repeat("a", 32))
 	require.NoError(t, e)
-	require.NoError(t, s.ProvisionSuffix(ctx, tx, fixtureKey, a, fixturePin))
+	pin := fixturePin
+	if len(pins) > 0 {
+		pin = pins[0]
+	}
+	require.NoError(t, s.ProvisionSuffix(ctx, tx, fixtureKey, a, pin))
 	require.NoError(t, tx.Commit())
 }
 
@@ -327,6 +331,7 @@ func TestConcurrentCASAndAmbiguousCommit(t *testing.T) {
 	s.Authority = fixtureAuthority{ackFails: true}
 	_, e = s.Mutate(ctx, fixtureKey, "owner", bytes.NewReader(mutationBytes(t, read.Bundle, `[{"stage":"invocation","action":"reset"}]`)))
 	require.ErrorIs(t, e, ErrUnavailable)
+	require.ErrorIs(t, e, ErrReconcile)
 	s.Authority = fixtureAuthority{}
 	actual, e := s.Get(ctx, fixtureKey, "owner")
 	require.NoError(t, e)

@@ -28,6 +28,13 @@ type AuthorityRead interface {
 	// callers must not replay a mutation or claim rollback.
 	Acknowledge(context.Context) error
 }
+
+// ErrReconcile distinguishes an uncertain COMMIT or post-COMMIT acknowledgement
+// failure from a rolled-back transaction. Native callers must preserve existing
+// artifacts and reconcile the exact scope/header before retry or compensation.
+// The existing public unavailable envelope is retained.
+var ErrReconcile = errors.Join(ErrUnavailable, errors.New("permission: commit requires reconciliation"))
+
 type NativeAnchor struct {
 	AuthorityIncarnation string `json:"authority_incarnation"`
 	RobotRecordID        string `json:"robot_record_id"`
@@ -158,14 +165,16 @@ func complete(ctx context.Context, t *scopeTx) error {
 		return ErrUnavailable
 	}
 	if t.tx.Commit() != nil {
-		return ErrUnavailable
+		return ErrReconcile
 	}
 	if t.authority.Acknowledge(ctx) != nil {
-		return ErrUnavailable
+		return ErrReconcile
 	}
 	return nil
 }
-func owner(h header) OwnerResponse { return OwnerResponse{h.p, h.attribution, Descriptor()} }
+func owner(h header, format string) OwnerResponse {
+	return OwnerResponse{h.p, h.attribution, DescriptorForFormat(format)}
+}
 func (s Store) Get(ctx context.Context, key Key, actor string) (OwnerResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -182,10 +191,14 @@ func (s Store) Get(ctx context.Context, key Key, actor string) (OwnerResponse, e
 	if e != nil || !catalogMembers(h.p, release) {
 		return OwnerResponse{}, ErrUnavailable
 	}
+	format, e := catalogFormat(ctx, s.Releases, h.p.Pin())
+	if e != nil {
+		return OwnerResponse{}, e
+	}
 	if e = complete(ctx, t); e != nil {
 		return OwnerResponse{}, e
 	}
-	return owner(h), nil
+	return owner(h, format), nil
 }
 func (s Store) Self(ctx context.Context, key Key) (Bundle, error) {
 	p, e := s.Get(ctx, key, "")
@@ -253,10 +266,14 @@ func (s Store) Mutate(ctx context.Context, key Key, actor string, r io.Reader) (
 	if n != 1 {
 		return OwnerResponse{}, ErrConflict
 	}
+	format, e := catalogFormat(ctx, s.Releases, next.Pin())
+	if e != nil {
+		return OwnerResponse{}, e
+	}
 	if e = complete(ctx, t); e != nil {
 		return OwnerResponse{}, e
 	}
-	return owner(header{next, current.anchor, current.anchorDigest, Attribution{&actor, at.Format(time.RFC3339Nano)}}), nil
+	return owner(header{next, current.anchor, current.anchorDigest, Attribution{&actor, at.Format(time.RFC3339Nano)}}, format), nil
 }
 
 type Preparation struct {

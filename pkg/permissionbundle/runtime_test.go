@@ -28,8 +28,9 @@ func TestRuntimeAssociationCommitAtomicityAndNoRejoinSeed(t *testing.T) {
 	require.Nil(t, RuntimeFor(&config.Context{}).Store())
 	require.False(t, r.HasFacts())
 	for _, fail := range []bool{true, false} {
-		tx, e := s.Session.Begin()
+		tx, cancel, e := BeginAssociation(c, s.Session)
 		require.NoError(t, e)
+		defer cancel()
 		_, e = tx.Exec(`INSERT INTO user VALUES(5,'bot2',1,0,1),(6,'bot3',1,0,1)`)
 		require.NoError(t, e)
 		_, e = tx.Exec(`INSERT INTO robot(id,robot_id,creator_uid,status) VALUES(5,'bot2','owner',1),(6,'bot3','owner',1)`)
@@ -57,16 +58,18 @@ func TestRuntimeAssociationCommitAtomicityAndNoRejoinSeed(t *testing.T) {
 	require.NoError(t, e)
 	// Rejoin preserves the exact existing permanent header; missing old state
 	// must fail instead of manufacturing another U/U incarnation.
-	tx, e := s.Session.Begin()
+	tx, cancel, e := BeginAssociation(c, s.Session)
 	require.NoError(t, e)
+	defer cancel()
 	require.NoError(t, CommitAssociations(c, tx, Association{BotUID: "bot2", SpaceID: "space"}))
 	after, e := s.Self(t.Context(), key)
 	require.NoError(t, e)
 	require.Equal(t, p, after)
 	_, e = s.Session.Exec(`DELETE FROM bot_permission_scope WHERE bot_uid='bot2'`)
 	require.NoError(t, e) // corruption of disposable fixture only
-	tx, e = s.Session.Begin()
+	tx, cancel, e = BeginAssociation(c, s.Session)
 	require.NoError(t, e)
+	defer cancel()
 	e = CommitAssociations(c, tx, Association{BotUID: "bot2", SpaceID: "space"})
 	require.ErrorIs(t, e, ErrUnavailable)
 	tx.RollbackUnlessCommitted()

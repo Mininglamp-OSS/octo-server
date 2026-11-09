@@ -1,0 +1,121 @@
+{
+  "contract": "permission-server-handoff-v4",
+  "task": "XIN-2793",
+  "charter_baseline": "v42",
+  "supersedes": "handoff-v3.json for catalog implementation; original facts/association/auth contracts retained",
+  "authority": {
+    "comment": "42cf053f-adf9-43ba-b7e2-0f4af4e8f73e",
+    "addendum_attachment": "01a1bfb4-aeef-7497-8f7f-268335e0b0fa",
+    "bytes": 70457,
+    "sha256": "f8bcf1af183fcb69b5c40575d26e21b8a37e7e8fb6720b53e4013924ad078725",
+    "change_map_attachment": "01a1bfb4-b198-7966-b095-4e737d6ec81b",
+    "change_map_sha256": "494fae43102a2061349efce8382d43546572b67cc88df533d7389f5d53e1aea5",
+    "source_ledger_attachment": "01a1bfb4-b6a9-740b-bf76-d846386ecfbd",
+    "source_ledger_sha256": "a9c10f6fdff0a81fd62739286b9514c08533f7733cf9716b057eca223e1aedbd"
+  },
+  "components": {
+    "verify": "VerifyCatalogPackage(context.Context, PackageInput{Pin, Files}, SlotValues) (*VerifiedCatalog,error)",
+    "directory": "ReadCatalogDirectory(context.Context,CatalogPin,operatorOwnedRoot) (PackageInput,error); private startup only, no request path",
+    "registry": "NewCatalogRegistry(ctx, []SupportedSource{Pin,Format,Artifact OR Files}, []CatalogTransition{From,To}, SlotValues); Replace validates all sources/pairs before one atomic publication",
+    "release": "Releases.Load/Compatible/SameIntent; v1 serving retained; complete representation-neutral directed semantic equality required by CatalogRegistry",
+    "publication": "immutable private bytes; copy-only access; failed final file/pair retains old registry; unsupported pin never falls back",
+    "slots": {
+      "signature": "SlotValues func(context.Context, SlotCell) (map[string]any,error)",
+      "cell": [
+        "Pin",
+        "EntryID",
+        "Facade (describe_op/get_skill_full/get_skill_summary/static)",
+        "Resources bool",
+        "ManagedMask 0..7",
+        "ServerFacade three/two/both"
+      ],
+      "return_domains": {
+        "facade_hint": "scalar-valid string",
+        "server_managed_argument_names": "sorted distinct scalar-valid string array"
+      },
+      "semantics": "One source-reconciled joint assignment for this same exact cell. Server visits matching cells, renders and computes independent maxima. Missing source binding refuses slot-bearing verification; package metadata cannot provide its own oracle. This is a private startup component seam, not a new network/control wire."
+    }
+  },
+  "reads": {
+    "owner_prefix": "/v1/robot/:robot_id/permission-bundle/v1",
+    "self_prefix": "/v1/bot/permission-bundle/v1",
+    "manifest": "GET /catalog?space_id=S&format=permission-catalog-package-v2&catalog_version=V&catalog_digest=H",
+    "file": "GET /catalog/file with same exact selectors plus path=P from current manifest inventory",
+    "eligibility": "Independent fresh exact-key owner/self/native scope check on every request; bf_ User Bot for self; existing limiter and one request deadline",
+    "legacy": "No-format GET /catalog returns whole v1 only for a supported v1 scope. V2 scope with no format refuses unsupported.",
+    "descriptor": "OwnerResponse.contract.catalog_format selects v1/v2 from fresh P; policy/schema_version and other descriptor fields/limits unchanged",
+    "responses": "Exact raw file bytes, JSON or application/octet-stream; private/no-store and unencoded; no generic filesystem/URL resolver"
+  },
+  "semantic_migration": "Directed reviewed pair plus complete validated neutral-view equality; eliminate only physical packing. Preserve all raw hashes, complete slots/renderers/selections/profiles/source/helper bindings and canonical intent. Ambiguous old maps fail. Exact CAS, complete capability_rules, v28 unchanged-departed-DENY and higher-revision rollback remain.",
+  "contracts_and_fixtures": {
+    "contracts/permission-catalog-package-v2.schema.json": {
+      "bytes": 9339,
+      "sha256": "93eb9cfdfa7005f0277e7b0a6f362f4df3445d1fe1bb27934aba933611f2a210"
+    },
+    "contracts/permission-wire-catalog-v2.schema.json": {
+      "bytes": 14169,
+      "sha256": "65198ec56d1dc428a25906c2376c08aa8beeae3c89b01dd135cde81f58f8eab8"
+    },
+    "contracts/permission-catalog-identities-v1.json": {
+      "bytes": 166440,
+      "sha256": "de05fcbf86bda29d2268987bbfb1b84bc1d5a26202fa0ee723762c124511e500"
+    },
+    "testdata/profile-examples-v6.json": {
+      "bytes": 11675,
+      "sha256": "584e43727de403d72303c53883404c3ed6eda0045368ad1fe837e9e67f616f7d"
+    },
+    "testdata/package-v2-complete.tar.gz": {
+      "bytes": 255987,
+      "sha256": "86c0657f522afa33502bfe687c8b8f9b0ae88badd099c42375692677599320b3"
+    },
+    "testdata/package-v2-complete-slots.tar.gz": {
+      "bytes": 255910,
+      "sha256": "f1812ad5083690da66d2d659e29af70f8824cfe7489dd1fdd3a81630696f45d9"
+    },
+    "testdata/package-v2-ledger.json": {
+      "bytes": 670,
+      "sha256": "5b460e24c89bb0b3ed87548654f85d866335b1c74dde59930d1b02ca1c880289"
+    },
+    "testdata/package-v2-ledger-slots.json": {
+      "bytes": 670,
+      "sha256": "7f0ff036e190951fa44b93d3aa47898496a48f2f45ecd9e3a4f45f7e7355b179"
+    }
+  },
+  "identity_projection": {
+    "source_candidate_bytes": 3175813,
+    "source_candidate_sha256": "1ef7021469a3bab55c48361c47318d6852daf1f401909a9e46b61f71d7b293fb",
+    "fields": [
+      "id",
+      "kind",
+      "target",
+      "aliases"
+    ],
+    "note": "Oracle projection only, not the original identity-index bytes/hash or a supported catalog"
+  },
+  "profile_specimens": {
+    "source": "approved ast-serialization-examples-v3.json",
+    "source_sha256": "22ce8db5b46ea4e21cbb021cf1ae0dcad52ebb01c7d086c211eabc4e2a0f59ed",
+    "note": "Retained inherited positive specimens; complete fixture adds valid eq.literal:null, and makes no production source-program claim."
+  },
+  "fixture_status": "Two independently authored synthetic complete packages; 827 IDs/10 profiles/393 truths/1179 base variants/56592 schema+156 discovery+1248 static cells. Independent Python ledgers matched by Go. Not a supported or source-equivalent product release.",
+  "supported_catalog_digest": null,
+  "remaining_producer_outputs": [
+    {
+      "producer": "XIN-2794",
+      "minimum": "Final complete production v2 files and stored/pre/post/node/depth/part/selector ledgers, source-renderer/slot-domain/discovery-mask conformance, reviewed support pins and directed pair evidence. Use this exact private SlotCell seam; no competing catalog or package self-approval."
+    },
+    {
+      "producer": "XIN-2793 + actual native IM/DB source and recovery operators",
+      "minimum": "Real native Header/current-access/history/disclosure/body/receipt/checkpoint and elected-current SQL/native-position/surviving acknowledgement/recovery contracts; then actual server adapters and startup binding. Exact source-cited prerequisites remain in remaining-producers-v2.json at d5ef4b38269b379bac4aa471a6cad06073c563c8; v42 does not waive them."
+    }
+  ],
+  "association_outcomes": "BeginAssociationContext optionally accepts an existing request context; BeginAssociation and CommitAssociations carry one original transaction deadline through authority/acknowledgement. Enabled native callers must use the paired begin/commit helpers. ErrReconcile marks uncertain COMMIT or post-COMMIT acknowledgement failure, wraps the unchanged public unavailable class and forbids destructive compensation or automatic replay; reconcile the exact native scope/header first. Bot creation preserves committed artifacts and withholds success on that outcome.",
+  "acceptance": "Synthetic component/SQLite/HTTP/race evidence only. Full source renderer equality for the real product, native/MCP/OS/restore acceptance NOT_RUN; source bindings incomplete; independent review deferred.",
+  "consumed_endpoint": {
+    "head": "afb732b20e63baf8acf06c4726a66e290b98e1b6",
+    "path": "docs/permission-endpoint-handoff-v4.json",
+    "bytes": 6435,
+    "sha256": "cc193256548ecb3b5c09b0a739f1cd5a7ca5503b1fb66e2a7bd5684ddcbd4671",
+    "agreement": "This server delivery supplies its requested v2 descriptor/private manifest/listed-file ABI. Endpoint remains identity-preflight only; complete verification/readiness belongs to server/MCP. Existing release_path/release_sha256 interpretation is an XIN-2794 versioned boot contract; no Hello fields are added here."
+  }
+}

@@ -1,6 +1,7 @@
 package botfather
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -235,6 +236,10 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 			}
 			if spErr != nil {
 				bf.Error("Bot加入Space失败", zap.String("spaceID", spaceID), zap.Error(spErr))
+				if errors.Is(spErr, permissionbundle.ErrReconcile) {
+					httperr.ResponseErrorL(c, errcode.ErrPermissionUnavailable, nil, nil)
+					return
+				}
 			}
 		} else {
 			bf.Warn("用户不属于指定Space，跳过", zap.String("uid", uid), zap.String("spaceID", spaceID))

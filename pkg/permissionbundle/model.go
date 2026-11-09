@@ -131,7 +131,22 @@ func loadSchemas() {
 	})
 }
 
-func Descriptor() []byte   { loadSchemas(); return bytes.Clone(schemas.descriptor) }
+func Descriptor() []byte { loadSchemas(); return bytes.Clone(schemas.descriptor) }
+func DescriptorForFormat(format string) []byte {
+	if format == CatalogArtifactV1 {
+		return Descriptor()
+	}
+	if format != CatalogPackageV2 {
+		return nil
+	}
+	v, e := decodeStrict(bytes.NewReader(Descriptor()), 16384)
+	if e != nil {
+		return nil
+	}
+	m := v.(map[string]any)
+	m["catalog_format"] = format
+	return canonical(m)
+}
 func hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func validHex(s string, n int) bool {
 	if len(s) != n {
