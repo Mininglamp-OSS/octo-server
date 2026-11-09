@@ -106,6 +106,10 @@
                     var groupSpaceId = (resp && resp.space_id) ? resp.space_id : '';
                     var prevSpaceId = '';
                     try { prevSpaceId = localStorage.getItem('currentSpaceId') || ''; } catch (e) { /* best-effort */ }
+                    // 以当前 Space 身份作为外部成员入群时，群已在当前 Space 可见，无需提示切换。
+                    if (resp && resp.my_source_space_id && resp.my_source_space_id === prevSpaceId) {
+                        groupSpaceId = '';
+                    }
                     if (groupSpaceId && prevSpaceId && groupSpaceId !== prevSpaceId) {
                         var spaceName = (resp && resp.space_name) ? resp.space_name : '';
                         var groupName = (resp && resp.group_name) ? resp.group_name : '';
