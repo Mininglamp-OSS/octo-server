@@ -126,9 +126,6 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 		respondQueryFailed(c)
 		return
 	}
-	if p.rejectArchivedWrite(c, entryMemberRemove, row) {
-		return
-	}
 	if !canManageMembers(requestProjectRole(c)) {
 		observeRejected(entryMemberRemove, reasonPermissionDenied)
 		httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
@@ -158,16 +155,6 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 			if removed {
 				p.audit(auditMemberRemove, actorUID, uid, row.ProjectID, row.SpaceID, "kicked")
 			}
-		case errors.Is(err, errProjectArchived):
-			if anyApplied(outcomes) {
-				observeRejected(entryMemberRemove, reasonProjectArchived)
-				outcomes = append(outcomes, memberOutcome{UID: uid, Reason: "project_archived"})
-				outcomes = appendNotAttemptedUIDs(outcomes, uids[i+1:])
-				c.Response(outcomes)
-				return
-			}
-			p.respondProjectArchivedError(c, entryMemberRemove)
-			return
 		case errors.Is(err, errActorNotSpaceMember):
 			if anyApplied(outcomes) {
 				outcomes = append(outcomes, memberOutcome{UID: uid, Reason: outcomeNotSpaceMember})
