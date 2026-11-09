@@ -24,76 +24,51 @@ import (
 //   - 在 testutil 升级之前只能用源码 grep 锁住关键实现特征，防回归。
 //   - 每个测试都带「不做 X 就回归」的语义说明，便于后续重构。
 
-// Test 1: groupScanJoin 的 X-Space-ID header 非成员分支必须降级成空串并
-// 通过 Warn 日志记录（不抛 5xx、不阻断主流程、不把脏数据写 DB）。
+// Test 1: groupScanJoin 的 X-Space-ID header 必须用 spacepkg.CheckMembership
+// 校验是否收 scaner；不可用（非成员 / 校验出错）时通过 Warn 记录并降级，
+// 不抛 5xx、不阻断主流程、不把脏数据写 DB。降级后回落 home Space 的行为由
+// scanjoin_identity_test.go 覆盖。
 func TestGroupScanJoin_XSpaceIDHeaderNotMember_FallsBackAndLogs(t *testing.T) {
 	body := mustReadFunc(t, "api.go", "func (g *Group) groupScanJoin(")
 
-	// A. scanjoin 必须调用 spacepkg.CheckMembership(..., scaner) 校验 header
-	//    指向的 Space 是否收 scaner。参数顺序与 package 其它调用一致
-	//    (db, spaceID, uid)，避免悄悄反调走人。
+	// A. 成员校验必须是 spacepkg.CheckMembership(db, spaceID, scaner)，
+	//    参数顺序与 package 其它调用一致，避免悄悄反调走人。
 	assert.Regexp(t,
-		regexp.MustCompile(`spacepkg\.CheckMembership\(\s*g\.ctx\.DB\(\)\s*,\s*headerSpaceID\s*,\s*scaner\s*\)`),
+		regexp.MustCompile(`spacepkg\.CheckMembership\(\s*g\.ctx\.DB\(\)\s*,\s*spaceID\s*,\s*scaner\s*\)`),
 		body,
-		"groupScanJoin 必须用 spacepkg.CheckMembership 校验 X-Space-ID 是否收 scaner")
+		"groupScanJoin 必须用 spacepkg.CheckMembership 校验 Space 是否收 scaner")
 
-	// B. 校验失败（!inSpace）必须走 g.Warn 路径，并且在同一个块内把
-	//    sourceSpaceID 清空，给下面的 home 兜底让位。
-	//    日志 key 用固定文案 "scanjoin X-Space-ID not member"，方便线上 grep。
+	// B. header 不可用时必须走 g.Warn，文案以 "scanjoin X-Space-ID not" 起头，方便线上 grep。
 	assert.Regexp(t,
-		regexp.MustCompile(`(?s)!\s*inSpace\b[^{]*\{[^}]*g\.Warn\(\s*"scanjoin X-Space-ID not member[^"]*"`),
+		regexp.MustCompile(`(?s)identity\.HeaderIgnored\s*\{[^}]*g\.Warn\(\s*"scanjoin X-Space-ID not[^"]*"`),
 		body,
-		"groupScanJoin 非成员分支必须 Warn 且文案以 'scanjoin X-Space-ID not member' 起头")
+		"groupScanJoin 必须在 X-Space-ID 不可用时 Warn")
 
-	// C. 非成员降级后必须**回落到 home Space**，与 header 空的历史行为等价。
-	//    也就是说 Warn 之后的代码路径必须能落到 GetUserDefaultSpaceID(scaner)。
-	warnIdx := strings.Index(body, `"scanjoin X-Space-ID not member, ignoring"`)
-	homeIdx := strings.Index(body, "GetUserDefaultSpaceID(g.ctx, scaner)")
-	assert.NotEqual(t, -1, warnIdx, "Warn 文案缺失 → 非成员分支回归")
-	assert.NotEqual(t, -1, homeIdx, "home 兜底缺失 → 非成员降级后会写空串 source_space_id")
-	assert.Less(t, warnIdx, homeIdx,
-		"Warn 必须先于 home 兜底出现在函数体内，否则降级路径跑不到兜底")
-
-	// D. CheckMembership 返回 error 时也必须降级（不阻断主流程），防止 DB
-	//    瞬时抖动把整条 scanjoin 路径打挂。
+	// C. header 校验出错只能降级，不能当作群 Space 成员校验失败抛 5xx。
+	src, err := os.ReadFile("scanjoin_identity.go")
+	assert.NoError(t, err)
 	assert.Regexp(t,
-		regexp.MustCompile(`(?s)membershipErr\s*!=\s*nil[^}]*g\.Error\(\s*"扫码入群 X-Space-ID[^"]*"`),
-		body,
-		"groupScanJoin 必须在 CheckMembership 出错时 Error 记日志并降级，不抛 5xx")
+		regexp.MustCompile(`(?s)headerErr\s*!=\s*nil\s*\|\|\s*!ok\s*\{\s*id\.HeaderIgnored\s*=\s*true`),
+		string(src),
+		"X-Space-ID 成员校验出错必须降级为忽略 header")
 }
 
-// Test 2: groupScanJoin 的 X-Space-ID header 合法成员路径必须照常使用
-// header 作为 source_space_id（不能因为加了校验就无脑兜底 home）。
+// Test 2: X-Space-ID 合法成员路径必须照常使用 header 作为 source_space_id，
+// 且只有校验通过后才使用（不能因为加了校验就无脑兜底 home，也不能跳过校验）。
 func TestGroupScanJoin_XSpaceIDHeaderValidMember_UsesIt(t *testing.T) {
-	body := mustReadFunc(t, "api.go", "func (g *Group) groupScanJoin(")
+	body := mustReadFunc(t, "scanjoin_identity.go", "func resolveScanJoinIdentity(")
 
-	// A. header 非空分支必须**先**把 headerSpaceID 赋给 sourceSpaceID
-	//    （代表合法 case 的默认走向）；membership 校验失败时才清空。
-	//    如果有人把 `sourceSpaceID = headerSpaceID` 挪到 CheckMembership
-	//    之后，就会把 inSpace==true 的合法 case 也 fallback，回归 YUJ-199。
-	assignIdx := strings.Index(body, "sourceSpaceID = headerSpaceID")
-	checkIdx := strings.Index(body, "spacepkg.CheckMembership(g.ctx.DB(), headerSpaceID, scaner)")
-	assert.NotEqual(t, -1, assignIdx, "header 合法 case 的 sourceSpaceID = headerSpaceID 赋值缺失 → YUJ-199 回归")
-	assert.NotEqual(t, -1, checkIdx, "CheckMembership 缺失 → YUJ-201 回归")
-	assert.Less(t, assignIdx, checkIdx,
-		"sourceSpaceID = headerSpaceID 必须出现在 CheckMembership 之前，"+
-			"否则 inSpace==true 的合法 case 会被跳过赋值、错误兜底到 home")
-
-	// B. header 合法 case 不能在 !inSpace 分支中被清空之外再次覆盖，
-	//    即 !inSpace 后必须退出赋值分支，让 home 兜底条件 `sourceSpaceID == ""`
-	//    生效。断言「sourceSpaceID = "" // 降级」注释在 !inSpace 之后。
+	checkIdx := strings.Index(body, "isMember(headerSpaceID)")
+	validIdx := strings.Index(body, "headerValid = true")
+	assignIdx := strings.Index(body, "id.SourceSpaceID = headerSpaceID")
+	assert.NotEqual(t, -1, checkIdx, "X-Space-ID 成员校验缺失 → YUJ-201 回归")
+	assert.NotEqual(t, -1, validIdx, "header 合法分支缺失 → YUJ-199 回归")
+	assert.NotEqual(t, -1, assignIdx, "header 合法 case 的赋值缺失 → YUJ-199 回归")
+	assert.Less(t, checkIdx, validIdx, "header 必须先校验成员关系再标记为可用")
 	assert.Regexp(t,
-		regexp.MustCompile(`(?s)!\s*inSpace\b[^}]*sourceSpaceID\s*=\s*""`),
+		regexp.MustCompile(`(?s)if\s+headerValid\s*\{\s*id\.SourceSpaceID\s*=\s*headerSpaceID`),
 		body,
-		"非成员分支必须把 sourceSpaceID 清空（降级），否则 header 伪造依旧会落进 DB")
-
-	// C. 合法成员 case 不走任何兜底；通过 `if sourceSpaceID == ""` 这个兜底
-	//    入口的存在 + 它被摆在 header 块之后，来证明合法 case 不会被覆盖。
-	fallbackGateIdx := strings.Index(body, `if sourceSpaceID == ""`)
-	assert.NotEqual(t, -1, fallbackGateIdx,
-		"home 兜底入口 `if sourceSpaceID == \"\"` 缺失 → header 为空 / 非成员降级后没法回落 home")
-	assert.Less(t, assignIdx, fallbackGateIdx,
-		"home 兜底判定必须在 header 赋值之后，保证合法 case 不会被兜底覆盖")
+		"只有 headerValid 时才能把 header 写入 source_space_id")
 }
 
 // Test 3: addMembersTxWithSpace 的邀请确认路径必须校验 operator 是否是

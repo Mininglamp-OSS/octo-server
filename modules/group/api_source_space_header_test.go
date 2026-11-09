@@ -25,43 +25,44 @@ import (
 // 进入 testutil 后可升级为端到端 assert。
 // 这里用分函数边界的 grep 精准锁定，避免误匹配同名字段。
 
-// Test 1: groupScanJoin 必须读 X-Space-ID header 作为 source_space_id 的
-// 首选来源（优先级：header → home Space 兜底）。
+// Test 1: groupScanJoin 必须读 X-Space-ID header，并把 header / 成员校验 /
+// home 兜底交给 resolveScanJoinIdentity（优先级：header → home Space 兜底）。
+// 决策本身的行为由 scanjoin_identity_test.go 的表驱动测试覆盖。
 func TestGroupScanJoin_SourceSpaceID_PrefersXSpaceIDHeader_YUJ199(t *testing.T) {
 	body := mustReadFunc(t, "api.go", "func (g *Group) groupScanJoin(")
 
-	// A. 必须调用 c.GetHeader("X-Space-ID")，且结果被 TrimSpace 后判空。
+	// A. 必须调用 c.GetHeader("X-Space-ID")，且结果被 TrimSpace。
 	assert.Regexp(t,
-		regexp.MustCompile(`c\.GetHeader\(\s*"X-Space-ID"\s*\)`),
+		regexp.MustCompile(`headerSpaceID\s*:=\s*strings\.TrimSpace\(\s*c\.GetHeader\(\s*"X-Space-ID"\s*\)\s*\)`),
 		body,
 		"groupScanJoin 必须从 X-Space-ID header 读当前 Space（YUJ-88 / GH#1038 / EP3 三端拦截器注入）")
 
-	// B. header 非空时必须赋给 sourceSpaceID（优先分支）。
+	// B. header 必须传入 resolveScanJoinIdentity，且结果用作 sourceSpaceID。
 	assert.Regexp(t,
-		regexp.MustCompile(`(?s)if\s+[^\n]*c\.GetHeader\(\s*"X-Space-ID"\s*\)[^\n]*;\s*[^\n]*!=\s*""\s*\{\s*sourceSpaceID\s*=`),
+		regexp.MustCompile(`(?s)resolveScanJoinIdentity\(\s*group\.SpaceID,\s*group\.AllowExternal,\s*headerSpaceID,`),
 		body,
-		"groupScanJoin 的 header 必须走 if header-nonempty -> sourceSpaceID=header 优先分支")
+		"groupScanJoin 必须把 X-Space-ID header 交给 resolveScanJoinIdentity")
+	assert.Regexp(t,
+		regexp.MustCompile(`sourceSpaceID\s*:=\s*identity\.SourceSpaceID`),
+		body,
+		"groupScanJoin 必须使用 resolveScanJoinIdentity 解析出的 source_space_id")
 
-	// C. header 为空时必须兜底到 GetUserDefaultSpaceID(scaner) — 保留历史行为。
+	// C. home 兜底必须是 scaner 的默认 Space — 保留历史行为。
 	assert.Regexp(t,
-		regexp.MustCompile(`sourceSpaceID\s*=\s*spacemod\.GetUserDefaultSpaceID\(g\.ctx,\s*scaner\)`),
+		regexp.MustCompile(`return\s+spacemod\.GetUserDefaultSpaceID\(g\.ctx,\s*scaner\)`),
 		body,
-		"groupScanJoin 必须在 header 为空时 fallback 到 scaner 的 home Space")
+		"groupScanJoin 必须以 scaner 的 home Space 作为兜底")
 }
 
-// Test 2: groupScanJoin 的 header 优先 / home 兜底**必须同时存在**，
+// Test 2: resolveScanJoinIdentity 中 header 优先 / home 兜底**必须同时存在**，
 // 任何一边缺失都会把 YUJ-199 regression 放回来。
 func TestGroupScanJoin_SourceSpaceID_HasBothPriorityAndFallback_YUJ199(t *testing.T) {
-	body := mustReadFunc(t, "api.go", "func (g *Group) groupScanJoin(")
+	body := mustReadFunc(t, "scanjoin_identity.go", "func resolveScanJoinIdentity(")
 
-	// 断言 header 读取 + home 兜底都在同一个 external 分支块内。
-	// 通过相对顺序确保 header 优先写，home 后兜底写；反之回归。
-	headerIdx := strings.Index(body, `c.GetHeader("X-Space-ID")`)
-	assert.NotEqual(t, -1, headerIdx, "header 读取缺失 → YUJ-199 回归")
-	fallbackIdx := strings.Index(body, "GetUserDefaultSpaceID(g.ctx, scaner)")
-	assert.NotEqual(t, -1, fallbackIdx, "home 兜底缺失 → 跨 Space scaner 没有 home 时行为漂移")
-	assert.Less(t, headerIdx, fallbackIdx,
-		"header 必须先判定再回落 home，否则依旧把群错落到 scaner home")
+	headerIdx := strings.Index(body, "id.SourceSpaceID = headerSpaceID")
+	assert.NotEqual(t, -1, headerIdx, "header 赋值缺失 → YUJ-199 回归")
+	fallbackIdx := strings.Index(body, "id.SourceSpaceID = defaultSpaceID()")
+	assert.NotEqual(t, -1, fallbackIdx, "home 兜底缺失 → 跨 Space scaner 没有 header 时行为漂移")
 }
 
 // Test 3: addMembersTxWithSpace（邀请确认路径）必须接受 inviterSpaceID 参数
