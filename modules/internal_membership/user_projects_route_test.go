@@ -135,6 +135,12 @@ func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(
 			ip:   "198.51.100.23",
 		},
 		{
+			name: "identity", method: http.MethodPost,
+			path: "/v1/internal/auth/identity",
+			body: []byte(`{"user_id":"u1","space_id":"s1"}`),
+			ip:   "198.51.100.27",
+		},
+		{
 			name: "project members", method: http.MethodGet,
 			path: projectMembershipsPath + "?space_id=space-a&project_id=p1",
 			ip:   "198.51.100.26",
@@ -148,7 +154,7 @@ func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(
 			doRouteRequest(t, r, rejected401, tc.method, tc.path,
 				"definitely-the-wrong-token-value", tc.ip, tc.body)
 			require.Equal(t, http.StatusUnauthorized, rejected401.Code, rejected401.Body.String())
-			if tc.name == "epochs" || tc.name == "verify" {
+			if tc.name == "epochs" || tc.name == "verify" || tc.name == "identity" {
 				require.Equal(t, "no-store", rejected401.Header().Get("Cache-Control"))
 			}
 			require.Equal(t, 1, rejected401.deadlines,
@@ -158,7 +164,7 @@ func TestProductionRoutesApplyLimiterBeforeAuthWithReadDeadlineOnEveryRejection(
 			doRouteRequest(t, r, rejected429, tc.method, tc.path,
 				testInternalToken, tc.ip, tc.body)
 			require.Equal(t, http.StatusTooManyRequests, rejected429.Code, rejected429.Body.String())
-			if tc.name == "epochs" || tc.name == "verify" {
+			if tc.name == "epochs" || tc.name == "verify" || tc.name == "identity" {
 				require.Equal(t, "no-store", rejected429.Header().Get("Cache-Control"))
 			}
 			require.Equal(t, "strict:"+membershipRateLimitTag,
@@ -199,6 +205,13 @@ func TestProductionRoutesShareOneStrictBucket(t *testing.T) {
 	doRouteRequest(t, r, second, http.MethodGet,
 		projectsPath+"?space_id=space-a&uid=User-A", testInternalToken, ip, nil)
 	require.Equal(t, http.StatusTooManyRequests, second.Code, second.Body.String())
+	third := httptest.NewRecorder()
+	doRouteRequest(t, r, third, http.MethodPost,
+		"/v1/internal/auth/identity", testInternalToken, ip,
+		[]byte(`{"user_id":"u1","space_id":"s1"}`))
+	require.Equal(t, http.StatusTooManyRequests, third.Code, third.Body.String())
+	require.Equal(t, "strict:"+membershipRateLimitTag, third.Header().Get("X-RateLimit-Scope"))
+	require.Equal(t, "no-store", third.Header().Get("Cache-Control"))
 	require.Zero(t, store.projectCalls)
 	require.Zero(t, store.epochCalls)
 }

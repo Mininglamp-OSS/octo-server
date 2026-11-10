@@ -7,15 +7,19 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -38,6 +42,8 @@ type Module struct {
 	// repairing collapses concurrent out-of-band sentinel repairs of the SAME project
 	// to one in-flight goroutine. Keyed by project id; see repairSentinelOutOfBand.
 	repairing sync.Map
+
+	identityReader identityReader
 }
 
 // New loads the enablement configuration at construction. When any part of it is
@@ -99,6 +105,7 @@ func New(ctx *config.Context) *Module {
 		configured.Set(1)
 	}
 	return &Module{
+		identityReader:      &dbIdentityReader{ctx: ctx},
 		ctx:                 ctx,
 		store:               dbStore{ctx: ctx},
 		internalToken:       token,
@@ -142,6 +149,9 @@ func (m *Module) Route(r *wkhttp.WKHttp) {
 	internal.GET("/projects", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjects)
 	internal.GET("/project-memberships", deadline, ipLimit, m.internalAuthMiddleware(), m.listProjectMemberships)
 	internal.GET("/projects/:project_id/lifecycle", deadline, noStoreResponse, ipLimit, m.internalAuthMiddleware(), m.projectLifecycle)
+	// Internal Secret replaces user-session middleware; the reader validates
+	// the supplied user/Space/Bot relationships in one read-only snapshot.
+	internal.POST("/auth/identity", deadline, noStoreResponse, ipLimit, m.internalAuthMiddleware(), m.resolveIdentity)
 }
 func noStoreResponse(c *wkhttp.Context) {
 	c.Writer.Header().Set("Cache-Control", "no-store")
@@ -779,4 +789,96 @@ func boundBodyReadTime() wkhttp.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// ---------- POST /v1/internal/auth/identity ----------
+
+type IdentityRequest struct {
+	UserID  string `json:"user_id"`
+	SpaceID string `json:"space_id"`
+	BotID   string `json:"bot_id,omitempty"`
+}
+type IdentityUser struct {
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+}
+type IdentitySpace struct {
+	SpaceID string `json:"space_id"`
+	Name    string `json:"name"`
+}
+type IdentityMembership struct {
+	Role int `json:"role"`
+}
+type IdentityBot struct {
+	BotID    string `json:"bot_id"`
+	Name     string `json:"name"`
+	IsActive bool   `json:"is_active"`
+}
+type IdentityContext struct {
+	User       IdentityUser       `json:"user"`
+	Space      IdentitySpace      `json:"space"`
+	Membership IdentityMembership `json:"membership"`
+	Bot        *IdentityBot       `json:"bot"`
+}
+type IdentityResponse struct {
+	Data IdentityContext `json:"data"`
+}
+
+// resolveIdentity returns current identity facts after validating user, Space
+// and personal Bot relationships.
+func (m *Module) resolveIdentity(c *wkhttp.Context) {
+	media, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || media != "application/json" {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrIdentityMedia, nil, nil)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 65536))
+	if err != nil {
+		var limit *http.MaxBytesError
+		if errors.As(err, &limit) {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrIdentityBodyLarge, nil, nil)
+		} else {
+			respondInvalidParam(c, "body")
+		}
+		return
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		respondInvalidParam(c, "body")
+		return
+	}
+	var in IdentityRequest
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&in) != nil || dec.Decode(&struct{}{}) != io.EOF {
+		respondInvalidParam(c, "body")
+		return
+	}
+	if !validIdentityID(in.UserID) || !validIdentityID(in.SpaceID) {
+		respondInvalidParam(c, "identity")
+		return
+	}
+	if in.BotID != "" && !validIdentityID(in.BotID) {
+		respondInvalidParam(c, "bot_id")
+		return
+	}
+	if m.identityReader == nil {
+		respondInternal(c)
+		return
+	}
+	out, err := m.identityReader.Resolve(c.Request.Context(), in)
+	switch {
+	case errors.Is(err, ErrIdentityNotFound):
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
+	case err != nil:
+		m.Error("identity lookup failed", zap.Error(err))
+		respondInternal(c)
+	case out == nil:
+		respondInternal(c)
+	default:
+		c.Response(IdentityResponse{Data: *out})
+	}
+}
+func validIdentityID(id string) bool {
+	return id != "" && strings.TrimSpace(id) == id && utf8.ValidString(id) && utf8.RuneCountInString(id) <= 40
 }

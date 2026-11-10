@@ -13,10 +13,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	mysql "github.com/go-sql-driver/mysql"
+	"github.com/gocraft/dbr/v2"
+	"github.com/stretchr/testify/require"
+	"time"
 )
 
 // testInternalToken is exactly minInternalTokenBytes long so every auth test
@@ -197,7 +202,10 @@ type errorEnvelope struct {
 	Error struct {
 		Code       string `json:"code"`
 		HTTPStatus int    `json:"http_status"`
+		Message    string `json:"message"`
 	} `json:"error"`
+	Msg    string `json:"msg"`
+	Status int    `json:"status"`
 }
 
 func decodeError(t *testing.T, w *httptest.ResponseRecorder) errorEnvelope {
@@ -1097,4 +1105,392 @@ func TestBothHandlersPassTheRequestContextToTheStore(t *testing.T) {
 			"that call holds a pooled connection across every read in its transaction, so " +
 			"an uncancellable wait for it is the expensive half of the same hazard")
 	}
+}
+
+// ============================================================================
+// Identity HTTP contract and route authentication
+// ============================================================================
+
+type identityReaderStub struct {
+	out   *IdentityContext
+	err   error
+	calls int
+	input IdentityRequest
+}
+
+func (s *identityReaderStub) Resolve(ctx context.Context, in IdentityRequest) (*IdentityContext, error) {
+	s.calls++
+	s.input = in
+	return s.out, s.err
+}
+
+const identityTestSecret = "identity-test-secret-01234567890123456789"
+
+func identityRouter(stub *identityReaderStub, secret string) *wkhttp.WKHttp {
+	m := &Module{identityReader: stub, internalToken: secret, Log: log.NewTLog("IdentityTest")}
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.SourceLanguage)))
+	r.POST("/v1/internal/auth/identity", noStoreResponse, m.internalAuthMiddleware(), m.resolveIdentity)
+	return r
+}
+func identityRequest(r *wkhttp.WKHttp, secret, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "/v1/internal/auth/identity", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Token", secret)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+func TestIdentityHTTPContract(t *testing.T) {
+	input := `{"user_id":"u1","space_id":"s1","bot_id":"b1"}`
+	want := &IdentityContext{User: IdentityUser{UserID: "u1", Name: "Current user"}, Space: IdentitySpace{SpaceID: "s1", Name: "Current Space"}, Membership: IdentityMembership{Role: 1}, Bot: &IdentityBot{BotID: "b1", Name: "Current Bot", IsActive: true}}
+	stub := &identityReaderStub{out: want}
+	w := identityRequest(identityRouter(stub, identityTestSecret), identityTestSecret, input)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	var body IdentityResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, *want, body.Data)
+	require.Equal(t, IdentityRequest{UserID: "u1", SpaceID: "s1", BotID: "b1"}, stub.input)
+	require.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+	require.NotContains(t, w.Body.String(), "token")
+}
+func TestIdentityRejectsBeforeLookup(t *testing.T) {
+	for _, tt := range []struct {
+		name, secret, body string
+		status             int
+	}{
+		{"wrong Secret", "wrong", `{"user_id":"u1","space_id":"s1"}`, 401},
+		{"missing user", identityTestSecret, `{"space_id":"s1"}`, 400},
+		{"missing Space", identityTestSecret, `{"user_id":"u1"}`, 400},
+		{"padded identity", identityTestSecret, `{"user_id":" u1","space_id":"s1"}`, 400},
+		{"unknown field", identityTestSecret, `{"user_id":"u1","space_id":"s1","owner":"other"}`, 400},
+		{"invalid JSON", identityTestSecret, `{`, 400},
+		{"null", identityTestSecret, `null`, 400},
+		{"batch Bot field", identityTestSecret, `{"user_id":"u1","space_id":"s1","bot_ids":["b1"]}`, 400},
+		{"Bot array", identityTestSecret, `{"user_id":"u1","space_id":"s1","bot_id":["b1"]}`, 400},
+		{"Bot number", identityTestSecret, `{"user_id":"u1","space_id":"s1","bot_id":42}`, 400},
+		{"padded Bot", identityTestSecret, `{"user_id":"u1","space_id":"s1","bot_id":" b1"}`, 400},
+		{"long Bot", identityTestSecret, `{"user_id":"u1","space_id":"s1","bot_id":"` + strings.Repeat("b", 41) + `"}`, 400},
+		{"multiple values", identityTestSecret, `{"user_id":"u1","space_id":"s1"}{}`, 400},
+		{"oversized body", identityTestSecret, `{"user_id":"` + strings.Repeat("u", 65536) + `"}`, 413},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &identityReaderStub{}
+			w := identityRequest(identityRouter(stub, identityTestSecret), tt.secret, tt.body)
+			require.Equal(t, tt.status, w.Code, w.Body.String())
+			require.Zero(t, stub.calls)
+			failure := decodeError(t, w)
+			expectedCode := "err.shared.param.invalid"
+			switch tt.status {
+			case 401:
+				expectedCode = "err.shared.auth.token_invalid"
+			case 413:
+				expectedCode = "err.server.internal_identity.body_large"
+			}
+			require.Equal(t, expectedCode, failure.Error.Code)
+			require.Equal(t, tt.status, failure.Error.HTTPStatus)
+			require.Equal(t, tt.status, failure.Status)
+			require.NotEmpty(t, failure.Msg)
+			require.Equal(t, failure.Error.Message, failure.Msg)
+		})
+	}
+}
+func TestIdentityFailuresUseExistingErrorEnvelope(t *testing.T) {
+	for _, tt := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{ErrIdentityNotFound, 404, "err.shared.not_found"}, {errors.New("private SQL failure"), 500, "err.shared.internal"},
+	} {
+		stub := &identityReaderStub{err: tt.err}
+		w := identityRequest(identityRouter(stub, identityTestSecret), identityTestSecret, `{"user_id":"u1","space_id":"s1"}`)
+		require.Equal(t, tt.status, w.Code, w.Body.String())
+		v := decodeError(t, w)
+		require.Equal(t, tt.code, v.Error.Code)
+		require.NotContains(t, w.Body.String(), "private SQL")
+		require.Equal(t, tt.status, v.Error.HTTPStatus)
+		require.Equal(t, tt.status, v.Status)
+		require.NotEmpty(t, v.Error.Message)
+		require.Equal(t, v.Error.Message, v.Msg)
+	}
+}
+func TestIdentityRequiresJSON(t *testing.T) {
+	stub := &identityReaderStub{}
+	r := identityRouter(stub, identityTestSecret)
+	req := httptest.NewRequest(http.MethodPost, "/v1/internal/auth/identity", strings.NewReader(`{}`))
+	req.Header.Set("X-Internal-Token", identityTestSecret)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, 415, w.Code)
+	failure := decodeError(t, w)
+	require.Equal(t, "err.server.internal_identity.media", failure.Error.Code)
+	require.Equal(t, 415, failure.Error.HTTPStatus)
+	require.Equal(t, 415, failure.Status)
+	require.Equal(t, failure.Error.Message, failure.Msg)
+	require.Zero(t, stub.calls)
+}
+
+func TestIdentityProductionRoute(t *testing.T) {
+	t.Setenv(MembershipInternalTokenEnv, identityTestSecret)
+	t.Setenv("OCTO_DRIVE_INTERNAL_TOKEN", strings.Repeat("d", 32))
+	for _, tc := range []struct {
+		name       string
+		cacheBound string
+		enabled    bool
+	}{
+		{"existing configuration enables identity", "30", true},
+		{"missing cache declaration disables identity", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(PeerMaxCacheAgeEnv, tc.cacheBound)
+			cfg := config.New()
+			cfg.EventPoolSize = 1
+			cfg.Push.PushPoolSize = 1
+			cfg.Robot.EventPoolSize = 1
+			m := New(config.NewContext(cfg))
+			stub := &identityReaderStub{out: &IdentityContext{
+				User: IdentityUser{UserID: "u1"}, Space: IdentitySpace{SpaceID: "s1"},
+			}}
+			m.identityReader = stub
+			r := wkhttp.New()
+			r.SetErrorRenderer(i18n.NewErrorRenderer(nil))
+			m.Route(r)
+			for _, secret := range []string{strings.Repeat("d", 32), ""} {
+				w := identityRequest(r, secret, `{"user_id":"u1","space_id":"s1"}`)
+				require.Equal(t, 401, w.Code)
+			}
+			require.Zero(t, stub.calls)
+			w := identityRequest(r, identityTestSecret, `{"user_id":"u1","space_id":"s1"}`)
+			require.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+			if !tc.enabled {
+				require.Empty(t, m.internalToken)
+				require.Equal(t, 401, w.Code, w.Body.String())
+				require.Zero(t, stub.calls)
+				return
+			}
+			require.Equal(t, identityTestSecret, m.internalToken)
+			require.Equal(t, 200, w.Code, w.Body.String())
+			require.Equal(t, 1, stub.calls)
+		})
+	}
+}
+
+func TestIdentityWithoutBot(t *testing.T) {
+	for _, body := range []string{
+		`{"user_id":"u1","space_id":"s1"}`,
+		`{"user_id":"u1","space_id":"s1","bot_id":""}`,
+	} {
+		stub := &identityReaderStub{out: &IdentityContext{User: IdentityUser{UserID: "u1"}, Space: IdentitySpace{SpaceID: "s1"}}}
+		response := identityRequest(identityRouter(stub, identityTestSecret), identityTestSecret, body)
+		require.Equal(t, 200, response.Code, response.Body.String())
+		require.Empty(t, stub.input.BotID)
+		require.Contains(t, response.Body.String(), `"bot":null`)
+	}
+}
+
+// ============================================================================
+// Identity database queries (isolated fixture required)
+// ============================================================================
+
+func identityProbe(t *testing.T) *dbr.Session {
+	t.Helper()
+	dsn := os.Getenv("OCTO_IDENTITY_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set isolated OCTO_IDENTITY_TEST_MYSQL_DSN")
+	}
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	admin, err := dbr.Open("mysql", cfg.FormatDSN(), nil)
+	require.NoError(t, err)
+	name := fmt.Sprintf("octo_identity_%d", time.Now().UnixNano())
+	_, err = admin.Exec("CREATE DATABASE `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	require.NoError(t, err)
+	t.Cleanup(func() { _, err := admin.Exec("DROP DATABASE `" + name + "`"); require.NoError(t, err); admin.Close() })
+	cfg.DBName = name
+	conn, err := dbr.Open("mysql", cfg.FormatDSN(), nil)
+	require.NoError(t, err)
+	conn.SetMaxOpenConns(2)
+	t.Cleanup(func() { conn.Close() })
+	for _, ddl := range []string{
+		"CREATE TABLE `user`(uid VARCHAR(40) PRIMARY KEY,name VARCHAR(200) NOT NULL,status INT NOT NULL,is_destroy INT NOT NULL) COLLATE utf8mb4_0900_ai_ci",
+		"CREATE TABLE space(space_id VARCHAR(40) PRIMARY KEY,name VARCHAR(200) NOT NULL,status INT NOT NULL) COLLATE utf8mb4_general_ci",
+		"CREATE TABLE space_member(space_id VARCHAR(40),uid VARCHAR(40),role INT NOT NULL,status INT NOT NULL,UNIQUE KEY(space_id,uid)) COLLATE utf8mb4_0900_ai_ci",
+		"CREATE TABLE robot(robot_id VARCHAR(40) PRIMARY KEY,creator_uid VARCHAR(40),status INT NOT NULL) COLLATE utf8mb4_general_ci",
+	} {
+		_, err = conn.Exec(ddl)
+		require.NoError(t, err)
+	}
+	return conn.NewSession(nil)
+}
+
+type identityQueryCounter struct {
+	dbr.NullEventReceiver
+	selects int
+}
+
+func (c *identityQueryCounter) TimingKv(event string, _ int64, _ map[string]string) {
+	if event == "dbr.select" {
+		c.selects++
+	}
+}
+
+func TestIdentityMySQL(t *testing.T) {
+	s := identityProbe(t)
+	reader := &dbIdentityReader{session: s}
+	exec := func(query string, args ...interface{}) {
+		t.Helper()
+		_, err := s.Exec(query, args...)
+		require.NoError(t, err)
+	}
+	reset := func() {
+		for _, table := range []string{"space_member", "robot", "space", "user"} {
+			exec("DELETE FROM `" + table + "`")
+		}
+		exec("INSERT INTO `user` VALUES('u1','Live User',1,0),('b1','Live Bot',1,0)")
+		exec("INSERT INTO space VALUES('s1','Live Space',1),('s2','Other Space',1)")
+		exec("INSERT INTO space_member VALUES('s1','u1',0,1),('s1','b1',0,1)")
+		exec("INSERT INTO robot VALUES('b1','u1',1)")
+	}
+	input := IdentityRequest{UserID: "u1", SpaceID: "s1", BotID: "b1"}
+	t.Run("Bot query only when requested", func(t *testing.T) {
+		previous := s.EventReceiver
+		counter := &identityQueryCounter{}
+		s.EventReceiver = counter
+		defer func() { s.EventReceiver = previous }()
+		for _, botID := range []string{"", "b1"} {
+			reset()
+			counter.selects = 0
+			in := input
+			in.BotID = botID
+			_, err := reader.Resolve(context.Background(), in)
+			require.NoError(t, err)
+			expected := 1
+			if botID != "" {
+				expected = 2
+			}
+			require.Equal(t, expected, counter.selects, "bot_id=%q", botID)
+		}
+	})
+	t.Run("only owner needs a Space seat", func(t *testing.T) {
+		reset()
+		exec("DELETE FROM space_member WHERE uid='b1'")
+		out, err := reader.Resolve(context.Background(), input)
+		require.NoError(t, err)
+		require.NotNil(t, out.Bot)
+		require.Equal(t, "b1", out.Bot.BotID)
+	})
+	t.Run("current data and role", func(t *testing.T) {
+		reset()
+		exec("UPDATE space_member SET role=2 WHERE uid='u1'")
+		got, err := reader.Resolve(context.Background(), input)
+		require.NoError(t, err)
+		require.Equal(t, "Live User", got.User.Name)
+		require.Equal(t, "Live Space", got.Space.Name)
+		require.Equal(t, 2, got.Membership.Role)
+		require.Equal(t, &IdentityBot{BotID: "b1", Name: "Live Bot", IsActive: true}, got.Bot)
+	})
+	for _, tc := range []struct{ name, mutation string }{
+		{"disabled user", "UPDATE `user` SET status=0 WHERE uid='u1'"}, {"destroyed user", "UPDATE `user` SET is_destroy=2 WHERE uid='u1'"},
+		{"disabled Space", "UPDATE space SET status=2 WHERE space_id='s1'"}, {"disbanded Space", "UPDATE space SET status=0 WHERE space_id='s1'"},
+		{"removed user", "UPDATE space_member SET status=0 WHERE uid='u1'"}, {"unknown user", "DELETE FROM `user` WHERE uid='u1'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reset()
+			exec(tc.mutation)
+			out, err := reader.Resolve(context.Background(), input)
+			require.ErrorIs(t, err, ErrIdentityNotFound)
+			require.Nil(t, out)
+		})
+	}
+	for _, tc := range []struct{ name, mutation string }{
+		{"other owner", "UPDATE robot SET creator_uid='u2' WHERE robot_id='b1'"},
+		{"owner alias", "UPDATE robot SET creator_uid='U1' WHERE robot_id='b1'"},
+		{"inactive Bot", "UPDATE robot SET status=0 WHERE robot_id='b1'"},
+		{"disabled Bot profile", "UPDATE user SET status=0 WHERE uid='b1'"},
+		{"destroyed Bot profile", "UPDATE user SET is_destroy=2 WHERE uid='b1'"},
+		{"missing Bot profile", "DELETE FROM user WHERE uid='b1'"},
+		{"Bot profile alone is insufficient", "DELETE FROM robot WHERE robot_id='b1'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reset()
+			exec(tc.mutation)
+			out, err := reader.Resolve(context.Background(), input)
+			require.ErrorIs(t, err, ErrIdentityNotFound)
+			require.Nil(t, out)
+		})
+	}
+	for _, botID := range []string{"missing", "B1"} {
+		t.Run("unavailable Bot "+botID, func(t *testing.T) {
+			reset()
+			in := input
+			in.BotID = botID
+			out, err := reader.Resolve(context.Background(), in)
+			require.ErrorIs(t, err, ErrIdentityNotFound)
+			require.Nil(t, out)
+		})
+	}
+	t.Run("no binding", func(t *testing.T) {
+		reset()
+		in := input
+		in.BotID = ""
+		out, err := reader.Resolve(context.Background(), in)
+		require.NoError(t, err)
+		require.Nil(t, out.Bot)
+	})
+	t.Run("cooling off remains live", func(t *testing.T) {
+		reset()
+		exec("UPDATE `user` SET is_destroy=1 WHERE uid='u1'")
+		_, err := reader.Resolve(context.Background(), input)
+		require.NoError(t, err)
+	})
+	t.Run("byte exact user and Space", func(t *testing.T) {
+		reset()
+		for _, pair := range [][2]string{{"U1", "s1"}, {"u1", "S1"}, {"ｕ1", "s1"}} {
+			in := input
+			in.UserID = pair[0]
+			in.SpaceID = pair[1]
+			out, err := reader.Resolve(context.Background(), in)
+			require.ErrorIs(t, err, ErrIdentityNotFound)
+			require.Nil(t, out)
+		}
+	})
+	t.Run("canceled request", func(t *testing.T) {
+		reset()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := reader.Resolve(ctx, input)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+	t.Run("pool wait is bounded", func(t *testing.T) {
+		reset()
+		s.SetMaxOpenConns(1)
+		held, err := s.DB.Conn(context.Background())
+		require.NoError(t, err)
+		defer held.Close()
+		start := time.Now()
+		_, err = reader.Resolve(context.Background(), input)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Less(t, time.Since(start), 5*time.Second)
+	})
+	t.Run("database fault is not a missing identity", func(t *testing.T) {
+		exec("DROP TABLE robot")
+		in := input
+		in.BotID = ""
+		out, err := reader.Resolve(context.Background(), in)
+		require.NoError(t, err, "unbound lookup must not query robot")
+		require.Nil(t, out.Bot)
+		in.UserID = "missing"
+		out, err = reader.Resolve(context.Background(), in)
+		require.ErrorIs(t, err, ErrIdentityNotFound)
+		require.Nil(t, out)
+		in.BotID = input.BotID
+		out, err = reader.Resolve(context.Background(), in)
+		require.ErrorIs(t, err, ErrIdentityNotFound, "invalid user must stop before Bot lookup")
+		require.Nil(t, out)
+		_, err = reader.Resolve(context.Background(), input)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrIdentityNotFound)
+	})
 }

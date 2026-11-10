@@ -1577,3 +1577,9 @@ other = "该项目不可用。"
 
 ["err.server.group.project_conflict"]
 other = "群与项目的关联状态已变化，请刷新后重试。"
+
+["err.server.internal_identity.media"]
+other = "Content-Type 必须为 application/json。"
+
+["err.server.internal_identity.body_large"]
+other = "请求内容超过 64 KiB。"
