@@ -191,8 +191,9 @@ WHERE u.uid = ? AND BINARY u.uid = BINARY ? AND u.status = 1 AND u.is_destroy <>
 		return out, nil
 	}
 
-	// Bot creation/association guarantees the owner's Space; only ownership
-	// and lifecycle are checked here. The user profile supplies the Bot name.
+	// Resolve the user's owned Bot independently of its Space seat. User/Space
+	// membership was checked above; these facts do not grant Bot resource access.
+	// The user profile supplies the Bot name.
 	const botQuery = `
 SELECT b.robot_id AS bot_id, bu.name AS bot_name
 FROM robot b

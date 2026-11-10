@@ -1276,10 +1276,100 @@ func TestIdentityProductionRoute(t *testing.T) {
 	}
 }
 
+// TestIdentityProductionRouteMySQL uses the default reader from New, the shipped
+// Route, isolated MySQL and the real limiter. No identity-reader stub is installed.
+func TestIdentityProductionRouteMySQL(t *testing.T) {
+	s := identityProbe(t)
+	for _, query := range []string{
+		"INSERT INTO `user` VALUES('u1','Live User',1,0),('u2','Other User',1,0),('b1','Live Bot',1,0),('b2','Other Bot',1,0)",
+		"INSERT INTO space VALUES('s1','Live Space',1),('s2','Other Space',1)",
+		"INSERT INTO space_member VALUES('s1','u1',1,1),('s2','u1',0,1),('s1','b1',0,1)",
+		"INSERT INTO robot VALUES('b1','u1',1),('b2','u2',1)",
+	} {
+		_, err := s.Exec(query)
+		require.NoError(t, err)
+	}
+	var database string
+	require.NoError(t, s.QueryRow("SELECT DATABASE()").Scan(&database))
+	dsn, err := mysql.ParseDSN(os.Getenv("OCTO_IDENTITY_TEST_MYSQL_DSN"))
+	require.NoError(t, err)
+	dsn.DBName = database
+
+	t.Setenv(MembershipInternalTokenEnv, identityTestSecret)
+	t.Setenv("OCTO_DRIVE_INTERNAL_TOKEN", strings.Repeat("d", 32))
+	t.Setenv(PeerMaxCacheAgeEnv, "30")
+	cfg := config.New()
+	cfg.Test = true
+	cfg.EventPoolSize = 1
+	cfg.Push.PushPoolSize = 1
+	cfg.Robot.EventPoolSize = 1
+	cfg.DB.MySQLAddr = dsn.FormatDSN()
+	cfg.DB.MySQLMaxOpenConns = 2
+	cfg.DB.MySQLMaxIdleConns = 2
+	ctx := config.NewContext(cfg)
+	t.Cleanup(func() { require.NoError(t, ctx.DB().Connection.Close()) })
+	clientIP := "198.51.100.93"
+	resetBucket(t, ctx, clientIP)
+	m := New(ctx)
+	r := newProductionRoute(t, ctx, m)
+	bot := &IdentityBot{BotID: "b1", Name: "Live Bot", IsActive: true}
+	for _, tc := range []struct {
+		name, secret, body string
+		status             int
+		spaceID, spaceName string
+		role               int
+		bot                *IdentityBot
+	}{
+		{name: "omitted Bot", body: `{"user_id":"u1","space_id":"s1"}`, status: 200, spaceID: "s1", spaceName: "Live Space", role: 1},
+		{name: "empty Bot", body: `{"user_id":"u1","space_id":"s1","bot_id":""}`, status: 200, spaceID: "s1", spaceName: "Live Space", role: 1},
+		{name: "null Bot", body: `{"user_id":"u1","space_id":"s1","bot_id":null}`, status: 200, spaceID: "s1", spaceName: "Live Space", role: 1},
+		{name: "owned Bot", body: `{"user_id":"u1","space_id":"s1","bot_id":"b1"}`, status: 200, spaceID: "s1", spaceName: "Live Space", role: 1, bot: bot},
+		{name: "owned Bot without requested Space seat", body: `{"user_id":"u1","space_id":"s2","bot_id":"b1"}`, status: 200, spaceID: "s2", spaceName: "Other Space", bot: bot},
+		{name: "user not in Space", body: `{"user_id":"u2","space_id":"s1"}`, status: 404},
+		{name: "unknown Space", body: `{"user_id":"u1","space_id":"missing"}`, status: 404},
+		{name: "unknown Bot", body: `{"user_id":"u1","space_id":"s1","bot_id":"missing"}`, status: 404},
+		{name: "Bot belongs to another user", body: `{"user_id":"u1","space_id":"s1","bot_id":"b2"}`, status: 404},
+		{name: "Bot ID is byte exact", body: `{"user_id":"u1","space_id":"s1","bot_id":"B1"}`, status: 404},
+		{name: "invalid Bot type", body: `{"user_id":"u1","space_id":"s1","bot_id":42}`, status: 400},
+		{name: "invalid Secret", secret: "wrong", body: `{"user_id":"u1","space_id":"s1"}`, status: 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			secret := tc.secret
+			if secret == "" {
+				secret = identityTestSecret
+			}
+			w := httptest.NewRecorder()
+			doRouteRequest(t, r, w, http.MethodPost, "/v1/internal/auth/identity", secret, clientIP, []byte(tc.body))
+			require.Equal(t, tc.status, w.Code, w.Body.String())
+			require.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+			if tc.status != http.StatusOK {
+				failure := decodeError(t, w)
+				require.Equal(t, tc.status, failure.Error.HTTPStatus)
+				require.Equal(t, tc.status, failure.Status)
+				require.NotEmpty(t, failure.Error.Code)
+				require.Equal(t, failure.Error.Message, failure.Msg)
+				require.NotContains(t, w.Body.String(), `"data"`)
+				return
+			}
+			var response IdentityResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+			require.Equal(t, IdentityContext{
+				User:       IdentityUser{UserID: "u1", Name: "Live User"},
+				Space:      IdentitySpace{SpaceID: tc.spaceID, Name: tc.spaceName},
+				Membership: IdentityMembership{Role: tc.role}, Bot: tc.bot,
+			}, response.Data)
+			if tc.bot == nil {
+				require.Contains(t, w.Body.String(), `"bot":null`)
+			}
+		})
+	}
+}
+
 func TestIdentityWithoutBot(t *testing.T) {
 	for _, body := range []string{
 		`{"user_id":"u1","space_id":"s1"}`,
 		`{"user_id":"u1","space_id":"s1","bot_id":""}`,
+		`{"user_id":"u1","space_id":"s1","bot_id":null}`,
 	} {
 		stub := &identityReaderStub{out: &IdentityContext{User: IdentityUser{UserID: "u1"}, Space: IdentitySpace{SpaceID: "s1"}}}
 		response := identityRequest(identityRouter(stub, identityTestSecret), identityTestSecret, body)

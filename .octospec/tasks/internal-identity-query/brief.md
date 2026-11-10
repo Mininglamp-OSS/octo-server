@@ -7,9 +7,9 @@ Expose `POST /v1/internal/auth/identity` (`identity.resolve`) so internal caller
 ## Load-bearing behavior
 
 - Validate active user, Space and user membership; return membership role separately from Space.
-- Read active user/Space membership first. Only when `bot_id` is supplied, read one active BF Bot owned by that user and its profile name. Bot creation/association guarantees the same Space; do not query a second membership or app_bot.
+- Read active user/Space membership first. Only when `bot_id` is supplied, read one active BF Bot owned by that user and its profile name. Validate user/Space membership and user/Bot ownership as independent relationships; a Bot Space seat is not required. Returned Bot facts do not establish Bot Space membership or resource permissions. Do not query a second membership or app_bot.
 - Use fixed sequential SELECTs in one read-only repeatable-read snapshot bounded to three seconds, including connection-pool wait. Keep indexable predicates and byte-exact ID comparisons. The provider reads current facts; callers own their result-cache policy.
-- Return `bot: null` only when no Bot is requested. An unavailable user/Space/member or supplied Bot (missing, wrong owner or inactive) returns the existing not-found error without a partial identity. A resolved Bot has `is_active=true`.
+- Treat omitted, empty and explicit JSON null `bot_id` as no Bot requested; return `bot: null` for all three. An unavailable user/Space/member or supplied Bot (missing, wrong owner or inactive) returns the existing not-found error without a partial identity. A resolved Bot has `is_active=true`.
 - Reuse the module's existing strict per-IP limiter before Secret authentication, sharing its bucket and configuration with membership/project routes.
 - Reuse the original internalAuthMiddleware and internalToken, including existing enablement checks. Do not maintain a separate identity Secret or auth middleware.
 - Reuse the existing registered error codes, compatibility envelope and shared renderer. Preserve existing routes and their peer-cache release gate.
@@ -20,7 +20,7 @@ Octo Server provider, tests and provider documentation. No Token issuance, permi
 
 ## Acceptance and verification
 
-HTTP contract and Secret isolation tests; real MySQL lifecycle, relationship and collation tests; cancellation/pool deadline tests; production-route Secret isolation tests; existing error-envelope compatibility tests; build, vet, race and i18n checks. See [verification.md](verification.md) for results and the legacy test-environment limitation.
+HTTP contract and Secret isolation tests; real MySQL lifecycle, relationship and collation tests; cancellation/pool deadline tests; production-route Secret isolation tests; default-reader MySQL/HTTP integration tests; existing error-envelope compatibility tests; build, vet, race and i18n checks. See [verification.md](verification.md) for results and the legacy test-environment limitation.
 
 ## Delivery
 

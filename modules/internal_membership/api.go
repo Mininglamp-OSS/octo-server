@@ -796,7 +796,8 @@ func boundBodyReadTime() wkhttp.HandlerFunc {
 type IdentityRequest struct {
 	UserID  string `json:"user_id"`
 	SpaceID string `json:"space_id"`
-	BotID   string `json:"bot_id,omitempty"`
+	// Omitted, empty or JSON null means no Bot; decoding null leaves this empty.
+	BotID string `json:"bot_id,omitempty"`
 }
 type IdentityUser struct {
 	UserID string `json:"user_id"`
