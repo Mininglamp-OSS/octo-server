@@ -414,7 +414,8 @@ func (d *DB) QuerySourceMessageIDsByShortIDs(shortIDs []string) (map[string]*int
 // SQL 关键点：
 //   - WHERE 加 version < ? 防赛跑：cron 拿到版本 V 后，若任何人（手动 archive/unarchive、
 //     收消息 auto-unarchive）把同一行的版本号推到 >= V，本批不再触它，避免 cron 用旧
-//     版本号覆盖更新的版本号，让 sync 客户端漏拉。
+//     版本号覆盖更新的版本号——行级 stale-write 守卫，依赖的就是「同一行的 version
+//     严格递增」，见 reserveThreadVersion 里的线程版本契约。
 //   - ORDER BY last_message_at, id：保证 MySQL 复制（statement-based / mixed）确定性，
 //     且和 idx_status_last_msg_id 三列索引同序，避免 filesort。
 //   - last_message_at IS NULL 的子区（从未发过消息）一律保留，避免误归档新建空子区。
@@ -472,6 +473,15 @@ func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64
 // 任一手动写要"输给"3 次并发更高版本号的写入才会失败，实际上单行很难触达。
 const versionRetryAttempts = 3
 
+// seqKeyPrefix / threadSeqStep 对应 octo-lib config.GenSeq 的共享序列表约定：
+// 版本号存在 seq 表里，`key` = "seq:<flag>"，min_seq 是该 key 的共享水位
+// （GenSeq 为每个进程缓存 step 宽的窗口，窗口上界就是它写回的 min_seq）。
+const (
+	seqKeyPrefix   = "seq:"
+	threadSeqStep  = 1000
+	threadSeqTable = "seq"
+)
+
 // CAS 写路径的 sentinel errors，让 service 层能精确区分"行不存在"、"行被并发删了"、
 // "行不在期望状态"等场景，而不是把所有"无变更"都当成成功。
 var (
@@ -486,6 +496,71 @@ var (
 	ErrThreadCASExhausted = errors.New("thread CAS retry exhausted")
 )
 
+// reserveThreadVersion 在共享序列 seq:thread 上原子地预留一个 >= floor 的版本号并返回。
+//
+// 为什么需要预留：GenSeq 是 per-process 的块分配器（octo-lib config/seq.go），
+// 每个进程缓存 1000 宽的窗口，多副本下各进程缓存的窗口可能重叠或整体落后——某一行
+// 的 version 完全可能已经大于本进程 GenSeq 还能给出的值。此时如果直接把「行内
+// version+1」写回，就等于凭空造了一个从未在共享序列中出现过的版本号：另一个子区
+// 之后从 GenSeq 拿到的值可能与它相等，共享水位也永远停在它下面。
+//
+// 这里的做法是把共享水位 min_seq 原子地推到 >= floor，并把推上去的值当作新版本号：
+//
+//	INSERT IGNORE seq(key='seq:thread', min_seq=0, step=1000)   -- 兜底建行（正常由 GenSeq 建）
+//	UPDATE seq SET min_seq=GREATEST(min_seq+1, floor)           -- 原子占用，行锁串行化
+//	SELECT min_seq                                             -- 读回刚占到的值
+//
+// 于是落库的版本号一定来自共享序列本身：它严格大于行内旧版本（>= floor），也严格
+// 大于此前的共享水位，后续任何一次窗口分配都从它之上开始，不会再把同一个版本号发给
+// 另一个子区。整段在一个事务里完成，保证 INSERT/UPDATE/SELECT 落在同一条连接上。
+//
+// 线程版本契约（也是下面 CAS 重试的前提）：
+//   - 消费方只依赖「同一行的 version 严格递增」；cron 归档与手动写的 `WHERE version<?`
+//     都是行级 stale-write 守卫。会话/侧边栏 sync 的游标来自 IM 会话
+//     （modules/message/api_conversation.go、api_sidebar.go），不是 thread.version，
+//     也没有任何路径跨行按 version 分页。
+//   - 正常路径的版本号来自 GenSeq 已预留的窗口；只有 GenSeq 落后时才走本函数补齐。
+//   - 消息解档（RecordMessageAndReactivate）在行锁内直接取行内 version+1：它持有同一行的
+//     SELECT ... FOR UPDATE，读到的就是最新版本，不会与任何写者抢同一个号。
+//
+// 已知边界：GenSeq 的窗口写回是「绝对值覆盖」（addOrUpdateSeq 用 ON DUPLICATE KEY
+// UPDATE min_seq=VALUES(min_seq)），一个缓存窗口陈旧的进程在续窗时仍可能把 min_seq
+// 写回低位。这是 octo-lib 的既有缺陷（同 #697 的窗口重叠问题），不在本 PR 的修复范围内；
+// 本函数保证的是「我们写出去的版本号一定是从共享序列里占到的」。
+func (d *DB) reserveThreadVersion(floor int64) (int64, error) {
+	key := seqKeyPrefix + ThreadSeqKey
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("reserve thread version: begin tx: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	if _, err := tx.InsertBySql(
+		"INSERT IGNORE INTO "+threadSeqTable+" (`key`, `min_seq`, `step`) VALUES (?, 0, ?)",
+		key, threadSeqStep,
+	).Exec(); err != nil {
+		return 0, fmt.Errorf("reserve thread version: ensure seq row: %w", err)
+	}
+	// min_seq+1 而不是直接 floor：并发的两次重试各自能拿到不同的值，不会撞号。
+	if _, err := tx.UpdateBySql(
+		"UPDATE "+threadSeqTable+" SET `min_seq`=GREATEST(`min_seq`+1, ?) WHERE `key`=?",
+		floor, key,
+	).Exec(); err != nil {
+		return 0, fmt.Errorf("reserve thread version: advance seq: %w", err)
+	}
+	var reserved int64
+	if err := tx.SelectBySql(
+		"SELECT `min_seq` FROM "+threadSeqTable+" WHERE `key`=?",
+		key,
+	).LoadOne(&reserved); err != nil {
+		return 0, fmt.Errorf("reserve thread version: read seq: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("reserve thread version: commit: %w", err)
+	}
+	return reserved, nil
+}
+
 // UpdateStatusFrom 把 status 从 expectedStatus 原子地切换到 newStatus，带 version
 // CAS guard 和重试。WHERE 同时校验 short_id / status==expectedStatus / version<新版本。
 //
@@ -497,14 +572,21 @@ var (
 //   - ErrThreadStatusMismatch：行 status 与 expected 不符，也不是 newStatus
 //   - ErrThreadCASExhausted：CAS 三连败（基本不会发生）
 //
+// 重试策略：首次用 newVersion() 的值；若行仍是 expectedStatus 但 version 已被推到
+// >= 本次版本号（典型：多实例部署下各实例缓存的 seq 段重叠/落后，另一实例用更大的
+// GenSeq 写过这一行），下一次改用 reserveThreadVersion 在共享序列上预留一个严格
+// 大于行内版本的值，而不是再取一次 GenSeq——只重取 GenSeq 会三连败并返回
+// ErrThreadCASExhausted（对外 500 store_failed，前端只显示「未知错误」），用户表现
+// 为"有的子区归档/改名/删除一直报错"。
+//
 // 比起锁外读 status 再调 UpdateStatus 的旧路径，这里把状态判定整合进 UPDATE 的 WHERE，
 // 闭掉了"读完 status 之后被 delete/cron 改写"的窗口。
 func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, newVersion func() (int64, error)) error {
+	version, err := newVersion()
+	if err != nil {
+		return fmt.Errorf("update status: gen version: %w", err)
+	}
 	for attempt := 0; attempt < versionRetryAttempts; attempt++ {
-		version, err := newVersion()
-		if err != nil {
-			return fmt.Errorf("update status: gen version: %w", err)
-		}
 		result, err := d.session.UpdateBySql(
 			"UPDATE thread SET status=?, version=?, updated_at=? "+
 				"WHERE short_id=? AND status=? AND version<?",
@@ -522,7 +604,7 @@ func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, new
 			return nil
 		}
 		// 0 行：行可能不存在 / 已删 / 已是 newStatus / status 还在 expected 但被抢版本。
-		actual, ok, perr := d.probeStatus(shortID)
+		actual, currentVersion, ok, perr := d.probeStatusAndVersion(shortID)
 		if perr != nil {
 			return fmt.Errorf("update status: probe: %w", perr)
 		}
@@ -535,7 +617,22 @@ func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, new
 		case newStatus:
 			return nil // 已经是目标状态，幂等成功
 		case expectedStatus:
-			// 仍在期望状态，但 version 被并发抢先：换更大 GenSeq 重试
+			// 仍在期望状态但 version 已被抢先。优先再取一个更大的 GenSeq（保持原有
+			// "换更大版本号重试"语义）；若 GenSeq 落后于行内值（多实例 seq 段重叠/
+			// 回退），改为在共享序列上预留一个 > 行内版本的值，避免三连败。
+			next, gerr := newVersion()
+			if gerr != nil {
+				return fmt.Errorf("update status: gen version: %w", gerr)
+			}
+			if next > currentVersion {
+				version = next
+			} else {
+				reserved, rerr := d.reserveThreadVersion(currentVersion + 1)
+				if rerr != nil {
+					return fmt.Errorf("update status: %w", rerr)
+				}
+				version = reserved
+			}
 		default:
 			return ErrThreadStatusMismatch
 		}
@@ -545,11 +642,11 @@ func (d *DB) UpdateStatusFrom(shortID string, expectedStatus, newStatus int, new
 
 // MarkDeleted 把任何非 deleted 状态的子区切到 deleted。幂等：已删除直接返回 nil。
 func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error {
+	version, err := newVersion()
+	if err != nil {
+		return fmt.Errorf("mark deleted: gen version: %w", err)
+	}
 	for attempt := 0; attempt < versionRetryAttempts; attempt++ {
-		version, err := newVersion()
-		if err != nil {
-			return fmt.Errorf("mark deleted: gen version: %w", err)
-		}
 		result, err := d.session.UpdateBySql(
 			"UPDATE thread SET status=?, version=?, updated_at=? "+
 				"WHERE short_id=? AND status!=? AND version<?",
@@ -566,7 +663,7 @@ func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error
 		if affected > 0 {
 			return nil
 		}
-		actual, ok, perr := d.probeStatus(shortID)
+		actual, currentVersion, ok, perr := d.probeStatusAndVersion(shortID)
 		if perr != nil {
 			return fmt.Errorf("mark deleted: probe: %w", perr)
 		}
@@ -576,18 +673,31 @@ func (d *DB) MarkDeleted(shortID string, newVersion func() (int64, error)) error
 		if actual == ThreadStatusDeleted {
 			return nil // 已删除，幂等
 		}
-		// 行存在且非 deleted：被抢版本，重试
+		// 行存在且非 deleted：version 被抢先。优先取更大的 GenSeq，落后时在共享序列上预留。
+		next, gerr := newVersion()
+		if gerr != nil {
+			return fmt.Errorf("mark deleted: gen version: %w", gerr)
+		}
+		if next > currentVersion {
+			version = next
+		} else {
+			reserved, rerr := d.reserveThreadVersion(currentVersion + 1)
+			if rerr != nil {
+				return fmt.Errorf("mark deleted: %w", rerr)
+			}
+			version = reserved
+		}
 	}
 	return ErrThreadCASExhausted
 }
 
 // UpdateName 改名。不允许在已删除的子区上改名（返回 ErrThreadDeleted）。
 func (d *DB) UpdateName(shortID string, name string, newVersion func() (int64, error)) error {
+	version, err := newVersion()
+	if err != nil {
+		return fmt.Errorf("update name: gen version: %w", err)
+	}
 	for attempt := 0; attempt < versionRetryAttempts; attempt++ {
-		version, err := newVersion()
-		if err != nil {
-			return fmt.Errorf("update name: gen version: %w", err)
-		}
 		result, err := d.session.UpdateBySql(
 			"UPDATE thread SET name=?, version=?, updated_at=? "+
 				"WHERE short_id=? AND status!=? AND version<?",
@@ -604,7 +714,7 @@ func (d *DB) UpdateName(shortID string, name string, newVersion func() (int64, e
 		if affected > 0 {
 			return nil
 		}
-		actual, ok, perr := d.probeStatus(shortID)
+		actual, currentVersion, ok, perr := d.probeStatusAndVersion(shortID)
 		if perr != nil {
 			return fmt.Errorf("update name: probe: %w", perr)
 		}
@@ -614,19 +724,36 @@ func (d *DB) UpdateName(shortID string, name string, newVersion func() (int64, e
 		if actual == ThreadStatusDeleted {
 			return ErrThreadDeleted
 		}
-		// 行存在且非 deleted：被抢版本，重试
+		// 行存在且非 deleted：version 被抢先。优先取更大的 GenSeq，落后时在共享序列上预留。
+		next, gerr := newVersion()
+		if gerr != nil {
+			return fmt.Errorf("update name: gen version: %w", gerr)
+		}
+		if next > currentVersion {
+			version = next
+		} else {
+			reserved, rerr := d.reserveThreadVersion(currentVersion + 1)
+			if rerr != nil {
+				return fmt.Errorf("update name: %w", rerr)
+			}
+			version = reserved
+		}
 	}
 	return ErrThreadCASExhausted
 }
 
-// probeStatus 读当前 status。返回 (status, exists, err)。
-func (d *DB) probeStatus(shortID string) (int, bool, error) {
-	var status int
-	n, err := d.session.SelectBySql("SELECT status FROM thread WHERE short_id=?", shortID).Load(&status)
-	if err != nil {
-		return 0, false, err
+// probeStatusAndVersion 读当前 status 与 version。返回 (status, version, exists, err)。
+// 供 CAS 写路径在 version 冲突后判断是否需要用共享序列预留一个更大的版本号。
+func (d *DB) probeStatusAndVersion(shortID string) (int, int64, bool, error) {
+	var row struct {
+		Status  int   `db:"status"`
+		Version int64 `db:"version"`
 	}
-	return status, n > 0, nil
+	n, err := d.session.SelectBySql("SELECT status, version FROM thread WHERE short_id=?", shortID).Load(&row)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return row.Status, row.Version, n > 0, nil
 }
 
 // Update 更新子区信息
@@ -772,13 +899,14 @@ func (d *DB) CountMembersBatch(threadIDs []int64) (map[int64]int, error) {
 // 关键点：
 //   - GenSeq（即 newVersion 回调）只在锁内、且确认当前确实 archived 时才调用。
 //     避免 listener 在拿锁前预生成的版本号低于 cron 在它前面拿到的版本号，
-//     从而把 thread.version 写"回退"——这是 sync 游标按 version 单调推进的前提。
+//     从而把 thread.version 写"回退"——行级 stale-write 守卫依赖 version 严格递增。
 //   - active 子区收消息不再消耗 GenSeq，热路径无写放大。
 //   - status=deleted 的行直接 no-op，不被消息复活。
 //
 // 与 ArchiveStaleBatch 的并发收敛：
 //   - cron 先拿锁 → status=archived → 我们 SELECT 读到 archived → 取新版本 → 解档为
-//     active（新版本号严格 > cron 的版本号，因为 GenSeq 是全局单调）。
+//     active（新版本号严格 > cron 的版本号：写的是 GREATEST(行内 version+1, GenSeq)，
+//     行内值在行锁内读取，所以即使 GenSeq 落后于 cron 的版本号也不会倒退）。
 //   - 我们先拿锁 → last_message_at=NOW → cron 的 WHERE last_message_at<cutoff 不匹配
 //     → cron 跳过本行。
 func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newVersion func() (int64, error)) error {
@@ -808,7 +936,7 @@ func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newV
 			return fmt.Errorf("record message: gen version: %w", gerr)
 		}
 		if _, err := tx.UpdateBySql(
-			"UPDATE thread SET status=?, version=?, last_message_at=?, "+
+			"UPDATE thread SET status=?, version=GREATEST(version+1, ?), last_message_at=?, "+
 				"message_count = message_count + 1, last_message_content=?, "+
 				"last_message_sender_uid=?, updated_at=? "+
 				"WHERE short_id=?",

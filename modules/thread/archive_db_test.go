@@ -219,6 +219,36 @@ func TestRecordMessageAndReactivate_ResurrectsArchived(t *testing.T) {
 	assert.WithinDuration(t, time.Now(), *m.LastMessageAt, 5*time.Second)
 }
 
+// TestRecordMessageAndReactivate_LaggingGenSeqKeepsVersionMonotonic 回归 reviewer 的
+// P2：解档写成 GREATEST(version+1, GenSeq) 之后，需要一个「GenSeq 落后于归档行版本」
+// 的直接用例——既有用例里 GenSeq 总是大于行内版本，删掉 GREATEST 也照样通过。
+// 覆盖 GenSeq 低于行内版本（50 < 5000）与恰好相等（5000 == 5000）两种边界：
+// 两种都必须落在 5001，且 preview / sender / message_count 同事务落库。
+func TestRecordMessageAndReactivate_LaggingGenSeqKeepsVersionMonotonic(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "reactivate_lagging", ThreadStatusArchived, &now, 5000)
+	insertThreadWithVersion(t, db, "reactivate_equal", ThreadStatusArchived, &now, 5000)
+
+	require.NoError(t, db.RecordMessageAndReactivate("reactivate_lagging", "back", "u42", constVersion(50)))
+	require.NoError(t, db.RecordMessageAndReactivate("reactivate_equal", "back", "u42", constVersion(5000)))
+
+	for _, shortID := range []string{"reactivate_lagging", "reactivate_equal"} {
+		m, err := db.QueryByShortID(shortID)
+		require.NoError(t, err)
+		assert.Equal(t, ThreadStatusActive, m.Status, "%s must be reactivated", shortID)
+		assert.Equal(t, int64(5001), m.Version,
+			"%s must advance past the archived row version even when GenSeq lags", shortID)
+		assert.Equal(t, int64(1), m.MessageCount)
+		assert.Equal(t, "back", m.LastMessageContent)
+		assert.Equal(t, "u42", m.LastMessageSenderUID)
+	}
+}
+
 // TestRecordMessageAndReactivate_NoVersionBumpForAlreadyActive 反向用例：
 // 已经 active 的子区收到消息只更新统计，不无谓地 bump version，避免每条消息把 thread
 // 推到 sync 的"已变更"队列里。
@@ -335,6 +365,150 @@ func TestUpdateStatusFrom_CASRetriesOnConcurrentBump(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ThreadStatusActive, m.Status)
 	assert.Equal(t, int64(200), m.Version)
+}
+
+// TestUpdateStatusFrom_VersionAheadOfGenSeq 回归线上「有的子区点归档报未知错误」：
+// 多实例部署下各实例缓存的 seq 段可能重叠/落后，某行 version 可能已经大于本实例
+// GenSeq 返回的值。旧实现每次重试都重新取 GenSeq（仍然更小），三连败后返回
+// ErrThreadCASExhausted → 对外 500 store_failed → 前端「未知错误」。
+// 新实现改为在共享序列上预留一个 > 行内版本的值重试：必须成功、version 严格递增，
+// 且落库值等于预留后的共享水位。
+func TestUpdateStatusFrom_VersionAheadOfGenSeq(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "version_ahead", ThreadStatusActive, &now, 5000)
+	clearThreadSeq(t, db)
+
+	// 本实例 GenSeq 一直返回落后的小值（模拟 seq 段回退/另一实例已推进）。
+	staleGen := func() (int64, error) { return 50, nil }
+
+	require.NoError(t, db.UpdateStatusFrom("version_ahead", ThreadStatusActive, ThreadStatusArchived, staleGen))
+
+	m, err := db.QueryByShortID("version_ahead")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusArchived, m.Status)
+	assert.Equal(t, int64(5001), m.Version, "version must advance past the row value, never regress")
+	assert.GreaterOrEqual(t, threadSeqWatermark(t, db), m.Version,
+		"fallback version must be reserved in the shared seq stream, not synthesized locally")
+}
+
+// threadSeqWatermark 读共享序列 seq:thread 的当前水位 min_seq。
+// GenSeq 的窗口上界就写在这里，也是 reserveThreadVersion 预留版本号的地方。
+func threadSeqWatermark(t *testing.T, db *DB) int64 {
+	t.Helper()
+	var v int64
+	err := db.session.SelectBySql(
+		"SELECT min_seq FROM `seq` WHERE `key`=?",
+		seqKeyPrefix+ThreadSeqKey,
+	).LoadOne(&v)
+	require.NoError(t, err)
+	return v
+}
+
+// clearThreadSeq 删掉 seq:thread 行，让断言不依赖 setup 阶段可能已经消耗掉的水位。
+// 这些用例的 newVersion 都是 stub，不会再有 GenSeq 把行写回来。
+func clearThreadSeq(t *testing.T, db *DB) {
+	t.Helper()
+	_, err := db.session.DeleteFrom(threadSeqTable).
+		Where("`key`=?", seqKeyPrefix+ThreadSeqKey).Exec()
+	require.NoError(t, err)
+}
+
+// TestReserveThreadVersion_AdvancesSharedWatermark 直接锁住 reserveThreadVersion 的
+// 契约：返回的版本号严格递增、互不重复，并同步推进共享水位；floor 高于水位时直接采用 floor。
+func TestReserveThreadVersion_AdvancesSharedWatermark(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+	clearThreadSeq(t, db)
+
+	v1, err := db.reserveThreadVersion(5001)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5001), v1, "first reservation must honour the floor")
+	assert.Equal(t, v1, threadSeqWatermark(t, db), "watermark must move to the reserved value")
+
+	v2, err := db.reserveThreadVersion(5001)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5002), v2, "second reservation must not reuse v1 even with the same floor")
+	assert.Equal(t, v2, threadSeqWatermark(t, db))
+
+	v3, err := db.reserveThreadVersion(9000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(9000), v3, "a floor above the watermark wins")
+	assert.Equal(t, v3, threadSeqWatermark(t, db))
+}
+
+// TestUpdateStatusFrom_VersionAheadOfGenSeqReservesAcrossRows 回归 Octo-Q P1：
+// 兜底版本号不能是「行内 version+1」这种凭空值。两个行内版本都落后于对方实例写入的
+// 5000 时，两次兜底必须拿到两个不同且递增的版本号，而不是同一行内 local 值。
+func TestUpdateStatusFrom_VersionAheadOfGenSeqReservesAcrossRows(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+	clearThreadSeq(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "ahead_row_a", ThreadStatusActive, &now, 5000)
+	insertThreadWithVersion(t, db, "ahead_row_b", ThreadStatusActive, &now, 5000)
+
+	staleGen := func() (int64, error) { return 50, nil }
+
+	require.NoError(t, db.UpdateStatusFrom("ahead_row_a", ThreadStatusActive, ThreadStatusArchived, staleGen))
+	require.NoError(t, db.UpdateStatusFrom("ahead_row_b", ThreadStatusActive, ThreadStatusArchived, staleGen))
+
+	a, err := db.QueryByShortID("ahead_row_a")
+	require.NoError(t, err)
+	b, err := db.QueryByShortID("ahead_row_b")
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(5001), a.Version)
+	assert.Equal(t, int64(5002), b.Version,
+		"the second fallback must reserve a fresh version, not reuse the first row's local value")
+	assert.Equal(t, int64(5002), threadSeqWatermark(t, db))
+}
+
+// TestUpdateName_VersionAheadOfGenSeq 同名场景：改名也不能因 GenSeq 落后而 500。
+func TestUpdateName_VersionAheadOfGenSeq(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "rename_ahead", ThreadStatusActive, &now, 5000)
+	clearThreadSeq(t, db)
+
+	require.NoError(t, db.UpdateName("rename_ahead", "renamed", func() (int64, error) { return 50, nil }))
+
+	m, err := db.QueryByShortID("rename_ahead")
+	require.NoError(t, err)
+	assert.Equal(t, "renamed", m.Name)
+	assert.Equal(t, int64(5001), m.Version)
+}
+
+// TestMarkDeleted_VersionAheadOfGenSeq 同名场景：删除也不能因 GenSeq 落后而 500。
+func TestMarkDeleted_VersionAheadOfGenSeq(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	insertThreadWithVersion(t, db, "delete_ahead", ThreadStatusActive, &now, 5000)
+	clearThreadSeq(t, db)
+
+	require.NoError(t, db.MarkDeleted("delete_ahead", func() (int64, error) { return 50, nil }))
+
+	m, err := db.QueryByShortID("delete_ahead")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusDeleted, m.Status)
+	assert.Equal(t, int64(5001), m.Version)
 }
 
 func TestUpdateStatusFrom_NoSuchRow(t *testing.T) {
