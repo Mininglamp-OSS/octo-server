@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,17 @@ func TestWriteNormalizesAtSQLBoundary(t *testing.T) {
 	}
 }
 
+func TestWriteOrdersStoredDecimalStringsAcrossWidths(t *testing.T) {
+	session, mock := testSession(t)
+	rows := []Row{{MessageID: 9, UID: "u"}, {MessageID: 14, UID: "u"}, {MessageID: 10, UID: "u"}, {MessageID: 11, UID: "u"}, {MessageID: 12, UID: "u"}, {MessageID: 13, UID: "u"}, {MessageID: 10, UID: "u"}}
+	mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("VALUES (10, '', 0, 'u'),(11, '', 0, 'u'),(12, '', 0, 'u'),(13, '', 0, 'u'),(14, '', 0, 'u'),(9, '', 0, 'u')")).WillReturnResult(sqlmock.NewResult(0, 6))
+	mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
+	if err := Write(context.Background(), session, rows); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWriteRetriesOnlyStatementDeadlock(t *testing.T) {
 	deadlock := fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1213, Message: "deadlock"})
 	for _, tc := range []struct {
@@ -81,7 +93,25 @@ func TestWriteRetriesOnlyStatementDeadlock(t *testing.T) {
 				mock.ExpectExec(insertPattern).WillReturnResult(sqlmock.NewResult(0, 1))
 				mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
 			}
-			err := Write(context.Background(), session, []Row{{MessageID: 1, UID: "u", ChannelID: "c", ChannelType: 2}})
+			writeReturned := false
+			enqueued := 0
+			err := AfterWrite(func() error {
+				err := Write(context.Background(), session, []Row{{MessageID: 1, UID: "u", ChannelID: "c", ChannelType: 2}})
+				writeReturned = true
+				return err
+			}, func() {
+				if !writeReturned {
+					t.Error("enqueue preceded Write return")
+				}
+				enqueued++
+			})
+			wantEnqueues := 0
+			if tc.success {
+				wantEnqueues = 1
+			}
+			if enqueued != wantEnqueues {
+				t.Fatalf("enqueues=%d want=%d", enqueued, wantEnqueues)
+			}
 			if (err == nil) != tc.success {
 				t.Fatalf("success=%v, error=%v", tc.success, err)
 			}
@@ -112,26 +142,23 @@ func TestWriteDeadlockExhaustion(t *testing.T) {
 	}
 }
 
-func TestWriteCancellationAndDeadline(t *testing.T) {
-	t.Run("cancelled before begin", func(t *testing.T) {
-		session, _ := testSession(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		if err := Write(ctx, session, []Row{{MessageID: 1}}); !errors.Is(err, context.Canceled) {
-			t.Fatalf("got %v", err)
-		}
-	})
-	t.Run("deadline bounds backoff", func(t *testing.T) {
-		session, mock := testSession(t)
-		mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectExec(insertPattern).WillReturnError(&mysql.MySQLError{Number: 1213})
-		mock.ExpectExec("^ROLLBACK$").WillReturnResult(sqlmock.NewResult(0, 0))
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-		defer cancel()
-		if err := Write(ctx, session, []Row{{MessageID: 1}}); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("got %v", err)
-		}
-	})
+func TestWriteParentCancellationDoesNotDropReceipt(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired_deadline_%v", expired), func(t *testing.T) {
+			session, mock := testSession(t)
+			parent, cancel := context.WithCancel(context.Background())
+			if expired {
+				parent, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			}
+			cancel()
+			mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
+			mock.ExpectExec(insertPattern).WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
+			if err := Write(parent, session, []Row{{MessageID: 1}}); err != nil {
+				t.Fatalf("parent cancellation dropped receipt: %v", err)
+			}
+		})
+	}
 }
 
 func TestWriteRejectsConflictingDuplicate(t *testing.T) {
@@ -157,7 +184,7 @@ func TestWriteTotalBudgetBoundsBegin(t *testing.T) {
 	session, mock := testSession(t)
 	mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0)).WillDelayFor(3 * time.Second)
 	start := time.Now()
-	err := Write(context.Background(), session, []Row{{MessageID: 1}})
+	err := writeWithPolicy(context.Background(), session, []Row{{MessageID: 1}}, 1, writeBudget)
 	if err == nil {
 		t.Fatal("delayed begin reported success")
 	}
@@ -180,7 +207,7 @@ func TestWriteCompletionRespectsContextAndDiscardsConnection(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
 			start := time.Now()
-			if err := Write(ctx, session, []Row{{MessageID: 1}}); err == nil {
+			if err := writeWithPolicy(ctx, session, []Row{{MessageID: 1}}, 3, 150*time.Millisecond); err == nil {
 				t.Fatal("timed-out completion reported success")
 			}
 			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
@@ -190,5 +217,44 @@ func TestWriteCompletionRespectsContextAndDiscardsConnection(t *testing.T) {
 				t.Fatalf("uncertain transaction returned to pool: %+v", stats)
 			}
 		})
+	}
+}
+
+func TestWriteRejectsInvalidAttemptLimit(t *testing.T) {
+	for _, attempts := range []int{0, -1} {
+		session, _ := testSession(t)
+		if err := writeWithPolicy(context.Background(), session, []Row{{MessageID: 1}}, attempts, writeBudget); err == nil {
+			t.Fatal("invalid maxAttempts accepted")
+		}
+	}
+}
+
+func TestWriteAttemptBudgetAndFailureDiagnostics(t *testing.T) {
+	for _, parentCanceled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parent_canceled_%v", parentCanceled), func(t *testing.T) {
+			session, mock := testSession(t)
+			mock.ExpectExec("^START TRANSACTION$").WillDelayFor(time.Second).WillReturnResult(sqlmock.NewResult(0, 0))
+			parent, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if parentCanceled {
+				cancel()
+			}
+			start := time.Now()
+			err := writeWithPolicy(parent, session, []Row{{MessageID: 1}}, 3, 300*time.Millisecond)
+			if !errors.Is(err, ErrBudgetExceeded) || errors.Is(err, ErrParentCanceled) != parentCanceled {
+				t.Fatalf("wrong error classification: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed < 90*time.Millisecond || elapsed > 500*time.Millisecond {
+				t.Fatalf("remaining/remaining-attempts budget not applied: %v", elapsed)
+			}
+		})
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	session, mock := testSession(t)
+	mock.ExpectExec("^START TRANSACTION$").WillReturnError(io.EOF)
+	err := Write(parent, session, []Row{{MessageID: 1}})
+	if !errors.Is(err, ErrParentCanceled) || errors.Is(err, ErrBudgetExceeded) || !errors.Is(err, io.EOF) {
+		t.Fatalf("parent cancellation confused with budget: %v", err)
 	}
 }

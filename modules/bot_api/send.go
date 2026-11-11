@@ -825,44 +825,47 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 					ChannelType: channelType, UID: robotID,
 				})
 			}
-			err = readreceipt.Write(c.Request.Context(), ba.db.session, rows)
+			err = readreceipt.AfterWrite(func() error {
+				return readreceipt.Write(c.Request.Context(), ba.db.session, rows)
+			}, func() {
+				// Write Redis cache for read receipt aggregation
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							ba.Error("goroutine panic",
+								zap.Any("recover", r),
+								zap.String("stack", string(debug.Stack())),
+							)
+						}
+					}()
+					for _, msg := range syncMsg.Messages {
+						messageIDStr := strconv.FormatInt(msg.MessageID, 10)
+						cacheData := map[string]interface{}{
+							"MessageID":      msg.MessageID,
+							"MessageIDStr":   messageIDStr,
+							"MessageSeq":     msg.MessageSeq,
+							"FromUID":        msg.FromUID,
+							"ChannelID":      fakeChannelID,
+							"ChannelType":    channelType,
+							"LoginUID":       robotID,
+							"ReqChannelID":   channelID,
+							"ReqChannelType": channelType,
+						}
+						jsonStr, _ := json.Marshal(cacheData)
+						ba.ctx.GetRedisConn().SetAndExpire(
+							fmt.Sprintf("readedCount:%s", messageIDStr),
+							string(jsonStr),
+							time.Hour*24*7,
+						)
+					}
+				}()
+			})
 			if err != nil {
 				ba.Error("插入已读记录失败", zap.Error(err))
 				httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 				return
 			}
 
-			// Write Redis cache for read receipt aggregation
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						ba.Error("goroutine panic",
-							zap.Any("recover", r),
-							zap.String("stack", string(debug.Stack())),
-						)
-					}
-				}()
-				for _, msg := range syncMsg.Messages {
-					messageIDStr := strconv.FormatInt(msg.MessageID, 10)
-					cacheData := map[string]interface{}{
-						"MessageID":      msg.MessageID,
-						"MessageIDStr":   messageIDStr,
-						"MessageSeq":     msg.MessageSeq,
-						"FromUID":        msg.FromUID,
-						"ChannelID":      fakeChannelID,
-						"ChannelType":    channelType,
-						"LoginUID":       robotID,
-						"ReqChannelID":   channelID,
-						"ReqChannelType": channelType,
-					}
-					jsonStr, _ := json.Marshal(cacheData)
-					ba.ctx.GetRedisConn().SetAndExpire(
-						fmt.Sprintf("readedCount:%s", messageIDStr),
-						string(jsonStr),
-						time.Hour*24*7,
-					)
-				}
-			}()
 		}
 	}
 

@@ -28,6 +28,10 @@ func TestMessageReadedCommitGatesCache(t *testing.T) {
 		for _, outcome := range []string{"retry-success", "exhausted", "commit-unknown"} {
 			t.Run(outcome+string(rune('0'+channelType)), func(t *testing.T) {
 				cache := readreceipttest.NewCache(t)
+				cache.ExpectCount(0)
+				if outcome == "retry-success" {
+					cache.ExpectCount(1)
+				}
 				im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					io.WriteString(w, `{"messages":[{"message_id":7,"message_seq":1,"from_uid":"sender"}]}`)
 				}))
@@ -44,7 +48,7 @@ func TestMessageReadedCommitGatesCache(t *testing.T) {
 				}
 				defer db.Close()
 				db.SetMaxOpenConns(2)
-				conn := &dbr.Connection{DB: db, Dialect: dialect.MySQL, EventReceiver: &readreceipttest.CommitEvents{Cache: cache}}
+				conn := &dbr.Connection{DB: db, Dialect: dialect.MySQL, EventReceiver: &dbr.NullEventReceiver{}}
 				m := &Message{ctx: ctx, Log: log.NewTLog("receipt-test"), memberReadedDB: &memberReadedDB{session: conn.NewSession(nil)}}
 				channel := "peer"
 				if channelType == 1 {

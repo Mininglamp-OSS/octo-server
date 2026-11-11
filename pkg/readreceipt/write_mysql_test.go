@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,25 +15,7 @@ import (
 // Run against an explicit local disposable DB or the existing Actions E2E DB.
 // The fixture is a test assumption, not evidence of the production schema.
 func TestWriteMySQLOverlappingBatches(t *testing.T) {
-	dsn := os.Getenv("READ_RECEIPT_MYSQL_DSN")
-	if dsn == "" && os.Getenv("GITHUB_ACTIONS") == "true" {
-		// ci/run-e2e-shard.sh recreates this disposable DB before each package.
-		dsn = "root:demo@tcp(127.0.0.1:3306)/test?parseTime=true"
-	}
-	if dsn == "" {
-		t.Skip("set READ_RECEIPT_MYSQL_DSN to a disposable MySQL database")
-	}
-	open := func() *dbr.Connection {
-		conn, err := dbr.Open("mysql", dsn, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn.SetMaxOpenConns(1)
-		conn.SetMaxIdleConns(1)
-		t.Cleanup(func() { conn.Close() })
-		return conn
-	}
-	left, right := open(), open()
+	left, right := openReceiptMySQL(t), openReceiptMySQL(t)
 	var leftID, rightID int64
 	if err := left.QueryRow("SELECT CONNECTION_ID()").Scan(&leftID); err != nil {
 		t.Fatal(err)
@@ -48,17 +31,7 @@ func TestWriteMySQLOverlappingBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("MySQL %s; isolation=%s; connections=%d/%d", version, isolation, leftID, rightID)
-	_, err := left.Exec(`CREATE TABLE IF NOT EXISTS member_readed (
-		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		message_id VARCHAR(20) NOT NULL,
-		channel_id VARCHAR(100) NOT NULL,
-		channel_type TINYINT UNSIGNED NOT NULL,
-		uid VARCHAR(100) NOT NULL,
-		UNIQUE KEY message_uid (message_id, uid)
-	) ENGINE=InnoDB`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ensureReceiptFixture(t, left)
 	for _, existing := range []int{0, 3, 7} {
 		t.Run(fmt.Sprintf("existing_%d", existing), func(t *testing.T) {
 			uid := fmt.Sprintf("receipt-test-%d-%d", time.Now().UnixNano(), existing)
@@ -111,4 +84,71 @@ func TestWriteMySQLOverlappingBatches(t *testing.T) {
 			t.Log("50 simultaneous ascending/shuffled 6/7 pairs; exactly seven unique rows per pair")
 		})
 	}
+}
+
+func receiptMySQLDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv("READ_RECEIPT_MYSQL_DSN")
+	if dsn == "" && os.Getenv("GITHUB_ACTIONS") == "true" {
+		// This package is in the E2E lane, whose runner recreates this DB.
+		dsn = "root:demo@tcp(127.0.0.1:3306)/test?parseTime=true"
+	}
+	if dsn == "" {
+		if os.Getenv("READ_RECEIPT_REQUIRE_MYSQL") == "1" {
+			t.Fatal("E2E requires READ_RECEIPT_MYSQL_DSN; refusing to skip")
+		}
+		t.Skip("set READ_RECEIPT_MYSQL_DSN to a disposable MySQL database")
+	}
+	return dsn
+}
+
+func openReceiptMySQL(t *testing.T) *dbr.Connection {
+	t.Helper()
+	conn, err := dbr.Open("mysql", receiptMySQLDSN(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.Ping(); err != nil {
+		t.Fatalf("required MySQL unavailable: %v", err)
+	}
+	return conn
+}
+
+func ensureReceiptFixture(t *testing.T, conn *dbr.Connection) {
+	t.Helper()
+	var exists int
+	if err := conn.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='member_readed'").Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists == 1 {
+		validateReceiptFixture(t, conn)
+		return
+	}
+	migration, err := os.ReadFile("../../modules/message/sql/20210407000001_message_legacy01.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := string(migration)
+	start := strings.Index(ddl, "CREATE TABLE `member_readed`")
+	if start < 0 {
+		t.Fatal("member_readed migration section not found")
+	}
+	end := strings.Index(ddl[start:], "-- 最近会话扩展表")
+	if end < 0 {
+		t.Fatal("member_readed migration section not found")
+	}
+	// Execute the actual repository table and all three indexes, not a reduced
+	// lookalike. This is still not evidence of the deployed production DDL.
+	for _, statement := range strings.Split(ddl[start:start+end], ";") {
+		if strings.TrimSpace(statement) == "" {
+			continue
+		}
+		if _, err := conn.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	validateReceiptFixture(t, conn)
 }

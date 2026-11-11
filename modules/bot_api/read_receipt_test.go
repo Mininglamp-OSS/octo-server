@@ -29,6 +29,10 @@ func TestBotReadReceiptCommitGatesCache(t *testing.T) {
 		for _, outcome := range []string{"retry-success", "exhausted", "commit-unknown"} {
 			t.Run(outcome+string(rune('0'+channelType)), func(t *testing.T) {
 				cache := readreceipttest.NewCache(t)
+				cache.ExpectCount(0)
+				if outcome == "retry-success" {
+					cache.ExpectCount(1)
+				}
 				var badgeCalls atomic.Int32
 				im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if r.URL.Path == "/conversations/setUnread" {
@@ -49,7 +53,7 @@ func TestBotReadReceiptCommitGatesCache(t *testing.T) {
 				}
 				defer db.Close()
 				db.SetMaxOpenConns(2)
-				conn := &dbr.Connection{DB: db, Dialect: dialect.MySQL, EventReceiver: &readreceipttest.CommitEvents{Cache: cache}}
+				conn := &dbr.Connection{DB: db, Dialect: dialect.MySQL, EventReceiver: &dbr.NullEventReceiver{}}
 				m := &BotAPI{ctx: ctx, Log: log.NewTLog("receipt-test"), db: &botAPIDB{session: conn.NewSession(nil)},
 					groupStatusQueryOverride: func(string) (int, error) { return 0, nil },
 					groupMemberCountOverride: func(string, string) (int, error) { return 1, nil },
