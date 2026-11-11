@@ -27,10 +27,12 @@ statement deadlocks without reporting an unknown commit as success.
 - Retry only statement error 1213 identified with `errors.As`, after releasing
   the old transaction. At most three fresh transactions, exponential backoff
   plus jitter and a separate two-second write budget. Each attempt receives
-  remaining time / remaining attempts; timeout is a failure, not a new retry
-  class. Diagnostics distinguish `budget_exceeded` from `parent_canceled`.
-- Intentional policy change (Lead decision R955-01, pending human maintainer
-  confirmation): use `context.WithoutCancel(parent)` before the two-second
+  remaining time / remaining attempts, with a first-attempt floor of 500ms
+  capped by the remaining total budget. A child deadline is diagnostic only:
+  confirmed-rollback 1213 may retry if the total context is live and enough
+  time remains for backoff; timeout alone is not a new retry class. Diagnostics distinguish `budget_exceeded` from `parent_canceled`.
+- Intentional policy change (Lead decision R955-01; maintainer accept(A),
+  Guo Song, 2026-11-11 20:35 GMT+8, PR issuecomment-6796042989): use `context.WithoutCancel(parent)` before the two-second
   budget, preserving values but ignoring parent cancellation/deadline. An
   accepted receipt's persistence continues after a mobile disconnect. Success
   is still only a confirmed commit; this is not a guarantee that every write
@@ -78,3 +80,13 @@ statement deadlocks without reporting an unknown commit as success.
   after a successful retry; exhausted/unknown-commit writes send none.
 - Native formatting, focused race tests, vet/build and available repository
   checks pass; unavailable full-system and production evidence is reported.
+
+### Round-two fixture evidence boundary
+
+Tests embed the existing migration SQL from `modules/message/sql` (a lightweight
+resource package uses `//go:embed *.sql` inside that directory; no copied DDL).
+The pinned filename and required table/three index statements fail loudly on
+rename/split. Existing fixtures are checked for columns/defaults/indexes including
+SUB_PART, InnoDB, and table/varchar collations matching the disposable database
+default. These checks establish the enumerated fixture assumptions, not complete
+schema equivalence or any production fact.

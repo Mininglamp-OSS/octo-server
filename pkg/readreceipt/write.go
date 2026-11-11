@@ -70,7 +70,11 @@ func writeWithPolicy(parent context.Context, session *dbr.Session, rows []Row, a
 			return writeFailure(parent, err, true)
 		}
 		remaining := time.Until(deadline)
-		attemptCtx, finish := context.WithTimeout(ctx, remaining/time.Duration(attempts-attempt+1))
+		attemptBudget := remaining / time.Duration(attempts-attempt+1)
+		if attempt == 1 {
+			attemptBudget = min(remaining, max(attemptBudget, 500*time.Millisecond))
+		}
+		attemptCtx, finish := context.WithTimeout(ctx, attemptBudget)
 		retry, err := writeAttempt(attemptCtx, session, rows)
 		exceeded := attemptCtx.Err() != nil
 		finish()
@@ -78,20 +82,31 @@ func writeWithPolicy(parent context.Context, session *dbr.Session, rows []Row, a
 			return nil
 		}
 		err = fmt.Errorf("read receipt attempt %d: %w", attempt, err)
-		if !retry || attempt == attempts || exceeded {
+		if !retry || attempt == attempts {
 			return writeFailure(parent, err, exceeded)
 		}
 		// Exponential 10/20 ms base plus jitter, bounded by the total budget.
 		base := (10 * time.Millisecond) << (attempt - 1)
-		timer := time.NewTimer(base + time.Duration(rand.Int64N(int64(base))))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return writeFailure(parent, errors.Join(err, ctx.Err()), true)
-		case <-timer.C:
+		delay := base + time.Duration(rand.Int64N(int64(base)))
+		if ctx.Err() != nil || time.Until(deadline) <= delay {
+			return writeFailure(parent, err, true)
+		}
+		if waitErr := waitForRetry(ctx, delay); waitErr != nil {
+			return writeFailure(parent, errors.Join(err, waitErr), true)
 		}
 	}
 	return errors.New("read receipt attempts exhausted")
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 func writeFailure(parent context.Context, err error, exceeded bool) error {

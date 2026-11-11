@@ -244,8 +244,8 @@ func TestWriteAttemptBudgetAndFailureDiagnostics(t *testing.T) {
 			if !errors.Is(err, ErrBudgetExceeded) || errors.Is(err, ErrParentCanceled) != parentCanceled {
 				t.Fatalf("wrong error classification: %v", err)
 			}
-			if elapsed := time.Since(start); elapsed < 90*time.Millisecond || elapsed > 500*time.Millisecond {
-				t.Fatalf("remaining/remaining-attempts budget not applied: %v", elapsed)
+			if elapsed := time.Since(start); elapsed < 290*time.Millisecond || elapsed > 650*time.Millisecond {
+				t.Fatalf("first-attempt floor/total budget not applied: %v", elapsed)
 			}
 		})
 	}
@@ -256,5 +256,59 @@ func TestWriteAttemptBudgetAndFailureDiagnostics(t *testing.T) {
 	err := Write(parent, session, []Row{{MessageID: 1}})
 	if !errors.Is(err, ErrParentCanceled) || errors.Is(err, ErrBudgetExceeded) || !errors.Is(err, io.EOF) {
 		t.Fatalf("parent cancellation confused with budget: %v", err)
+	}
+}
+
+// A confirmed rollback can finish just before its child deadline, while the
+// caller observes expiry just afterwards. Only the total budget vetoes retry.
+type delayedRollbackReceiver struct{ dbr.NullEventReceiver }
+
+func (*delayedRollbackReceiver) Event(name string) {
+	if name == "dbr.rollback" {
+		time.Sleep(550 * time.Millisecond)
+	}
+}
+func TestWriteRetriesConfirmedRollbackAfterChildExpiry(t *testing.T) {
+	session, mock := testSession(t)
+	session.EventReceiver = &delayedRollbackReceiver{}
+	mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(insertPattern).WillReturnError(&mysql.MySQLError{Number: 1213})
+	mock.ExpectExec("^ROLLBACK$").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(insertPattern).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
+	if err := writeWithPolicy(context.Background(), session, []Row{{MessageID: 1}}, 3, 1200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestWriteInsufficientRetryBudget(t *testing.T) {
+	session, mock := testSession(t)
+	deadlock := &mysql.MySQLError{Number: 1213}
+	mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(insertPattern).WillReturnError(deadlock)
+	mock.ExpectExec("^ROLLBACK$").WillReturnResult(sqlmock.NewResult(0, 0))
+	err := writeWithPolicy(context.Background(), session, []Row{{MessageID: 1}}, 3, 8*time.Millisecond)
+	if !errors.Is(err, ErrBudgetExceeded) || !errors.Is(err, deadlock) || errors.Is(err, ErrParentCanceled) {
+		t.Fatalf("budget/1213 classification: %v", err)
+	}
+}
+func TestWriteBudgetExpiresDuringRetrySleep(t *testing.T) {
+	session, mock := testSession(t)
+	deadlock := &mysql.MySQLError{Number: 1213}
+	mock.ExpectExec("^START TRANSACTION$").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(insertPattern).WillReturnError(deadlock)
+	mock.ExpectExec("^ROLLBACK$").WillReturnResult(sqlmock.NewResult(0, 0))
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Millisecond)
+	defer cancel()
+	retry, err := writeAttempt(ctx, session, []Row{{MessageID: 1}})
+	if !retry || !errors.Is(err, deadlock) {
+		t.Fatalf("fast 1213/confirmed rollback: %v %v", retry, err)
+	}
+	// Exercise the same wait used by Write deterministically: scheduler delays can
+	// consume budget after admission. No fixed sleep or jitter-dependent outcome.
+	waitErr := waitForRetry(ctx, 30*time.Millisecond)
+	err = writeFailure(context.Background(), errors.Join(err, waitErr), waitErr != nil)
+	if !errors.Is(err, ErrBudgetExceeded) || !errors.Is(err, deadlock) || errors.Is(err, ErrParentCanceled) {
+		t.Fatalf("sleep budget classification: %v", err)
 	}
 }

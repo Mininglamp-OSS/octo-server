@@ -12,6 +12,13 @@ import (
 // An explicit DSN must not silently reuse an old simplified fixture.
 func validateReceiptFixture(t *testing.T, conn *dbr.Connection) {
 	t.Helper()
+	var engine, collation, databaseCollation string
+	if err := conn.QueryRow(`SELECT t.ENGINE, t.TABLE_COLLATION, s.DEFAULT_COLLATION_NAME FROM information_schema.tables t JOIN information_schema.schemata s ON s.SCHEMA_NAME=t.TABLE_SCHEMA WHERE t.TABLE_SCHEMA=DATABASE() AND t.TABLE_NAME='member_readed'`).Scan(&engine, &collation, &databaseCollation); err != nil {
+		t.Fatal(err)
+	}
+	if engine != "InnoDB" || collation != databaseCollation {
+		t.Fatalf("fixture requires InnoDB and database default collation: engine=%s collation=%s default=%s", engine, collation, databaseCollation)
+	}
 	type column struct {
 		dataType string
 		width    int64
@@ -22,7 +29,7 @@ func validateReceiptFixture(t *testing.T, conn *dbr.Connection) {
 		"channel_type": {"smallint", 0}, "uid": {"varchar", 40},
 		"created_at": {"timestamp", 0}, "updated_at": {"timestamp", 0},
 	}
-	rows, err := conn.Query(`SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_TYPE FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='member_readed'`)
+	rows, err := conn.Query(`SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_TYPE, COLLATION_NAME FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='member_readed'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,8 +37,8 @@ func validateReceiptFixture(t *testing.T, conn *dbr.Connection) {
 	for rows.Next() {
 		var name, kind, nullable, extra, columnType string
 		var width sql.NullInt64
-		var defaultValue sql.NullString
-		if err := rows.Scan(&name, &kind, &width, &nullable, &defaultValue, &extra, &columnType); err != nil {
+		var defaultValue, columnCollation sql.NullString
+		if err := rows.Scan(&name, &kind, &width, &nullable, &defaultValue, &extra, &columnType, &columnCollation); err != nil {
 			rows.Close()
 			t.Fatal(err)
 		}
@@ -41,6 +48,9 @@ func validateReceiptFixture(t *testing.T, conn *dbr.Connection) {
 		}
 		switch kind {
 		case "varchar":
+			if columnCollation.String != databaseCollation {
+				t.Errorf("fixture %s collation differs: %s", name, columnCollation.String)
+			}
 			if !defaultValue.Valid || defaultValue.String != "" {
 				t.Errorf("fixture %s default differs: %v", name, defaultValue)
 			}
@@ -66,7 +76,7 @@ func validateReceiptFixture(t *testing.T, conn *dbr.Connection) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixture columns differ from migration: got=%v want=%v", got, want)
 	}
-	indexes, err := conn.Query(`SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='member_readed' ORDER BY INDEX_NAME, SEQ_IN_INDEX`)
+	indexes, err := conn.Query(`SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SUB_PART FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='member_readed' ORDER BY INDEX_NAME, SEQ_IN_INDEX`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,9 +84,13 @@ func validateReceiptFixture(t *testing.T, conn *dbr.Connection) {
 	for indexes.Next() {
 		var name, column string
 		var nonUnique int
-		if err := indexes.Scan(&name, &nonUnique, &column); err != nil {
+		var prefix sql.NullInt64
+		if err := indexes.Scan(&name, &nonUnique, &column, &prefix); err != nil {
 			indexes.Close()
 			t.Fatal(err)
+		}
+		if prefix.Valid {
+			t.Errorf("fixture index %s column %s uses prefix %d", name, column, prefix.Int64)
 		}
 		if gotIndexes[name] == "" {
 			if nonUnique == 0 {

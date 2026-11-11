@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	messagesql "github.com/Mininglamp-OSS/octo-server/modules/message/sql"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -127,25 +127,11 @@ func ensureReceiptFixture(t *testing.T, conn *dbr.Connection) {
 		validateReceiptFixture(t, conn)
 		return
 	}
-	migration, err := os.ReadFile("../../modules/message/sql/20210407000001_message_legacy01.sql")
+	statements, err := receiptFixtureStatements(messagesql.Files)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ddl := string(migration)
-	start := strings.Index(ddl, "CREATE TABLE `member_readed`")
-	if start < 0 {
-		t.Fatal("member_readed migration section not found")
-	}
-	end := strings.Index(ddl[start:], "-- 最近会话扩展表")
-	if end < 0 {
-		t.Fatal("member_readed migration section not found")
-	}
-	// Execute the actual repository table and all three indexes, not a reduced
-	// lookalike. This is still not evidence of the deployed production DDL.
-	for _, statement := range strings.Split(ddl[start:start+end], ";") {
-		if strings.TrimSpace(statement) == "" {
-			continue
-		}
+	for _, statement := range statements {
 		if _, err := conn.Exec(statement); err != nil {
 			t.Fatal(err)
 		}
