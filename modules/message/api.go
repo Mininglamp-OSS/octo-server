@@ -1191,19 +1191,6 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
-	tx, err := m.ctx.DB().Begin()
-	if err != nil {
-		m.Error("开启事务失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-	defer func() {
-		if err := recover(); err != nil {
-			tx.RollbackUnlessCommitted()
-			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
-		}
-	}()
-
 	// 构建批量插入的数据
 	readedModels := make([]*memberReadedModel, 0, len(syncMsg.Messages))
 	for _, message := range syncMsg.Messages {
@@ -1215,16 +1202,9 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		})
 	}
 	// 批量插入或更新已读记录
-	err = m.memberReadedDB.batchInsertOrUpdateTx(readedModels, tx)
+	err = m.memberReadedDB.batchInsertOrUpdate(c.Request.Context(), readedModels)
 	if err != nil {
-		tx.Rollback()
 		m.Error("添加已读数据失败", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		tx.Rollback()
-		m.Error("提交事务失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}

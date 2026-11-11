@@ -1,11 +1,11 @@
 package message
 
 import (
-	"fmt"
-	"strings"
+	"context"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
+	"github.com/Mininglamp-OSS/octo-server/pkg/readreceipt"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -21,36 +21,16 @@ func newMemberReadedDB(ctx *config.Context) *memberReadedDB {
 	}
 }
 
-// 批量插入或更新已读记录
-func (m *memberReadedDB) batchInsertOrUpdateTx(models []*memberReadedModel, tx *dbr.Tx) error {
-	if len(models) == 0 {
-		return nil
-	}
-
-	// 构建批量插入的值和参数
-	valueStrings := make([]string, 0, len(models))
-	valueArgs := make([]interface{}, 0, len(models)*4)
-
+// batchInsertOrUpdate shares the final normalization/transaction boundary with Bot receipts.
+func (m *memberReadedDB) batchInsertOrUpdate(ctx context.Context, models []*memberReadedModel) error {
+	rows := make([]readreceipt.Row, 0, len(models))
 	for _, model := range models {
-		valueStrings = append(valueStrings, "(?, ?, ?, ?)")
-		valueArgs = append(valueArgs,
-			model.MessageID,
-			model.ChannelID,
-			model.ChannelType,
-			model.UID)
+		rows = append(rows, readreceipt.Row{
+			MessageID: model.MessageID, ChannelID: model.ChannelID,
+			ChannelType: model.ChannelType, UID: model.UID,
+		})
 	}
-
-	// 构建完整的 SQL 语句
-	stmt := fmt.Sprintf(`INSERT INTO member_readed 
-        (message_id, channel_id, channel_type, uid) 
-        VALUES %s 
-        ON DUPLICATE KEY UPDATE 
-        message_id=VALUES(message_id)`,
-		strings.Join(valueStrings, ","))
-
-	// 使用 tx.InsertBySql 执行批量插入
-	_, err := tx.InsertBySql(stmt, valueArgs...).Exec()
-	return err
+	return readreceipt.Write(ctx, m.session, rows)
 }
 
 // 查询消息已读数量
