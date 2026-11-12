@@ -1,0 +1,57 @@
+{
+  "contract": "permission-server-remaining-producers-v4",
+  "task": "XIN-2793",
+  "charter_baseline": "v45",
+  "supersedes": "remaining-producers-v3.json for active ownership; v1-v3 retained byte-for-byte",
+  "removed": [
+    {
+      "id": "IM-native-producer",
+      "was": "octo-im native HeaderV1/delivery_reference/disclosure RPC",
+      "status": "REMOVED_FROM_ACTIVE_SCOPE_BY_OWNER (no octo-im work)"
+    },
+    {
+      "id": "HA-fence-provisioning",
+      "was": "external fence/election/recovery service",
+      "status": "OPTIONAL_NON_PRODUCTION; never an operator demand"
+    }
+  ],
+  "remaining": [
+    {
+      "id": "R1",
+      "owner": "XIN-2830",
+      "item": "Exact simpler ordinary-SQL recovery replacement contract plus a short backup/restore operating limitation; no live HA/backup/failover change"
+    },
+    {
+      "id": "R2",
+      "owner": "PjM with XIN-2793 and XIN-2795",
+      "item": "Native message version at delivery (version-at-delivery decision in handoff-v6)"
+    },
+    {
+      "id": "R3",
+      "owner": "XIN-2793 follow-up",
+      "item": "Wire ServerMessageFactProvider into a private fact route composition only after R1; today it is an isolated seam exercised through SQLNativeFactAdapter in synthetic tests"
+    },
+    {
+      "id": "R4",
+      "owner": "XIN-2794 / PjM",
+      "item": "C1-C9 source reconciliation and reviewed support pin and directed pairs; supported_catalog_digest stays null"
+    },
+    {
+      "id": "R5",
+      "owner": "XIN-2795",
+      "item": "E1-E12 and update docs to cite semantic digest 15c7ca2b for catalog-package-v2"
+    },
+    {
+      "id": "R6",
+      "owner": "upstream source owners",
+      "item": "A1 page bounds: concrete values and evidence pending; no constants chosen here"
+    }
+  ],
+  "limitations": [
+    "ServerMessageFactProvider cut is a read-time marker, not an acknowledged-state fence",
+    "Permit one-use tracking is in-process memory; a restart forgets consumed permits",
+    "History pages are stable against appends only; concurrent edit, revoke or clear-history can change later pages",
+    "Group/thread original visibility and untagged DM space are unknown and therefore non-serving for admit/contributor",
+    "Provider reads through its own SQL session, not inside the caller's RepeatableRead transaction"
+  ]
+}

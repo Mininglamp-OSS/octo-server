@@ -1,5 +1,13 @@
 package permissionbundle
 
+// OPTIONAL / NON-PRODUCTION (v45). The external-authority types in this file
+// (RecoveryFenceV1, ElectedAuthoritySession, ExternalAuthorityDriver,
+// FencedAuthorityAdapter) are retained as historical interfaces and synthetic
+// test seams. They are not a delivery prerequisite and no operator is required
+// to provision an external fence, election or recovery service. They are not
+// wired into live startup with a no-op, and nothing here claims restore-safe
+// acknowledged-state recovery for ordinary SQL.
+
 import (
 	"context"
 	"fmt"

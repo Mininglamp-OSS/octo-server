@@ -19,20 +19,25 @@ import (
 
 const NativeFactProviderModeIMV1 = "native_im_fact_provider_v1"
 
+// NativeFactProviderModeServerStoreV1 selects the server-only provider that
+// reads octo-server's own message storage (ServerMessageFactProvider). It is
+// accepted on evidence from that storage, not by name.
+const NativeFactProviderModeServerStoreV1 = "octo_server_message_store_v1"
+
 // RejectPlainMessageSyncFactSource rejects content-first message sync and
 // webhook mirror substitutes that cannot prove header-only inspection,
 // delivery-stream incarnation, or historical/current visibility cuts.
 func RejectPlainMessageSyncFactSource(mode string) error {
 	normalized := strings.ToLower(strings.TrimSpace(mode))
 	switch normalized {
-	case NativeFactProviderModeIMV1:
+	case NativeFactProviderModeIMV1, NativeFactProviderModeServerStoreV1:
 		return nil
 	case "", "none", "disabled":
 		return fmt.Errorf("%w: native fact provider mode not configured", ErrUnavailable)
 	case "im_sync_channel_message", "plain_message_sync", "bot_api_sync", "messages_sync":
 		return fmt.Errorf("%w: plain message sync (%s) returns content-first uint32 payloads and does not prove header-only inspection or original visibility", ErrUnavailable, mode)
 	case "webhook_mirror", "message_mirror", "sql_message_mirror":
-		return fmt.Errorf("%w: webhook or SQL message mirror (%s) cannot establish authoritative delivery headers or original visibility cuts", ErrUnavailable, mode)
+		return fmt.Errorf("%w: webhook or separate SQL message mirror (%s) is a copy that cannot establish authoritative delivery headers or original visibility; use octo_server_message_store_v1 to read the server message storage itself", ErrUnavailable, mode)
 	default:
 		return fmt.Errorf("%w: unsupported native fact provider mode %q", ErrUnavailable, mode)
 	}
@@ -114,6 +119,26 @@ type IMResolvedDelivery struct {
 	CallerParentCurrentRead bool
 	BotParentCurrentRead    bool
 	BotCurrentSend          bool
+
+	// Explicit unknowns: set by providers whose storage cannot prove the value
+	// for this reference. A reference with an applicable unknown is returned as
+	// unavailable (non-serving); the value is never treated as true.
+	MessageSpaceUnknown          bool
+	MessageVersionUnknown        bool
+	CallerOriginalVisibleUnknown bool
+	BotOriginalVisibleUnknown    bool
+}
+
+// unknownReason reports whether an unproven value applies to the purpose.
+// Original visibility is only consulted by non-reply purposes.
+func (d IMResolvedDelivery) unknownReason(purpose string) string {
+	if d.MessageSpaceUnknown || d.MessageVersionUnknown {
+		return "predicate_unsupported"
+	}
+	if purpose != "reply" && (d.CallerOriginalVisibleUnknown || d.BotOriginalVisibleUnknown) {
+		return "predicate_unsupported"
+	}
+	return ""
 }
 
 type IMHistoryHeaderItem struct {
@@ -564,6 +589,14 @@ func (a *SQLNativeFactAdapter) readResolve(ctx context.Context, tx *dbr.Tx, key 
 		}
 		if item.Status != "resolved" {
 			return nil, ErrUnavailable
+		}
+		if reason := item.unknownReason(purpose); reason != "" {
+			results = append(results, map[string]any{
+				"reference": ref,
+				"status":    "unavailable",
+				"reason":    reason,
+			})
+			continue
 		}
 		hMap := item.Header.toMap()
 		srcExists, spaceExact, threadNotDel, err := a.evalSourceExists(ctx, tx, key, item.Header.Source)

@@ -1,0 +1,152 @@
+{
+  "contract": "permission-server-handoff-v6",
+  "task": "XIN-2793",
+  "charter_baseline": "v45",
+  "supersedes": "handoff-v5.json for active prerequisites; handoff-v1.json through handoff-v5.json retained byte-for-byte as history",
+  "authority": {
+    "continuation": "Owner message 2120836305729261568 (03:09 PST), v45 continuation prefix on XIN-2793",
+    "trigger_comment": "ceedb6f4-58bd-4fce-bd4f-14f71e8c6c21",
+    "charter_receipt": "d040527d-641a-4df8-9b0c-bc9070f45688"
+  },
+  "scope_limits": [
+    "No octo-im / WuKongIM code, config, schema, API or service change, task, PR or delegation",
+    "No external fence, election, consensus or recovery platform as a delivery prerequisite",
+    "No live business/DB/service/config/environment change; synthetic isolated local tests only",
+    "No production allowlist, review, deploy, ready or merge; Architect 7b11211f is not adopted as a visibility/recovery contract"
+  ],
+  "server_message_facts": {
+    "provider": "pkg/permissionbundle.ServerMessageFactProvider implements NativeIMFactProvider over octo-server's own storage",
+    "mode_token": "octo_server_message_store_v1",
+    "storage_read": [
+      "sharded message tables (message, message<N>) via the module's own DB.getTable",
+      "message_extra (version, revoke, is_deleted, content_edit, content_edit_hash)",
+      "message_user_extra and channel_offset (per-user delete / clear history), channel_setting.offset_message_seq",
+      "group, group_member, thread (native membership and thread state)"
+    ],
+    "shared_helpers": "modules/message.NewServerMessageFactHooks supplies shard naming, visibles whitelist (visiblesAllows), payload space tag (extractPayloadSpaceID) and system-principal test (space.IsSystemBot); the package carries no default copy and refuses to construct without them",
+    "delivery_reference": "s1-<channel_type>-<hex(channel_id)>-<message_id>-<native_version>; native_version = x<message_extra.version>_<content_edit_hash|0>; token charset [A-Za-z0-9_-]",
+    "header_reference": "h1-<same fields>, always carrying the current native version",
+    "source_reference": "c1-<channel_type>-<hex(channel_id)>",
+    "metadata_only": "no message, quote or media body is placed in any returned value; payload_sha256 is the contract-mandated digest of the current effective body (edited content when edited)",
+    "deny_before_body": "resolve and history headers return metadata only; the permit from IssueHistoryDisclosureV1 is an HMAC token bound to bot, space, context id, epoch, header reference and payload digest and is issued only after current re-resolution",
+    "two_step_disclosure": "preserved: ListHistoryHeadersV1 then IssueHistoryDisclosureV1; the atomic header-plus-body substitute is not implemented or activated",
+    "proven_now": {
+      "dm": "source identity, author, message version (exact only when the reference carries the current version), tagged space (payload space_id == key space), current read for both principals including visibles, per-user delete, per-user and channel clear-history, revoke/delete/non-persisted outcomes, and original visibility for the two DM participants",
+      "group_thread": "source, parent group, space (group.space_id), thread deletion, current membership/read/send for author and bot, visibles exclusion as a definite write-time false, revoke/delete/edit outcomes"
+    },
+    "explicit_unknown_non_serving": {
+      "mechanism": "IMResolvedDelivery.MessageSpaceUnknown / MessageVersionUnknown / CallerOriginalVisibleUnknown / BotOriginalVisibleUnknown; SQLNativeFactAdapter returns that reference as status=unavailable reason=predicate_unsupported (original-visibility unknowns apply to admit and contributor, not reply)",
+      "cases": [
+        "reference without a native version",
+        "DM message with no payload space_id tag (default-space forward compatibility needs state this provider does not assume)",
+        "group/thread original visibility: octo-server keeps no membership history, so a past membership gap cannot be excluded; only a visibles exclusion is provable (false)"
+      ],
+      "counterexample": "group_member rows carry only the current is_deleted/status; a member who left and rejoined is indistinguishable from continuous membership at message time"
+    },
+    "unavailable_reasons": {
+      "mirror_lag": "no row in the message shard for the reference (never persisted or not yet written; not distinguished)",
+      "expired_reference": "revoked, deleted, thread deleted, group not in a readable state",
+      "predicate_unsupported": "malformed or foreign reference, unknown predicate",
+      "disclosure_unavailable": "disclosure not provable"
+    },
+    "cut": "IMAuthorityCut is a read-time marker over ordinary SQL state with an operator-provided 32-hex store incarnation; it is not an acknowledged-state or restore-safe fence",
+    "not_wired_into_startup": "the provider is an isolated seam; no startup path constructs it and no no-op authority is installed"
+  },
+  "ordinary_sql_vs_failover_restore": {
+    "verified_ordinary_sql": "Prepare, independent atomic CAS Save, complete GET readback, reopen of the same store file retaining incarnation/digest/denies, concurrent CAS and ambiguous commit, and choice-B unchanged departed-member DENY, on plain SQL with the fixture authority",
+    "not_claimed": "failover, restore, PITR or RPO0 safety of acknowledged state; a same-DB counter or SQL writable flag is not independent proof; manual reconciliation is not equivalent",
+    "guarantee_delta_vs_v44": "v44 fenced-authority acknowledgement (RecoverAtLeast, election generation) is optional and non-production; without it a restored or rolled-back database can re-serve older bundle revisions. The simpler replacement contract is owned by XIN-2830, not defined here.",
+    "live_startup": "opt-in InstallFromEnv still refuses to serve without a configured authority and returns an explicit ErrUnavailable; nothing fabricates readiness"
+  },
+  "active_prerequisites": [
+    "XIN-2830: deliver the simpler ordinary-SQL replacement contract and short backup/restore operating limitation",
+    "XIN-2793 owner/PjM: choose how endpoint obtains the native message version for a delivered message (see open_decisions)",
+    "XIN-2794 / PjM: C1-C9 source reconciliation and reviewed (catalog_version, catalog_digest) support pin; supported_catalog_digest remains null",
+    "XIN-2795: endpoint ingestion of scope_incarnation/context_epoch and resolve_contributors/open_relay tls metadata (E1-E12)"
+  ],
+  "optional_non_production": [
+    "ExternalAuthorityDriver / FencedAuthorityAdapter / RecoveryFenceV1 / ElectedAuthoritySession retained as historical interfaces and synthetic test seams",
+    "SQLNativeFactAdapter with a NativeIMFactProvider other than ServerMessageFactProvider",
+    "SQLNativeFactAdapter.Authority interface, still required by the adapter constructor"
+  ],
+  "removed_from_active_prerequisites": [
+    "octo-im / WuKongIM development or native header/disclosure RPC",
+    "external HA / fence / election / recovery provisioning by operators",
+    "WKSocket native HeaderV1 / delivery_reference producer in octo-im"
+  ],
+  "open_decisions": [
+    {
+      "id": "version-at-delivery",
+      "question": "The endpoint's recvPacket fields (message id, channel, channel type) can build a delivery reference, but the native version token is not in them. Without it resolve returns unavailable/predicate_unsupported by design.",
+      "smallest_adjustment": "either the endpoint reads the current message_extra version from the existing server sync/extra response and puts it in the reference, or the server adds a private metadata-only version peek. Neither is implemented here.",
+      "owner": "PjM with XIN-2793 and XIN-2795"
+    }
+  ],
+  "consumed_cli": {
+    "task": "XIN-2794",
+    "repository": "ken-anderson2006/octo-cli",
+    "pr": 234,
+    "head": "d39072f8182a28ce2be5884151eb03f16cd205b2",
+    "previous_head": "27b387f1b767a6e0cc200b8e23d074ad3bd28cc1",
+    "contract": {
+      "path": "docs/permission/cli-component-contract-v6.json",
+      "bytes": 8998,
+      "sha256": "8da203c9e6b650f5bc94d81080f4ed7281bd2cc36755ff0027f8e2e6b0b9fe9d"
+    },
+    "manifest": {
+      "path": "docs/permission/contract-manifest-v6.json",
+      "bytes": 2612,
+      "sha256": "7fbb9cece9dfa384181c2fc272cb6afc7f6667b32712aa2e71c8a1c04615301d"
+    },
+    "endpoint_abi": {
+      "path": "docs/permission/endpoint-abi-v2.json",
+      "bytes": 6955,
+      "sha256": "7f9556d0526cff30ef1c36d53d2457dbc4266b8912722717badebac796ad8909"
+    },
+    "package_unchanged_since_27b387f1": true,
+    "catalog_package": {
+      "manifest_bytes": 4934,
+      "manifest_sha256": "ecc56c2ab0a2c520ab7e5203d2abab06671daf90c28d69f88fe1de8d154109fc",
+      "files": 30,
+      "stored_bytes": 7823327
+    },
+    "witness": {
+      "path": "docs/permission/source-slot-witness-v5.json.gz",
+      "bytes": 12562,
+      "sha256": "0c5da173bd0f53c64562a70a5c5feebc955ad111bbe84ed11f5588c08b4b9c0b"
+    },
+    "semantic_digest": "15c7ca2bf6df703979df529afbca6828f116b2463b1a818456edfad80bcad799",
+    "server_verified": "ReadCatalogDirectory + ReadSlotWitnessFile + VerifyCatalogPackage on the unmodified files extracted from d39072f8 yields the same 30 files, ledger and semantic digest",
+    "cli_server_dependency_pin_is_stale": "CLI v6 still names server ff4d43c4 and handoff-v4; the active server contract is handoff-v6 at the head published in XIN-2793",
+    "supported_pins": [],
+    "approved_directed_compatible_pairs": []
+  },
+  "consumed_endpoint": {
+    "task": "XIN-2795",
+    "repository": "ploy-elison/codex-channel-octo",
+    "pr": 102,
+    "head": "a3164ded106e06de88f98a6820da4f0d80876dc9",
+    "handoff": {
+      "path": "docs/permission-endpoint-handoff-v5.json",
+      "bytes": 7294,
+      "sha256": "8b96b29e212e5bf068b66f7eb2dc68a7eb83e4cafc1611e57435501598b6bcdc"
+    },
+    "evidence": {
+      "path": "docs/evidence/xin-2795-v44-browser.json",
+      "bytes": 2077,
+      "sha256": "3b21939e8d283655d9a2ccaf4519439c7ae1180f9bcd8dcc32eac58ad14eca7c"
+    },
+    "reported_semantic_digest": "415acc86598208cbf051c9c08cc47e33e0ec9cd8fe7f9444b48b80f11d95ba21",
+    "digest_reconciliation": "see semantic_digest_reconciliation"
+  },
+  "semantic_digest_reconciliation": {
+    "package_bytes": "identical: 30 files, 7,823,327 stored bytes, manifest ecc56c2a..., same witness 0c5da173...",
+    "ledger": "identical in both representations (pre/post bytes and nodes, parts, roots, shared rows, content records, cells)",
+    "415acc86": "semantic digest emitted by the server verifier at ff4d43c4 (v44 predecessor), whose semantic view hashed selection/rendered maps and normalized content descriptors differently. Reproduced here by running the ff4d43c4 verifier on the unmodified CLI package with a copy of the v5 witness loader (test-only alteration; the loader did not exist at ff4d43c4).",
+    "15c7ca2b": "semantic digest of the current verifier (a4021ad8 onward), matching the CLI's own catalog-package-report-v5.json and cli-component-contract-v6.json. It is the representation the CLI froze.",
+    "conclusion": "not a package or ledger disagreement; the endpoint evidence and handoff-v5 pin the older server representation. Endpoint docs should cite 15c7ca2b for catalog-package-v2 and name the server head that produced it.",
+    "alterations": "only the loader copy above; no package byte, witness byte or verifier code was altered for either run"
+  },
+  "supported_catalog_digest": null,
+  "production_activation": "FAIL_CLOSED"
+}
