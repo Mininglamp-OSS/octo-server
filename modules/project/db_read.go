@@ -29,8 +29,10 @@ func projectReadListPredicate(spaceID, uid, keyword string, archiveFilter projec
 		where += " AND p.archived_at IS NOT NULL"
 	}
 	if keyword != "" {
-		where += " AND p.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'"
-		args = append(args, projectLikePattern(keyword))
+		where += " AND (p.name LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!'" +
+			" OR p.description LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci ESCAPE '!')"
+		pattern := projectLikePattern(keyword)
+		args = append(args, pattern, pattern)
 	}
 	return where, args
 }
