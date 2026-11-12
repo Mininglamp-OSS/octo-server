@@ -3,9 +3,13 @@ package internal_membership
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	projectpkg "github.com/Mininglamp-OSS/octo-server/pkg/project"
+	"github.com/gocraft/dbr/v2"
 )
 
 // membershipStore is the narrow data surface these handlers need.
@@ -119,4 +123,97 @@ func (s dbStore) ProjectMetadata(ctx context.Context, spaceID string, projectIDs
 // Lifecycle delegates to the scoped lifecycle fact layer.
 func (s dbStore) Lifecycle(ctx context.Context, spaceID, projectID string) (*projectpkg.ProjectLifecycle, error) {
 	return projectpkg.ProjectLifecycleInSpace(ctx, s.ctx.DB(), spaceID, projectID)
+}
+
+const identityQueryTimeoutSeconds = 3
+
+var ErrIdentityNotFound = errors.New("identity unavailable in Space")
+
+type identityReader interface {
+	Resolve(context.Context, IdentityRequest) (*IdentityContext, error)
+}
+
+type dbIdentityReader struct {
+	ctx     *config.Context
+	session *dbr.Session
+}
+
+// Resolve reads user/Space first, then an optional BF Bot in the same bounded
+// snapshot. Indexable predicates precede byte-exact ID comparisons.
+func (r *dbIdentityReader) Resolve(ctx context.Context, in IdentityRequest) (*IdentityContext, error) {
+	session := r.session
+	if session == nil && r.ctx != nil {
+		session = r.ctx.DB()
+	}
+	if session == nil {
+		return nil, errors.New("identity database unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, identityQueryTimeoutSeconds*time.Second)
+	defer cancel()
+	tx, err := session.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin identity snapshot: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+	const userSpaceQuery = `
+SELECT u.uid AS user_id, u.name AS user_name,
+       s.space_id, s.name AS space_name, sm.role AS member_role
+FROM user u
+JOIN space s ON s.space_id = ? AND BINARY s.space_id = BINARY ? AND s.status = 1
+JOIN space_member sm ON sm.space_id = ? AND BINARY sm.space_id = BINARY s.space_id
+    AND sm.uid = ? AND BINARY sm.uid = BINARY u.uid AND sm.status = 1
+WHERE u.uid = ? AND BINARY u.uid = BINARY ? AND u.status = 1 AND u.is_destroy <> 2`
+	var row struct {
+		UserID     string `db:"user_id"`
+		UserName   string `db:"user_name"`
+		SpaceID    string `db:"space_id"`
+		SpaceName  string `db:"space_name"`
+		MemberRole int    `db:"member_role"`
+	}
+	err = tx.SelectBySql(userSpaceQuery,
+		in.SpaceID, in.SpaceID, in.SpaceID, in.UserID, in.UserID, in.UserID,
+	).LoadOneContext(ctx, &row)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, ErrIdentityNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read user and Space: %w", err)
+	}
+	if row.MemberRole < 0 || row.MemberRole > 2 {
+		return nil, errors.New("inconsistent identity membership")
+	}
+	out := &IdentityContext{
+		User:       IdentityUser{UserID: row.UserID, Name: row.UserName},
+		Space:      IdentitySpace{SpaceID: row.SpaceID, Name: row.SpaceName},
+		Membership: IdentityMembership{Role: row.MemberRole},
+	}
+	if in.BotID == "" {
+		return out, nil
+	}
+
+	// Resolve the user's owned Bot independently of its Space seat. User/Space
+	// membership was checked above; these facts do not grant Bot resource access.
+	// The user profile supplies the Bot name.
+	const botQuery = `
+SELECT b.robot_id AS bot_id, bu.name AS bot_name
+FROM robot b
+JOIN user bu ON bu.uid = ? AND BINARY bu.uid = BINARY b.robot_id
+    AND bu.status = 1 AND bu.is_destroy <> 2
+WHERE b.robot_id = ? AND BINARY b.robot_id = BINARY ?
+    AND b.creator_uid = ? AND BINARY b.creator_uid = BINARY ? AND b.status = 1`
+	var bot struct {
+		BotID string `db:"bot_id"`
+		Name  string `db:"bot_name"`
+	}
+	err = tx.SelectBySql(botQuery,
+		in.BotID, in.BotID, in.BotID, in.UserID, in.UserID,
+	).LoadOneContext(ctx, &bot)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, ErrIdentityNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Bot: %w", err)
+	}
+	out.Bot = &IdentityBot{BotID: bot.BotID, Name: bot.Name, IsActive: true}
+	return out, nil
 }

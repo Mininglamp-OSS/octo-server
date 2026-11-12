@@ -603,6 +603,12 @@ other = "A request with this idempotency key is still in progress; please retry.
 ["err.server.integration.user_not_linked"]
 other = "User is not linked to an Octo account."
 
+["err.server.internal_identity.body_large"]
+other = "Request body exceeds 64 KiB."
+
+["err.server.internal_identity.media"]
+other = "Content-Type must be application/json."
+
 ["err.server.message.banword_not_found"]
 other = "The banned word does not exist."
 

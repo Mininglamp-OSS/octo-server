@@ -54,6 +54,20 @@ var (
 	})
 )
 
+// Internal identity request validation errors.
+var (
+	ErrIdentityMedia = register(codes.Code{
+		ID:             "err.server.internal_identity.media",
+		HTTPStatus:     http.StatusUnsupportedMediaType,
+		DefaultMessage: "Content-Type must be application/json.",
+	})
+	ErrIdentityBodyLarge = register(codes.Code{
+		ID:             "err.server.internal_identity.body_large",
+		HTTPStatus:     http.StatusRequestEntityTooLarge,
+		DefaultMessage: "Request body exceeds 64 KiB.",
+	})
+)
+
 // 复用 pkg/i18n/codes 已注册的 err.shared.* 码：integration / Octo-link 与 Bot
 // 占用端点的非业务错误（参数、未找到、无权限、内部错误）走这些通用码。在此以
 // 强类型 var 暴露，调用点与上面的 err.server.* 对称，避免裸字符串引用 ID。
