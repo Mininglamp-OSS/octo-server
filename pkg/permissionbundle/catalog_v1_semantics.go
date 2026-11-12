@@ -22,7 +22,7 @@ func normalizeArtifactV1(ctx context.Context, release Release, slots SlotValues)
 	}
 	old := x.(map[string]any)
 	v := &VerifiedCatalog{pin: release.Pin, files: map[string][]byte{}, entries: map[string]map[string]any{}, content: map[string]map[string]any{}, roots: map[string][]byte{}, rows: map[string]map[string]any{}, profiles: map[string]map[string]any{}, selected: map[string]string{}, rendered: map[string]string{}, manifest: old}
-	p := &packageCheck{v: v, ctx: ctx, budget: 1048576, owners: map[string]string{}, rootRecords: map[string]map[string]any{}, jsonRoots: map[string]bool{}, rootNodes: map[string]int{}, uses: map[string]int{}, templateCells: map[string][]SlotCell{}, slots: slots, unpartitioned: true}
+	p := &packageCheck{v: v, ctx: ctx, budget: 1048576, owners: map[string]string{}, rootRecords: map[string]map[string]any{}, jsonRoots: map[string]bool{}, rootNodes: map[string]int{}, uses: map[string]int{}, templateCells: map[string][]SlotCell{}, renderedSlots: map[string]string{}, slots: slots, unpartitioned: true}
 	root := func(raw []byte) string {
 		id := hash(raw)
 		v.roots[id] = raw

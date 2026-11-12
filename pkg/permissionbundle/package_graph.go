@@ -3,6 +3,7 @@ package permissionbundle
 import (
 	"bytes"
 	"sort"
+	"strings"
 )
 
 func entryDependencies(e map[string]any, profiles map[string]map[string]any) ([]string, error) {
@@ -398,28 +399,19 @@ func tupleLess(a, b [3]int) bool {
 func (p *packageCheck) semanticView() []byte {
 	v := p.v
 	descriptors := map[string]any{}
-	normalized := map[string]any{}
 	refs := map[string]string{}
 	collision := false
-	var normalize func(string) any
-	normalize = func(id string) any {
-		if value, ok := normalized[id]; ok {
-			return value
+	var semanticRef func(string) string
+	semanticRef = func(id string) string {
+		if ref := refs[id]; ref != "" {
+			return ref
 		}
 		c := v.content[id]
 		d := objectWithout(c, "sha256", "selector")
 		switch c["kind"] {
-		case "bytes":
-			delete(d, "data_ref")
-			d["raw_sha256"] = c["data_ref"]
-		case "template":
-			delete(d, "value_ref")
-			d["raw_sha256"] = c["value_ref"]
 		case "schema_variant":
-			delete(d, "template_hash")
-			delete(d, "parameter_truth_hash")
-			d["template"] = normalize(c["template_hash"].(string))
-			d["parameter_truth"] = normalize(c["parameter_truth_hash"].(string))
+			d["template_hash"] = semanticRef(c["template_hash"].(string))
+			d["parameter_truth_hash"] = semanticRef(c["parameter_truth_hash"].(string))
 		case "discovery_index":
 			rows := []any{}
 			for _, value := range c["rows"].([]any) {
@@ -428,59 +420,79 @@ func (p *packageCheck) semanticView() []byte {
 			}
 			d["rows"] = rows
 		}
-		normalized[id] = d
-		return d
-	}
-	semanticRef := func(id string) string {
-		if ref := refs[id]; ref != "" {
-			return ref
-		}
-		value := normalize(id)
-		key := hash(canonical(value))
-		if existing, ok := descriptors[key]; ok && !bytes.Equal(canonical(existing), canonical(value)) {
+		key := hash(canonical(d))
+		if existing, ok := descriptors[key]; ok && !bytes.Equal(canonical(existing), canonical(d)) {
 			collision = true
 		}
-		descriptors[key] = value
+		descriptors[key] = d
 		refs[id] = key
 		return key
 	}
 	entries := []any{}
 	for _, id := range sortedObjectKeys(v.entries) {
 		e := objectWithout(v.entries[id], "content_refs")
-		unique := map[string]any{}
+		unique := map[string]bool{}
 		for _, r := range v.entries[id]["content_refs"].([]any) {
-			ref := semanticRef(r.(string))
-			unique[ref] = ref
+			unique[semanticRef(r.(string))] = true
 		}
 		keys := make([]string, 0, len(unique))
 		for k := range unique {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		entryRefs := []any{}
+		entryRefs := make([]any, 0, len(keys))
 		for _, k := range keys {
-			entryRefs = append(entryRefs, unique[k])
+			entryRefs = append(entryRefs, k)
 		}
-		e["content"] = entryRefs
+		e["content_refs"] = entryRefs
 		entries = append(entries, e)
 	}
-	selection := map[string]any{}
 	for id := range v.content {
 		semanticRef(id)
 	}
+	schemaCells := map[string]any{}
+	discoveryCells := map[string]any{}
+	staticCells := map[string]any{}
 	for key, id := range v.selected {
-		selection[key] = semanticRef(id)
+		parts := strings.Split(key, "|")
+		if len(parts) != 5 {
+			collision = true
+			continue
+		}
+		entry, facade := parts[0], parts[1]
+		suffix := parts[2] + "/" + parts[3] + "/" + parts[4]
+		ref := semanticRef(id)
+		switch {
+		case facade == "static":
+			staticCells[entry+"/"+suffix] = ref
+		case v.entries[entry]["kind"] == "discovery":
+			service := ""
+			if entry != "octo-cli/discovery/search-all" {
+				service, _ = v.entries[entry]["target"].(string)
+			}
+			discoveryCells[service+"|"+facade+"/"+suffix] = ref
+		default:
+			op, _ := v.entries[entry]["target"].([]any)[1].(string)
+			schemaCells[op+"|"+facade+"/"+suffix] = ref
+		}
 	}
-	rendered := map[string]any{}
-	for key, h := range v.rendered {
-		rendered[key] = h
+	renderedSlots := map[string]any{}
+	for key, h := range p.renderedSlots {
+		renderedSlots[key] = h
 	}
-	d := map[string]any{"entries": entries, "selection": selection, "descriptors": descriptors, "rendered": rendered, "profiles": v.index["profiles"], "source_files": v.index["source_files"], "exceptions": v.index["exceptions"]}
-	for _, k := range []string{"semantics_version", "identity_index_sha256", "source_heads", "normalization"} {
-		d[k] = v.manifest[k]
+	d := map[string]any{
+		"entries":           entries,
+		"content":           descriptors,
+		"selectors":         map[string]any{"schema": schemaCells, "discovery": discoveryCells, "static": staticCells},
+		"rendered_slots":    renderedSlots,
+		"profiles":          v.index["profiles"],
+		"source_files":      v.index["source_files"],
+		"exceptions":        v.index["exceptions"],
+		"source_heads":      v.manifest["source_heads"],
+		"normalization":     v.manifest["normalization"],
+		"semantics_version": v.manifest["semantics_version"],
+		"limits":            objectWithout(v.manifest["limits"].(map[string]any), "packaging"),
 	}
-	limits := objectWithout(v.manifest["limits"].(map[string]any), "packaging")
-	d["limits"] = limits
 	if collision {
 		return nil
 	}

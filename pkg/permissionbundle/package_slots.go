@@ -3,6 +3,7 @@ package permissionbundle
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -222,7 +223,11 @@ func renderPackageTemplate(raw []byte, c map[string]any, spans map[string]valueS
 		raw []byte
 	}
 	replacements := []replacement{}
-	for _, value := range c["slots"].([]any) {
+	slots := c["slots"].([]any)
+	if len(values) != len(slots) {
+		return nil, packageError("source joint assignment count")
+	}
+	for _, value := range slots {
 		slot := value.(map[string]any)
 		domain := slot["domain"].(string)
 		v, ok := values[domain]
@@ -440,6 +445,19 @@ func (p *packageCheck) postSlots() error {
 						}
 					}
 					v.rendered[cellKey(cell.EntryID, cell.Facade, r, cell.ManagedMask, f)] = work.hash
+					op := ""
+					if cell.Facade != "static" {
+						if entry := v.entries[cell.EntryID]; entry != nil {
+							if target, ok := entry["target"].([]any); ok && len(target) > 1 {
+								op, _ = target[1].(string)
+							}
+						}
+					}
+					slotKey := fmt.Sprintf("%s|%s/%d/%d/%d", id, op, r, cell.ManagedMask, f)
+					if prior, ok := p.renderedSlots[slotKey]; ok && prior != work.hash {
+						return packageError("source joint assignment equivocation")
+					}
+					p.renderedSlots[slotKey] = work.hash
 				}
 			}
 			if e := charge(maxBytes, maxNodes); e != nil {

@@ -39,20 +39,22 @@ type SlotCell struct {
 type SlotValues func(context.Context, SlotCell) (map[string]any, error)
 
 type PackageLedger struct {
-	StoredBytes    int `json:"stored_bytes"`
-	MetadataNodes  int `json:"metadata_nodes"`
-	PreBytes       int `json:"pre_bytes"`
-	PostBytes      int `json:"post_bytes"`
-	PreNodes       int `json:"pre_nodes"`
-	PostNodes      int `json:"post_nodes"`
-	MaxDepth       int `json:"max_depth"`
-	Parts          int `json:"parts"`
-	Roots          int `json:"roots"`
-	SharedRows     int `json:"shared_rows"`
-	Content        int `json:"content_records"`
-	SchemaCells    int `json:"schema_cells"`
-	DiscoveryCells int `json:"discovery_cells"`
-	StaticCells    int `json:"static_cells"`
+	StoredBytes     int `json:"stored_bytes"`
+	MetadataNodes   int `json:"metadata_nodes"`
+	PreBytes        int `json:"pre_bytes"`
+	PostBytes       int `json:"post_bytes"`
+	PreNodes        int `json:"pre_nodes"`
+	PostNodes       int `json:"post_nodes"`
+	MaxDepth        int `json:"max_depth"`
+	Files           int `json:"files"`
+	Parts           int `json:"parts"`
+	MaxPartsPerRoot int `json:"max_parts_per_root"`
+	Roots           int `json:"roots"`
+	SharedRows      int `json:"shared_rows"`
+	Content         int `json:"content_records"`
+	SchemaCells     int `json:"schema_cells"`
+	DiscoveryCells  int `json:"discovery_cells"`
+	StaticCells     int `json:"static_cells"`
 }
 
 // VerifiedCatalog exposes copies only. Semantic bytes and every file remain

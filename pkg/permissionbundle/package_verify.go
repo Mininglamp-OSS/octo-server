@@ -18,6 +18,7 @@ type packageCheck struct {
 	rootNodes     map[string]int
 	uses          map[string]int
 	templateCells map[string][]SlotCell
+	renderedSlots map[string]string
 	slots         SlotValues
 	unpartitioned bool // private v1 semantic normalization only, never v2 admission
 }
@@ -35,7 +36,7 @@ func VerifyCatalogPackage(ctx context.Context, input PackageInput, slots SlotVal
 		return nil, packageError("inventory")
 	}
 	v := &VerifiedCatalog{pin: input.Pin, files: map[string][]byte{}, entries: map[string]map[string]any{}, content: map[string]map[string]any{}, roots: map[string][]byte{}, rows: map[string]map[string]any{}, profiles: map[string]map[string]any{}, selected: map[string]string{}, rendered: map[string]string{}}
-	p := &packageCheck{v: v, ctx: ctx, budget: 1048576, owners: map[string]string{}, rootRecords: map[string]map[string]any{}, jsonRoots: map[string]bool{}, rootNodes: map[string]int{}, uses: map[string]int{}, templateCells: map[string][]SlotCell{}, slots: slots}
+	p := &packageCheck{v: v, ctx: ctx, budget: 1048576, owners: map[string]string{}, rootRecords: map[string]map[string]any{}, jsonRoots: map[string]bool{}, rootNodes: map[string]int{}, uses: map[string]int{}, templateCells: map[string][]SlotCell{}, renderedSlots: map[string]string{}, slots: slots}
 	for path, raw := range input.Files {
 		kind, _, _, ok := packagePath(path)
 		limit := 262144
@@ -196,6 +197,7 @@ func VerifyCatalogPackage(ctx context.Context, input PackageInput, slots SlotVal
 	if e := p.postSlots(); e != nil {
 		return nil, e
 	}
+	v.ledger.Files = len(v.files)
 	v.ledger.Roots = len(v.roots)
 	v.ledger.SharedRows = len(v.rows)
 	v.ledger.Content = len(v.content)
@@ -375,6 +377,9 @@ func (p *packageCheck) expandRoots() error {
 		parts := r["parts"].([]any)
 		if (n == 0) != (len(parts) == 0) || addWork(&v.ledger.Parts, len(parts), 65536) != nil {
 			return packageError("parts")
+		}
+		if len(parts) > v.ledger.MaxPartsPerRoot {
+			v.ledger.MaxPartsPerRoot = len(parts)
 		}
 		size := 0
 		for _, value := range parts {
