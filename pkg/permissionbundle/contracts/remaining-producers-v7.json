@@ -1,0 +1,63 @@
+{
+  "contract": "permission-server-remaining-producers-v7",
+  "task": "XIN-2793",
+  "charter_baseline": "v52-round2-mainline-repair",
+  "supersedes": "remaining-producers-v6.json for active ownership; v1-v6 retained byte-for-byte",
+  "resolved_in_this_slice": [
+    {
+      "id": "S-B2-history-headers-space-and-source-guard",
+      "was": "ListHistoryHeadersV1 filtered only on res.unavailable and BotCurrentRead, emitting status=resolved headers across space boundaries (!MessageSpaceExact) and for untagged DMs (MessageSpaceUnknown)",
+      "status": "DELIVERED_IN_SERVER: ListHistoryHeadersV1 requires !res.delivery.MessageSpaceUnknown && res.delivery.MessageSpaceExact && res.delivery.MessageSourceExact && res.delivery.BotCurrentRead before emitting status=resolved; untagged DMs return status=unavailable (reason=predicate_unsupported) and cross-space items return status=unavailable (reason=expired_reference)"
+    },
+    {
+      "id": "S-B3-history-disclosure-scope-and-epoch-guard",
+      "was": "SQLNativeFactAdapter.readHistoryDisclosure omitted evalScopeBaseFacts and called IssueHistoryDisclosureV1 (inserting durable permit rows) before checking storedEpoch == contextEpoch",
+      "status": "DELIVERED_IN_SERVER: readHistoryDisclosure enforces evalScopeBaseFacts (botUserActive && botRobotActive && spaceActive && botSpaceMember) and short-circuits storedEpoch != contextEpoch before calling IssueHistoryDisclosureV1, writing zero rows into bot_permission_disclosure_permit on epoch mismatch"
+    }
+  ],
+  "previously_resolved_in_server": [
+    "S-B1-message-ttl-expire (Verified CLOSED in XIN-2834 Round 2 review: loadMessage reads COALESCE(expire,0) and resolveOne enforces read-time and revalidation-time message TTL expiry across bind_delivery, resolve, history_headers, and history_disclosure)",
+    "R2-server-seam (POST /v1/bot/permission-facts/v1/bind-delivery metadata-only delivery binding)",
+    "R3-startup-composition (main.go:installPermissionBundle -> InstallFromEnvWithHooks with message.NewServerMessageFactHooks)",
+    "own-session-consistency (RepeatableRead *dbr.Tx propagated across SQLNativeFactAdapter and ServerMessageFactProvider with FOR SHARE NOWAIT)",
+    "permit-durability-seam (DurablePermitLedger backed by bot_permission_disclosure_permit)"
+  ],
+  "remaining": [
+    {
+      "id": "A-B4-A-B5-A-B6-A-B7",
+      "owner": "XIN-2795 (codex-channel-octo)",
+      "item": "Repair [A-B4] stdio ticket max_response_bytes acceptance/preservation, [A-B5] MCP HTTP 202 empty-body notification handling, [A-B6] disclose() acceptance of octo-server 43-char base64url HMAC permit (#/$defs/Token without pmt1- prefix), and [A-B7] bwrap --unshare-pid + optional HTTP relay pin enforcement"
+    },
+    {
+      "id": "C-B1r2-C-B3",
+      "owner": "XIN-2794 (octo-cli)",
+      "item": "Repair [C-B1r2] stamping MaxSerializedRPCBytes onto relay HTTP header and stdio ticket budget, and [C-B3] targetPath dot-segment/encoded-slash rejection + AdmitPageBytes under-lock MaxCumulativeBytes check"
+    },
+    {
+      "id": "R1",
+      "owner": "XIN-2830 / Owner",
+      "item": "Owner-approved ordinary-SQL recovery/history contract decision (Architect 4831fa26 / 7b11211f remains an unapproved proposal and is not self-approved here); live startup remains fail-closed without a configured authority"
+    },
+    {
+      "id": "R4",
+      "owner": "XIN-2794 / PjM / Owner",
+      "item": "C1-C9 source reconciliation and reviewed support pin and directed pairs; supported_catalog_digest stays null"
+    },
+    {
+      "id": "R5-permit-ddl",
+      "owner": "deployment / schema migration owner",
+      "item": "Provision bot_permission_disclosure_permit table (ServerDisclosurePermitDDL) and set OCTO_PERMISSION_BUNDLE_DURABLE_PERMIT_LEDGER=true before enabling durable history disclosure permits in a live database"
+    },
+    {
+      "id": "R6",
+      "owner": "upstream source owners",
+      "item": "A1 page bounds: concrete values and evidence pending; no constants chosen here"
+    }
+  ],
+  "residual_limitations": [
+    "ServerMessageFactProvider cut is a read-time marker over ordinary SQL state, not an acknowledged-state failover/restore fence",
+    "History pages are stable against appends only; concurrent edit, revoke, TTL expiry or clear-history can change later pages",
+    "Group/thread original visibility (without a visibles exclusion) and untagged DM space cannot be proven from current octo-server tables and remain explicit unknown/non-serving for admit/contributor",
+    "When DurablePermitLedger is false (default until bot_permission_disclosure_permit DDL is deployed), single-use permit tracking is in-process memory"
+  ]
+}

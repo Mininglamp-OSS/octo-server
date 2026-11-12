@@ -1035,29 +1035,52 @@ func (a *SQLNativeFactAdapter) readHistoryDisclosure(ctx context.Context, tx *db
 	for i, v := range rawHeaders {
 		headerRefs[i] = v.(map[string]any)["header_reference"].(string)
 	}
+	base, err := a.evalScopeBaseFacts(ctx, tx, key)
+	if err != nil || !base.botUserActive || !base.botRobotActive || !base.spaceActive || !base.botSpaceMember {
+		return nil, ErrUnavailable
+	}
 	var storedEpoch string
 	var retired int
 	if err := queryOne(ctx, tx, `SELECT context_epoch,retired FROM bot_permission_scope WHERE bot_uid=? AND space_id=?`+a.suffix(false), []any{key.BotUID, key.SpaceID}, &storedEpoch, &retired); err != nil || retired != 0 {
 		return nil, ErrUnavailable
 	}
-	disclosures, imCut, err := a.IMProvider.IssueHistoryDisclosureV1(ctx, key, contextID, contextEpoch, headerRefs)
-	if err != nil || len(disclosures) != len(headerRefs) || !validHex(imCut.Incarnation, 32) || !validHex(imCut.ReadNonce, 32) || imCut.ReadNonce == sqlNonce {
-		return nil, ErrUnavailable
-	}
-	epochMatches := storedEpoch == contextEpoch
-	results := make([]any, 0, len(disclosures))
-	for i, item := range disclosures {
-		ref := headerRefs[i]
-		if item.Reference != "" && item.Reference != ref {
+	if storedEpoch != contextEpoch {
+		_, imCut, err := a.IMProvider.InspectDeliveredHeadersV1(ctx, key, "admit", nil)
+		if err != nil || !validHex(imCut.Incarnation, 32) || !validHex(imCut.ReadNonce, 32) || imCut.ReadNonce == sqlNonce {
 			return nil, ErrUnavailable
 		}
-		if !epochMatches {
+		results := make([]any, 0, len(headerRefs))
+		for _, ref := range headerRefs {
 			results = append(results, map[string]any{
 				"reference": ref,
 				"status":    "unavailable",
 				"reason":    "expired_reference",
 			})
-			continue
+		}
+		sqlCompleted := time.Now().UTC().Truncate(time.Microsecond)
+		sqlAuth := formatAuthorityDescriptor(sqlID, "sql", sqlIncarnation, sqlPos, sqlNonce, sqlStarted, sqlCompleted)
+		imAuth := formatAuthorityDescriptor(imCut.AuthorityID, "im", imCut.Incarnation, imCut.Position, imCut.ReadNonce, imCut.StartedAt, imCut.CompletedAt)
+		authorities, observedAt := sortAuthoritiesAndObserved(sqlAuth, imAuth, sqlCompleted, imCut.CompletedAt)
+		return canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"key":             keyObj,
+			"request_id":      req["request_id"],
+			"read_id":         readID,
+			"observed_at":     observedAt,
+			"authorities":     authorities,
+			"results":         results,
+		}), nil
+	}
+	disclosures, imCut, err := a.IMProvider.IssueHistoryDisclosureV1(ctx, key, contextID, contextEpoch, headerRefs)
+	if err != nil || len(disclosures) != len(headerRefs) || !validHex(imCut.Incarnation, 32) || !validHex(imCut.ReadNonce, 32) || imCut.ReadNonce == sqlNonce {
+		return nil, ErrUnavailable
+	}
+	results := make([]any, 0, len(disclosures))
+	for i, item := range disclosures {
+		ref := headerRefs[i]
+		if item.Reference != "" && item.Reference != ref {
+			return nil, ErrUnavailable
 		}
 		if item.Status == "unavailable" {
 			results = append(results, map[string]any{

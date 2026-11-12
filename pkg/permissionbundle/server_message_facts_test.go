@@ -944,3 +944,190 @@ func TestServerMessageFactsMessageExpireTTLBoundaryAndRevalidation(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, 0, expiredPermits)
 }
+
+func TestServerMessageFactsRound2CrossSpaceHistoryAndDisclosureScopeAndEpochGuards(t *testing.T) {
+	ctx := t.Context()
+	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f := newServerFacts(t)
+	f.s.Authority = authority
+	f.exec(ServerDisclosurePermitDDL)
+	f.p.durablePermits = true
+
+	// Provision scope (context_epoch = "0", retired = 0).
+	_, err = f.s.Get(ctx, fixtureKey, "owner")
+	require.NoError(t, err)
+
+	// Seed DM messages in f.dmChan:
+	// 9501: same-space tagged DM ("space") -> resolved
+	// 9502: untagged DM (MessageSpaceUnknown == true) -> unavailable (predicate_unsupported)
+	// 9503: cross-space tagged DM ("other-space", MessageSpaceExact == false) -> unavailable (expired_reference)
+	// 9505: second same-space tagged DM ("space") for [S-B3] scope revocation checks
+	f.msg("9501", 1, "peer", f.dmChan, 1, map[string]any{"type": 1, "space_id": "space", "content": "R2-SAME-SPACE-DM"})
+	f.msg("9502", 2, "peer", f.dmChan, 1, map[string]any{"type": 1, "content": "R2-UNTAGGED-DM"})
+	f.msg("9503", 3, "peer", f.dmChan, 1, map[string]any{"type": 1, "space_id": "other-space", "content": "R2-CROSS-SPACE-DM"})
+	f.msg("9505", 4, "peer", f.dmChan, 1, map[string]any{"type": 1, "space_id": "space", "content": "R2-SCOPE-GUARD-DM"})
+
+	// Seed a group in space_B ("other-space") where both bot and peer are active members, plus message 9504.
+	f.exec("INSERT INTO `group` VALUES('group_space_b','other-space',1)")
+	f.exec("INSERT INTO group_member VALUES('group_space_b','bot',1,0,0),('group_space_b','peer',1,0,0)")
+	f.msg("9504", 1, "peer", "group_space_b", 2, map[string]any{"type": 1, "content": "R2-CROSS-SPACE-GROUP"})
+
+	adapter, err := NewSQLNativeFactAdapter(authority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	// [S-B2] Part 1: Direct ListHistoryHeadersV1 and Runtime.Facts(history_headers) on DM channel.
+	// Newest first: 9505 (resolved), 9503 (unavailable: cross-space), 9502 (unavailable: untagged DM), 9501 (resolved).
+	dmSrc := ServerSourceReference(1, f.dmChan)
+	dmPage, err := f.p.ListHistoryHeadersV1(ctx, fixtureKey, dmSrc, nil, 10)
+	require.NoError(t, err)
+	require.Len(t, dmPage.Items, 4)
+	require.Equal(t, "resolved", dmPage.Items[0].Status)
+	require.Equal(t, "9505", dmPage.Items[0].Header.MessageID)
+	require.Equal(t, "unavailable", dmPage.Items[1].Status, "cross-space DM 9503 must not resolve in history_headers")
+	require.Equal(t, "expired_reference", dmPage.Items[1].Reason)
+	require.Empty(t, dmPage.Items[1].Header.MessageID)
+	require.Equal(t, "unavailable", dmPage.Items[2].Status, "untagged DM 9502 must not resolve in history_headers")
+	require.Equal(t, "predicate_unsupported", dmPage.Items[2].Reason)
+	require.Empty(t, dmPage.Items[2].Header.MessageID)
+	require.Equal(t, "resolved", dmPage.Items[3].Status)
+	require.Equal(t, "9501", dmPage.Items[3].Header.MessageID)
+
+	hhDMBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":   json.Number("1"),
+		"profile_version":  json.Number("1"),
+		"request_id":       strings.Repeat("1", 32),
+		"operation":        "history_headers",
+		"source_reference": dmSrc,
+		"cursor":           nil,
+		"page_size":        json.Number("10"),
+	})))
+	require.NoError(t, err)
+	require.NotContains(t, string(hhDMBytes), "other-space")
+	hhDMItems := fixtureObject(t, hhDMBytes)["page"].(map[string]any)["items"].([]any)
+	require.Len(t, hhDMItems, 4)
+	require.Equal(t, "9505", hhDMItems[0].(map[string]any)["message_id"])
+	require.Equal(t, "unavailable", hhDMItems[1].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hhDMItems[1].(map[string]any)["reason"])
+	require.Equal(t, "unavailable", hhDMItems[2].(map[string]any)["status"])
+	require.Equal(t, "predicate_unsupported", hhDMItems[2].(map[string]any)["reason"])
+	require.Equal(t, "9501", hhDMItems[3].(map[string]any)["message_id"])
+
+	// [S-B2] Part 2: Cross-space group source_reference queried under fixtureKey (space_id="space").
+	grpBSrc := ServerSourceReference(2, "group_space_b")
+	grpBPage, err := f.p.ListHistoryHeadersV1(ctx, fixtureKey, grpBSrc, nil, 10)
+	require.NoError(t, err)
+	require.Len(t, grpBPage.Items, 1)
+	require.Equal(t, "unavailable", grpBPage.Items[0].Status, "group in other-space must be unavailable under space")
+	require.Equal(t, "expired_reference", grpBPage.Items[0].Reason)
+	require.Empty(t, grpBPage.Items[0].Header.MessageID)
+
+	hhGrpBBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":   json.Number("1"),
+		"profile_version":  json.Number("1"),
+		"request_id":       strings.Repeat("2", 32),
+		"operation":        "history_headers",
+		"source_reference": grpBSrc,
+		"cursor":           nil,
+		"page_size":        json.Number("10"),
+	})))
+	require.NoError(t, err)
+	require.NotContains(t, string(hhGrpBBytes), "other-space")
+	hhGrpBItems := fixtureObject(t, hhGrpBBytes)["page"].(map[string]any)["items"].([]any)
+	require.Len(t, hhGrpBItems, 1)
+	require.Equal(t, "unavailable", hhGrpBItems[0].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hhGrpBItems[0].(map[string]any)["reason"])
+
+	// [S-B3] Part 1: Mismatched context_epoch short-circuits BEFORE IssueHistoryDisclosureV1,
+	// writing zero durable permit rows into bot_permission_disclosure_permit.
+	hdrRef9501 := dmPage.Items[3].Header.HeaderReference
+	hdrRef9505 := dmPage.Items[0].Header.HeaderReference
+
+	hdBadEpochBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("3", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("4", 32),
+		"context_epoch":   "999",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef9501},
+		},
+	})))
+	require.NoError(t, err)
+	hdBadEpochRes := fixtureObject(t, hdBadEpochBytes)["results"].([]any)
+	require.Len(t, hdBadEpochRes, 1)
+	require.Equal(t, "unavailable", hdBadEpochRes[0].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hdBadEpochRes[0].(map[string]any)["reason"])
+	require.Nil(t, hdBadEpochRes[0].(map[string]any)["permit"])
+
+	var permitCountAfterBadEpoch int
+	err = f.s.Session.QueryRow("SELECT COUNT(*) FROM " + ServerDisclosurePermitTable).Scan(&permitCountAfterBadEpoch)
+	require.NoError(t, err)
+	require.Equal(t, 0, permitCountAfterBadEpoch, "mismatched context_epoch must not insert durable permit rows")
+
+	// Matching context_epoch ("0") while scope base facts hold issues the permit and records 1 row.
+	hdGoodEpochBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("5", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("4", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef9501},
+		},
+	})))
+	require.NoError(t, err)
+	hdGoodEpochRes := fixtureObject(t, hdGoodEpochBytes)["results"].([]any)
+	require.Equal(t, "resolved", hdGoodEpochRes[0].(map[string]any)["status"])
+	require.NotEmpty(t, hdGoodEpochRes[0].(map[string]any)["permit"])
+
+	var permitCountAfterGoodEpoch int
+	err = f.s.Session.QueryRow("SELECT COUNT(*) FROM " + ServerDisclosurePermitTable).Scan(&permitCountAfterGoodEpoch)
+	require.NoError(t, err)
+	require.Equal(t, 1, permitCountAfterGoodEpoch)
+
+	// [S-B3] Part 2: readHistoryDisclosure enforces evalScopeBaseFacts (botSpaceMember, spaceActive, botUserActive, botRobotActive)
+	// even when bot_permission_scope.retired == 0 (both on direct SQLNativeFactAdapter.Read and Runtime.Facts).
+	hdReq9505 := canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("6", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("7", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef9505},
+		},
+	})
+	f.exec("UPDATE space_member SET status=0 WHERE space_id='space' AND uid='bot'")
+	tx1, err := f.s.Session.Begin()
+	require.NoError(t, err)
+	_, err = adapter.Read(ctx, tx1, fixtureKey, hdReq9505)
+	tx1.RollbackUnlessCommitted()
+	require.ErrorIs(t, err, ErrUnavailable, "departed bot space_member must fail closed in SQLNativeFactAdapter.readHistoryDisclosure")
+	_, err = rt.Facts(ctx, fixtureKey, bytes.NewReader(hdReq9505))
+	require.ErrorIs(t, err, ErrForbidden, "departed bot space_member must fail closed in Runtime.Facts(history_disclosure)")
+
+	f.exec("UPDATE space_member SET status=1 WHERE space_id='space' AND uid='bot'")
+	f.exec("UPDATE space SET status=0 WHERE space_id='space'")
+	tx2, err := f.s.Session.Begin()
+	require.NoError(t, err)
+	_, err = adapter.Read(ctx, tx2, fixtureKey, hdReq9505)
+	tx2.RollbackUnlessCommitted()
+	require.ErrorIs(t, err, ErrUnavailable, "deactivated space must fail closed in SQLNativeFactAdapter.readHistoryDisclosure")
+	_, err = rt.Facts(ctx, fixtureKey, bytes.NewReader(hdReq9505))
+	require.ErrorIs(t, err, ErrForbidden, "deactivated space must fail closed in Runtime.Facts(history_disclosure)")
+
+	var permitCountFor9505 int
+	err = f.s.Session.QueryRow("SELECT COUNT(*) FROM "+ServerDisclosurePermitTable+" WHERE header_reference=?", hdrRef9505).Scan(&permitCountFor9505)
+	require.NoError(t, err)
+	require.Equal(t, 0, permitCountFor9505)
+}

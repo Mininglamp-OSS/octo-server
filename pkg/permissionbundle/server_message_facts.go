@@ -676,10 +676,14 @@ func (p *ServerMessageFactProvider) ListHistoryHeadersV1(ctx context.Context, ke
 			return IMHistoryHeadersPage{}, err
 		}
 		itemRef := encodeServerRef(serverRefDelivery, r)
-		if res.unavailable != "" || !res.delivery.BotCurrentRead {
+		if res.unavailable != "" || res.delivery.MessageSpaceUnknown || !res.delivery.MessageSpaceExact || !res.delivery.MessageSourceExact || !res.delivery.BotCurrentRead {
 			reason := res.unavailable
 			if reason == "" {
-				reason = "expired_reference"
+				if res.delivery.MessageSpaceUnknown {
+					reason = "predicate_unsupported"
+				} else {
+					reason = "expired_reference"
+				}
 			}
 			page.Items = append(page.Items, IMHistoryHeaderItem{Status: "unavailable", Reference: itemRef, Reason: reason})
 			continue
