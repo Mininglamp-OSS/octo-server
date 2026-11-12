@@ -81,3 +81,29 @@ func (d *DB) queryGroupMemberCounts(groupNos []string) (map[string]int64, error)
 	}
 	return counts, nil
 }
+
+// queryGroupMyBotAdmin returns the groups where the requested member currently
+// holds bot_admin=1. The list projection combines it with the native role so a
+// Bot administrator keeps GROUP.md write authority without pretending to hold
+// a human manager role.
+func (d *DB) queryGroupMyBotAdmin(memberUID string, groupNos []string) (map[string]bool, error) {
+	admins := make(map[string]bool, len(groupNos))
+	if memberUID == "" || len(groupNos) == 0 {
+		return admins, nil
+	}
+
+	var rows []struct {
+		GroupNo string `db:"group_no"`
+	}
+	if _, err := d.session.
+		Select("group_no").
+		From("group_member").
+		Where("uid=? AND group_no IN ? AND is_deleted=0 AND bot_admin=1", memberUID, groupNos).
+		Load(&rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		admins[row.GroupNo] = true
+	}
+	return admins, nil
+}

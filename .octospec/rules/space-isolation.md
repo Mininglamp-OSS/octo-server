@@ -31,6 +31,13 @@ write must never cross a Space boundary.
 - API routes are prefixed `/v1/`.
 - New modules: add a blank import in `internal/modules.go`.
 
+## Scoped legacy-download exception
+
+`GET /v2/cli/files/_download` retains the legacy object-key download behavior
+after CLI token authentication and `im.files:read` authorization. Object
+keys are not associated with a Space, so this endpoint does not establish
+object-level Space isolation. The exception applies only to this endpoint.
+
 ## Why load-bearing
 
 Space isolation and ownership checks are the core multi-tenant security

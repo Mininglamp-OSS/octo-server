@@ -67,12 +67,12 @@ type GroupsResult struct {
 // the OS pre-filter max(timestamp) — because a hidden newest match there would
 // leak its time and bias bucket order (a real leak, now fixed).
 type GroupBucket struct {
-	ChannelID        string       `json:"channel_id"`
-	ChannelType      uint8        `json:"channel_type"`
-	ParentGroupNo    string       `json:"parent_group_no,omitempty"`
-	GroupName        string       `json:"group_name"`
-	ThreadID         string       `json:"thread_id,omitempty"`
-	ThreadName       string       `json:"thread_name,omitempty"`
+	ChannelID     string `json:"channel_id"`
+	ChannelType   uint8  `json:"channel_type"`
+	ParentGroupNo string `json:"parent_group_no,omitempty"`
+	GroupName     string `json:"group_name"`
+	ThreadID      string `json:"thread_id,omitempty"`
+	ThreadName    string `json:"thread_name,omitempty"`
 	// MatchCount is the pre-visibility OS doc_count (may exceed the caller's
 	// visible count — see the type doc). Left as-is by design §6 / owner
 	// option A; MatchCountApprox flags it.
@@ -129,7 +129,7 @@ func (h *Handler) searchGlobalGroups(c *wkhttp.Context) {
 	recordAllowlistTimings(c, allowTimings)
 	if len(osChannelIDs) == 0 {
 		recordAudit(c, "search_global_groups", 0, "", req.Keyword, 0)
-		c.Response(groupsEnvelope(emptyGroupsResult(req.Sequence), false))
+		respondSearchResult(c, groupsEnvelope(emptyGroupsResult(req.Sequence), false))
 		return
 	}
 
@@ -179,7 +179,7 @@ func (h *Handler) searchGlobalGroups(c *wkhttp.Context) {
 		return
 	}
 	recordAudit(c, "search_global_groups", 0, "", req.Keyword, len(result.Groups))
-	c.Response(groupsEnvelope(result, hasMore))
+	respondSearchResult(c, groupsEnvelope(result, hasMore))
 }
 
 // groupsTriggerSatisfied implements the §2.3 trigger gate. It deliberately

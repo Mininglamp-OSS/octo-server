@@ -142,7 +142,7 @@ func (h *Handler) searchAround(c *wkhttp.Context) {
 	result := splitAroundWindow(hits, len(beforeHits), len(afterHits), hasMoreBefore, hasMoreAfter)
 
 	recordAudit(c, "search_around", req.ChannelType, req.ChannelID, "", len(hits))
-	c.Response(result)
+	respondSearchResult(c, result)
 }
 
 // fetchAnchor looks up the single anchor doc by (channelId, messageId), applies

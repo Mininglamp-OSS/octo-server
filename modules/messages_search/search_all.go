@@ -125,7 +125,7 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 	items := h.buildSearchAllHits(ctx, filtered, req, loginUID)
 
 	recordAudit(c, "search_all", req.ChannelType, req.ChannelID, req.Keyword, len(items))
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }
 
 func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStripEnabled bool, req SearchAllReq, normChannelID, spaceID string) (elastic.Query, error) {

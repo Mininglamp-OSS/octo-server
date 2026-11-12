@@ -1,6 +1,7 @@
 package messages_search
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -627,7 +628,7 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 // 其子区). The earlier v1 "thread_member unavailable, so drop all threads"
 // behaviour is superseded — threads inherit their parent group's membership
 // gate, so no `thread_member` join is required to be correct.
-func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, []channelRef, allowlistTimings, error) {
+func (h *Handler) buildAllowlist(c *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, []channelRef, allowlistTimings, error) {
 	var timings allowlistTimings
 	groups, err := h.groupService.GetGroupsWithMemberUID(loginUID)
 	if err != nil {
@@ -703,7 +704,7 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 	// Space. Mirrors the filtering in modules/search/api.go so the two
 	// surfaces converge on the same DM candidate set.
 	dmStart := time.Now()
-	dmPeers, dmBlacklistMs, dmErr := h.enumerateDMPeersTimed(loginUID, spaceID)
+	dmPeers, dmBlacklistMs, dmErr := h.enumerateDMPeersTimed(loginUID, spaceID, isCLIV2Search(c))
 	timings.dmPeers += time.Since(dmStart) - dmBlacklistMs
 	timings.blacklist += dmBlacklistMs
 	if dmErr != nil {
@@ -1003,11 +1004,12 @@ func (h *Handler) enumerateDMPeers(loginUID, spaceID string) ([]string, error) {
 	if spaceID == "" {
 		return peers, nil
 	}
-	// Apply the bot-in-space gate. Non-bot DMs need no extra work — Space
-	// containment is already implied by the friend / space_member gate that
-	// picked them (the caller's Space middleware would have rejected the
-	// request otherwise). Bots have no space_member row so we check them
-	// explicitly against CheckBotsInSpace.
+	// Apply the bot-in-space gate. Non-bot DMs are left untouched here; the
+	// v2 caller additionally intersects them with the bound Space's active
+	// member set in enumerateDMPeersTimed(strictSpace), while v1 keeps the
+	// legacy friend / space_member union. Bots are checked explicitly against
+	// CheckBotsInSpace because App Bots are visible via app_bot rather than a
+	// `user.robot` flag.
 	if len(peers) == 0 {
 		return peers, nil
 	}
@@ -1020,16 +1022,23 @@ func (h *Handler) enumerateDMPeers(loginUID, spaceID string) ([]string, error) {
 // audit field (audit's blacklist_ms). The rest of the time — GetFriends,
 // fetchSpaceMemberUIDs, bot filter — is attributed to the dm_peers bucket
 // by the caller subtracting blacklistDur from the wall-clock delta.
-func (h *Handler) enumerateDMPeersTimed(loginUID, spaceID string) ([]string, time.Duration, error) {
+//
+// strictSpace is the v2 adaptation: the real-user portion of the candidate
+// set is intersected with the bound Space's active member list (the same
+// predicate single-channel checkP2PAccess evaluates), while system Bots and
+// bots that passed the bot-in-Space filter are preserved. A space_member or
+// bot-classification failure aborts the enumeration instead of degrading to a
+// friends-only allowlist. v1 callers pass false and keep the legacy union.
+func (h *Handler) enumerateDMPeersTimed(loginUID, spaceID string, strictSpace bool) ([]string, time.Duration, error) {
 	startToken := time.Now()
 	_ = startToken // reserved: measure sub-phases in enumerateDMPeers itself
 	// We instrument the sole blacklist call via an atomic
 	// counter-style capture. Simplest option: temporarily swap in a
 	// shim on filterBlacklistedDMPeers is intrusive; instead we
 	// re-implement enumerateDMPeers here with the timing hook inlined
-	// so the production path stays a single method. The two must stay
-	// semantically equivalent — tests for enumerateDMPeers exercise
-	// the plain method (below) directly.
+	// so the production path stays a single method. For v1 callers
+	// (strictSpace=false) the two methods are semantically equivalent;
+	// tests for enumerateDMPeers exercise the plain method (below) directly.
 	var blacklistDur time.Duration
 	friends, err := h.userService.GetFriends(loginUID)
 	if err != nil {
@@ -1042,18 +1051,41 @@ func (h *Handler) enumerateDMPeersTimed(loginUID, spaceID string) ([]string, tim
 		}
 		peers = append(peers, f.UID)
 	}
+	if strictSpace && spaceID == "" {
+		// The v2 route always carries a bound Space; this is defense in depth
+		// so an explicit empty Space can never degrade into a friends-only
+		// allowlist.
+		return nil, 0, errV2GlobalSearchRequiresSpace
+	}
+	var memberSet map[string]struct{}
 	if spaceID != "" {
 		members, mErr := h.fetchSpaceMemberUIDs(spaceID, loginUID)
 		if mErr != nil {
+			if strictSpace {
+				// v2: falling back to friends-only would re-admit friends that
+				// are not members of the bound Space. The Space candidate set
+				// is a security boundary, so fail closed instead.
+				h.Error("messages_search: space_member enumeration failed; refusing friends-only fallback for v2 global search",
+					zap.String("login_uid", loginUID),
+					zap.String("space_id", spaceID),
+					zap.Error(mErr))
+				return nil, 0, mErr
+			}
 			h.Warn("messages_search: space_member enumeration failed; falling back to friends-only DM allowlist",
 				zap.Error(mErr))
 		} else {
 			peers = append(peers, members...)
+			if strictSpace {
+				memberSet = make(map[string]struct{}, len(members))
+				for _, m := range members {
+					memberSet[m] = struct{}{}
+				}
+			}
 		}
 	}
 	peers = util.RemoveRepeatedElement(peers)
 
-	// Time only the bidirectional blacklist gate — the piece YUJ-27
+	// Time only the blacklist gate — the piece YUJ-27
 	// batched from 2N per-peer round-trips down to 1 IN query.
 	blStart := time.Now()
 	peers = h.filterBlacklistedDMPeers(loginUID, peers)
@@ -1066,7 +1098,79 @@ func (h *Handler) enumerateDMPeersTimed(loginUID, spaceID string) ([]string, tim
 		return peers, blacklistDur, nil
 	}
 	filtered, err := h.applyDMBotFilter(spaceID, peers)
-	return filtered, blacklistDur, err
+	if err != nil {
+		return nil, blacklistDur, err
+	}
+	if strictSpace {
+		filtered, err = h.filterTokenSpaceDMPeers(spaceID, memberSet, filtered)
+		if err != nil {
+			return nil, blacklistDur, err
+		}
+	}
+	return filtered, blacklistDur, nil
+}
+
+// errV2GlobalSearchRequiresSpace fail-closes the v2 global DM candidate
+// enumeration when no bound Space was resolved. The v2 route rejects an empty
+// Space before the handler runs, so this is a defense-in-depth guard rather
+// than a normal path.
+var errV2GlobalSearchRequiresSpace = errors.New("messages_search: v2 global search requires a bound Space")
+
+// filterTokenSpaceDMPeers applies the v2 Token-Space membership gate to the
+// already bot-filtered DM candidate set of the global allowlist.
+//
+// Real users must be active members of the bound Space. The membership source
+// is the same space_member(status=1) relation that single-channel
+// checkP2PAccess evaluates through userService.AreSpaceMembers: the caller's
+// own membership in the bound Space is established by the route's
+// authentication boundary (SpaceMiddleware for v1; the token-bound Space for
+// v2), so peer-in-set is equivalent to CheckBothMembers(spaceID, loginUID,
+// peer).
+//
+// Bots keep the existing bot-in-Space semantics rather than being judged by
+// space_member alone: system Bots stay visible, and Bots accepted by the
+// bot-in-Space relation (a space_member row, or an app_bot row visible in this
+// Space) are kept. App Bots have no `user` row, so this checks the peer set
+// directly instead of reusing GetBotUIDs' user.robot view. The caller's own DM
+// is excluded from enumeration upstream. On a classification error the whole
+// candidate enumeration fails closed instead of admitting unclassified peers.
+func (h *Handler) filterTokenSpaceDMPeers(spaceID string, memberSet map[string]struct{}, peers []string) ([]string, error) {
+	if len(peers) == 0 {
+		return peers, nil
+	}
+	spaceVisibleBots, err := h.botInSpaceUIDs(spaceID, peers)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		if _, ok := memberSet[peer]; ok {
+			out = append(out, peer)
+			continue
+		}
+		if spacepkg.IsSystemBot(peer) || spaceVisibleBots[peer] {
+			out = append(out, peer)
+		}
+	}
+	return out, nil
+}
+
+// botInSpaceUIDs returns the peers that the bot-in-Space relation accepts:
+// space_member rows and app_bot rows visible in spaceID (platform-scoped App
+// Bots are visible in every Space; space-scoped only in their own Space). It
+// deliberately checks the whole peer set, not GetBotUIDs' user.robot filter,
+// so platform App Bots (which have no `user` row) keep their existing "valid
+// Bot" semantics. Real-user members are already kept via memberSet; a
+// space_member hit here is harmless.
+func (h *Handler) botInSpaceUIDs(spaceID string, peers []string) (map[string]bool, error) {
+	if h.dmBotInSpaceFn != nil {
+		return h.dmBotInSpaceFn(spaceID, peers)
+	}
+	candidates := make(map[string]bool, len(peers))
+	for _, peer := range peers {
+		candidates[peer] = true
+	}
+	return spacepkg.CheckBotsInSpace(h.ctx.DB(), spaceID, candidates)
 }
 
 // filterBlacklistedDMPeers drops peers involved in a bidirectional-blacklist

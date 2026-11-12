@@ -1,8 +1,9 @@
 module github.com/Mininglamp-OSS/octo-server
 
-go 1.25
+go 1.25.0
 
 require (
+	codex.mlamp.cn/dmwork/octo-auth-sdk v0.2.0
 	firebase.google.com/go/v4 v4.13.0
 	github.com/BurntSushi/toml v1.6.0
 	github.com/DATA-DOG/go-sqlmock v1.5.0

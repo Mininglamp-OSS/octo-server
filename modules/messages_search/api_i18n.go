@@ -3,6 +3,7 @@ package messages_search
 import (
 	"context"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 
@@ -15,6 +16,9 @@ import (
 
 // respondValidation emits VALIDATION_ERROR with field/reason details.
 func respondValidation(c *wkhttp.Context, field, reason string) {
+	if respondCLIV2SearchError(c, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid search request.") {
+		return
+	}
 	d := i18n.Details{}
 	if field != "" {
 		d["field"] = field
@@ -28,22 +32,34 @@ func respondValidation(c *wkhttp.Context, field, reason string) {
 // respondValidationDetails is the variant for callers that already populated a
 // Details map (e.g. with max_length).
 func respondValidationDetails(c *wkhttp.Context, d i18n.Details) {
+	if respondCLIV2SearchError(c, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid search request.") {
+		return
+	}
 	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchValidationFailed, nil, d)
 }
 
 // respondUpstream emits UPSTREAM_UNAVAILABLE (search backend down).
 func respondUpstream(c *wkhttp.Context) {
+	if respondCLIV2SearchError(c, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE", "Search service unavailable.") {
+		return
+	}
 	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchUpstreamUnavailable, nil, nil)
 }
 
 // respondInternal emits INTERNAL_ERROR — used when something on our side broke
 // (DSL bug, unexpected unmarshal failure). Body message is generic.
 func respondInternal(c *wkhttp.Context) {
+	if respondCLIV2SearchError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "An internal error occurred.") {
+		return
+	}
 	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchInternal, nil, nil)
 }
 
 // respondRateLimited emits RATE_LIMITED with optional retry-after.
 func respondRateLimited(c *wkhttp.Context, retryAfterSec int) {
+	if respondCLIV2SearchError(c, http.StatusTooManyRequests, "RATE_LIMITED", "Search rate limit exceeded.") {
+		return
+	}
 	d := i18n.Details{}
 	if retryAfterSec > 0 {
 		d["retry_after"] = retryAfterSec
@@ -56,6 +72,9 @@ func respondRateLimited(c *wkhttp.Context, retryAfterSec int) {
 // "" when caller has no specific resource label). Empty resource omits the
 // detail key.
 func respondNotFound(c *wkhttp.Context, resource string) {
+	if respondCLIV2SearchError(c, http.StatusNotFound, "NOT_FOUND", "The requested resource was not found.") {
+		return
+	}
 	d := i18n.Details{}
 	if resource != "" {
 		d["resource"] = resource
@@ -68,6 +87,9 @@ func respondNotFound(c *wkhttp.Context, resource string) {
 // backendGate middleware (and mirrored by the legacy surfaces) so every
 // search entry point refuses uniformly instead of 500/panic/leaking.
 func respondSearchDisabled(c *wkhttp.Context) {
+	if respondCLIV2SearchError(c, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE", "Search is unavailable.") {
+		return
+	}
 	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchDisabled, nil, nil)
 }
 
@@ -75,6 +97,9 @@ func respondSearchDisabled(c *wkhttp.Context) {
 // cap (max_result_window) was reached. Carries the cap so clients can surface
 // a meaningful "narrow your search" hint.
 func respondDepthExceeded(c *wkhttp.Context) {
+	if respondCLIV2SearchError(c, http.StatusBadRequest, "VALIDATION_ERROR", "The requested search depth exceeds the maximum.") {
+		return
+	}
 	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchDepthExceeded, nil, i18n.Details{
 		"max_depth": maxPaginationDepth,
 	})

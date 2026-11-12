@@ -128,6 +128,8 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 		Tenant:  authtree.ScopeUnscoped,
 		Handler: f.getDownloadURL,
 	})
+
+	f.registerCLIV2Routes(r)
 }
 
 func (f *File) stickerUploadHandlers(r *wkhttp.WKHttp) []wkhttp.HandlerFunc {

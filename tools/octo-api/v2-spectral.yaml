@@ -1,0 +1,201 @@
+extends:
+  - spectral:oas
+
+functions:
+  - no-empty-schema
+  - no-draft-language
+functionsDir: ./functions
+
+aliases:
+  Operation:
+    - '$.paths[*][get,post,put,patch,delete]'
+
+rules:
+
+  # Promote the OpenAPI validator's core structural rules to blocking errors.
+  oas3-schema: error
+  oas3-api-servers: error
+  operation-operationId: error
+  operation-operationId-unique: error
+  operation-description: error
+  operation-tags: error
+  operation-tag-defined: error
+  no-$ref-siblings: error
+  # OpenAPI 3.1 is required for the isolated v2 contract.
+  octo-v2-openapi-version:
+    description: v2 contract must use OpenAPI 3.1.
+    severity: error
+    given: '$'
+    then:
+      field: openapi
+      function: pattern
+      functionOptions:
+        match: '^3\.1\.'
+
+  # v1 is deliberately not included in this file; every documented route must
+  # be a direct /v2/cli route with no duplicated or hidden version base path.
+  octo-v2-path-prefix:
+    description: v2 document must contain only /v2/cli routes.
+    severity: error
+    given: '$.paths'
+    then:
+      field: '@key'
+      function: pattern
+      functionOptions:
+        match: '^/v2/cli(/[a-z0-9_{}]+)+$'
+        notMatch: '[A-Z]|//'
+
+  octo-v2-operation-id:
+    description: Every operation needs a stable operationId.
+    severity: error
+    given: '#Operation'
+    then:
+      field: operationId
+      function: pattern
+      functionOptions:
+        match: '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,2}$'
+
+  octo-v2-summary:
+    description: Every operation needs a concise summary.
+    severity: error
+    given: '#Operation'
+    then:
+      field: summary
+      function: length
+      functionOptions:
+        min: 1
+        max: 80
+
+  octo-v2-description:
+    description: Every operation needs a distinct behavior description.
+    severity: error
+    given: '#Operation'
+    then:
+      field: description
+      function: truthy
+
+  octo-v2-single-tag:
+    description: Every operation must use exactly one declared tag.
+    severity: error
+    given: '#Operation'
+    then:
+      field: tags
+      function: length
+      functionOptions:
+        min: 1
+        max: 1
+
+  octo-v2-bearer-required:
+    description: All v2 operations must inherit the new business-token Bearer scheme.
+    severity: error
+    given: '$'
+    then:
+      field: security
+      function: truthy
+
+  octo-v2-auth-scheme:
+    description: Bearer security must be defined as HTTP Bearer.
+    severity: error
+    given: '$.components.securitySchemes.bearerAuth'
+    then:
+      - field: type
+        function: pattern
+        functionOptions:
+          match: '^http$'
+      - field: scheme
+        function: pattern
+        functionOptions:
+          match: '^bearer$'
+
+  octo-v2-auth-errors:
+    description: Every authenticated operation must document 401, 403, 404, and 500.
+    severity: error
+    given: '#Operation'
+    then:
+      - field: responses.401
+        function: truthy
+      - field: responses.403
+        function: truthy
+      - field: responses.404
+        function: truthy
+      - field: responses.500
+        function: truthy
+
+  octo-v2-success-envelope:
+    description: Every JSON 2xx response must expose the top-level data envelope.
+    severity: error
+    resolved: true
+    given: '$.paths[*][*].responses[?(@property.match(/^2/))].content[*].schema'
+    then:
+      field: properties.data
+      function: truthy
+
+  octo-v2-error-envelope:
+    description: Every JSON 4xx/5xx response must expose the top-level error envelope.
+    severity: error
+    resolved: true
+    given: '$.paths[*][*].responses[?(@property.match(/^[45]/))].content[*].schema'
+    then:
+      field: properties.error
+      function: truthy
+
+  octo-v2-json-errors:
+    description: All error response bodies must be JSON.
+    severity: error
+    given: '$.paths[*][*].responses[?(@property.match(/^[45]/))].content[*]~'
+    then:
+      function: pattern
+      functionOptions:
+        match: '^application/json$'
+
+  octo-v2-no-empty-schemas:
+    description: Component schemas must define concrete object properties or explicitly allow an open object; arrays must declare items, and only EmptyData may explicitly forbid all properties.
+    severity: error
+    given: '$.components.schemas'
+    then:
+      function: no-empty-schema
+  octo-v2-no-draft-language:
+    description: Published descriptions must not retain provisional contract-review language.
+    severity: error
+    given: '$..description'
+    then:
+      function: no-draft-language
+
+  octo-v2-path-parameter-id:
+    description: Resource path parameters must use the resource_id naming form.
+    severity: error
+    given: '$.paths[*][*].parameters[?(@.in=="path")]'
+    then:
+      field: name
+      function: pattern
+      functionOptions:
+        match: '^[a-z][a-z0-9_]*_id$'
+        notMatch: '^(uid|short_id|group_no)$'
+
+  octo-v2-response-error-code-description:
+    description: Error responses must identify an allowed OCTO R2 error code.
+    severity: error
+    given: '$.components.responses[*].description'
+    then:
+      function: pattern
+      functionOptions:
+        match: '\b(AUTH_REQUIRED|FORBIDDEN|NOT_FOUND|CONFLICT|DUPLICATE|VALIDATION_ERROR|PAYLOAD_TOO_LARGE|UNSUPPORTED_MEDIA_TYPE|CLIENT_VERSION_TOO_OLD|RATE_LIMITED|INTERNAL_ERROR|UPSTREAM_UNAVAILABLE)\b'
+  octo-v2-action:
+    description: Every operation must declare a concrete server-owned permission action.
+    severity: error
+    given: '#Operation'
+    then:
+      field: x-octo-action
+      function: pattern
+      functionOptions:
+        match: '^im\.[a-z][a-z0-9_.-]*:(read|write)$'
+
+  octo-v2-principal:
+    description: Every operation must select the authenticated token or effective actor.
+    severity: error
+    given: '#Operation'
+    then:
+      field: x-octo-principal
+      function: enumeration
+      functionOptions:
+        values: [token_user, effective_actor]

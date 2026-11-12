@@ -296,6 +296,8 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 
 // Route registers all Bot API routes.
 func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
+	ba.registerCLIMessageRoutes(r)
+	ba.registerCLIMiscRoutes(r)
 	// register endpoint (token needed but not via authBot group — handled inline).
 	//
 	// **两层限流,顺序载荷性**:先 per-IP,再 per-token。

@@ -70,6 +70,22 @@ func (h *Handler) checkChannelAccess(c *wkhttp.Context, channelType uint8, chann
 	}
 }
 
+// checkTokenSpaceDMMembership evaluates the v2 real-user DM membership gate:
+// the caller and the peer must both be active members of the Token's bound
+// Space. It is the single predicate shared by the single-channel P2P gate and
+// the v2 global DM candidate filter, so the two surfaces cannot drift.
+//
+// The caller's note-to-self DM is self-readable and short-circuits before the
+// DB lookup. The caller's own membership in the bound Space is established by
+// the route's authentication boundary (SpaceMiddleware for v1; the token-bound
+// Space for v2) before this predicate runs.
+func (h *Handler) checkTokenSpaceDMMembership(spaceID, loginUID, peerUID string) (bool, error) {
+	if peerUID == loginUID {
+		return true, nil
+	}
+	return h.userService.AreSpaceMembers(spaceID, loginUID, peerUID)
+}
+
 // checkP2PAccess gates DM search behind the same access semantics as
 // modules/user/api_pinned.go::validateChannelAccess: notes-to-self → own
 // bot → other-user bot (must be friends) → real-user (same-Space OR
@@ -142,10 +158,14 @@ func (h *Handler) checkP2PAccess(c *wkhttp.Context, peerUID, loginUID string) bo
 		// spaceID 走 principal（决策十）：真人等价于 GetSpaceID(c)；bot 无 space_member
 		// 行、Space 为空（as-bot 的 P2P 分支由 #C 用 bot 谓词接管，不落此真人分支）。
 		spaceID := h.principal(c).SpaceID()
+		if isCLIV2Search(c) && spaceID == "" {
+			respondNotFound(c, "channel")
+			return false
+		}
 		if spaceID != "" {
-			sameSpace, serr := h.userService.AreSpaceMembers(spaceID, loginUID, peerUID)
+			sameSpace, serr := h.checkTokenSpaceDMMembership(spaceID, loginUID, peerUID)
 			if serr != nil {
-				h.Error("p2p access check failed: AreSpaceMembers",
+				h.Error("p2p access check failed: checkTokenSpaceDMMembership",
 					zap.Error(serr),
 					zap.String("uid", loginUID),
 					zap.String("peer", peerUID),
@@ -154,6 +174,10 @@ func (h *Handler) checkP2PAccess(c *wkhttp.Context, peerUID, loginUID string) bo
 				return false
 			}
 			allowed = sameSpace
+			if isCLIV2Search(c) && !sameSpace {
+				respondNotFound(c, "channel")
+				return false
+			}
 		}
 		if !allowed {
 			isFriend, ferr := h.userService.IsFriend(loginUID, peerUID)
@@ -271,6 +295,9 @@ func (h *Handler) checkGroupAccess(c *wkhttp.Context, groupNo, loginUID string) 
 		respondNotFound(c, "channel")
 		return false
 	}
+	if !h.checkBoundSpaceGroup(c, groupNo, loginUID, groupModel.SpaceID) {
+		return false
+	}
 	active, err := h.groupService.ExistMemberActive(groupNo, loginUID)
 	if err != nil {
 		h.Error("group access check failed: ExistMemberActive",
@@ -301,6 +328,23 @@ func (h *Handler) checkThreadAccess(c *wkhttp.Context, channelID, loginUID strin
 	if err != nil {
 		respondNotFound(c, "channel")
 		return false
+	}
+	if isCLIV2Search(c) {
+		groupModel, err := h.groupService.GetGroupWithGroupNo(parsedGroup)
+		if err != nil {
+			h.Error("thread access check failed: GetGroupWithGroupNo",
+				zap.Error(err),
+				zap.String("group_no", parsedGroup))
+			respondInternal(c)
+			return false
+		}
+		if groupModel == nil {
+			respondNotFound(c, "channel")
+			return false
+		}
+		if !h.checkBoundSpaceGroup(c, parsedGroup, loginUID, groupModel.SpaceID) {
+			return false
+		}
 	}
 	if _, err := h.threadService.GetThread(parsedGroup, shortID, loginUID); err != nil {
 		// Three-way collapse (not-found / deleted / DB error) per the

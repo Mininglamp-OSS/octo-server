@@ -128,7 +128,7 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 	items := h.buildMediaHits(ctx, filtered, req, loginUID)
 
 	recordAudit(c, "search_media", req.ChannelType, req.ChannelID, "", len(items))
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }
 
 func buildSearchMediaDSL(req SearchMediaReq, normChannelID, spaceID string) elastic.Query {

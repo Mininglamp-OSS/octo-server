@@ -84,7 +84,7 @@ func (h *Handler) searchGlobalMessages(c *wkhttp.Context) {
 	}
 	if len(osChannelIDs) == 0 {
 		recordAudit(c, "search_global_messages", 0, "", req.Keyword, 0)
-		c.Response(envelope([]SearchAllHit{}, false, ""))
+		respondSearchResult(c, envelope([]SearchAllHit{}, false, ""))
 		return
 	}
 
@@ -164,7 +164,7 @@ func (h *Handler) searchGlobalMessages(c *wkhttp.Context) {
 
 	recordAudit(c, "search_global_messages", 0, "", req.Keyword, len(items))
 	recordSearchTimings(c, searchTimings)
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }
 
 // buildGlobalMessagesDSL is the multi-channel variant of buildSearchAllDSL.
@@ -458,5 +458,5 @@ func (h *Handler) searchAllForGlobalFastPath(c *wkhttp.Context, req SearchAllReq
 
 	items := h.buildSearchAllHits(ctx, filtered, req, loginUID)
 	recordAudit(c, "search_global_messages_fast", req.ChannelType, req.ChannelID, req.Keyword, len(items))
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }

@@ -49,7 +49,7 @@ env-test:
 #                   - lint-unregistered-code: no inline codes.Code{} literals
 #                     passed to httperr.ResponseErrorL (registry bypass)
 
-.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint card-dispatch-lint
+.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint card-dispatch-lint openapi-check openapi-v2-check
 
 i18n-extract:
 	go run ./pkg/i18n/cmd/octo-i18n-extract
@@ -82,3 +82,12 @@ i18n-merge: i18n-extract
 	  tools/i18nmarkers/shared/active.en-US.toml \
 	  tools/i18nmarkers/server/active.en-US.toml \
 	  pkg/i18n/locales/active.zh-CN.toml
+
+# Validate the standalone OpenAPI 3.1 contract for the isolated /v2/cli API.
+# Existing v1 module Swagger contracts are intentionally not regenerated here.
+# `openapi-check` is the v2 contract's top-level check; it does not run legacy
+# v1 annotation coverage or regenerate the independent contract.
+openapi-check: openapi-v2-check
+
+openapi-v2-check:
+	npx --yes @stoplight/spectral-cli@latest lint docs/openapi/v2.yaml --ruleset tools/octo-api/v2-spectral.yaml --fail-severity error

@@ -645,6 +645,22 @@ func (d *DB) queryMembersWithKeyword(groupNo string, loginUID string, keyword st
 	return details, err
 }
 
+func (d *DB) countMembersWithKeyword(groupNo, loginUID, keyword string) (int64, error) {
+	builder := d.session.Select("COUNT(DISTINCT group_member.id)").From("group_member")
+	if keyword != "" {
+		builder = builder.LeftJoin("user", "group_member.uid=user.uid").
+			LeftJoin("user_setting", dbr.Expr("user_setting.uid=? and user_setting.to_uid=group_member.uid", loginUID)).
+			Where("group_member.group_no=? and group_member.is_deleted=0 and group_member.status=? and (group_member.remark like ? or user.name like ? or user_setting.remark like ?)",
+				groupNo, common.GroupMemberStatusNormal, "%"+keyword+"%", "%"+keyword+"%", "%"+keyword+"%")
+	} else {
+		builder = builder.Where("group_member.group_no=? and group_member.is_deleted=0 and group_member.status=?",
+			groupNo, common.GroupMemberStatusNormal)
+	}
+	var total int64
+	err := builder.LoadOne(&total)
+	return total, err
+}
+
 func (d *DB) queryManagersWithGroupNos(groupNos []string) ([]*MemberDetailModel, error) {
 	var memberModels []*MemberDetailModel
 	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no in ? and group_member.is_deleted=0 and group_member.role<>0", groupNos).Load(&memberModels)

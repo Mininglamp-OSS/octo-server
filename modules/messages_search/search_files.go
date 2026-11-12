@@ -156,7 +156,7 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 	items := h.buildFileHits(ctx, filtered, req, loginUID)
 
 	recordAudit(c, "search_files", req.ChannelType, req.ChannelID, req.Keyword, len(items))
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }
 
 func buildSearchFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStripEnabled bool, req SearchFilesReq, normChannelID, spaceID string) (elastic.Query, error) {

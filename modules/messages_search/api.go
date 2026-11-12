@@ -14,8 +14,9 @@ import (
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 )
 
-// Handler wires the four /v1/messages/_search* endpoints. New is invoked from
-// 1module.go via the standard register.AddModule entry point.
+// Handler wires the /v1 search endpoints and contributes the /v2/cli search
+// handlers to the independent cliv2 router. New is invoked from 1module.go
+// through the standard register.AddModule entry point.
 type Handler struct {
 	ctx *config.Context
 	log.Log
@@ -47,6 +48,12 @@ type Handler struct {
 	// + spacepkg.CheckBotsInSpace on h.ctx.DB()); tests inject a pass-through
 	// stub so enumerateDMPeers is exercisable without a real MySQL connection.
 	dmBotFilterFn func(spaceID string, peers []string) ([]string, error)
+	// dmBotInSpaceFn is a test seam for the Space-visible peer lookup (the
+	// space_member + app_bot relation) used by the v2 Token-Space DM candidate
+	// filter. Nil in production (falls through to spacepkg.CheckBotsInSpace on
+	// h.ctx.DB()); tests inject an empty-set stub so the v2 global allowlist is
+	// exercisable without a real MySQL connection.
+	dmBotInSpaceFn func(spaceID string, peers []string) (map[string]bool, error)
 	// threadEnumFn is a test seam for the thread enumeration inside
 	// buildAllowlist. Nil in production (falls through to thread.NewDB(h.ctx)
 	// .QueryNonDeletedShortIDsByGroupNos — archived threads are included per
@@ -89,18 +96,18 @@ func New(ctx *config.Context) *Handler {
 	cfg := loadConfig()
 	msgSvc := message.NewService(ctx)
 	h := &Handler{
-		ctx:               ctx,
-		Log:               log.NewTLog("messages_search"),
-		cfg:               cfg,
-		userService:       user.NewService(ctx),
-		groupService:      group.NewService(ctx),
-		messageService:    msgSvc,
-		threadService:     thread.NewService(ctx),
-		cardTrust:         cardtrust.New(ctx),
-		visibility:        newMessageVisibilityProbe(msgSvc),
-		limiter:           newUIDLimiter(cfg.RateLimit.QPS, cfg.RateLimit.Burst),
-		cache:             newSenderCache(senderCacheCapacity, senderCacheTTL),
-		mode:              searchbackend.Resolve(ctx.GetConfig().ZincSearch.SearchOn),
+		ctx:            ctx,
+		Log:            log.NewTLog("messages_search"),
+		cfg:            cfg,
+		userService:    user.NewService(ctx),
+		groupService:   group.NewService(ctx),
+		messageService: msgSvc,
+		threadService:  thread.NewService(ctx),
+		cardTrust:      cardtrust.New(ctx),
+		visibility:     newMessageVisibilityProbe(msgSvc),
+		limiter:        newUIDLimiter(cfg.RateLimit.QPS, cfg.RateLimit.Burst),
+		cache:          newSenderCache(senderCacheCapacity, senderCacheTTL),
+		mode:           searchbackend.Resolve(ctx.GetConfig().ZincSearch.SearchOn),
 	}
 	if cfg.CursorHMAC == "" {
 		// The fallback key in cursor.go is a published constant, so cursors
@@ -119,10 +126,10 @@ func New(ctx *config.Context) *Handler {
 	return h
 }
 
-// Route mounts the four endpoints under /v1/messages with the standard
+// Route mounts the /v1 endpoints under /v1/messages with the standard
 // auth/space/uid-limit chain plus the per-user search rate limiter and the
-// audit middleware (PRM-02). Individual handlers are wired in their own
-// search_*.go files via the registerHandler helper.
+// audit middleware (PRM-02). It also contributes the User-only /v2/cli routes
+// to the independent router; individual handlers are defined in search_*.go.
 //
 // The backendGate middleware runs INSIDE the chain (after auth + rate limit +
 // audit) so a disabled / zinc deployment still meters and audits the refusal
@@ -147,6 +154,7 @@ func (h *Handler) Route(r *wkhttp.WKHttp) {
 	// the enum is a static dictionary with no backend dependency. Mounted
 	// separately with only AuthMiddleware + the shared UID rate limiter.
 	h.mountFileTypesRoute(r)
+	h.mountCLIV2Routes(r)
 }
 
 // backendGate refuses every _search* request with SEARCH_DISABLED unless the

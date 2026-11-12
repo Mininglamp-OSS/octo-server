@@ -37,12 +37,12 @@ type MessageHit struct {
 	// which return hits from many rooms in a single response — omitempty on the
 	// single-channel surfaces keeps the wire shape byte-identical for the
 	// legacy _search / _search_all / _search_around callers that pass 0.
-	ChannelType     uint8          `json:"channel_type,omitempty"`
-	ThumbURL        string         `json:"thumb_url,omitempty"`
-	VideoURL        string         `json:"video_url,omitempty"`
-	Width           int            `json:"width,omitempty"`
-	Height          int            `json:"height,omitempty"`
-	DurationMs      int64          `json:"duration_ms,omitempty"`
+	ChannelType uint8  `json:"channel_type,omitempty"`
+	ThumbURL    string `json:"thumb_url,omitempty"`
+	VideoURL    string `json:"video_url,omitempty"`
+	Width       int    `json:"width,omitempty"`
+	Height      int    `json:"height,omitempty"`
+	DurationMs  int64  `json:"duration_ms,omitempty"`
 	// RichText is the typed projection of a payload.type=14 rich-text message,
 	// emitted only when the hit is rich-text AND the indexer preserved
 	// `_source.payloadRaw`. Older docs (pre-payloadRaw indexer) leave it nil,
@@ -157,7 +157,7 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 	items := h.buildMessageHits(ctx, filtered, req, loginUID)
 
 	recordAudit(c, "search_messages", req.ChannelType, req.ChannelID, req.Keyword, len(items))
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }
 
 // buildSearchMessagesDSL constructs the bool query for /_search. Returns the

@@ -25,6 +25,7 @@ type Thread struct {
 	ctx          *config.Context
 	db           *DB
 	service      IService
+	groupDB      *group.DB
 	groupService group.IService
 	log.Log
 }
@@ -36,6 +37,7 @@ func New(ctx *config.Context) *Thread {
 		db:           NewDB(ctx),
 		service:      NewService(ctx),
 		groupService: group.NewService(ctx),
+		groupDB:      group.NewDB(ctx),
 		Log:          log.NewTLog("Thread"),
 	}
 
@@ -209,6 +211,7 @@ func (t *Thread) Route(r *wkhttp.WKHttp) {
 		threadSimple.POST("/:short_id/leave", t.protectAIContainerSimpleMutation, t.leaveThreadSimple)
 		threadSimple.GET("/:short_id", t.getThreadSimple)
 	}
+	t.registerCLIThreadRoutes(r)
 }
 
 func (t *Thread) protectAIContainerMutation(c *wkhttp.Context) {

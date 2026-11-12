@@ -357,3 +357,34 @@ func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV5Default(t *testing
 		require.NoError(t, err)
 	}
 }
+func TestCLIRouterDisabledWithoutAuthConfiguration(t *testing.T) {
+	router, enabled, err := newCLIRouter("", "")
+	require.NoError(t, err)
+	require.False(t, enabled)
+	require.Nil(t, router)
+}
+
+func TestCLIRouterRejectsPartialAuthConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		base   string
+		secret string
+	}{
+		{name: "missing secret", base: "https://auth.example"},
+		{name: "missing base URL", secret: strings.Repeat("s", 32)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, enabled, err := newCLIRouter(tc.base, tc.secret)
+			require.Error(t, err)
+			require.False(t, enabled)
+			require.Nil(t, router)
+		})
+	}
+}
+
+func TestCLIRouterEnabledWithCompleteAuthConfiguration(t *testing.T) {
+	router, enabled, err := newCLIRouter("https://auth.example", strings.Repeat("s", 32))
+	require.NoError(t, err)
+	require.True(t, enabled)
+	require.NotNil(t, router)
+}

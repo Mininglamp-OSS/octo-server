@@ -66,7 +66,7 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 	}
 	if len(osChannelIDs) == 0 {
 		recordAudit(c, "search_global_files", 0, "", req.Keyword, 0)
-		c.Response(envelope([]FileHit{}, false, ""))
+		respondSearchResult(c, envelope([]FileHit{}, false, ""))
 		return
 	}
 
@@ -140,7 +140,7 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 	searchTimings.senderJoin = time.Since(sjStart)
 	recordAudit(c, "search_global_files", 0, "", req.Keyword, len(items))
 	recordSearchTimings(c, searchTimings)
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }
 
 // buildGlobalFilesDSL is the multi-channel variant of buildSearchFilesDSL.
@@ -334,5 +334,5 @@ func (h *Handler) dispatchSingleFiles(c *wkhttp.Context, req SearchGlobalFilesRe
 	}
 	items := h.buildGlobalFileHits(ctx, filtered, loginUID)
 	recordAudit(c, "search_global_files_fast", target.ChannelType, target.WireID, req.Keyword, len(items))
-	c.Response(envelope(items, hasMore, nextCursor))
+	respondSearchResult(c, envelope(items, hasMore, nextCursor))
 }

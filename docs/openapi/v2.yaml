@@ -1,0 +1,2372 @@
+openapi: 3.1.0
+info:
+  title: OCTO Server CLI API
+  version: 2.0.0
+  description: |
+    OpenAPI contract for the independent /v2/cli surface. The existing /v1
+    API remains unchanged and is documented by its existing module contracts.
+
+    This contract describes the implemented independent /v2/cli routes. It
+    does not change the existing /v1 API.
+
+    User, Space, message, group, and thread adapters derive Space scope from
+    the authenticated Token and apply their resource or membership checks.
+    Request fields cannot select or override that bound Space. Routes that
+    support a verified User Bot binding use that Bot as the effective actor;
+    token-user-only routes continue to act as the Token owner. File routes
+    create server-assigned object keys and do not claim Space ownership for
+    uploaded objects.
+servers:
+  - url: https://api.botgate.cn/api
+    description: OCTO Server API gateway base; /v2/cli is part of each route.
+tags:
+  - name: identity
+    description: Authenticated token identity.
+  - name: user
+    description: User profile access.
+  - name: space
+    description: Access within the token-bound Space.
+  - name: message
+    description: Messaging, synchronization, and user-principal search.
+  - name: group
+    description: Native group operations.
+  - name: thread
+    description: Group thread operations.
+  - name: file
+    description: File uploads with server-assigned object keys.
+  - name: upload
+    description: Temporary upload credentials and signed uploads.
+security:
+  - bearerAuth: []
+paths:
+  /v2/cli/identity:
+    get:
+      tags: [identity]
+      operationId: identity.get
+      summary: Get token identity
+      description: |
+        Returns the verified token owner, its bound Space, and an optional
+        verified User Bot binding. A missing binding is represented by an empty
+        bot_id; an invalid or unavailable configured Bot is an error and never falls
+        back to the user. This operation does not issue or rotate a legacy Bot
+        or IM token.
+      x-octo-action: im.identity:read
+      x-octo-principal: token_user
+      responses:
+        '200':
+          description: Verified identity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentityResponse'
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/users/{user_id}:
+    get:
+      tags: [user]
+      operationId: user.get
+      summary: Get a user profile
+      description: Returns a user profile visible to the effective actor within existing user and bound-Space access rules.
+      x-octo-action: im.users:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          description: User identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: User profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfileResponse'
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/space/members:
+    get:
+      tags: [space]
+      operationId: space.member.list
+      summary: List members in the bound Space
+      description: |
+        Lists members from the authenticated token's bound Space after the
+        effective actor passes the existing active-Space-membership check.
+        Caller-supplied Space identifiers cannot override that binding.
+        Supports a name keyword and page/page_size offset paging with total
+        metadata.
+      x-octo-action: im.spaces:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: keyword
+          in: query
+          required: false
+          description: Optional name substring filter; requests over 128 bytes are rejected.
+          schema: {type: string}
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Page of Space members and offset pagination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpaceMembersResponse'
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/typing:
+    post:
+      tags: [message]
+      operationId: message.typing
+      summary: Send a typing indicator
+      description: Sends typing state as the effective actor after the existing channel access checks. This route does not accept on-behalf-of requests.
+      x-octo-action: im.messages:write
+      x-octo-principal: effective_actor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TypingRequest'
+      responses:
+        '200':
+          description: Typing indicator accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageStatusResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/messages:
+    post:
+      tags: [message]
+      operationId: message.send
+      summary: Send a message
+      description: Sends a message as the effective actor after the existing channel and permission checks. The authenticated user remains the Token owner; this route rejects on-behalf-of requests.
+      x-octo-action: im.messages:write
+      x-octo-principal: effective_actor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageSendRequest'
+      responses:
+        '200':
+          description: Message accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageSendResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/messages/{message_id}:
+    patch:
+      tags: [message]
+      operationId: message.edit
+      summary: Edit a message
+      description: |
+        Edits a message authored by the effective actor. Token-user edits
+        accept content_edit; a bound Bot may also use the existing raw-card or
+        registered-template edit mode. The path message_id is copied into the
+        request when omitted and must match if supplied.
+      x-octo-action: im.messages:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          description: Message identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageEditRequest'
+      responses:
+        '200':
+          description: Message edited.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageStatusResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/messages/_sync:
+    post:
+      tags: [message]
+      operationId: message.sync
+      description: Synchronizes channel messages for the effective actor using the supplied sequence range, limit, and pull mode. The response preserves the existing message synchronization shape.
+      x-octo-action: im.messages:read
+      x-octo-principal: effective_actor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageSyncRequest'
+      responses:
+        '200':
+          description: Synchronized channel window.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageSyncResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/messages/_read_receipt:
+    post:
+      tags: [message]
+      operationId: message.read_receipt
+      description: Records message read state for the effective actor after the existing channel and message checks.
+      x-octo-action: im.messages:read
+      x-octo-principal: effective_actor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadReceiptRequest'
+      responses:
+        '200':
+          description: Read state recorded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageStatusResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/messages/_search:
+    post:
+      tags: [message]
+      operationId: message.search
+      summary: Search messages in a channel
+      description: Searches as the authenticated token user, never as a bound Bot, and retains channel visibility, Space scope, and message filtering.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MessageSearchRequest'}
+      responses:
+        '200':
+          description: Cursor-paginated message hits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageSearchResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_all:
+    post:
+      tags: [message]
+      operationId: message.search_all
+      summary: Search messages and files in a channel
+      description: Searches messages and files as the authenticated token user and applies the existing channel, Space, and visibility filters.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MessageSearchRequest'}
+      responses:
+        '200':
+          description: Cursor-paginated mixed message and file hits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchAllResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_files:
+    post:
+      tags: [message]
+      operationId: message.search_files
+      summary: Search files in a channel
+      description: Searches file messages as the authenticated token user and retains the current file and visibility filters.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FileSearchRequest'}
+      responses:
+        '200':
+          description: Cursor-paginated file hits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FileSearchResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_media:
+    post:
+      tags: [message]
+      operationId: message.search_media
+      summary: Search media in a channel
+      description: Searches image and video messages as the authenticated token user and retains existing channel and visibility rules.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MediaSearchRequest'}
+      responses:
+        '200':
+          description: Cursor-paginated media hits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MediaSearchResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_around:
+    post:
+      tags: [message]
+      operationId: message.search_around
+      summary: Find context around a message
+      description: Finds the visible context window around an anchor as the authenticated token user; the anchor and surrounding hits pass the same channel, Space, and visibility checks.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SearchAroundRequest'}
+      responses:
+        '200':
+          description: Context window around the anchor.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchAroundResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_global_groups:
+    post:
+      tags: [message]
+      operationId: message.search_global_groups
+      summary: Search groups across readable channels
+      description: |
+        Aggregates visible search results by readable channel as the token user.
+        Returns a bounded aggregate for the visible groups. pagination.has_more
+        indicates that more groups exist than fit in the response; next_cursor
+        is always empty because this aggregate does not support paging.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GlobalGroupsSearchRequest'}
+      responses:
+        '200':
+          description: Aggregated visible groups and cursor-shaped legacy metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GlobalGroupsSearchResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_global_messages:
+    post:
+      tags: [message]
+      operationId: message.search_global_messages
+      summary: Search messages across readable channels
+      description: Searches messages and files across the token user's readable channels, with the existing allowlist, Space, and visibility filters.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GlobalMessagesSearchRequest'}
+      responses:
+        '200':
+          description: Cursor-paginated mixed message and file hits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchAllResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/messages/_search_global_files:
+    post:
+      tags: [message]
+      operationId: message.search_global_files
+      summary: Search files across readable channels
+      description: Searches file messages across the token user's readable channels and retains existing allowlist, Space, and visibility filters.
+      x-octo-action: im.messages:read
+      x-octo-principal: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GlobalFilesSearchRequest'}
+      responses:
+        '200':
+          description: Cursor-paginated file hits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FileSearchResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/groups:
+    get:
+      tags: [group]
+      operationId: group.list
+      summary: List visible groups
+      description: Lists non-disbanded native groups in the bound Space where the effective actor has an active membership; purpose-managed groups are excluded. Uses 1-based offset paging.
+      x-octo-action: im.groups:read
+      x-octo-principal: effective_actor
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Page of matching native groups.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupListResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    post:
+      tags: [group]
+      operationId: group.create
+      summary: Create a group
+      description: |
+        Creates a native group with the token user as creator and the bound
+        Space as its Space. A verified User Bot binding may act on the request.
+        An optional space_id must match the bound Space.
+      x-octo-action: im.groups:write
+      x-octo-principal: effective_actor
+      x-octo-owner: token_user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GroupCreateRequest'}
+      responses:
+        '200':
+          description: Created group.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupCreateResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}:
+    get:
+      tags: [group]
+      operationId: group.get
+      summary: Get a group
+      description: Returns group details only after the selected actor passes the existing group access checks.
+      x-octo-action: im.groups:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Group data.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupDetailResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/members:
+    get:
+      tags: [group]
+      operationId: group.member.list
+      summary: List group members
+      description: Lists group members using 1-based page and page_size offset pagination with an optional keyword filter after the effective actor passes the group membership check. Returns the member array and top-level pagination metadata.
+      x-octo-action: im.groups:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Native group identifier.
+          schema: {type: string, pattern: '^[0-9a-fA-F]{32}$'}
+        - name: keyword
+          in: query
+          required: false
+          description: Optional member-name filter.
+          schema: {type: string}
+        - name: page
+          in: query
+          required: false
+          description: 1-based page number; defaults to 1.
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: page_size
+          in: query
+          required: false
+          description: Page size; defaults to 20 and is limited to 100.
+          schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+      responses:
+        '200':
+          description: Page of group members.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupMembersResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/md:
+    get:
+      tags: [group]
+      operationId: group.markdown.get
+      summary: Get group Markdown
+      description: Gets the group's Markdown document after the effective actor passes the existing group membership check.
+      x-octo-action: im.groups:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Group Markdown document.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupMarkdownResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    put:
+      tags: [group]
+      operationId: group.markdown.update
+      summary: Update group Markdown
+      description: Updates group Markdown as the effective actor after existing membership, management, and disband checks; the group owner is unchanged.
+      x-octo-action: im.groups:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MarkdownUpdateRequest'}
+      responses:
+        '200':
+          description: Markdown updated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MarkdownUpdateResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/info:
+    patch:
+      tags: [group]
+      operationId: group.info.update
+      summary: Update group information
+      description: Updates the supplied group name and/or notice after the existing management and disband checks. The response confirms completion.
+      x-octo-action: im.groups:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GroupInfoUpdateRequest'}
+      responses:
+        '200':
+          description: Group information updated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OkResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/members/_add:
+    post:
+      tags: [group]
+      operationId: group.member.add
+      summary: Add group members
+      description: |
+        Adds the requested members as the effective actor after existing
+        admission, privilege, and Bot-ownership checks. The response reports
+        the number of members added.
+      x-octo-action: im.groups:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GroupMemberAddRequest'}
+      responses:
+        '200':
+          description: Member additions completed with legacy-compatible counts.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupMemberAddResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/members/_remove:
+    post:
+      tags: [group]
+      operationId: group.member.remove
+      summary: Remove group members
+      description: Removes requested members after the existing group, role, membership, and Bot-ownership checks; the response reports the number removed.
+      x-octo-action: im.groups:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GroupMemberRemoveRequest'}
+      responses:
+        '200':
+          description: Member removals completed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupMemberRemoveResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/threads:
+    get:
+      tags: [thread]
+      operationId: group.thread.list
+      summary: List group threads
+      description: Lists threads matching the optional status filter, using 1-based page/page_size offset paging after the effective actor passes the parent-group access check.
+      x-octo-action: im.threads:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Group identifier.
+          schema: {type: string}
+        - name: status
+          in: query
+          required: false
+          description: Thread status filter; defaults to active.
+          schema: {type: string, enum: [active, archived, all], default: active}
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Page of threads and offset pagination.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ThreadListResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    post:
+      tags: [thread]
+      operationId: group.thread.create
+      summary: Create a group thread
+      description: Creates a thread as the selected effective actor after the existing parent-group and source-message checks; the thread creator is the selected actor.
+      x-octo-action: im.threads:write
+      x-octo-principal: effective_actor
+      x-octo-owner: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ThreadCreateRequest'}
+      responses:
+        '200':
+          description: Created thread.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ThreadResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/threads/{thread_id}:
+    get:
+      tags: [thread]
+      operationId: thread.get
+      summary: Get a thread
+      description: Returns thread details after checking effective-actor access to the parent group and thread.
+      x-octo-action: im.threads:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+        - name: thread_id
+          in: path
+          required: true
+          description: Thread identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Thread details.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ThreadResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/threads/{thread_id}/members:
+    get:
+      tags: [thread]
+      operationId: thread.member.list
+      summary: List thread members
+      description: Lists thread members after the effective actor passes the parent-group and thread access checks. Returns a page of members with top-level offset pagination metadata.
+      x-octo-action: im.threads:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+        - name: thread_id
+          in: path
+          required: true
+          description: Thread identifier.
+          schema: {type: string}
+        - name: page
+          in: query
+          required: false
+          description: 1-based page number; defaults to 1.
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: page_size
+          in: query
+          required: false
+          description: Page size; defaults to 20 and is limited to 100.
+          schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+      responses:
+        '200':
+          description: Thread members.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ThreadMembersResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/threads/{thread_id}/join:
+    post:
+      tags: [thread]
+      operationId: thread.join
+      summary: Join a thread
+      description: Joins the thread as the selected effective actor after existing parent-group and thread membership checks.
+      x-octo-action: im.threads:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+        - name: thread_id
+          in: path
+          required: true
+          description: Thread identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Thread membership added.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OkResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/threads/{thread_id}/leave:
+    post:
+      tags: [thread]
+      operationId: thread.leave
+      summary: Leave a thread
+      description: Removes the selected effective actor from the thread while preserving existing creator, group, and thread state rules.
+      x-octo-action: im.threads:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+        - name: thread_id
+          in: path
+          required: true
+          description: Thread identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Thread membership removed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OkResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/groups/{group_id}/threads/{thread_id}/md:
+    get:
+      tags: [thread]
+      operationId: thread.markdown.get
+      summary: Get thread Markdown
+      description: Gets thread Markdown after the effective actor passes existing parent-group and thread access checks.
+      x-octo-action: im.threads:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+        - name: thread_id
+          in: path
+          required: true
+          description: Thread identifier.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Thread Markdown document.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ThreadMarkdownResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    put:
+      tags: [thread]
+      operationId: thread.markdown.update
+      summary: Update thread Markdown
+      description: Updates thread Markdown as the effective actor after the existing parent-group, thread, and management checks; the thread creator remains unchanged.
+      x-octo-action: im.threads:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          description: Parent group identifier.
+          schema: {type: string}
+        - name: thread_id
+          in: path
+          required: true
+          description: Thread identifier.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MarkdownUpdateRequest'}
+      responses:
+        '200':
+          description: Markdown updated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MarkdownUpdateResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/files:
+    post:
+      tags: [file]
+      operationId: file.upload
+      summary: Upload a file
+      description: |
+        Uploads one non-empty chat file. The server validates the extension and
+        configured size limit, generates a fresh object key, and returns a
+        download URL, filename, and byte size; no caller-selected key is allowed.
+      x-octo-action: im.files:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: Only chat uploads are supported; omitting this parameter selects chat.
+          schema: {type: string, enum: [chat], default: chat}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: '#/components/schemas/FileUploadForm'}
+      responses:
+        '200':
+          description: Uploaded file information.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FileUploadResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/files/_download:
+    get:
+      tags: [file]
+      operationId: file.download
+      summary: Download a file
+      description: |
+        Redirects to the existing storage download URL for the supplied object
+        key. This legacy-compatible endpoint does not check whether the object
+        belongs to the token's Space.
+      x-octo-action: im.files:read
+      x-octo-principal: effective_actor
+      parameters:
+        - name: path
+          in: query
+          required: true
+          description: Object key to download.
+          schema: {type: string}
+        - name: filename
+          in: query
+          required: false
+          description: Optional download filename.
+          schema: {type: string}
+      responses:
+        '302':
+          description: Redirect to the storage download URL.
+          headers:
+            Location:
+              description: Storage download URL.
+              schema: {type: string, format: uri}
+          content:
+            text/html:
+              schema: {type: string}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /v2/cli/uploads/credentials:
+    get:
+      tags: [upload]
+      operationId: upload.credentials.get
+      summary: Get temporary upload credentials
+      description: Issues temporary credentials using the existing upload policy and storage scope. Returned credentials are sensitive; issuance does not establish file ownership.
+      x-octo-action: im.files:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: filename
+          in: query
+          required: true
+          description: Filename used to validate the extension and construct the object key.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Temporary object-storage credentials.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadCredentialsResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/uploads/_presigned:
+    get:
+      tags: [upload]
+      operationId: upload.presigned.get
+      summary: Get a presigned upload URL
+      description: Issues a signed upload URL with the existing file size, extension, storage key, and expiration policy. A signed URL does not establish object ownership.
+      x-octo-action: im.files:write
+      x-octo-principal: effective_actor
+      parameters:
+        - name: filename
+          in: query
+          required: true
+          description: Upload filename.
+          schema: {type: string}
+        - name: file_size
+          in: query
+          required: true
+          description: Expected upload size in bytes.
+          schema: {type: integer, format: int64, minimum: 1}
+      responses:
+        '200':
+          description: Presigned upload details.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PresignedUploadResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: OCTO business token
+      description: New CLI business Token/API Key; legacy v1 credentials are not accepted by this route group.
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      description: 1-based offset page; defaults to 1.
+      schema: {type: integer, minimum: 1, default: 1}
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      description: Page size; defaults to 20 and is limited to 100.
+      schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+  responses:
+    ValidationError:
+      description: Invalid request parameters or body (VALIDATION_ERROR).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ValidationErrorResponse'}
+    AuthenticationRequired:
+      description: Missing, expired, or invalid new business token (AUTH_REQUIRED).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/AuthenticationRequiredErrorResponse'}
+    Forbidden:
+      description: Token action or resource permission denied (FORBIDDEN).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ForbiddenErrorResponse'}
+    NotFound:
+      description: Resource not found or intentionally hidden by access checks (NOT_FOUND).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/NotFoundErrorResponse'}
+    Conflict:
+      description: Resource state or version conflict (CONFLICT or DUPLICATE).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ConflictErrorResponse'}
+    PayloadTooLarge:
+      description: Request body or file exceeds a supported size (PAYLOAD_TOO_LARGE).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/PayloadTooLargeErrorResponse'}
+    UnsupportedMediaType:
+      description: Request content type is not supported (UNSUPPORTED_MEDIA_TYPE).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UnsupportedMediaTypeErrorResponse'}
+    ClientVersionTooOld:
+      description: Client version is below the supported minimum (CLIENT_VERSION_TOO_OLD).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ClientVersionTooOldErrorResponse'}
+    RateLimited:
+      description: Request rate limit exceeded (RATE_LIMITED).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RateLimitedErrorResponse'}
+    InternalError:
+      description: Unexpected server failure (INTERNAL_ERROR).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/InternalErrorResponse'}
+    UpstreamUnavailable:
+      description: Search or storage dependency is temporarily unavailable (UPSTREAM_UNAVAILABLE).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UpstreamUnavailableErrorResponse'}
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiError'
+    ValidationErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: VALIDATION_ERROR}
+    AuthenticationRequiredErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: AUTH_REQUIRED}
+    ForbiddenErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: FORBIDDEN}
+    NotFoundErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: NOT_FOUND}
+    ConflictErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, enum: [CONFLICT, DUPLICATE]}
+    PayloadTooLargeErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: PAYLOAD_TOO_LARGE}
+    UnsupportedMediaTypeErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: UNSUPPORTED_MEDIA_TYPE}
+    ClientVersionTooOldErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: CLIENT_VERSION_TOO_OLD}
+    RateLimitedErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: RATE_LIMITED}
+    InternalErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: INTERNAL_ERROR}
+    UpstreamUnavailableErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+            - type: object
+              required: [code]
+              properties:
+                code: {type: string, const: UPSTREAM_UNAVAILABLE}
+    ApiError:
+      type: object
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTH_REQUIRED
+            - FORBIDDEN
+            - NOT_FOUND
+            - CONFLICT
+            - DUPLICATE
+            - VALIDATION_ERROR
+            - PAYLOAD_TOO_LARGE
+            - UNSUPPORTED_MEDIA_TYPE
+            - CLIENT_VERSION_TOO_OLD
+            - RATE_LIMITED
+            - INTERNAL_ERROR
+            - UPSTREAM_UNAVAILABLE
+          description: Fixed OCTO error code. The HTTP status maps to the corresponding code in the response description.
+        message:
+          type: string
+          description: Safe English error message; internal diagnostics are never returned.
+        details:
+          $ref: '#/components/schemas/ErrorDetails'
+        hint:
+          type: string
+          description: Optional user-facing recovery hint.
+    ErrorDetails:
+      type: object
+      description: Structured, public-safe error details; individual operations may define additional keys.
+      properties:
+        reason: {type: string}
+        field: {type: string}
+        resource: {type: string}
+        required_role: {type: string}
+        conflict_reason: {type: string}
+        current_state: {type: string}
+        existing_id: {type: string}
+        max_bytes: {type: integer, format: int64}
+        actual_bytes: {type: integer, format: int64}
+        expected: {type: string}
+        actual: {type: string}
+        min_version: {type: string}
+        retry_after_seconds: {type: integer}
+        upstream: {type: string}
+        upstream_status: {type: integer}
+        failed_index: {type: integer}
+      additionalProperties: true
+    EmptyData:
+      type: object
+      description: Empty success payload for operations with no business response.
+      maxProperties: 0
+      additionalProperties: false
+    EmptyResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/EmptyData'
+    MessageStatusResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [status]
+          properties:
+            status: {type: integer, const: 200}
+    OkResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [ok]
+          properties:
+            ok: {type: boolean, const: true}
+    CursorPagination:
+      type: object
+      required: [has_more, next_cursor]
+      properties:
+        has_more: {type: boolean}
+        next_cursor:
+          type: string
+          description: Opaque cursor. An empty string means there is no resumable next page.
+    OffsetPagination:
+      type: object
+      required: [total, page, page_size]
+      properties:
+        total: {type: integer, format: int64, minimum: 0}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1, maximum: 100}
+    Identity:
+      type: object
+      required: [user_id, user_name, bot_id, space_id]
+      properties:
+        user_id: {type: string}
+        user_name: {type: string}
+        bot_id:
+          type: string
+          description: Empty when the trusted token has no User Bot binding.
+        space_id: {type: string}
+    IdentityResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/Identity'}
+    UserProfile:
+      type: object
+      description: |
+        Profile fields vary with visibility. A minimal visible profile retains
+        the token user's local relationship/settings fields; full profiles add
+        identity, online, Bot, real-name, and contact fields. The CLI v2 route
+        removes group_no before calling the legacy detail handler, so its
+        optional group-scoped enrichment is not part of this response.
+      required: [uid, name, mute, top, chat_pwd_on, screenshot, revoke_remind, receipt, follow, status, robot, remark, flame, flame_second]
+      properties:
+        uid: {type: string}
+        name: {type: string}
+        username: {type: string}
+        email: {type: string}
+        zone: {type: string}
+        phone: {type: string}
+        mute: {type: integer}
+        top: {type: integer}
+        sex: {type: integer}
+        category: {type: string}
+        short_no: {type: string}
+        chat_pwd_on: {type: integer}
+        screenshot: {type: integer}
+        revoke_remind: {type: integer}
+        receipt: {type: integer}
+        online: {type: integer}
+        last_offline: {type: integer}
+        device_flag: {type: integer}
+        follow: {type: integer}
+        be_deleted: {type: integer}
+        be_blacklist: {type: integer}
+        code: {type: string}
+        vercode: {type: string}
+        source_desc: {type: string}
+        remark: {type: string}
+        is_upload_avatar: {type: integer}
+        status: {type: integer}
+        robot: {type: integer, enum: [0, 1]}
+        bot_commands: {type: string}
+        bot_description: {type: string}
+        bot_creator_uid: {type: string}
+        bot_creator_name: {type: string}
+        bot_auto_approve: {type: integer}
+        bot_agent_platform: {type: string}
+        bot_agent_version: {type: string}
+        bot_plugin_version: {type: string}
+        is_destroy: {type: integer}
+        flame: {type: integer}
+        flame_second: {type: integer}
+        join_group_invite_uid: {type: string}
+        join_group_invite_name: {type: string}
+        join_group_time: {type: string}
+        realname_verified: {type: boolean}
+        real_name: {type: string}
+        realname_verified_at: {type: integer, format: int64}
+        phone_country_code: {type: string}
+    UserProfileResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/UserProfile'}
+    SpaceMember:
+      type: object
+      required: [uid, name, robot]
+      properties:
+        uid: {type: string}
+        name: {type: string}
+        robot: {type: integer, enum: [0, 1]}
+    SpaceMembersResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/SpaceMember'}
+        pagination: {$ref: '#/components/schemas/OffsetPagination'}
+    TypingRequest:
+      type: object
+      required: [channel_id, channel_type]
+      properties:
+        channel_id: {type: string}
+        channel_type:
+          type: integer
+          enum: [1, 2, 5]
+          description: Channel kind; 1=person, 2=group, 5=thread.
+    MessagePayload:
+      type: object
+      description: Existing message payload is a typed, extensible JSON object; server-owned authorization and OBO marker fields are not accepted.
+      properties:
+        type: {type: integer}
+        content: {type: string}
+        mention:
+          type: object
+          properties:
+            user_ids:
+              type: array
+              items: {type: string}
+          additionalProperties: true
+        reply:
+          type: object
+          properties:
+            message_id: {type: string}
+          additionalProperties: true
+        card:
+          type: object
+          description: Raw interactive-card content when the registered-template mode is not used.
+          properties:
+            type: {type: string}
+          additionalProperties: true
+        template_ref:
+          $ref: '#/components/schemas/TemplateReference'
+      additionalProperties: true
+    TemplateReference:
+      type: object
+      required: [id, version]
+      properties:
+        id: {type: string}
+        version: {type: string}
+      additionalProperties: false
+    MessageSendRequest:
+      type: object
+      required: [channel_id, channel_type, payload]
+      properties:
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        stream_no: {type: string, description: Accepted by the Bot handler; the token-user handler ignores it.}
+        payload: {$ref: '#/components/schemas/MessagePayload'}
+    MessageSendResult:
+      type: object
+      required: [message_id, message_seq, client_msg_no]
+      properties:
+        message_id: {type: integer, format: int64}
+        message_seq: {type: integer, format: int64}
+        client_msg_no: {type: string}
+    MessageSendResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/EmptyData'
+            - $ref: '#/components/schemas/MessageSendResult'
+    MessageEditRequest:
+      type: object
+      description: The path message_id is inserted when omitted and must match if supplied. Token-user edits require message_seq and content_edit; the Bot handler accepts raw content_edit or a registered-template edit, and can resolve message_seq when omitted.
+      required: [channel_id, channel_type]
+      properties:
+        message_id: {type: string}
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        message_seq: {type: integer, format: int64, minimum: 0}
+        content_edit: {type: string}
+        template_ref: {$ref: '#/components/schemas/TemplateReference'}
+        state: {type: string}
+        data:
+          type: object
+          description: Template-specific data; fields depend on the registered template.
+          additionalProperties: true
+        card_seq: {type: integer, format: int64, minimum: 1}
+        transient: {type: boolean}
+      oneOf:
+        - required: [content_edit]
+          not:
+            required: [template_ref]
+        - required: [template_ref, state, data, card_seq]
+          not:
+            required: [content_edit]
+    MessageSyncRequest:
+      type: object
+      required: [channel_id, channel_type]
+      properties:
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        start_message_seq: {type: integer, format: int64, minimum: 0}
+        end_message_seq: {type: integer, format: int64, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200, default: 50}
+        pull_mode: {type: integer}
+    ReadReceiptRequest:
+      type: object
+      description: Token-user requests require at least one message ID. Bot requests may omit message_ids, but are limited to 100 IDs.
+      required: [channel_id, channel_type]
+      properties:
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        message_ids:
+          type: array
+          items: {type: string}
+    MessageSyncResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/MessageSyncResult'}
+    MessageSyncResult:
+      type: object
+      required: [start_message_seq, end_message_seq, pull_mode, more, messages]
+      properties:
+        start_message_seq: {type: integer, format: int64}
+        end_message_seq: {type: integer, format: int64}
+        pull_mode: {type: integer}
+        more: {type: integer, enum: [0, 1]}
+        messages:
+          type: array
+          items: {$ref: '#/components/schemas/SynchronizedMessage'}
+    SynchronizedMessage:
+      type: object
+      description: Existing message synchronization item; fields are actor-dependent and additional message extensions may be present.
+      properties:
+        header:
+          type: object
+          properties:
+            no_persist: {type: integer}
+            red_dot: {type: integer}
+            sync_once: {type: integer}
+          additionalProperties: true
+        setting: {type: integer}
+        message_id: {type: integer, format: int64}
+        message_idstr: {type: string}
+        message_seq: {type: integer, format: int64}
+        client_msg_no: {type: string}
+        stream_no: {type: string}
+        from_uid: {type: string}
+        from_is_external: {type: integer}
+        from_source_space_name: {type: string}
+        from_home_space_id: {type: string}
+        from_home_space_name: {type: string}
+        to_uid: {type: string}
+        channel_id: {type: string}
+        channel_type: {type: integer}
+        expire: {type: integer}
+        timestamp: {type: integer}
+        payload: {$ref: '#/components/schemas/MessagePayload'}
+        signal_payload: {type: string}
+        reply_count: {type: integer}
+        reply_count_seq: {type: string}
+        reply_seq: {type: string}
+        reactions:
+          type: array
+          items: {type: object, additionalProperties: true}
+        is_deleted: {type: integer}
+        voice_status: {type: integer}
+        streams:
+          type: array
+          items: {type: object, additionalProperties: true}
+        readed: {type: integer}
+        revoke: {type: integer}
+        revoker: {type: string}
+        readed_count: {type: integer}
+        unread_count: {type: integer}
+        extra_version: {type: integer, format: int64}
+        message_extra:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    SearchFilters:
+      type: object
+      properties:
+        sender_ids:
+          type: array
+          maxItems: 50
+          items: {type: string}
+        sent_at_from: {type: string, description: RFC3339 timestamp or YYYY-MM-DD lower bound, inclusive.}
+        sent_at_to: {type: string, description: RFC3339 timestamp or YYYY-MM-DD upper bound, inclusive.}
+    MessageSearchRequest:
+      type: object
+      required: [channel_type, channel_id]
+      properties:
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        channel_id: {type: string}
+        keyword: {type: string, maxLength: 64}
+        filters: {$ref: '#/components/schemas/SearchFilters'}
+        sort: {type: string, enum: [time_desc, time_asc, relevance]}
+        page_size: {type: integer, minimum: 1, maximum: 100, default: 20}
+        cursor: {type: string, description: Opaque server-issued cursor.}
+    MediaSearchRequest:
+      type: object
+      required: [channel_type, channel_id]
+      properties:
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        channel_id: {type: string}
+        keyword: {type: string, const: '', description: Accepted only as empty; the media search handler rejects non-empty keywords.}
+        filters: {$ref: '#/components/schemas/SearchFilters'}
+        sort: {type: string, enum: [time_desc, time_asc]}
+        page_size: {type: integer, minimum: 1, maximum: 100, default: 20}
+        cursor: {type: string, description: Opaque server-issued cursor.}
+    FileSearchRequest:
+      type: object
+      required: [channel_type, channel_id]
+      properties:
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        channel_id: {type: string}
+        keyword: {type: string, maxLength: 64}
+        filters: {$ref: '#/components/schemas/SearchFilters'}
+        sort: {type: string, enum: [time_desc, time_asc, relevance]}
+        page_size: {type: integer, minimum: 1, maximum: 100, default: 20}
+        cursor: {type: string, description: Opaque server-issued cursor.}
+    SearchAroundRequest:
+      type: object
+      required: [channel_type, channel_id, anchor_message_id]
+      properties:
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        channel_id: {type: string}
+        anchor_message_id: {type: string, description: Positive decimal-string message identifier.}
+        filters: {$ref: '#/components/schemas/SearchFilters'}
+        page_size: {type: integer, minimum: 1, maximum: 100, default: 20, description: Maximum hits in each direction.}
+    GlobalChannelReference:
+      type: object
+      required: [channel_id, channel_type]
+      properties:
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+    GlobalSearchFilters:
+      type: object
+      properties:
+        sender_ids:
+          type: array
+          maxItems: 50
+          items: {type: string}
+        member_uid: {type: string}
+        member_uids:
+          type: array
+          maxItems: 50
+          items: {type: string}
+        channel_ids:
+          type: array
+          items: {$ref: '#/components/schemas/GlobalChannelReference'}
+        channel_types:
+          type: array
+          items: {type: integer, enum: [1, 2, 5]}
+        content_types:
+          type: array
+          items: {type: integer}
+        sent_at_from: {type: string}
+        sent_at_to: {type: string}
+    GlobalFileFilters:
+      type: object
+      properties:
+        sender_ids:
+          type: array
+          maxItems: 50
+          items: {type: string}
+        member_uid: {type: string}
+        member_uids:
+          type: array
+          maxItems: 50
+          items: {type: string}
+        channel_ids:
+          type: array
+          items: {$ref: '#/components/schemas/GlobalChannelReference'}
+        channel_types:
+          type: array
+          items: {type: integer, enum: [1, 2, 5]}
+        file_exts:
+          type: array
+          items: {type: string}
+        file_size_min: {type: integer, format: int64, minimum: 0}
+        file_size_max: {type: integer, format: int64, minimum: 0}
+        sent_at_from: {type: string}
+        sent_at_to: {type: string}
+    GlobalMessagesSearchRequest:
+      type: object
+      properties:
+        keyword: {type: string, maxLength: 64}
+        filters: {$ref: '#/components/schemas/GlobalSearchFilters'}
+        sort: {type: string, enum: [time_desc, time_asc, relevance]}
+        page_size: {type: integer, minimum: 1, maximum: 100, default: 20}
+        cursor: {type: string, description: Opaque server-issued cursor.}
+    GlobalFilesSearchRequest:
+      type: object
+      properties:
+        keyword: {type: string, maxLength: 64}
+        filters: {$ref: '#/components/schemas/GlobalFileFilters'}
+        sort: {type: string, enum: [time_desc, time_asc, relevance]}
+        page_size: {type: integer, minimum: 1, maximum: 100, default: 20}
+        cursor: {type: string, description: Opaque server-issued cursor.}
+    GlobalGroupsSearchRequest:
+      type: object
+      properties:
+        keyword: {type: string, maxLength: 64}
+        sequence: {type: integer, format: int64}
+        filters: {$ref: '#/components/schemas/GlobalSearchFilters'}
+    OuterPreview:
+      type: object
+      required: [child_count]
+      properties:
+        child_count: {type: integer}
+    InnerMessageHit:
+      type: object
+      required: [message_id, type]
+      properties:
+        message_id: {type: string}
+        type: {type: integer}
+        search_text: {type: string}
+        sender_id: {type: string}
+        sender_name: {type: string}
+        sent_at: {type: string, format: date-time}
+    RichTextBlock:
+      type: object
+      description: Typed rich-text block; additional fields depend on the block type.
+      required: [type]
+      properties:
+        type: {type: string}
+        text: {type: string}
+        url: {type: string, format: uri}
+        width: {type: integer}
+        height: {type: integer}
+        size: {type: integer, format: int64}
+        name: {type: string}
+        extension: {type: string}
+        mime: {type: string}
+        caption: {type: string}
+      additionalProperties: true
+    RichTextDetail:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: array
+          items: {$ref: '#/components/schemas/RichTextBlock'}
+        plain: {type: string}
+        mention: {$ref: '#/components/schemas/RichTextMention'}
+    RichTextMentionEntity:
+      type: object
+      required: [uid, offset, length]
+      properties:
+        uid: {type: string}
+        offset: {type: integer, minimum: 0}
+        length: {type: integer, minimum: 0}
+    RichTextMention:
+      type: object
+      properties:
+        entities:
+          type: array
+          items: {$ref: '#/components/schemas/RichTextMentionEntity'}
+        all: {type: integer}
+        humans: {type: integer}
+        ais: {type: integer}
+    MessageSearchHit:
+      type: object
+      required: [message_id, message_seq, message_kind, sender_id, sent_at, channel_id]
+      properties:
+        message_id: {type: string}
+        message_seq: {type: integer, format: int64}
+        message_kind: {type: string, enum: [text, forward, image, video]}
+        snippet: {type: string}
+        sender_id: {type: string}
+        sender_name: {type: string}
+        sender_avatar_url: {type: string, format: uri}
+        sent_at: {type: string, format: date-time}
+        outer_preview: {$ref: '#/components/schemas/OuterPreview'}
+        inner_messages:
+          type: array
+          items: {$ref: '#/components/schemas/InnerMessageHit'}
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        thumb_url: {type: string, format: uri}
+        video_url: {type: string, format: uri}
+        width: {type: integer}
+        height: {type: integer}
+        duration_ms: {type: integer, format: int64}
+        rich_text: {$ref: '#/components/schemas/RichTextDetail'}
+    MediaSearchHit:
+      type: object
+      required: [message_id, message_seq, media_kind, sender_id, sent_at, month_bucket]
+      properties:
+        message_id: {type: string}
+        message_seq: {type: integer, format: int64}
+        media_kind: {type: string, enum: [image, video]}
+        thumb_url: {type: string, format: uri}
+        video_url: {type: string, format: uri}
+        width: {type: integer}
+        height: {type: integer}
+        duration_ms: {type: integer, format: int64}
+        sender_id: {type: string}
+        sender_name: {type: string}
+        sender_avatar_url: {type: string, format: uri}
+        sent_at: {type: string, format: date-time}
+        month_bucket: {type: string}
+    FileSearchHit:
+      type: object
+      required: [message_id, message_seq, file_name, preview_url, sender_id, sent_at]
+      properties:
+        message_id: {type: string}
+        message_seq: {type: integer, format: int64}
+        file_name: {type: string}
+        file_size_bytes: {type: integer, format: int64}
+        file_ext: {type: string}
+        download_url: {type: string, format: uri}
+        preview_url:
+          type: [string, 'null']
+          format: uri
+        name_highlight: {type: string}
+        content_snippet: {type: string}
+        sender_id: {type: string}
+        sender_name: {type: string}
+        sender_avatar_url: {type: string, format: uri}
+        sent_at: {type: string, format: date-time}
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+    SearchAllHit:
+      type: object
+      required: [result_type, sorted_at]
+      properties:
+        result_type: {type: string, enum: [message, file]}
+        sorted_at: {type: string, format: date-time}
+        message: {$ref: '#/components/schemas/MessageSearchHit'}
+        file: {$ref: '#/components/schemas/FileSearchHit'}
+    SearchAroundResult:
+      type: object
+      required: [before, anchor, after, has_more_before, has_more_after]
+      properties:
+        before:
+          type: array
+          items: {$ref: '#/components/schemas/MessageSearchHit'}
+        anchor: {$ref: '#/components/schemas/MessageSearchHit'}
+        after:
+          type: array
+          items: {$ref: '#/components/schemas/MessageSearchHit'}
+        has_more_before: {type: boolean}
+        has_more_after: {type: boolean}
+    GroupSearchBucket:
+      type: object
+      required: [channel_id, channel_type, group_name, match_count, match_count_approx, latest_at, preview]
+      properties:
+        channel_id: {type: string}
+        channel_type: {type: integer, enum: [1, 2, 5]}
+        parent_group_no: {type: string}
+        group_name: {type: string}
+        thread_id: {type: string}
+        thread_name: {type: string}
+        match_count: {type: integer, format: int64}
+        match_count_approx: {type: boolean}
+        latest_at: {type: string, format: date-time}
+        preview:
+          type: array
+          items: {$ref: '#/components/schemas/MessageSearchHit'}
+    GlobalGroupsSearchResult:
+      type: object
+      required: [sequence, query_id, total_groups, total_groups_approx, groups]
+      properties:
+        sequence: {type: integer, format: int64}
+        query_id: {type: string}
+        total_groups: {type: integer, format: int64}
+        total_groups_approx: {type: boolean}
+        groups:
+          type: array
+          items: {$ref: '#/components/schemas/GroupSearchBucket'}
+    MessageSearchResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/MessageSearchHit'}
+        pagination: {$ref: '#/components/schemas/CursorPagination'}
+    MediaSearchResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/MediaSearchHit'}
+        pagination: {$ref: '#/components/schemas/CursorPagination'}
+    FileSearchResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/FileSearchHit'}
+        pagination: {$ref: '#/components/schemas/CursorPagination'}
+    SearchAllResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/SearchAllHit'}
+        pagination: {$ref: '#/components/schemas/CursorPagination'}
+    SearchAroundResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/SearchAroundResult'}
+    GlobalGroupsSearchResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data: {$ref: '#/components/schemas/GlobalGroupsSearchResult'}
+        pagination: {$ref: '#/components/schemas/CursorPagination'}
+    NativeGroup:
+      type: object
+      required: [group_no, group_type, category, name, is_named, avatar_text, avatar_color, is_upload_avatar, remark, notice, mute, top, show_nick, save, forbidden, invite, chat_pwd_on, screenshot, revoke_remind, join_group_remind, forbidden_add_friend, status, receipt, flame, flame_second, allow_view_history_msg, member_count, online_count, quit, role, forbidden_expir_time, allow_member_pinned_message, has_group_md, group_md_version, group_md_updated_at, can_edit_group_md, can_manage_bot_admin, space_id, project_id, is_external_group, allow_external, allow_no_mention, created_at, updated_at, version]
+      properties:
+        group_no: {type: string}
+        purpose: {type: string, description: Present for server-managed groups.}
+        group_type: {type: integer}
+        category: {type: string}
+        name: {type: string}
+        is_named: {type: integer}
+        avatar_text: {type: string}
+        avatar_color: {type: [integer, 'null']}
+        is_upload_avatar: {type: integer}
+        remark: {type: string}
+        notice: {type: string}
+        mute: {type: integer}
+        top: {type: integer}
+        show_nick: {type: integer}
+        save: {type: integer}
+        forbidden: {type: integer}
+        invite: {type: integer}
+        chat_pwd_on: {type: integer}
+        screenshot: {type: integer}
+        revoke_remind: {type: integer}
+        join_group_remind: {type: integer}
+        forbidden_add_friend: {type: integer}
+        status: {type: integer}
+        receipt: {type: integer}
+        flame: {type: integer}
+        flame_second: {type: integer}
+        allow_view_history_msg: {type: integer}
+        member_count: {type: integer}
+        online_count: {type: integer}
+        quit: {type: integer}
+        role: {type: integer}
+        forbidden_expir_time: {type: integer, format: int64}
+        allow_member_pinned_message: {type: integer}
+        has_group_md: {type: boolean}
+        group_md_version: {type: integer, format: int64}
+        group_md_updated_at: {type: [string, 'null']}
+        can_edit_group_md: {type: boolean}
+        can_manage_bot_admin: {type: boolean}
+        space_id: {type: string}
+        project_id: {type: string}
+        is_external_group: {type: integer}
+        allow_external: {type: integer}
+        allow_no_mention: {type: integer}
+        created_at: {type: string}
+        updated_at: {type: string}
+        version: {type: integer, format: int64}
+    GroupListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/NativeGroup'}
+        pagination: {$ref: '#/components/schemas/OffsetPagination'}
+    GroupDetailResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/NativeGroup'}
+    GroupMember:
+      type: object
+      required: [id, uid, group_no, name, remark, role, version, is_deleted, status, vercode, invite_uid, robot, forbidden_expir_time, bot_admin, is_external, source_space_id, source_space_name, home_space_id, home_space_name, realname_verified, bot_owned_by_me, created_at, updated_at]
+      properties:
+        id: {type: integer, format: int64, minimum: 0}
+        uid: {type: string}
+        group_no: {type: string}
+        name: {type: string}
+        remark: {type: string}
+        role: {type: integer}
+        version: {type: integer, format: int64}
+        is_deleted: {type: integer}
+        status: {type: integer}
+        vercode: {type: string}
+        invite_uid: {type: string}
+        robot: {type: integer}
+        forbidden_expir_time: {type: integer, format: int64}
+        bot_admin: {type: integer}
+        is_external: {type: integer}
+        source_space_id: {type: string}
+        source_space_name: {type: string}
+        home_space_id: {type: string}
+        home_space_name: {type: string}
+        realname_verified: {type: boolean}
+        real_name: {type: string}
+        realname_verified_at: {type: integer, format: int64}
+        bot_owned_by_me: {type: boolean}
+        created_at: {type: string}
+        updated_at: {type: string}
+    GroupMembersResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/GroupMember'}
+        pagination: {$ref: '#/components/schemas/OffsetPagination'}
+    MarkdownDocument:
+      type: object
+      required: [content, version, updated_at, updated_by]
+      properties:
+        content: {type: string}
+        version: {type: integer, format: int64}
+        updated_at:
+          type: [string, 'null']
+          format: date-time
+        updated_by: {type: string}
+    GroupMarkdownResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/MarkdownDocument'}
+    MarkdownUpdateRequest:
+      type: object
+      required: [content]
+      properties:
+        content: {type: string}
+    MarkdownUpdateResult:
+      type: object
+      required: [version]
+      properties:
+        version: {type: integer, format: int64}
+    MarkdownUpdateResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/MarkdownUpdateResult'}
+    GroupCreateRequest:
+      type: object
+      required: [members]
+      properties:
+        name: {type: string}
+        members:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: {type: string}
+        space_id:
+          type: string
+          description: If supplied, it must equal the Space bound to the token.
+    GroupCreateResult:
+      type: object
+      required: [group_id, name]
+      properties:
+        group_id: {type: string}
+        name: {type: string}
+        skipped_members:
+          type: array
+          description: Included only when the group service reports skipped members.
+          items: {type: string}
+    GroupCreateResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/GroupCreateResult'}
+    GroupInfoUpdateRequest:
+      type: object
+      properties:
+        name: {type: string}
+        notice: {type: string}
+      anyOf:
+        - required: [name]
+        - required: [notice]
+    GroupMemberAddRequest:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: {type: string}
+    GroupMemberAddResult:
+      type: object
+      required: [added]
+      properties:
+        added: {type: integer, minimum: 0}
+    GroupMemberAddResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/GroupMemberAddResult'}
+    GroupMemberRemoveRequest:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          minItems: 1
+          items: {type: string}
+    GroupMemberRemoveResult:
+      type: object
+      required: [removed]
+      properties:
+        removed: {type: integer, minimum: 0}
+    GroupMemberRemoveResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/GroupMemberRemoveResult'}
+    ThreadCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        source_message_id: {type: integer, format: int64}
+        source_message_payload:
+          type: [object, array, string, number, boolean]
+          items: {}
+          additionalProperties: true
+          description: Optional non-null JSON payload for user-subject requests, limited to 64 KiB and requiring source_message_id. Bot-subject requests containing this field are rejected.
+    Thread:
+      type: object
+      required: [short_id, group_no, group_name, channel_id, channel_type, name, creator_uid, status, member_count, message_count, last_message_at, has_thread_md, thread_md_version, thread_md_updated_at, mute, created_at, updated_at]
+      properties:
+        short_id: {type: string}
+        group_no: {type: string}
+        group_name: {type: string}
+        channel_id: {type: string}
+        channel_type: {type: integer, const: 5}
+        name: {type: string}
+        creator_uid: {type: string}
+        source_message_id: {type: integer, format: int64}
+        status: {type: integer}
+        member_count: {type: integer}
+        message_count: {type: integer, format: int64}
+        last_message_content: {type: string}
+        last_message_sender_name: {type: string}
+        last_message_at: {type: string}
+        has_thread_md: {type: boolean}
+        thread_md_version: {type: integer, format: int64}
+        thread_md_updated_at: {type: string}
+        mute:
+          type: [integer, 'null']
+          enum: [0, 1, null]
+          description: Null means inherit the parent group setting; 0=not muted, 1=muted.
+        created_at: {type: string}
+        updated_at: {type: string}
+    ThreadResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/Thread'}
+    ThreadListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/Thread'}
+        pagination: {$ref: '#/components/schemas/OffsetPagination'}
+    ThreadMember:
+      type: object
+      required: [uid, name, role, created_at]
+      properties:
+        uid: {type: string}
+        name: {type: string}
+        role: {type: integer, description: 0=member, 1=thread creator.}
+        created_at: {type: string}
+    ThreadMembersResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/ThreadMember'}
+        pagination: {$ref: '#/components/schemas/OffsetPagination'}
+    ThreadMarkdownResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/MarkdownDocument'}
+    FileUploadForm:
+      type: object
+      required: [file]
+      properties:
+        file:
+          type: string
+          format: binary
+          description: File bytes; file extension and configured size limits are enforced by the server.
+    FileUploadResult:
+      type: object
+      required: [url, name, size]
+      properties:
+        url:
+          type: string
+          description: Download URL; a relative preview path is used if the storage service cannot create a download URL.
+        name: {type: string}
+        size: {type: integer, format: int64, minimum: 0}
+    FileUploadResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/FileUploadResult'}
+    UploadCredentials:
+      type: object
+      required: [bucket, region, key, credentials, start_at, expires_at, cdn_base_url]
+      properties:
+        bucket: {type: string}
+        region: {type: string}
+        key: {type: string}
+        credentials:
+          type: object
+          required: [temporary_secret_id, temporary_secret_key, session_token]
+          properties:
+            temporary_secret_id: {type: string}
+            temporary_secret_key: {type: string}
+            session_token: {type: string}
+        start_at: {type: integer, format: int64, description: Unix timestamp in seconds.}
+        expires_at: {type: integer, format: int64, description: Unix timestamp in seconds.}
+        cdn_base_url: {type: string}
+    UploadCredentialsResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/UploadCredentials'}
+    PresignedUpload:
+      type: object
+      required: [method, upload_url, download_url, content_type, key, expires_in, expired_at, max_file_size]
+      properties:
+        method: {type: string, const: PUT}
+        upload_url: {type: string, format: uri}
+        download_url: {type: string, format: uri}
+        content_type: {type: string}
+        key: {type: string}
+        expires_in: {type: integer, minimum: 1, description: Expiration duration in seconds.}
+        expired_at: {type: integer, format: int64, description: Unix timestamp in seconds.}
+        max_file_size: {type: integer, format: int64, minimum: 1}
+        content_disposition: {type: string}
+    PresignedUploadResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/PresignedUpload'}

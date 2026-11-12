@@ -1,13 +1,16 @@
 package bot_api
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cliv2"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -153,6 +156,25 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 		ba.Error("同步消息失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
 		return
+	}
+
+	// The legacy /v1/bot routes keep their previous unlabeled-history behavior.
+	// CLI v2 supplies the authenticated Token principal so the shared filter
+	// can attribute unlabeled messages only to that owner's default Space.
+	if resp != nil && req.ChannelType == common.ChannelTypePerson.Uint8() {
+		if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
+			principal := cliv2.Principal{}
+			if c.FullPath() == "/v2/cli/messages/_sync" {
+				principal = cliv2.PrincipalFrom(c)
+			}
+			messages, filterErr := ba.filterCLIBotSyncMessagesBySpace(resp.Messages, req.ChannelID, spaceID, principal)
+			if filterErr != nil {
+				ba.Error("CLI v2 Bot default Space lookup failed", zap.Error(filterErr))
+				cliv2.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error.")
+				return
+			}
+			resp.Messages = messages
+		}
 	}
 
 	c.Response(resp)

@@ -452,6 +452,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		internal.POST("/verify-token", u.verifyTokenAegisRedirect)
 	}
 
+	u.registerCLIV2Routes(r)
 	u.ctx.AddOnlineStatusListener(u.onlineService.listenOnlineStatus)  // 监听在线状态
 	u.ctx.AddOnlineStatusListener(u.handleOnlineStatus)                // 需要放在listenOnlineStatus之后
 	u.ctx.Schedule(time.Minute*5, u.onlineStatusCheck)                 // 在线状态定时检查
@@ -1275,10 +1276,17 @@ func (u *User) userUpdateSetting(c *wkhttp.Context) {
 // 获取用户详情
 func (u *User) get(c *wkhttp.Context) {
 	uid := c.Param("uid")
+	if uid == "" {
+		uid = c.Param("user_id")
+	}
 	groupNo := c.Query("group_no")
 	loginUID := c.MustGet("uid").(string)
 
 	if u.ctx.GetConfig().IsVisitor(uid) { // 访客频道
+		if isCLIV2UserDetail(c) {
+			failUserDetail(c, http.StatusNotFound, "NOT_FOUND", "Resource not found.", func() {})
+			return
+		}
 		c.Request.URL.Path = fmt.Sprintf("/v1/hotline/visitors/%s/im", uid)
 		u.ctx.GetHttpRoute().HandleContext(c)
 		return
@@ -1291,14 +1299,18 @@ func (u *User) get(c *wkhttp.Context) {
 		ch, err := u.resolveWebhookChannel(uid, loginUID)
 		if err != nil {
 			u.Error("查询 webhook 发送者信息失败", zap.Error(err), zap.String("uid", uid))
-			respondUserErrorWithStatus(c, errcode.ErrUserQueryFailed)
+			failUserDetail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error.", func() {
+				respondUserErrorWithStatus(c, errcode.ErrUserQueryFailed)
+			})
 			return
 		}
 		if ch == nil {
-			respondUserError(c, errcode.ErrUserNotFound)
+			failUserDetail(c, http.StatusNotFound, "NOT_FOUND", "Resource not found.", func() {
+				respondUserError(c, errcode.ErrUserNotFound)
+			})
 			return
 		}
-		c.Response(newWebhookUserDetailResp(uid, ch))
+		respondUserDetail(c, newWebhookUserDetailResp(uid, ch))
 		return
 	}
 
@@ -1307,15 +1319,21 @@ func (u *User) get(c *wkhttp.Context) {
 		// 目标不存在与查询故障必须分开：前者是稳定的 not_found（不能报"查询失败"误导
 		// 客户端重试），后者才是 5xx 语义的查询故障。
 		if errors.Is(err, ErrorUserNotExist) {
-			respondUserError(c, errcode.ErrUserNotFound)
+			failUserDetail(c, http.StatusNotFound, "NOT_FOUND", "Resource not found.", func() {
+				respondUserError(c, errcode.ErrUserNotFound)
+			})
 			return
 		}
 		u.Error("获取用户详情失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserQueryFailed)
+		failUserDetail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error.", func() {
+			respondUserError(c, errcode.ErrUserQueryFailed)
+		})
 		return
 	}
 	if userDetailResp == nil {
-		respondUserError(c, errcode.ErrUserNotFound)
+		failUserDetail(c, http.StatusNotFound, "NOT_FOUND", "Resource not found.", func() {
+			respondUserError(c, errcode.ErrUserNotFound)
+		})
 		return
 	}
 
@@ -1348,11 +1366,13 @@ func (u *User) get(c *wkhttp.Context) {
 	}
 	if err != nil {
 		u.Error("查询用户资料可见关系失败", zap.Error(err), zap.String("uid", uid))
-		respondUserError(c, errcode.ErrUserQueryFailed)
+		failUserDetail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error.", func() {
+			respondUserError(c, errcode.ErrUserQueryFailed)
+		})
 		return
 	}
 	if !visible {
-		c.Response(newMinimalUserDetailResp(userDetailResp))
+		respondUserDetail(c, newMinimalUserDetailResp(userDetailResp))
 		return
 	}
 	// BotFather 的命令菜单是服务端自有文案，按请求协商语言重渲染（#335）；
@@ -1476,7 +1496,7 @@ func (u *User) get(c *wkhttp.Context) {
 		// while preserving the already authorized basic profile.
 		profile = userDetailResp
 	}
-	c.Response(profile)
+	respondUserDetail(c, profile)
 }
 
 //	获取用户详情

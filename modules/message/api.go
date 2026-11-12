@@ -352,6 +352,7 @@ func New(ctx *config.Context) *Message {
 
 // Route 路由配置
 func (m *Message) Route(r *wkhttp.WKHttp) {
+	m.registerCLIMessageRoutes(r)
 	// UID 限流：所有认证路由组共享同一桶（详见 SharedUIDRateLimiter 注释）
 	uidLimit := appwkhttp.SharedUIDRateLimiter(r, m.ctx)
 	// SpaceMiddleware 对齐 /v1/conversation：opt-in，未声明 X-Space-ID / space_id

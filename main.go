@@ -47,6 +47,7 @@ import (
 	docsshared "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_shared"
 	summarycompleted "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_completed"
 	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cliv2"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -158,6 +159,30 @@ func validateTokenExpireConfig(vp *viper.Viper) (time.Duration, error) {
 	return tokenlifecycle.ValidateTokenExpire(vp)
 }
 
+func newCLIRouter(authBaseURL, serviceSecret string) (*libwkhttp.WKHttp, bool, error) {
+	if strings.TrimSpace(authBaseURL) == "" && strings.TrimSpace(serviceSecret) == "" {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(authBaseURL) == "" || strings.TrimSpace(serviceSecret) == "" {
+		return nil, false, errors.New("OCTO_AUTH_SERVER_URL and OCTO_AUTH_SERVICE_SECRET must be configured together")
+	}
+	router, err := cliv2.NewRouter(authBaseURL, serviceSecret)
+	if err != nil {
+		return nil, false, err
+	}
+	return router, true, nil
+}
+
+// newVersionedErrorRenderer builds the router-wide error renderer once at
+// startup. CLI v2 requests are served by an independent router with its own v2
+// renderer, but middleware on the shared router (the global per-IP limiter in
+// particular) can reject them before forwarding. Selecting the envelope from
+// the request path keeps those rejections on the v2 contract while every
+// non-/v2/cli route keeps the unchanged legacy i18n envelope.
+func newVersionedErrorRenderer(defaultLanguage string) libwkhttp.ErrorRenderer {
+	return cliv2.NewPathAwareErrorRenderer(octoi18n.NewErrorRenderer(octoi18n.NewLocalizer(defaultLanguage)))
+}
+
 func main() {
 	// `app session-rollout ...` is dispatched before flag.Parse: the server's
 	// own -config flag would otherwise swallow the subcommand's flags, since
@@ -243,6 +268,15 @@ func runAPI(ctx *config.Context) {
 	s := server.New(ctx)
 	route := s.GetRoute()
 	ctx.SetHttpRoute(route)
+	cliRouter, cliEnabled, err := newCLIRouter(os.Getenv("OCTO_AUTH_SERVER_URL"), os.Getenv("OCTO_AUTH_SERVICE_SECRET"))
+	if err != nil {
+		panic(fmt.Errorf("configure CLI v2 authorization: %w", err))
+	}
+	if cliEnabled {
+		if err := cliv2.SetUIDRateLimiter(cliRouter, appwkhttp.SharedUIDRateLimiter(cliRouter, ctx)); err != nil {
+			panic(fmt.Errorf("configure CLI v2 UID rate limiter: %w", err))
+		}
+	}
 	defaultLanguage, err := octoi18n.DefaultLanguageFromEnv()
 	if err != nil {
 		panic(err)
@@ -250,7 +284,7 @@ func runAPI(ctx *config.Context) {
 	if err := octoi18n.ValidateRuntimeLocales(defaultLanguage); err != nil {
 		panic(fmt.Errorf("validate i18n runtime locales: %w", err))
 	}
-	route.SetErrorRenderer(octoi18n.NewErrorRenderer(octoi18n.NewLocalizer(defaultLanguage)))
+	route.SetErrorRenderer(newVersionedErrorRenderer(defaultLanguage))
 	// 注入自定义 TokenParser，替代 octo-lib legacyTokenParser：以 pkg/auth.Decode
 	// 解析 cache value，支持 v2 JSON envelope 与 "uid@name[@role]" 旧格式（i18n D19/D21）。
 	// 同时注入 LanguageResolver，让 AuthMiddleware 把 user_language:{uid} → DB 的
@@ -535,6 +569,15 @@ func runAPI(ctx *config.Context) {
 	if err != nil {
 		cardActionRuntime.Stop()
 		panic(err)
+	}
+	if cliEnabled {
+		if err := cliv2.Mount(route, cliRouter); err != nil {
+			cardActionRuntime.Stop()
+			panic(fmt.Errorf("mount CLI v2 router: %w", err))
+		}
+		route.Any("/v2/cli/*path", func(c *libwkhttp.Context) {
+			cliRouter.ServeHTTP(c.Writer, c.Request)
+		})
 	}
 	// The system-setting singleton may have been constructed before module
 	// migrations completed. Reload it now, then probe the effective SMTP only

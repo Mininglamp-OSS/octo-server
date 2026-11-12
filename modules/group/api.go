@@ -194,6 +194,7 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	// 邀请详情需要认证
 	group.GET("/invites/:invite_no", g.groupMemberInviteDetail) // 获取邀请详情
+	g.registerCLIGroupRoutes(r)
 	go g.CheckForbiddenLoop()
 }
 
