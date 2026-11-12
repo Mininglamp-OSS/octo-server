@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -44,6 +45,9 @@ func (s *Search) Route(r *wkhttp.WKHttp) {
 	searchs := r.Group("/v1/search", s.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(s.ctx))
 	{
 		searchs.POST("/global", s.global) // 全局搜索
+		searchs.POST("/contacts", appwkhttp.SharedUIDRateLimiter(r, s.ctx), s.contacts)
+		searchs.POST("/groups", appwkhttp.SharedUIDRateLimiter(r, s.ctx), s.groups)
+		searchs.POST("/threads", appwkhttp.SharedUIDRateLimiter(r, s.ctx), s.threads)
 	}
 }
 
