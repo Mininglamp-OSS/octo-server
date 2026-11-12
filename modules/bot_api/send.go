@@ -27,6 +27,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/readreceipt"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
@@ -817,52 +818,54 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 			return
 		}
 		if syncMsg != nil && len(syncMsg.Messages) > 0 {
-			valueStrings := make([]string, 0, len(syncMsg.Messages))
-			valueArgs := make([]interface{}, 0, len(syncMsg.Messages)*4)
+			rows := make([]readreceipt.Row, 0, len(syncMsg.Messages))
 			for _, msg := range syncMsg.Messages {
-				valueStrings = append(valueStrings, "(?, ?, ?, ?)")
-				valueArgs = append(valueArgs, msg.MessageID, fakeChannelID, channelType, robotID)
+				rows = append(rows, readreceipt.Row{
+					MessageID: msg.MessageID, ChannelID: fakeChannelID,
+					ChannelType: channelType, UID: robotID,
+				})
 			}
-			stmt := fmt.Sprintf(`INSERT INTO member_readed (message_id, channel_id, channel_type, uid) VALUES %s ON DUPLICATE KEY UPDATE message_id=VALUES(message_id)`,
-				strings.Join(valueStrings, ","))
-			_, err = ba.db.session.InsertBySql(stmt, valueArgs...).Exec()
+			err = readreceipt.AfterWrite(func() error {
+				return readreceipt.Write(c.Request.Context(), ba.db.session, rows)
+			}, func() {
+				// Write Redis cache for read receipt aggregation
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							ba.Error("goroutine panic",
+								zap.Any("recover", r),
+								zap.String("stack", string(debug.Stack())),
+							)
+						}
+					}()
+					for _, msg := range syncMsg.Messages {
+						messageIDStr := strconv.FormatInt(msg.MessageID, 10)
+						cacheData := map[string]interface{}{
+							"MessageID":      msg.MessageID,
+							"MessageIDStr":   messageIDStr,
+							"MessageSeq":     msg.MessageSeq,
+							"FromUID":        msg.FromUID,
+							"ChannelID":      fakeChannelID,
+							"ChannelType":    channelType,
+							"LoginUID":       robotID,
+							"ReqChannelID":   channelID,
+							"ReqChannelType": channelType,
+						}
+						jsonStr, _ := json.Marshal(cacheData)
+						ba.ctx.GetRedisConn().SetAndExpire(
+							fmt.Sprintf("readedCount:%s", messageIDStr),
+							string(jsonStr),
+							time.Hour*24*7,
+						)
+					}
+				}()
+			})
 			if err != nil {
 				ba.Error("插入已读记录失败", zap.Error(err))
 				httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 				return
 			}
 
-			// Write Redis cache for read receipt aggregation
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						ba.Error("goroutine panic",
-							zap.Any("recover", r),
-							zap.String("stack", string(debug.Stack())),
-						)
-					}
-				}()
-				for _, msg := range syncMsg.Messages {
-					messageIDStr := strconv.FormatInt(msg.MessageID, 10)
-					cacheData := map[string]interface{}{
-						"MessageID":      msg.MessageID,
-						"MessageIDStr":   messageIDStr,
-						"MessageSeq":     msg.MessageSeq,
-						"FromUID":        msg.FromUID,
-						"ChannelID":      fakeChannelID,
-						"ChannelType":    channelType,
-						"LoginUID":       robotID,
-						"ReqChannelID":   channelID,
-						"ReqChannelType": channelType,
-					}
-					jsonStr, _ := json.Marshal(cacheData)
-					ba.ctx.GetRedisConn().SetAndExpire(
-						fmt.Sprintf("readedCount:%s", messageIDStr),
-						string(jsonStr),
-						time.Hour*24*7,
-					)
-				}
-			}()
 		}
 	}
 

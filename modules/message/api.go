@@ -39,6 +39,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/readreceipt"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -1191,19 +1192,6 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
-	tx, err := m.ctx.DB().Begin()
-	if err != nil {
-		m.Error("开启事务失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-	defer func() {
-		if err := recover(); err != nil {
-			tx.RollbackUnlessCommitted()
-			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
-		}
-	}()
-
 	// 构建批量插入的数据
 	readedModels := make([]*memberReadedModel, 0, len(syncMsg.Messages))
 	for _, message := range syncMsg.Messages {
@@ -1215,63 +1203,59 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		})
 	}
 	// 批量插入或更新已读记录
-	err = m.memberReadedDB.batchInsertOrUpdateTx(readedModels, tx)
+	err = readreceipt.AfterWrite(func() error {
+		return m.memberReadedDB.batchInsertOrUpdate(c.Request.Context(), readedModels)
+	}, func() {
+		// 异步处理 Redis 缓存
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					m.Error("messageReaded redis cache panic", zap.Any("recover", r), zap.String("stack", string(debug.Stack())))
+				}
+			}()
+			for _, message := range syncMsg.Messages {
+				messageIDStr := strconv.FormatInt(message.MessageID, 10)
+				jsonStr, err := json.Marshal(&messageReadedCountModel{
+					MessageIDStr:   messageIDStr,
+					MessageID:      message.MessageID,
+					MessageSeq:     message.MessageSeq,
+					FromUID:        message.FromUID,
+					ChannelID:      fakeChannelID,
+					ChannelType:    req.ChannelType,
+					LoginUID:       loginUID,
+					ReqChannelID:   req.ChannelID,
+					ReqChannelType: req.ChannelType,
+				})
+				if err != nil {
+					m.Error("序列化消息错误", zap.Error(err))
+					continue
+				}
+
+				func() {
+					m.mutex.Lock()
+					defer m.mutex.Unlock()
+					err = m.ctx.GetRedisConn().SetAndExpire(
+						fmt.Sprintf("%s%s", CacheReadedCountPrefix, messageIDStr),
+						jsonStr,
+						time.Hour*24*7,
+					)
+				}()
+
+				if err != nil {
+					m.Error("添加消息扩展数据到缓存失败！",
+						zap.Error(err),
+						zap.Int64("messageID", message.MessageID),
+						zap.String("channelID", fakeChannelID),
+					)
+				}
+			}
+		}()
+	})
 	if err != nil {
-		tx.Rollback()
 		m.Error("添加已读数据失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
-	if err := tx.Commit(); err != nil {
-		tx.Rollback()
-		m.Error("提交事务失败", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-	// 异步处理 Redis 缓存
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				m.Error("messageReaded redis cache panic", zap.Any("recover", r), zap.String("stack", string(debug.Stack())))
-			}
-		}()
-		for _, message := range syncMsg.Messages {
-			messageIDStr := strconv.FormatInt(message.MessageID, 10)
-			jsonStr, err := json.Marshal(&messageReadedCountModel{
-				MessageIDStr:   messageIDStr,
-				MessageID:      message.MessageID,
-				MessageSeq:     message.MessageSeq,
-				FromUID:        message.FromUID,
-				ChannelID:      fakeChannelID,
-				ChannelType:    req.ChannelType,
-				LoginUID:       loginUID,
-				ReqChannelID:   req.ChannelID,
-				ReqChannelType: req.ChannelType,
-			})
-			if err != nil {
-				m.Error("序列化消息错误", zap.Error(err))
-				continue
-			}
-
-			func() {
-				m.mutex.Lock()
-				defer m.mutex.Unlock()
-				err = m.ctx.GetRedisConn().SetAndExpire(
-					fmt.Sprintf("%s%s", CacheReadedCountPrefix, messageIDStr),
-					jsonStr,
-					time.Hour*24*7,
-				)
-			}()
-
-			if err != nil {
-				m.Error("添加消息扩展数据到缓存失败！",
-					zap.Error(err),
-					zap.Int64("messageID", message.MessageID),
-					zap.String("channelID", fakeChannelID),
-				)
-			}
-		}
-	}()
 	c.ResponseOK()
 
 }
