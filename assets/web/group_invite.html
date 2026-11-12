@@ -556,7 +556,8 @@ function onJoinClick() {
                     space_id: data.space_id || "",
                     space_name: data.space_name || "",
                     group_no: data.group_no || groupNo,
-                    group_name: data.group_name || ""
+                    group_name: data.group_name || "",
+                    my_source_space_id: data.my_source_space_id || ""
                 };
             });
         });
@@ -575,6 +576,10 @@ function onJoinClick() {
         try {
             var prevSpaceId = localStorage.getItem('currentSpaceId') || '';
             var groupSpaceId = r.space_id || '';
+            // 以当前 Space 身份作为外部成员入群时，群已在当前 Space 可见，无需提示切换。
+            if (r.my_source_space_id && r.my_source_space_id === prevSpaceId) {
+                groupSpaceId = '';
+            }
             if (groupSpaceId && prevSpaceId && groupSpaceId !== prevSpaceId) {
                 sessionStorage.setItem('pendingJoinSuccessNotice', JSON.stringify({
                     kind: 'group',

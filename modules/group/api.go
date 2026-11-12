@@ -2776,55 +2776,40 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		return
 	}
 
-	// 外部成员检测：群属于某个 Space 且扫码者不在该 Space 时，标记为外部成员
-	isExternal := 0
-	sourceSpaceID := ""
-	if group.SpaceID != "" {
-		inSpace, checkErr := spacepkg.CheckMembership(g.ctx.DB(), group.SpaceID, scaner)
-		if checkErr != nil {
-			g.Error("检查 Space 成员失败", zap.Error(checkErr))
-			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-			return
-		}
-		if !inSpace {
-			// 当群禁止外部成员加入时，拒绝跨 Space 扫码入群
-			if group.AllowExternal == 0 {
-				httperr.ResponseErrorL(c, errcode.ErrGroupExternalJoinForbidden, nil, nil)
-				return
-			}
-			isExternal = 1
-			// YUJ-199 / GH#1265：source_space_id 必须反映扫码者**当前视角**
-			// 所在的 Space（三端拦截器注入的 X-Space-ID header），而不是
-			// scaner 的 home Space。否则用户 A 在测试空间建群，B 在华山派
-			// 扫码入群后，群会错落在 B 的 home（ExampleCorp）视图。
-			// 三端（Android/iOS/Web React）的 header 拦截器（YUJ-88/GH#1038/EP3）
-			// 早就把 X-Space-ID 注入在每个请求上，这里只需读取 + 兜底 home。
-			//
-			// YUJ-201 / GH#1268：纵深防御——client 可以任意伪造 X-Space-ID
-			// header，如果 scaner 并不是那个 Space 的成员，就不能用它作为
-			// source_space_id（否则把群错落到 scaner 看不见的外部 Space）。
-			// 校验失败时降级成空串走 home 兜底，并 Warn 记一笔方便排查。
-			if headerSpaceID := strings.TrimSpace(c.GetHeader("X-Space-ID")); headerSpaceID != "" {
-				sourceSpaceID = headerSpaceID
-				inSpace, membershipErr := spacepkg.CheckMembership(g.ctx.DB(), headerSpaceID, scaner)
-				if membershipErr != nil {
-					g.Error("扫码入群 X-Space-ID 成员校验失败",
-						zap.String("uid", scaner),
-						zap.String("spaceId", headerSpaceID),
-						zap.Error(membershipErr))
-					sourceSpaceID = "" // 降级到 home Space，不阻断主流程
-				} else if !inSpace {
-					g.Warn("scanjoin X-Space-ID not member, ignoring",
-						zap.String("uid", scaner),
-						zap.String("spaceId", headerSpaceID))
-					sourceSpaceID = "" // 降级，不写脏数据
-				}
-			}
-			if sourceSpaceID == "" {
-				sourceSpaceID = spacemod.GetUserDefaultSpaceID(g.ctx, scaner)
-			}
-		}
+	// 入群身份：以扫码者当前所在 Space（X-Space-ID）的身份入群，规则见
+	// resolveScanJoinIdentity。
+	// YUJ-199 / GH#1265：source_space_id 反映扫码者当前视角所在的 Space，而不是
+	// home Space；三端 header 拦截器（YUJ-88/GH#1038/EP3）在每个请求注入 X-Space-ID。
+	// YUJ-201 / GH#1268：X-Space-ID 可被伪造，扫码者不是该 Space 成员时忽略，
+	// 兜底 home Space，不写脏数据。
+	headerSpaceID := strings.TrimSpace(c.GetHeader("X-Space-ID"))
+	identity, err := resolveScanJoinIdentity(
+		group.SpaceID,
+		group.AllowExternal,
+		headerSpaceID,
+		func(spaceID string) (bool, error) {
+			return spacepkg.CheckMembership(g.ctx.DB(), spaceID, scaner)
+		},
+		func() string { return spacemod.GetUserDefaultSpaceID(g.ctx, scaner) },
+	)
+	if err != nil {
+		g.Error("检查 Space 成员失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
 	}
+	if identity.HeaderIgnored {
+		g.Warn("scanjoin X-Space-ID not usable, ignoring",
+			zap.String("uid", scaner),
+			zap.String("spaceId", headerSpaceID),
+			zap.Error(identity.HeaderErr))
+	}
+	if identity.Forbidden {
+		// 群禁止外部成员加入时，拒绝跨 Space 扫码入群
+		httperr.ResponseErrorL(c, errcode.ErrGroupExternalJoinForbidden, nil, nil)
+		return
+	}
+	isExternal := identity.IsExternal
+	sourceSpaceID := identity.SourceSpaceID
 
 	scanAdmission := MemberAdmission{
 		UID:       scaner,
@@ -2944,6 +2929,9 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		"group_name": group.Name,
 		"space_id":   group.SpaceID,
 		"space_name": spaceName,
+		// 以外部成员身份入群时的来源 Space：客户端据此判断群已在当前 Space 可见，
+		// 无需跳转/提示切换到群所属 Space。内部成员为空串。
+		"my_source_space_id": sourceSpaceID,
 	})
 }
 
