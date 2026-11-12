@@ -40,6 +40,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -380,7 +381,8 @@ type Robot struct {
 	// (#627). All message_extra version allocation in this module goes through
 	// it; it selects legacy GenSeq vs the transactional channel sequence by the
 	// DB-authoritative state row.
-	seqStore *msgextraseq.Store
+	seqStore         *msgextraseq.Store
+	permissionBundle *permissionbundle.Store
 	// systemSettings is the process-wide admin-config snapshot, resolved once
 	// here rather than per call. common.EnsureSystemSettings takes a global
 	// mutex on every invocation, so calling it per request would put a
@@ -390,7 +392,12 @@ type Robot struct {
 }
 
 func New(ctx *config.Context) *Robot {
+	var permissionStore *permissionbundle.Store
+	if runtime := permissionbundle.RuntimeFor(ctx); runtime != nil {
+		permissionStore = runtime.Store()
+	}
 	rb := &Robot{
+		permissionBundle:              permissionStore,
 		ctx:                           ctx,
 		Log:                           log.NewTLog("Robot"),
 		db:                            *newBotDB(ctx),
@@ -439,6 +446,15 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.GET("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.getMCPPolicy)
 		auth.PUT("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.putMCPPolicy)
 		auth.DELETE("/robot/:robot_id/mcp-policy", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteMCPPolicy)
+	}
+
+	if rb.permissionBundle != nil {
+		permissions := r.Group("/v1/robot/:robot_id/permission-bundle/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
+		permissions.GET("", rb.permissionBundleHandler("owner_get"))
+		permissions.PUT("", rb.permissionBundleHandler("mutate"))
+		permissions.POST("/prepare", rb.permissionBundleHandler("prepare"))
+		permissions.GET("/catalog", rb.permissionBundleHandler("catalog"))
+		permissions.GET("/catalog/file", rb.permissionBundleHandler("catalog_file"))
 	}
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
@@ -1884,6 +1900,17 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 func (rb *Robot) myBots(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := c.Query("space_id")
+	if spaceID != "" {
+		member, e := space.CheckMembership(rb.db.session, spaceID, loginUID)
+		if e != nil {
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if !member {
+			httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
+			return
+		}
+	}
 
 	type myBotRow struct {
 		UID         string `db:"uid"`
@@ -1912,7 +1939,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 
 	query += ` ORDER BY f.created_at DESC`
 
-	_, err := rb.ctx.DB().SelectBySql(query, args...).Load(&bots)
+	_, err := rb.db.session.SelectBySql(query, args...).Load(&bots)
 	if err != nil {
 		rb.Error("查询我的 Bot 列表失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
@@ -1935,7 +1962,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 			Name string `db:"name"`
 		}
 		var names []nameRow
-		_, _ = rb.ctx.DB().SelectBySql(
+		_, _ = rb.db.session.SelectBySql(
 			"SELECT uid, name FROM user WHERE uid IN ?", creatorUIDs,
 		).Load(&names)
 		for _, n := range names {

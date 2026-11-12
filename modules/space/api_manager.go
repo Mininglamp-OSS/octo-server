@@ -67,7 +67,7 @@ func NewManager(ctx *config.Context, space *Space) *Manager {
 		ctx:       ctx,
 		Log:       log.NewTLog("spaceManager"),
 		db:        NewDB(ctx),
-		managerDB: newManagerDB(ctx.DB()),
+		managerDB: newManagerDB(ctx.DB(), ctx),
 		space:     space,
 	}
 }

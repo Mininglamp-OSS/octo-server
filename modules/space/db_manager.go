@@ -3,6 +3,8 @@ package space
 import (
 	"errors"
 	"fmt"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"strings"
 	"time"
 
@@ -101,10 +103,15 @@ type managerMemberModel struct {
 // managerDB 管理后台专用查询
 type managerDB struct {
 	session *dbr.Session
+	ctx     *config.Context
 }
 
-func newManagerDB(session *dbr.Session) *managerDB {
-	return &managerDB{session: session}
+func newManagerDB(session *dbr.Session, contexts ...*config.Context) *managerDB {
+	d := &managerDB{session: session}
+	if len(contexts) > 0 {
+		d.ctx = contexts[0]
+	}
+	return d
 }
 
 // memberCountJoin 成员数的 LEFT JOIN 派生表，预聚合 status=1 的活跃成员数。
@@ -472,7 +479,8 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
-	tx, err := d.session.Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+	defer cancelAssociation()
 	if err != nil {
 		return err
 	}
@@ -490,7 +498,17 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 		return err
 	}
 
+	associations := []permissionbundle.Association{}
 	for _, uid := range uids {
+		newAssociation := false
+		if permissionbundle.RuntimeFor(d.ctx) != nil {
+			var prior []string
+			if _, err = tx.SelectBySql("SELECT uid FROM space_member WHERE space_id=? AND uid=? FOR SHARE", spaceId, uid).Load(&prior); err != nil {
+				return err
+			}
+			newAssociation = len(prior) == 0
+		}
+		associations = append(associations, permissionbundle.Association{BotUID: uid, SpaceID: spaceId, New: newAssociation})
 		// 判据来自**写入**，不来自 Go 里的字符串比较。
 		//
 		// 上一版是 `priorStatus[uid]`——map 的键是**数据库返回的拼写**，查询用的是**调用方
@@ -528,7 +546,7 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return permissionbundle.CommitAssociations(d.ctx, tx, associations...)
 }
 
 // ErrCannotRemoveOwner 拦截删除 owner 的请求，调用方需先转让所有权

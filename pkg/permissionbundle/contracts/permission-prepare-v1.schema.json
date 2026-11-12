@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:octo:permission:implementation:prepare-v1",
+  "$comment": "Owner-approved bounded preparation. Runtime scope, ordered whole-batch eligibility and expected tuple are independently validated; this is not a lease or message authority.",
+  "$defs": {
+    "Request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "expected", "peer_uids"],
+      "properties": {
+        "key": {"$ref": "urn:octo:permission:document:v6:policy-wire#/$defs/Key"},
+        "expected": {"$ref": "urn:octo:permission:document:v6:policy-wire#/$defs/Expected"},
+        "peer_uids": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"$ref": "urn:octo:permission:document:v6:policy-wire#/$defs/NativeID"}}
+      }
+    },
+    "Response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "expected", "references"],
+      "properties": {
+        "key": {"$ref": "urn:octo:permission:document:v6:policy-wire#/$defs/Key"},
+        "expected": {"$ref": "urn:octo:permission:document:v6:policy-wire#/$defs/Expected"},
+        "references": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"const": "dm"}, "id": {"$ref": "urn:octo:permission:document:v6:policy-wire#/$defs/RawDM"}}}}
+      }
+    }
+  },
+  "oneOf": [{"$ref": "#/$defs/Request"}, {"$ref": "#/$defs/Response"}]
+}

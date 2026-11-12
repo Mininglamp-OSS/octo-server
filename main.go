@@ -32,6 +32,7 @@ import (
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_membership"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
+	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
@@ -50,6 +51,7 @@ import (
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	ratelimitpkg "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
@@ -440,6 +442,10 @@ func runAPI(ctx *config.Context) {
 	if err != nil {
 		panic(fmt.Errorf("install card action callback dispatch: %w", err))
 	}
+	if err := installPermissionBundle(ctx); err != nil {
+		cardActionRuntime.Stop()
+		panic(fmt.Errorf("install permission bundle runtime: %w", err))
+	}
 	// 构造进程级共享头像渲染缓存,并把观测 hooks 接到上面注册的头像指标。所有头像端点
 	// (user 的 UserAvatar;群组头像渲染合并后亦然——#478)经 avatarrender.GetOrRender
 	// 共用这一个实例:共享 LRU + 同一个渲染信号量(后者唯一,才是真正的进程级渲染并发
@@ -606,6 +612,10 @@ func installCardDispatch(ctx *config.Context) error {
 	producerSpecs := append(cardDispatchProducerSpecs(), actionProducers...)
 	registry := carddispatch.NewRegistry(deps, producerSpecs)
 	return carddispatch.Install(ctx, registry)
+}
+
+func installPermissionBundle(ctx *config.Context) error {
+	return permissionbundle.InstallFromEnvWithHooks(ctx, nil, nil, message.NewServerMessageFactHooks(ctx))
 }
 
 func cardActionApprovalProducerSpecs(routes []cardactiondispatch.RouteSpec) ([]carddispatch.ProducerSpec, error) {

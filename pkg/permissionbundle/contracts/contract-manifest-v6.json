@@ -1,0 +1,36 @@
+{
+  "format": "permission-server-contract-manifest-v6",
+  "baseline": "v45",
+  "base_directory": "repository root",
+  "status": "v45_server_message_facts_seam_and_handoff_not_a_production_allowlist",
+  "files": {
+    "docs/permission-server-convergence-v44.md": {
+      "bytes": 9591,
+      "sha256": "a68028d9642310174b3e05f1f3435d64f22dd70a9a8f2292c1abd66d1bb6a0a9"
+    },
+    "docs/permission-server-convergence-v45.md": {
+      "bytes": 5066,
+      "sha256": "18d5e46be8a44bb6f76f4388d3fed26c76150ae657fa0047a54365e6b91e9b91"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v5.json": {
+      "bytes": 6628,
+      "sha256": "d51823e404a4c9e3e2b252f6f33453b9fa5047f1bca0e1ca787397bccf6ec9ab"
+    },
+    "pkg/permissionbundle/contracts/handoff-v5.json": {
+      "bytes": 3626,
+      "sha256": "e72902dc68c60acc4f36344749a971b4fc94e43253da4407365259d64d873384"
+    },
+    "pkg/permissionbundle/contracts/handoff-v6.json": {
+      "bytes": 11590,
+      "sha256": "6dd041bdec050fc1fefc0f60b3849759f38f6bc9eeb148fbfb0759b9b28f93e0"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v3.json": {
+      "bytes": 4438,
+      "sha256": "bfb2857fda2ceef9fe94d4044a55813d3cde4846c73ec345ef204c9244bb2c2f"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v4.json": {
+      "bytes": 2317,
+      "sha256": "e27506598cb8fc4d90c355c53493a8e4a33f1165723c0f65a50cc3a051dc3b63"
+    }
+  }
+}

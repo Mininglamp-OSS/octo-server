@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mcppolicy"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -5152,6 +5153,7 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 type authVerifyBotReq struct {
 	BotToken         string `json:"bot_token"`
 	IncludeMCPPolicy bool   `json:"include_mcp_policy"`
+	IdentityVersion  int    `json:"identity_version,omitempty"`
 }
 
 type authVerifyBotResp struct {
@@ -5168,12 +5170,20 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 	c.Header("Cache-Control", "private, no-store")
 	var req authVerifyBotReq
 	if err := c.BindJSON(&req); err != nil {
+		if errors.Is(err, permissionbundle.ErrVersion) {
+			httperr.ResponseErrorL(c, errcode.ErrPermissionVersion, nil, nil)
+			return
+		}
 		u.Warn("invalid verify-bot request")
 		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.BotToken == "" {
 		respondUserTokenRequired(c, "bot_token")
+		return
+	}
+	if req.IdentityVersion == 2 {
+		u.authVerifyManagedBot(c, req)
 		return
 	}
 

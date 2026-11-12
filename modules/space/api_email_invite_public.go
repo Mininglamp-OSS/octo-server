@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"go.uber.org/zap"
 )
 
@@ -217,7 +218,8 @@ func (s *Space) acceptEmailInvite(c *wkhttp.Context) {
 }
 
 func (s *Space) acceptOwnerInvite(c *wkhttp.Context, inv *spaceEmailInviteModel, loginUID string) {
-	tx, err := s.ctx.DB().Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(s.ctx, s.ctx.DB())
+	defer cancelAssociation()
 	if err != nil {
 		s.Error("开启事务失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
@@ -250,7 +252,7 @@ func (s *Space) acceptOwnerInvite(c *wkhttp.Context, inv *spaceEmailInviteModel,
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	if err = tx.Commit(); err != nil {
+	if err = s.db.commitMemberTx(tx, spaceId, params.Creator, true); err != nil {
 		s.Error("提交事务失败", zap.Error(err), zap.Int64("inviteID", inv.Id))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return

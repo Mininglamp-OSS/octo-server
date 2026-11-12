@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	dbpkg "github.com/Mininglamp-OSS/octo-server/pkg/db"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -120,7 +121,8 @@ func (d *DB) querySpaceByID(spaceId string) (*SpaceModel, error) {
 // afterJoinSpace（预设群、默认分类、事件、缓存失效）。那些副作用必须在**提交之后**
 // 执行：它们要起 goroutine、调外部服务，绝不能持在事务里，否则回滚了副作用也已外发。
 func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSpaceJoinOutcome, error) {
-	tx, err := d.session.Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+	defer cancelAssociation()
 	if err != nil {
 		return nil, InitialSpaceFailed, err
 	}
@@ -218,7 +220,7 @@ func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSp
 		return nil, InitialSpaceInactive, nil
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := d.commitMemberTx(tx, spaceId, uid, true); err != nil {
 		return nil, InitialSpaceFailed, fmt.Errorf("commit initial space join: %w", err)
 	}
 	// 返回复核后的那份:调用方拿它跑 afterJoinSpace(预设群等),用提交时刻的真值。
@@ -344,6 +346,18 @@ func (d *DB) insertMember(m *MemberModel, tx *dbr.Tx) error {
 }
 
 func (d *DB) insertMemberNoTx(m *MemberModel) error {
+	if permissionbundle.RuntimeFor(d.ctx) != nil {
+		tx, cancelAssociation, e := permissionbundle.BeginAssociation(d.ctx, d.session)
+		defer cancelAssociation()
+		if e != nil {
+			return e
+		}
+		defer tx.RollbackUnlessCommitted()
+		if _, e = tx.InsertInto("space_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec(); e != nil {
+			return e
+		}
+		return d.commitMemberTx(tx, m.SpaceId, m.UID, true)
+	}
 	_, err := d.session.InsertInto("space_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
@@ -476,7 +490,8 @@ func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, op
 // 缓存所依赖的规则（见 modules/project 的 bumpMemberEpochTx）。
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
 	return dbpkg.RetryOnLockConflict(func() error {
-		tx, err := d.session.Begin()
+		tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+		defer cancelAssociation()
 		if err != nil {
 			return err
 		}
@@ -487,7 +502,7 @@ func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
 		if _, err := openSeatTx(tx, spaceId, uid, &role); err != nil {
 			return err
 		}
-		return tx.Commit()
+		return d.commitMemberTx(tx, spaceId, uid, false)
 	})
 }
 
@@ -815,6 +830,25 @@ func GetSpaceMemberUIDs(ctx *config.Context, spaceID string) ([]string, error) {
 
 // insertMemberIgnore 插入成员（忽略重复）
 func (d *DB) insertMemberIgnore(m *MemberModel) error {
+	if permissionbundle.RuntimeFor(d.ctx) != nil {
+		tx, cancelAssociation, e := permissionbundle.BeginAssociation(d.ctx, d.session)
+		defer cancelAssociation()
+		if e != nil {
+			return e
+		}
+		defer tx.RollbackUnlessCommitted()
+		var prior []string
+		if _, e = tx.SelectBySql("SELECT uid FROM space_member WHERE space_id=? AND uid=? FOR SHARE", m.SpaceId, m.UID).Load(&prior); e != nil {
+			return e
+		}
+		if _, e = tx.InsertBySql("INSERT IGNORE INTO space_member (space_id,uid,role,status,created_at,updated_at) VALUES (?,?,?,?,NOW(),NOW())", m.SpaceId, m.UID, m.Role, m.Status).Exec(); e != nil {
+			return e
+		}
+		if m.Status != 1 {
+			return permissionbundle.CommitAssociations(d.ctx, tx)
+		}
+		return d.commitMemberTx(tx, m.SpaceId, m.UID, len(prior) == 0)
+	}
 	_, err := d.session.InsertBySql(
 		"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())",
 		m.SpaceId, m.UID, m.Role, m.Status,
@@ -832,7 +866,8 @@ var ErrAlreadyMember = errors.New("already_member")
 // Uses SELECT ... FOR UPDATE to prevent race conditions.
 // Returns ErrSpaceFull if the space has reached its member limit.
 func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) error {
-	tx, err := d.session.Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+	defer cancelAssociation()
 	if err != nil {
 		return err
 	}
@@ -871,7 +906,7 @@ func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) 
 		return err
 	}
 
-	return tx.Commit()
+	return d.commitMemberTx(tx, spaceId, uid, true)
 }
 
 // atomicReactivateMemberIfNotFull atomically checks capacity and reactivates a member.
@@ -889,7 +924,8 @@ func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUser
 }
 
 func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, maxUsers int) error {
-	tx, err := d.session.Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+	defer cancelAssociation()
 	if err != nil {
 		return err
 	}
@@ -918,7 +954,7 @@ func (d *DB) atomicReactivateMemberIfNotFullOnce(spaceId string, uid string, max
 	if _, err = openSeatTx(tx, spaceId, uid, &roleCommon); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return d.commitMemberTx(tx, spaceId, uid, false)
 }
 
 // ---------- Admin/Owner Query ----------
@@ -1045,7 +1081,8 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 }
 
 func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId string, maxUsers int) (approveOutcome, string, error) {
-	tx, err := d.session.Begin()
+	tx, cancelAssociation, err := permissionbundle.BeginAssociation(d.ctx, d.session)
+	defer cancelAssociation()
 	if err != nil {
 		return approveFailed, "", err
 	}
@@ -1119,7 +1156,7 @@ func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId stri
 	// 本就是活跃成员：审批照常落库（status=1 与活跃成员并存，不变量成立），
 	// 但不占用名额——没有新增成员就不该消耗。
 	if memberRows > 0 && member.Status == 1 {
-		if err = tx.Commit(); err != nil {
+		if err = d.commitMemberTx(tx, spaceId, row.UID, false); err != nil {
 			return approveFailed, "", err
 		}
 		return approveAlreadyMember, row.InviteCode, nil
@@ -1187,7 +1224,7 @@ func (d *DB) approveJoinApplyAtomicOnce(applyID int64, reviewerUID, spaceId stri
 		}
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = d.commitMemberTx(tx, spaceId, row.UID, !reopened); err != nil {
 		return approveFailed, "", err
 	}
 	return approveOK, row.InviteCode, nil

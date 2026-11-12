@@ -1,0 +1,116 @@
+{
+  "format": "permission-server-contract-manifest-v4",
+  "baseline": "v42",
+  "base_directory": "repository root",
+  "status": "implemented_v2_components_synthetic_conformance_not_a_supported_production_release",
+  "files": {
+    "docs/permission-catalog-package-v2.md": {
+      "bytes": 11362,
+      "sha256": "04f139010c262b43d4c251156d9cc95d997a12d3d19594acff10c4c2062998c9"
+    },
+    "docs/permission-review-disposition-v5.md": {
+      "bytes": 4204,
+      "sha256": "8b6ef2a6dd98b4840a7c0e476a80ee5e26ab9c7a2430cd411f562188ff6e1f66"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v1.json": {
+      "bytes": 1235,
+      "sha256": "a8cad7bffe202b9cab7a18d5262e6610623d555f7470c86d94b5c76c43f38830"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v2.json": {
+      "bytes": 1816,
+      "sha256": "276cd8cb80c9b7f2d04ab2a835927454d75663f96ce611ccd47b2a8a05993780"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v3.json": {
+      "bytes": 2888,
+      "sha256": "bde21d2f820d35a43110e2463c1326f02f411a6de692cc567f9098f0bca2f47c"
+    },
+    "pkg/permissionbundle/contracts/handoff-v1.json": {
+      "bytes": 2545,
+      "sha256": "31cf10807ef0fac36c3d214354fbb69bcea0c79ee8a217d38644ad289893cfae"
+    },
+    "pkg/permissionbundle/contracts/handoff-v2.json": {
+      "bytes": 2460,
+      "sha256": "041fa98ab4888c309e91f3ab34c7246dba78622e7ef327203c411a08041ef6c5"
+    },
+    "pkg/permissionbundle/contracts/handoff-v3.json": {
+      "bytes": 2129,
+      "sha256": "a2723a2c74665a77e443bf0ddedb479bb5bcc0ff0e3ed5144622deb0427b4091"
+    },
+    "pkg/permissionbundle/contracts/handoff-v4.json": {
+      "bytes": 8285,
+      "sha256": "c226b46007904c37ef5b46f78b587cd734f4ac4ccf8c739f786e87cfe4573791"
+    },
+    "pkg/permissionbundle/contracts/permission-catalog-identities-v1.json": {
+      "bytes": 166440,
+      "sha256": "de05fcbf86bda29d2268987bbfb1b84bc1d5a26202fa0ee723762c124511e500"
+    },
+    "pkg/permissionbundle/contracts/permission-catalog-package-v2.schema.json": {
+      "bytes": 9339,
+      "sha256": "93eb9cfdfa7005f0277e7b0a6f362f4df3445d1fe1bb27934aba933611f2a210"
+    },
+    "pkg/permissionbundle/contracts/permission-managed-v2.schema.json": {
+      "bytes": 9203,
+      "sha256": "1deb9a708a39fb68e29ab61b4123254d4e02e77672e18b9619f7bbd97ab455fc"
+    },
+    "pkg/permissionbundle/contracts/permission-native-facts-v1.schema.json": {
+      "bytes": 30549,
+      "sha256": "bf08d33e87ad1a4726116c97171b008394e6896bba4babf03762914b5ad0e643"
+    },
+    "pkg/permissionbundle/contracts/permission-prepare-v1.schema.json": {
+      "bytes": 1559,
+      "sha256": "7cfac561ee191c19b44d547d0566ac3d41281111d003e39246dc99ca6711a37c"
+    },
+    "pkg/permissionbundle/contracts/permission-release-manifest-v1.schema-template.json": {
+      "bytes": 56076,
+      "sha256": "8f77c88f5d0d432c1cd2a827c904930510a2dc2a897af7f3d94eece3e300696d"
+    },
+    "pkg/permissionbundle/contracts/permission-rule-reference-resolver-v1.schema.json": {
+      "bytes": 3800,
+      "sha256": "4274b23a57db8c60379d808656d72d08650bd8b52123918e0907383541b3b65a"
+    },
+    "pkg/permissionbundle/contracts/permission-wire-catalog-v2.schema.json": {
+      "bytes": 14169,
+      "sha256": "65198ec56d1dc428a25906c2376c08aa8beeae3c89b01dd135cde81f58f8eab8"
+    },
+    "pkg/permissionbundle/contracts/permission-wire-v1.schema.json": {
+      "bytes": 14242,
+      "sha256": "3c77bfb4290c4c510ce3081496175bdb20cf8eb4014ff1c013e967742eb99609"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v1.json": {
+      "bytes": 5153,
+      "sha256": "53f29a0e572cf240584511627236489658089bfcf70598a56216d545730f6a52"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v2.json": {
+      "bytes": 29231,
+      "sha256": "ee1ecf62dc3902113674fb10f02403feb367677950487d1042ce59acbed76f9d"
+    },
+    "pkg/permissionbundle/contracts/synthetic-examples-v1.json": {
+      "bytes": 1551,
+      "sha256": "5b76f06c85d15ecc89c70af4d0e5ec0ef1e44f516de4a8374a4a92fa7f446c19"
+    },
+    "pkg/permissionbundle/testdata/package-v2-complete-slots.tar.gz": {
+      "bytes": 255910,
+      "sha256": "f1812ad5083690da66d2d659e29af70f8824cfe7489dd1fdd3a81630696f45d9"
+    },
+    "pkg/permissionbundle/testdata/package-v2-complete.tar.gz": {
+      "bytes": 255987,
+      "sha256": "86c0657f522afa33502bfe687c8b8f9b0ae88badd099c42375692677599320b3"
+    },
+    "pkg/permissionbundle/testdata/package-v2-ledger-slots.json": {
+      "bytes": 670,
+      "sha256": "7f0ff036e190951fa44b93d3aa47898496a48f2f45ecd9e3a4f45f7e7355b179"
+    },
+    "pkg/permissionbundle/testdata/package-v2-ledger.json": {
+      "bytes": 670,
+      "sha256": "5b460e24c89bb0b3ed87548654f85d866335b1c74dde59930d1b02ca1c880289"
+    },
+    "pkg/permissionbundle/testdata/profile-examples-v6.json": {
+      "bytes": 11675,
+      "sha256": "584e43727de403d72303c53883404c3ed6eda0045368ad1fe837e9e67f616f7d"
+    },
+    "scripts/build-permission-package-fixture.py": {
+      "bytes": 15327,
+      "sha256": "6764b121ee625af0b5a96197a47a3a2627dc487704b59d6fa1808f53468eda2f"
+    }
+  }
+}

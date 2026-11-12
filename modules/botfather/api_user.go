@@ -1,6 +1,7 @@
 package botfather
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -223,12 +225,21 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		if countErr != nil {
 			bf.Error("校验Space归属失败", zap.String("spaceID", spaceID), zap.Error(countErr))
 		} else if memberCount > 0 {
-			_, spErr := bf.db.session.InsertBySql(
-				"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-				spaceID, robotID,
-			).Exec()
+			var spErr error
+			if permissionbundle.RuntimeFor(bf.ctx) != nil {
+				spErr = bf.db.bindCreatedBotToSpace(uid, robotID, spaceID)
+			} else {
+				_, spErr = bf.db.session.InsertBySql(
+					"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+					spaceID, robotID,
+				).Exec()
+			}
 			if spErr != nil {
 				bf.Error("Bot加入Space失败", zap.String("spaceID", spaceID), zap.Error(spErr))
+				if errors.Is(spErr, permissionbundle.ErrReconcile) {
+					httperr.ResponseErrorL(c, errcode.ErrPermissionUnavailable, nil, nil)
+					return
+				}
 			}
 		} else {
 			bf.Warn("用户不属于指定Space，跳过", zap.String("uid", uid), zap.String("spaceID", spaceID))

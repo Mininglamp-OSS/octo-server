@@ -1,0 +1,23 @@
+{
+  "contract": "permission-server-handoff-v3",
+  "task": "XIN-2793",
+  "supersedes_handoff": "handoff-v2.json",
+  "wire": "unchanged permission-wire-v1 / permission-managed-v2 / permission-native-facts-v1",
+  "retained_interfaces": "Owner/self/catalog/facts routes, NativeFactSource.Read/ValidateCuts, association commit classification and trusted Install seam remain exactly as handoff-v2.json",
+  "catalog_adapter": {
+    "constructor": "NewArtifactReleases([]SupportedCatalog{Pin CatalogPin, Artifact []byte}, []CatalogTransition{From, To CatalogPin}) (*ArtifactReleases, error)",
+    "producer": "XIN-2794 single supported catalog; trusted startup supplies reviewed immutable support entries and directed approved compatibility pairs",
+    "load": "Load(context.Context, CatalogPin) (Release, error): exact pin only, immutable bytes and defensive membership copy",
+    "compatible": "Compatible(context.Context, CatalogPin, CatalogPin) error: both supported plus same pin or explicit directed approval",
+    "same_intent": "SameIntent(context.Context, CatalogPin, CatalogPin, Rule) (bool,error): approved pair and unchanged complete entry/program/content-binding graph for a deny; differences require current reference validation, never deny deletion",
+    "validation": "Canonical whole-artifact SHA-256; unchanged Release structural fragment; bounds, 827 unique IDs, 10 ordered profiles, content hashes/base64 and references",
+    "not_supplied": "Source/profile reconciliation, facade rendering, branch totality and support approval are XIN-2794 prerequisites; template root remains rejecting; no candidate accepted by default"
+  },
+  "default_composition": "No permission routes until real FencedAuthority, supported Releases and optional real native facts are installed before module construction",
+  "supported_catalog_digest": null,
+  "producer_map": "remaining-producers-v2.json",
+  "readable_map": "docs/permission-producer-map-v2.md",
+  "source_delivery": "INCOMPLETE_REAL_NATIVE_AND_DB_BINDINGS",
+  "native_and_cross_repository_acceptance": "NOT_RUN",
+  "review_gate": "deferred_until_complete_source_delivery"
+}

@@ -1,0 +1,57 @@
+{
+  "contract": "permission-server-remaining-producers-v6",
+  "task": "XIN-2793",
+  "charter_baseline": "v52-mainline-repair",
+  "supersedes": "remaining-producers-v5.json for active ownership; v1-v5 retained byte-for-byte",
+  "resolved_in_this_slice": [
+    {
+      "id": "S-B1-message-ttl-expire",
+      "was": "ServerMessageFactProvider omitted COALESCE(expire,0) from message lookup and did not enforce read-time message TTL expiration across bind, resolve, history_headers, and history_disclosure",
+      "status": "DELIVERED_IN_SERVER: loadMessage reads COALESCE(expire,0) from the sharded message table and resolveOne enforces msg.expire > 0 && p.now().Unix()-int64(msg.expire) >= msg.timestamp at every read and revalidation step, returning expired_reference for bind_delivery, resolve, history_headers, and history_disclosure (never issuing a disclosure permit for an expired message); ListHistoryHeadersV1 formats page_id as 32-hex (Hex32) for end-to-end Runtime.Facts schema compliance"
+    }
+  ],
+  "previously_resolved_in_server": [
+    "R2-server-seam (POST /v1/bot/permission-facts/v1/bind-delivery metadata-only delivery binding)",
+    "R3-startup-composition (main.go:installPermissionBundle -> InstallFromEnvWithHooks with message.NewServerMessageFactHooks)",
+    "own-session-consistency (RepeatableRead *dbr.Tx propagated across SQLNativeFactAdapter and ServerMessageFactProvider with FOR SHARE NOWAIT)",
+    "permit-durability-seam (DurablePermitLedger backed by bot_permission_disclosure_permit)"
+  ],
+  "remaining": [
+    {
+      "id": "A-B1-A-B2-A-B3",
+      "owner": "XIN-2795 (codex-channel-octo)",
+      "item": "Repair [A-B1] consuming-connection HTTP relay TLS pin/server_name/budget enforcement, [A-B2] createNativeEndpointDriver wire alignment with octo-server handoff-v7/v8 (authorities array, proven_predicates map, decimal-string context_epoch, metadata-only history_disclosure, operation=resolve revalidation, and all-true resolved.predicates checks in publish/refuse), and [A-B3] Linux bwrap --unshare-net relay bridge"
+    },
+    {
+      "id": "C-B1-C-B2",
+      "owner": "XIN-2794 (octo-cli)",
+      "item": "Repair [C-B1] X-Octo-Acquisition-Budget-Bytes emission on hijacked HTTP relay responses + ticket budget propagation and [C-B2] relay ticket server_name + ca_sha256/peer_sha256 preservation without host-private ca_file dependency"
+    },
+    {
+      "id": "R1",
+      "owner": "XIN-2830 / Owner",
+      "item": "Owner-approved ordinary-SQL recovery/history contract decision (Architect 4831fa26 / 7b11211f remains an unapproved proposal and is not self-approved here); live startup remains fail-closed without a configured authority"
+    },
+    {
+      "id": "R4",
+      "owner": "XIN-2794 / PjM / Owner",
+      "item": "C1-C9 source reconciliation and reviewed support pin and directed pairs; supported_catalog_digest stays null"
+    },
+    {
+      "id": "R5-permit-ddl",
+      "owner": "deployment / schema migration owner",
+      "item": "Provision bot_permission_disclosure_permit table (ServerDisclosurePermitDDL) and set OCTO_PERMISSION_BUNDLE_DURABLE_PERMIT_LEDGER=true before enabling durable history disclosure permits in a live database"
+    },
+    {
+      "id": "R6",
+      "owner": "upstream source owners",
+      "item": "A1 page bounds: concrete values and evidence pending; no constants chosen here"
+    }
+  ],
+  "residual_limitations": [
+    "ServerMessageFactProvider cut is a read-time marker over ordinary SQL state, not an acknowledged-state failover/restore fence",
+    "History pages are stable against appends only; concurrent edit, revoke, TTL expiry or clear-history can change later pages",
+    "Group/thread original visibility (without a visibles exclusion) and untagged DM space cannot be proven from current octo-server tables and remain explicit unknown/non-serving for admit/contributor",
+    "When DurablePermitLedger is false (default until bot_permission_disclosure_permit DDL is deployed), single-use permit tracking is in-process memory"
+  ]
+}

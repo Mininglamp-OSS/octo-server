@@ -1,0 +1,41 @@
+{
+  "format": "permission-server-remaining-producers-v3",
+  "task": "XIN-2793",
+  "task_id": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "charter_baseline": "v44",
+  "supersedes": "remaining-producers-v2.json; remaining-producers-v1.json and remaining-producers-v2.json retained byte-for-byte",
+  "trigger_comment_id": "b2b302d2-1a96-4e4b-8f8a-c51d27440541",
+  "readable_doc": "docs/permission-server-convergence-v44.md",
+  "current_vs_delivered_dependency_contract": [
+    {
+      "surface": "v2 catalog package verifier + source-slot-witness-v5 loader",
+      "owner": "XIN-2793 (octo-server) consuming XIN-2794 (octo-cli)",
+      "delivered_in_repo": "VerifyCatalogPackage, ReadSlotWitnessFile, LoadSlotWitnessGzip, LoadSlotWitnessJSON, CatalogRegistry, and TestCLICandidatePackageV2AndSlotWitnessV5 verifying octo-cli 27b387f1b767a6e0cc200b8e23d074ad3bd28cc1 manifest.json (4,934 B, ecc56c2a...), source-slot-witness-v5.json.gz (12,562 B, 0c5da173...; decoded 843,132 B, 0dac8946...), all 30 files, 16 ledger metrics, and semantic digest 15c7ca2bf6df703979df529afbca6828f116b2463b1a818456edfad80bcad799.",
+      "remaining_external_prerequisite": "XIN-2794 C1-C9 source-reconciliation proof (C3 parameter truth, C4 profile/reference closure, C6 discovery 8-mask invariance, C7 fixed-program non-empty runtime branches) and Owner-reviewed production allowlist pin (supported_catalog_digest remains null)."
+    },
+    {
+      "surface": "Opt-in runtime and route composition",
+      "owner": "XIN-2793 (octo-server)",
+      "delivered_in_repo": "InstallOptIn and InstallFromEnv in pkg/permissionbundle/install.go, wired via installPermissionBundle(ctx) in main.go before module.Setup(ctx). Valid configured dependencies mount /v1/robot/:robot_id/permission-bundle/v1*, /v1/bot/permission-bundle/v1*, and /v1/bot/permission-facts/v1; default disabled is a no-op; missing or invalid authority fails closed with ErrUnavailable.",
+      "remaining_external_prerequisite": "Production deployment binding of ExternalAuthorityDriver, NativeIMFactProvider, and reviewed production CatalogPin."
+    },
+    {
+      "surface": "FencedAuthority / RecoverAtLeast and authority lineage",
+      "owner": "XIN-2793 (octo-server) + DB HA/recovery operator",
+      "delivered_in_repo": "RecoveryFenceV1, ElectedAuthoritySession, ExternalAuthorityDriver, FencedAuthorityAdapter, FencedAuthorityRead, and RejectUnfencedAuthorityMode in pkg/permissionbundle/authority_fence.go. AuthorityRead.Incarnation() preserves 32-hex continuity-verified lineage distinct from ElectionGeneration() uint64 across normal failovers; old writer generations are fenced before COMMIT; post-COMMIT ack failure returns ErrReconcile; sql_read_only_variables and same_db_counter are explicitly rejected.",
+      "remaining_external_prerequisite": "Deployed DB HA/election and surviving recovery fence operator driver implementing ExternalAuthorityDriver across MySQL failover and point-in-time restore."
+    },
+    {
+      "surface": "NativeFactSource SQL + IM adapter seam",
+      "owner": "XIN-2793 (octo-server) + native IM maintainer",
+      "delivered_in_repo": "SQLNativeFactAdapter and NativeIMFactProvider in pkg/permissionbundle/native_facts_adapter.go evaluating all locking SQL predicates inside the caller's RepeatableRead dbr.Tx and combining with authoritative IM header/visibility/history/disclosure cuts across resolve, history_headers, and history_disclosure and all 10 profiles. RejectPlainMessageSyncFactSource explicitly rejects plain content-first IMSyncChannelMessage and webhook/SQL mirrors.",
+      "remaining_external_prerequisite": "Attested serving IM repository/revision and authoritative native IM implementation of InspectDeliveredHeadersV1, ListHistoryHeadersV1, IssueHistoryDisclosureV1, ValidateIMCut, and recipient replay horizon checkpoints."
+    },
+    {
+      "surface": "Endpoint & CLI runtime handoff",
+      "owner": "XIN-2795 (codex-channel-octo) + XIN-2794 (octo-cli)",
+      "delivered_in_repo": "Private v2 manifest/file routes (/catalog, /catalog/file), closed OwnerResponse.contract.catalog_format discriminator, Prepare/CAS/Get readback, and choice-B unchanged departed-member DENY retention matching docs/permission-endpoint-handoff-v4.json (6,435 B, cc193256...).",
+      "remaining_external_prerequisite": "Complete end-to-end native/MCP/endpoint/OS/restore acceptance after external IM and DB HA producers are bound."
+    }
+  ]
+}

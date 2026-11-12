@@ -1,0 +1,33 @@
+{
+  "contract": "permission-server-handoff-v2",
+  "task": "XIN-2793",
+  "supersedes_handoff_sha256": "31cf10807ef0fac36c3d214354fbb69bcea0c79ee8a217d38644ad289893cfae",
+  "wire": "unchanged permission-wire-v1 / permission-managed-v2 / permission-native-facts-v1",
+  "configuration": "Trusted startup calls permissionbundle.Install(context, Store, CatalogPin, NativeFactSource) before constructing modules; no model/request/environment activation or default catalog.",
+  "owner_prefix": "/v1/robot/:robot_id/permission-bundle/v1?space_id=S",
+  "owner_operations": ["GET complete OwnerResponse", "PUT complete atomic Mutation", "POST /prepare ordered whole-batch DM mapping", "GET /catalog exact supported immutable artifact"],
+  "self_prefix": "/v1/bot/permission-bundle/v1?space_id=S",
+  "self_operations": ["GET P", "GET /catalog"],
+  "facts": {
+    "path": "/v1/bot/permission-facts/v1?space_id=S",
+    "method": "POST",
+    "authentication": "authenticated bf_ User Bot, exact own key, current SQL scope, existing Bot limiter",
+    "mount": "only with installed NativeFactSource",
+    "operations": ["resolve", "history_headers", "history_disclosure"],
+    "read_signature": "Read(context.Context, *dbr.Tx, Key, []byte) ([]byte, error)",
+    "cut_signature": "ValidateCuts(context.Context, Key, []byte) error",
+    "semantics": "Source supplies actual native/SQL facts at declared native cuts. Server validates closed frames and correlation, never invocation/capability verdicts. A protocol fixture is not native authority."
+  },
+  "association_commit": {
+    "begin": "BeginAssociation(config.Context, dbr.Session): fresh RR and one native-transaction deadline when installed",
+    "commit": "CommitAssociations(context, tx, Association...): native guards for all supplied scopes, sorted final header suffix, commit then authority acknowledgement",
+    "new": "true only for an actual newly inserted association; existing/reopened membership requires its preserved header",
+    "missing_rejoin_header": "unavailable; never seed U/U",
+    "unsupported": "human, built-in and legacy-token association creates no supported User Bot header"
+  },
+  "default_composition": "permission routes absent until required real dependencies are installed",
+  "supported_catalog_digest": null,
+  "source_delivery": "INCOMPLETE_BLOCKED_ON_NAMED_PRODUCERS",
+  "native_and_cross_repository_acceptance": "NOT_RUN",
+  "review_gate": "deferred_until_complete_source_delivery"
+}

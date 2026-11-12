@@ -126,7 +126,7 @@ func UpsertMembersForTest(ctx *config.Context, spaceID string, uids []string) er
 	if err := refuseOutsideTests(); err != nil {
 		return err
 	}
-	return newManagerDB(ctx.DB()).upsertMembers(spaceID, uids)
+	return newManagerDB(ctx.DB(), ctx).upsertMembers(spaceID, uids)
 }
 
 // SeatRefForTest builds a SeatRef from bytes a test already knows, without a database

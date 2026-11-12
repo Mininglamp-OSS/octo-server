@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"go.uber.org/zap"
 )
 
@@ -51,10 +52,14 @@ func MintBotOBO(ctx *config.Context, ownerUID, spaceID, displayName, botToken st
 		return nil, fmt.Errorf("MintBotOBO: createBotCore: %w", err)
 	}
 
-	_, err = h.ctx.DB().InsertBySql(
-		"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-		spaceID, robotID,
-	).Exec()
+	if permissionbundle.RuntimeFor(ctx) != nil {
+		err = h.db.bindCreatedBotToSpace(ownerUID, robotID, spaceID)
+	} else {
+		_, err = h.ctx.DB().InsertBySql(
+			"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+			spaceID, robotID,
+		).Exec()
+	}
 	if err != nil {
 		h.Warn("MintBotOBO: bot 加入 Space 失败",
 			zap.Error(err), zap.String("bot_uid", robotID), zap.String("space_id", spaceID))

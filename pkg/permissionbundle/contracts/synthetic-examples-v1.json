@@ -1,0 +1,28 @@
+{
+  "status": "SYNTHETIC_COMPONENT_FIXTURES_NOT_A_RELEASE_OR_NATIVE_PROOF",
+  "bundle": {
+    "schema_version": 1,
+    "key": {"origin": "https://synthetic.invalid", "bot_uid": "bot", "space_id": "space"},
+    "scope_incarnation": "11111111111111111111111111111111",
+    "revision": "0",
+    "context_epoch": "0",
+    "catalog_version": "synthetic-v1",
+    "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bundle_digest": "4651e0f02e04ccb5e3e2d622d74656a1b4e1429bbebdf6ade5c7c1088a79b7bf",
+    "invocation": {"state": "U", "rules": []},
+    "capability": {"state": "U", "rules": []}
+  },
+  "positive_mutation": {
+    "schema_version": 1,
+    "action": "mutate",
+    "expected": {"scope_incarnation": "11111111111111111111111111111111", "revision": "0", "catalog_version": "synthetic-v1", "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "changes": [{"stage": "invocation", "action": "activate", "rules": [{"rule_id": "allow-group", "effect": "allow", "caller": {"kind": "all_humans"}, "source": {"kind": "refs", "refs": [{"kind": "group", "id": "group"}]}}]}]
+  },
+  "negative_mutation_raw": [
+    "{\"schema_version\":1,\"schema_versio\\u006e\":1}",
+    "{\"schema_version\":1.0,\"action\":\"mutate\"}",
+    "{\"schema_version\":1,\"private\":\"not permitted\"}"
+  ],
+  "positive_identity_raw": "{\"bot_token\":\"bf_synthetic\",\"identity_version\":2}",
+  "negative_identity_raw": "{\"bot_token\":\"bf_synthetic\",\"identity_version\":2,\"owner_uid\":\"forged\"}"
+}

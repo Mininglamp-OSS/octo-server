@@ -1577,3 +1577,21 @@ other = "MCP 策略已变更，请读取当前版本后重试。"
 
 ["err.server.mcp.policy_unavailable"]
 other = "MCP 策略暂不可用。"
+
+["err.server.permission.invalid_bundle"]
+other = "权限配置请求无效。"
+
+["err.server.permission.revision_conflict"]
+other = "权限配置已变更，请读取完整配置后重试。"
+
+["err.server.permission.scope_forbidden"]
+other = "当前身份无法访问此权限范围。"
+
+["err.server.permission.reference_unavailable"]
+other = "权限引用不可用。"
+
+["err.server.permission.bundle_unavailable"]
+other = "权限配置暂不可用。"
+
+["err.server.permission.unsupported_version"]
+other = "不支持此权限协议版本。"

@@ -105,6 +105,15 @@ func TestMCPPolicyRouteAssemblyAndBearerDenial(t *testing.T) {
 			t.Fatalf("%s: %d %s", method, rec.Code, rec.Body.String())
 		}
 	}
+	// An unconfigured permission runtime must expose no permanently unusable
+	// production routes. A managed client treats the absent surface as X.
+	for _, path := range []string{"/v1/robot/bot_B/permission-bundle/v1", "/v1/robot/bot_B/permission-bundle/v1/catalog", "/v1/robot/bot_B/permission-bundle/v1/prepare"} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path+"?space_id=space", nil))
+		if rec.Code != 404 {
+			t.Fatalf("unconfigured permission route registered: %s %d", path, rec.Code)
+		}
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}

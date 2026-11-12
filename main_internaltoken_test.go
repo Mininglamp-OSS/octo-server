@@ -129,6 +129,7 @@ func TestFixedInternalTokenRegistryIsCompleteBySweep(t *testing.T) {
 		"OCTO_OIDC_PROVIDER_ID_TOKEN_TTL": "a duration; same",
 		"OCTO_PII_ENCRYPTION_SECRET":      "column encryption key",
 		"OCTO_SEARCH_CURSOR_HMAC":         "cursor signing key",
+		"OCTO_PERMISSION_BUNDLE_PERMIT_KEY_HEX": "HMAC signing key for history disclosure permits, not a service-to-service bearer capability",
 		"OCTO_USER_API_KEY_SECRET":        "key-encryption key for user API keys",
 		"TS_CACHE_TOKENEXPIRE":            "a duration; matches on TOKEN",
 		// Found only after the pattern was widened. Both are real single-env
