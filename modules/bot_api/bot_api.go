@@ -421,6 +421,9 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 			botAPI.GET("/permission-bundle/v1/catalog/file", ba.permissionBundleHandler("catalog_file"))
 			if runtime := permissionbundle.RuntimeFor(ba.ctx); runtime != nil && runtime.HasFacts() {
 				botAPI.POST("/permission-facts/v1", ba.permissionFacts)
+				if runtime.HasDeliveryBinding() {
+					botAPI.POST("/permission-facts/v1/bind-delivery", ba.permissionBindDelivery)
+				}
 			}
 		}
 		botAPI.POST("/sendMessage", ba.sendMessage)

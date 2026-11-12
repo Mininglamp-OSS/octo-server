@@ -32,6 +32,7 @@ import (
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_membership"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
+	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/project"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
@@ -614,7 +615,7 @@ func installCardDispatch(ctx *config.Context) error {
 }
 
 func installPermissionBundle(ctx *config.Context) error {
-	return permissionbundle.InstallFromEnv(ctx, nil, nil)
+	return permissionbundle.InstallFromEnvWithHooks(ctx, nil, nil, message.NewServerMessageFactHooks(ctx))
 }
 
 func cardActionApprovalProducerSpecs(routes []cardactiondispatch.RouteSpec) ([]carddispatch.ProducerSpec, error) {

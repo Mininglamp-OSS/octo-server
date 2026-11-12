@@ -176,6 +176,78 @@ type NativeIMFactProvider interface {
 	ValidateIMCut(ctx context.Context, key Key, authorityID, incarnation, position, readNonce string) error
 }
 
+// DeliveryBindingRequestV1 carries the trusted ingress evidence an endpoint
+// observes on an inbound delivery frame when requesting an authenticated,
+// metadata-only message reference/version binding from server storage.
+// A current-version lookup by message_id alone is never accepted as proof of
+// the delivered version: the caller must supply the observed sender, sequence,
+// and payload SHA-256 digest from the ingress frame.
+type DeliveryBindingRequestV1 struct {
+	RequestID             string
+	ChannelType           uint8
+	ChannelID             string
+	MessageID             string
+	MessageSeq            string
+	FromUID               string
+	ObservedPayloadSHA256 string
+	ExpectedNativeVersion string
+}
+
+// DeliveryBindingResultV1 is the metadata-only outcome of binding a delivered
+// message frame against server storage. No message, quote, or media body is
+// ever included.
+type DeliveryBindingResultV1 struct {
+	Status                string
+	Reason                string
+	Current               bool
+	DeliveryReference     string
+	HeaderReference       string
+	NativeMessageVersion  string
+	ObservedPayloadSHA256 string
+	Header                IMHeaderRecord
+	ProvenPredicates      map[string]bool
+	UnknownPredicates     []string
+	ResolvablePurposes    []string
+}
+
+// NativeDeliveryReferenceBinder is implemented by NativeIMFactProvider
+// implementations (such as ServerMessageFactProvider) that can bind a
+// delivered message frame's trusted ingress evidence to a versioned
+// s1-.../h1-... reference without releasing body bytes.
+type NativeDeliveryReferenceBinder interface {
+	BindDeliveredMessageV1(ctx context.Context, key Key, req DeliveryBindingRequestV1) (DeliveryBindingResultV1, IMAuthorityCut, error)
+}
+
+// DeliveredMessageBinder is the optional NativeFactSource extension for
+// authenticated metadata-only message reference/version binding under the
+// caller's RepeatableRead transaction.
+type DeliveredMessageBinder interface {
+	HasDeliveryBinding() bool
+	BindDeliveredMessage(ctx context.Context, tx *dbr.Tx, key Key, requestBytes []byte) ([]byte, error)
+}
+
+type factReadTxKey struct{}
+
+type factReadTxContext struct {
+	tx          *dbr.Tx
+	testNoLocks bool
+}
+
+func withFactReadTx(ctx context.Context, tx *dbr.Tx, testNoLocks bool) context.Context {
+	if tx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, factReadTxKey{}, factReadTxContext{tx: tx, testNoLocks: testNoLocks})
+}
+
+func factReadTxFromContext(ctx context.Context) (factReadTxContext, bool) {
+	if ctx == nil {
+		return factReadTxContext{}, false
+	}
+	v, ok := ctx.Value(factReadTxKey{}).(factReadTxContext)
+	return v, ok && v.tx != nil
+}
+
 type sqlCutVerifier interface {
 	VerifySQLAuthorityCut(authorityID, incarnation, position string) error
 }
@@ -252,10 +324,19 @@ func sortAuthoritiesAndObserved(sqlAuth, imAuth map[string]any, sqlCompleted, im
 	return []any{items[0], items[1]}, observed.UTC().Format(time.RFC3339Nano)
 }
 
+func (a *SQLNativeFactAdapter) HasDeliveryBinding() bool {
+	if a == nil || a.IMProvider == nil {
+		return false
+	}
+	_, ok := a.IMProvider.(NativeDeliveryReferenceBinder)
+	return ok
+}
+
 func (a *SQLNativeFactAdapter) Read(ctx context.Context, tx *dbr.Tx, key Key, requestBytes []byte) ([]byte, error) {
 	if a == nil || a.Authority == nil || a.IMProvider == nil || tx == nil || !key.Valid() {
 		return nil, ErrUnavailable
 	}
+	ctx = withFactReadTx(ctx, tx, a.testNoLocks)
 	req, _, err := nativeRequest(bytes.NewReader(requestBytes))
 	if err != nil {
 		return nil, err
@@ -300,6 +381,121 @@ func (a *SQLNativeFactAdapter) Read(ctx context.Context, tx *dbr.Tx, key Key, re
 	default:
 		return nil, ErrInvalid
 	}
+}
+
+func (a *SQLNativeFactAdapter) BindDeliveredMessage(ctx context.Context, tx *dbr.Tx, key Key, requestBytes []byte) ([]byte, error) {
+	if a == nil || a.Authority == nil || a.IMProvider == nil || tx == nil || !key.Valid() {
+		return nil, ErrUnavailable
+	}
+	binder, ok := a.IMProvider.(NativeDeliveryReferenceBinder)
+	if !ok {
+		return nil, ErrUnavailable
+	}
+	ctx = withFactReadTx(ctx, tx, a.testNoLocks)
+	parsedReq, _, err := parseDeliveryBindingRequest(bytes.NewReader(requestBytes))
+	if err != nil {
+		return nil, err
+	}
+	sqlStarted := time.Now().UTC().Truncate(time.Microsecond)
+	authRead, err := a.Authority.Begin(ctx, tx)
+	if err != nil || authRead == nil || !validHex(authRead.Incarnation(), 32) {
+		return nil, ErrUnavailable
+	}
+	sqlID := a.SQLID
+	if sqlID == "" {
+		sqlID = "sql-primary"
+	}
+	sqlPos := "1"
+	if meta, ok := authRead.(sqlSessionMetadata); ok {
+		if id := meta.AuthorityID(); id != "" {
+			sqlID = id
+		}
+		sqlPos = strconv.FormatUint(meta.Position(), 10)
+	}
+	sqlNonce, err := randomHex32()
+	if err != nil {
+		return nil, err
+	}
+	readID, err := randomHex32()
+	if err != nil {
+		return nil, err
+	}
+	keyObj, err := asObject(key)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	base, err := a.evalScopeBaseFacts(ctx, tx, key)
+	if err != nil || !base.botUserActive || !base.botRobotActive || !base.spaceActive || !base.botSpaceMember {
+		return nil, ErrUnavailable
+	}
+	res, imCut, err := binder.BindDeliveredMessageV1(ctx, key, parsedReq)
+	if err != nil || !validHex(imCut.Incarnation, 32) || !validHex(imCut.ReadNonce, 32) || imCut.ReadNonce == sqlNonce {
+		return nil, ErrUnavailable
+	}
+	authorityRefs := []any{imCut.ReadNonce, sqlNonce}
+	var binding map[string]any
+	switch res.Status {
+	case "refused":
+		if res.Reason == "" {
+			return nil, ErrUnavailable
+		}
+		binding = map[string]any{
+			"status":         "refused",
+			"reason":         res.Reason,
+			"current":        false,
+			"authority_refs": authorityRefs,
+		}
+		if res.NativeMessageVersion != "" {
+			binding["native_message_version"] = res.NativeMessageVersion
+		}
+	case "bound":
+		if !res.Current || res.DeliveryReference == "" || res.HeaderReference == "" || res.NativeMessageVersion == "" || !validHex(res.ObservedPayloadSHA256, 64) {
+			return nil, ErrUnavailable
+		}
+		proven := make(map[string]any, len(res.ProvenPredicates))
+		for k, v := range res.ProvenPredicates {
+			proven[k] = v
+		}
+		unknowns := make([]any, len(res.UnknownPredicates))
+		for i, u := range res.UnknownPredicates {
+			unknowns[i] = u
+		}
+		purposes := make([]any, len(res.ResolvablePurposes))
+		for i, p := range res.ResolvablePurposes {
+			purposes[i] = p
+		}
+		binding = map[string]any{
+			"status":                  "bound",
+			"current":                 true,
+			"delivery_reference":      res.DeliveryReference,
+			"header_reference":        res.HeaderReference,
+			"native_message_version":  res.NativeMessageVersion,
+			"observed_payload_sha256": res.ObservedPayloadSHA256,
+			"header":                  res.Header.toMap(),
+			"proven_predicates":       proven,
+			"unknown_predicates":      unknowns,
+			"resolvable_purposes":     purposes,
+			"authority_refs":          authorityRefs,
+		}
+	default:
+		return nil, ErrUnavailable
+	}
+	sqlCompleted := time.Now().UTC().Truncate(time.Microsecond)
+	sqlAuth := formatAuthorityDescriptor(sqlID, "sql", authRead.Incarnation(), sqlPos, sqlNonce, sqlStarted, sqlCompleted)
+	imAuth := formatAuthorityDescriptor(imCut.AuthorityID, "im", imCut.Incarnation, imCut.Position, imCut.ReadNonce, imCut.StartedAt, imCut.CompletedAt)
+	authorities, observedAt := sortAuthoritiesAndObserved(sqlAuth, imAuth, sqlCompleted, imCut.CompletedAt)
+
+	resp := map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"key":             keyObj,
+		"request_id":      parsedReq.RequestID,
+		"read_id":         readID,
+		"observed_at":     observedAt,
+		"authorities":     authorities,
+		"binding":         binding,
+	}
+	return canonical(resp), nil
 }
 
 type sqlScopeBaseFacts struct {

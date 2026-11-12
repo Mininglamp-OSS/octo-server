@@ -50,6 +50,13 @@ func (r *Runtime) Store() *Store {
 	return &r.store
 }
 func (r *Runtime) HasFacts() bool { return r != nil && r.facts != nil }
+func (r *Runtime) HasDeliveryBinding() bool {
+	if r == nil || r.facts == nil {
+		return false
+	}
+	binder, ok := r.facts.(DeliveredMessageBinder)
+	return ok && binder.HasDeliveryBinding()
+}
 
 // BeginAssociation keeps legacy transactions unchanged until composition is
 // installed. Enabled native units use one fresh RR transaction and one deadline

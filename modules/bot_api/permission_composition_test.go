@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/messages_search"
 	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/gocraft/dbr/v2"
@@ -103,6 +104,7 @@ func TestBotPermissionOptInRouteCompositionMountsPolicyAndFactsWhenValid(t *test
 		{http.MethodGet, "/v1/bot/permission-bundle/v1/catalog?space_id=space"},
 		{http.MethodGet, "/v1/bot/permission-bundle/v1/catalog/file?space_id=space"},
 		{http.MethodPost, "/v1/bot/permission-facts/v1?space_id=space"},
+		{http.MethodPost, "/v1/bot/permission-facts/v1/bind-delivery?space_id=space"},
 	} {
 		rec := httptest.NewRecorder()
 		rUnconfigured.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)))
@@ -163,6 +165,94 @@ func TestBotPermissionOptInRouteCompositionMountsPolicyAndFactsWhenValid(t *test
 		rec := httptest.NewRecorder()
 		rValid.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)))
 		// Mounted routes enter authBot (400 error envelope on missing token) instead of 404.
+		require.NotEqual(t, http.StatusNotFound, rec.Code, "%s %s", tc.method, tc.path)
+	}
+}
+
+func TestBotPermissionOptInRouteCompositionWithRealServerMessageFactHooks(t *testing.T) {
+	pin := permissionbundle.CatalogPin{Version: "synthetic-v1", Digest: strings.Repeat("b", 64)}
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	conn := &dbr.Connection{DB: db, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
+	session := conn.NewSession(nil)
+
+	// 1. Missing authority still fails closed even when real ServerMessageFactHooks are supplied.
+	noAuthCtx := config.NewContext(config.New())
+	err = permissionbundle.InstallOptIn(noAuthCtx, permissionbundle.InstallConfig{
+		Enabled:                true,
+		Session:                session,
+		Origin:                 "https://synthetic.invalid",
+		Pin:                    pin,
+		Releases:               botRouteTestReleases{pin: pin},
+		FactProviderMode:       permissionbundle.NativeFactProviderModeServerStoreV1,
+		ServerMessageHooks:     message.NewServerMessageFactHooks(noAuthCtx),
+		ServerStoreIncarnation: strings.Repeat("5", 32),
+		ServerPermitKey:        []byte(strings.Repeat("k", 32)),
+	})
+	require.ErrorIs(t, err, permissionbundle.ErrUnavailable)
+	require.Nil(t, permissionbundle.RuntimeFor(noAuthCtx))
+
+	// 2. Missing hooks/incarnation/permit key in octo_server_message_store_v1 mode fails closed.
+	missingHooksCtx := config.NewContext(config.New())
+	err = permissionbundle.InstallOptIn(missingHooksCtx, permissionbundle.InstallConfig{
+		Enabled:                true,
+		Session:                session,
+		Origin:                 "https://synthetic.invalid",
+		Pin:                    pin,
+		Releases:               botRouteTestReleases{pin: pin},
+		AuthorityMode:          permissionbundle.AuthorityModeExternalFencedV1,
+		AuthorityDriver:        botRouteTestAuthorityDriver{digest: pin.Digest},
+		FactProviderMode:       permissionbundle.NativeFactProviderModeServerStoreV1,
+		ServerStoreIncarnation: strings.Repeat("5", 32),
+		ServerPermitKey:        []byte(strings.Repeat("k", 32)),
+	})
+	require.ErrorIs(t, err, permissionbundle.ErrUnavailable)
+	require.Nil(t, permissionbundle.RuntimeFor(missingHooksCtx))
+
+	// 3. Valid opt-in with real message.NewServerMessageFactHooks composes ServerMessageFactProvider
+	// and mounts policy, facts, and bind-delivery routes.
+	validCtx := config.NewContext(config.New())
+	err = permissionbundle.InstallOptIn(validCtx, permissionbundle.InstallConfig{
+		Enabled:                true,
+		Session:                session,
+		Origin:                 "https://synthetic.invalid",
+		Pin:                    pin,
+		Releases:               botRouteTestReleases{pin: pin},
+		AuthorityMode:          permissionbundle.AuthorityModeExternalFencedV1,
+		AuthorityDriver:        botRouteTestAuthorityDriver{digest: pin.Digest},
+		FactProviderMode:       permissionbundle.NativeFactProviderModeServerStoreV1,
+		ServerMessageHooks:     message.NewServerMessageFactHooks(validCtx),
+		ServerStoreIncarnation: strings.Repeat("5", 32),
+		ServerPermitKey:        []byte(strings.Repeat("k", 32)),
+	})
+	require.NoError(t, err)
+	rt := permissionbundle.RuntimeFor(validCtx)
+	require.NotNil(t, rt)
+	require.True(t, rt.HasFacts())
+	require.True(t, rt.HasDeliveryBinding())
+
+	baValid := &BotAPI{
+		ctx:              validCtx,
+		permissionBundle: rt.Store(),
+		rateLimiters:     newBotRateLimiters(validCtx.GetConfig()),
+		searchHandler:    messages_search.Shared(validCtx),
+		Log:              log.NewTLog("bot-server-store-optin-test"),
+	}
+	rValid := wkhttp.New()
+	baValid.Route(rValid)
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/bot/permission-bundle/v1?space_id=space"},
+		{http.MethodGet, "/v1/bot/permission-bundle/v1/catalog?space_id=space"},
+		{http.MethodGet, "/v1/bot/permission-bundle/v1/catalog/file?space_id=space"},
+		{http.MethodPost, "/v1/bot/permission-facts/v1?space_id=space"},
+		{http.MethodPost, "/v1/bot/permission-facts/v1/bind-delivery?space_id=space"},
+	} {
+		rec := httptest.NewRecorder()
+		rValid.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)))
 		require.NotEqual(t, http.StatusNotFound, rec.Code, "%s %s", tc.method, tc.path)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
+	"github.com/Mininglamp-OSS/octo-server/pkg/permissionbundle"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
@@ -356,4 +357,57 @@ func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV5Default(t *testing
 		_, err := registry.Lookup(aireasoningprocess.TemplateID, version)
 		require.NoError(t, err)
 	}
+}
+
+func TestInstallPermissionBundleWiresRealServerMessageHooksAndRemainsGatedWithoutAuthority(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	require.NoError(t, err)
+
+	foundInstallCall := false
+	foundHooksCall := false
+	for _, declaration := range file.Decls {
+		fn, ok := declaration.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "installPermissionBundle" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch sel.Sel.Name {
+			case "InstallFromEnvWithHooks":
+				foundInstallCall = true
+			case "NewServerMessageFactHooks":
+				foundHooksCall = true
+			}
+			return true
+		})
+	}
+	require.True(t, foundInstallCall, "installPermissionBundle must call permissionbundle.InstallFromEnvWithHooks")
+	require.True(t, foundHooksCall, "installPermissionBundle must pass message.NewServerMessageFactHooks(ctx)")
+
+	// Default disabled: no-op, leaves runtime nil.
+	t.Setenv(permissionbundle.EnvPermissionBundleEnabled, "")
+	disabledCtx := config.NewContext(config.New())
+	require.NoError(t, installPermissionBundle(disabledCtx))
+	require.Nil(t, permissionbundle.RuntimeFor(disabledCtx))
+
+	// Enabled without external FencedAuthority driver in live startup fails closed (no dummy authority).
+	t.Setenv(permissionbundle.EnvPermissionBundleEnabled, "true")
+	t.Setenv(permissionbundle.EnvPermissionBundleOrigin, "https://synthetic.invalid")
+	t.Setenv(permissionbundle.EnvPermissionBundleCatalogVersion, "2026-04-06-permission-v1-r1")
+	t.Setenv(permissionbundle.EnvPermissionBundleCatalogDigest, strings.Repeat("b", 64))
+	t.Setenv(permissionbundle.EnvPermissionBundleFactProviderMode, permissionbundle.NativeFactProviderModeServerStoreV1)
+	t.Setenv(permissionbundle.EnvPermissionBundleStoreIncarnation, strings.Repeat("5", 32))
+	t.Setenv(permissionbundle.EnvPermissionBundlePermitKeyHex, strings.Repeat("6b", 32))
+	gatedCtx := config.NewContext(config.New())
+	err = installPermissionBundle(gatedCtx)
+	require.ErrorIs(t, err, permissionbundle.ErrUnavailable)
+	require.Nil(t, permissionbundle.RuntimeFor(gatedCtx))
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -342,6 +343,272 @@ func (r *Runtime) Facts(ctx context.Context, key Key, body io.Reader) ([]byte, e
 		return nil, ErrUnavailable
 	}
 	out, e := nativeResponse(key, req, response)
+	if e != nil {
+		return nil, e
+	}
+	if r.facts.ValidateCuts(ctx, key, out) != nil {
+		return nil, ErrUnavailable
+	}
+	var envelope struct {
+		Authorities []struct {
+			Kind        string `json:"kind"`
+			Incarnation string `json:"incarnation"`
+		} `json:"authorities"`
+	}
+	if json.Unmarshal(out, &envelope) != nil {
+		return nil, ErrUnavailable
+	}
+	for _, a := range envelope.Authorities {
+		if a.Kind == "sql" && a.Incarnation != t.authority.Incarnation() {
+			return nil, ErrUnavailable
+		}
+	}
+	if e = complete(ctx, t); e != nil {
+		return nil, e
+	}
+	return out, nil
+}
+
+func parseDeliveryBindingRequest(r io.Reader) (DeliveryBindingRequestV1, []byte, error) {
+	v, e := decodeStrict(r, 8192)
+	if e != nil {
+		return DeliveryBindingRequestV1{}, nil, e
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	allowed := map[string]bool{
+		"schema_version":          true,
+		"operation":               true,
+		"request_id":              true,
+		"channel_type":            true,
+		"channel_id":              true,
+		"message_id":              true,
+		"message_seq":             true,
+		"from_uid":                true,
+		"observed_payload_sha256": true,
+		"expected_native_version": true,
+	}
+	for k := range m {
+		if !allowed[k] {
+			return DeliveryBindingRequestV1{}, nil, ErrInvalid
+		}
+	}
+	if m["schema_version"] != json.Number("1") || m["operation"] != "bind_delivery" {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	reqID, ok := m["request_id"].(string)
+	if !ok || !ValidNativeID(reqID) {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	chTypeNum, ok := m["channel_type"].(json.Number)
+	if !ok {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	chTypeU64, err := U64(string(chTypeNum))
+	if err != nil || (chTypeU64 != channelTypePerson && chTypeU64 != channelTypeGroup && chTypeU64 != channelTypeThread) {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	chID, ok := m["channel_id"].(string)
+	if !ok || chID == "" || len(chID) > 256 {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	msgID, ok := m["message_id"].(string)
+	if !ok {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	if n, err := U64(msgID); err != nil || n == 0 || n > 9223372036854775807 {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	msgSeq, ok := m["message_seq"].(string)
+	if !ok {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	if n, err := U64(msgSeq); err != nil || n == 0 || n > 4294967295 {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	fromUID, ok := m["from_uid"].(string)
+	if !ok || !ValidNativeID(fromUID) {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	payloadSHA, ok := m["observed_payload_sha256"].(string)
+	if !ok || !validHex(payloadSHA, 64) {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
+	var expectedVer string
+	if rawVer, exists := m["expected_native_version"]; exists && rawVer != nil {
+		s, ok := rawVer.(string)
+		if !ok || s == "" || len(s) > 128 || strings.ContainsAny(s, "- \t\r\n") {
+			return DeliveryBindingRequestV1{}, nil, ErrInvalid
+		}
+		expectedVer = s
+	}
+	out := DeliveryBindingRequestV1{
+		RequestID:             reqID,
+		ChannelType:           uint8(chTypeU64),
+		ChannelID:             chID,
+		MessageID:             msgID,
+		MessageSeq:            msgSeq,
+		FromUID:               fromUID,
+		ObservedPayloadSHA256: payloadSHA,
+		ExpectedNativeVersion: expectedVer,
+	}
+	return out, canonical(m), nil
+}
+
+func deliveryBindingResponse(key Key, req DeliveryBindingRequestV1, body []byte) ([]byte, error) {
+	v, e := decodeStrict(bytes.NewReader(body), MaxBundleBytes)
+	if e != nil {
+		return nil, ErrUnavailable
+	}
+	m, ok := v.(map[string]any)
+	if !ok || !nativeLexical(v) {
+		return nil, ErrUnavailable
+	}
+	if m["schema_version"] != json.Number("1") || m["profile_version"] != json.Number("1") {
+		return nil, ErrUnavailable
+	}
+	k, e := asObject(key)
+	if e != nil || !bytes.Equal(canonical(k), canonical(m["key"])) || m["request_id"] != req.RequestID {
+		return nil, ErrUnavailable
+	}
+	observed, e := utcTime(m["observed_at"])
+	if e != nil {
+		return nil, e
+	}
+	authList, ok := m["authorities"].([]any)
+	if !ok || len(authList) == 0 {
+		return nil, ErrUnavailable
+	}
+	ids := map[string]string{}
+	var previous []byte
+	for _, item := range authList {
+		a, ok := item.(map[string]any)
+		if !ok {
+			return nil, ErrUnavailable
+		}
+		encoded := canonical(a)
+		if previous != nil && bytes.Compare(encoded, previous) <= 0 {
+			return nil, ErrUnavailable
+		}
+		nonce, _ := a["read_nonce"].(string)
+		if !validHex(nonce, 32) || ids[nonce] != "" {
+			return nil, ErrUnavailable
+		}
+		ids[nonce], _ = a["kind"].(string)
+		previous = encoded
+		start, e := utcTime(a["started_at"])
+		if e != nil {
+			return nil, e
+		}
+		end, e := utcTime(a["completed_at"])
+		if e != nil || end.Before(start) || observed.Before(end) {
+			return nil, ErrUnavailable
+		}
+	}
+	binding, ok := m["binding"].(map[string]any)
+	if !ok || len(canonical(binding)) > 8192 {
+		return nil, ErrUnavailable
+	}
+	refs, ok := binding["authority_refs"].([]any)
+	if !ok || len(refs) == 0 {
+		return nil, ErrUnavailable
+	}
+	kinds := map[string]bool{}
+	for _, r := range refs {
+		ns, ok := r.(string)
+		if !ok || ids[ns] == "" {
+			return nil, ErrUnavailable
+		}
+		kinds[ids[ns]] = true
+	}
+	if !kinds["sql"] || !kinds["im"] {
+		return nil, ErrUnavailable
+	}
+	status, _ := binding["status"].(string)
+	switch status {
+	case "refused":
+		allowedBinding := map[string]bool{
+			"status":                 true,
+			"reason":                 true,
+			"current":                true,
+			"native_message_version": true,
+			"authority_refs":         true,
+		}
+		for bk := range binding {
+			if !allowedBinding[bk] {
+				return nil, ErrUnavailable
+			}
+		}
+		if cur, ok := binding["current"].(bool); !ok || cur {
+			return nil, ErrUnavailable
+		}
+		if reason, ok := binding["reason"].(string); !ok || reason == "" {
+			return nil, ErrUnavailable
+		}
+	case "bound":
+		allowedBinding := map[string]bool{
+			"status":                  true,
+			"current":                 true,
+			"delivery_reference":      true,
+			"header_reference":        true,
+			"native_message_version":  true,
+			"observed_payload_sha256": true,
+			"header":                  true,
+			"proven_predicates":       true,
+			"unknown_predicates":      true,
+			"resolvable_purposes":     true,
+			"authority_refs":          true,
+		}
+		for bk := range binding {
+			if !allowedBinding[bk] {
+				return nil, ErrUnavailable
+			}
+		}
+		if cur, ok := binding["current"].(bool); !ok || !cur {
+			return nil, ErrUnavailable
+		}
+		if binding["observed_payload_sha256"] != req.ObservedPayloadSHA256 {
+			return nil, ErrUnavailable
+		}
+		h, ok := binding["header"].(map[string]any)
+		if !ok || !nativeHeader(key, h) || h["payload_sha256"] != req.ObservedPayloadSHA256 {
+			return nil, ErrUnavailable
+		}
+	default:
+		return nil, ErrUnavailable
+	}
+	return canonical(m), nil
+}
+
+func (r *Runtime) BindDeliveredMessage(ctx context.Context, key Key, body io.Reader) ([]byte, error) {
+	if r == nil || r.facts == nil || !r.HasDeliveryBinding() {
+		return nil, ErrUnavailable
+	}
+	binder, ok := r.facts.(DeliveredMessageBinder)
+	if !ok {
+		return nil, ErrUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	t, e := r.store.begin(ctx, key, "")
+	if e != nil {
+		return nil, e
+	}
+	defer t.tx.RollbackUnlessCommitted()
+	req, input, e := parseDeliveryBindingRequest(body)
+	if e != nil {
+		return nil, e
+	}
+	response, e := binder.BindDeliveredMessage(ctx, t.tx, key, input)
+	if e != nil {
+		if errors.Is(e, ErrInvalid) {
+			return nil, ErrInvalid
+		}
+		return nil, ErrUnavailable
+	}
+	out, e := deliveryBindingResponse(key, req, response)
 	if e != nil {
 		return nil, e
 	}

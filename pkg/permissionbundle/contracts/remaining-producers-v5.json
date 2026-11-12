@@ -1,0 +1,61 @@
+{
+  "contract": "permission-server-remaining-producers-v5",
+  "task": "XIN-2793",
+  "charter_baseline": "v45-0341-continuation",
+  "supersedes": "remaining-producers-v4.json for active ownership; v1-v4 retained byte-for-byte",
+  "resolved_in_this_slice": [
+    {
+      "id": "R2-server-seam",
+      "was": "Native message version at delivery (server-side metadata-only binding seam)",
+      "status": "DELIVERED_IN_SERVER: POST /v1/bot/permission-facts/v1/bind-delivery (Runtime.BindDeliveredMessage -> SQLNativeFactAdapter.BindDeliveredMessage -> ServerMessageFactProvider.BindDeliveredMessageV1) binds canonical source/id + from_uid + message_seq + observed_payload_sha256 to s1-.../h1-... and x<version>_<hash> with explicit mismatch/edit/revoke/delete refusal and zero body release"
+    },
+    {
+      "id": "R3-startup-composition",
+      "was": "Compose ServerMessageFactProvider with real modules/message.NewServerMessageFactHooks in opt-in startup",
+      "status": "DELIVERED_IN_SERVER: main.go:installPermissionBundle -> permissionbundle.InstallFromEnvWithHooks / InstallOptIn composes ServerMessageFactProvider with real message.NewServerMessageFactHooks(ctx) while keeping live startup gated fail-closed without a dummy authority"
+    },
+    {
+      "id": "own-session-consistency",
+      "was": "ServerMessageFactProvider read through its own SQL session outside caller's RepeatableRead tx",
+      "status": "DELIVERED_IN_SERVER: SQLNativeFactAdapter propagates caller's RepeatableRead *dbr.Tx via context and ServerMessageFactProvider executes all queries on that *dbr.Tx with FOR SHARE NOWAIT"
+    },
+    {
+      "id": "permit-durability-seam",
+      "was": "In-memory-only single-use disclosure permit tracking lost on restart",
+      "status": "DELIVERED_IN_SERVER: ServerMessageFactProvider supports DurablePermitLedger backed by bot_permission_disclosure_permit (ServerDisclosurePermitDDL) so consumed permits cannot be replayed or re-issued after restart"
+    }
+  ],
+  "remaining": [
+    {
+      "id": "R1",
+      "owner": "XIN-2830 / Owner",
+      "item": "Owner-approved ordinary-SQL recovery/history contract decision (Architect 4831fa26 / 7b11211f remains an unapproved proposal and is not self-approved here); live startup remains fail-closed without a configured authority"
+    },
+    {
+      "id": "R2-endpoint-caller",
+      "owner": "XIN-2795",
+      "item": "Update codex-channel-octo endpoint-factory.ts from custom op=inspect_delivery/recover_fence/prepare_disclosure to call POST /v1/bot/permission-facts/v1/bind-delivery (operation=bind_delivery with observed_payload_sha256) and schema-valid operation=resolve|history_headers|history_disclosure on POST /v1/bot/permission-facts/v1"
+    },
+    {
+      "id": "R4",
+      "owner": "XIN-2794 / PjM",
+      "item": "C1-C9 source reconciliation and reviewed support pin and directed pairs; supported_catalog_digest stays null"
+    },
+    {
+      "id": "R5-permit-ddl",
+      "owner": "deployment / schema migration owner",
+      "item": "Provision bot_permission_disclosure_permit table (ServerDisclosurePermitDDL) and set OCTO_PERMISSION_BUNDLE_DURABLE_PERMIT_LEDGER=true before enabling durable history disclosure permits in a live database"
+    },
+    {
+      "id": "R6",
+      "owner": "upstream source owners",
+      "item": "A1 page bounds: concrete values and evidence pending; no constants chosen here"
+    }
+  ],
+  "residual_limitations": [
+    "ServerMessageFactProvider cut is a read-time marker over ordinary SQL state, not an acknowledged-state failover/restore fence",
+    "History pages are stable against appends only; concurrent edit, revoke or clear-history can change later pages",
+    "Group/thread original visibility (without a visibles exclusion) and untagged DM space cannot be proven from current octo-server tables and remain explicit unknown/non-serving for admit/contributor",
+    "When DurablePermitLedger is false (default until bot_permission_disclosure_permit DDL is deployed), single-use permit tracking is in-process memory"
+  ]
+}

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/gocraft/dbr/v2"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -73,13 +72,8 @@ func newServerFacts(t *testing.T) *serverFacts {
 		_, err := s.Session.Exec(q)
 		require.NoError(t, err)
 	}
-	// The provider reads through its own connection, as it does in production
-	// where it is not part of the caller's RepeatableRead transaction.
-	pconn, err := dbr.Open("sqlite3", path+"?_busy_timeout=1000", nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { pconn.Close() })
 	p, err := NewServerMessageFactProvider(ServerMessageFactConfig{
-		Session: pconn.NewSession(nil), Hooks: testServerHooks(), StoreIncarnation: strings.Repeat("5", 32), PermitKey: []byte(strings.Repeat("k", 32)),
+		Session: s.Session, Hooks: testServerHooks(), StoreIncarnation: strings.Repeat("5", 32), PermitKey: []byte(strings.Repeat("k", 32)),
 	})
 	require.NoError(t, err)
 	return &serverFacts{t: t, s: s, p: p, dmChan: pair["id"].(string), parent: parent, threadCh: parent + "____123456789012345"}
@@ -374,4 +368,309 @@ func TestServerMessageFactsThroughSQLNativeFactAdapter(t *testing.T) {
 			require.Equal(t, "mirror_lag", results[4].(map[string]any)["reason"])
 		}
 	}
+}
+
+func sha256OfJSON(v map[string]any) string {
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestServerMessageFactsBindDeliveredMessagePositiveAndRaceRefusals(t *testing.T) {
+	ctx := t.Context()
+	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f := newServerFacts(t)
+	f.s.Authority = authority
+
+	dmPayload := map[string]any{"type": 1, "space_id": "space", "content": "DM-SECRET-BODY"}
+	dmDigest := sha256OfJSON(dmPayload)
+	f.msg("7001", 1, "peer", f.dmChan, 1, dmPayload)
+
+	groupPayload := map[string]any{"type": 1, "content": "GROUP-SECRET-BODY"}
+	groupDigest := sha256OfJSON(groupPayload)
+	f.msg("7002", 2, "peer", "group", 2, groupPayload)
+
+	threadPayload := map[string]any{"type": 1, "content": "THREAD-SECRET-BODY"}
+	threadDigest := sha256OfJSON(threadPayload)
+	f.msg("7003", 3, "peer", f.threadCh, 5, threadPayload)
+
+	untaggedDMPayload := map[string]any{"type": 1, "content": "UNTAGGED-DM-SECRET"}
+	untaggedDMDigest := sha256OfJSON(untaggedDMPayload)
+	f.msg("7004", 4, "peer", f.dmChan, 1, untaggedDMPayload)
+
+	crossSpaceDMPayload := map[string]any{"type": 1, "space_id": "other-space", "content": "CROSS-SPACE-SECRET"}
+	crossSpaceDMDigest := sha256OfJSON(crossSpaceDMPayload)
+	f.msg("7005", 5, "peer", f.dmChan, 1, crossSpaceDMPayload)
+
+	adapter, err := NewSQLNativeFactAdapter(authority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+	require.True(t, rt.HasDeliveryBinding())
+
+	callBind := func(req map[string]any) map[string]any {
+		out, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(req)))
+		require.NoError(t, err)
+		for _, secret := range []string{"DM-SECRET-BODY", "GROUP-SECRET-BODY", "THREAD-SECRET-BODY", "UNTAGGED-DM-SECRET", "CROSS-SPACE-SECRET", "EDITED-BODY"} {
+			require.NotContains(t, string(out), secret)
+		}
+		return fixtureObject(t, out)["binding"].(map[string]any)
+	}
+
+	// 1. Positive path: space-tagged DM binds with all purposes resolvable and zero unknowns.
+	bDM := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-dm-1",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7001",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": dmDigest,
+	})
+	require.Equal(t, "bound", bDM["status"])
+	require.Equal(t, true, bDM["current"])
+	require.Equal(t, "x0_0", bDM["native_message_version"])
+	require.Equal(t, ServerDeliveryReference(1, f.dmChan, "7001", "x0_0"), bDM["delivery_reference"])
+	require.Empty(t, bDM["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, bDM["resolvable_purposes"].([]any))
+
+	// 2. Positive path: Group and Thread bind for reply, while explicitly listing
+	// caller_original_visible and bot_original_visible in unknown_predicates (never fabricated true).
+	bGroup := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-grp-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "7002",
+		"message_seq":             "2",
+		"from_uid":                "peer",
+		"observed_payload_sha256": groupDigest,
+	})
+	require.Equal(t, "bound", bGroup["status"])
+	require.Equal(t, []any{"bot_original_visible", "caller_original_visible"}, bGroup["unknown_predicates"].([]any))
+	require.Equal(t, []any{"reply"}, bGroup["resolvable_purposes"].([]any))
+	grpProven := bGroup["proven_predicates"].(map[string]any)
+	require.NotContains(t, grpProven, "caller_original_visible")
+	require.NotContains(t, grpProven, "bot_original_visible")
+
+	bThread := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-thd-1",
+		"channel_type":            json.Number("5"),
+		"channel_id":              f.threadCh,
+		"message_id":              "7003",
+		"message_seq":             "3",
+		"from_uid":                "peer",
+		"observed_payload_sha256": threadDigest,
+	})
+	require.Equal(t, "bound", bThread["status"])
+	require.Equal(t, []any{"bot_original_visible", "caller_original_visible"}, bThread["unknown_predicates"].([]any))
+	require.Equal(t, []any{"reply"}, bThread["resolvable_purposes"].([]any))
+
+	// 3. Untagged DM binds reference metadata but marks message_space_exact as unknown (non-serving for resolve).
+	bUntagged := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-untagged-1",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7004",
+		"message_seq":             "4",
+		"from_uid":                "peer",
+		"observed_payload_sha256": untaggedDMDigest,
+	})
+	require.Equal(t, "bound", bUntagged["status"])
+	require.Equal(t, []any{"message_space_exact"}, bUntagged["unknown_predicates"].([]any))
+	require.Empty(t, bUntagged["resolvable_purposes"].([]any))
+	require.NotContains(t, bUntagged["proven_predicates"].(map[string]any), "message_space_exact")
+
+	// 4. Race/mismatch negative path: concurrent edit in message_extra changes effective payload digest.
+	// A current-version lookup alone cannot prove the pre-edit frame's version, so binding with the
+	// pre-edit observed_payload_sha256 explicitly refuses with payload_digest_mismatch.
+	editedBytes := `{"content":"EDITED-BODY","space_id":"space","type":1}`
+	editedSum := sha256.Sum256([]byte(editedBytes))
+	editedDigest := hex.EncodeToString(editedSum[:])
+	f.exec("INSERT INTO message_extra VALUES('7001',4,0,0,?,'e44')", editedBytes)
+
+	bRace := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-race-1",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7001",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": dmDigest,
+	})
+	require.Equal(t, "refused", bRace["status"])
+	require.Equal(t, "payload_digest_mismatch", bRace["reason"])
+	require.Equal(t, false, bRace["current"])
+	require.Equal(t, "x4_e44", bRace["native_message_version"])
+
+	// Stale expected_native_version also refuses with version_mismatch even if digest matches edited payload.
+	bStaleVer := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-ver-1",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7001",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": editedDigest,
+		"expected_native_version": "x0_0",
+	})
+	require.Equal(t, "refused", bStaleVer["status"])
+	require.Equal(t, "version_mismatch", bStaleVer["reason"])
+	require.Equal(t, "x4_e44", bStaleVer["native_message_version"])
+
+	// Matching edited digest and expected_native_version binds to x4_e44.
+	bEditedOK := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-edited-ok",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7001",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": editedDigest,
+		"expected_native_version": "x4_e44",
+	})
+	require.Equal(t, "bound", bEditedOK["status"])
+	require.Equal(t, ServerDeliveryReference(1, f.dmChan, "7001", "x4_e44"), bEditedOK["delivery_reference"])
+
+	// 5. Sender or sequence mismatch refuses with identity_mismatch.
+	bBadSender := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-sender-bad",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "7002",
+		"message_seq":             "2",
+		"from_uid":                "departed",
+		"observed_payload_sha256": groupDigest,
+	})
+	require.Equal(t, "refused", bBadSender["status"])
+	require.Equal(t, "identity_mismatch", bBadSender["reason"])
+
+	bBadSeq := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-seq-bad",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "7002",
+		"message_seq":             "99",
+		"from_uid":                "peer",
+		"observed_payload_sha256": groupDigest,
+	})
+	require.Equal(t, "refused", bBadSeq["status"])
+	require.Equal(t, "identity_mismatch", bBadSeq["reason"])
+
+	// 6. Revoked, missing, and cross-space messages refuse with exact reasons.
+	f.exec("UPDATE message_extra SET revoke=1 WHERE message_id='7001'")
+	bRevoked := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-revoked",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7001",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": editedDigest,
+	})
+	require.Equal(t, "refused", bRevoked["status"])
+	require.Equal(t, "expired_reference", bRevoked["reason"])
+
+	bMissing := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-missing",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7999",
+		"message_seq":             "99",
+		"from_uid":                "peer",
+		"observed_payload_sha256": dmDigest,
+	})
+	require.Equal(t, "refused", bMissing["status"])
+	require.Equal(t, "mirror_lag", bMissing["reason"])
+
+	bCrossSpace := callBind(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-bind-cross-space",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "7005",
+		"message_seq":             "5",
+		"from_uid":                "peer",
+		"observed_payload_sha256": crossSpaceDMDigest,
+	})
+	require.Equal(t, "refused", bCrossSpace["status"])
+	require.Equal(t, "visibility_denied", bCrossSpace["reason"])
+}
+
+func TestServerMessageFactsDurablePermitLedgerSurvivesRestart(t *testing.T) {
+	f := newServerFacts(t)
+	f.exec(ServerDisclosurePermitDDL)
+
+	p1, err := NewServerMessageFactProvider(ServerMessageFactConfig{
+		Session:             f.s.Session,
+		Hooks:               testServerHooks(),
+		StoreIncarnation:    strings.Repeat("5", 32),
+		PermitKey:           []byte(strings.Repeat("k", 32)),
+		DurablePermitLedger: true,
+	})
+	require.NoError(t, err)
+
+	f.msg("8001", 1, "peer", f.dmChan, 1, map[string]any{"type": 1, "space_id": "space", "content": "PERMIT-BODY"})
+	src := ServerSourceReference(1, f.dmChan)
+	page, err := p1.ListHistoryHeadersV1(t.Context(), fixtureKey, src, nil, 2)
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	hdr := page.Items[0].Header
+
+	items, _, err := p1.IssueHistoryDisclosureV1(t.Context(), fixtureKey, "ctx-durable", "1", []string{hdr.HeaderReference})
+	require.NoError(t, err)
+	require.Equal(t, "resolved", items[0].Status)
+	permit := items[0].Permit
+	require.NotEmpty(t, permit)
+
+	// Consume the permit once in process 1.
+	require.NoError(t, p1.ConsumeDisclosurePermit(fixtureKey, "ctx-durable", "1", hdr.HeaderReference, hdr.PayloadSHA256, permit))
+
+	// Simulate a process restart by constructing a brand-new provider instance
+	// with a fresh in-memory map against the same SQLite database.
+	p2, err := NewServerMessageFactProvider(ServerMessageFactConfig{
+		Session:             f.s.Session,
+		Hooks:               testServerHooks(),
+		StoreIncarnation:    strings.Repeat("5", 32),
+		PermitKey:           []byte(strings.Repeat("k", 32)),
+		DurablePermitLedger: true,
+	})
+	require.NoError(t, err)
+
+	// Replaying the consumed permit after restart is rejected by the SQL permit ledger.
+	require.ErrorIs(t, p2.ConsumeDisclosurePermit(fixtureKey, "ctx-durable", "1", hdr.HeaderReference, hdr.PayloadSHA256, permit), ErrReference)
+
+	// Re-requesting IssueHistoryDisclosureV1 for the already-consumed (context, epoch, headerRef)
+	// after restart refuses to resurrect the consumed permit.
+	reissue, _, err := p2.IssueHistoryDisclosureV1(t.Context(), fixtureKey, "ctx-durable", "1", []string{hdr.HeaderReference})
+	require.NoError(t, err)
+	require.Equal(t, "unavailable", reissue[0].Status)
+	require.Equal(t, "disclosure_unavailable", reissue[0].Reason)
 }

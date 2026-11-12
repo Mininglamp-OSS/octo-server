@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,25 @@ const (
 	serverGroupStatusNormal  = 1
 	serverGroupStatusDisband = 2
 	serverThreadDeleted      = 3
+
+	// ServerDisclosurePermitTable names the optional SQL ledger table that
+	// persists issued/consumed single-use history disclosure permits across
+	// process restarts when DurablePermitLedger is enabled.
+	ServerDisclosurePermitTable = "bot_permission_disclosure_permit"
+
+	// ServerDisclosurePermitDDL is the portable schema definition for the
+	// durable single-use disclosure permit ledger.
+	ServerDisclosurePermitDDL = `CREATE TABLE IF NOT EXISTS bot_permission_disclosure_permit (
+		permit_sha256 VARCHAR(64) NOT NULL PRIMARY KEY,
+		bot_uid VARCHAR(128) NOT NULL,
+		space_id VARCHAR(128) NOT NULL,
+		context_id VARCHAR(128) NOT NULL,
+		context_epoch VARCHAR(64) NOT NULL,
+		header_reference VARCHAR(255) NOT NULL,
+		payload_sha256 CHAR(64) NOT NULL,
+		issued_at BIGINT NOT NULL,
+		consumed_at BIGINT NULL
+	)`
 )
 
 // ServerMessageHooks injects the octo-server owned helpers so this package does
@@ -89,16 +109,21 @@ type ServerMessageFactConfig struct {
 	StoreIncarnation string
 	// PermitKey (>=32 bytes) authenticates history disclosure permits.
 	PermitKey []byte
-	Now       func() time.Time
+	// DurablePermitLedger persists issued/consumed disclosure permits in SQL
+	// (bot_permission_disclosure_permit) so single-use consumption survives
+	// process restarts.
+	DurablePermitLedger bool
+	Now                 func() time.Time
 }
 
 type ServerMessageFactProvider struct {
-	db          *dbr.Session
-	hooks       ServerMessageHooks
-	authorityID string
-	incarnation string
-	permitKey   []byte
-	now         func() time.Time
+	db             *dbr.Session
+	hooks          ServerMessageHooks
+	authorityID    string
+	incarnation    string
+	permitKey      []byte
+	durablePermits bool
+	now            func() time.Time
 
 	mu      sync.Mutex
 	usedPmt map[string]struct{}
@@ -118,7 +143,8 @@ func NewServerMessageFactProvider(cfg ServerMessageFactConfig) (*ServerMessageFa
 	}
 	return &ServerMessageFactProvider{
 		db: cfg.Session, hooks: cfg.Hooks, authorityID: id, incarnation: cfg.StoreIncarnation,
-		permitKey: append([]byte(nil), cfg.PermitKey...), now: now, usedPmt: map[string]struct{}{},
+		permitKey: append([]byte(nil), cfg.PermitKey...), durablePermits: cfg.DurablePermitLedger,
+		now: now, usedPmt: map[string]struct{}{},
 	}, nil
 }
 
@@ -187,10 +213,36 @@ func (p *ServerMessageFactProvider) cut(started time.Time) (IMAuthorityCut, erro
 	}, nil
 }
 
+func (p *ServerMessageFactProvider) lockSuffix(ctx context.Context) string {
+	if tc, ok := factReadTxFromContext(ctx); ok && !tc.testNoLocks {
+		return " FOR SHARE NOWAIT"
+	}
+	return ""
+}
+
 func (p *ServerMessageFactProvider) one(ctx context.Context, q string, args []any, dest ...any) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
+	if tc, ok := factReadTxFromContext(ctx); ok {
+		return tc.tx.QueryRowContext(ctx, q, args...).Scan(dest...)
+	}
 	return p.db.QueryRowContext(ctx, q, args...).Scan(dest...)
+}
+
+func (p *ServerMessageFactProvider) query(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	if tc, ok := factReadTxFromContext(ctx); ok {
+		return tc.tx.QueryContext(ctx, q, args...)
+	}
+	return p.db.QueryContext(ctx, q, args...)
+}
+
+func (p *ServerMessageFactProvider) exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if tc, ok := factReadTxFromContext(ctx); ok {
+		return tc.tx.ExecContext(ctx, q, args...)
+	}
+	return p.db.ExecContext(ctx, q, args...)
 }
 
 type serverMsgRow struct {
@@ -212,7 +264,7 @@ type serverExtraRow struct {
 
 func (p *ServerMessageFactProvider) loadMessage(ctx context.Context, r serverRef) (*serverMsgRow, error) {
 	var m serverMsgRow
-	err := p.one(ctx, "SELECT message_seq,from_uid,COALESCE(`timestamp`,0),payload,COALESCE(is_deleted,0) FROM "+p.hooks.MessageTable(r.channelID)+" WHERE channel_id=? AND channel_type=? AND message_id=?",
+	err := p.one(ctx, "SELECT message_seq,from_uid,COALESCE(`timestamp`,0),payload,COALESCE(is_deleted,0) FROM "+p.hooks.MessageTable(r.channelID)+" WHERE channel_id=? AND channel_type=? AND message_id=?"+p.lockSuffix(ctx),
 		[]any{r.channelID, int(r.channelType), r.messageID}, &m.seq, &m.fromUID, &m.timestamp, &m.payload, &m.deleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -225,7 +277,7 @@ func (p *ServerMessageFactProvider) loadMessage(ctx context.Context, r serverRef
 
 func (p *ServerMessageFactProvider) loadExtra(ctx context.Context, messageID string) (serverExtraRow, error) {
 	var e serverExtraRow
-	err := p.one(ctx, "SELECT COALESCE(version,0),COALESCE(revoke,0),COALESCE(is_deleted,0),content_edit,COALESCE(content_edit_hash,'') FROM message_extra WHERE message_id=?",
+	err := p.one(ctx, "SELECT COALESCE(version,0),COALESCE(revoke,0),COALESCE(is_deleted,0),content_edit,COALESCE(content_edit_hash,'') FROM message_extra WHERE message_id=?"+p.lockSuffix(ctx),
 		[]any{messageID}, &e.version, &e.revoke, &e.deleted, &e.edit, &e.hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return serverExtraRow{}, nil
@@ -252,7 +304,7 @@ func (e serverExtraRow) nativeVersion() string {
 }
 
 func (p *ServerMessageFactProvider) groupFacts(ctx context.Context, groupNo string) (exists bool, status int, spaceID string, err error) {
-	e := p.one(ctx, "SELECT COALESCE(space_id,''),status FROM `group` WHERE group_no=?", []any{groupNo}, &spaceID, &status)
+	e := p.one(ctx, "SELECT COALESCE(space_id,''),status FROM `group` WHERE group_no=?"+p.lockSuffix(ctx), []any{groupNo}, &spaceID, &status)
 	if errors.Is(e, sql.ErrNoRows) {
 		return false, 0, "", nil
 	}
@@ -264,7 +316,7 @@ func (p *ServerMessageFactProvider) groupFacts(ctx context.Context, groupNo stri
 
 func (p *ServerMessageFactProvider) activeMember(ctx context.Context, groupNo, uid string) (bool, error) {
 	var n int
-	if err := p.one(ctx, "SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND COALESCE(is_deleted,0)=0 AND COALESCE(status,1)=1", []any{groupNo, uid}, &n); err != nil {
+	if err := p.one(ctx, "SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND COALESCE(is_deleted,0)=0 AND COALESCE(status,1)=1"+p.lockSuffix(ctx), []any{groupNo, uid}, &n); err != nil {
 		return false, ErrUnavailable
 	}
 	return n > 0, nil
@@ -272,7 +324,7 @@ func (p *ServerMessageFactProvider) activeMember(ctx context.Context, groupNo, u
 
 func (p *ServerMessageFactProvider) userHidden(ctx context.Context, r serverRef, m *serverMsgRow, uid, dmPeerUID string) (bool, error) {
 	var deleted int
-	err := p.one(ctx, "SELECT COALESCE(message_is_deleted,0) FROM "+p.hooks.MessageUserExtraTable(uid)+" WHERE uid=? AND message_id=?", []any{uid, r.messageID}, &deleted)
+	err := p.one(ctx, "SELECT COALESCE(message_is_deleted,0) FROM "+p.hooks.MessageUserExtraTable(uid)+" WHERE uid=? AND message_id=?"+p.lockSuffix(ctx), []any{uid, r.messageID}, &deleted)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, ErrUnavailable
 	}
@@ -284,7 +336,7 @@ func (p *ServerMessageFactProvider) userHidden(ctx context.Context, r serverRef,
 		offKey = dmPeerUID
 	}
 	var off sql.NullInt64
-	err = p.one(ctx, "SELECT MAX(message_seq) FROM "+p.hooks.ChannelOffsetTable(uid)+" WHERE uid=? AND channel_id=? AND channel_type=?", []any{uid, offKey, int(r.channelType)}, &off)
+	err = p.one(ctx, "SELECT MAX(message_seq) FROM "+p.hooks.ChannelOffsetTable(uid)+" WHERE uid=? AND channel_id=? AND channel_type=?"+p.lockSuffix(ctx), []any{uid, offKey, int(r.channelType)}, &off)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, ErrUnavailable
 	}
@@ -292,7 +344,7 @@ func (p *ServerMessageFactProvider) userHidden(ctx context.Context, r serverRef,
 		return true, nil
 	}
 	var chOff sql.NullInt64
-	err = p.one(ctx, "SELECT offset_message_seq FROM channel_setting WHERE channel_id=? AND channel_type=?", []any{r.channelID, int(r.channelType)}, &chOff)
+	err = p.one(ctx, "SELECT offset_message_seq FROM channel_setting WHERE channel_id=? AND channel_type=?"+p.lockSuffix(ctx), []any{r.channelID, int(r.channelType)}, &chOff)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, ErrUnavailable
 	}
@@ -347,7 +399,7 @@ func (p *ServerMessageFactProvider) resolveOne(ctx context.Context, key Key, ref
 			return un("parent_unavailable")
 		}
 		var tstatus int
-		e := p.one(ctx, "SELECT status FROM thread WHERE group_no=? AND short_id=?", []any{parts[1], parts[2]}, &tstatus)
+		e := p.one(ctx, "SELECT status FROM thread WHERE group_no=? AND short_id=?"+p.lockSuffix(ctx), []any{parts[1], parts[2]}, &tstatus)
 		if errors.Is(e, sql.ErrNoRows) || (e == nil && tstatus == serverThreadDeleted) {
 			return un("expired_reference")
 		}
@@ -380,7 +432,7 @@ func (p *ServerMessageFactProvider) resolveOne(ctx context.Context, key Key, ref
 	}
 
 	var robot int
-	e := p.one(ctx, "SELECT COALESCE(robot,0) FROM user WHERE uid=?", []any{msg.fromUID}, &robot)
+	e := p.one(ctx, "SELECT COALESCE(robot,0) FROM user WHERE uid=?"+p.lockSuffix(ctx), []any{msg.fromUID}, &robot)
 	if errors.Is(e, sql.ErrNoRows) {
 		return un("predicate_unsupported")
 	}
@@ -583,7 +635,7 @@ func (p *ServerMessageFactProvider) ListHistoryHeadersV1(ctx context.Context, ke
 	}
 	ctx2, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	rows, err := p.db.QueryContext(ctx2, "SELECT message_id,message_seq FROM "+p.hooks.MessageTable(src.channelID)+" WHERE channel_id=? AND channel_type=? AND message_seq<? AND COALESCE(is_deleted,0)=0 ORDER BY message_seq DESC LIMIT ?",
+	rows, err := p.query(ctx2, "SELECT message_id,message_seq FROM "+p.hooks.MessageTable(src.channelID)+" WHERE channel_id=? AND channel_type=? AND message_seq<? AND COALESCE(is_deleted,0)=0 ORDER BY message_seq DESC LIMIT ?"+p.lockSuffix(ctx),
 		src.channelID, int(src.channelType), upper, int(pageSize)+1)
 	if err != nil {
 		return IMHistoryHeadersPage{}, ErrUnavailable
@@ -653,6 +705,45 @@ func (p *ServerMessageFactProvider) permit(key Key, contextID, contextEpoch, hea
 	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
 }
 
+func permitSHA256Hex(permit string) string {
+	sum := sha256.Sum256([]byte(permit))
+	return hex.EncodeToString(sum[:])
+}
+
+func (p *ServerMessageFactProvider) isPermitUsedInMemory(permit string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, used := p.usedPmt[permit]
+	return used
+}
+
+func (p *ServerMessageFactProvider) ensurePermitIssued(ctx context.Context, key Key, contextID, contextEpoch, headerRef, payloadSHA, permit string) (bool, error) {
+	if p.isPermitUsedInMemory(permit) {
+		return false, nil
+	}
+	if !p.durablePermits {
+		return true, nil
+	}
+	pmtHash := permitSHA256Hex(permit)
+	var consumedAt sql.NullInt64
+	err := p.one(ctx, "SELECT consumed_at FROM "+ServerDisclosurePermitTable+" WHERE permit_sha256=?"+p.lockSuffix(ctx), []any{pmtHash}, &consumedAt)
+	if err == nil {
+		if consumedAt.Valid {
+			return false, nil
+		}
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, ErrUnavailable
+	}
+	issuedAt := p.now().UTC().UnixNano()
+	if _, err := p.exec(ctx, "INSERT INTO "+ServerDisclosurePermitTable+" (permit_sha256, bot_uid, space_id, context_id, context_epoch, header_reference, payload_sha256, issued_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+		pmtHash, key.BotUID, key.SpaceID, contextID, contextEpoch, headerRef, payloadSHA, issuedAt); err != nil {
+		return false, ErrUnavailable
+	}
+	return true, nil
+}
+
 // IssueHistoryDisclosureV1 is step two of the existing two-step disclosure: it
 // re-resolves each header reference against current storage and issues a
 // permit only for references that are current, version-exact and whose bot
@@ -686,9 +777,18 @@ func (p *ServerMessageFactProvider) IssueHistoryDisclosureV1(ctx context.Context
 		case !d.MessageSpaceExact || !d.MessageSourceExact || !d.BotCurrentRead || !d.BotOriginalVisible:
 			out = append(out, IMDisclosureItem{Reference: hr, Status: "unavailable", Reason: "disclosure_unavailable"})
 		default:
+			pmt := p.permit(key, contextID, contextEpoch, hr, res.payloadHash)
+			avail, err := p.ensurePermitIssued(ctx, key, contextID, contextEpoch, hr, res.payloadHash, pmt)
+			if err != nil {
+				return nil, IMAuthorityCut{}, err
+			}
+			if !avail {
+				out = append(out, IMDisclosureItem{Reference: hr, Status: "unavailable", Reason: "disclosure_unavailable"})
+				continue
+			}
 			out = append(out, IMDisclosureItem{
 				Reference: hr, Status: "resolved", HeaderReference: hr, PayloadSHA256: res.payloadHash,
-				Permit: p.permit(key, contextID, contextEpoch, hr, res.payloadHash),
+				Permit: pmt,
 			})
 		}
 	}
@@ -696,10 +796,18 @@ func (p *ServerMessageFactProvider) IssueHistoryDisclosureV1(ctx context.Context
 	return out, cut, err
 }
 
-// ConsumeDisclosurePermit verifies a permit and marks it used in this process.
-// The used-set is in-memory and not durable; a restart forgets consumed
-// permits, which is recorded as a limitation, not a guarantee.
+// ConsumeDisclosurePermit verifies a permit and marks it used. When
+// DurablePermitLedger is enabled, consumption is atomically persisted in
+// bot_permission_disclosure_permit so a consumed permit cannot be replayed
+// after a process restart; otherwise it falls back to the in-memory used-set.
 func (p *ServerMessageFactProvider) ConsumeDisclosurePermit(key Key, contextID, contextEpoch, headerRef, payloadSHA, permit string) error {
+	return p.ConsumeDisclosurePermitContext(context.Background(), key, contextID, contextEpoch, headerRef, payloadSHA, permit)
+}
+
+func (p *ServerMessageFactProvider) ConsumeDisclosurePermitContext(ctx context.Context, key Key, contextID, contextEpoch, headerRef, payloadSHA, permit string) error {
+	if p == nil {
+		return ErrUnavailable
+	}
 	want := p.permit(key, contextID, contextEpoch, headerRef, payloadSHA)
 	if !hmac.Equal([]byte(want), []byte(permit)) {
 		return ErrReference
@@ -709,8 +817,150 @@ func (p *ServerMessageFactProvider) ConsumeDisclosurePermit(key Key, contextID, 
 	if _, used := p.usedPmt[permit]; used {
 		return ErrReference
 	}
+	if p.durablePermits {
+		pmtHash := permitSHA256Hex(permit)
+		consumedAt := p.now().UTC().UnixNano()
+		res, err := p.exec(ctx, "UPDATE "+ServerDisclosurePermitTable+" SET consumed_at=? WHERE permit_sha256=? AND bot_uid=? AND space_id=? AND context_id=? AND context_epoch=? AND header_reference=? AND payload_sha256=? AND consumed_at IS NULL",
+			consumedAt, pmtHash, key.BotUID, key.SpaceID, contextID, contextEpoch, headerRef, payloadSHA)
+		if err != nil {
+			return ErrUnavailable
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return ErrUnavailable
+		}
+		if affected != 1 {
+			return ErrReference
+		}
+	}
 	p.usedPmt[permit] = struct{}{}
 	return nil
+}
+
+// BindDeliveredMessageV1 binds an inbound delivery frame's trusted ingress
+// evidence (channel_type, channel_id, message_id, message_seq, from_uid,
+// observed_payload_sha256, and optional expected_native_version) against actual
+// octo-server message storage.
+//
+// It never accepts a current-version lookup by message_id alone as proof of
+// the delivered version: if the stored row is missing, deleted, revoked, has a
+// mismatched sender or sequence, or has a different effective payload SHA-256
+// (e.g. due to a concurrent edit in message_extra), it explicitly refuses with
+// a deterministic reason and never releases any message, quote, or media body.
+func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, key Key, req DeliveryBindingRequestV1) (DeliveryBindingResultV1, IMAuthorityCut, error) {
+	if p == nil || !key.Valid() {
+		return DeliveryBindingResultV1{}, IMAuthorityCut{}, ErrUnavailable
+	}
+	started := p.now().UTC().Truncate(time.Microsecond)
+	ref := serverRef{
+		kind:        serverRefDelivery,
+		channelType: req.ChannelType,
+		channelID:   req.ChannelID,
+		messageID:   req.MessageID,
+	}
+	res, err := p.resolveOne(ctx, key, ref)
+	if err != nil {
+		return DeliveryBindingResultV1{}, IMAuthorityCut{}, err
+	}
+	cut, err := p.cut(started)
+	if err != nil {
+		return DeliveryBindingResultV1{}, IMAuthorityCut{}, err
+	}
+	if res.unavailable != "" {
+		return DeliveryBindingResultV1{
+			Status:  "refused",
+			Reason:  res.unavailable,
+			Current: false,
+		}, cut, nil
+	}
+	d := res.delivery
+	curVersion := d.Header.NativeMessageVersion
+	if d.Header.AuthorUID != req.FromUID || d.Header.Delivery.Sequence != req.MessageSeq || !d.MessageAuthorExact {
+		return DeliveryBindingResultV1{
+			Status:               "refused",
+			Reason:               "identity_mismatch",
+			Current:              false,
+			NativeMessageVersion: curVersion,
+		}, cut, nil
+	}
+	if !strings.EqualFold(res.payloadHash, req.ObservedPayloadSHA256) {
+		return DeliveryBindingResultV1{
+			Status:               "refused",
+			Reason:               "payload_digest_mismatch",
+			Current:              false,
+			NativeMessageVersion: curVersion,
+		}, cut, nil
+	}
+	if req.ExpectedNativeVersion != "" && req.ExpectedNativeVersion != curVersion {
+		return DeliveryBindingResultV1{
+			Status:               "refused",
+			Reason:               "version_mismatch",
+			Current:              false,
+			NativeMessageVersion: curVersion,
+		}, cut, nil
+	}
+	if (!d.MessageSpaceUnknown && !d.MessageSpaceExact) || !d.BotCurrentRead || !d.MessageRecipientExact {
+		return DeliveryBindingResultV1{
+			Status:               "refused",
+			Reason:               "visibility_denied",
+			Current:              false,
+			NativeMessageVersion: curVersion,
+		}, cut, nil
+	}
+
+	proven := map[string]bool{
+		"message_source_exact":    d.MessageSourceExact,
+		"message_author_exact":    d.MessageAuthorExact,
+		"message_recipient_exact": d.MessageRecipientExact,
+		"message_version_exact":   true,
+		"caller_current_read":     d.CallerCurrentRead,
+		"bot_current_read":        d.BotCurrentRead,
+		"bot_current_send":        d.BotCurrentSend,
+	}
+	if req.ChannelType != channelTypePerson {
+		proven["caller_parent_current_read"] = d.CallerParentCurrentRead
+		proven["bot_parent_current_read"] = d.BotParentCurrentRead
+	}
+	var unknowns []string
+	if d.MessageSpaceUnknown {
+		unknowns = append(unknowns, "message_space_exact")
+	} else {
+		proven["message_space_exact"] = d.MessageSpaceExact
+	}
+	if d.CallerOriginalVisibleUnknown {
+		unknowns = append(unknowns, "caller_original_visible")
+	} else {
+		proven["caller_original_visible"] = d.CallerOriginalVisible
+	}
+	if d.BotOriginalVisibleUnknown {
+		unknowns = append(unknowns, "bot_original_visible")
+	} else {
+		proven["bot_original_visible"] = d.BotOriginalVisible
+	}
+	sort.Strings(unknowns)
+
+	var purposes []string
+	if !d.MessageSpaceUnknown && d.MessageSpaceExact {
+		if !d.CallerOriginalVisibleUnknown && !d.BotOriginalVisibleUnknown {
+			purposes = []string{"admit", "contributor", "reply"}
+		} else {
+			purposes = []string{"reply"}
+		}
+	}
+
+	deliveryRef := ServerDeliveryReference(req.ChannelType, req.ChannelID, req.MessageID, curVersion)
+	return DeliveryBindingResultV1{
+		Status:                "bound",
+		Current:               true,
+		DeliveryReference:     deliveryRef,
+		HeaderReference:       d.Header.HeaderReference,
+		NativeMessageVersion:  curVersion,
+		ObservedPayloadSHA256: res.payloadHash,
+		Header:                d.Header,
+		ProvenPredicates:      proven,
+		UnknownPredicates:     unknowns,
+		ResolvablePurposes:    purposes,
+	}, cut, nil
 }
 
 // ServerSourceReference builds the history source token for one channel.
@@ -718,4 +968,7 @@ func ServerSourceReference(channelType uint8, channelID string) string {
 	return strings.TrimSuffix(encodeServerRef(serverRefSource, serverRef{channelType: channelType, channelID: channelID, messageID: "0"}), "-0")
 }
 
-var _ NativeIMFactProvider = (*ServerMessageFactProvider)(nil)
+var (
+	_ NativeIMFactProvider          = (*ServerMessageFactProvider)(nil)
+	_ NativeDeliveryReferenceBinder = (*ServerMessageFactProvider)(nil)
+)

@@ -2,6 +2,7 @@ package permissionbundle
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -12,15 +13,19 @@ import (
 )
 
 const (
-	EnvPermissionBundleEnabled           = "OCTO_PERMISSION_BUNDLE_ENABLED"
-	EnvPermissionBundleOrigin            = "OCTO_PERMISSION_BUNDLE_ORIGIN"
-	EnvPermissionBundleCatalogDir        = "OCTO_PERMISSION_BUNDLE_CATALOG_DIR"
-	EnvPermissionBundleCatalogVersion    = "OCTO_PERMISSION_BUNDLE_CATALOG_VERSION"
-	EnvPermissionBundleCatalogDigest     = "OCTO_PERMISSION_BUNDLE_CATALOG_DIGEST"
-	EnvPermissionBundleSlotWitnessPath   = "OCTO_PERMISSION_BUNDLE_SLOT_WITNESS_PATH"
-	EnvPermissionBundleSlotWitnessSHA256 = "OCTO_PERMISSION_BUNDLE_SLOT_WITNESS_SHA256"
-	EnvPermissionBundleAuthorityMode     = "OCTO_PERMISSION_BUNDLE_AUTHORITY_MODE"
-	EnvPermissionBundleFactProviderMode  = "OCTO_PERMISSION_BUNDLE_FACT_PROVIDER_MODE"
+	EnvPermissionBundleEnabled             = "OCTO_PERMISSION_BUNDLE_ENABLED"
+	EnvPermissionBundleOrigin              = "OCTO_PERMISSION_BUNDLE_ORIGIN"
+	EnvPermissionBundleCatalogDir          = "OCTO_PERMISSION_BUNDLE_CATALOG_DIR"
+	EnvPermissionBundleCatalogVersion      = "OCTO_PERMISSION_BUNDLE_CATALOG_VERSION"
+	EnvPermissionBundleCatalogDigest       = "OCTO_PERMISSION_BUNDLE_CATALOG_DIGEST"
+	EnvPermissionBundleSlotWitnessPath     = "OCTO_PERMISSION_BUNDLE_SLOT_WITNESS_PATH"
+	EnvPermissionBundleSlotWitnessSHA256   = "OCTO_PERMISSION_BUNDLE_SLOT_WITNESS_SHA256"
+	EnvPermissionBundleAuthorityMode       = "OCTO_PERMISSION_BUNDLE_AUTHORITY_MODE"
+	EnvPermissionBundleFactProviderMode    = "OCTO_PERMISSION_BUNDLE_FACT_PROVIDER_MODE"
+	EnvPermissionBundleStoreAuthorityID    = "OCTO_PERMISSION_BUNDLE_STORE_AUTHORITY_ID"
+	EnvPermissionBundleStoreIncarnation    = "OCTO_PERMISSION_BUNDLE_STORE_INCARNATION"
+	EnvPermissionBundlePermitKeyHex        = "OCTO_PERMISSION_BUNDLE_PERMIT_KEY_HEX"
+	EnvPermissionBundleDurablePermitLedger = "OCTO_PERMISSION_BUNDLE_DURABLE_PERMIT_LEDGER"
 )
 
 // InstallConfig configures explicit opt-in permission bundle runtime composition.
@@ -29,23 +34,28 @@ const (
 // When Enabled is true, missing or invalid authority, origin, catalog, or fact
 // dependencies return an explicit error and never fabricate a ready runtime.
 type InstallConfig struct {
-	Enabled           bool
-	Session           *dbr.Session
-	Origin            string
-	Pin               CatalogPin
-	Releases          Releases
-	CatalogDir        string
-	SlotWitnessPath   string
-	SlotWitnessSHA256 string
-	SlotValues        SlotValues
-	AuthorityMode     string
-	AuthorityDriver   ExternalAuthorityDriver
-	Authority         FencedAuthority
-	Native            NativeGuard
-	FactProviderMode  string
-	IMFactProvider    NativeIMFactProvider
-	Facts             NativeFactSource
-	testNoLocks       bool
+	Enabled                   bool
+	Session                   *dbr.Session
+	Origin                    string
+	Pin                       CatalogPin
+	Releases                  Releases
+	CatalogDir                string
+	SlotWitnessPath           string
+	SlotWitnessSHA256         string
+	SlotValues                SlotValues
+	AuthorityMode             string
+	AuthorityDriver           ExternalAuthorityDriver
+	Authority                 FencedAuthority
+	Native                    NativeGuard
+	FactProviderMode          string
+	IMFactProvider            NativeIMFactProvider
+	ServerMessageHooks        ServerMessageHooks
+	ServerStoreAuthorityID    string
+	ServerStoreIncarnation    string
+	ServerPermitKey           []byte
+	ServerDurablePermitLedger bool
+	Facts                     NativeFactSource
+	testNoLocks               bool
 }
 
 func parseOptInEnabled(raw string) (bool, error) {
@@ -60,8 +70,17 @@ func parseOptInEnabled(raw string) (bool, error) {
 }
 
 // InstallFromEnv reads explicit opt-in environment configuration and delegates
-// to InstallOptIn. Unset or false OCTO_PERMISSION_BUNDLE_ENABLED is a no-op.
+// to InstallFromEnvWithHooks without pre-bound server message hooks.
 func InstallFromEnv(ctx *config.Context, authorityDriver ExternalAuthorityDriver, imProvider NativeIMFactProvider) error {
+	return InstallFromEnvWithHooks(ctx, authorityDriver, imProvider, ServerMessageHooks{})
+}
+
+// InstallFromEnvWithHooks reads explicit opt-in environment configuration and
+// composes the permission bundle runtime, binding ServerMessageFactProvider to
+// serverHooks when OCTO_PERMISSION_BUNDLE_FACT_PROVIDER_MODE is
+// octo_server_message_store_v1. Unset or false OCTO_PERMISSION_BUNDLE_ENABLED
+// is a no-op.
+func InstallFromEnvWithHooks(ctx *config.Context, authorityDriver ExternalAuthorityDriver, imProvider NativeIMFactProvider, serverHooks ServerMessageHooks) error {
 	enabled, err := parseOptInEnabled(os.Getenv(EnvPermissionBundleEnabled))
 	if err != nil {
 		return err
@@ -69,17 +88,34 @@ func InstallFromEnv(ctx *config.Context, authorityDriver ExternalAuthorityDriver
 	if !enabled {
 		return nil
 	}
+	var permitKey []byte
+	if rawKey := strings.TrimSpace(os.Getenv(EnvPermissionBundlePermitKeyHex)); rawKey != "" {
+		decoded, err := hex.DecodeString(rawKey)
+		if err != nil {
+			return fmt.Errorf("%w: invalid %s hex", ErrUnavailable, EnvPermissionBundlePermitKeyHex)
+		}
+		permitKey = decoded
+	}
+	durablePermits, err := parseOptInEnabled(os.Getenv(EnvPermissionBundleDurablePermitLedger))
+	if err != nil {
+		return fmt.Errorf("%w: invalid %s", ErrUnavailable, EnvPermissionBundleDurablePermitLedger)
+	}
 	return InstallOptIn(ctx, InstallConfig{
-		Enabled:           true,
-		Origin:            strings.TrimSpace(os.Getenv(EnvPermissionBundleOrigin)),
-		Pin:               CatalogPin{Version: strings.TrimSpace(os.Getenv(EnvPermissionBundleCatalogVersion)), Digest: strings.TrimSpace(os.Getenv(EnvPermissionBundleCatalogDigest))},
-		CatalogDir:        strings.TrimSpace(os.Getenv(EnvPermissionBundleCatalogDir)),
-		SlotWitnessPath:   strings.TrimSpace(os.Getenv(EnvPermissionBundleSlotWitnessPath)),
-		SlotWitnessSHA256: strings.TrimSpace(os.Getenv(EnvPermissionBundleSlotWitnessSHA256)),
-		AuthorityMode:     strings.TrimSpace(os.Getenv(EnvPermissionBundleAuthorityMode)),
-		AuthorityDriver:   authorityDriver,
-		FactProviderMode:  strings.TrimSpace(os.Getenv(EnvPermissionBundleFactProviderMode)),
-		IMFactProvider:    imProvider,
+		Enabled:                   true,
+		Origin:                    strings.TrimSpace(os.Getenv(EnvPermissionBundleOrigin)),
+		Pin:                       CatalogPin{Version: strings.TrimSpace(os.Getenv(EnvPermissionBundleCatalogVersion)), Digest: strings.TrimSpace(os.Getenv(EnvPermissionBundleCatalogDigest))},
+		CatalogDir:                strings.TrimSpace(os.Getenv(EnvPermissionBundleCatalogDir)),
+		SlotWitnessPath:           strings.TrimSpace(os.Getenv(EnvPermissionBundleSlotWitnessPath)),
+		SlotWitnessSHA256:         strings.TrimSpace(os.Getenv(EnvPermissionBundleSlotWitnessSHA256)),
+		AuthorityMode:             strings.TrimSpace(os.Getenv(EnvPermissionBundleAuthorityMode)),
+		AuthorityDriver:           authorityDriver,
+		FactProviderMode:          strings.TrimSpace(os.Getenv(EnvPermissionBundleFactProviderMode)),
+		IMFactProvider:            imProvider,
+		ServerMessageHooks:        serverHooks,
+		ServerStoreAuthorityID:    strings.TrimSpace(os.Getenv(EnvPermissionBundleStoreAuthorityID)),
+		ServerStoreIncarnation:    strings.TrimSpace(os.Getenv(EnvPermissionBundleStoreIncarnation)),
+		ServerPermitKey:           permitKey,
+		ServerDurablePermitLedger: durablePermits,
 	})
 }
 
@@ -167,17 +203,32 @@ func InstallOptIn(ctx *config.Context, cfg InstallConfig) error {
 	}
 
 	facts := cfg.Facts
+	imProvider := cfg.IMFactProvider
 	factMode := strings.ToLower(strings.TrimSpace(cfg.FactProviderMode))
 	if factMode != "" && factMode != "none" && factMode != "disabled" {
 		if err := RejectPlainMessageSyncFactSource(cfg.FactProviderMode); err != nil {
 			return err
 		}
-		if facts == nil && cfg.IMFactProvider == nil {
+		if facts == nil && imProvider == nil && factMode == NativeFactProviderModeServerStoreV1 {
+			serverProvider, err := NewServerMessageFactProvider(ServerMessageFactConfig{
+				Session:             session,
+				Hooks:               cfg.ServerMessageHooks,
+				StoreAuthorityID:    cfg.ServerStoreAuthorityID,
+				StoreIncarnation:    cfg.ServerStoreIncarnation,
+				PermitKey:           cfg.ServerPermitKey,
+				DurablePermitLedger: cfg.ServerDurablePermitLedger,
+			})
+			if err != nil {
+				return err
+			}
+			imProvider = serverProvider
+		}
+		if facts == nil && imProvider == nil {
 			return fmt.Errorf("%w: opt-in native fact mode %q requires a NativeIMFactProvider", ErrUnavailable, cfg.FactProviderMode)
 		}
 	}
-	if facts == nil && cfg.IMFactProvider != nil {
-		sqlFacts, err := NewSQLNativeFactAdapter(authority, cfg.IMFactProvider)
+	if facts == nil && imProvider != nil {
+		sqlFacts, err := NewSQLNativeFactAdapter(authority, imProvider)
 		if err != nil {
 			return err
 		}
