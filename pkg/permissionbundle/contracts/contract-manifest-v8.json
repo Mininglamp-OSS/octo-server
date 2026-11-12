@@ -1,0 +1,68 @@
+{
+  "format": "permission-server-contract-manifest-v8",
+  "baseline": "v52-mainline-repair",
+  "base_directory": "repository root",
+  "status": "v52_s_b1_message_ttl_expire_repair_and_handoff_v8_not_a_production_allowlist",
+  "files": {
+    "docs/permission-server-convergence-v44.md": {
+      "bytes": 9591,
+      "sha256": "a68028d9642310174b3e05f1f3435d64f22dd70a9a8f2292c1abd66d1bb6a0a9"
+    },
+    "docs/permission-server-convergence-v45.md": {
+      "bytes": 5066,
+      "sha256": "18d5e46be8a44bb6f76f4388d3fed26c76150ae657fa0047a54365e6b91e9b91"
+    },
+    "docs/permission-server-convergence-v46.md": {
+      "bytes": 8162,
+      "sha256": "986a03f698c3ba223d3bc6d8bad702887b4ef52defa1b9a8470a9ea0c5579c54"
+    },
+    "docs/permission-server-convergence-v52.md": {
+      "bytes": 9188,
+      "sha256": "feff0efe87ea50ca2db824e398fb31acec70cb4ae286bf50075872f73d827fdc"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v5.json": {
+      "bytes": 6628,
+      "sha256": "d51823e404a4c9e3e2b252f6f33453b9fa5047f1bca0e1ca787397bccf6ec9ab"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v6.json": {
+      "bytes": 1412,
+      "sha256": "3239495a365f56240e7224e550294fdf8dd52e61e7ad823d0cfdef1e4599ac2a"
+    },
+    "pkg/permissionbundle/contracts/contract-manifest-v7.json": {
+      "bytes": 2127,
+      "sha256": "8ae92962d775c09cac86bf617399a950ef6416e80de23f18de33e29df27948f2"
+    },
+    "pkg/permissionbundle/contracts/handoff-v5.json": {
+      "bytes": 3626,
+      "sha256": "e72902dc68c60acc4f36344749a971b4fc94e43253da4407365259d64d873384"
+    },
+    "pkg/permissionbundle/contracts/handoff-v6.json": {
+      "bytes": 11590,
+      "sha256": "6dd041bdec050fc1fefc0f60b3849759f38f6bc9eeb148fbfb0759b9b28f93e0"
+    },
+    "pkg/permissionbundle/contracts/handoff-v7.json": {
+      "bytes": 15815,
+      "sha256": "0bb6754dbd6de0f66c25bfa02ff5973ff477c64443a84aad7f5bde1b454fc454"
+    },
+    "pkg/permissionbundle/contracts/handoff-v8.json": {
+      "bytes": 17955,
+      "sha256": "a38dfc0149ea0c5b718174ee9c00f6842f040f3572138f5045ce1a42b0303278"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v3.json": {
+      "bytes": 4438,
+      "sha256": "bfb2857fda2ceef9fe94d4044a55813d3cde4846c73ec345ef204c9244bb2c2f"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v4.json": {
+      "bytes": 2317,
+      "sha256": "e27506598cb8fc4d90c355c53493a8e4a33f1165723c0f65a50cc3a051dc3b63"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v5.json": {
+      "bytes": 4044,
+      "sha256": "31f28c62f96451dc4f8eeed0c61e6c1b952cbaff073e2fd982a26c3047d19bbb"
+    },
+    "pkg/permissionbundle/contracts/remaining-producers-v6.json": {
+      "bytes": 4027,
+      "sha256": "5c4946f72d2d6f979ccd0e09855e061c1d0deb22137ca14608dd14724568c8a0"
+    }
+  }
+}

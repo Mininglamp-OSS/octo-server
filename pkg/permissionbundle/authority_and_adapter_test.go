@@ -694,7 +694,7 @@ func TestInstallOptInAndEnvWiringFailsClosedWithoutAuthorityAndServesWhenValid(t
 }
 
 func TestContractManifestV4AndV5ByteAndHashIntegrity(t *testing.T) {
-	for _, manifestName := range []string{"contract-manifest-v4.json", "contract-manifest-v5.json", "contract-manifest-v6.json", "contract-manifest-v7.json"} {
+	for _, manifestName := range []string{"contract-manifest-v4.json", "contract-manifest-v5.json", "contract-manifest-v6.json", "contract-manifest-v7.json", "contract-manifest-v8.json"} {
 		t.Run(manifestName, func(t *testing.T) {
 			raw, err := os.ReadFile(filepath.Join("contracts", manifestName))
 			require.NoError(t, err)

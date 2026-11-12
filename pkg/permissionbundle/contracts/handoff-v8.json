@@ -1,0 +1,294 @@
+{
+  "contract": "permission-server-handoff-v8",
+  "task": "XIN-2793",
+  "charter_baseline": "v52-mainline-repair",
+  "supersedes": "handoff-v7.json for active server integration and private ABI contracts; handoff-v1.json through handoff-v7.json retained byte-for-byte as history",
+  "authority": {
+    "continuation": "Owner message 2120917153384140800, ACTIVE v52 prefix on XIN-2793",
+    "trigger_comment": "57c2870a-f023-44bc-bef4-2ac5d8ca4836",
+    "trigger_thread": "57c2870a-f023-44bc-bef4-2ac5d8ca4836",
+    "charter_receipt": "32e49395-62f6-4aea-bd5b-4b583797d2a3",
+    "independent_review": "9a49c03b-542a-4223-9ac3-3513fb717752 (XIN-2834 / 46d23689-0cb4-4d33-b488-8d430ae854c3)"
+  },
+  "scope_limits": [
+    "S-B1 only: preserve native octo-server message expiry (message.expire) at read and revalidation time across bind_delivery, resolve, history_headers, and history_disclosure",
+    "Never misapply message TTL expiration to replay-journal TTL eviction",
+    "No octo-im / WuKongIM code, config, schema, API or service change, task, PR or delegation",
+    "No external fence, election, consensus or recovery platform as a delivery prerequisite",
+    "No dummy/no-op authority installed in live startup and no self-approval of Architect 4831fa26 / 7b11211f recovery/history/replay delta",
+    "No live business/DB/service/config/environment change; synthetic isolated local tests only",
+    "No production allowlist, review, deploy, ready, merge or acceptance claim"
+  ],
+  "contract_diff_vs_handoff_v7": {
+    "wire_routes_and_json_schemas": "UNCHANGED — all route paths, query parameters, auth headers, and JSON request/response schemas match handoff-v7.json and pkg/permissionbundle/contracts/permission-native-facts-v1.schema.json",
+    "s_b1_message_ttl_enforcement": "CHANGED (BUG FIX) — ServerMessageFactProvider.loadMessage now selects COALESCE(expire,0) from the sharded message table, and resolveOne enforces msg.expire > 0 && p.now().Unix()-int64(msg.expire) >= msg.timestamp at every read/revalidation step, returning expired_reference for bind_delivery (status=refused), resolve (status=unavailable), history_headers (item status=unavailable), and history_disclosure (status=unavailable, no permit issued)",
+    "history_headers_page_id_format": "CHANGED (BUG FIX) — ServerMessageFactProvider.ListHistoryHeadersV1 now formats page.page_id as a 32-character lowercase hex digest (Hex32) without a leading 'p' prefix so HistoryHeadersResponse validates cleanly through Runtime.Facts"
+  },
+  "opt_in_startup_composition": {
+    "entrypoint": "main.go:installPermissionBundle(ctx) -> permissionbundle.InstallFromEnvWithHooks(ctx, nil, nil, message.NewServerMessageFactHooks(ctx))",
+    "env_variables": {
+      "OCTO_PERMISSION_BUNDLE_ENABLED": "true | 1 | yes | on (unset/false is a no-op leaving RuntimeFor(ctx) == nil)",
+      "OCTO_PERMISSION_BUNDLE_ORIGIN": "https origin",
+      "OCTO_PERMISSION_BUNDLE_CATALOG_DIR": "operator catalog directory",
+      "OCTO_PERMISSION_BUNDLE_CATALOG_VERSION": "pinned catalog version",
+      "OCTO_PERMISSION_BUNDLE_CATALOG_DIGEST": "64-hex pinned catalog digest",
+      "OCTO_PERMISSION_BUNDLE_SLOT_WITNESS_PATH": "path to source-slot-witness-v5.json.gz",
+      "OCTO_PERMISSION_BUNDLE_SLOT_WITNESS_SHA256": "64-hex SHA-256 of witness file",
+      "OCTO_PERMISSION_BUNDLE_AUTHORITY_MODE": "external_fenced_v1",
+      "OCTO_PERMISSION_BUNDLE_FACT_PROVIDER_MODE": "octo_server_message_store_v1 | native_im_fact_provider_v1",
+      "OCTO_PERMISSION_BUNDLE_STORE_AUTHORITY_ID": "optional authority id (default octo-server-message-store)",
+      "OCTO_PERMISSION_BUNDLE_STORE_INCARNATION": "required 32-hex store incarnation when mode is octo_server_message_store_v1",
+      "OCTO_PERMISSION_BUNDLE_PERMIT_KEY_HEX": "required >=64-hex (>=32-byte) HMAC key when mode is octo_server_message_store_v1",
+      "OCTO_PERMISSION_BUNDLE_DURABLE_PERMIT_LEDGER": "optional bool enabling SQL table bot_permission_disclosure_permit"
+    },
+    "live_startup_posture": "Gated fail-closed: main.go passes authorityDriver=nil, so setting OCTO_PERMISSION_BUNDLE_ENABLED=true in live startup without an approved authority returns ErrUnavailable and never installs a dummy authority",
+    "mounted_bot_routes_when_valid": [
+      "GET /v1/bot/permission-bundle/v1?space_id=<space_id>",
+      "GET /v1/bot/permission-bundle/v1/catalog?space_id=<space_id>",
+      "GET /v1/bot/permission-bundle/v1/catalog/file?space_id=<space_id>",
+      "POST /v1/bot/permission-facts/v1?space_id=<space_id>",
+      "POST /v1/bot/permission-facts/v1/bind-delivery?space_id=<space_id>"
+    ]
+  },
+  "delivery_reference_binding_seam": {
+    "route": "POST /v1/bot/permission-facts/v1/bind-delivery?space_id=<space_id>",
+    "auth": "User Bot token (bf_ prefix, BotKindUser) + ExplicitSpace query/header agreement + Content-Encoding must be empty",
+    "why_current_version_lookup_alone_is_insufficient": "octo-server stores mutable edits in message_extra (version, content_edit, content_edit_hash, revoke, is_deleted) without a per-version historical payload table. Looking up message_id alone returns the current x<version>_<hash> even if a concurrent edit occurred between WKSocket delivery and server lookup, which would bind a pre-edit frame to post-edit metadata (or vice versa).",
+    "required_trusted_ingress_evidence": {
+      "channel_type": "uint8 (1=DM/person, 2=group, 5=thread) from WKSocket frame",
+      "channel_id": "physical channel identifier from WKSocket frame",
+      "message_id": "positive int64 decimal string from WKSocket frame",
+      "message_seq": "positive uint32 decimal string (> 0) from WKSocket frame",
+      "from_uid": "sender UID observed on WKSocket frame",
+      "observed_payload_sha256": "64-hex lowercase SHA-256 computed by the endpoint over the exact raw payload bytes received on the WKSocket frame before any body parsing/release",
+      "expected_native_version": "optional candidate x<version>_<hash> token if already held by caller"
+    },
+    "verification_and_refusal_rules": {
+      "mirror_lag": "message row absent from sharded message table (not yet persisted or no_persist)",
+      "expired_reference": "message.is_deleted != 0, message.expire > 0 && now.Unix() - int64(message.expire) >= message.timestamp (read-time TTL expiry), message_extra.revoke != 0, message_extra.is_deleted != 0, thread status == 3, or group missing/disabled",
+      "parent_unavailable": "thread parent group missing or not in Normal/Disband status",
+      "identity_mismatch": "stored from_uid != request.from_uid or stored message_seq != request.message_seq",
+      "payload_digest_mismatch": "SHA-256 of current effective stored payload (content_edit when edited, else message.payload) != request.observed_payload_sha256 (concurrent edit race or content mismatch)",
+      "version_mismatch": "request.expected_native_version provided and != current x<version>_<content_edit_hash|0>",
+      "visibility_denied": "known space mismatch (!MessageSpaceUnknown && !MessageSpaceExact) or !BotCurrentRead (visibles exclusion, per-user delete, channel offset clear, or bot not active member)",
+      "predicate_unsupported": "foreign DM channel (dmPeer mismatch) or missing sender user row"
+    },
+    "non_fabrication_guarantees": [
+      "Zero message, quote, or media body bytes are ever returned in bound or refused responses",
+      "TTL-expired messages (message.expire > 0 && now.Unix() - int64(message.expire) >= message.timestamp) are refused in bind_delivery and returned as unavailable (reason=expired_reference) in resolve, history_headers, and history_disclosure, never issuing a disclosure permit",
+      "Group and thread deliveries without a visibles exclusion list bot_original_visible and caller_original_visible in unknown_predicates (resolvable_purposes: [\"reply\"]) and never fabricate original visibility as true",
+      "Untagged DM deliveries (payload.space_id == \"\") list message_space_exact in unknown_predicates (resolvable_purposes: []) and never fabricate DM space membership as true",
+      "Two-step history disclosure (history_headers -> history_disclosure) is preserved; no atomic header+body substitute is activated"
+    ]
+  },
+  "own_session_consistency_and_permit_durability": {
+    "own_session_repeatable_read": {
+      "status": "RESOLVED_IN_CODE",
+      "mechanism": "SQLNativeFactAdapter.Read and SQLNativeFactAdapter.BindDeliveredMessage attach the caller's RepeatableRead *dbr.Tx to context via withFactReadTx(ctx, tx, a.testNoLocks); ServerMessageFactProvider executes all message, message_extra, message_user_extra, channel_offset, channel_setting, group, group_member, thread, user, and permit queries on that same *dbr.Tx with FOR SHARE NOWAIT"
+    },
+    "restart_durable_permit_ledger": {
+      "status": "IMPLEMENTED_OPT_IN_SQL_LEDGER_WITH_ISOLATED_DDL_RESIDUAL",
+      "mechanism": "When DurablePermitLedger is enabled (ServerMessageFactConfig.DurablePermitLedger or OCTO_PERMISSION_BUNDLE_DURABLE_PERMIT_LEDGER=true), IssueHistoryDisclosureV1 records issued permits in bot_permission_disclosure_permit (ServerDisclosurePermitDDL) and refuses to re-issue consumed permits; ConsumeDisclosurePermit / ConsumeDisclosurePermitContext atomically sets consumed_at WHERE consumed_at IS NULL (requiring RowsAffected == 1), surviving process restarts",
+      "residual": "Live production DB migration for bot_permission_disclosure_permit is out of scope of this slice; when DurablePermitLedger is false, single-use tracking falls back to the in-process usedPmt map"
+    }
+  },
+  "private_abi_specification": {
+    "step_1_bind_delivery": {
+      "endpoint": "POST /v1/bot/permission-facts/v1/bind-delivery?space_id=<space_id>",
+      "request_example": {
+        "schema_version": 1,
+        "operation": "bind_delivery",
+        "request_id": "req-bind-0001",
+        "channel_type": 2,
+        "channel_id": "group_1",
+        "message_id": "9001",
+        "message_seq": "7",
+        "from_uid": "user_1",
+        "observed_payload_sha256": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea"
+      },
+      "bound_response_example": {
+        "schema_version": 1,
+        "profile_version": 1,
+        "key": {
+          "origin": "https://octo.example.com",
+          "bot_uid": "bot_1",
+          "space_id": "space_1"
+        },
+        "request_id": "req-bind-0001",
+        "read_id": "0123456789abcdef0123456789abcdef",
+        "observed_at": "2026-11-12T12:00:00Z",
+        "authorities": [
+          {
+            "authority_id": "octo-server-message-store",
+            "completed_at": "2026-11-12T12:00:00Z",
+            "consistency": "ack_before_read_start",
+            "incarnation": "55555555555555555555555555555555",
+            "kind": "im",
+            "position": "1794484800000000",
+            "read_nonce": "11111111111111111111111111111111",
+            "started_at": "2026-11-12T12:00:00Z"
+          },
+          {
+            "authority_id": "sql-primary",
+            "completed_at": "2026-11-12T12:00:00Z",
+            "consistency": "ack_before_read_start",
+            "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "sql",
+            "position": "1",
+            "read_nonce": "22222222222222222222222222222222",
+            "started_at": "2026-11-12T12:00:00Z"
+          }
+        ],
+        "binding": {
+          "status": "bound",
+          "current": true,
+          "delivery_reference": "s1-2-67726f75705f31-9001-x0_0",
+          "header_reference": "h1-2-67726f75705f31-9001-x0_0",
+          "native_message_version": "x0_0",
+          "observed_payload_sha256": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+          "header": {
+            "header_version": 1,
+            "header_reference": "h1-2-67726f75705f31-9001-x0_0",
+            "message_id": "9001",
+            "source": {
+              "kind": "group",
+              "id": "group_1"
+            },
+            "parent_group": null,
+            "space_id": "space_1",
+            "author_uid": "user_1",
+            "author_kind": "human",
+            "recipient_bot_uid": "bot_1",
+            "native_message_version": "x0_0",
+            "payload_sha256": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+            "delivery": {
+              "stream_id": "octo-server-message-store",
+              "stream_incarnation": "55555555555555555555555555555555",
+              "sequence": "7"
+            }
+          },
+          "proven_predicates": {
+            "bot_current_read": true,
+            "bot_current_send": true,
+            "bot_parent_current_read": true,
+            "caller_current_read": true,
+            "caller_parent_current_read": true,
+            "message_author_exact": true,
+            "message_recipient_exact": true,
+            "message_source_exact": true,
+            "message_space_exact": true,
+            "message_version_exact": true
+          },
+          "unknown_predicates": [
+            "bot_original_visible",
+            "caller_original_visible"
+          ],
+          "resolvable_purposes": [
+            "reply"
+          ],
+          "authority_refs": [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222"
+          ]
+        }
+      },
+      "refused_response_example": {
+        "binding": {
+          "status": "refused",
+          "reason": "expired_reference",
+          "current": false,
+          "authority_refs": [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222"
+          ]
+        }
+      }
+    },
+    "step_2_resolve_facts": {
+      "endpoint": "POST /v1/bot/permission-facts/v1?space_id=<space_id>",
+      "request_example": {
+        "schema_version": 1,
+        "profile_version": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "operation": "resolve",
+        "purpose": "reply",
+        "references": [
+          {
+            "delivery_reference": "s1-2-67726f75705f31-9001-x0_0"
+          }
+        ]
+      }
+    },
+    "step_3_history_headers_and_step_4_history_disclosure": {
+      "endpoint": "POST /v1/bot/permission-facts/v1?space_id=<space_id>",
+      "history_headers_request_example": {
+        "schema_version": 1,
+        "profile_version": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "operation": "history_headers",
+        "source_reference": "c1-1-626f745f3140757365725f31",
+        "cursor": null,
+        "page_size": 10
+      },
+      "history_disclosure_request_example": {
+        "schema_version": 1,
+        "profile_version": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "operation": "history_disclosure",
+        "context_id": "fedcba9876543210fedcba9876543210",
+        "context_epoch": "1",
+        "headers": [
+          {
+            "header_reference": "h1-1-626f745f3140757365725f31-5005-x0_0"
+          }
+        ]
+      }
+    },
+    "endpoint_responsibilities": [
+      "Compute observed_payload_sha256 over raw WKSocket frame payload bytes before releasing any message/quote/media content to agent context",
+      "Call POST /v1/bot/permission-facts/v1/bind-delivery?space_id=<space_id> with operation=bind_delivery and message_seq > 0; parse authorities as a 2-element array and binding.proven_predicates as a boolean map",
+      "Call POST /v1/bot/permission-facts/v1?space_id=<space_id> using schema-pinned operation=resolve | history_headers | history_disclosure with 32-hex request_id/context_id and decimal-string context_epoch",
+      "In publish and refuse, check resolved.reference and require every boolean predicate in resolved.predicates (including bot_current_send, bot_group_active_member, dm_bot_to_human_send_relation, dm_human_blocks_bot_clear, message_version_exact) to be true before sending",
+      "Enforce fail-closed DENY with zero body release whenever bind-delivery returns status=refused (including reason=expired_reference) or resolve/history_headers/history_disclosure returns status=unavailable"
+    ]
+  },
+  "consumed_cli": {
+    "task": "XIN-2794",
+    "repository": "ken-anderson2006/octo-cli",
+    "pr": 234,
+    "head": "3ef52206809ade6b10fcb6976e4c7ab7c8af69a7",
+    "previous_head": "d39072f8182a28ce2be5884151eb03f16cd205b2",
+    "manifest": {
+      "path": "docs/permission/contract-manifest-v6.json",
+      "bytes": 2903,
+      "sha256": "37355c4f25f86b5fe438439a4cba0270ec6f0726b5254b6ab40fdb4b8db57e0d"
+    },
+    "endpoint_abi": {
+      "path": "docs/permission/endpoint-abi-v2.json",
+      "bytes": 10811,
+      "sha256": "785342476f15d3d21a9936d370117dfcf6df49aa040d04ebbb21b786453470f9"
+    },
+    "semantic_digest": "15c7ca2bf6df703979df529afbca6828f116b2463b1a818456edfad80bcad799"
+  },
+  "consumed_endpoint": {
+    "task": "XIN-2795",
+    "repository": "ploy-elison/codex-channel-octo",
+    "pr": 102,
+    "head": "131dc9c38bfe6813a0a0e9f207398fa06112cb9e",
+    "previous_head": "d007962a7762ec42ae2279c673392121ad630e64",
+    "handoff": {
+      "path": "docs/permission-endpoint-handoff-v7.json",
+      "bytes": 11702,
+      "sha256": "848285d7ad93acdb44b12f8d822cf7c80cf931c56821c2ab124fc1587462a05f"
+    },
+    "continuation_doc": {
+      "path": "docs/permission-v50-continuation.md",
+      "bytes": 12398,
+      "sha256": "cc061c76cc12fcb6038da8a56fc0399265e886bbb2682c657a57a3090753ed4d"
+    },
+    "reconciled_semantic_digest": "15c7ca2bf6df703979df529afbca6828f116b2463b1a818456edfad80bcad799",
+    "abi_alignment_note": "Endpoint 131dc9c3 must align createNativeEndpointDriver with handoff-v7/v8 ([A-B2]): parse authorities as array, proven_predicates as boolean map, decimal-string context_epoch, metadata-only history_disclosure permit response, operation=resolve for revalidation, and require all resolved.predicates booleans to be true before publish/refuse"
+  },
+  "supported_catalog_digest": null,
+  "production_activation": "FAIL_CLOSED"
+}

@@ -249,8 +249,13 @@ type serverMsgRow struct {
 	seq       uint32
 	fromUID   string
 	timestamp int64
+	expire    uint32
 	payload   []byte
 	deleted   int
+}
+
+func (m *serverMsgRow) isExpired(now time.Time) bool {
+	return m != nil && m.expire > 0 && now.Unix()-int64(m.expire) >= m.timestamp
 }
 
 type serverExtraRow struct {
@@ -264,8 +269,8 @@ type serverExtraRow struct {
 
 func (p *ServerMessageFactProvider) loadMessage(ctx context.Context, r serverRef) (*serverMsgRow, error) {
 	var m serverMsgRow
-	err := p.one(ctx, "SELECT message_seq,from_uid,COALESCE(`timestamp`,0),payload,COALESCE(is_deleted,0) FROM "+p.hooks.MessageTable(r.channelID)+" WHERE channel_id=? AND channel_type=? AND message_id=?"+p.lockSuffix(ctx),
-		[]any{r.channelID, int(r.channelType), r.messageID}, &m.seq, &m.fromUID, &m.timestamp, &m.payload, &m.deleted)
+	err := p.one(ctx, "SELECT message_seq,from_uid,COALESCE(`timestamp`,0),COALESCE(expire,0),payload,COALESCE(is_deleted,0) FROM "+p.hooks.MessageTable(r.channelID)+" WHERE channel_id=? AND channel_type=? AND message_id=?"+p.lockSuffix(ctx),
+		[]any{r.channelID, int(r.channelType), r.messageID}, &m.seq, &m.fromUID, &m.timestamp, &m.expire, &m.payload, &m.deleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -427,7 +432,7 @@ func (p *ServerMessageFactProvider) resolveOne(ctx context.Context, key Key, ref
 	if err != nil {
 		return serverResolution{}, err
 	}
-	if msg.deleted != 0 || extra.revoke != 0 || extra.deleted != 0 {
+	if msg.deleted != 0 || msg.isExpired(p.now()) || extra.revoke != 0 || extra.deleted != 0 {
 		return un("expired_reference")
 	}
 
@@ -691,7 +696,7 @@ func (p *ServerMessageFactProvider) ListHistoryHeadersV1(ctx context.Context, ke
 	}
 	page.Cut = cu
 	idSum := sha256.Sum256([]byte(sourceRef + "|" + key.BotUID + "|" + strconv.FormatInt(upper, 10) + "|" + cu.Position))
-	page.PageID = "p" + hex.EncodeToString(idSum[:16])
+	page.PageID = hex.EncodeToString(idSum[:16])
 	return page, nil
 }
 

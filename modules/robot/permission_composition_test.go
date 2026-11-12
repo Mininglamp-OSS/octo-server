@@ -163,4 +163,3 @@ func TestPermissionOptInRouteCompositionMountsWhenValidAndRemainsUnmountedWhenIn
 		require.Equal(t, http.StatusUnauthorized, rec.Code, "%s %s", tc.method, tc.path)
 	}
 }
-

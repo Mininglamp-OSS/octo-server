@@ -63,7 +63,7 @@ func newServerFacts(t *testing.T) *serverFacts {
 	require.NoError(t, err)
 	parent := strings.Repeat("1", 32)
 	for _, q := range []string{
-		"CREATE TABLE message(message_id TEXT,message_seq INTEGER,from_uid TEXT,channel_id TEXT,channel_type INTEGER,`timestamp` INTEGER,payload BLOB,is_deleted INTEGER)",
+		"CREATE TABLE message(message_id TEXT,message_seq INTEGER,from_uid TEXT,channel_id TEXT,channel_type INTEGER,`timestamp` INTEGER,payload BLOB,is_deleted INTEGER,expire INTEGER DEFAULT 0)",
 		"CREATE TABLE message_extra(message_id TEXT UNIQUE,version INTEGER,revoke INTEGER,is_deleted INTEGER,content_edit TEXT,content_edit_hash TEXT)",
 		"CREATE TABLE message_user_extra(uid TEXT,message_id TEXT,message_is_deleted INTEGER)",
 		"CREATE TABLE channel_offset(uid TEXT,channel_id TEXT,channel_type INTEGER,message_seq INTEGER)",
@@ -80,8 +80,12 @@ func newServerFacts(t *testing.T) *serverFacts {
 }
 
 func (f *serverFacts) msg(id string, seq int, from, channel string, ctype int, payload map[string]any) {
+	f.msgWithExpire(id, seq, from, channel, ctype, int64(1700000000+seq), 0, payload)
+}
+
+func (f *serverFacts) msgWithExpire(id string, seq int, from, channel string, ctype int, ts, expire int64, payload map[string]any) {
 	b, _ := json.Marshal(payload)
-	_, err := f.s.Session.Exec("INSERT INTO message VALUES(?,?,?,?,?,?,?,0)", id, seq, from, channel, ctype, 1700000000+seq, b)
+	_, err := f.s.Session.Exec("INSERT INTO message VALUES(?,?,?,?,?,?,?,0,?)", id, seq, from, channel, ctype, ts, b, expire)
 	require.NoError(f.t, err)
 }
 
@@ -673,4 +677,270 @@ func TestServerMessageFactsDurablePermitLedgerSurvivesRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "unavailable", reissue[0].Status)
 	require.Equal(t, "disclosure_unavailable", reissue[0].Reason)
+}
+
+func TestServerMessageFactsMessageExpireTTLBoundaryAndRevalidation(t *testing.T) {
+	ctx := t.Context()
+	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f := newServerFacts(t)
+	f.s.Authority = authority
+	f.exec(ServerDisclosurePermitDDL)
+	f.p.durablePermits = true
+
+	// Controllable provider clock starting at t = 1700000100.
+	nowUnix := int64(1700000100)
+	f.p.now = func() time.Time { return time.Unix(nowUnix, 0).UTC() }
+
+	const baseTS = int64(1700000000)
+	p9001 := map[string]any{"type": 1, "space_id": "space", "content": "TTL-LIVE-NO-EXPIRE"}
+	p9002 := map[string]any{"type": 1, "space_id": "space", "content": "TTL-UNEXPIRED-101"}
+	p9003 := map[string]any{"type": 1, "space_id": "space", "content": "TTL-AT-BOUNDARY-100"}
+	p9004 := map[string]any{"type": 1, "space_id": "space", "content": "TTL-PAST-BOUNDARY-50"}
+	p9005 := map[string]any{"type": 1, "space_id": "space", "content": "TTL-REVALIDATE-105"}
+	p9006 := map[string]any{"type": 1, "content": "TTL-GROUP-BOUNDARY-100"}
+
+	// 9001: expire=0 (never expires)
+	f.msgWithExpire("9001", 1, "peer", f.dmChan, 1, baseTS, 0, p9001)
+	// 9002: expire=101 -> at now=1700000100, now - expire = 1699999999 < baseTS (unexpired)
+	f.msgWithExpire("9002", 2, "peer", f.dmChan, 1, baseTS, 101, p9002)
+	// 9003: expire=100 -> at now=1700000100, now - expire = 1700000000 == baseTS (expired at boundary)
+	f.msgWithExpire("9003", 3, "peer", f.dmChan, 1, baseTS, 100, p9003)
+	// 9004: expire=50 -> at now=1700000100, now - expire = 1700000050 > baseTS (expired past boundary)
+	f.msgWithExpire("9004", 4, "peer", f.dmChan, 1, baseTS, 50, p9004)
+	// 9005: expire=105 -> unexpired at now=1700000100, expires when clock advances to 1700000105
+	f.msgWithExpire("9005", 5, "peer", f.dmChan, 1, baseTS, 105, p9005)
+	// 9006: group message at boundary (expire=100)
+	f.msgWithExpire("9006", 1, "peer", "group", 2, baseTS, 100, p9006)
+
+	// Provision scope so Runtime.Facts(history_disclosure) can validate context_epoch ("0").
+	_, err = f.s.Get(ctx, fixtureKey, "owner")
+	require.NoError(t, err)
+
+	adapter, err := NewSQLNativeFactAdapter(authority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	assertNoSecrets := func(out []byte) {
+		for _, s := range []string{
+			"TTL-LIVE-NO-EXPIRE", "TTL-UNEXPIRED-101", "TTL-AT-BOUNDARY-100",
+			"TTL-PAST-BOUNDARY-50", "TTL-REVALIDATE-105", "TTL-GROUP-BOUNDARY-100",
+		} {
+			require.NotContains(t, string(out), s)
+		}
+	}
+
+	callBind := func(reqID string, ctype int, ch, msgID, seq string, payload map[string]any) map[string]any {
+		out, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":          json.Number("1"),
+			"operation":               "bind_delivery",
+			"request_id":              reqID,
+			"channel_type":            json.Number(strconv.Itoa(ctype)),
+			"channel_id":              ch,
+			"message_id":              msgID,
+			"message_seq":             seq,
+			"from_uid":                "peer",
+			"observed_payload_sha256": sha256OfJSON(payload),
+		})))
+		require.NoError(t, err)
+		assertNoSecrets(out)
+		return fixtureObject(t, out)["binding"].(map[string]any)
+	}
+
+	// 1. BindDeliveredMessage at now = 1700000100:
+	b9001 := callBind("req-ttl-bind-9001", 1, f.dmChan, "9001", "1", p9001)
+	require.Equal(t, "bound", b9001["status"])
+	require.Equal(t, true, b9001["current"])
+
+	b9002 := callBind("req-ttl-bind-9002", 1, f.dmChan, "9002", "2", p9002)
+	require.Equal(t, "bound", b9002["status"])
+	require.Equal(t, true, b9002["current"])
+
+	b9003 := callBind("req-ttl-bind-9003", 1, f.dmChan, "9003", "3", p9003)
+	require.Equal(t, "refused", b9003["status"])
+	require.Equal(t, "expired_reference", b9003["reason"])
+	require.Equal(t, false, b9003["current"])
+
+	b9004 := callBind("req-ttl-bind-9004", 1, f.dmChan, "9004", "4", p9004)
+	require.Equal(t, "refused", b9004["status"])
+	require.Equal(t, "expired_reference", b9004["reason"])
+	require.Equal(t, false, b9004["current"])
+
+	b9005 := callBind("req-ttl-bind-9005", 1, f.dmChan, "9005", "5", p9005)
+	require.Equal(t, "bound", b9005["status"])
+	require.Equal(t, true, b9005["current"])
+	ref9005 := b9005["delivery_reference"].(string)
+	hdrRef9005 := b9005["header_reference"].(string)
+
+	b9006 := callBind("req-ttl-bind-9006", 2, "group", "9006", "1", p9006)
+	require.Equal(t, "refused", b9006["status"])
+	require.Equal(t, "expired_reference", b9006["reason"])
+	require.Equal(t, false, b9006["current"])
+
+	// 2. Resolve via Runtime.Facts at now = 1700000100:
+	ref9001 := ServerDeliveryReference(1, f.dmChan, "9001", "x0_0")
+	ref9002 := ServerDeliveryReference(1, f.dmChan, "9002", "x0_0")
+	ref9003 := ServerDeliveryReference(1, f.dmChan, "9003", "x0_0")
+	ref9004 := ServerDeliveryReference(1, f.dmChan, "9004", "x0_0")
+	ref9006 := ServerDeliveryReference(2, "group", "9006", "x0_0")
+
+	for _, purpose := range []string{"admit", "contributor", "reply"} {
+		resBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      hex.EncodeToString([]byte("ttl-res-" + purpose + "----------------")[:16]),
+			"operation":       "resolve",
+			"purpose":         purpose,
+			"references": []any{
+				map[string]any{"delivery_reference": ref9001},
+				map[string]any{"delivery_reference": ref9002},
+				map[string]any{"delivery_reference": ref9003},
+				map[string]any{"delivery_reference": ref9004},
+				map[string]any{"delivery_reference": ref9005},
+				map[string]any{"delivery_reference": ref9006},
+			},
+		})))
+		require.NoError(t, err)
+		assertNoSecrets(resBytes)
+		results := fixtureObject(t, resBytes)["results"].([]any)
+		require.Len(t, results, 6)
+		require.Equal(t, "resolved", results[0].(map[string]any)["status"])
+		require.Equal(t, "resolved", results[1].(map[string]any)["status"])
+		require.Equal(t, "unavailable", results[2].(map[string]any)["status"])
+		require.Equal(t, "expired_reference", results[2].(map[string]any)["reason"])
+		require.Equal(t, "unavailable", results[3].(map[string]any)["status"])
+		require.Equal(t, "expired_reference", results[3].(map[string]any)["reason"])
+		require.Equal(t, "resolved", results[4].(map[string]any)["status"])
+		require.Equal(t, "unavailable", results[5].(map[string]any)["status"])
+		require.Equal(t, "expired_reference", results[5].(map[string]any)["reason"])
+	}
+
+	// 3. History headers via Runtime.Facts at now = 1700000100:
+	// Ordered newest first: 9005 (resolved), 9004 (unavailable/expired_reference),
+	// 9003 (unavailable/expired_reference), 9002 (resolved), 9001 (resolved).
+	hhBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":   json.Number("1"),
+		"profile_version":  json.Number("1"),
+		"request_id":       strings.Repeat("a", 32),
+		"operation":        "history_headers",
+		"source_reference": ServerSourceReference(1, f.dmChan),
+		"cursor":           nil,
+		"page_size":        json.Number("10"),
+	})))
+	require.NoError(t, err)
+	assertNoSecrets(hhBytes)
+	hhItems := fixtureObject(t, hhBytes)["page"].(map[string]any)["items"].([]any)
+	require.Len(t, hhItems, 5)
+	require.Equal(t, "9005", hhItems[0].(map[string]any)["message_id"])
+	require.Equal(t, "unavailable", hhItems[1].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hhItems[1].(map[string]any)["reason"])
+	require.Equal(t, "unavailable", hhItems[2].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hhItems[2].(map[string]any)["reason"])
+	require.Equal(t, "9002", hhItems[3].(map[string]any)["message_id"])
+	require.Equal(t, "9001", hhItems[4].(map[string]any)["message_id"])
+
+	hdrRef9001 := hhItems[4].(map[string]any)["header_reference"].(string)
+	hdrRef9002 := hhItems[3].(map[string]any)["header_reference"].(string)
+	hdrRef9003 := encodeServerRef(serverRefHeader, serverRef{channelType: 1, channelID: f.dmChan, messageID: "9003", version: "x0_0"})
+	hdrRef9004 := encodeServerRef(serverRefHeader, serverRef{channelType: 1, channelID: f.dmChan, messageID: "9004", version: "x0_0"})
+
+	// 4. History disclosure via Runtime.Facts at now = 1700000100:
+	// 9001 and 9002 receive permits; 9003 (at boundary) and 9004 (past boundary) are refused with expired_reference and zero permit.
+	hdBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("b", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("c", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef9001},
+			map[string]any{"header_reference": hdrRef9002},
+			map[string]any{"header_reference": hdrRef9003},
+			map[string]any{"header_reference": hdrRef9004},
+		},
+	})))
+	require.NoError(t, err)
+	assertNoSecrets(hdBytes)
+	hdResults := fixtureObject(t, hdBytes)["results"].([]any)
+	require.Len(t, hdResults, 4)
+	require.Equal(t, "resolved", hdResults[0].(map[string]any)["status"])
+	require.NotEmpty(t, hdResults[0].(map[string]any)["permit"])
+	require.Equal(t, "resolved", hdResults[1].(map[string]any)["status"])
+	require.NotEmpty(t, hdResults[1].(map[string]any)["permit"])
+	require.Equal(t, "unavailable", hdResults[2].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hdResults[2].(map[string]any)["reason"])
+	require.Nil(t, hdResults[2].(map[string]any)["permit"])
+	require.Equal(t, "unavailable", hdResults[3].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hdResults[3].(map[string]any)["reason"])
+	require.Nil(t, hdResults[3].(map[string]any)["permit"])
+
+	// 5. Revalidation after clock advances to now = 1700000105:
+	// 9005 (expire=105) is now at its exact TTL boundary, and 9002 (expire=101) is now past its boundary.
+	// Even though 9005 was bound and listed as resolved at t=1700000100, re-resolving or requesting
+	// history_disclosure at t=1700000105 must refuse with expired_reference and issue no permit.
+	nowUnix = 1700000105
+
+	b9005After := callBind("req-ttl-bind-9005-after", 1, f.dmChan, "9005", "5", p9005)
+	require.Equal(t, "refused", b9005After["status"])
+	require.Equal(t, "expired_reference", b9005After["reason"])
+
+	resAfterBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("d", 32),
+		"operation":       "resolve",
+		"purpose":         "contributor",
+		"references": []any{
+			map[string]any{"delivery_reference": ref9001},
+			map[string]any{"delivery_reference": ref9002},
+			map[string]any{"delivery_reference": ref9005},
+		},
+	})))
+	require.NoError(t, err)
+	resAfter := fixtureObject(t, resAfterBytes)["results"].([]any)
+	require.Equal(t, "resolved", resAfter[0].(map[string]any)["status"])
+	require.Equal(t, "unavailable", resAfter[1].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", resAfter[1].(map[string]any)["reason"])
+	require.Equal(t, "unavailable", resAfter[2].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", resAfter[2].(map[string]any)["reason"])
+
+	hdAfterBytes, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("e", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("f", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef9005},
+			map[string]any{"header_reference": hdrRef9002},
+			map[string]any{"header_reference": hdrRef9001},
+		},
+	})))
+	require.NoError(t, err)
+	assertNoSecrets(hdAfterBytes)
+	hdAfter := fixtureObject(t, hdAfterBytes)["results"].([]any)
+	require.Equal(t, "unavailable", hdAfter[0].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hdAfter[0].(map[string]any)["reason"])
+	require.Nil(t, hdAfter[0].(map[string]any)["permit"])
+	require.Equal(t, "unavailable", hdAfter[1].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", hdAfter[1].(map[string]any)["reason"])
+	require.Nil(t, hdAfter[1].(map[string]any)["permit"])
+	require.Equal(t, "resolved", hdAfter[2].(map[string]any)["status"])
+	require.NotEmpty(t, hdAfter[2].(map[string]any)["permit"])
+
+	// Verify durable ledger has zero rows for expired 9003, 9004, or 9005.
+	var expiredPermits int
+	err = f.s.Session.QueryRow(
+		"SELECT COUNT(*) FROM "+ServerDisclosurePermitTable+" WHERE header_reference IN (?,?,?)",
+		hdrRef9003, hdrRef9004, hdrRef9005,
+	).Scan(&expiredPermits)
+	require.NoError(t, err)
+	require.Equal(t, 0, expiredPermits)
 }
